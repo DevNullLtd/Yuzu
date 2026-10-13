@@ -32,8 +32,12 @@ extern const std::string
     kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
 extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
-extern const std::string_view
-    kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
+// server/core/vendor/ibm-plex/*.woff2 (SIL OFL)
+extern const std::string_view kIbmPlexSans400Woff2;
+extern const std::string_view kIbmPlexSans500Woff2;
+extern const std::string_view kIbmPlexSans600Woff2;
+extern const std::string_view kIbmPlexMono400Woff2;
+extern const std::string_view kIbmPlexMono500Woff2;
 } // namespace yuzu::server
 
 namespace yuzu::server::page {
@@ -131,20 +135,28 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
         res.set_header("Cache-Control", "public, max-age=86400");
         res.set_content(yuzu::server::kCytoscapeJs, "application/javascript; charset=utf-8");
     });
-    // Inter variable webfont (SIL OFL) — the Yuzu design system's
-    // default family. Single woff2 covers all weights via font-
-    // variation-settings on the @font-face declaration in
-    // css_bundle.cpp.
-    sink.Get("/static/fonts/InterVariable.woff2", [](const httplib::Request&,
-                                                      httplib::Response& res) {
-        res.set_header("Cache-Control", "public, max-age=2592000, immutable");
-        // Zero-copy: pass the byte view's data+size directly so we
-        // don't allocate a 345 KB std::string per fetch. (Gate 3
-        // cpp-S1.) httplib's set_content(const char*, size_t, ...)
-        // copies into the response buffer once.
-        res.set_content(yuzu::server::kInterVariableWoff2.data(),
-                        yuzu::server::kInterVariableWoff2.size(), "font/woff2");
-    });
+    // IBM Plex webfonts (SIL OFL) — IBM's prebuilt Latin woff2 files, one per
+    // weight, declared in yuzu.css. Zero-copy: pass the byte view's
+    // data+size directly so we don't allocate a std::string per fetch
+    // (Gate 3 cpp-S1). httplib's set_content(const char*, size_t, ...)
+    // copies into the response buffer once.
+    struct FontAsset {
+        const char* path;
+        const std::string_view* bytes;
+    };
+    static const FontAsset kFonts[] = {
+        {"/static/fonts/ibm-plex-sans-latin-400-normal.woff2", &yuzu::server::kIbmPlexSans400Woff2},
+        {"/static/fonts/ibm-plex-sans-latin-500-normal.woff2", &yuzu::server::kIbmPlexSans500Woff2},
+        {"/static/fonts/ibm-plex-sans-latin-600-normal.woff2", &yuzu::server::kIbmPlexSans600Woff2},
+        {"/static/fonts/ibm-plex-mono-latin-400-normal.woff2", &yuzu::server::kIbmPlexMono400Woff2},
+        {"/static/fonts/ibm-plex-mono-latin-500-normal.woff2", &yuzu::server::kIbmPlexMono500Woff2},
+    };
+    for (const auto& font : kFonts) {
+        sink.Get(font.path, [bytes = font.bytes](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=2592000, immutable");
+            res.set_content(bytes->data(), bytes->size(), "font/woff2");
+        });
+    }
 
     sink.Get("/static/yuzu-charts.js", [](const httplib::Request&,
                                           httplib::Response& res) {
