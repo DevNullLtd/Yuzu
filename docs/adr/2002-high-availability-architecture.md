@@ -1125,7 +1125,8 @@ so a wrong disposition is never edited in place, only superseded by a later row 
 "remaining 4.4 scope" in §7b's `#4555` decision text) is judged OUT of WS-4 4.4's actual scope: the
 WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix.md`), and gossip-based
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
-not a WS-4 gate item.
+not a WS-4 gate item: as of 2026-10-13 that tracker is **WS-15** in `docs/ha-delivery-matrix.md`
+(roadmap 7.1.1, #5759), paired with WS-13's agent-side failover (roadmap 14.2, #291).
 
 **Update (2026-10-01, #1197 - server-side unknown-session verdict; INERT until the gateway consumes it).**
 `BatchHeartbeatResponse` gained `repeated string unknown_session_ids = 2` and
