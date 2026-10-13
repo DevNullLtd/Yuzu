@@ -307,7 +307,7 @@ curl -s -b cookies.txt \
 ## Storage substrate (PostgreSQL, ADR-0039)
 
 Since the Postgres migration (ADR-0006/0039), responses live in the server's
-PostgreSQL database (schema `response_store`), not a local `responses.db`. Two
+PostgreSQL database (schema `response_store`), not a local `responses.db`. Three
 operator-visible notes:
 
 - **History reset on cutover.** The legacy SQLite `responses.db` is **not**
@@ -322,6 +322,36 @@ operator-visible notes:
   are replaced with the Unicode replacement character (U+FFFD) at ingest. The
   response row is still stored and still renders (defanged) — it is not
   dropped or turned into a 500.
+- **Facets are bounded.** Each response keeps the distinct (column, value) pairs of its output as
+  facets, which drive the facet filter, group-from-results and the agent-count preview.
+  - **Long values.** A value over 2048 bytes (measured on the value as stored, after invalid UTF-8
+    and NUL bytes are rewritten) is left out of the response's facets. It is excluded, never
+    truncated, because a prefix would be a different value than the one the agent reported. The
+    response row, its output and every other facet still persist. Before this limit, one such value
+    made the whole facet insert fail and the response lost ALL of its facets. The limit exists
+    because the value is part of two database indexes, which refuse an entry over about 2.7 KB.
+  - **Older rows.** Older servers indexed values that fit the database index limit (about 2.7 KB
+    for an incompressible value, minus the instruction id length; a compressible value could be
+    larger). Rows already stored by an older server stay readable until retention removes them.
+    Values over 2048 bytes in newly ingested responses are not indexed, so the facet filter, the
+    dropdowns and the group-from-results count show nothing or "0 agents" for such a value.
+  - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column
+    index ascending, then value ascending, so the same output always keeps the same facets. A rare
+    value (one line, such as a single package on one host) sorts late and is the first to be cut.
+    The symptom is an agent missing from a facet filter or preview while its response still shows in
+    the results. Before, which 5,000 survived was whichever the server held first, so a rare value
+    could be cut and the choice was not repeatable.
+  - **Lost facets are not recoverable.** A response whose facets were lost (`batch_failed`, or cut
+    by `cap`) has no facets re-derived afterwards, and nothing marks such a response as affected
+    (#5630). The workaround is to run the command again and to recreate any static group built from
+    the affected response from the NEW run, because running the command again does not repair a
+    group that already exists and recreating it from the old result set gives the same short
+    group.
+  - **Counting.** Every facet that did not persist is counted in
+    `yuzu_server_response_facets_dropped_total{reason}` (`value_too_long`, `cap`, `batch_failed`);
+    see [metrics.md](metrics.md).
+  - **Retention.** Facet rows are removed with their response by the existing reaper
+    (`--response-retention-days`, default 90); there is no separate facet retention.
 
 ## Retention and cleanup
 

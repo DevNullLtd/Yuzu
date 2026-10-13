@@ -112,6 +112,54 @@ header rather than a redirect, so a panel never swaps the sign-in page into itse
 must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
 that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
 
+## Behaviour change: an over-long facet value is left out of the response's facets (#5623)
+
+**What changed.** A facet value over 2048 bytes (measured in bytes on the value as stored) is now
+excluded from a response's facets, never truncated. The response row, its output and every other facet
+of that response still persist. Before, one such value made the whole facet insert fail and the response
+lost ALL of its facets. The limit exists because the value is part of two database indexes, which refuse
+an entry over about 2.7 KB. A new counter, `yuzu_server_response_facets_dropped_total{reason}` (`value_too_long`,
+`cap`, `batch_failed`), counts the distinct (column, value) facets that did not persist; it is
+published only after the response commits, is pre-seeded at 0 at boot, and a failed commit publishes
+nothing. No alert rule ships or is owed: it is a data-completeness signal, and a per-response marker
+and alert are tracked in #5630. See [`metrics.md`](metrics.md).
+
+**Stored values.** Older servers indexed values that fit the database index limit: about 2.7 KB for an
+incompressible value (less the instruction id length), and more for a value that compresses well (a
+reviewer's probe on PostgreSQL 16 inserted 100,000 bytes of repeated text and rejected 500,000; this was
+not repeated here). Rows already stored by an older server stay readable until retention removes them.
+Facet rows are removed with their response by the existing reaper (`--response-retention-days`,
+default 90); nothing new is added.
+
+**Effect on the dashboard.** The dashboard is unchanged by this release. For newly ingested responses a
+value over 2048 bytes is no longer indexed, including compressible values larger than about 2.7 KB that
+older servers could index. The facet filter, the dropdowns and the group-from-results and create-group
+counts therefore show nothing or "0 agents" for such a value, and a direct group-from-results submit
+answers `422` "No agents match"; it never creates an empty group.
+
+**5,000-facet cap.** Above 5,000 distinct facets in one response, the facets kept are now chosen in a
+fixed order: most lines first, then column index ascending, then value ascending. Before, they were
+whichever the server happened to hold first, so a rare value could be cut and the choice was not
+repeatable. Different rare values may therefore survive or be lost compared with before.
+
+**Lost facets are not recoverable.** A response whose facets were lost (`batch_failed`, or cut by
+`cap`) has no facets re-derived later, and nothing marks the response as affected (#5630).
+**Workaround:** run the command again, and RECREATE any static group built from the affected response
+from the NEW run; running the command again does not repair an existing group.
+
+**Rolling upgrade.** The change is server-only: there is no schema, configuration, agent or gateway step,
+the order in which replicas are upgraded does not matter, and rolling back is starting the previous
+server binary. What differs during a rollout:
+
+- **Ingest decides the facets.** A facet is lost, or kept, on whichever replica ingested the response. An
+  old replica that ingests a response carrying a value too long for the database index drops ALL facets
+  of that response; a new replica excludes only the long value and keeps the rest.
+- **Every replica reads the same table.** Every replica reads the same `response_facets` rows, so a group
+  built from a response that an OLD replica ingested is short whichever replica builds the group.
+  Upgrading the replica that serves the group does not repair it; use the workaround above.
+
+See [`response-store.md`](response-store.md) (Facets are bounded).
+
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
 **What changed.** Deleting (deactivating) an account and demoting a local `admin` account now go through

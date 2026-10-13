@@ -58,6 +58,49 @@ class PgPool;
 
 namespace yuzu::server {
 
+/// Longest facet value, in bytes, that is persisted to `response_facets`. A longer
+/// value is EXCLUDED from the response's facets, never truncated (a prefix would be a
+/// different value than the one the agent reported); the response row, its output and
+/// every other facet still persist. The length is measured on the sanitized value, the
+/// form ingest stores.
+///
+/// Why 2048: `response_facets.value` is in the primary key (response_id, col_idx,
+/// value) and in `idx_facets_query (instruction_id, col_idx, value)`. A btree tuple
+/// over 2704 bytes is refused (PostgreSQL 18.4, 8 KB pages), and one refused row fails
+/// the whole multi-row INSERT, so every facet of the response is lost. Measured against
+/// a copy of both indexes with incompressible values: the largest value that inserts is
+/// about 2680 minus len(instruction_id) bytes (2644 at a 40 byte id, 2620 at 64, 2484 at
+/// 200). A value that compresses well gets past that, because the limit applies to the
+/// COMPRESSED index entry (the "index row requires N bytes, maximum size is 8191"
+/// error): a reviewer's probe on PostgreSQL 16 inserted 100,000 bytes of repeated text
+/// and rejected 500,000 (not repeated by the author).
+/// The byte length alone therefore decides here. 2048 leaves about 630 bytes for the
+/// instruction_id, whose length the ingest path does not bound (it is the id the agent
+/// echoes; the longest the server mints is about 60 bytes); a longer id still fails the
+/// facet batch, which is counted as `batch_failed`.
+inline constexpr std::size_t kMaxFacetValueBytes = 2048;
+
+/// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
+/// (column, value) pairs) of a response that did not persist, by reason. Counted only
+/// once the response has been stored, and the response row itself is stored in every
+/// counted case. If the SAVEPOINT machinery itself fails (SAVEPOINT creation, or the
+/// ROLLBACK TO after a failed batch), the transaction is aborted and the whole response
+/// is dropped: that is counted by `yuzu_server_response_ingest_dropped_total{query_error}`
+/// only, and no facet counter moves.
+inline constexpr const char* kResponseFacetsDroppedMetric =
+    "yuzu_server_response_facets_dropped_total";
+/// `value_too_long`: excluded because longer than `kMaxFacetValueBytes`.
+inline constexpr const char* kFacetDropValueTooLong = "value_too_long";
+/// `cap`: distinct facets past the per-response cardinality cap.
+inline constexpr const char* kFacetDropCap = "cap";
+/// `batch_failed`: the facet INSERT batch failed and was rolled back to its savepoint,
+/// so none of the response's facets persisted (the response itself committed).
+inline constexpr const char* kFacetDropBatchFailed = "batch_failed";
+
+/// Describe and pre-seed every reason of the facets-dropped counter at zero, so an idle
+/// server exports the series. Called once at startup from `ServerImpl`.
+void seed_response_facet_metrics(yuzu::MetricsRegistry& m);
+
 struct StoredResponse {
     int64_t id{0};
     std::string instruction_id;
