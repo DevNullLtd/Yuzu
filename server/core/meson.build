@@ -459,6 +459,7 @@ yuzu_server_core_lib = static_library(
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
+    'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
     'src/rbac_store.cpp',
     'src/rbac_admin_authority_owner.cpp',
     'src/oidc_provider.cpp',
