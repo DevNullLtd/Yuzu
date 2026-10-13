@@ -1022,9 +1022,9 @@ TEST_CASE("viz page: loads yuzu-viz.js as type=module", "[viz][page]") {
     CHECK_THAT(html, ContainsSubstring("<script type=\"module\" src=\"/static/yuzu-viz.js\">"));
 }
 
-TEST_CASE("viz page: nav highlights Fleet Viz when on the page", "[viz][page]") {
+TEST_CASE("viz page: nav highlights Fleet when on the page", "[viz][page]") {
     std::string html(kVizFleetPageHtml);
-    CHECK_THAT(html, ContainsSubstring("href=\"/viz/fleet\" class=\"nav-link active\""));
+    CHECK_THAT(html, ContainsSubstring("class=\"shell-nav on\" href=\"/viz/fleet\" aria-current=\"page\""));
 }
 
 // ── IBM Plex webfonts (woff2 binary) ────────────────────────────────────────

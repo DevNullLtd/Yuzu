@@ -400,8 +400,7 @@ yuzu_server_core_lib = static_library(
     'src/auto_approve.cpp',
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
-    'src/chargen_ui.cpp',
-    'src/procfetch_ui.cpp',
+    'src/app_shell.cpp',
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
@@ -639,8 +638,6 @@ yuzu_server_core_lib = static_library(
     'src/device_token_store.cpp',
     'src/software_deployment_store.cpp',
     'src/license_store.cpp',
-    'src/topology_ui.cpp',
-    'src/statistics_ui.cpp',
     # css_bundle.cpp removed in favour of build-time chunked embed (Gate 4
     # cpp-B1: kYuzuCss exceeds MSVC's 16,380-byte raw-string-literal limit).
     # Source CSS lives at server/core/static/yuzu.css; embed_js.py emits

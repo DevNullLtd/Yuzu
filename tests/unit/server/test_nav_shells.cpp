@@ -1,0 +1,321 @@
+/**
+ * @file test_nav_shells.cpp
+ * @brief Pure tests for the app shell (app_shell.{hpp,cpp}): the nav model, the breadcrumb,
+ *        the renderer, the marker swap the routes use, and that every full-page template
+ *        actually carries a shell block with the right item active.
+ *
+ * The last group is the one that matters most. Before the shell, each page hand-copied its
+ * nav and the per-route "make this link active" step was a plain string replace that
+ * silently did nothing when the markup drifted. `apply_shell` is also silent when a page
+ * has no marker pair, so these cases are what catches a page that lost its marker.
+ */
+
+#include "app_shell.hpp"
+#include "result_sets_ui.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+
+#include <cstddef>
+#include <regex>
+#include <set>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// Full-page templates (defined at global scope in the *_ui.cpp translation units).
+extern const char* const kDashboardIndexHtml;
+extern const char* const kHelpHtml;
+extern const char* const kInstructionPageHtml;
+extern const char* const kTarPageHtml;
+extern const char* const kVizFleetPageHtml;
+extern const char* const kVizHostPageHtml;
+extern const char* const kComplianceHtml;
+extern const char* const kGuardianHtml;
+extern const char* const kGuardianDetailPageHtml;
+extern const char* const kSettingsHtml;
+
+using Catch::Matchers::ContainsSubstring;
+using namespace yuzu::server::shell;
+
+namespace {
+
+std::size_t count_of(std::string_view hay, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto p = hay.find(needle); p != std::string_view::npos; p = hay.find(needle, p + needle.size()))
+        ++n;
+    return n;
+}
+
+/// The one `<a class="shell-nav on" href="X"` / sub-item `<a href="X" class="on"` pair
+/// a page highlights, as the hrefs found.
+std::vector<std::string> highlighted_hrefs(std::string_view html) {
+    std::vector<std::string> out;
+    static const std::regex top(R"re(<a class="shell-nav on" href="([^"]+)")re");
+    static const std::regex sub(R"re(<a href="([^"]+)" class="on")re");
+    const std::string s(html);
+    for (const auto* re : {&top, &sub})
+        for (std::sregex_iterator it(s.begin(), s.end(), *re), end; it != end; ++it)
+            out.push_back((*it)[1].str());
+    return out;
+}
+
+} // namespace
+
+// ── Nav model ───────────────────────────────────────────────────────────────
+
+TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[nav][shell]") {
+    std::vector<std::string_view> titles;
+    for (const auto& g : nav_groups())
+        titles.push_back(g.title);
+    CHECK(titles == std::vector<std::string_view>{"Operate", "Posture", "Estate", "System"});
+
+    std::vector<std::string_view> labels;
+    for (const auto& g : nav_groups())
+        for (const auto& it : g.items)
+            labels.push_back(it.label);
+    CHECK(labels == std::vector<std::string_view>{"Dashboard", "Instructions", "Result sets",
+                                                  "Compliance", "Guardian", "DEX", "TAR",
+                                                  "Hardware", "Software", "Fleet", "Settings"});
+}
+
+TEST_CASE("app shell: keys and hrefs are unique and every top-level entry has an icon",
+          "[nav][shell]") {
+    std::set<std::string_view> keys, hrefs;
+    for (const auto& g : nav_groups())
+        for (const auto& it : g.items) {
+            CHECK_FALSE(it.icon.empty());
+            CHECK(keys.insert(it.key).second);
+            CHECK(hrefs.insert(it.href).second);
+            for (const auto& c : it.children) {
+                CHECK(c.icon.empty());
+                CHECK(c.children.empty());
+                CHECK(keys.insert(c.key).second);
+                CHECK(hrefs.insert(c.href).second);
+            }
+        }
+}
+
+TEST_CASE("app shell: only Software and Fleet have sub-items; Settings is one admin-only entry",
+          "[nav][shell]") {
+    std::vector<std::string> with_children;
+    for (const auto& g : nav_groups())
+        for (const auto& it : g.items) {
+            if (!it.children.empty())
+                with_children.push_back(std::string(it.key) + ">" + std::string(it.children[0].key));
+            CHECK((it.key == "settings") == it.admin_only);
+        }
+    CHECK(with_children == std::vector<std::string>{"software>auto", "fleet>network"});
+
+    const auto groups = nav_groups();
+    REQUIRE(groups.back().title == "System");
+    REQUIRE(groups.back().items.size() == 1);
+    CHECK(groups.back().items[0].href == "/settings");
+}
+
+// ── Breadcrumb ──────────────────────────────────────────────────────────────
+
+TEST_CASE("app shell: breadcrumb is group / page, and a sub-item skips its parent",
+          "[nav][shell]") {
+    CHECK(breadcrumb_trail({.active_key = "dashboard"}) ==
+          std::vector<std::string>{"Operate", "Dashboard"});
+    CHECK(breadcrumb_trail({.active_key = "network"}) ==
+          std::vector<std::string>{"Estate", "Network"});
+    CHECK(breadcrumb_trail({.active_key = "auto"}) ==
+          std::vector<std::string>{"Estate", "Deployments"});
+}
+
+TEST_CASE("app shell: a title extends the trail, a repeated label does not", "[nav][shell]") {
+    CHECK(breadcrumb_trail({.active_key = "guardian", .title = "Baseline"}) ==
+          std::vector<std::string>{"Posture", "Guardian", "Baseline"});
+    CHECK(breadcrumb_trail({.active_key = "guardian", .title = "Guardian"}) ==
+          std::vector<std::string>{"Posture", "Guardian"});
+}
+
+TEST_CASE("app shell: a page without a nav entry shows only its title; nothing known shows nothing",
+          "[nav][shell]") {
+    CHECK(breadcrumb_trail({.title = "Help"}) == std::vector<std::string>{"Help"});
+    CHECK(breadcrumb_trail({.active_key = "no-such-page", .title = "Help"}) ==
+          std::vector<std::string>{"Help"});
+    CHECK(breadcrumb_trail({}).empty());
+}
+
+TEST_CASE("app shell: an explicit breadcrumb replaces the derived parent trail", "[nav][shell]") {
+    CHECK(breadcrumb_trail({.active_key = "fleet", .title = "Host", .breadcrumb = "Estate / Fleet"}) ==
+          std::vector<std::string>{"Estate", "Fleet", "Host"});
+    // Blank segments and stray separators are dropped.
+    CHECK(breadcrumb_trail({.title = "Leaf", .breadcrumb = " / A //  B /"}) ==
+          std::vector<std::string>{"A", "B", "Leaf"});
+}
+
+// ── Renderer ────────────────────────────────────────────────────────────────
+
+TEST_CASE("app shell: exactly one item is the current page", "[nav][shell]") {
+    for (const auto& g : nav_groups())
+        for (const auto& it : g.items) {
+            INFO(it.key);
+            const auto html = render_shell({.active_key = it.key});
+            CHECK(count_of(html, "aria-current=\"page\"") == 1);
+            CHECK_THAT(html, ContainsSubstring("href=\"" + std::string(it.href) + "\" aria-current=\"page\"") ||
+                                 ContainsSubstring("href=\"" + std::string(it.href) +
+                                                   "\" id=\"nav-settings-link\" aria-current=\"page\""));
+        }
+    CHECK(count_of(render_shell({.active_key = "no-such-page"}), "aria-current=\"page\"") == 0);
+    CHECK(count_of(render_shell({}), "aria-current=\"page\"") == 0);
+}
+
+TEST_CASE("app shell: sub-items show only for the active family and light their parent",
+          "[nav][shell]") {
+    const auto on_dashboard = render_shell({.active_key = "dashboard"});
+    CHECK(count_of(on_dashboard, "class=\"shell-sub\"") == 0);
+
+    const auto on_software = render_shell({.active_key = "software"});
+    CHECK(count_of(on_software, "class=\"shell-sub\"") == 1);
+    CHECK_THAT(on_software, ContainsSubstring("<a href=\"/auto\">Deployments</a>"));
+    CHECK(highlighted_hrefs(on_software) == std::vector<std::string>{"/software"});
+
+    // The sub-item is the current page; its parent stays lit as the family.
+    const auto on_auto = render_shell({.active_key = "auto"});
+    CHECK_THAT(on_auto, ContainsSubstring("<a href=\"/auto\" class=\"on\" aria-current=\"page\">"));
+    CHECK(highlighted_hrefs(on_auto) == std::vector<std::string>{"/software", "/auto"});
+
+    const auto on_network = render_shell({.active_key = "network"});
+    CHECK(highlighted_hrefs(on_network) == std::vector<std::string>{"/viz/fleet", "/network"});
+}
+
+TEST_CASE("app shell: keeps the identity hooks, Sign out and the admin-only Settings entry",
+          "[nav][shell]") {
+    const auto html = render_shell({.active_key = "dashboard"});
+    // Ids the shell script fills / hides.
+    CHECK(count_of(html, "id=\"nav-user\"") == 1);
+    CHECK(count_of(html, "id=\"role-badge\"") == 1);
+    CHECK(count_of(html, "id=\"context-user\"") == 1);
+    CHECK(count_of(html, "id=\"nav-settings-link\"") == 1);
+    CHECK_THAT(html, ContainsSubstring("href=\"/settings\" id=\"nav-settings-link\""));
+    // Sign out posts to /logout through htmx, as the old nav's Logout button did.
+    CHECK_THAT(html, ContainsSubstring("<button class=\"shell-out\" type=\"button\" hx-post=\"/logout\">Sign out</button>"));
+    // The same /api/me read + non-admin rule the pages used to carry.
+    CHECK_THAT(html, ContainsSubstring("fetch('/api/me')"));
+    CHECK_THAT(html, ContainsSubstring("d.role!=='admin'&&role!=='Administrator'&&role!=='PlatformEngineer'"));
+}
+
+TEST_CASE("app shell: breadcrumb text is HTML-escaped", "[nav][shell]") {
+    const auto html = render_shell({.title = "<img src=x onerror=alert(1)>"});
+    CHECK_THAT(html, ContainsSubstring("&lt;img src=x onerror=alert(1)&gt;"));
+    CHECK_THAT(html, !ContainsSubstring("<img"));
+}
+
+TEST_CASE("app shell: styles come from tokens, never hex literals", "[nav][shell]") {
+    static const std::regex hex(R"(#[0-9a-fA-F]{3,8}\b)");
+    const auto html = render_shell({.active_key = "dashboard"});
+    CHECK_FALSE(std::regex_search(html, hex));
+    CHECK_THAT(html, !ContainsSubstring("box-shadow"));
+    CHECK_THAT(html, !ContainsSubstring("font-family"));
+    CHECK_THAT(html, !ContainsSubstring("text-transform"));
+}
+
+TEST_CASE("app shell: each raw literal in the renderer stays under MSVC's string limit",
+          "[nav][shell]") {
+    // The CSS and script are separate literals (C2026 at 16,380 bytes); the whole block must
+    // at least not approach that as a single piece.
+    CHECK(render_shell({.active_key = "dashboard"}).size() < 16000);
+}
+
+// ── apply_shell / bake ──────────────────────────────────────────────────────
+
+TEST_CASE("apply_shell: fills an empty marker pair and keeps the rest of the page", "[nav][shell]") {
+    const std::string page = "<body>A<!--yuzu:shell--><!--/yuzu:shell-->B</body>";
+    const auto out = apply_shell(page, {.active_key = "dex"});
+    CHECK(out.starts_with("<body>A<!--yuzu:shell-->"));
+    CHECK(out.ends_with("<!--/yuzu:shell-->B</body>"));
+    CHECK(highlighted_hrefs(out) == std::vector<std::string>{"/dex"});
+}
+
+TEST_CASE("apply_shell: re-targets a page that is already baked, leaving exactly one block",
+          "[nav][shell]") {
+    const std::string page = "<body><!--yuzu:shell--><!--/yuzu:shell--><main>x</main></body>";
+    const auto once = apply_shell(page, {.active_key = "guardian"});
+    const auto twice = apply_shell(once, {.active_key = "hardware"});
+    CHECK(highlighted_hrefs(twice) == std::vector<std::string>{"/hardware"});
+    CHECK(count_of(twice, kShellBegin) == 1);
+    CHECK(count_of(twice, kShellEnd) == 1);
+    CHECK_THAT(twice, ContainsSubstring("<main>x</main>"));
+    CHECK(apply_shell(twice, {.active_key = "hardware"}) == twice); // idempotent
+}
+
+TEST_CASE("apply_shell: a page without markers comes back unchanged", "[nav][shell]") {
+    const std::string page = "<body><nav class=\"x\"></nav></body>";
+    CHECK(apply_shell(page, {.active_key = "dex"}) == page);
+    CHECK(apply_shell("<body><!--yuzu:shell--></body>", {.active_key = "dex"}) ==
+          "<body><!--yuzu:shell--></body>"); // begin without end
+}
+
+TEST_CASE("bake: returns a stable, shell-bearing copy", "[nav][shell]") {
+    const char* a = bake("<!--yuzu:shell--><!--/yuzu:shell-->one", {.active_key = "tar"});
+    const char* b = bake("<!--yuzu:shell--><!--/yuzu:shell-->two", {.active_key = "dex"});
+    CHECK_THAT(std::string(a), ContainsSubstring("one"));
+    CHECK_THAT(std::string(b), ContainsSubstring("two"));
+    CHECK(highlighted_hrefs(a) == std::vector<std::string>{"/tar"}); // a survives b's bake
+}
+
+// ── The page templates themselves ───────────────────────────────────────────
+
+TEST_CASE("every full-page template carries one shell block with its own item active",
+          "[nav][shell][pages]") {
+    struct Page {
+        const char* name;
+        const char* html;
+        std::vector<std::string> active; // hrefs highlighted
+    };
+    const std::vector<Page> pages = {
+        {"dashboard", kDashboardIndexHtml, {"/"}},
+        {"instructions", kInstructionPageHtml, {"/instructions"}},
+        {"result sets", yuzu::server::kResultSetsPageHtml, {"/result-sets"}},
+        {"compliance", kComplianceHtml, {"/compliance"}},
+        {"guardian", kGuardianHtml, {"/guardian"}},
+        {"guardian detail (shared shell default)", kGuardianDetailPageHtml, {"/guardian"}},
+        {"tar", kTarPageHtml, {"/tar"}},
+        {"settings", kSettingsHtml, {"/settings"}},
+        {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
+        {"host map", kVizHostPageHtml, {"/viz/fleet"}},
+        {"help", kHelpHtml, {}},
+    };
+    for (const auto& p : pages) {
+        INFO(p.name);
+        const std::string html(p.html);
+        CHECK(count_of(html, kShellBegin) == 1);
+        CHECK(count_of(html, kShellEnd) == 1);
+        CHECK(highlighted_hrefs(html) == p.active);
+        // The hand-written chrome is gone — nothing left to drift.
+        CHECK_THAT(html, !ContainsSubstring("nav-bar"));
+        CHECK_THAT(html, !ContainsSubstring("nav-link"));
+        CHECK_THAT(html, !ContainsSubstring("context-bar"));
+        // One identity read per page — the shell's, not a per-page copy.
+        CHECK(count_of(html, "fetch('/api/me')") == 1);
+    }
+}
+
+TEST_CASE("the shared detail shell re-targets to every route that reuses it", "[nav][shell][pages]") {
+    // The five route files that fill kGuardianDetailPageHtml's tokens and then pick the
+    // active item. Each key must light its own entry (and its family) and nothing else.
+    struct Route {
+        const char* key;
+        std::vector<std::string> active;
+    };
+    const std::vector<Route> routes = {
+        {"dex", {"/dex"}},
+        {"hardware", {"/hardware"}},
+        {"software", {"/software"}},
+        {"auto", {"/software", "/auto"}},
+        {"network", {"/viz/fleet", "/network"}},
+    };
+    for (const auto& r : routes) {
+        INFO(r.key);
+        const auto html = apply_shell(kGuardianDetailPageHtml, {.active_key = r.key});
+        CHECK(highlighted_hrefs(html) == r.active);
+        CHECK(count_of(html, kShellBegin) == 1);
+        // The route's own token substitution still has its anchors.
+        CHECK_THAT(html, ContainsSubstring("{{TITLE}}"));
+        CHECK_THAT(html, ContainsSubstring("{{FRAGMENT}}"));
+    }
+}

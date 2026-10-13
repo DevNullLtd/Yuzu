@@ -3,8 +3,10 @@
 // syntax-highlighted preview (right). The authoring panel (New/Edit) is
 // only shown to users with the PlatformEngineer or Administrator role.
 
+#include "app_shell.hpp"
+
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kInstructionPageHtml =
+const char* const kInstructionPageTemplate =
     R"HTM(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -142,33 +144,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 </style>
 </head><body>
 
-<nav class="nav-bar">
-  <a href="/" class="nav-brand">
-    <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
-  </a>
-  <a href="/" class="nav-link">Dashboard</a>
-  <a href="/instructions" class="nav-link active">Instructions</a>
-  <a href="/compliance" class="nav-link">Compliance</a>
-  <a href="/guardian" class="nav-link">Guardian</a>
-  <a href="/dex" class="nav-link">DEX</a>
-  <a href="/tar" class="nav-link">TAR</a>
-  <a href="/hardware" class="nav-link">Hardware</a>
-  <a href="/software" class="nav-link">Software</a>
-  <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-    <a href="/result-sets" class="nav-link">Result Sets</a>
-  <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
-  <span class="nav-spacer"></span>
-  <span class="nav-user" id="nav-user"></span>
-  <button class="nav-logout" hx-post="/logout">Logout</button>
-</nav>
-<div class="context-bar" id="context-bar">
-  <span class="context-role-badge" id="role-badge"></span>
-  <span class="context-user" id="context-user"></span>
-  <span class="context-spacer"></span>
-  <button class="context-bell" title="Notifications">
-    <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
-  </button>
-</div>
+  <!--yuzu:shell--><!--/yuzu:shell-->
 
 <div style="padding:2rem">
 <h1>Instructions</h1>
@@ -359,18 +335,6 @@ function initScrollSync() {
     }
 }
 
-/* ── Populate nav bar + context bar ─────────────────────── */
-fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-  document.getElementById('nav-user').textContent = (d.display_name || d.username);
-  var role = d.rbac_role || d.role;
-  document.getElementById('role-badge').textContent = role;
-  document.getElementById('context-user').textContent = (d.display_name || d.username);
-  document.body.setAttribute('data-role', role);
-  if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
-    var sl = document.getElementById('nav-settings-link');
-    if(sl) sl.style.display = 'none';
-  }
-});
 loadExecDefinitions();
 loadExecAgents();
 
@@ -858,6 +822,10 @@ document.addEventListener('click', function(event) {
 </script>
 </body></html>
 )HTM";
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kInstructionPageHtml =
+    yuzu::server::shell::bake(kInstructionPageTemplate, {.active_key = "instructions"});
 
 // ── Editor fragment HTML template ─────────────────────────────────────────
 // Rendered by the server with user role check. Only shown to

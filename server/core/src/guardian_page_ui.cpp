@@ -14,8 +14,10 @@
 // CSS lives in the inline <style> below because those classes (.gp-*) are not
 // part of the shared stylesheet. Do NOT apply the `frontend-design` plugin here.
 
+#include "app_shell.hpp"
+
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kGuardianDetailPageHtml =
+const char* const kGuardianDetailPageTemplate =
     R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -251,29 +253,7 @@ extern const char* const kGuardianDetailPageHtml =
   </style>
 </head>
 <body>
-  <nav class="nav-bar">
-    <a href="/" class="nav-brand">
-      <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
-    </a>
-    <a href="/" class="nav-link">Dashboard</a>
-    <a href="/instructions" class="nav-link">Instructions</a>
-    <a href="/compliance" class="nav-link">Compliance</a>
-    <a href="/guardian" class="nav-link active">Guardian</a>
-    <a href="/dex" class="nav-link">DEX</a>
-    <a href="/tar" class="nav-link">TAR</a>
-    <a href="/hardware" class="nav-link">Hardware</a>
-    <a href="/software" class="nav-link">Software</a>
-    <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-    <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
-    <span class="nav-spacer"></span>
-    <span class="nav-user" id="nav-user"></span>
-    <button class="nav-logout" hx-post="/logout">Logout</button>
-  </nav>
-  <div class="context-bar" id="context-bar">
-    <span class="context-role-badge" id="role-badge"></span>
-    <span class="context-user" id="context-user"></span>
-    <span class="context-spacer"></span>
-  </div>
+  <!--yuzu:shell--><!--/yuzu:shell-->
 
   <div class="gp-wrap">
     <div id="guardian-detail"
@@ -447,16 +427,6 @@ extern const char* const kGuardianDetailPageHtml =
       });
     }
 
-    /* Populate nav user / role badge, mirroring the dashboard chrome. */
-    fetch('/api/me').then(function (r) { return r.json(); }).then(function (d) {
-      var nu = document.getElementById('nav-user'); if (nu) nu.textContent = (d.display_name || d.username) || '';
-      var role = d.rbac_role || d.role || '';
-      var rb = document.getElementById('role-badge'); if (rb) rb.textContent = role;
-      var cu = document.getElementById('context-user'); if (cu) cu.textContent = (d.display_name || d.username) || '';
-      if (d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
-        var sl = document.getElementById('nav-settings-link'); if (sl) sl.style.display = 'none';
-      }
-    }).catch(function () {});
   </script>
 )HTM"
     // Chunk 3: the Hardware CI record's generic action runner. Split into its own
@@ -815,4 +785,8 @@ extern const char* const kGuardianDetailPageHtml =
 </body>
 </html>
 )HTM";
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kGuardianDetailPageHtml =
+    yuzu::server::shell::bake(kGuardianDetailPageTemplate, {.active_key = "guardian"});
 // NOLINTEND(cert-err58-cpp)

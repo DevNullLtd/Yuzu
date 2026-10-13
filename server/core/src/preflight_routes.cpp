@@ -15,6 +15,7 @@
 
 #include "preflight_routes.hpp"
 
+#include "app_shell.hpp"
 #include "preflight_eval.hpp"       // collect/applicable/dispatch_params/check_*/config_*/checks_from_json
 #include "preflight_parse.hpp"      // kPreflightChecks, compute_device_results, bucket_from_token
 #include "preflight_run_store.hpp"  // PreflightRunStore + rows
@@ -74,9 +75,8 @@ std::string page_shell(const std::string& title, const std::string& fragment_url
     };
     sub("{{TITLE}}", title);
     sub("{{FRAGMENT}}", fragment_url);
-    sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
-        "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-    return html;
+    // /auto is the Deployments sub-item of Software in the app shell.
+    return shell::apply_shell(std::move(html), {.active_key = "auto"});
 }
 
 std::string param(const httplib::Request& req, const char* key) {
