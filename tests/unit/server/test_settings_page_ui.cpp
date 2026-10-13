@@ -95,3 +95,9 @@ TEST_CASE("Settings page carries the static Settings heading", "[settings][setti
     CHECK(count_of(html, "<h1>Settings</h1>") == 1);
     CHECK(count_of(html, "<h1") == 1);
 }
+
+TEST_CASE("Settings page keeps the td-level state colours", "[settings][settings_page]") {
+    const std::string html = kSettingsHtml;
+    CHECK(count_of(html, ".user-table td.muted { color: var(--mut); }") == 1);
+    CHECK(count_of(html, ".user-table td.feedback-error { color: var(--bad); }") == 1);
+}

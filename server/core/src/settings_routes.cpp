@@ -855,7 +855,7 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
                 status_cls = "role-user";
                 status_txt = "Exhausted";
             } else {
-                status_cls = "role-ok";
+                status_cls = "role-admin";
                 status_txt = "Active";
             }
 

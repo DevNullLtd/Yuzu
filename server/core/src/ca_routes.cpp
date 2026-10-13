@@ -209,7 +209,7 @@ std::string render_ca_fragment(CaStore* ca_store) {
                     "<td>" + fmt_epoch(c.not_after) +
                     "</td>"
                     "<td><span class=\"role-badge " +
-                    (revoked ? "role-user\">Revoked" : "role-ok\">Active") + "</span></td><td>";
+                    (revoked ? "role-user\">Revoked" : "role-admin\">Active") + "</span></td><td>";
             if (!revoked) {
                 // Carry the serial in a hidden input rather than a JSON hx-vals
                 // attribute: simpler, and it avoids JSON-inside-an-HTML-attribute

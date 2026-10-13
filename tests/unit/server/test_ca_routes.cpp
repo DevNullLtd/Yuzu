@@ -535,6 +535,24 @@ TEST_CASE("ca_routes: dashboard fragment renders, gated, and HTML-escapes (PR4b)
     REQUIRE(denied->status == 403);
 }
 
+// The table has no Expired state, so an unrevoked certificate past not_after still reads
+// Active; it must never wear the green OK colour (role-ok), which would assert health for it.
+TEST_CASE("ca_routes: an expired certificate is not shown with the green OK pill",
+          "[ca_routes][pki][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    IssuedCertRecord lapsed = sample_issued("E0D1");
+    lapsed.not_after = 1; // long past
+    REQUIRE(h.store->record_issued(lapsed));
+    h.wire();
+
+    auto frag = h.sink.Get("/fragments/settings/ca");
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200);
+    CHECK(frag->body.find("role-badge role-admin\">Active") != std::string::npos);
+    CHECK(frag->body.find("role-ok\">Active") == std::string::npos);
+}
+
 TEST_CASE("ca_routes: dashboard revoke wrapper revokes + re-renders (PR4b)",
           "[ca_routes][pki][security][pg]") {
     Harness h;
