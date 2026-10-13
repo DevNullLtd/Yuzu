@@ -86,7 +86,7 @@ void PreflightRunner::tick() {
         // NOT reuse this frozen cohort; it must re-resolve devices_fn(creator)∩group
         // authorization at each dispatch, or an operator who has since lost scope to
         // a device would still command it.
-        // #4644 Gate 7: when a check's fetch window is saturated, an agent absent from it is
+        // #4644: when a check's fetch window is saturated, an agent absent from it is
         // ambiguous (answered-then-evicted vs unanswered) and re-dispatching only adds rows that
         // evict more answers. Stop dispatching for this run; the grid already labels those cells
         // "inconclusive: response cap reached" and the run still completes at its deadline, so

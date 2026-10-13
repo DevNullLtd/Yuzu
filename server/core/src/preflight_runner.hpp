@@ -55,7 +55,7 @@ public:
         NowFn now_ms_fn;
         int retention_days{14};
         /// Per-check response fetch cap. Production keeps `preflight::kResponseFetchCap`; a
-        /// test lowers it to drive the saturated-window path (#4644 Gate 7) without seeding
+        /// test lowers it to drive the saturated-window path (#4644) without seeding
         /// 50,000 rows.
         int response_fetch_cap{preflight::kResponseFetchCap};
         // #3495: lets a shutdown request stop tick() from STARTING further

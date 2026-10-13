@@ -540,7 +540,7 @@ TEST_CASE("GET /api/v1/compliance/{id}: audit succeeds -> 200 with the per-agent
     CHECK(saw_success);
 }
 
-// #4644 Gate 7: the policy-fragment and policy list routes read `limit` strictly.
+// #4644: the policy-fragment and policy list routes read `limit` strictly.
 // The LEGACY list routes hand `limit` straight to the store's SQL LIMIT (the v1 twins clamp it
 // to 1..1000 first, see the negative-limit case above): a negative one is PG's `LIMIT must not
 // be negative`, a store degrade that surfaced as a 503 for a client mistake.

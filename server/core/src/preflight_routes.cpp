@@ -14,7 +14,7 @@
 /// (created_by) so one operator can't open another's run.
 
 #include "preflight_routes.hpp"
-#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "preflight_eval.hpp"       // collect/applicable/dispatch_params/check_*/config_*/checks_from_json
 #include "preflight_parse.hpp"      // kPreflightChecks, compute_device_results, bucket_from_token

@@ -164,11 +164,12 @@ struct Deps {
 void register_schedule_routes(HttpRouteSink& sink, Deps deps);
 
 /// Parses the `enabled` field of a `POST /api/schedules/{id}/enable` body (#4644 made it strict).
-/// Accepts a JSON boolean or the integers 0 / 1; a missing key or a BLANK (empty or
+/// Accepts a JSON boolean, the integers 0 / 1 or the exact strings "true" / "false" (the last
+/// keeps the disable kill switch reachable for text-encoding clients); a missing key or a BLANK (empty or
 /// whitespace-only) body defaults to `true` (disable is an explicit opt-in, never inferred from
 /// absence). Anything else returns nullopt and
-/// the route answers 400 without arming or changing the schedule: a string (the legacy
-/// `"true"`/`"false"` encoding is no longer accepted), another number, null, an array or object,
+/// the route answers 400 without arming or changing the schedule: any other string (`"True"`,
+/// `"0"`, empty), another number, null, an array or object,
 /// or a body that is truncated / not a JSON object. `{"enabled":0}` used to ARM the schedule.
 /// A real JSON boolean once fell through to the "absent" default (`{"enabled": false}` computed
 /// `true`), defeating the disable-always-reachable kill switch (H-01, #1806); the boolean arm

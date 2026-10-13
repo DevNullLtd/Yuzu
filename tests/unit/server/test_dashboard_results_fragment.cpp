@@ -402,7 +402,7 @@ TEST_CASE("/fragments/results: Create Group button still renders for an "
     CHECK(contains(res->body, "Create Group from 1 Agent"));
 }
 
-// ── #4644 Gate 7 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──
+// ── #4644 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──
 
 TEST_CASE("/fragments/results: an unfiltered read cut by the payload cap shows a truncation "
           "notice an uncut one does not",
@@ -492,7 +492,7 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
     CHECK_FALSE(contains(cut->body, " results across "));
 }
 
-// #4644 Gate 7: `page` / `per_page` are ONE base-10 integer or a 400: a malformed page used to
+// #4644: `page` / `per_page` are ONE base-10 integer or a 400: a malformed page used to
 // fall back to the default silently, so the operator read page 1 as the page they asked for.
 TEST_CASE("/fragments/results: a malformed page or per_page is a 400 and valid values are served",
           "[pg][server][dashboard][fragment][numeric_params]") {

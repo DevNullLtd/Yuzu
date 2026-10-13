@@ -664,6 +664,12 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
             h.post("/api/v1/inventory/query", bad, status);
             CHECK(status == 400);
         }
+        // Valid JSON that is not an object used to reach body.value() and answer a bare 500.
+        for (const char* bad : {"[]", "null", "5", R"("x")", "true"}) {
+            INFO(bad);
+            h.post("/api/v1/inventory/query", bad, status);
+            CHECK(status == 400);
+        }
     }
     SECTION("v1 inventory query: limit is read as 64 bits, clamps above 1000 and a zero, negative "
             "or non-integer value is a 400 (#4644)") {

@@ -9,7 +9,7 @@
 #include "compliance_routes.hpp"
 
 #include "compliance_model.hpp"      // shared REST/MCP/fragment builders (#4034, recipe Rule 1)
-#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial/a4_error/ensure_correlation_id — mints/
                                      // reuses X-Correlation-Id so header and body always agree
 #include "rest_audit.hpp"           // detail::emit_behavioral_audit (#1647, #4034 follow-up)

@@ -2,7 +2,7 @@
 
 #include "execution_model.hpp" // #2146 A2-R1: shared execution_child_row_json builder
 #include "execution_scope_rules.hpp"
-#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "execution_tracker.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp"

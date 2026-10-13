@@ -96,6 +96,14 @@ TEST_CASE("CIDR: /0 matches everything", "[auto_approve][cidr]") {
     REQUIRE_FALSE(engine->evaluate(make_ctx("", "255.255.255.255")).empty());
 }
 
+TEST_CASE("CIDR: a blank rule value never matches, even an empty peer IP (#4644)",
+          "[auto_approve][cidr]") {
+    auto engine = make_engine();
+    (void)engine->add_rule({AutoApproveRuleType::ip_subnet, "", "blank"});
+    REQUIRE(engine->evaluate(make_ctx("", "")).empty());
+    REQUIRE(engine->evaluate(make_ctx("", "10.0.0.1")).empty());
+}
+
 TEST_CASE("CIDR: invalid IP returns no match", "[auto_approve][cidr]") {
     auto engine = make_engine();
     engine->add_rule({AutoApproveRuleType::ip_subnet, "10.0.0.0/8", "test"});

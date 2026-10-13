@@ -391,7 +391,7 @@ TEST_CASE("settings enrollment: bulk approve/deny with the store down are 503 + 
     CHECK(h.only("enrollment.bulk_deny").result == "failure");
 }
 
-// #4644 Gate 7: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit used to
+// #4644: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit used to
 // mint an unlimited token. Only an EMPTY field or a literal 0 may mean "unlimited"/"no expiry";
 // anything else must be ONE base-10 integer, otherwise 400, audited denied, nothing minted.
 TEST_CASE("settings enrollment: a malformed max_uses or ttl_hours mints nothing",

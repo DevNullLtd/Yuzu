@@ -961,7 +961,7 @@ TEST_CASE("software routes: the shell carries the page script and /inventory red
     REQUIRE(redirect->status == 302);
 }
 
-// #4644 Gate 7 (carried across the M.9 catalogue rewrite): `limit` is ONE base-10 integer. The
+// #4644 (carried across the M.9 catalogue rewrite): `limit` is ONE base-10 integer. The
 // software fragments no longer clamp it themselves (the page size is fixed), but a malformed
 // value must still be refused by the shared model parser, not silently read as the default.
 // The fragments answer 200 + caveat (htmx does not swap 4xx), with no store read.

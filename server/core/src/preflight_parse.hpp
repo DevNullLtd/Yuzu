@@ -366,7 +366,7 @@ struct PreflightCheckResponses {
     /// grid-persisting caller MUST check this (via `any_check_degraded`)
     /// before calling `compute_device_results`/`persist_and_maybe_complete`.
     bool degraded = false;
-    /// #4644 Gate 7: true when this check's fetch hit its row cap (`kResponseFetchCap`). The
+    /// #4644: true when this check's fetch hit its row cap (`kResponseFetchCap`). The
     /// read is a SLIDING window (`ORDER BY ts DESC LIMIT`), so an agent absent from
     /// `by_agent` is then AMBIGUOUS: it may be unanswered, or it may have answered and had its
     /// row evicted. Such an agent is never reported as passing (its verdict stays Unknown, so

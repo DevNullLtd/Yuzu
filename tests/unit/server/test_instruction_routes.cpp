@@ -578,7 +578,7 @@ TEST_CASE("instruction_routes: GET /api/instructions lists real rows and honors 
     CHECK(by_name->status == 200);
     CHECK(has_id(body(by_name->body)["definitions"], id_a));
 
-    // #4644 Gate 7: a numeric prefix is not an integer.
+    // #4644: a numeric prefix is not an integer.
     for (const char* bad : {"limit=100abc", "limit=1e3", "limit=0x10", "limit=4294967296"}) {
         INFO(bad);
         auto r = h.sink.Get(std::string("/api/instructions?") + bad);

@@ -2,7 +2,7 @@
 
 #include "http_route_sink.hpp"
 #include "instruction_store.hpp"
-#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "instruction_yaml.hpp"
 #include "json_extract.hpp"
 #include "store_errors.hpp"

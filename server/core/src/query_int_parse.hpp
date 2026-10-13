@@ -2,7 +2,7 @@
 
 /// @file query_int_parse.hpp
 /// Strict integer parsing for HTTP query parameters, shared by every REST route
-/// family (#4644 and its Gate 7 sweep). Pure and I/O-free: no httplib.h, no store.
+/// family (#4644 and its sweep). Pure and I/O-free: no httplib.h, no store.
 ///
 /// Why this exists: `std::stoi`/`std::stoll` accept leading digits followed by
 /// anything (`stoi("0x1")` -> 0, `stoll("1e9")` -> 1, `stoi("100abc")` -> 100), so a

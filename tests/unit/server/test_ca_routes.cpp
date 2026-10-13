@@ -503,7 +503,7 @@ TEST_CASE("ca_routes: /ca/issued pagination params are accepted + clamped", "[ca
         REQUIRE(r);
         REQUIRE(r->status == 200);
     }
-    // #4644 Gate 7: a MALFORMED integer is not "out of range", it is not a number. It used
+    // #4644: a MALFORMED integer is not "out of range", it is not a number. It used
     // to fall back to the default page silently (`limit=abc` -> 200, 200 rows).
     for (const char* q : {"/api/v1/ca/issued?limit=abc", "/api/v1/ca/issued?limit=50x",
                           "/api/v1/ca/issued?limit=1e2", "/api/v1/ca/issued?offset=0x10",

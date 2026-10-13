@@ -609,7 +609,7 @@ TEST_CASE("execution_routes: wiring -- server.cpp still calls register_execution
     CHECK(src.find("register_execution_routes(") != std::string::npos);
 }
 
-// ── #4644 Gate 7: the legacy list reads `limit` strictly ────────────────────
+// ── #4644: the legacy list reads `limit` strictly ────────────────────
 
 TEST_CASE("execution_routes: GET /api/executions rejects a trailing-garbage or overflowing "
           "limit with 400 instead of reading its numeric prefix (#4644)",

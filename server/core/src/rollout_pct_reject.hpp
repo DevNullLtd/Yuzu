@@ -6,7 +6,7 @@
 // (`parse_rollout_pct_strict`). A rejected percentage must never fall back to the 100% default
 // (a full-fleet rollout nobody asked for), so both answer 400 with nothing stored or changed. Sharing the response
 // means the toast + A4 body are unit-testable without a multipart request, and the two sites
-// cannot drift apart (#4644 Gate 8 round 5).
+// cannot drift apart (#4644).
 //
 // The toast text is built only from the enum below, never from request input: it is a header
 // value, so a caller-supplied string here would be header injection.

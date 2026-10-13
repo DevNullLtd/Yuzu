@@ -435,7 +435,7 @@ TEST_CASE("PatchManager reports !is_open on a migration failure and degrades wri
     CHECK_FALSE(mgr.get_deployment("anything").has_value());
 }
 
-// ── #4644 Gate 7: the patch list routes read `limit` strictly ────────────────
+// ── #4644: the patch list routes read `limit` strictly ────────────────
 
 TEST_CASE("DiscoveryRoutes: GET /api/patches and /api/patches/deployments reject a malformed "
           "limit with 400 instead of ignoring it",

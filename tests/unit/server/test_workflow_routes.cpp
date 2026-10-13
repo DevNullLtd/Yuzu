@@ -2424,7 +2424,7 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[pg][workflow][execut
     CHECK(res->status == 410);
 }
 
-// #4644 Gate 8 round 5: the Last-Event-ID wiring of THIS route (the one that has no gap probe and no
+// #4644: the Last-Event-ID wiring of THIS route (the one that has no gap probe and no
 // `?since`). The sink hands back the real httplib::Response, so the chunked provider is driven once with
 // a capturing DataSink and the frames the route queued are counted. A route that mapped a malformed header
 // to cursor 0 (replay the whole ring) or dropped the strict cursor goes red.
@@ -5094,7 +5094,7 @@ TEST_CASE("GET /api/v1/schedules: an unrecognized enabled_only value answers 400
     CHECK(res->status == 400);
 }
 
-// #4644 Gate 7: the workflow list routes read `limit` strictly.
+// #4644: the workflow list routes read `limit` strictly.
 TEST_CASE("GET /api/workflows and /api/v1/workflows: a trailing-garbage or overflowing limit is "
           "a 400 not its numeric prefix",
           "[pg][workflow][list]") {

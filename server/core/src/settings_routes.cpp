@@ -3,7 +3,7 @@
 /// Extracted from server.cpp — Phase 1 of the god-object decomposition.
 
 #include "settings_routes.hpp"
-#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "ota_signature_sidecar.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
@@ -3932,7 +3932,7 @@ void SettingsRoutes::register_routes(
         // between what the UI shows and what the detector runs).
         // A present-but-malformed field is a 400 with NOTHING saved: `stoi("0x10")` is 0 and
         // `stoi("5abc")` is 5, so a typo used to persist a different (clamped) threshold
-        // than the one the operator typed (#4644 Gate 7). Empty/absent keeps the default.
+        // than the one the operator typed (#4644). Empty/absent keeps the default.
         bool malformed = false;
         auto clamp_int = [&](const char* field, int lo, int hi, int fallback) {
             const auto v = extract_form_value(req.body, field);

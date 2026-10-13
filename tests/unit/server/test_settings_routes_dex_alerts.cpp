@@ -224,7 +224,7 @@ TEST_CASE("cohort-export POST: non-admin → 403, nothing persisted",
     CHECK(h.apply_calls == 0);
 }
 
-// #4644 Gate 7: a present-but-malformed blast-radius threshold is a 400 with NOTHING saved and
+// #4644: a present-but-malformed blast-radius threshold is a 400 with NOTHING saved and
 // no live apply. `stoi("0x10")` is 0 and `stoi("5abc")` is 5, so a typo used to persist a
 // different (clamped) threshold than the one typed. Valid integers keep the documented clamp.
 TEST_CASE("blast POST: a malformed threshold 400s and persists nothing and a valid one clamps",

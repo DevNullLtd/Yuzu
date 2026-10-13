@@ -605,7 +605,7 @@ TEST_CASE("dashboard_api_routes: /api/analytics/recent reports the emitted event
     CHECK(j["count"] == 1);
 }
 
-// ── #4644 Gate 7: strict numeric query parameters ──────────────────────────
+// ── #4644: strict numeric query parameters ──────────────────────────
 
 TEST_CASE("dashboard_api_routes: /api/audit rejects a malformed since/until/limit/offset with "
           "400 instead of reading its numeric prefix",

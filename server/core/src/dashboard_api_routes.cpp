@@ -2,7 +2,7 @@
 
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
-#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "data_export.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp" // extract_json_string — shared JSON body-extraction helper

@@ -356,7 +356,7 @@ TEST_CASE("POST /api/notifications/:id/dismiss: happy path dismisses and audits 
     CHECK(all[0].dismissed == true); // confirms the mutation actually landed
 }
 
-// #4644 Gate 7: a present-but-malformed `limit`/`offset` used to be swallowed by
+// #4644: a present-but-malformed `limit`/`offset` used to be swallowed by
 // `catch (...) {}` and the default page served as if it were the one asked for.
 TEST_CASE("GET /api/notifications: a malformed limit or offset is a 400 and valid values unchanged",
           "[notification_routes][pg][numeric_params]") {

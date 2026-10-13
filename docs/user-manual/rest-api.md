@@ -2990,8 +2990,9 @@ session are both structurally denied before any store read.
 { "enabled": true }
 ```
 
-`enabled` must be a genuine JSON boolean — the strings `"true"`/`"false"`
-and the numbers `0`/`1` are rejected, never coerced.
+`enabled` must be a JSON boolean, the integer `0` or `1`, or the exact string `"true"` or
+`"false"` (so a client that sends the value as text can still disable a runaway schedule). Any
+other value is `400` and changes nothing.
 
 **Response (200):**
 

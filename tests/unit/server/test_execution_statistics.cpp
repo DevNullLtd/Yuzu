@@ -561,7 +561,7 @@ TEST_CASE("ExecutionStatistics: definition stats skips pending/running execution
 }
 
 // ============================================================================
-// #4644 Gate 7: a degraded read is distinguishable from "no executions"
+// #4644: a degraded read is distinguishable from "no executions"
 // ============================================================================
 
 TEST_CASE("ExecutionStatistics: try_get_* reports a degraded store as nullopt and not empty",

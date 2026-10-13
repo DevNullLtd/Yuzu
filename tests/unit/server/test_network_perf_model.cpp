@@ -683,7 +683,7 @@ TEST_CASE("OpenAPI spec lists the network endpoints (A2 discovery), stays valid 
     CHECK(res->body.find(R"("/network/devices":)") != std::string::npos);
 }
 
-// #4644 Gate 8 round 4: the devices drill's `limit` is ONE base-10 integer or a 400 (it used to be
+// #4644: the devices drill's `limit` is ONE base-10 integer or a 400 (it used to be
 // read with stoi, so `limit=50abc` silently became 50). A well-formed value is still clamped.
 TEST_CASE("network routes: a malformed devices limit is a 400 and a valid one is served",
           "[network][routes][numeric_params]") {

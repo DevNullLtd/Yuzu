@@ -429,7 +429,7 @@ TEST_CASE("REST offload-targets: GET /:id/deliveries 404 on missing target",
     CHECK(res->status == 404);
 }
 
-// #4644 Gate 7: the delivery-list `limit` is ONE base-10 integer or a 400. The documented
+// #4644: the delivery-list `limit` is ONE base-10 integer or a 400. The documented
 // [1, 1000] clamp still applies to every well-formed integer.
 TEST_CASE("REST offload-targets: GET /:id/deliveries rejects a malformed limit",
           "[rest][offload][pg][numeric_params]") {

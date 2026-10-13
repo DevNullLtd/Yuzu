@@ -755,7 +755,7 @@ TEST_CASE("preflight routes: GET /api/v1/preflight/runs 400s on an invalid limit
                            /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{},
                            /*audit_fn=*/{}, &run_store);
 
-    // #4644 Gate 7: `stoll` read "5x" as 5 and "0x10" as 0; the strict parse refuses both.
+    // #4644: `stoll` read "5x" as 5 and "0x10" as 0; the strict parse refuses both.
     for (const char* bad : {"not-a-number", "5x", "0x10", "1e1", "", "99999999999999999999"}) {
         INFO("limit=" << bad);
         auto res = sink.Get(std::string("/api/v1/preflight/runs?limit=") + bad);

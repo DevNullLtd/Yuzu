@@ -2,7 +2,7 @@
 
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
-#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "pg_error_class.hpp" // is_permanent_pg_error — approval store error classification (PR #4656)
@@ -1006,7 +1006,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Internal CA certificate revocation list (DER, public)", "tags": ["Security"], "responses": {"200": {"description": "DER-encoded CRL", "content": {"application/pkix-crl": {}}}, "503": {"description": "CRL unavailable"}}}
     },
     "/ca/issued": {
-      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then."}, "403": {"description": "Requires Security:Read"}}}
+      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then."}, "400": {"description": "limit or offset is not a single base-10 integer, or is outside limit 1..1000 / offset 0..1000000"}, "403": {"description": "Requires Security:Read"}}}
     },
     "/ca/revoke": {
       "post": {"summary": "Revoke a certificate by serial", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["serial_hex"], "properties": {"serial_hex": {"type": "string"}, "reason": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked; CRL republished"}, "403": {"description": "Requires Security:Delete"}, "404": {"description": "Serial not found or already revoked"}}}
@@ -1201,7 +1201,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Delete an offload target", "tags": ["Offload"], "description": "Requires Infrastructure:Write. Cascades on offload_deliveries; pending buffered events are dropped. Successful deletes audit offload_target.delete/success; 404 paths audit offload_target.delete/denied with detail=not_found.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}], "responses": {"200": {"description": "Target deleted"}, "404": {"description": "Target not found (or numeric overflow on path segment)"}, "503": {"description": "Offload store unavailable"}}}
     },
     "/offload-targets/{id}/deliveries": {
-      "get": {"summary": "List recent offload delivery attempts", "tags": ["Offload"], "description": "Requires Infrastructure:Read. limit query parameter is clamped to [1, 1000]; default 50.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 50}}], "responses": {"200": {"description": "List of delivery records"}, "404": {"description": "Target not found (deleted, never created, or numeric overflow on id)"}, "503": {"description": "Offload store unavailable"}}}
+      "get": {"summary": "List recent offload delivery attempts", "tags": ["Offload"], "description": "Requires Infrastructure:Read. limit query parameter is clamped to [1, 1000]; default 50.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 50}}], "responses": {"200": {"description": "List of delivery records"}, "400": {"description": "limit is present but not a single base-10 integer (for example 10abc); a valid integer is still clamped to [1, 1000]"}, "404": {"description": "Target not found (deleted, never created, or numeric overflow on id)"}, "503": {"description": "Offload store unavailable"}}}
     },
     "/executions/{id}/visualization": {
       "get": {"summary": "Render execution responses as chart-ready JSON", "tags": ["Executions"], "description": "Gated by the ADR-0017 admit-then-filter fleet-read primitive (Response:Read). A management-group-confined caller sees chart data built only from their in-scope agents' responses; the row cap and rows_capped signal reflect the caller's own scoped result, not the raw fleet-wide one. The definition_id query parameter is required and must match [A-Za-z0-9._-]+. Returns chart data shaped by the spec.visualization (or spec.visualizations) block on the InstructionDefinition (see yaml-dsl-spec.md). When a definition declares multiple charts, use the optional index query parameter to select among them; default 0. The response payload includes chart_index and chart_count fields so callers can iterate. Caps the underlying response read at 10000 rows AND at 50 MiB of row payload (output + error_detail, applied in the store query itself, on whole rows, with at least one row always read); when more matching rows exist past the row cap the payload includes rows_capped:true and rows_cap:10000, and when either cap cut the read it includes result_truncated_by_cap:true and truncation_cause (row_cap or byte_cap), because a chart built from a cut read is a wrong picture, not a smaller one. rows_capped is exact: it is not set on a read of exactly 10000 rows. Emits an execution.visualization.fetch audit event on every invocation.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "definition_id", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "index", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}, "description": "Chart index when the definition declares multiple visualizations."}], "responses": {"200": {"description": "Chart data payload"}, "400": {"description": "definition_id not provided or index is not a non-negative integer"}, "404": {"description": "Definition not found, no visualization configured, or index out of range"}, "500": {"description": "Visualization spec is invalid"}, "503": {"description": "Service unavailable"}}}
@@ -8166,7 +8166,7 @@ void RestApiV1::register_routes(
                          q.limit = strict_stoi(limit_str);
                      } catch (const std::exception&) {
                          // Not ONE base-10 integer (or overflow): a client error, not a
-                         // silent fall-back to the default page size (#4644 Gate 7).
+                         // silent fall-back to the default page size (#4644).
                          res.status = 400;
                          res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
                                          "application/json");
@@ -9310,9 +9310,9 @@ void RestApiV1::register_routes(
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
+        if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
-            res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON: expected an object"), "application/json");
             return;
         }
 
@@ -9713,7 +9713,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  // try_get_*: a degraded read is a 503, never a zeroed summary served as a
-                 // measurement (#4644 Gate 7).
+                 // measurement (#4644).
                  const auto summary = execution_tracker->try_get_fleet_summary();
                  if (!summary) {
                      res.status = 503;
@@ -9763,7 +9763,7 @@ void RestApiV1::register_routes(
                  ExecutionStatsQuery q;
                  if (req.has_param("agent_id"))
                      q.agent_id = req.get_param_value("agent_id");
-                 // #4644 Gate 7: a malformed `since`/`limit` used to be swallowed into the
+                 // #4644: a malformed `since`/`limit` used to be swallowed into the
                  // default (`?since=junk` meant "from the beginning"), answering a different
                  // query than the caller asked. Not ONE base-10 integer -> 400.
                  try {
@@ -9831,7 +9831,7 @@ void RestApiV1::register_routes(
                  ExecutionStatsQuery q;
                  if (req.has_param("definition_id"))
                      q.definition_id = req.get_param_value("definition_id");
-                 // #4644 Gate 7: a malformed `since`/`limit` used to be swallowed into the
+                 // #4644: a malformed `since`/`limit` used to be swallowed into the
                  // default (`?since=junk` meant "from the beginning"), answering a different
                  // query than the caller asked. Not ONE base-10 integer -> 400.
                  try {
@@ -10223,7 +10223,7 @@ void RestApiV1::register_routes(
     // CC7.2 evidence, PLUS a "success" row per docs/api-twin-recipe.md §4's
     // REST-JSON posture and the `/api/v1/executions/{id}/responses` REST
     // precedent above) — a judgment call made when v1 was added, when the
-    // legacy routes audited only scope-drops. #4644 Gate 7 has since brought
+    // legacy routes audited only scope-drops. #4644 has since brought
     // all three legacy routes (response_routes.cpp) to the same fail-closed
     // success audit, so the twins are countable together; only the detail
     // string differs.
@@ -11475,7 +11475,7 @@ void RestApiV1::register_routes(
                 scope_arg = std::move(in_scope); // engaged-empty means no rows
             }
 
-            // #4644 Gate 7 (row 6a): the same byte-aware fetch the export routes use. The
+            // #4644 (row 6a): the same byte-aware fetch the export routes use. The
             // old unbounded query() materialised up to 10,000 full rows (each output is
             // cut to 2 MiB at ingest) while holding a lease on the shared Postgres pool;
             // query_bounded applies the 50 MiB payload cap in SQL, so the PGresult and the
@@ -17316,7 +17316,7 @@ void RestApiV1::register_routes(
             int window = 7; // days each side
             if (req.has_param("window")) {
                 // A malformed `window` used to fall back to 7 silently, answering a
-                // different comparison than asked (#4644 Gate 7).
+                // different comparison than asked (#4644).
                 const auto v = parse_query_int<int>(req.get_param_value("window"));
                 if (!v) {
                     res.status = 400;

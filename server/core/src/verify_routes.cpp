@@ -1,5 +1,5 @@
 #include "verify_routes.hpp"
-#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_perf_compare.hpp"  // app_perf_param_valid (PURE — no store dep)
 #include "http_route_sink.hpp"   // HttpRouteSink, HttplibRouteSink

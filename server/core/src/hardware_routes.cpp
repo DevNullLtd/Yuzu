@@ -7,7 +7,7 @@
 /// filter/paginate/JSON logic in hardware_list_model.{hpp,cpp}.
 
 #include "hardware_routes.hpp"
-#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "authz_model.hpp"          // authz::in_scope
 #include "http_route_sink.hpp"
@@ -95,7 +95,7 @@ std::int64_t now_secs() {
 }
 
 // nullopt when `offset`/`limit` is present but not ONE base-10 integer: the caller
-// answers 400 rather than serving a page the operator did not ask for (#4644 Gate 7).
+// answers 400 rather than serving a page the operator did not ask for (#4644).
 std::optional<HardwareListQuery> query_from_request(const httplib::Request& req) {
     HardwareListQuery q;
     if (req.has_param("q")) q.q = req.get_param_value("q");

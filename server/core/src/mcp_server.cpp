@@ -280,7 +280,7 @@ std::string param_str(const nlohmann::json& params, const char* key, const char*
 /// value above INT64_MAX to a negative number (UINT64_MAX becomes -1, the documented
 /// "any" sentinel on several filters). An out-of-range unsigned value therefore
 /// SATURATES to INT64_MAX (it stays "huge", never flips sign) rather than wrapping
-/// (#4644 Gate 7). Filters where even a saturated value would answer the wrong
+/// (#4644). Filters where even a saturated value would answer the wrong
 /// question use `param_int_strict` and answer -32602 instead.
 int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0) {
     if (params.contains(key) && params[key].is_number_integer()) {
@@ -296,7 +296,7 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
 /// which a store reads as "use the default" (or a one-row page), not "a very large
 /// number". Saturating keeps the ordering the caller expressed; each caller's own
 /// clamp or store ceiling then applies to INT_MAX exactly as it would to any large
-/// value (#4644 Gate 7).
+/// value (#4644).
 [[nodiscard]] int saturate_to_int(int64_t v) {
     return static_cast<int>(std::clamp<int64_t>(v, std::numeric_limits<int>::min(),
                                                 std::numeric_limits<int>::max()));
@@ -2210,8 +2210,8 @@ static const ToolDef kTools[] = {
      "List certificates issued by the internal CA (inventory: serial, subject, purpose, status, "
      "expiry, revocation). Mirrors GET /api/v1/ca/issued. Requires Security:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("limit":{"type":"integer","default":200,"maximum":1000,"description":"Max rows"},)j"
-     R"j("offset":{"type":"integer","default":0,"description":"Pagination offset"})j"
+     R"j("limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Max rows"},)j"
+     R"j("offset":{"type":"integer","default":0,"minimum":0,"maximum":1000000,"description":"Pagination offset"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"serial_hex":{"type":"string"},"subject":{"type":"string"},"san":{"type":"string"},"purpose":{"type":"string"},"status":{"type":"string"},"not_after":{"type":"integer"},"issued_at":{"type":"integer"},"revoked_at":{"type":"integer"},"revocation_reason":{"type":"string"},"issued_by":{"type":"string"},"issuer_key_id":{"type":"string"}},"required":["serial_hex","subject","san","purpose","status","not_after","issued_at","revoked_at","revocation_reason","issued_by","issuer_key_id"]}},"count":{"type":"integer"},"limit":{"type":"integer"},"offset":{"type":"integer"},"has_more":{"type":"boolean"},"next_offset":{"type":"integer","description":"Present only when has_more is true"}},"required":["items","count","limit","offset","has_more"]})j"},
 
@@ -8456,7 +8456,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.principal = param_str(args, "principal");
                 aq.action = param_str(args, "action");
                 aq.target_type = param_str(args, "target_type");
-                // #4644 Gate 7: the lenient reader turned a wrong-typed bound into 0
+                // #4644: the lenient reader turned a wrong-typed bound into 0
                 // ("unbounded") and, before it saturated, wrapped UINT64_MAX to -1, so a
                 // malformed window silently meant "the whole log". Strict: -32602. The
                 // bounds are presence-tracked: omitted is unbounded, a supplied value is a
@@ -15717,12 +15717,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string window = param_str(args, "window", "7d");
-                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "invalid window (expected 24h|7d|30d|all)"),
-                        "application/json");
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
                 // WS-A4 PR-1 Gate 7 fix round: `DexApi::app`
@@ -15763,12 +15760,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string window = param_str(args, "window", "7d");
-                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "invalid window (expected 24h|7d|30d|all)"),
-                        "application/json");
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
                 const auto model = dex_api_->apps(window);
@@ -15794,12 +15788,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string window = param_str(args, "window", "7d");
-                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "invalid window (expected 24h|7d|30d|all)"),
-                        "application/json");
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
                 const std::string os = param_str(args, "os", "all");
@@ -15851,12 +15842,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string window = param_str(args, "window", "7d");
-                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "invalid window (expected 24h|7d|30d|all)"),
-                        "application/json");
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
                 const std::string os = param_str(args, "os", "all");
@@ -15904,12 +15892,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string window = param_str(args, "window", "7d");
-                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "invalid window (expected 24h|7d|30d|all)"),
-                        "application/json");
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
                 const auto model = dex_api_->device_history(agent_id, window);
@@ -16003,12 +15988,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string window = param_str(args, "window", "7d");
-                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "invalid window (expected 24h|7d|30d|all)"),
-                        "application/json");
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
                 const std::string weighting = param_str(args, "weighting", "default");
@@ -16035,12 +16017,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string window = param_str(args, "window", "7d");
-                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "invalid window (expected 24h|7d|30d|all)"),
-                        "application/json");
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
                 const auto model = dex_api_->trends(window);
@@ -16075,12 +16054,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const std::string window = param_str(args, "window", "7d");
-                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "invalid window (expected 24h|7d|30d|all)"),
-                        "application/json");
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
                 // WS-A4 PR-1 Gate 7 fix round: `DexApi::
@@ -16966,7 +16942,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // out-of-int32 client value, unlike .get<int>(); gov L2); clamp in
                 // 64-bit BEFORE narrowing.
                 // Strict: a wrong-typed window used to fall back to 7 days, answering a
-                // different comparison than asked (#4644 Gate 7).
+                // different comparison than asked (#4644).
                 const auto window_opt = param_int_strict(args, "window", 7);
                 if (!window_opt) {
                     // retry-hint-exempt: malformed client input, not a store fault --
@@ -21477,7 +21453,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // try_get_definition_statistics), which return std::optional: nullopt
             // means the store was not open, the pool timed out or a statement
             // failed, and every handler below answers a retryable error for it
-            // rather than a zero/empty success (#4644 Gate 7). The plain get_*
+            // rather than a zero/empty success (#4644). The plain get_*
             // forms still collapse a fault to zero/empty and have no production
             // caller. The other guardable failure mode is the pointer itself being
             // unwired. Unaudited on REST (no audit_fn call at either route); the
@@ -21505,7 +21481,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // try_get_*: a degraded read is a retryable error, never a zeroed summary
-                // serialized as a measurement (#4644 Gate 7).
+                // serialized as a measurement (#4644).
                 const auto summary = execution_tracker->try_get_fleet_summary();
                 if (!summary) {
                     mcp_audit("failure", "get_execution_statistics degraded");

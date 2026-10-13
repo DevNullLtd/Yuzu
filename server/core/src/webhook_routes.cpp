@@ -1,5 +1,5 @@
 #include "webhook_routes.hpp"
-#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
 

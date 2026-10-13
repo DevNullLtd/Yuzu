@@ -321,7 +321,7 @@ TEST_CASE("REST webhooks[pg]: GET /:id/deliveries empty list", "[rest][webhook][
     CHECK(j["deliveries"].empty());
 }
 
-// #4644 Gate 7: the delivery-list `limit` is ONE base-10 integer or a 400.
+// #4644: the delivery-list `limit` is ONE base-10 integer or a 400.
 TEST_CASE("REST webhooks[pg]: GET /:id/deliveries rejects a malformed limit",
           "[rest][webhook][pg][numeric_params]") {
     WebhookRouteHarness h;

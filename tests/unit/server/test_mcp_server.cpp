@@ -4859,7 +4859,7 @@ TEST_CASE("MCP Guardian: create_guardian_rule creates a legacy yaml_source rule,
     CHECK(get_data["yaml_source"] == "# legacy\n");
 }
 
-// #4644 Gate 8 round 2: an update bumps the stored version by one, so a lenient read
+// #4644: an update bumps the stored version by one, so a lenient read
 // that saturated an above-INT64_MAX `version` to INT64_MAX made the next bump a signed
 // overflow. Strict and bounded to 1..INT32_MAX instead.
 TEST_CASE("MCP Guardian: create_guardian_rule bounds version to 1..2147483647",
@@ -10131,7 +10131,7 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     }
-    SECTION("#4644 Gate 7: a wrong-typed or oversized window is kInvalidParams, not 7 days") {
+    SECTION("#4644: a wrong-typed or oversized window is kInvalidParams, not 7 days") {
         for (const char* window : {R"("7")", "1.5", "true", "18446744073709551615",
                                    "9223372036854775808"}) {
             INFO(window);
@@ -19578,7 +19578,7 @@ TEST_CASE("MCP operator surface: mint_upload_grant writes a real UploadGrantStor
     CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
 }
 
-// #4644 Gate 8 round 2: a lenient read saturated an above-INT64_MAX declared_max_size
+// #4644: a lenient read saturated an above-INT64_MAX declared_max_size
 // to INT64_MAX, which the store accepts (it only rejects <= 0); the old wrap to -1 was
 // refused. Strict now: reject the value, accept every positive int64 below it.
 TEST_CASE("MCP operator surface: mint_upload_grant rejects a declared_max_size that does not "
@@ -33542,7 +33542,7 @@ TEST_CASE("MCP get_offload_target: an unsigned id above INT64_MAX saturates to a
     }
 }
 
-// #4644 Gate 8 round 2: the tool schema declares batch_size 1..10000. The saturating
+// #4644: the tool schema declares batch_size 1..10000. The saturating
 // narrowing turned 4294967296 (and UINT64_MAX) into INT_MAX, an accepted value that
 // lets the offload buffer grow without bound before its first flush. Enforce the range.
 TEST_CASE("MCP B5: create_offload_target enforces batch_size 1..10000 and rejects the "
@@ -34500,7 +34500,7 @@ TEST_CASE("MCP B5: software-deployment mutations are tier-denied below supervise
     CHECK(list_res->status == 403);
 }
 
-// ── #4644 Gate 7: MCP integer handling never wraps a value into a different one ──
+// ── #4644: MCP integer handling never wraps a value into a different one ──
 
 TEST_CASE("MCP query_audit_log: a wrong-typed or out-of-range since/until/limit is -32602 "
           "never a wrapped or defaulted value",
@@ -34692,7 +34692,7 @@ TEST_CASE("MCP get_execution_statistics_by_agent: an unwired fleet-read gate fai
     CHECK(denied->body.find("agent-gate") == std::string::npos);
 }
 
-// #4644 Gate 7: a degraded statistics read is a retryable error, never an empty array or a
+// #4644: a degraded statistics read is a retryable error, never an empty array or a
 // zeroed summary serialized as a measurement.
 TEST_CASE("MCP execution statistics tools: a degraded tracker read is a retryable error",
           "[pg][mcp][integration][operator_surface][degrade]") {

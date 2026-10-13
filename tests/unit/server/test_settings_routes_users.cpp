@@ -1122,7 +1122,7 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: no password controls on
     }
 }
 
-// ── #4644 Gate 8 round 4: the API-token form's ttl_hours is strict, and refusal mints nothing ──
+// ── #4644: the API-token form's ttl_hours is strict, and refusal mints nothing ──
 // `ttl_hours` of `0x5` used to read as 0 (never expires) and a negative TTL still computes 0.
 // This form answers 200 with a feedback span (its existing convention), so the proof that
 // matters is that NO token exists afterwards. `0`, an empty field and `-0` keep their documented

@@ -186,7 +186,7 @@ TEST_CASE("read_json_epoch_window: presence-tracked bounds and until of zero ref
         CHECK_FALSE(since.has_value());
         CHECK_FALSE(until.has_value());
     }
-    SECTION("a non-object body leaves both unset (the route's own field reads reject it)") {
+    SECTION("a non-object body leaves both unset (the routes refuse it before this read)") {
         CHECK_FALSE(run("[]", since, until).has_value());
         CHECK_FALSE(since.has_value());
     }

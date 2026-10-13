@@ -2,7 +2,7 @@
 
 #include "enrollment_directory_model.hpp" // #4031: shared row builders, REST/MCP parity (Rule 1)
 #include "http_route_sink.hpp"
-#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>

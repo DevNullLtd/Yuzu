@@ -3074,7 +3074,7 @@ TEST_CASE("DEX perf/apps picker route: q/platform/sort params reach the render "
     }
 }
 
-// #4644 Gate 7: the perf-devices fragment `limit` is ONE base-10 integer or a 400; it used to
+// #4644: the perf-devices fragment `limit` is ONE base-10 integer or a 400; it used to
 // fall back to 50 silently on `5x`, `0x10`, `1e2`.
 TEST_CASE("DEX perf devices fragment: a malformed limit is a 400 and a valid one is served",
           "[pg][dex][perf][routes][numeric_params]") {

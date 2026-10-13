@@ -758,7 +758,7 @@ TEST_CASE("GET /api/v1/executions/:id/children: fleet_read_fn denial -> 403",
     CHECK(res->status == 403);
 }
 
-// ── #4644 Gate 7: the execution-statistics routes and the v1 executions list read
+// ── #4644: the execution-statistics routes and the v1 executions list read
 // `since`/`limit` strictly. A malformed value used to be swallowed into the default
 // (`?since=junk` meant "from the beginning"), answering a different query than asked.
 
@@ -1115,7 +1115,7 @@ TEST_CASE("GET /api/v1/execution-statistics/agents: a gate denial is a 403 and a
     CHECK(denied->body.find("agent-in") == std::string::npos);
 }
 
-// #4644 Gate 7: the statistics tracker reads used to answer a store degrade (pool timeout,
+// #4644: the statistics tracker reads used to answer a store degrade (pool timeout,
 // failed statement) with an EMPTY or ZEROED value, so REST served 200 `[]` / an all-zero
 // summary: "no executions" presented as a measurement. A degraded read is now a 503 with
 // retry_after_ms; an HONEST empty scope (deny-all, no rows) is still a 200 `[]`.

@@ -3692,7 +3692,7 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
         REQUIRE(res);
         CHECK(res->status == 400);
     }
-    SECTION("#4644 Gate 7: a malformed window → 400, not the 7-day default") {
+    SECTION("#4644: a malformed window → 400, not the 7-day default") {
         RestGsHarness h;
         for (const char* bad : {"window=7days", "window=1e1", "window=0x7", "window=", "window=abc",
                                 "window=4294967296"}) {

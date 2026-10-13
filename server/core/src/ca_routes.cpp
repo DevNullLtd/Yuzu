@@ -1,5 +1,5 @@
 #include "ca_routes.hpp"
-#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "rest_a4_envelope.hpp"
 #include "web_utils.hpp"
@@ -57,7 +57,7 @@ constexpr std::size_t kMaxIssueCodeSigningBody = 64 * 1024;
 constexpr int kMaxCodeSigningValidityDaysRest = 730;
 
 // nullopt when the parameter is present but not ONE base-10 integer: the caller answers
-// 400 (a malformed page size must not silently become the default, #4644 Gate 7).
+// 400 (a malformed page size must not silently become the default, #4644).
 std::optional<int> clamp_int(const httplib::Request& req, const char* key, int def, int lo,
                              int hi) {
     auto it = req.params.find(key);

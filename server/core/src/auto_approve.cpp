@@ -252,6 +252,9 @@ bool AutoApproveEngine::is_valid_ip_subnet_value(const std::string& value) {
 
 bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::string& ip) const {
     // Parse CIDR: "10.0.0.0/8"
+    // A blank rule value must never match (an empty peer IP would otherwise equal it).
+    if (cidr.empty())
+        return false;
     auto slash = cidr.find('/');
     if (slash == std::string::npos) {
         // Exact IP match

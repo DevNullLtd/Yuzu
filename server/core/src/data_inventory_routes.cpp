@@ -122,10 +122,10 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
+        if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
             res.set_content(
-                R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})",
+                R"({"error":{"code":400,"message":"invalid JSON: expected an object"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }

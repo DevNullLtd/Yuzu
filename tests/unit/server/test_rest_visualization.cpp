@@ -400,7 +400,7 @@ TEST_CASE("REST visualization: multi-chart definition (#587)",
     CHECK(body0["data"]["chart_index"] == 0);
     CHECK(body0["data"]["chart_count"] == 2);
 
-    // #4644 Gate 7: `index=1abc` was read as 1 (the bar chart); it is a 400 now.
+    // #4644: `index=1abc` was read as 1 (the bar chart); it is a 400 now.
     for (const char* bad : {"index=1abc", "index=1e0", "index=0x1", "index="}) {
         INFO(bad);
         auto r = h.sink.Get(std::string("/api/v1/executions/cmd-multi/visualization?definition_id="
@@ -649,7 +649,7 @@ TEST_CASE("REST visualization: every agent out of scope → empty chart, no leak
     CHECK(res->body.find("sshd") == std::string::npos);
 }
 
-// ── #4644 Gate 7 (row 6a): the chart read is byte-bounded and says so when it is cut ──
+// ── #4644 (row 6a): the chart read is byte-bounded and says so when it is cut ──
 
 TEST_CASE("REST visualization: a read cut by the payload cap is flagged result_truncated_by_cap "
           "(cause byte_cap); an uncut read carries no such keys",

@@ -431,7 +431,7 @@ TEST_CASE("GET /api/v1/product-packs/{id}: unknown id is 404",
     CHECK(res->status == 404);
 }
 
-// #4644 Gate 7: a trailing-garbage limit is a 400, not its numeric prefix.
+// #4644: a trailing-garbage limit is a 400, not its numeric prefix.
 TEST_CASE("GET /api/v1/instructions and /product-packs: limit=100abc and an overflowing limit "
           "are 400",
           "[rest][v1][instructions][product_pack][pg]") {

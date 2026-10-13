@@ -192,7 +192,7 @@ TEST_CASE("/fragments/auto/verify/drill: gates GuaranteedState:Read and audits "
     CHECK(h.audit_calls[0].action != "dex.app_perf.compare");
 }
 
-// #4644 Gate 7: `window` is a FILTER. `strtol` accepted nothing-but-a-number but the old
+// #4644: `window` is a FILTER. `strtol` accepted nothing-but-a-number but the old
 // parse silently fell back to the 7-day default on anything else, so a typo verified a
 // DIFFERENT window than the one the operator asked for. Now: present-but-malformed is the
 // same honest 200 note as this file's other rejections, with nothing computed or audited.

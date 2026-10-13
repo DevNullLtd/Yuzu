@@ -692,7 +692,7 @@ TEST_CASE("GET /api/v1/events: an invalid ?since is a 400 and not a silent no-re
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.event_bus->publish(exec_id, "execution-progress", R"({"pending":1})", false);
-    // #4644 Gate 7 flipped this from "degrades to no replay": `?since` is the caller's EXPLICIT
+    // #4644 flipped this from "degrades to no replay": `?since` is the caller's EXPLICIT
     // cursor (stoull read "-1" as a cursor past every event and "5abc" as 5), so a malformed one
     // is refused before any subscription or stream-budget lease. The `Last-Event-ID` HEADER, which a
     // browser sends on its own reconnect, keeps the neutral no-replay outcome (see the
@@ -1674,7 +1674,7 @@ TEST_CASE("GET /api/v1/approvals/pending/count: a genuine store failure answers 
     REQUIRE(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
 }
 
-// ── #4644 Gate 7: the replay cursor is ONE non-negative base-10 integer ─────────
+// ── #4644: the replay cursor is ONE non-negative base-10 integer ─────────
 // `stoull` accepted "-1" (wrapping to a cursor past every event) and "5abc" (as 5), so a typo
 // silently replayed the wrong window. A malformed `?since` is the caller's explicit input: 400,
 // answered BEFORE the stream budget and the bus subscription are touched. A malformed
@@ -1708,7 +1708,7 @@ TEST_CASE("GET /api/v1/events: a malformed Last-Event-ID header is live only and
     }
 }
 
-// ── #4644 Gate 8 round 4: a malformed Last-Event-ID is LIVE ONLY, never replay-everything ─────
+// ── #4644: a malformed Last-Event-ID is LIVE ONLY, never replay-everything ─────
 // A cursor of 0 replays the whole ring buffer (every id is > 0), so the old `-> 0` fallback
 // replayed up to 1000 events as duplicates while the comment, upgrading.md and the test above
 // all said "no replay". TestRouteSink cannot drain a chunked SSE body, so the frame count is
@@ -1758,7 +1758,7 @@ TEST_CASE("sse_cursor_from_header: a valid header replays exactly the tail",
     }
 }
 
-// ── #4644 Gate 8 round 5: pin the ROUTE wiring (not only the helper) by draining the provider ─────
+// ── #4644: pin the ROUTE wiring (not only the helper) by draining the provider ─────
 // TestRouteSink cannot read a chunked transfer-encoding body off a socket, but the sink hands back
 // the real `httplib::Response`, whose chunked content provider can be driven directly with a
 // capturing DataSink. The provider writes only through `DataSink::write`, drains the sink queue

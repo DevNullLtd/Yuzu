@@ -287,6 +287,18 @@ TEST_CASE("POST /api/inventory/query: since and until are presence-tracked and u
           "until must be a positive epoch second or omitted");
 }
 
+TEST_CASE("POST /api/inventory/query: a body that is valid JSON but not an object is 400, not a 500 "
+          "(#4644)",
+          "[server][routes][data_inventory_routes][numeric_params]") {
+    Harness h;
+    for (const char* bad : {"[]", "null", "5", R"("x")", "true"}) {
+        INFO(bad);
+        auto res = h.sink.Post("/api/inventory/query", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+}
+
 TEST_CASE("POST /api/inventory/query: limit is read as 64 bits and a wrapped, zero, negative or "
           "non-integer value is not silently a different page size (#4644)",
           "[server][routes][data_inventory_routes][rest][pg]") {

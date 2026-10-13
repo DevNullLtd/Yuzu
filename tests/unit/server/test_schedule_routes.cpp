@@ -896,6 +896,9 @@ TEST_CASE("parse_schedule_enabled: accepts real JSON booleans and the integers 0
     CHECK(schedule::parse_schedule_enabled(R"({"enabled":false})") == false); // the inversion bug
     CHECK(schedule::parse_schedule_enabled(R"({"enabled":1})") == true);
     CHECK(schedule::parse_schedule_enabled(R"({"enabled":0})") == false); // used to ARM it
+    // The exact strings keep the kill switch reachable for clients that send text.
+    CHECK(schedule::parse_schedule_enabled(R"({"enabled":"false"})") == false);
+    CHECK(schedule::parse_schedule_enabled(R"({"enabled":"true"})") == true);
     CHECK(schedule::parse_schedule_enabled(R"({})") == true);  // missing key -> default
     CHECK(schedule::parse_schedule_enabled("") == true);       // no body -> default
     // A whitespace-only body is blank too (like the rotate and enrollment readers), not a 400.
@@ -903,10 +906,10 @@ TEST_CASE("parse_schedule_enabled: accepts real JSON booleans and the integers 0
         INFO("blank body of " << std::string(blank).size() << " bytes");
         CHECK(schedule::parse_schedule_enabled(blank) == true);
     }
-    // Everything else is refused (#4644), never inferred as "arm": strings (the legacy encoding
+    // Everything else is refused (#4644), never inferred as "arm": any other string (case variants
     // included), other numbers, null, containers, and a truncated or non-object document.
     for (const char* bad :
-         {R"({"enabled":"true"})", R"({"enabled":"false"})", R"({"enabled":"0"})",
+         {R"({"enabled":"True"})", R"({"enabled":"FALSE"})", R"({"enabled":"0"})",
           R"({"enabled":""})", R"({"enabled":null})", R"({"enabled":2})", R"({"enabled":-1})",
           R"({"enabled":1.0})", R"({"enabled":5.5})", R"({"enabled":1e3})",
           R"({"enabled":4294967297})", R"({"enabled":9223372036854775808})",

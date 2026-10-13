@@ -332,7 +332,7 @@ TEST_CASE("auth-sample: scoping returns exactly the 4 auth events (count bound)"
     CHECK(count_substr(res->body, "\"action\":") == 4); // not the 2 noise events
 }
 
-// ── #4644 Gate 7: GET /api/v1/audit reads `limit` strictly ──────────────────
+// ── #4644: GET /api/v1/audit reads `limit` strictly ──────────────────
 
 TEST_CASE("GET /api/v1/audit: a malformed limit is a 400 instead of the default or its numeric "
           "prefix",

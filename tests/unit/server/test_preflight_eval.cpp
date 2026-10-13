@@ -139,7 +139,7 @@ TEST_CASE("bucket_token / bucket_from_token round-trip", "[preflight][eval]") {
     CHECK(bucket_from_token("garbage") == Bucket::kIncomplete); // safe default
 }
 
-// #4644 Gate 7: a cell with no response in a TRUNCATED fetch window is ambiguous, never a pass.
+// #4644: a cell with no response in a TRUNCATED fetch window is ambiguous, never a pass.
 TEST_CASE("compute_device_results labels an absent agent in a truncated window inconclusive",
           "[preflight][eval][numeric_params]") {
     PreflightCheckResponses c;

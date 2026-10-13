@@ -507,7 +507,7 @@ public:
     // not the same fact as "no executions". The plain `get_*` forms collapse a degrade into
     // an empty/zeroed value and exist for callers that have no way to report one; a REST or
     // MCP handler answering a degrade with 200 and `[]` presents a wrong result as correct
-    // (#4644 Gate 7).
+    // (#4644).
     [[nodiscard]] std::optional<std::vector<AgentExecutionStats>>
     try_get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
     [[nodiscard]] std::optional<std::vector<DefinitionExecutionStats>>

@@ -43,7 +43,7 @@
 
 #include "fleet_topology_store.hpp"
 #include "fleet_topology_types.hpp"
-#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "http_route_sink.hpp"
 #include "offline_endpoint_store.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error

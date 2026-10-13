@@ -463,7 +463,7 @@ TEST_CASE("a rollout write does not clobber a concurrent change to another colum
     CHECK(h.audited.front().detail.find("mandatory=true") != std::string::npos);
 }
 
-// #4644 Gate 7: a malformed rollout percentage must NOT fall back to 100 (a full-fleet rollout
+// #4644: a malformed rollout percentage must NOT fall back to 100 (a full-fleet rollout
 // nobody asked for): 400, nothing stored, no audit row claiming a change happened.
 TEST_CASE("OTA rollout with a malformed percentage is a 400 and changes nothing",
           "[ota][audit][settings_routes][pg][numeric_params]") {

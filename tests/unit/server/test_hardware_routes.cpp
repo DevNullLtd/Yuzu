@@ -721,7 +721,7 @@ TEST_CASE("route: POST .../sync — audit-store degrade fails CLOSED, no dispatc
     REQUIRE(h.sync_dispatch_calls == 0);
 }
 
-// #4644 Gate 7: offset/limit/await_since are ONE base-10 integer or a 400. `await_since` is
+// #4644: offset/limit/await_since are ONE base-10 integer or a 400. `await_since` is
 // the freshness bound a sync poll waits past: a malformed one used to read as "no bound" and
 // the poll could serve a STALE snapshot as fresh.
 TEST_CASE("route: hardware list and JSON list and sync poll refuse malformed numeric params",

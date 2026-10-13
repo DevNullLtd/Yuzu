@@ -58,7 +58,7 @@ collect_check_responses(ResponseStore& store, const std::string& run_id,
                         const std::vector<std::pair<std::string, std::string>>& applicable,
                         int fetch_cap = kResponseFetchCap);
 
-/// True iff any check's fetch hit its row cap (#4644 Gate 7): absent agents are then
+/// True iff any check's fetch hit its row cap (#4644): absent agents are then
 /// inconclusive, and a caller MUST NOT keep re-dispatching to them (every reply adds a row
 /// and evicts another agent's, so more dispatch cannot resolve the ambiguity).
 bool any_check_truncated(const std::vector<PreflightCheckResponses>& checks);

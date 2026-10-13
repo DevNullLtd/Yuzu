@@ -3,7 +3,7 @@
 /// See tar_tree_routes.hpp for the auth/caching contract.
 
 #include "tar_tree_routes.hpp"
-#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644 Gate 7)
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial, detail::a4_error, make_correlation_id
@@ -561,9 +561,20 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // SQL fetch is bounded only at the TOP (ts <= to) for a custom `to`; the lower
         // bound stays oldest-retained so a long-running process started before the
         // window is still captured (the engine applies `from` as an interval filter).
+        // A custom window that does not parse is refused here (#4644): the lenient parser
+        // read it as "unset", which dispatched an unbounded query for a window the operator
+        // had typed.
         std::int64_t fetch_to = 0;
-        if (preset == "custom")
-            fetch_to = parse_ts_param(to);
+        if (preset == "custom") {
+            const auto from_ts = parse_ts_param_strict(from);
+            const auto to_ts = parse_ts_param_strict(to);
+            if (!from_ts || !to_ts) {
+                note(res, "The custom window is not a valid time. Use the From and To pickers "
+                          "(UTC), or epoch seconds, and re-run.");
+                return;
+            }
+            fetch_to = *to_ts;
+        }
         // SECURITY: `fetch_to` is interpolated into the tar.sql query STRING handed to
         // the agent. The agent forbids parameterized/recursive CTEs, so there is NO
         // bind-parameter path here — this is safe ONLY because `fetch_to` is a
@@ -690,8 +701,15 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         auto conns = tcp_ok ? parse_tar_tcp_output(tcp.output) : std::vector<TarTcpConn>{};
         const auto anchors = compute_tar_anchors(events);
         const std::int64_t now = now_epoch_seconds();
-        const TarWindow win =
-            resolve_tar_window(preset, parse_ts_param(from), parse_ts_param(to), anchors, now);
+        const auto from_ts = parse_ts_param_strict(from);
+        const auto to_ts = parse_ts_param_strict(to);
+        if (preset == "custom" && (!from_ts || !to_ts)) {
+            note(res, "The custom window is not a valid time. Use the From and To pickers "
+                      "(UTC), or epoch seconds, and re-run.");
+            return;
+        }
+        const TarWindow win = resolve_tar_window(preset, from_ts.value_or(0), to_ts.value_or(0),
+                                                 anchors, now);
         auto tree = reconstruct_tar_process_tree(events, win.from_ts, win.to_ts, anchors);
 
         const std::string os = device_os(lookup_fn_ ? lookup_fn_(device) : std::nullopt);

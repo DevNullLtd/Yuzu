@@ -326,7 +326,7 @@ TEST_CASE("PreflightRunner tick: an unset should_stop processes every run, "
     CHECK(targeted == std::set<std::string>{"agent-1", "agent-2"});
 }
 
-// #4644 Gate 7: the per-check response read is a SLIDING window (newest rows win). When it hits
+// #4644: the per-check response read is a SLIDING window (newest rows win). When it hits
 // its cap an agent missing from it may have ANSWERED and been evicted, so the grid must say so
 // ("inconclusive: response cap reached"), never go, and the runner must stop re-dispatching
 // (every reply adds a row and evicts another agent's answer). The run still completes at its

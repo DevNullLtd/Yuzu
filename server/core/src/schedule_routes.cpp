@@ -270,7 +270,7 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             // #4644: nothing is armed or changed on a value that is not an unambiguous boolean.
             res.status = 400;
             res.set_content(
-                nlohmann::json({{"error", "enabled must be a JSON boolean, or the integer 0 or 1"}})
+                nlohmann::json({{"error", "enabled must be a JSON boolean, the integer 0 or 1, or the string \"true\" or \"false\""}})
                     .dump(),
                 "application/json");
             return;
@@ -332,6 +332,16 @@ std::optional<bool> parse_schedule_enabled(const std::string& body) {
         if (v == 0)
             return false;
         if (v == 1)
+            return true;
+    }
+    // The exact strings "true" and "false" keep the documented kill switch reachable for older
+    // clients that send the value as text: `{"enabled":"false"}` must still disable a runaway
+    // schedule. Case variants and every other string stay refused.
+    if (v.is_string()) {
+        const auto& t = v.get_ref<const std::string&>();
+        if (t == "false")
+            return false;
+        if (t == "true")
             return true;
     }
     return std::nullopt;
