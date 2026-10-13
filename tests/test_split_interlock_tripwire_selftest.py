@@ -68,7 +68,7 @@ EXPECTED_SUBSTRATE_MARKERS = {
     "engine_principal_store": {"cell": "a", "regex": "engine_principal_store"},
     "principal_quota": {"cell": "m", "regex": "class PrincipalQuota"},
     "use_case_run_id": {"cell": "c", "regex": "use_case_run_id"},
-    "release_log_store": {"cell": "d", "regex": "^[[:space:]]*(class|struct)[[:space:]]+([A-Za-z_]+[[:space:]]+)?ReleaseLog(Store)?([^A-Za-z0-9_]|$)|^[[:space:]]*#[[:space:]]*include[[:space:]]+[<\"][^>\"]*release_log_store|^[^/*]*CREATE[[:space:]]+TABLE[^;]{0,200}release_log"},
+    "release_log_store": {"cell": "d", "regex": "^[[:space:]]*(class|struct)[[:space:]]+([A-Za-z_]+[[:space:]]+)?ReleaseLog(Store)?([[:space:]]+final)?[[:space:]]*([{:]|$)|^[[:space:]]*#[[:space:]]*include[[:space:]]+[<\"][^>\"]*release_log_store\\.h|^[^/*#-]*CREATE[[:space:]]+TABLE[^;(]{0,60}release_log"},
     "evaluate_as_operator": {"cell": "b", "regex": "evaluate_as_operator"},
     "capability_registry": {"cell": "h", "regex": "register_securable|create_securable|ratified_mapping"},
 }
@@ -153,12 +153,17 @@ def main() -> int:
                          '// #include "release_log_store.hpp"',
                          "// CREATE TABLE release_log (id BIGINT)",
                          "/* CREATE TABLE release_log */",
-                         " * CREATE TABLE release_log (id BIGINT)"):
+                         " * CREATE TABLE release_log (id BIGINT)",
+                         "class ReleaseLogStore;", "struct ReleaseLog;", "class ReleaseLogStore ;  // fwd",
+                         "-- CREATE TABLE release_log (id BIGINT)", "# CREATE TABLE release_log (id BIGINT)",
+                         "CREATE TABLE audit_events (release_log_id BIGINT)",
+                         '#include "release_log_store_test_helpers.hpp"'):
             if _ere_matches(must_not, _td) is True:
                 _fail(f"release_log_store regex falsely matches unrelated log-handoff code: {must_not!r}", failures)
         for must in ("class ReleaseLogStore {", "struct ReleaseLogStore final {", "class YUZU_API ReleaseLogStore {",
                      '#include "release_log_store.hpp"', "CREATE TABLE IF NOT EXISTS release_log (id BIGINT)",
-                     "CREATE  TABLE release_log_entries (", "class ReleaseLog {", "    class ReleaseLog final {",
+                     "CREATE  TABLE release_log_entries (", "class ReleaseLog {", "    class ReleaseLog final {", "class ReleaseLogStore",
+                     "class ReleaseLogStore final : public IStore {", "class ReleaseLogStore : public IStore {",
                      'R"sql(CREATE TABLE release_log (id BIGINT))sql"', '"CREATE TABLE IF NOT EXISTS release_log ("',
                      "#include <yuzu/server/release_log_store.hpp>"):
             if _ere_matches(must, _td) is False:
