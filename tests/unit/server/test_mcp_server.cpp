@@ -12915,6 +12915,9 @@ TEST_CASE("MCP list_workflow_executions: a store failure is a retryable error ne
     const auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    // Without this guard a reply that has no `data` object (a plain error_response) aborts the
+    // whole test binary inside nlohmann instead of failing this one case.
+    REQUIRE(body["error"].contains("data"));
     CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == yuzu::server::mcp::kMcpStoreFaultRetryMs);
     CHECK(body["error"]["message"].get<std::string>().find("statement timeout") == std::string::npos);
     CHECK_FALSE(body.contains("result"));
