@@ -98,8 +98,13 @@ std::string json_value_to_string(const nlohmann::json& val) {
     if (val.is_string()) {
         return val.get<std::string>();
     }
+    // UNSIGNED first: nlohmann's is_number_integer() is true for the unsigned variant too, and
+    // get<int64_t>() wraps a stored value above INT64_MAX to a negative ("-1" for 2^64-1).
+    if (val.is_number_unsigned()) {
+        return std::to_string(val.get<std::uint64_t>());
+    }
     if (val.is_number_integer()) {
-        return std::to_string(val.get<int64_t>());
+        return std::to_string(val.get<std::int64_t>());
     }
     if (val.is_number_float()) {
         return std::to_string(val.get<double>());
@@ -837,7 +842,11 @@ std::vector<InventoryEvalResult> evaluate_inventory(
 
         if (overall_match) {
             int64_t collected_at = 0;
-            if (data.contains("collected_at") && data["collected_at"].is_number_integer()) {
+            if (data.contains("collected_at") && data["collected_at"].is_number_integer() &&
+                (!data["collected_at"].is_number_unsigned() ||
+                 data["collected_at"].get<std::uint64_t>() <=
+                     static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))) {
+                // An unsigned above INT64_MAX is not an epoch int64 can hold: leave 0, don't wrap.
                 collected_at = data["collected_at"].get<int64_t>();
             }
 

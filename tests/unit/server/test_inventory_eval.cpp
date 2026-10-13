@@ -2078,3 +2078,57 @@ TEST_CASE("InventoryEval: the legacy leading-number read refuses whitespace and 
     CHECK_FALSE(lt("0x10", "0x9"));
     CHECK_FALSE(lt("0x9", "0x10"));
 }
+
+TEST_CASE("InventoryEval: a stored unsigned above INT64_MAX renders as itself, never its int64 wrap",
+          "[inventory_eval][numeric_params]") {
+    // nlohmann's is_number_integer() is true for the unsigned variant too, so rendering through
+    // get<int64_t>() first turned 18446744073709551615 into "-1": == "-1" matched it, and
+    // == "18446744073709551615" did not. The stored JSON is parsed by evaluate_inventory, so a
+    // positive integer arrives as the unsigned variant exactly as in production.
+    auto run = [](const char* stored, const char* op, const char* operand) {
+        Records records = {{"agent-a|p", std::string(R"({"v": )") + stored + "}"}};
+        InventoryEvalRequest req;
+        req.conditions = {{"p", "v", op, operand}};
+        return evaluate_inventory(req, records);
+    };
+    auto hit = [&](const char* stored, const char* op, const char* operand) {
+        return !run(stored, op, operand).empty();
+    };
+    constexpr const char* kMax = "18446744073709551615";
+    CHECK(nlohmann::json::parse(kMax).is_number_unsigned());
+
+    CHECK_FALSE(hit(kMax, "==", "-1"));
+    CHECK(hit(kMax, "!=", "-1"));
+    CHECK_FALSE(hit(kMax, "contains", "-1"));
+    CHECK(hit(kMax, "==", kMax));
+    CHECK_FALSE(hit(kMax, "!=", kMax));
+    CHECK(hit(kMax, "contains", "4073709551615"));
+    {
+        const auto r = run(kMax, "==", kMax);
+        REQUIRE(r.size() == 1);
+        CHECK(r[0].matched_value == kMax);
+    }
+    {
+        const auto r = run(kMax, "exists", "");
+        REQUIRE(r.size() == 1);
+        CHECK(r[0].matched_value == kMax);
+    }
+
+    // INT64_MAX + 1 wrapped to INT64_MIN.
+    constexpr const char* kJustOver = "9223372036854775808";
+    CHECK_FALSE(hit(kJustOver, "==", "-9223372036854775808"));
+    CHECK(hit(kJustOver, "==", kJustOver));
+    {
+        const auto r = run(kJustOver, "==", kJustOver);
+        REQUIRE(r.size() == 1);
+        CHECK(r[0].matched_value == kJustOver);
+    }
+
+    // The signed side is unchanged: INT64_MIN and INT64_MAX render exactly.
+    constexpr const char* kMin = "-9223372036854775808";
+    constexpr const char* kI64Max = "9223372036854775807";
+    CHECK(hit(kMin, "==", kMin));
+    CHECK(hit(kI64Max, "==", kI64Max));
+    CHECK_FALSE(hit(kMin, "==", kJustOver));
+    CHECK(run(kMin, "==", kMin)[0].matched_value == kMin);
+}

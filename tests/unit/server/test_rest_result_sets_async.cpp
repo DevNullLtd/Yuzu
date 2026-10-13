@@ -3065,6 +3065,48 @@ TEST_CASE("POST /api/v1/inventory/evaluate: a numeric condition value is compare
     CHECK(agents_for(">=", R"("9007199254740993.0")") == Ids{});
 }
 
+// #4644 round 3 (F1): a stored JSON integer above INT64_MAX is rendered as itself on the REST
+// evaluate route (its string `==` / `!=` / `contains` paths and `matched_value`), never as its
+// int64 wrap "-1". Reverting only json_value_to_string's unsigned-first ordering turns this red.
+TEST_CASE("POST /api/v1/inventory/evaluate: a stored unsigned above INT64_MAX is not read as its "
+          "int64 wrap (#4644)",
+          "[pg][result_set][inventory][inventory_eval][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-u64", R"({"big":18446744073709551615})"});
+        REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+    }
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    auto rows_for = [&](const char* op, const char* value) {
+        int status = 0;
+        auto body = h.post("/api/v1/inventory/evaluate",
+                           std::string(R"({"conditions":[{"plugin":"custom","field":"big","op":")") +
+                               op + R"(","value":")" + value + R"("}]})",
+                           status);
+        REQUIRE(status == 200);
+        return body["data"];
+    };
+    CHECK(rows_for("==", "-1").empty());
+    CHECK(rows_for("!=", "-1").size() == 1);
+    CHECK(rows_for("contains", "-1").empty());
+    const auto hit = rows_for("==", "18446744073709551615");
+    REQUIRE(hit.size() == 1);
+    CHECK(hit[0]["agent_id"] == "agent-u64");
+    CHECK(hit[0]["matched_value"] == "18446744073709551615");
+}
+
 // #4496 follow-up: the sibling of the two `results_excluded_by_poison` tests
 // above, for the OTHER exclusion cause -- a genuine JSON parse error.
 TEST_CASE("POST /api/v1/inventory/evaluate: a malformed record is flagged via "

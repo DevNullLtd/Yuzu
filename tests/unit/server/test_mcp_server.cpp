@@ -8030,6 +8030,60 @@ TEST_CASE("MCP DEX: get_dex_device_score off-enum window -> invalid params, neve
     CHECK(res->body.find("-32602") != std::string::npos); // kInvalidParams
 }
 
+// #4644 round 3 (K3): get_dex_device_score read `window` through param_str, which turned a PRESENT
+// non-string (30, null, true) into 7d. It now shares dex_window_arg with the three fleet tools.
+TEST_CASE("MCP DEX: get_dex_device_score refuses a present non-string or empty window; only an "
+          "absent one defaults to 7d (#4644)",
+          "[pg][mcp][integration][dex][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    int call_id = 1000;
+    auto call = [&](const std::string& window_member) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(call_id++) +
+                       R"(,"params":{"name":"get_dex_device_score","arguments":{"agent_id":"WS-1")" +
+                       window_member + "}}}");
+    };
+    for (const char* bad : {R"(,"window":30)", R"(,"window":null)", R"(,"window":true)",
+                            R"(,"window":"")", R"(,"window":["7d"])", R"(,"window":"90d")"}) {
+        INFO(bad);
+        auto res = call(bad);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("invalid window") !=
+              std::string::npos);
+    }
+    {
+        auto res = call("");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        auto payload =
+            nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        CHECK(payload["window"] == "7d");
+    }
+    for (const char* ok : {"24h", "7d", "30d", "all"}) {
+        INFO(ok);
+        auto res = call(std::string(R"(,"window":")") + ok + "\"");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        auto payload =
+            nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        CHECK(payload["window"] == ok);
+    }
+}
+
 TEST_CASE("MCP DEX: list_dex_apps off-enum window -> invalid params, never a "
           "silently-defaulted 7d (parity with REST GET /api/v1/dex/apps)",
           "[pg][mcp][integration][dex]") {

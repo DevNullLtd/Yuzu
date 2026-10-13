@@ -126,8 +126,10 @@ bool json_column_match(std::string_view output, const std::string& column, const
         std::string cell;
         if (field.is_string())
             cell = field.get<std::string>();
+        else if (field.is_number_unsigned()) // before the signed case: see json_value_to_string
+            cell = std::to_string(field.get<std::uint64_t>());
         else if (field.is_number_integer())
-            cell = std::to_string(field.get<long long>());
+            cell = std::to_string(field.get<std::int64_t>());
         else if (field.is_number_float())
             cell = std::to_string(field.get<double>());
         else if (field.is_boolean())

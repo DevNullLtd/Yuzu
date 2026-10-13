@@ -15398,12 +15398,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // GET /api/v1/dex/devices/{id}, which rejects an off-enum value rather
                 // than silently resolving it to 7d (an echoed `window` that contradicts
                 // the data it labels is exactly what that validation exists to prevent).
-                const std::string window = param_str(args, "window", "7d");
-                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "invalid window (expected 24h|7d|30d|all)"),
-                        "application/json");
+                // dex_window_arg also refuses a PRESENT non-string or empty window (#4644):
+                // param_str alone swallowed `30`, `null` and `true` into 7d.
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
                     return;
                 }
                 const auto model = dex_api_->device_score(agent_id, window);

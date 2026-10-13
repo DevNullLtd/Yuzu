@@ -255,3 +255,12 @@ TEST_CASE("matcher: a present wrong-typed column/op/value matches nobody and is 
     CHECK(response_matches(R"({"column":"c","op":"in","value_set":["v"]})", kOk, out));
     CHECK_FALSE(validate_matcher(R"({"column":"c","op":"in","value_set":["v"]})").has_value());
 }
+
+// A JSON-array output cell that is an unsigned integer above INT64_MAX renders as itself. The
+// signed read first wrapped 18446744073709551615 to "-1", so `eq "-1"` admitted the responder.
+TEST_CASE("matcher: a JSON unsigned cell above INT64_MAX is not read as its int64 wrap",
+          "[result_set][matcher]") {
+    const std::string out = R"([{"c":18446744073709551615}])";
+    CHECK(response_matches(R"({"column":"c","op":"eq","value":"18446744073709551615"})", kOk, out));
+    CHECK_FALSE(response_matches(R"({"column":"c","op":"eq","value":"-1"})", kOk, out));
+}
