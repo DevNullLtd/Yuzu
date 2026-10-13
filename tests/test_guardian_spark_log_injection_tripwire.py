@@ -816,12 +816,20 @@ def find_violations_in_text(text: str) -> list[tuple[int, str, list[str]]]:
 #     last line that starts with `}` in column 0 before the call);
 #   - in the custom-properties files, the bare name `agent_id`, which there is
 #     always a request-derived parameter or route capture.
+# `safe_agent_id` is trusted only because its DEFINITION is checked too: every
+# declaration or init of that name must have a right-hand side that is wholly one
+# `log_id_token(...)` call, and a file that logs `safe_agent_id` without defining it
+# is flagged, so neither weakening nor deleting the definition can pass.
 # Not covered, by design: a bare id that reaches the log through a variable the
 # check cannot trace to a request accessor (for example an id read back from a
-# session table), a hostname or other claimed field, an accessor passed as a
-# sub-expression of a larger call, and any new spelling nobody has added here.
-# It is a regression net for the sites fixed under #5513, not proof that no
-# claimed id is ever logged raw.
+# session table), a hostname or other claimed field, and any new spelling nobody
+# has added here. An accessor passed as a sub-expression of a larger call (for
+# example `fmt::format("{}", request->agent_id())`) IS flagged, conservatively,
+# unless the whole argument is a wrap call. Known lexical limits: alias forms such
+# as `string_view x = ...` and `auto&& x = ...`, brace-init aliases and a later
+# plain assignment to an alias are not tracked, and `SPDLOG_*` macros and
+# `spdlog::log(level, ...)` calls are not scanned. It is a regression net for the
+# sites fixed under #5513, not proof that no claimed id is ever logged raw.
 # ---------------------------------------------------------------------------
 
 AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
@@ -841,6 +849,50 @@ _AGENT_ID_ALIAS_DECL_RE = re.compile(
 _SANITIZE_CALL_NAME_RE = re.compile(r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*sanitize_for_log\(")
 
 
+_LOG_ID_TOKEN_CALL_NAME_RE = re.compile(r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*log_id_token\(")
+_SAFE_AGENT_ID_DEF_RE = re.compile(r"\bsafe_agent_id\s*(=(?!=)|[({])")
+_SAFE_AGENT_ID_USE_RE = re.compile(r"(?<![\w.>:])safe_agent_id\b(?!\s*[=({])")
+
+
+def _safe_agent_id_definitions(text: str) -> list[tuple[int, str, bool]]:
+    """Every declaration / init of `safe_agent_id` in `text` as (1-based line,
+    statement snippet, rhs_is_whole_log_id_token_call). Lines in a `//` comment
+    before the match are skipped. The right-hand side runs to the top-level `;`
+    (for `=`) or to the balancing close of the `(` / `{` initialiser."""
+    out: list[tuple[int, str, bool]] = []
+    for m in _SAFE_AGENT_ID_DEF_RE.finditer(text):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        if "//" in text[line_start : m.start()]:
+            continue
+        opener = m.group(1)
+        i = m.end() if opener == "=" else m.end() - 1
+        rhs_start = i if opener == "=" else i + 1
+        depth = 0 if opener == "=" else 1
+        n = len(text)
+        while i < n:
+            c = text[i]
+            if c == '"':
+                i = _skip_string_literal(text, i)
+                continue
+            if c == "'":
+                i = _skip_char_literal(text, i)
+                continue
+            if c in "({[":
+                depth += 1
+            elif c in ")}]":
+                depth -= 1
+                if depth == 0 and opener != "=":
+                    break
+            elif c == ";" and depth == 0 and opener == "=":
+                break
+            i += 1
+        rhs = text[rhs_start:i]
+        line_no = text.count("\n", 0, m.start()) + 1
+        snippet = " ".join(text[m.start() : min(i + 1, n)].split())
+        out.append((line_no, snippet, _is_whole_call_wrapped(rhs, _LOG_ID_TOKEN_CALL_NAME_RE)))
+    return out
+
+
 def _agent_id_arg_is_safe(arg: str) -> bool:
     text = arg.strip()
     return (
@@ -857,11 +909,20 @@ def find_agent_id_violations_in_text(
     with an unwrapped request-derived agent-id argument (see the block comment
     above for exactly what that means)."""
     out: list[tuple[int, str]] = []
+    defs = _safe_agent_id_definitions(text)
+    for line_no, snippet, wrapped in defs:
+        if not wrapped:
+            out.append((line_no, snippet))
     for pos, stmt in find_spdlog_statements_with_pos(text):
         parsed = parse_call(stmt)
         if parsed is None:
             continue
         _, args_text = parsed
+        if not defs and any(
+            _SAFE_AGENT_ID_USE_RE.search(a) for a in split_top_level_args(args_text)
+        ):
+            out.append((text.count("\n", 0, pos) + 1, stmt))
+            continue
         fn_start = text.rfind("\n}", 0, pos)
         scope = text[fn_start + 1 if fn_start != -1 else 0 : pos]
         bare = set(always_bare) | {m.group(1) for m in _AGENT_ID_ALIAS_DECL_RE.finditer(scope)}
@@ -1124,6 +1185,25 @@ def _selfcheck() -> None:
         ('spdlog::info("sent {} bytes to {}", n, req->agent_id());', ()),
         ('spdlog::info("peer {} and {}", log_id_token(a), info.agent_id());', ()),
         ('spdlog::info("peer {}", "id=" + info.agent_id());', ()),
+        # The trusted local must be DEFINED as a whole log_id_token call: an unwrapped
+        # definition, a partial wrap, a brace/paren init and a use with no definition
+        # in the file all go red.
+        (
+            "void F() {\n  const std::string safe_agent_id = info.agent_id();\n"
+            '  spdlog::info("peer {}", safe_agent_id);\n}\n',
+            (),
+        ),
+        (
+            "void F() {\n  const std::string safe_agent_id = ::yuzu::log_id_token(a) + info.agent_id();\n"
+            '  spdlog::info("peer {}", safe_agent_id);\n}\n',
+            (),
+        ),
+        (
+            "void F() {\n  const std::string safe_agent_id{info.agent_id()};\n"
+            '  spdlog::info("peer {}", safe_agent_id);\n}\n',
+            (),
+        ),
+        ('void F() {\n  spdlog::info("peer {}", safe_agent_id);\n}\n', ()),
         ('spdlog::info("peer {}", log_id_token(a) + info.agent_id());', ()),
         ('spdlog::warn("delete failed for agent={}", agent_id);', ("agent_id",)),
         (
@@ -1144,7 +1224,11 @@ def _selfcheck() -> None:
         ('spdlog::info("peer {} seen", ::yuzu::log_id_token(info.agent_id()));', ()),
         ('spdlog::info("peer {} seen", audit_token(request->agent_id()));', ()),
         ('spdlog::warn("x {}", onbehalf::sanitize_for_log(req->agent_id(), 64));', ()),
-        ('spdlog::info("peer {}", safe_agent_id);', ()),
+        (
+            "void F() {\n  const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());\n"
+            '  spdlog::info("peer {}", safe_agent_id);\n}\n',
+            (),
+        ),
         ('spdlog::warn("length {} (max {})", info.agent_id().size(), kMax);', ()),
         ('spdlog::warn("empty? {}", request->agent_id().empty());', ()),
         ('spdlog::warn("delete failed for agent={}", ::yuzu::log_id_token(agent_id));', ("agent_id",)),

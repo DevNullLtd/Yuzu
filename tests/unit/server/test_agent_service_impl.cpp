@@ -32,8 +32,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <filesystem>
-
 #include "agent_registry.hpp"
 #include "app_usage_store.hpp"
 #include "audit_store.hpp"
@@ -63,6 +61,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <random>
@@ -1315,6 +1314,8 @@ TEST_CASE("CheckForUpdate: logs a claimed agent_id and version with control byte
     yuzu::test::LogCapture cap;
     auto status = h.svc.CheckForUpdate(&ctx, &req, &resp);
     cap.stop();
+    // `reg` is destroyed before `h.svc`, which holds a raw pointer to it.
+    h.svc.set_update_registry(nullptr);
 
     REQUIRE(status.ok());
     CHECK(resp.update_available());
