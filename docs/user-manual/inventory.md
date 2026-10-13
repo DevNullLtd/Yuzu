@@ -635,9 +635,17 @@ conflated.
 
 The Hardware list and its KPI strip serve at most the 100,000 most recently seen
 endpoints within the 30-day window; a fleet above that sees a capped list without a
-warning (a truncation signal is tracked in #5712). The per-device record's offline
+warning (a truncation signal is tracked in #5712). The cap counts distinct enrolled
+`agent_id`s seen in the window: a device that disconnects cleanly stays listed as
+Offline for the full 30 days (#5678), and a device re-enrolled under a new `agent_id`
+appears as two rows until the old one ages out. The per-device record's offline
 identity fallback reads the same capped set, so an offline device outside it shows no
 identity and, with nothing else synced, reads as not found.
+
+A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
+deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates
+it. A device that is never decommissioned stays listed as Offline for the 30-day window,
+and its stored record is deleted 37 days after its last contact.
 
 ## Access control
 
