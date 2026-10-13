@@ -34,6 +34,17 @@ public:
         return engine_.get_execution(id);
     }
 
+    // The list read added after the original triad: the store takes the scope as plain data
+    // (no authz dependency), so the set is flattened here.
+    [[nodiscard]] std::expected<WorkflowExecutionPage, std::string>
+    list_workflow_executions(const WorkflowExecutionListQuery& q,
+                             const authz::VisibleSet& scope) const override {
+        std::optional<std::vector<std::string>> visible;
+        if (scope)
+            visible.emplace(scope->begin(), scope->end());
+        return engine_.query_executions_page(q, visible);
+    }
+
 private:
     WorkflowEngine& engine_;
 };

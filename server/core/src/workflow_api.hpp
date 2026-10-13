@@ -4,15 +4,16 @@
 /// The EIGHTH per-family in-process API seam for the presentation/core/
 /// engine split (ADR-0031, WS-A4), covering the multi-step-workflow READ
 /// surface — the Postgres-backed `WorkflowEngine`'s `GET /api/v1/workflows`,
-/// `GET /api/v1/workflows/{id}` and `GET /api/v1/workflow-executions/{id}`
-/// resources (and their MCP twins `list_workflows`/`get_workflow`/
+/// `GET /api/v1/workflows/{id}`, `GET /api/v1/workflow-executions` and
+/// `GET /api/v1/workflow-executions/{id}` resources (and their MCP twins
+/// `list_workflows`/`get_workflow`/`list_workflow_executions`/
 /// `get_workflow_execution`). Abstract, ZERO store-shaped dependencies — it
 /// includes only the pure `workflow_types.hpp` + std headers, so this header
 /// can be included by a future presentation-side client without dragging the
 /// server's `WorkflowEngine` (a Postgres-backed store, `workflow_engine.hpp`)
 /// along.
 ///
-/// The three methods == the three public REST v1 resources above (plus their
+/// The four methods == the four public REST v1 resources above (plus their
 /// MCP twins), so a presentation/MCP caller consumes only what the public,
 /// versioned core API serves (ADR-0031 B3, INV-31-4 "no private core API") —
 /// a local in-process implementation today (`LocalWorkflowApi`,
@@ -38,6 +39,7 @@
 /// mutators, #4334-style: there is nothing to carve out of an enforced TU
 /// here, since these routes were never in it).
 
+#include "authz_model.hpp" // authz::VisibleSet: the caller's admitted agent set (pure, store-free)
 #include "workflow_types.hpp"
 
 #include <expected>
@@ -82,6 +84,20 @@ public:
     /// a response from it — this method has no confinement of its own.
     [[nodiscard]] virtual std::expected<std::optional<WorkflowExecution>, std::string>
     get_workflow_execution(const std::string& id) const = 0;
+
+    /// The workflow-execution LIST behind `GET /api/v1/workflow-executions` / MCP
+    /// `list_workflow_executions`: metadata rows only, newest first (or each workflow's newest run,
+    /// `q.latest_per_workflow`). `scope` is the caller's composed fleet-read scope from
+    /// `fleet_read_fn` (`nullopt` = unfiltered, engaged-empty = deny-all) and has NO default on
+    /// purpose: a run is returned only if it has at least one agent in `scope`, decided in the
+    /// store BEFORE `ORDER BY`/`LIMIT` (ADR-0017 INV-3), so a caller can never be handed a row
+    /// `workflow_execution_visible()` would refuse and a page can never be consumed by invisible
+    /// rows. `std::unexpected` is a genuine store failure (incl. a statement timeout), never an
+    /// empty page — surface it as a degrade, through `genericize_db_error(...)` like the methods
+    /// above.
+    [[nodiscard]] virtual std::expected<WorkflowExecutionPage, std::string>
+    list_workflow_executions(const WorkflowExecutionListQuery& q,
+                             const authz::VisibleSet& scope) const = 0;
 };
 
 } // namespace yuzu::server

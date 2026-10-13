@@ -30,9 +30,18 @@ public:
         std::function<std::expected<std::optional<yuzu::server::WorkflowExecution>, std::string>(
             const std::string&)>;
 
-    FnWorkflowApi(ListFn list_fn, GetFn get_fn, GetExecutionFn get_execution_fn)
+    /// Receives the validated query AND the scope the route/tool handed the seam, so a test can
+    /// assert exactly what was forwarded.
+    using ListExecutionsFn = std::function<std::expected<yuzu::server::WorkflowExecutionPage, std::string>(
+        const yuzu::server::WorkflowExecutionListQuery&, const yuzu::server::authz::VisibleSet&)>;
+
+    // The fourth function defaults to unwired so the existing three-argument construction sites
+    // (which never list executions) stay unchanged.
+    FnWorkflowApi(ListFn list_fn, GetFn get_fn, GetExecutionFn get_execution_fn,
+                  ListExecutionsFn list_executions_fn = {})
         : list_fn_(std::move(list_fn)), get_fn_(std::move(get_fn)),
-          get_execution_fn_(std::move(get_execution_fn)) {}
+          get_execution_fn_(std::move(get_execution_fn)),
+          list_executions_fn_(std::move(list_executions_fn)) {}
 
     [[nodiscard]] std::expected<std::vector<yuzu::server::Workflow>, std::string>
     list_workflows(const yuzu::server::WorkflowQuery& q) const override {
@@ -55,10 +64,19 @@ public:
         return get_execution_fn_(id);
     }
 
+    [[nodiscard]] std::expected<yuzu::server::WorkflowExecutionPage, std::string>
+    list_workflow_executions(const yuzu::server::WorkflowExecutionListQuery& q,
+                             const yuzu::server::authz::VisibleSet& scope) const override {
+        if (!list_executions_fn_)
+            return std::unexpected(std::string{"FnWorkflowApi: list_workflow_executions unwired"});
+        return list_executions_fn_(q, scope);
+    }
+
 private:
     ListFn list_fn_;
     GetFn get_fn_;
     GetExecutionFn get_execution_fn_;
+    ListExecutionsFn list_executions_fn_;
 };
 
 } // namespace yuzu::server::test
