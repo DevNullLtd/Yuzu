@@ -9,7 +9,7 @@ The single entry point for any HA work in Yuzu. Bundles three things:
 
 1. **The model** — the two independent axes and the safe-to-scale gate (get
    this wrong and a second replica double-dispatches destructive commands).
-2. **The delivery matrix** — every workstream WS-0…WS-14: what it delivers,
+2. **The delivery matrix** — every workstream WS-0…WS-15: what it delivers,
    current state, dependencies, whether it gates a second replica, routed
    reviewers, and status.
 3. **Gap/priority + workflow** — what to build next and the standard
@@ -46,7 +46,7 @@ them before this skill claims anything is "done."
 ### 1a. Two independent axes
 
 - **Server-tier HA** — N presentation + core replicas (WS-0…WS-6, WS-8,
-  WS-10, WS-11, WS-13).
+  WS-10, WS-11, WS-13, WS-15).
 - **Storage HA** — HA Postgres (WS-7). **A single Postgres is a valid,
   supported deployment; server-tier HA does not require it.**
 
@@ -129,7 +129,8 @@ by **gateway-fronting (WS-4)**, not the split.
 
 Source of truth: `docs/ha-delivery-matrix.md`. Read it before this skill
 claims a status. WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 are
-delivery/ops workstreams the three-model review surfaced as missing.
+delivery/ops workstreams the three-model review surfaced as missing; WS-15 (gateway
+failback/rebalance, roadmap 7.1.1, #5759) was added 2026-10-13 as WS-13's pair.
 
 **WS-6 re-stamped 2026-09-23 (PR #4833):** slice 6.1 (cross-replica CRL publication, #4126) in
 review; 6.1b / 6.2 / 6.3 planned; the operator decisions (shared CA key custody, not
@@ -397,8 +398,9 @@ gateway-fronted fleets.**
 | **WS-10** | **Background-job replica-safety classification** — checked-in, CI-auditable table (job → fenced-leader-only / replica-safe / disabled-until-fixed); bring #2508 wall-clock passes to clock-guard | audit+disable need nothing; `fenced-leader-only` enforcement needs WS-3 | **Y** | `cpp-safety`+`sre`+`compliance-officer` | P0 | **10.1/10.2 done (#4092); 10.3 enforcement wired by WS-3 3.2** |
 | **WS-11** | **HA-state observability** (NEW): leader identity/epoch, replica lag, quorum state, outbox backlog, failover duration, routing re-homes, split-brain alerts — Prometheus metrics + rules | WS-3, WS-7 | N, except the #4014 leader-observability subset, which **gates** (2026-10-13); the rest ships *with* the 2nd replica | `sre`+`docs-writer` (+ alert-rule gate) | P1 | planned |
 | **WS-12** | **Single→HA cutover + DR** (NEW): runbook to move an existing single deployment to HA-PG + gateway-front rollout; **backup/PITR/WAL under HA-PG** (replaces superseded `disaster-recovery.md`) | WS-7 | N | `release-deploy`+`sre`+`docs-writer` | P1 | planned |
-| **WS-13** | **Agent-side gateway failover rollout** (NEW): agent endpoint discovery/failover + fleet rollout flipping direct-connect fleets to gateway-front | WS-4 | Y (gateway-fronted fleets) | `cross-platform`+`security-guardian` | P1 | planned |
+| **WS-13** | **Agent-side gateway failover rollout** (NEW): agent endpoint discovery/failover + fleet rollout flipping direct-connect fleets to gateway-front. **Tracker #291** (roadmap 14.2). Failover is one-way without WS-15 | WS-4 | Y (gateway-fronted fleets) | `cross-platform`+`security-guardian` | P1 | planned |
 | **WS-14** | **Coordination-substrate security & capacity review** (NEW): threat review of advisory locks / etcd / Patroni / HAProxy / fencing tokens; capacity + failure-domain + sync-quorum latency validation | WS-3, WS-7 | N | `security-guardian`+`sre` | P2 | planned |
+| **WS-15** | **Gateway adjacency, load shedding, failback + rebalance** (NEW, 2026-10-13): roadmap **7.1.1**, **#5759**: adjacency table, rate-limited/jittered GOAWAY shedding, gradual failback, hysteresis, optional latency affinity. `yuzu_gw_cluster.erl` does not exist yet | WS-4, WS-13 | N (capacity) | `gateway-erlang`+`sre`+`architect` | P2 | planned |
 
 ### Hard invariants that must NOT regress when landing any WS
 
@@ -440,7 +442,8 @@ constraint. Delivery phases (dependency-ordered):
    **The split question (§1c) is RESOLVED — decoupled, ratified by the ADR-1005 owner (Dave Rae, 2026-09-07); the split does not gate a 2nd replica.**
 3. **Phase C — Enable, validate, operate:** flip on the second replica;
    `WS-9` runs continuously throughout B/C; `WS-11` ships *with* the second
-   replica; then `WS-12` (cutover/DR), `WS-14` (security/capacity). `WS-2b`
+   replica; then `WS-12` (cutover/DR), `WS-14` (security/capacity), `WS-15`
+   (gateway failback/rebalance, paired with WS-13). `WS-2b`
    (spine) and `WS-8` tier-split readyz land with the ADR-1005 split.
 
 **Suggested next slices** (as of 2026-09-29 — `docs/ha-delivery-matrix.md` row
@@ -469,6 +472,21 @@ cites are authoritative):
   `ha-enrollment-concurrent-register.sh` — 6.1b / 6.3 remain). **WS-8**-readyz
   is DONE for the monolith (2026-09-24). A loss-free cross-replica reconnect
   (durable outbox replay) is the open 2a-2 follow-up.
+
+**Gateway failover ↔ failback are one capability in two rows (2026-10-13).** Roadmap
+**14.2 "Multi-Gateway Topology" (#291)** is delivered as **WS-13** (agent fails over to a surviving
+gateway). Its declared dependency, roadmap **7.1.1 "Gateway Adjacency, Load Shedding, and
+Latency-Based Redistribution" (#5759)**, is delivered as **WS-15** (failback, load sharing,
+rate-limited shedding). 7.1.1 had no issue and was descoped from WS-4 without a named tracker
+(ADR-2002 §7, the `yuzu_gw_cluster` paragraph), which is how it went missing. Plan, scope or
+review either row together with the other:
+- WS-13 without WS-15 is one-way. The survivors keep the extra load, and nothing moves agents back.
+- WS-15 shedding must honour WS-13's one-channel-per-session rule: a shed agent re-registers and
+  mints a new session.
+- Failover does not remove a reconnect storm; it moves the failed node's share (about 1/N of the fleet) onto the
+  survivors. Both rows therefore depend on CONNECTED-notice delivery holding at burst (BigColin CN1:
+  `notify_pending_max`/`?MAX_NOTIFY_INFLIGHT` in `yuzu_gw_upstream.erl`) and on jittered
+  reconnect/shed pacing.
 
 **Shared with ADR-1005 (do not duplicate):** engine-tier HA (incl. NVD/CVE
 sync, withdrawn from WS-1), the MCP Decision-15 pre-commitments WS-2 inherits,
