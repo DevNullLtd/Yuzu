@@ -338,6 +338,26 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
         const std::string ok = op["responses"]["200"].value("description", "");
         CHECK(ok.find("os") != std::string::npos);
         CHECK(ok.find("source") != std::string::npos);
+
+        // The protective-set caveat is part of the published contract.
+        const std::string desc = op.value("description", "");
+        CHECK(desc.find("__guard__.push_rules") != std::string::npos);
+        CHECK(desc.find("unquarantine") != std::string::npos);
+        CHECK(desc.find(std::string(method) == "get" ? "dispatch still proceeds"
+                                                      : "no dispatch effect") !=
+              std::string::npos);
+
+        // ...and so are the parameter-level caveats: GET's `os` description and PUT's
+        // `enabled` property.
+        if (std::string(method) == "get") {
+            const std::string os_desc = (*os_param).value("description", "");
+            CHECK(os_desc.find("never gates dispatch") != std::string::npos);
+        } else {
+            const auto& enabled =
+                op["requestBody"]["content"]["application/json"]["schema"]["properties"]["enabled"];
+            const std::string enabled_desc = enabled.value("description", "");
+            CHECK(enabled_desc.find("no dispatch effect") != std::string::npos);
+        }
     }
 }
 

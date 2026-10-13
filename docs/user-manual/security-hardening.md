@@ -578,7 +578,13 @@ Two consequences worth planning for:
 - **The quarantine plugin's own actions are exempt** — `quarantine`, `unquarantine`, `status` and
   `whitelist` still reach a contained device, so release stays possible. The exemption is keyed on
   the action, not the plugin, so a future fifth action would be gated until it is deliberately
-  added.
+  added. These four actions, and the Guardian rule push `__guard__.push_rules`, are also exempt
+  from the per-plugin/action kill switch, the per-OS kill switch (and its agent-presence read),
+  the plugin-presence filter and a degraded plugin-config store, so none of them can strand a
+  contained device. A kill-switch row for one of these pairs is still accepted and displayed, but
+  it is informational only and has no dispatch effect. To stop Guardian rule delivery during an
+  incident, disable or remove the rules instead; see
+  [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
 - **Four server-internal pushes are also exempt, and you should know they exist.** The TAR
   fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
   (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory
