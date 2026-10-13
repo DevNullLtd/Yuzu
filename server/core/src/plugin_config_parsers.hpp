@@ -238,6 +238,17 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
     return yuzu::protective::is_protective_action(scope.plugin, scope.action);
 }
 
+/// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
+/// `, protective_exempt=true` when the row covers a protective action (stored
+/// but never gating dispatch). One definition for the REST and MCP write
+/// surfaces so the documented evidence format cannot drift between them.
+[[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope, bool enabled) {
+    std::string detail = enabled ? "enabled=true" : "enabled=false";
+    if (kill_switch_row_covers_protective(scope))
+        detail += ", protective_exempt=true";
+    return detail;
+}
+
 /// One stored kill-switch row of a single plugin, as the resolver sees it.
 struct KillSwitchRowView {
     std::string_view action; ///< "" = plugin-level

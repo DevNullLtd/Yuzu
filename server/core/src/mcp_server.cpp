@@ -20750,9 +20750,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
                 // A row on a protective pair is stored but never gates dispatch;
                 // label the evidence so it is never read as proof of a stop.
-                std::string ks_detail = std::string("enabled=") + (enabled ? "true" : "false");
+                const std::string ks_detail = plugin_config::kill_switch_set_detail(*scope, enabled);
                 if (plugin_config::kill_switch_row_covers_protective(*scope)) {
-                    ks_detail += ", protective_exempt=true";
                     spdlog::warn("plugin_config: kill-switch row {} is a protective action; "
                                  "stored but never refuses dispatch",
                                  target_id);
