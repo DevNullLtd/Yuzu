@@ -471,8 +471,12 @@ TEST_CASE("shares exports: every world-equivalent client reads anonymous", "[sha
         CHECK(flags_of(p.shares[0]) == "clients_1"); // still counted as one client
     }
     // Not the world: a real network, a single zero host, a partial wildcard, a netgroup.
+    // Also not the world: zero-looking strings no resolver accepts as an address (RECONSTRUCTION
+    // of the adversarial-review witnesses).
     for (const char* spec : {"10.0.0.0/8(rw)", "0.0.0.0(rw)", "0.0.0.0/8(rw)", "*.corp(rw)", "?x(rw)",
-                             "@trusted(rw)", "gss/krb5i(rw)"}) {
+                             "@trusted(rw)", "gss/krb5i(rw)", "::::/0(rw)", "0.../0(rw)", ":/0(rw)",
+                             "0.:/0(rw)", "0.0.0.0.0/0(rw)", "0::0::0/0(rw)", "0:0:0:0:0:0:0:0:0/0(rw)",
+                             "0.0.0.0/..(rw)", "0.0.0.0/(rw)"}) {
         const auto p = lin(std::string("/srv/w ") + spec + "\n");
         REQUIRE(p.shares.size() == 1);
         INFO(spec);
@@ -500,6 +504,18 @@ TEST_CASE("shares exports: no_root_squash honours squash options as nfs-utils ap
     const auto e = lin("/srv/e -no_root_squash host\n");
     REQUIRE(e.shares.size() == 1);
     CHECK(flags_of(e.shares[0]) == "no_root_squash,clients_1");
+}
+
+TEST_CASE("shares exports: only a double quote quotes and only octal escapes decode (xgettok)",
+          "[shares]") {
+    // RECONSTRUCTION from nfs-utils support/nfs/xio.c: `"` toggles quoting, `\NNN` is the only
+    // escape, any other backslash is literal; exports(5) documents no single-quote form.
+    CHECK(lin("'/srv/x' *(rw)\n").shares.empty());
+    const auto p = lin("/srv/my\\040dir host\n/srv/a\\ b host\n\"/srv/q\\\"x\" host\n");
+    REQUIRE(p.shares.size() == 3);
+    CHECK(p.shares[0].path == "/srv/my dir");
+    CHECK(p.shares[1].path == "/srv/a\\"); // `\ ` is no escape: the blank ends the token
+    CHECK(p.shares[2].path == "/srv/q\\");  // `\"` closes the quote: the backslash stays literal
 }
 
 TEST_CASE("shares exports: a quoted non-absolute path is skipped like an unquoted one", "[shares]") {
@@ -622,6 +638,33 @@ TEST_CASE("shares smb.conf: copy chains, unresolved targets and cycles", "[share
     CHECK(cyc.shares.size() == 2);
     const auto clean = smb("[x]\npath=/x\n");
     CHECK_FALSE(clean.copy_unresolved);
+}
+
+TEST_CASE("shares smb.conf: a copy target Samba has not loaded at the directive is unresolved",
+          "[shares]") {
+    // RECONSTRUCTION: handle_copy resolves the target at parse time among already-loaded
+    // services and snapshots it, so a forward reference or a later re-opening diverges from the
+    // final merged file this parser reads. Flagged, never modelled; the share is still emitted.
+    const auto fwd = smb("[x]\ncopy = base\n[base]\npath=/b\n");
+    CHECK(fwd.copy_unresolved);
+    CHECK(fwd.shares.size() == 2);
+
+    const auto reopened = smb("[tpl]\npath=/early\n[x]\ncopy = tpl\n[tpl]\npath=/late\n");
+    CHECK(reopened.copy_unresolved);
+    CHECK(by_name(reopened, "x").path == "/late"); // still emitted from the merged view
+    CHECK(by_name(reopened, "tpl").path == "/late");
+
+    // All seven projected keys local: the lazy lookup never reaches `copy`, the eager pass does.
+    const auto shadowed = smb("[x]\ncopy = missing\npath=/x\nread only = no\nwrite list = a\n"
+                              "read list = b\nguest ok = no\nbrowseable = yes\navailable = yes\n");
+    CHECK(shadowed.copy_unresolved);
+    CHECK(by_name(shadowed, "x").path == "/x");
+
+    // A target wholly before the copier and never re-opened after it stays resolved, through a
+    // chain and through a case-variant spelling of the directive.
+    CHECK_FALSE(smb("[tpl]\npath=/t\n[x]\ncopy = TPL\n[y]\ncopy = x\n").copy_unresolved);
+    CHECK_FALSE(smb("[tpl]\npath=/t\n[tpl]\nguest ok = yes\n[x]\ncopy = tpl\n").copy_unresolved);
+    CHECK(smb("[x]\ncopy = x\npath=/x\n").copy_unresolved);
 }
 
 TEST_CASE("shares smb.conf: Samba's built-in read only = yes applies when nothing sets it",

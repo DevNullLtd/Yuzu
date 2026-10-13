@@ -1,6 +1,6 @@
 ## Shares Definitions
 ## Reports the shares this host is CONFIGURED to serve over SMB and NFS: names, paths, ro/rw,
-## whether anonymous access is allowed, and a few flags. Nothing is changed or fetched.
+## whether anonymous access is configured, and a few flags. Nothing is changed or fetched.
 ## Plugin: shares | Actions: list
 ##
 ## Sources by platform:
@@ -26,7 +26,7 @@ metadata:
   version: 1.0.0
   description: >
     Reports the shares this host is configured to serve over SMB and NFS: name, path,
-    ro/rw/mixed, whether anonymous access is allowed and a few flags, never ACLs or NFS client
+    ro/rw/mixed, whether anonymous access is configured and a few flags, never ACLs or NFS client
     host lists (clients are a count). On Linux, read from /etc/exports, /etc/exports.d and
     /etc/samba/smb.conf as written, not live nfsd/smbd state; the Samba registry backend,
     include files and usershares are not read. The macOS and Windows legs are planned and not
@@ -88,7 +88,7 @@ spec:
         platforms: [linux]
       - name: field_5
         type: string
-        description: 'share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, or an all-zero network), false when not, "-" when unknown. Not used by the other kinds.'
+        description: 'share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, or an all-zero network), false when not, "-" when unknown. For SMB this reflects `guest ok` as written; whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). Not used by the other kinds.'
         example: 'false'
         platforms: [linux]
       - name: field_6
