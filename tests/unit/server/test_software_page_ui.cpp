@@ -440,6 +440,24 @@ TEST_CASE("software page: modes return the right regions", "[inventory][ui]") {
     REQUIRE(has(f, "id=\"sw-results\" data-hash=\"\""));
 }
 
+TEST_CASE("software page: panel wrappers stay balanced in every region", "[inventory][ui]") {
+    // The inv-panel wrappers are concatenated by hand across both results_region return paths.
+    auto balanced = [](const std::string& h) {
+        INFO(h);
+        REQUIRE(count_of(h, "<div ") + count_of(h, "<div>") == count_of(h, "</div>"));
+    };
+    auto d = page();
+    balanced(full({}, d));
+    balanced(render_software_page({}, d, SoftwarePageMode::Results));
+    d = page({});
+    d.totals = SoftwareCatalogTotals{0, 0};
+    balanced(full({}, d));
+    balanced(render_software_page({}, d, SoftwarePageMode::Results));
+    d = page();
+    d.rows.reset();
+    balanced(render_software_page({}, d, SoftwarePageMode::Results));
+}
+
 TEST_CASE("software page: degrade, empty, filtered-empty and caveat states", "[inventory][ui]") {
     auto d = page();
     d.rows.reset();

@@ -183,7 +183,8 @@ std::string render_verify_result(const PairedComparison& c, std::int64_t cohort_
     h += "</div>";
 
     // Truncation is LOUD, not silent: a capped read can mis-pair a boundary machine,
-    // so the comparison below must not be trusted (gov UP-1). Red, above everything.
+    // so the comparison below must not be trusted (gov UP-1). It sits above the comparison with
+    // a warning glyph, a bold remedy and a red-tinted border (`.vf-ind.bad`).
     if (truncated)
         h += "<div class=\"vf-ind bad\">"
              "\xE2\x9A\xA0 This cohort is too large to compare reliably \xE2\x80\x94 the read hit the "

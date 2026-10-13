@@ -151,9 +151,9 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
                                const std::vector<std::pair<std::string, std::string>>& recent) {
     std::string h = kAutoCss;
     h += "<div class=\"af-page\">";
-    // Page title block: the design's Deployments artboard wording.
-    h += "<div class=\"af-ph\"><h1>Deployments</h1><p>Roll out software and patches in rings, check them "
-         "first, and roll back if needed.</p></div>";
+    // Page title block: the subtitle states what the page does, in the order the stages run.
+    h += "<div class=\"af-ph\"><h1>Deployments</h1><p>Check software rollouts first, deploy them, then "
+         "verify the result.</p></div>";
     h += "<div class=\"af-note\">"
          "Configure the checks (parameters + thresholds), run across a cohort, and get a go/no-go "
          "grouped by device. Runs persist \xE2\x80\x94 reopen one below to revisit it.</div>";
