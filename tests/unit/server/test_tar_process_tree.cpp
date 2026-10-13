@@ -16,6 +16,9 @@
 
 using namespace yuzu::server;
 
+// The TAR page shell is a raw-string constant in its own TU (tar_page_ui.cpp), at global scope.
+extern const char* const kTarPageHtml;
+
 namespace {
 
 TarProcEvent ev(std::int64_t ts, const char* action, std::uint32_t pid, std::uint32_t ppid,
@@ -645,6 +648,30 @@ TEST_CASE("render_tar_capture_sources: rows, badges, staged toggles, device attr
     CHECK(html.find("badge-pii") != std::string::npos);             // dns PII badge
     CHECK(html.find("stageCapToggle(this)") != std::string::npos);  // guardrail wiring
     CHECK(html.find("capApplyBar") != std::string::npos);           // push bar present
+}
+
+TEST_CASE("TAR page: the capture-sources push bar stays hidden until a change is staged",
+          "[tar][capture-sources][page]") {
+    const std::string status = "config|arp_enabled|false\n";
+    const std::string compat =
+        "header|source|os|status|capture_method|notes\nrow|arp|windows|supported|iphlpapi|x\n";
+    // The renderer emits the bar with the `hidden` attribute; refreshCapBar() flips it.
+    const std::string html = render_tar_capture_sources("agent-123", status, compat);
+    CHECK(html.find("id=\"capApplyBar\" hidden>") != std::string::npos);
+    // `.apply-bar { display: flex }` outranks the UA `[hidden]` rule, so without this override
+    // the bar is always visible ("0 pending changes").
+    const std::string page = kTarPageHtml;
+    CHECK(page.find(".apply-bar[hidden] { display: none; }") != std::string::npos);
+}
+
+TEST_CASE("TAR page: cell colour rules are table-prefixed so they outrank the td default",
+          "[tar][page]") {
+    // `.tar-frame-body td { color: var(--ink2) }` has specificity (0,1,1); a bare single-class
+    // cell rule (0,1,0) loses to it and the support-state / ARP-type colours never apply.
+    const std::string page = kTarPageHtml;
+    CHECK(page.find("#capTable .os-ok { color: var(--ok); }") != std::string::npos);
+    CHECK(page.find("#capTable .os-con { color: var(--warn); }") != std::string::npos);
+    CHECK(page.find(".devnet-table .arp-type-other { color: var(--warn); }") != std::string::npos);
 }
 
 TEST_CASE("render_tar_dns_panel: newest-first input is a load-bearing invariant (ADR-0015)",

@@ -138,6 +138,30 @@ TEST_CASE("page_routes: / serves the dashboard shell, ungated", "[server][routes
     CHECK_FALSE(r->body.empty());
 }
 
+// The store-degraded results row is <td class="empty-state result-degrade-banner">. A bare
+// `.result-degrade-banner` rule (0,1,0) loses its padding, colour and bottom border to
+// `#results-table td.empty-state` (1,1,1), so the page CSS must carry the td form. That form only
+// ties at (1,1,1), so it wins on source order: it must follow td.empty-state, and the frame rule
+// that swaps its border for an inset shadow (a collapsed header rule paints the top edge neutral)
+// must follow it in turn.
+TEST_CASE("page_routes: / dashboard CSS keeps the degraded results banner above td.empty-state",
+          "[server][routes][page_routes]") {
+    Harness h;
+    h.wire();
+
+    auto r = h.sink.Get("/");
+    REQUIRE(r);
+    const auto empty = r->body.find("#results-table td.empty-state {");
+    const auto banner =
+        r->body.find(".result-degrade-banner, #results-table td.result-degrade-banner {");
+    const auto frame = r->body.find("border: 0; box-shadow: inset 0 0 0 1px");
+    REQUIRE(empty != std::string::npos);
+    REQUIRE(banner != std::string::npos);
+    REQUIRE(frame != std::string::npos);
+    CHECK(banner > empty);
+    CHECK(frame > banner);
+}
+
 // ── Legacy redirects (2) ──────────────────────────────────────────────────
 
 TEST_CASE("page_routes: /chargen and /procfetch redirect to /, ungated",
