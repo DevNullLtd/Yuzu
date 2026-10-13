@@ -751,7 +751,8 @@ TEST_CASE("BaselineStore: a mutation that fails inside the database does not fir
     bool renamed_back = false;
     const auto restore_table = [&] {
         if (!renamed_back)
-            exec_sql_nothrow(db.dsn(), "ALTER TABLE baseline_store.baselines_broken RENAME TO baselines");
+            exec_sql_nothrow(db.dsn(),
+                             "ALTER TABLE baseline_store.baselines_broken RENAME TO baselines");
     };
     yuzu::test::ScopeExit restore{restore_table};
     row->description = "edited";

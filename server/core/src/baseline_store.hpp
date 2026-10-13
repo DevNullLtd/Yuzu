@@ -182,9 +182,8 @@ public:
     /// Post-mutation hook (#5513). Called by update_baseline, delete_baseline and a deployed
     /// create_baseline after the change COMMITTED and the pool lease was released: a deploy
     /// writes the new `deployed_snapshot`, a delete tears the Baseline down, and either changes
-    /// the deployed
-    /// member set the heartbeat reconcile pushes. The hook exists so a reconcile that is already
-    /// running can be told BEFORE the caller's own policy-generation bump (a separate lease,
+    /// the deployed member set the heartbeat reconcile pushes. The hook exists so a reconcile
+    /// that is already running can be told BEFORE the caller's own policy-generation bump (a separate lease,
     /// up to its write timeout) and fan-out run. It fires on every committed update, including
     /// edits that leave the deployed set unchanged (a rename, a draft edit): the store does not
     /// read the old row, and an extra invalidation only costs a reload. Contract: called on the
