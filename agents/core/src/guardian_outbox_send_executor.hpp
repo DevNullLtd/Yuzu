@@ -221,6 +221,7 @@ public:
         // logs below are about the OLD (orphaned) entry, never about `entry` (the
         // NEWLY offered one), so they must not use entry.event_id.
         std::string orphan_event_id;
+        std::uint64_t orphan_seq = 0; // #3972: the orphan's seq, captured with its event_id (same reason)
         {
             // Every branch below sets a FLAG rather than `return`ing directly, so the
             // lock is always released the ordinary way (this block's closing brace)
@@ -230,6 +231,7 @@ public:
             std::lock_guard<std::mutex> lk{state_->mu};
             if (state_->in_flight && state_->in_flight_event_id != entry.event_id) {
                 orphan_event_id = state_->in_flight_event_id;
+                orphan_seq = state_->in_flight_seq;
                 // The head entry changed under us (generation-supersede purge or a
                 // withdrawal - both ORDINARY operations, not a rare race) while a
                 // send for the OLD head was still running. That worker is orphaned
@@ -276,10 +278,10 @@ public:
         if (log_orphan_exception)
             log_orphan_exception_discarded();
         if (log_orphan_recovery)
-            log_send_recovery(orphan_event_id);
+            log_send_recovery(orphan_event_id, orphan_seq);
         if (mismatch_still_running) {
             if (log_mismatch_stall)
-                log_send_stall(orphan_event_id);
+                log_send_stall(orphan_event_id, orphan_seq);
             return SendResult::Retain;
         }
         if (stopping_retain)
@@ -337,7 +339,7 @@ public:
         if (!state_->done) {
             lk.unlock();
             if (log_new_stall)
-                log_send_stall(entry.event_id);
+                log_send_stall(entry.event_id, entry.seq);
             return std::nullopt; // still running; caller retains and comes back
         }
         auto result = state_->result;
@@ -352,9 +354,9 @@ public:
         state_->eptr = nullptr;
         lk.unlock();
         if (log_new_stall)
-            log_send_stall(entry.event_id);
+            log_send_stall(entry.event_id, entry.seq);
         if (log_recovery)
-            log_send_recovery(entry.event_id);
+            log_send_recovery(entry.event_id, entry.seq);
         if (eptr)
             std::rethrow_exception(eptr); // never rethrow while holding a lock a catch handler cannot see
         return result;
@@ -458,10 +460,12 @@ public:
         bool log_orphan_exception = false;
         bool log_orphan_recovery = false;
         std::string event_id;
+        std::uint64_t seq = 0;
         {
             std::lock_guard<std::mutex> lk{state_->mu};
             if (state_->in_flight) {
                 event_id = state_->in_flight_event_id;
+                seq = state_->in_flight_seq;
                 log_stall = check_stall_locked();
                 if (state_->done && lane_empty) {
                     const auto reclaimed = reclaim_done_orphan_locked();
@@ -474,11 +478,11 @@ public:
             out.snapshot = snapshot_locked();
         }
         if (log_stall)
-            log_send_stall(event_id);
+            log_send_stall(event_id, seq);
         if (log_orphan_exception)
             log_orphan_exception_discarded();
         if (log_orphan_recovery)
-            log_send_recovery(event_id);
+            log_send_recovery(event_id, seq);
         return out;
     }
 
@@ -635,19 +639,19 @@ private:
     /// observability failure (e.g. spdlog itself throwing) must never escape offer(),
     /// be miscounted as a send exception, or delay delivery - matches the established
     /// pattern at guardian_outbox_drain_worker.cpp's `firewalled` lambda.
-    static void log_send_stall(const std::string& event_id) {
+    static void log_send_stall(const std::string& event_id, std::uint64_t seq) {
         try {
-            spdlog::warn("Guardian outbox send stalled past its threshold (event_id {}); "
+            spdlog::warn("Guardian outbox send stalled past its threshold (event_id {}, seq {}); "
                          "drain continues, the send stays running detached.",
-                         ::yuzu::log_id_token(event_id));
+                         ::yuzu::log_id_token(event_id), seq);
         } catch (...) {
         }
     }
-    static void log_send_recovery(const std::string& event_id) {
+    static void log_send_recovery(const std::string& event_id, std::uint64_t seq) {
         try {
-            spdlog::info("Guardian outbox send (event_id {}) completed after having "
+            spdlog::info("Guardian outbox send (event_id {}, seq {}) completed after having "
                          "stalled past its threshold.",
-                         ::yuzu::log_id_token(event_id));
+                         ::yuzu::log_id_token(event_id), seq);
         } catch (...) {
         }
     }

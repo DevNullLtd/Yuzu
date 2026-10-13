@@ -4,6 +4,7 @@
 #include "guardian_lifecycle_journal.hpp"
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_id_token
 
 #include <algorithm>
 #include <chrono>
@@ -329,7 +330,22 @@ SendResult GuardianOutboxDrainWorker::wrapped_send(const OutboxEntry& entry) {
     bool blocked = false;
     bool blocker_running = false;
     std::uint64_t blocker_seq = 0;
-    if (entry.seq != 0) {
+    if (entry.seq == 0) {
+        // Ordering fails open for an unstamped entry. Every production enqueue path stamps a seq,
+        // so a nonzero count is a defect signal, not an expected state: count every occurrence,
+        // log the first per lane (the event id embeds the rule id, so it is tokenised, #4665).
+        h.unstamped.fetch_add(1, std::memory_order_relaxed);
+        if (!h.logged_unstamped) {
+            h.logged_unstamped = true;
+            try {
+                spdlog::warn("Guardian drain worker: {} lane (event_id {}): ordering is not enforced for an "
+                             "unstamped (seq 0) outbox entry; this should be unreachable on the production "
+                             "enqueue paths. Further occurrences counted only.",
+                             x == kLifecycleLane ? "lifecycle" : "compliance", ::yuzu::log_id_token(entry.event_id));
+            } catch (...) {
+            }
+        }
+    } else {
         try {
             const auto front = y == kLifecycleLane ? rt_.lifecycle_front_seq() : rt_.outbox_front_seq();
             const auto snap = exec_of(y).in_flight_snapshot();
@@ -342,6 +358,19 @@ SendResult GuardianOutboxDrainWorker::wrapped_send(const OutboxEntry& entry) {
             }
         } catch (...) {
             blocked = false;
+            // Still fails open (unchanged); the counter and the first-per-lane warn make the
+            // fault visible.
+            h.blocker_read_faults.fetch_add(1, std::memory_order_relaxed);
+            if (!h.logged_blocker_fault) {
+                h.logged_blocker_fault = true;
+                try {
+                    spdlog::warn("Guardian drain worker: {} lane blocker read threw; the cross-lane launch hold "
+                                 "fails open for this entry (event_id {}). Further occurrences counted only.",
+                                 x == kLifecycleLane ? "lifecycle" : "compliance",
+                                 ::yuzu::log_id_token(entry.event_id));
+                } catch (...) {
+                }
+            }
         }
     }
 
@@ -389,10 +418,11 @@ SendResult GuardianOutboxDrainWorker::wrapped_send(const OutboxEntry& entry) {
                     h.logged_release = true;
                     try {
                         spdlog::warn("Guardian drain worker: {} lane launch hold released after the {} ms cumulative "
-                                     "hold behind an older entry (blocker seq {}, held seq {}); up to {} entries may now "
-                                     "overtake it. Further releases counted only.",
+                                     "hold behind an older entry (blocker seq {}, held seq {}, held event_id {}); up to {} "
+                                     "entries may now overtake it. Further releases counted only.",
                                      x == kLifecycleLane ? "lifecycle" : "compliance",
                                      maint_.cross_lane_order_hold.count(), blocker_seq, entry.seq,
+                                     ::yuzu::log_id_token(entry.event_id),
                                      maint_.cross_lane_release_allowance);
                     } catch (...) {
                     }

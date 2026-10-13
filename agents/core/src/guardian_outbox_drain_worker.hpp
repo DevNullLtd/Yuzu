@@ -536,6 +536,14 @@ public:
     [[nodiscard]] std::uint64_t releases_for_test(OutboxDomain lane) const noexcept {
         return hold_[lane_of(lane)].releases.load(std::memory_order_relaxed);
     }
+    /// Test-only: entries with seq == 0 offered on that lane (ordering is not enforced for them),
+    /// and blocker reads on that lane that threw (the hold fails open). No production caller.
+    [[nodiscard]] std::uint64_t unstamped_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].unstamped.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t blocker_read_faults_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].blocker_read_faults.load(std::memory_order_relaxed);
+    }
 
     /// Test-only synchronization seam - see the call site in stop() for what race it
     /// exists to make deterministic (#3953 item 6). Production callers never set this.
@@ -642,9 +650,13 @@ private:
         bool sent_this_pass{false};
         bool blocker_running_this_pass{false};
         bool logged_release{false};       ///< log-once latch
+        bool logged_unstamped{false};     ///< log-once latch for the first seq == 0 entry on this lane
+        bool logged_blocker_fault{false}; ///< log-once latch for the first blocker-read throw on this lane
         std::atomic<std::uint64_t> last_blocker_seq{0};
         std::atomic<std::uint64_t> denials{0};
         std::atomic<std::uint64_t> releases{0};
+        std::atomic<std::uint64_t> unstamped{0};            ///< seq == 0 entries offered (ordering fails open)
+        std::atomic<std::uint64_t> blocker_read_faults{0};  ///< blocker reads that threw (fails open)
     };
     LaneHold hold_[2];
 

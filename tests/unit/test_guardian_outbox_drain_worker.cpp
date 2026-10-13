@@ -2001,6 +2001,9 @@ struct HoldSink {
     std::size_t retained[2]{0, 0};
     std::vector<Ev> log;
     std::function<void(const OutboxEntry&)> on_compliance_start; ///< runs outside the lock
+    /// Models GuardianEngine's stream_write_mu_ (the #3972 chaos case UP-13): when set, every send
+    /// holds it from just after its start event to just before returning. Set before start().
+    std::mutex* stream_mu{nullptr};
 
     SendResult operator()(const OutboxEntry& e) {
         const auto ln = lane_idx(e.domain);
@@ -2021,6 +2024,9 @@ struct HoldSink {
             on_compliance_start(e);
         if (throws[ln])
             throw std::runtime_error("hold test: injected send throw");
+        std::unique_lock<std::mutex> stream_lk;
+        if (stream_mu)
+            stream_lk = std::unique_lock<std::mutex>{*stream_mu};
         std::unique_lock<std::mutex> lk{mu};
         cv.wait(lk, [&] { return permits[ln] != 0; });
         if (permits[ln] > 0)
@@ -2748,6 +2754,35 @@ TEST_CASE("#3972 T10: an unstamped (seq == 0) entry is never held and never bloc
     CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1); // unchanged
 }
 
+TEST_CASE("#3972 T10b: an unstamped (seq == 0) entry is counted on its own lane; a stamped one is not",
+          "[spark][guardian][drain][order]") {
+    // The counter is the observable half of the fail-open diagnostic (the once-per-lane warn is
+    // not asserted: that would need spdlog capture). Health maps to the compliance lane.
+    HoldRig f(20, std::chrono::hours{1});
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 7, "l-7")) == SendResult::Sent);
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Compliance, 8, "c-8")) == SendResult::Sent);
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Lifecycle) == 0);
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Compliance) == 0);
+
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 0, "l-0a")) == SendResult::Sent);
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Lifecycle) == 1);
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Compliance) == 0);
+    // Counted on every occurrence, even though the warn is logged only once per lane.
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 0, "l-0b")) == SendResult::Sent);
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Lifecycle) == 2);
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Health, 0, "h-0")) == SendResult::Sent);
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Compliance) == 1);
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Health) == 1); // same lane as Compliance
+
+    // A stamped entry after an unstamped one does not move either counter.
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 9, "l-9")) == SendResult::Sent);
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Lifecycle) == 2);
+    // The blocker-read-fault counter has no injection seam without a production change; it
+    // stays at zero on every path above.
+    CHECK(f.worker->blocker_read_faults_for_test(OutboxDomain::Lifecycle) == 0);
+    CHECK(f.worker->blocker_read_faults_for_test(OutboxDomain::Compliance) == 0);
+}
+
 TEST_CASE("#3972 T11: denials are counted per lane and every release increments the fleet sum "
           "once",
           "[spark][guardian][drain][order]") {
@@ -2983,6 +3018,49 @@ TEST_CASE("#3972 chaos: compound jam - a throwing lifecycle head, steady verdict
         CHECK(releases >= 1); // O1
     CHECK(releases > 0);
     CHECK(overtakers <= releases * N + 2); // O2
+}
+
+TEST_CASE("#3972 chaos: a third sender holding the stream write mutex past H - the released send "
+          "parks on the mutex, nothing wedges, both sends complete once it is freed",
+          "[spark][guardian][drain][order][.chaos]") {
+    // Characterises UP-13 (accepted residual, #5690), not a guarantee. The hold gates LAUNCH, not
+    // the wire: in production the two lanes' sends contend on stream_write_mu_, so an older send
+    // that launched but has not yet acquired it can lose to a younger one released after H. The
+    // sink models the mutex (HoldSink::stream_mu); this test holds it from the test thread for
+    // longer than H. It does NOT assert which send acquires the mutex first: the hand-off order
+    // between waiters is OS-dependent, so any order assertion here would be a flake, not a pin.
+    // Hidden: run it by name ("#3972 chaos: ...") or with a '[drain]'/'[order]' positive filter.
+    std::mutex stream_mu;
+    HoldRig f(20, kHold, kAllowance);
+    f.sink.stream_mu = &stream_mu;
+    // Declared after `f` so a REQUIRE unwind unlocks it before ~HoldRig waits the sends out.
+    std::unique_lock<std::mutex> third_sender{stream_mu};
+
+    f.drift("cmp"); // a lifecycle `armed` (older), then a compliance verdict (younger)
+    f.start();
+
+    // The older lifecycle send launches and parks on the mutex (its start event is logged first).
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Lifecycle) == 1; }));
+    // The younger compliance entry is held, then released after H and launches while the older
+    // send is still parked: the release is counted and the released send is parked as well.
+    REQUIRE(spin_until([&] { return f.worker->releases_for_test(OutboxDomain::Compliance) == 1; }, 10s));
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 1; }, 10s));
+    CHECK(f.sink.n_ended(OutboxDomain::Lifecycle) == 0);
+    CHECK(f.sink.n_ended(OutboxDomain::Compliance) == 0);
+    CHECK(f.worker->cross_lane_order_release_count() == 1);
+    CHECK(f.lifecycle().in_flight_snapshot().running);
+    CHECK(f.compliance().in_flight_snapshot().running);
+
+    // The third sender lets go: both parked sends complete, in whichever order the OS picks, and
+    // the worker still joins promptly.
+    third_sender.unlock();
+    REQUIRE(spin_until([&] {
+        return f.sink.n_ended(OutboxDomain::Lifecycle) == 1 && f.sink.n_ended(OutboxDomain::Compliance) == 1;
+    }, 10s));
+    const auto t_stop = std::chrono::steady_clock::now();
+    f.worker->stop();
+    CHECK(std::chrono::steady_clock::now() - t_stop < 5s);
+    CHECK(spin_until([&] { return f.worker->active_send_workers() == 0; }, 5s));
 }
 
 TEST_CASE("#3972: the production defaults of the cross-lane hold are 1 s and 64 launches",
