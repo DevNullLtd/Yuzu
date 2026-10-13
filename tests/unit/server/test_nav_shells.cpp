@@ -370,6 +370,19 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         CHECK_THAT(html, !ContainsSubstring("context-bar"));
         // One identity read per page — the shell's, not a per-page copy.
         CHECK(count_of(html, "fetch('/api/me')") == 1);
+        // Sign out is `hx-post="/logout"`, so every page must load htmx (Help once did not,
+        // and the button did nothing there).
+        CHECK_THAT(html, ContainsSubstring("/static/htmx.js"));
+        // The shell script owns the Ctrl+K hand-off, behind its typing guard. A page-local
+        // handler that navigates to the palette runs first and bypasses that guard, so
+        // outside the shell block no page may carry the `?palette=1` hand-off as a string
+        // (the dashboard only mentions it in a comment, and reads the parameter on load).
+        const auto sb = html.find(kShellBegin);
+        const auto se = html.find(kShellEnd);
+        REQUIRE(sb != std::string::npos);
+        REQUIRE(se != std::string::npos);
+        const auto page_only = html.substr(0, sb) + html.substr(se);
+        CHECK(count_of(page_only, "palette=1'") + count_of(page_only, "palette=1\"") == 0);
     }
 }
 
