@@ -279,6 +279,77 @@ to the previous release's images. The gate has no override; the naming forms
 it checks are a second copy of the builders' naming, and its header lists
 where each lives.
 
+### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
+
+Every Linux native artifact carries the glibc / libstdc++ floor of the host
+that built it by accident (#5143). The gate makes the floor an explicit,
+committed promise and measures every build against it. **In S0 it is
+report-only: nothing it finds can fail a build or a release.** S2 turns it on.
+
+- **The script** runs `objdump -T` and `readelf -d` over every ELF under a
+  staging directory and compares the versioned symbols it imports
+  (`GLIBC_x.y`, `GLIBCXX_x.y.z`, `CXXABI_x.y.z`, `LIBSYSTEMD_n`, `BLKID_n`,
+  `OPENSSL_x.y.z`, anything else reported verbatim) with a floor file, by
+  numeric version. It also flags any forbidden symbol (`EVP_sm4_*`) and any
+  `RUNPATH`/`RPATH` entry not anchored at `$ORIGIN`. The header of
+  `scripts/ci/check-elf-floor.sh` is the canonical reference for the flags,
+  exit codes, floor-file schema and baseline schema. Two cases are errors,
+  not clean results: a directory with no ELF in it (an empty scan must never
+  read as clean) and an ELF the tools cannot read.
+- **Modes.** `--report-only` (the default) prints violations, emits
+  `::warning::` annotations and a job-summary table on GitHub Actions, and
+  exits 0. `--enforce` exits 1 on any violation. It is implemented and tested
+  but wired nowhere yet. Usage and configuration errors exit 2 in both modes.
+- **Floor files** are `deploy/packaging/linux-floor-agent.json` (glibc 2.28,
+  `GLIBCXX_3.4.25`, `CXXABI_1.3.11`, `LIBSYSTEMD` 239 plus the Red Hat
+  `LIBSYSTEMD_240` backport, `BLKID_1.0`) and
+  `deploy/packaging/linux-floor-server.json` (glibc 2.34, `GLIBCXX_3.4.29`,
+  `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
+  `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
+  measurement. Changing one is a floor decision (ADR-2003, "Floor review
+  rule"), not a tuning edit.
+- **Baseline.** `deploy/packaging/linux-floor-baseline.json` is the measured
+  gap of the v0.14.1 Linux x64 release artifacts (`agent`, `server` and
+  `gateway` sets: per ELF the highest tag per family and the offending
+  symbols). It is evidence, not an input: nothing reads it to decide pass or
+  fail. To regenerate it from a release, download and extract the release
+  tarballs into empty scratch directories, then run the script once per set
+  against the same output file (each run replaces only its own set):
+
+  ```bash
+  B=deploy/packaging/linux-floor-baseline.json; rm -f "$B"
+  scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-agent.json \
+    --dir <extracted yuzu-linux-x64> --exclude bin/yuzu-server --set-name agent \
+    --source "<tag> yuzu-linux-x64.tar.gz (all ELFs except bin/yuzu-server)" --emit-baseline "$B"
+  scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-server.json \
+    --dir <extracted yuzu-linux-x64> --include bin/yuzu-server --set-name server \
+    --source "<tag> yuzu-linux-x64.tar.gz (bin/yuzu-server)" --emit-baseline "$B"
+  scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-server.json \
+    --dir <extracted yuzu-gateway-X.Y.Z-linux-x64 directory> --set-name gateway \
+    --source "<tag> yuzu-gateway-linux-x64.tar.gz" --emit-baseline "$B"
+  ```
+
+  Point `--dir` at the directory that holds `bin/` and `erts-*`, not at its
+  parent, so artifact keys carry no version. Output is deterministic (sorted,
+  no timestamps or paths): a refresh diffs cleanly. The floor-review rule in
+  ADR-2003 says when to refresh it.
+- **Release wiring.** `release.yml`'s `build-linux` job runs the script
+  report-only on the staged tarball contents right after "Package archive"
+  (agent set, then server set) in a `continue-on-error` step, and uploads the
+  summaries, the full per-ELF reports and a `baseline.json` as the
+  `linux-elf-floor-report` artifact (14 days). The artifact deliberately has no
+  `yuzu-` prefix: the `release` job downloads every `yuzu-*` artifact. The
+  gateway tarball is not yet scanned in CI (S3 adds it).
+- **Pre-release QA.** `pre-release.yml`'s `install-rpm` matrix gained
+  `rockylinux:8` and `amazonlinux:2023` as **non-gating** legs
+  (`continue-on-error` via `matrix.experimental`). They are expected to fail
+  on 0.14.x artifacts until S2; a failure there does not turn the job, or the
+  QA report, red. S2 removes `experimental` from them.
+- **Tests.** `tests/shell/test_check_elf_floor.sh` (in preflight's "Shell gate
+  tests") builds fixture ELFs with `gcc` and a linker version script, so the
+  tags it checks are synthesized and the result does not depend on the host's
+  glibc.
+
 ### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
 
 A per-PR grep over `agents/plugins/*` and `agents/core` for a raw
@@ -563,7 +634,9 @@ than the tag under test (#5150). The other jobs check the following:
   later, and `stop` must succeed. A bare `ping` is not enough: it answers
   once Erlang distribution is up, even when the application refuses to
   start. The legs are ubuntu:22.04/24.04/26.04 and debian:12 for .deb, and
-  fedora:42 and rockylinux:9 for .rpm (installed with `dnf`). If a leg's libc
+  fedora:42 and rockylinux:9 for .rpm (installed with `dnf`); rockylinux:8 and
+  amazonlinux:2023 also run for .rpm but are non-gating (see "Linux ELF floor
+  gate"). If a leg's libc
   or libstdc++ is older than the build's, the job fails and names the glibc
   floor (#5143). A gateway whose crypto NIF cannot load is named as #5171. A
   missing package fails; it is not skipped (#5151).

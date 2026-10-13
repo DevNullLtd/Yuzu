@@ -446,15 +446,28 @@ jobs:
   #   gateway's bundled ERTS needs GLIBC_2.38 too, and #5171 is behind it.
   # - fedora:42, gateway: the bundled OTP crypto NIF needs OpenSSL SM4
   #   symbols Red Hat's OpenSSL lacks (#5171).
+  #
+  # NON-GATING legs (matrix.experimental, ADR-2003 slice S0): rockylinux:8 (the
+  # agent's glibc 2.28 floor) and amazonlinux:2023 are expected to FAIL on the
+  # 0.14.x artefacts until the EL8-built agent lands (ADR-2003 S2). They run so
+  # the gap is measured on every pre-release, and `continue-on-error` keeps a
+  # red one from failing the job or the QA report. S2 promotes them (deletes
+  # `experimental`) as it moves the floor into the build.
   install-rpm:
     name: "Install .rpm (${{ matrix.distro }})"
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
         distro: ["fedora:42", "rockylinux:9"]
+        include:
+          - distro: "rockylinux:8"
+            experimental: true
+          - distro: "amazonlinux:2023"
+            experimental: true
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
