@@ -7,8 +7,8 @@
 /// blocks the htmx eval attributes). Honesty: a `std::nullopt` data argument is a STORE DEGRADE → an
 /// "unavailable" banner, NEVER an empty table (authoritative reads, ADR-0016 §7 — an
 /// empty table reads as "installed nowhere"). A non-null but empty value is a genuine
-/// "no rows" and renders an honest empty note. The component CSS is inlined per
-/// fragment (the `.inv-*` namespace) — the same self-contained-fragment-CSS precedent
+/// "no rows" and renders an honest empty note. The component CSS is inlined once, with
+/// the full page (the `.inv-*` namespace) — the same self-contained-fragment-CSS precedent
 /// as device_routes' live snapshot (`.ls-*`).
 
 #include "inventory_routes.hpp"
@@ -105,8 +105,8 @@ std::string rel_time(std::int64_t now_secs, std::int64_t then_secs) {
     return std::to_string(d / 86400) + "d ago";
 }
 
-// Inlined component CSS — emitted once per top-level fragment so styling is present
-// on any tab entry point (duplicate <style> on a tab swap is idempotent/harmless).
+// Inlined component CSS — emitted once, at the head of the full /software page (sw_head);
+// the Results / Rows modes and the expansions swap into that page and rely on it.
 // Design tokens only (yuzu.css): bordered panels, one readout row, 36 px controls.
 std::string inv_style() {
     return R"css(<style>

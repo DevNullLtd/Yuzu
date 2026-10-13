@@ -24,8 +24,9 @@ std::string esc(const std::string& s) { return html_escape(s); }
 // KPI counts above are always exact. 100k-scale paging is a follow-up.
 constexpr int kRenderCapPerGroup = 500;
 
-// Reuses the `af-*` fields, buttons and panel from kAutoCss (preflight_ui.cpp): this
-// fragment only ever renders inside the /auto page. Design tokens only (yuzu.css).
+// Reuses the `af-*` fields, buttons, panel and device-group list (`af-grp`, `af-dev`,
+// `af-rhd`, `af-empty`) from kAutoCss (preflight_ui.cpp): this fragment only ever
+// renders inside the /auto page. Design tokens only (yuzu.css).
 const char* kDeployCss = R"CSS(<style>
 .dp-cohort{margin:0 0 14px;padding:12px 14px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:13.5px}
 .dp-cohort b{color:var(--ink)}
@@ -33,9 +34,7 @@ const char* kDeployCss = R"CSS(<style>
 #deploy-cfg .af-cfg:first-of-type{padding-top:0}
 .dp-warn{margin:14px 0;padding:12px 14px;border:1px solid color-mix(in srgb,var(--warn) 50%,var(--line2));border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:13.5px}
 .dp-warn b{color:var(--ink)}
-.dp-rhd{margin-bottom:12px;font-size:13px;color:var(--mut)}
-.dp-rhd b{color:var(--ink);font-weight:600}
-.dp-rhd .art{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--ink2)}
+.af-rhd .art{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--ink2)}
 .dp-kpis{display:flex;flex-wrap:wrap;margin:0 0 14px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
 .dp-kpi{flex:1 1 110px;padding:12px 16px;border-left:1px solid var(--line);user-select:none}
 .dp-kpi:first-child{border-left:0}
@@ -48,16 +47,7 @@ const char* kDeployCss = R"CSS(<style>
 .dp-bar i{display:block;height:100%}
 .dp-seg-ok{background:var(--ok)}.dp-seg-run{background:var(--info)}.dp-seg-stg{background:var(--primary)}.dp-seg-fail{background:var(--bad)}.dp-seg-skip{background:var(--line2)}
 .dp-prog{margin-bottom:14px;font-size:13px;color:var(--mut);font-variant-numeric:tabular-nums}
-.dp-grp{margin-bottom:16px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
-.dp-grp-hd{padding:12px 16px;border-bottom:1px solid var(--line);font-size:14px;font-weight:600;color:var(--ink)}
-.dp-grp-hd .c{font-weight:400;color:var(--mut)}
-.dp-dev{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
-.dp-dev:last-child{border-bottom:0}
-.dp-dev:hover{background:var(--surface2)}
-.dp-dev .hn{min-width:148px;font-weight:600;color:var(--ink);word-break:break-all}
-.dp-dev .hn a{color:var(--primary);text-decoration:none}.dp-dev .hn a:hover{color:var(--primary-h);text-decoration:underline}
-.dp-dev .os{min-width:118px;font-size:13px;color:var(--mut)}
-.dp-dev .prog{display:flex;flex:1;flex-wrap:wrap;align-items:center;gap:6px}
+.af-dev .prog{display:flex;flex:1;flex-wrap:wrap;align-items:center;gap:6px}
 .dp-step{padding:1px 8px;border-radius:3px;font-size:12.5px;font-weight:500;white-space:nowrap}
 .dp-step.done{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
 .dp-step.act{background:color-mix(in srgb,var(--info) 14%,transparent);color:var(--info)}
@@ -68,7 +58,6 @@ const char* kDeployCss = R"CSS(<style>
 .dp-detail.bad{color:var(--bad)}
 .dp-skip{font-size:13px;color:var(--warn)}
 .dp-more{padding:8px 16px;font-size:13px;color:var(--mut)}
-.dp-empty{display:none;padding:4px 0;font-size:13px;color:var(--mut)}
 </style>)CSS";
 
 struct DispBucket {
@@ -211,7 +200,7 @@ std::string render_deploy_results(const DeploymentRow& dep,
         h += " hx-get=\"" + esc(repoll_url) + "\" hx-trigger=\"load delay:900ms\" hx-swap=\"outerHTML\"";
     h += ">";
 
-    h += "<div class=\"dp-rhd\"><span class=\"art\">" + esc(dep.artifact_filename) +
+    h += "<div class=\"af-rhd\"><span class=\"art\">" + esc(dep.artifact_filename) +
          "</span> &middot; " + std::to_string(total) + (total == 1 ? " device" : " devices") +
          " &middot; " + std::to_string(settled) + "/" + std::to_string(total) + " settled &middot; " +
          esc(dep.status == "complete" ? "complete" : "deploying\xE2\x80\xA6") + "</div>";
@@ -262,8 +251,8 @@ std::string render_deploy_results(const DeploymentRow& dep,
                 ++n;
         if (n == 0)
             continue;
-        h += "<div class=\"dp-grp\" data-bucket=\"" + std::string(bkey) + "\">";
-        h += "<div class=\"dp-grp-hd\">" + std::string(title) + " <span class=\"c\">(" +
+        h += "<div class=\"af-grp\" data-bucket=\"" + std::string(bkey) + "\">";
+        h += "<div class=\"af-grp-hd\">" + std::string(title) + " <span class=\"c\">(" +
              std::to_string(n) + ")</span></div>";
         int rendered = 0;
         for (const auto& d : devices) {
@@ -276,7 +265,7 @@ std::string render_deploy_results(const DeploymentRow& dep,
             }
             ++rendered;
             const std::string host = d.hostname.empty() ? d.agent_id : d.hostname;
-            h += "<div class=\"dp-dev\" data-bucket=\"" + std::string(bkey) + "\">";
+            h += "<div class=\"af-dev\" data-bucket=\"" + std::string(bkey) + "\">";
             h += "<span class=\"hn\"><a href=\"/hardware/ci?id=" + esc(d.agent_id) + "\">" + esc(host) +
                  "</a></span>";
             h += "<span class=\"os\">" + esc(d.os.empty() ? "?" : d.os) + "</span>";
@@ -284,7 +273,7 @@ std::string render_deploy_results(const DeploymentRow& dep,
         }
         h += "</div>";
     }
-    h += "<div class=\"dp-empty\">No devices match this filter.</div>";
+    h += "<div class=\"af-empty\">No devices match this filter.</div>";
 
     if (repoll_url.empty() && dep.status == "complete")
         h += "<div class=\"gp-note\">Complete. <b>Succeeded</b> = exit 0; <b>Failed</b> = stage error "
@@ -300,10 +289,10 @@ std::string render_deploy_results(const DeploymentRow& dep,
     h += "<script>(function(){window.__dp=window.__dp||{b:'all'};var P=window.__dp;"
          "window.dpSet=function(b){P.b=(P.b===b?'all':b);window.dpApply();};"
          "window.dpApply=function(){var g=document.getElementById('dp-grid');if(!g)return;var vis=false;"
-         "g.querySelectorAll('.dp-grp').forEach(function(gr){var gb=gr.getAttribute('data-bucket');"
+         "g.querySelectorAll('.af-grp').forEach(function(gr){var gb=gr.getAttribute('data-bucket');"
          "var s=(P.b==='all'||P.b===gb);gr.style.display=s?'':'none';if(s)vis=true;});"
          "g.querySelectorAll('.dp-kpi[data-b]').forEach(function(k){k.classList.toggle('sel',k.getAttribute('data-b')===P.b);});"
-         "var e=g.querySelector('.dp-empty');if(e)e.style.display=vis?'none':'';};"
+         "var e=g.querySelector('.af-empty');if(e)e.style.display=vis?'none':'';};"
          "window.dpApply();})();</script>";
 
     h += "</div>";
