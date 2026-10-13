@@ -56,7 +56,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
     .tar-frame-body tbody tr:last-child td { border-bottom: 0; }
     .tar-frame-body tbody tr:hover td { background: var(--surface2); }
     .tar-frame-body th.r, .tar-frame-body td.r { text-align: right; }
-    .tar-frame-body code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+    .tar-content code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
     .tar-frame-body .source-pill {
       display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 3px;
       font-size: 12.5px; font-weight: 500; color: var(--warn);
@@ -65,7 +65,6 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
     .tar-frame-body .badge { height: auto; padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
     .tar-meta { font-size: 13px; color: var(--mut); }
     .tar-meta strong, .tar-meta b { color: var(--ink); font-weight: 600; }
-    .tar-mute { color: var(--mut); }
     .tar-frame-body .placeholder, .tar-frame-body .empty-state {
       text-align: center; color: var(--mut); font-size: 14px;
     }
@@ -113,10 +112,13 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
     .scope-chip-label, .picker-row label, .filter-label, .tt-filter-label {
       font-size: 13px; font-weight: 500; color: var(--ink2);
     }
-    .scope-chip-select, .tar-sql-name, .tar-tree-filter, .tar-tree-custom input[type="datetime-local"] {
-      height: var(--ctl); padding: 0 10px; min-width: 0; font: inherit; font-size: 14px;
+    .scope-chip-select, .tar-sql-name, .tar-tree-filter, .tar-tree-custom input[type="datetime-local"],
+    .tar-sql-textarea {
       color: var(--ink); background: var(--bg); border: 1px solid var(--line2);
       border-radius: var(--rad-ctl);
+    }
+    .scope-chip-select, .tar-sql-name, .tar-tree-filter, .tar-tree-custom input[type="datetime-local"] {
+      height: var(--ctl); padding: 0 10px; min-width: 0; font: inherit; font-size: 14px;
     }
     .scope-chip-select { max-width: 24rem; }
     .scope-chip-meta, .src-note { font-size: 12.5px; color: var(--mut); }
@@ -124,8 +126,6 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
     .tar-sql-textarea {
       width: 100%; min-height: 84px; padding: 8px 10px; resize: vertical;
       font-family: var(--mds-font-family-mono); font-size: 12.5px;
-      color: var(--ink); background: var(--bg); border: 1px solid var(--line2);
-      border-radius: var(--rad-ctl);
     }
     .tar-sql-textarea::placeholder, .tar-tree-filter::placeholder, .tar-sql-name::placeholder { color: var(--faint); }
     .tar-sql-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
@@ -134,8 +134,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
     .tar-sql-result { margin-top: 12px; font-size: 13.5px; color: var(--mut); }
     .tar-sql-result a { color: var(--primary); }
     .tar-sql-result code {
-      font-family: var(--mds-font-family-mono); font-size: 12.5px; color: var(--ink2);
-      background: var(--surface2); padding: 1px 6px; border-radius: 3px;
+      color: var(--ink2); background: var(--surface2); padding: 1px 6px; border-radius: 3px;
     }
     .tar-sql-result.error { color: var(--bad); }
 
@@ -172,7 +171,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
     .tar-tree-filter { flex: 1 1 12rem; min-width: 10rem; }
     .tar-tree-banner, .tar-tree-note, .tar-tree-warn, .tar-tree-empty, .tar-tree-loading,
     .tar-tree-nomatch { font-size: 13px; color: var(--mut); margin: 6px 0; }
-    .tar-tree-note code { font-family: var(--mds-font-family-mono); font-size: 12.5px; color: var(--ink2); }
+    .tar-tree-note code { color: var(--ink2); }
     .tar-tree-banner b { color: var(--ink); font-weight: 600; }
     .tar-tree-warn { color: var(--warn); }
     .tar-tree-mute, .tar-tree-pid { color: var(--mut); }
@@ -242,7 +241,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
     .tar-kv { display: flex; justify-content: space-between; gap: 16px; padding: 9px 16px; border-bottom: 1px solid var(--line); }
     .tar-kv-k { flex: 0 0 auto; color: var(--mut); }
     .tar-kv-v { min-width: 0; text-align: right; font-weight: 500; color: var(--ink); overflow-wrap: anywhere; }
-    code.tar-kv-v { font-family: var(--mds-font-family-mono); font-size: 12.5px; font-weight: 400; }
+    code.tar-kv-v { font-weight: 400; }
     .tar-kv-v.tar-tree-mute { font-weight: 400; color: var(--mut); }
     .tar-detail-section { padding: 12px 16px 8px; font-size: 13px; font-weight: 600; }
     .tar-detail-anom { padding: 10px 16px; color: var(--bad); border-bottom: 1px solid var(--line); }
@@ -278,12 +277,12 @@ R"HTM(
     .devnet-table th { position: sticky; top: 0; background: var(--surface2); text-align: left;
       padding: 6px 12px; color: var(--mut); font-weight: 500; border-bottom: 1px solid var(--line); }
     .devnet-table td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-    .dn-type { color: var(--ink); font-weight: 500; }
-    .dn-data, .arp-mac { color: var(--ink2); }
-    .dn-ttl { color: var(--mut); text-align: right; }
-    .dn-src, .arp-type-static { color: var(--mut); }
-    .arp-type-dynamic { color: var(--ink2); }
-    .arp-type-other { color: var(--warn); } /* incomplete / unresolved */
+    /* Table-prefixed so the cell colours outrank .tar-frame-body td */
+    .devnet-table .dn-type { color: var(--ink); font-weight: 500; }
+    .devnet-table .dn-data, .devnet-table .arp-mac, .devnet-table .arp-type-dynamic { color: var(--ink2); }
+    .devnet-table .dn-ttl { color: var(--mut); text-align: right; }
+    .devnet-table .dn-src, .devnet-table .arp-type-static { color: var(--mut); }
+    .devnet-table .arp-type-other { color: var(--warn); } /* incomplete / unresolved */
     .devnet-caveat { padding: 8px 16px; font-size: 12.5px; color: var(--mut); border-top: 1px solid var(--line); }
     .devnet-empty { padding: 28px 16px; text-align: center; color: var(--mut); font-size: 14px; }
 
@@ -296,9 +295,9 @@ R"HTM(
     .badge-pii { background: var(--mds-color-bg-warning-tinted); color: var(--warn); }
     .badge-rows { background: var(--surface2); color: var(--mut); font-family: var(--mds-font-family-mono); }
     .os-cell { font-size: 12.5px; white-space: nowrap; }
-    .os-ok { color: var(--ok); }
-    .os-con { color: var(--warn); }
-    .os-planned { color: var(--mut); }
+    #capTable .os-ok { color: var(--ok); }
+    #capTable .os-con { color: var(--warn); }
+    #capTable .os-planned { color: var(--mut); }
     /* Switch (design .sw): 36x20 track, 16px square knob */
     .tgl { position: relative; display: inline-block; flex: 0 0 36px; width: 36px; height: 20px; }
     .tgl input { opacity: 0; width: 0; height: 0; }

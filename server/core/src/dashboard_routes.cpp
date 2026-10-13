@@ -3254,7 +3254,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // the operator knows the row needs the agent upgraded rather than reading
         // "—" as "unknown / not paused".
         if (r.value_error) {
-            html += "<td colspan=\"2\"><span class=\"tar-mute\">reported <code>" +
+            html += "<td colspan=\"2\"><span class=\"tar-tree-mute\">reported <code>" +
                     html_escape(r.enabled_raw) + "</code></span></td>";
         } else if (r.paused_at == 0) {
             html += "<td colspan=\"2\"><span class=\"badge badge-warning\" title=\"this agent "
@@ -3266,7 +3266,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         }
         html += "<td class=\"r\">";
         if (r.live_rows < 0) {
-            html += "<span class=\"tar-mute\">—</span>";
+            html += "<span class=\"tar-tree-mute\">—</span>";
         } else {
             html += std::format("{}", r.live_rows);
         }
@@ -3291,7 +3291,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         html += "<td class=\"r\">";
         if (can_execute) {
             html += std::format(
-                "<button class=\"btn-secondary\" "
+                "<button class=\"btn-secondary btn-sm\" "
                 "hx-post=\"/fragments/tar/retention-paused/reenable\" "
                 "hx-vals='{{\"device_id\":\"{}\",\"source\":\"{}\"}}' "
                 "hx-target=\"closest tr\" hx-swap=\"delete\" "
@@ -3306,7 +3306,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             // native prompt) gates it — no hx-confirm. Data via HTML-escaped
             // data-* attrs (read by the JS), never interpolated into script.
             html += std::format(
-                "<button class=\"btn-danger\" "
+                "<button class=\"btn-danger btn-sm\" "
                 "data-device=\"{}\" data-host=\"{}\" data-source=\"{}\" "
                 "onclick=\"tarPurgeConfirm(this)\" "
                 "title=\"Permanently delete this source's stored data (source stays "

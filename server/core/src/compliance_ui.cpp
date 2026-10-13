@@ -75,19 +75,20 @@ extern const char* const kComplianceHtml =
     .policy-table tbody tr:last-child td, .detail-table tbody tr:last-child td { border-bottom: 0; }
     .policy-table tbody tr:hover td, .detail-table tbody tr:hover td { background: var(--surface2); }
     .policy-table td:last-child { text-align: right; }
-    .policy-idx { color: var(--faint); }
-    .policy-name { font-weight: 600; color: var(--ink); }
+    /* Cell classes carry the table prefix so they outrank the table's own td rule above */
+    .policy-table .policy-idx { color: var(--faint); }
+    .policy-table .policy-name { font-weight: 600; color: var(--ink); }
     .policy-scope, .mono-id {
       font-family: var(--mds-font-family-mono); font-size: 12.5px;
     }
-    .policy-scope { color: var(--mut); white-space: normal; min-width: 14ch; }
+    .policy-table .policy-scope { color: var(--mut); white-space: normal; min-width: 14ch; }
     .policy-pct { font-weight: 600; }
     .policy-pct.good { color: var(--ok); }
     .policy-pct.warn { color: var(--warn); }
     .policy-pct.bad  { color: var(--bad); }
-    .policy-count, .cell-mut { color: var(--mut); }
+    .policy-table .policy-count, .detail-table .cell-mut { color: var(--mut); }
     .policy-count { font-size: 12.5px; }
-    .cell-wrap { white-space: normal; }
+    .detail-table .cell-wrap { white-space: normal; }
 
     /* ── Mini compliance bars in table ─────────────────────── */
     .mini-bar {
