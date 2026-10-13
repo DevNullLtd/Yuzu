@@ -70,6 +70,7 @@
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
+#include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
 #include "response_export_metrics.hpp" // #4644/#4703: param-rejected counter (shared with REST)
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
@@ -1018,6 +1019,42 @@ static const ToolDef kTools[] = {
      "read whose audit row was dropped) — a genuinely nonexistent id writes no audit row.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed — the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
+
+    {"list_workflow_executions", "List workflow executions (runs) — WorkflowEngine's own multi-step "
+     "run records, a DIFFERENT data model from list_executions's single-instruction fan-out "
+     "Executions: a workflow run never appears there. Use it to see which runs happened, their "
+     "status and progress, then call get_workflow_execution with an id for the per-step results. "
+     "Rows are metadata only (id, workflow_id, workflow_name, workflow_deleted, status, "
+     "current_step, started_at, completed_at) — never agent ids, step results or a fleet-size "
+     "count. Newest first by (started_at, id); page with next_cursor passed back as cursor (null "
+     "when no more rows exist) — a cursor is a position only and does not bind the other filters. "
+     "latest_per_workflow=true returns at most one run per workflow (the newest among the runs "
+     "that pass the other filters and your visibility), ordered by workflow_id, with no cursor "
+     "(combining the two is refused) and result_truncated_by_cap true when more workflows matched "
+     "than limit. Requires Workflow:Read through the fleet-read gate (admit-then-filter): a "
+     "confined caller (management-group or service-scoped) sees only runs with at least one agent "
+     "in its scope, applied before ordering and the page limit, so hidden runs never consume a "
+     "page slot or shape a cursor. Input is strict: an unknown argument, an out-of-vocabulary "
+     "status, a malformed workflow_id/since/until/cursor, since after until, or limit below 1 is "
+     "refused as invalid params; limit above 500 is clamped. A store failure or statement timeout "
+     "is a retryable error carrying retry_after_ms, never an empty list. Mirrors REST GET "
+     "/api/v1/workflow-executions. Read-only; audited as the generic mcp.list_workflow_executions "
+     "on success (the gate audits a denial).",
+     R"j({"type":"object","properties":{)j"
+     R"j("workflow_id":{"type":"string","maxLength":128,"pattern":"^[A-Za-z0-9_-]{1,128}$","description":"Exact workflow filter"},)j"
+     R"j("status":{"type":"string","enum":["pending","running","completed","failed","cancelled"],"description":"Exact status filter"},)j"
+     R"j("since":{"type":"integer","minimum":0,"maximum":9007199254740992,"description":"Runs started at or after this epoch second"},)j"
+     R"j("until":{"type":"integer","minimum":0,"maximum":9007199254740992,"description":"Runs started strictly before this epoch second; must not be before since"},)j"
+     R"j("limit":{"type":"integer","default":50,"minimum":1,"maximum":500,"description":"Page size; above 500 is clamped"},)j"
+     R"j("cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page; not combinable with latest_per_workflow"},)j"
+     R"j("latest_per_workflow":{"type":"boolean","default":false,"description":"At most one (the newest visible) run per workflow, ordered by workflow_id"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("id":{"type":"string"},"workflow_id":{"type":"string"},"workflow_name":{"type":"string"},"workflow_deleted":{"type":"boolean","description":"True when the workflow was soft-deleted; its history is kept"},"status":{"type":"string"},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"})j"
+     R"j(},"required":["id","workflow_id","workflow_name","workflow_deleted","status","current_step","started_at","completed_at"]}},)j"
+     R"j("next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows exist"},)j"
+     R"j("result_truncated_by_cap":{"type":"boolean","description":"Present (true) only under latest_per_workflow when more workflows matched than limit"})j"
+     R"j(},"required":["executions","next_cursor"]})j"},
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
@@ -3862,6 +3899,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // gated on fleet_read_fn — a real confinement mechanism, so it earns the
     // `confined` tag (same precedent as query_responses/get_agent_details).
     {"get_workflow_execution", {"Workflow", "Read", ServiceScopeClass::confined}},
+    // The run LIST is the same data under the same gate: fleet_read_fn_ is its sole authorization
+    // and its scope is pushed into the store's SQL before ORDER BY/LIMIT (a real confinement
+    // mechanism, so `confined` is honest). kServiceScopeGlobalSafe is NOT widened.
+    {"list_workflow_executions", {"Workflow", "Read", ServiceScopeClass::confined}},
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     // #2146 Batch B2 -- result-set tools. `ResultSet` is NOT a seeded RBAC
@@ -4625,6 +4666,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_workflows", {ToolEffect::ReadOnly, true, "List workflows"}},
     {"get_workflow", {ToolEffect::ReadOnly, true, "Get workflow"}},
     {"get_workflow_execution", {ToolEffect::ReadOnly, true, "Get workflow execution"}},
+    {"list_workflow_executions", {ToolEffect::ReadOnly, true, "List workflow executions"}},
     {"validate_scope", {ToolEffect::ReadOnly, true, "Validate scope"}},
     {"preview_scope_targets", {ToolEffect::ReadOnly, true, "Preview scope targets"}},
     // #2146 Batch B2 -- result-set tools. The mechanical rule (readOnlyHint
@@ -11704,6 +11746,55 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto payload = workflow_execution_detail_json(**exec_result, gate.scope);
                 if (!audit_ok)
                     payload["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── list_workflow_executions ──────────────────────────────────
+            // The run LIST: same data model and gate as get_workflow_execution above. fleet_read_fn_
+            // is the SOLE gate (never paired with perm_fn on (Workflow, Read)); its scope goes to the
+            // WorkflowApi seam, whose store applies it before ORDER BY/LIMIT (ADR-0017 INV-3), so no
+            // post-fetch workflow_execution_visible() pass is needed or wanted here. Strict input, no
+            // success-path audit beyond the generic mcp_audit (REST writes none).
+            if (tool_name == "list_workflow_executions") {
+                if (!fleet_read_fn_) {
+                    spdlog::error(
+                        "list_workflow_executions: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Workflow", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                auto query = parse_workflow_execution_list_args(args);
+                if (!query) {
+                    // retry-hint-exempt: caller-input rejection, not a store fault.
+                    res.set_content(error_response(id, kInvalidParams, query.error()), "application/json");
+                    return;
+                }
+                if (!workflow_api_) {
+                    res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto page = workflow_api_->list_workflow_executions(*query, gate.scope);
+                if (!page) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                yuzu::server::genericize_db_error("list_workflow_executions",
+                                                                  page.error()),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                nlohmann::json payload{{"executions", workflow_execution_rows_json(*page)},
+                                       {"next_cursor", workflow_execution_next_cursor_json(*page)}};
+                if (page->truncated_by_cap)
+                    payload["result_truncated_by_cap"] = true;
+                mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                     "application/json");
