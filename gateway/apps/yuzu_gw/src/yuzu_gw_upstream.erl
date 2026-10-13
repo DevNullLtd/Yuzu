@@ -4,11 +4,116 @@
 %%% Proxies Register, Inventory, and stream status notifications
 %%% to the upstream server.
 %%%
+%%% Stream status notifications are held, not dropped (#4632):
+%%%   A notification is stored in a bounded pending store
+%%%   (yuzu_gw_notify_queue) and a drain step sends held entries first in first
+%%%   out, at most ?MAX_NOTIFY_INFLIGHT (10) at a time, each on its own
+%%%   monitored worker so the gen_server never blocks on one. Entries are held,
+%%%   not dropped, while the in-flight limit is reached and while the circuit
+%%%   breaker is open or half_open. The store key is {AgentId, SessionId,
+%%%   StreamHomeId}: a newer event for a held key replaces the held one (it
+%%%   keeps its place in the queue; counted as notify_coalesced; the one
+%%%   exception is the key of a half_open probe in flight, which is no longer
+%%%   held: a newer event for it is held at the tail of the queue), so a
+%%%   CONNECTED followed by a DISCONNECTED for one session sends only the
+%%%   DISCONNECTED, while two sessions of one agent are both kept. The cap
+%%%   notify_pending_max counts keys, not agents, and the key of a half_open probe
+%%%   in flight still counts toward it (a new key is admitted only while the held
+%%%   keys plus the probe's key stay below the cap); a notification for a new key
+%%%   over the cap is dropped and counted (notify_dropped, reason at_capacity).
+%%%   The store is volatile: it is lost when this process stops or restarts.
+%%%   The cap bounds the retained keys only; it is not a memory ceiling, and
+%%%   casts still queue in the mailbox while a ProxyRegister, ProxyInventory or
+%%%   replay RPC runs inside this process. While a registration replay is active
+%%%   one of the ten slots is held back, so a backlog that refills every freed
+%%%   slot cannot keep the replay drip waiting until the backlog is empty.
+%%%   The half_open probe has a deadline owned by this process,
+%%%   notify_probe_timeout_ms (default 15000, valid 100 to 300000): a probe worker
+%%%   that has not reported by then is killed and the probe fails like any failed
+%%%   probe (the event is given back, the breaker reopens with the longer backoff,
+%%%   the next half_open cycle sends a new probe). The vendored client's own
+%%%   bounds (connect, handshake, response) are library defaults an endpoint
+%%%   setting can remove; this deadline does not depend on them. It covers the
+%%%   probe only: a ProxyRegister, ProxyInventory or replay RPC runs inside this
+%%%   process and is bounded by the client alone.
+%%%
+%%% Standing invariant (#4632): the head held notification is the breaker probe.
+%%%   A notification that fails deterministically for its own payload would block
+%%%   the whole queue: it fails every probe, the breaker reopens with a longer
+%%%   backoff, and it goes back to the head. So every payload field an agent
+%%%   controls must be made safe at admission (yuzu_gw_peer_addr, applied in the
+%%%   notify_stream_status cast handler and where the Register call reads the
+%%%   :authority header). The peer address is the only such field the gateway
+%%%   sanitises: the agent id is bounded (1 to 256 bytes) at the gateway edge by
+%%%   yuzu_gw_agent_service:register/2 with the same condition the server applies,
+%%%   the session id is minted by the server, the rest is gateway
+%%%   configuration (cluster_id is converted to UTF-8 at boot).
+%%%   The general rule behind it: a LOCAL encode exception (the request could not
+%%%   be encoded, so it never left the gateway) says nothing about the upstream,
+%%%   so it never feeds the circuit breaker, as neither a success nor a failure.
+%%%   do_rpc returns it as {local_error, {Class, Why}}, a shape no server answer
+%%%   can take. A held notification that is the probe and fails that way can
+%%%   never encode, so it is evicted with a warning (not requeued) and the next
+%%%   head is probed at once; every other failure still requeues it.
+%%%   The same rule covers a server ANSWER that is about the request, not about
+%%%   the upstream (INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS,
+%%%   FAILED_PRECONDITION, OUT_OF_RANGE: the gRPC statuses for a wrong request;
+%%%   the server returns the first and the fourth on these RPCs today): on a
+%%%   live call it neither fails nor recovers the breaker, because counting it
+%%%   as a failure would open the breaker on a request that says nothing about
+%%%   the upstream, and counting it as a recovery would reset real failures. A
+%%%   probe answered that way is retired, not requeued (requeueing would be
+%%%   answered the same way by every probe, for ever). The one exception is a registration REPLAY answered
+%%%   FAILED_PRECONDITION: that is the server's authoritative answer that the
+%%%   presented session was superseded, and do_replay_one counts it as a breaker
+%%%   SUCCESS (record_result_no_replay({ok, superseded}, State)), so a run of
+%%%   stale replays after a reconnect storm cannot trip the breaker. A replay
+%%%   answered with any other request-fault status stays neutral.
+%%%   Every other status still counts as a failure: UNAVAILABLE, INTERNAL,
+%%%   DEADLINE_EXCEEDED, UNKNOWN, PERMISSION_DENIED, UNAUTHENTICATED,
+%%%   RESOURCE_EXHAUSTED (a server out of memory answers it), CANCELLED,
+%%%   UNIMPLEMENTED, ABORTED and DATA_LOSS, and so does every transport error,
+%%%   HTTP-level error and exception out of the client. A request over the
+%%%   server's 4 MiB receive limit is refused here as a local encode failure
+%%%   (never sent), instead of being answered RESOURCE_EXHAUSTED by the server.
+%%%
+%%% The half_open probe (#4632):
+%%%   Held entries are not sent while the breaker is open. When it goes half_open
+%%%   (and when work first arrives while it is half_open) the HEAD held entry is
+%%%   sent as the probe, and the breaker is driven by its result. Without it a
+%%%   held entry could wait forever after the server recovered: a disconnected
+%%%   session sends no heartbeat, and a known session needs no verdict. Only one
+%%%   probe is out at a time, it counts in the ten worker budget, and while the
+%%%   breaker is half_open nothing else drains while it is out (if a call path RPC
+%%%   closes the breaker meanwhile, the closed drain runs as usual). The probe
+%%%   worker sends its result to this process before it exits; the result
+%%%   carries the breaker generation (cb_gen, bumped on every entry into
+%%%   half_open) it was sent under.
+%%%     - The event is retired on ok. On error it goes back to the head of the
+%%%       store, unless a newer event for the same key was held meanwhile: that
+%%%       one wins and the old one is dropped (counted as notify_coalesced). One
+%%%       slot is held back from the cap while a probe is out, so that the
+%%%       give-back always fits. On a local encode exception the event is evicted instead (a
+%%%       warning names the agent and the reason), it is neither retired as sent
+%%%       nor given back, and the breaker is not touched.
+%%%     - The breaker is moved only when it is still half_open under the SAME
+%%%       generation: ok closes it (and casts the replay), error reopens it with
+%%%       doubled backoff (a local encode exception does neither). In any other
+%%%       state or generation the result does not
+%%%       touch the breaker (a call path RPC may have closed or reopened it
+%%%       meanwhile; a breaker that is open has no on_success or on_failure).
+%%%     - A probe worker that dies without a result is an error (worker_down),
+%%%       once: the record is cleared by whichever of result or 'DOWN' comes
+%%%       first, and a result is always delivered before the 'DOWN' of its
+%%%       sender.
+%%%   Ordinary workers never report to the breaker.
+%%%
 %%% Includes a circuit breaker to prevent cascading failures when the
 %%% upstream server is unreachable. States:
 %%%   closed    — RPCs pass through; consecutive failures tracked
 %%%   open      — RPCs fail immediately with {error, circuit_open}
 %%%   half_open — one probe RPC allowed; success closes, failure reopens
+%%%               (a call path RPC, or one held notification as the probe)
 %%%
 %%% Registration replay on reconnect:
 %%%   When the upstream connection re-establishes after a failure, the
@@ -37,15 +142,23 @@
 %%%   that arrives half_open is queued, and its first replay RPC is the probe.
 %%%
 %%% Configuration (sys.config / application env):
-%%%   circuit_breaker_failure_threshold   — consecutive failures to trip (default 5)
-%%%   circuit_breaker_reset_timeout_ms    — initial open duration (default 10000)
-%%%   circuit_breaker_max_reset_timeout_ms — max backoff cap (default 300000)
+%%%   circuit_breaker_failure_threshold   - consecutive failures to trip
+%%%                                          (default 5, valid 1..1000)
+%%%   circuit_breaker_reset_timeout_ms    - initial open duration
+%%%                                          (default 10000, valid 100..3600000)
+%%%   circuit_breaker_max_reset_timeout_ms - max backoff cap
+%%%                                          (default 300000, valid 100..3600000;
+%%%                                          raised to the initial duration when
+%%%                                          it is below it, with a warning)
 %%%   registration_replay_spacing_ms      - gap between replay RPCs
 %%%                                          (default 20, valid 0..60000)
 %%%   registration_replay_session_guard_ms - how long a replayed session is not
 %%%                                          queued again by a verdict
 %%%                                          (default 10000, valid 0..3600000)
 %%%   registration_replay_queue_max       - most agents the replay queue holds
+%%%                                          (default 10000, valid 1..1000000)
+%%%   notify_pending_max                  - most stream-status notification keys
+%%%                                          held while they cannot be sent
 %%%                                          (default 10000, valid 1..1000000)
 %%   cluster_id                          — this gateway's trust-zone/region id,
 %%                                          stamped on every StreamStatusNotification
@@ -88,14 +201,34 @@
 -define(MIN_CALL_TIMEOUT_MS, 100).
 -define(MAX_CALL_TIMEOUT_MS, 300000).
 -define(DEFAULT_CB_THRESHOLD, 5).
+%% The valid range of circuit_breaker_failure_threshold: 0 would trip the breaker
+%% on the first failure, and a value past 1000 is not a threshold.
+-define(MIN_CB_THRESHOLD, 1).
+-define(MAX_CB_THRESHOLD, 1000).
 -define(DEFAULT_CB_RESET_MS, 10000).
 -define(DEFAULT_CB_MAX_RESET_MS, 300000).
+%% The valid range of both circuit_breaker_*reset_timeout_ms keys (100 ms to 1 h).
+%% The floor keeps the half_open probe from becoming a ~1 kHz loop (a 1 ms base
+%% or cap reopens and re-probes every millisecond).
+-define(MIN_CB_TIMEOUT_MS, 100).
+-define(MAX_CB_TIMEOUT_MS, 3600000).
 -define(DEFAULT_REPLAY_SPACING_MS, 20).
 -define(MAX_REPLAY_SPACING_MS, 60000).
 -define(DEFAULT_REPLAY_SESSION_GUARD_MS, 10000).
 -define(MAX_REPLAY_SESSION_GUARD_MS, 3600000).
 -define(DEFAULT_REPLAY_QUEUE_MAX, 10000).
 -define(MAX_REPLAY_QUEUE_MAX, 1000000).
+-define(DEFAULT_NOTIFY_PENDING_MAX, 10000).
+-define(MAX_NOTIFY_PENDING_MAX, 1000000).
+%% The deadline the gateway itself puts on a half_open notify probe (#4632): after
+%% this long without a result the probe worker is killed and the probe fails like
+%% any other failed probe. The default is of the order of the vendored client's own
+%% bounds for one call (connect 5 s, handshake 4.5 s, response 5 s, which the
+%% gateway does not control); 100 ms to 5 min is the range of the sibling
+%% upstream_call_timeout_ms.
+-define(DEFAULT_NOTIFY_PROBE_TIMEOUT_MS, 15000).
+-define(MIN_NOTIFY_PROBE_TIMEOUT_MS, 100).
+-define(MAX_NOTIFY_PROBE_TIMEOUT_MS, 300000).
 %% Most session ids one replay_sessions cast may name. The same bound as
 %% ?MAX_VERDICT_IDS in yuzu_gw_heartbeat_buffer, which applies it before the
 %% cast; keep the two equal.
@@ -108,8 +241,55 @@
 %% encode_command_request/1 in yuzu_gw_proto.erl for the forwarding half.
 -define(WIRE_CAP_DISPATCH_TAG_V1, <<"command_dispatch_tag_v1">>).
 
+%% The tag of the exception encode_request/2 raises: the request could not be
+%% encoded in this process (see do_rpc/4).
+-define(LOCAL_ENCODE_FAILED, yuzu_gw_local_encode_failed).
+
+%% The largest request the server accepts: the receive limit of a stock gRPC
+%% server (4 MiB; no SetMaxReceiveMessageSize override exists on the server). A
+%% request over that bound can still arrive at this module, and the server would
+%% answer RESOURCE_EXHAUSTED before its handler runs. That is a fact about the
+%% request, so encode_request/2 refuses it here as a local encode failure, and
+%% RESOURCE_EXHAUSTED stays a status that counts against the upstream (a server
+%% out of memory or threads answers it too).
+-define(MAX_REQUEST_BYTES, 4194304).
+
+%% The statuses that say the request was wrong, not that the upstream is
+%% unhealthy: INVALID_ARGUMENT (the server's agent id and enrollment field
+%% checks) and FAILED_PRECONDITION (a superseded replay) are the two the server
+%% returns on these RPCs today; NOT_FOUND, ALREADY_EXISTS and OUT_OF_RANGE are
+%% the same class by the gRPC definition (the server never returns them here).
+%% Such an answer proves nothing about the upstream, so on a live call it neither
+%% fails nor recovers the breaker (see record_result/2); the one exception, a
+%% replay answered FAILED_PRECONDITION, is a breaker success (do_replay_one).
+%% Every other status counts.
+-define(IS_REQUEST_FAULT(Status), (Status =:= ?GRPC_STATUS_INVALID_ARGUMENT orelse
+                                   Status =:= ?GRPC_STATUS_NOT_FOUND orelse
+                                   Status =:= ?GRPC_STATUS_ALREADY_EXISTS orelse
+                                   Status =:= ?GRPC_STATUS_FAILED_PRECONDITION orelse
+                                   Status =:= ?GRPC_STATUS_OUT_OF_RANGE)).
+
+%% What do_rpc returns. A local_error is an exception raised by the request
+%% encoder in this process: the request never left the gateway.
+-type rpc_result() :: {ok, term()} | {error, term()} | {local_error, {atom(), term()}}.
+
+-type notify_probe() :: #{pid   := pid(),
+                          mref  := reference(),
+                          %% The deadline timer: a {notify_probe_timeout, Pid, Gen}
+                          %% message to this process, cancelled when the probe resolves.
+                          timer := reference(),
+                          gen   := non_neg_integer(),
+                          key   := yuzu_gw_notify_queue:key(),
+                          event := yuzu_gw_notify_queue:event()}.
+
 -record(state, {
     notify_pids     :: #{pid() => true},
+    %% Stream-status notifications held until a worker slot is free and the
+    %% breaker is closed. Volatile: it does not outlive this process.
+    notify_pending  :: yuzu_gw_notify_queue:t(),
+    notify_pending_max :: pos_integer(),
+    %% How long a half_open notify probe may run before it is killed (ms).
+    notify_probe_timeout_ms :: pos_integer(),
     %% Circuit breaker state
     cb_state        :: closed | open | half_open,
     cb_failures     :: non_neg_integer(),
@@ -118,6 +298,13 @@
     cb_max_timeout  :: non_neg_integer(),
     cb_cur_timeout  :: non_neg_integer(),
     cb_timer        :: reference() | undefined,
+    %% The number of times the breaker entered half_open, and the held
+    %% notification currently sent as the half_open probe (its worker, monitor,
+    %% the generation it was started under, and the store key and event it
+    %% took out of the store so a failure can give it back). The event stays
+    %% out of format_status.
+    cb_gen          = 0 :: non_neg_integer(),
+    notify_probe    = undefined :: undefined | notify_probe(),
     %% Registration replay on upstream reconnect
     replay_spacing  :: non_neg_integer(),
     replay_queue    :: [{binary(), binary() | undefined, map()}],  %% agents still to re-proxy ([] = idle)
@@ -223,9 +410,40 @@ call_timeout() ->
 %%%===================================================================
 
 init([]) ->
-    Threshold  = application:get_env(yuzu_gw, circuit_breaker_failure_threshold, ?DEFAULT_CB_THRESHOLD),
-    BaseTimeout = application:get_env(yuzu_gw, circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS),
-    MaxTimeout  = application:get_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, ?DEFAULT_CB_MAX_RESET_MS),
+    %% cluster_id is stamped on every notification as a protobuf string, so it is
+    %% converted with the unicode conversion, not list_to_binary/1 (which would
+    %% truncate a code point above 127 to latin-1, not valid UTF-8). The boot
+    %% check in yuzu_gw_app refuses an unrepresentable value first; this is the
+    %% second line (the reason names the cause, never the value).
+    case yuzu_gw_env:utf8_binary(application:get_env(yuzu_gw, cluster_id, <<"default">>)) of
+        {ok, ClusterId} -> init_state(ClusterId);
+        error           -> {stop, {invalid_cluster_id, app_env}}
+    end.
+
+init_state(ClusterId) ->
+    %% The threshold and both timeouts are validated. A threshold of 0 would trip
+    %% the breaker on the first failure; a reset timeout under the floor would make
+    %% the half_open probe a near hot loop (trip_circuit doubles a tiny base).
+    %% Anything outside the range warns naming the key and takes the default.
+    Threshold   = yuzu_gw_env:env_int(circuit_breaker_failure_threshold, ?DEFAULT_CB_THRESHOLD,
+                                      ?MIN_CB_THRESHOLD, ?MAX_CB_THRESHOLD),
+    BaseTimeout = yuzu_gw_env:env_int(circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS,
+                                      ?MIN_CB_TIMEOUT_MS, ?MAX_CB_TIMEOUT_MS),
+    MaxTimeout0 = yuzu_gw_env:env_int(circuit_breaker_max_reset_timeout_ms,
+                                      ?DEFAULT_CB_MAX_RESET_MS,
+                                      ?MIN_CB_TIMEOUT_MS, ?MAX_CB_TIMEOUT_MS),
+    %% Whether the operator set a usable cap: an unset or rejected key left the
+    %% default in force, and the clamp warning must not present that default as a
+    %% value the operator configured.
+    MaxConfigured = case application:get_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms) of
+                        {ok, V} when is_integer(V), V >= ?MIN_CB_TIMEOUT_MS,
+                                     V =< ?MAX_CB_TIMEOUT_MS -> true;
+                        _                                   -> false
+                    end,
+    %% The cap is never below the initial duration: trip_circuit takes the first
+    %% open period from the base but caps the NEXT one, so a base above the cap
+    %% would open for the base and then shorten (the default cap is 300000).
+    MaxTimeout  = clamp_max_timeout(BaseTimeout, MaxTimeout0, MaxConfigured),
     ReplaySpacing = yuzu_gw_env:env_int(registration_replay_spacing_ms,
                                     ?DEFAULT_REPLAY_SPACING_MS, 0, ?MAX_REPLAY_SPACING_MS),
     SessionGuard = yuzu_gw_env:env_int(registration_replay_session_guard_ms,
@@ -233,15 +451,29 @@ init([]) ->
                                    ?MAX_REPLAY_SESSION_GUARD_MS),
     QueueMax = yuzu_gw_env:env_int(registration_replay_queue_max,
                                ?DEFAULT_REPLAY_QUEUE_MAX, 1, ?MAX_REPLAY_QUEUE_MAX),
-    ClusterId = ensure_binary(application:get_env(yuzu_gw, cluster_id, <<"default">>)),
+    NotifyPendingMax = yuzu_gw_env:env_int(notify_pending_max,
+                                           ?DEFAULT_NOTIFY_PENDING_MAX, 1,
+                                           ?MAX_NOTIFY_PENDING_MAX),
+    ProbeTimeout = yuzu_gw_env:env_int(notify_probe_timeout_ms,
+                                       ?DEFAULT_NOTIFY_PROBE_TIMEOUT_MS,
+                                       ?MIN_NOTIFY_PROBE_TIMEOUT_MS,
+                                       ?MAX_NOTIFY_PROBE_TIMEOUT_MS),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
                 "replay_spacing=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
-                "cluster_id=~s)",
-                [Threshold, BaseTimeout, ReplaySpacing, SessionGuard, QueueMax, ClusterId]),
+                "notify_pending_max=~b, notify_probe_timeout=~bms, cluster_id=~ts)",
+                [Threshold, BaseTimeout, ReplaySpacing, SessionGuard, QueueMax,
+                 NotifyPendingMax, ProbeTimeout, ClusterId]),
+
+    %% A restarted instance counts only its own workers, so the gauges start
+    %% from zero here (workers of an earlier instance are unlinked and uncounted).
+    emit_notify_queue(0, 0),
 
     {ok, #state{
         notify_pids     = #{},
+        notify_pending  = yuzu_gw_notify_queue:new(NotifyPendingMax),
+        notify_pending_max = NotifyPendingMax,
+        notify_probe_timeout_ms = ProbeTimeout,
         cb_state        = closed,
         cb_failures     = 0,
         cb_threshold    = Threshold,
@@ -258,6 +490,25 @@ init([]) ->
         cluster_id      = ClusterId
     }}.
 
+%% The effective cap: the configured one, or the initial duration when the cap is
+%% below it. The warning names the configuration that did not take effect: the
+%% configured cap when the operator set one, otherwise the default cap, said to
+%% be the default (the operator never wrote that number).
+clamp_max_timeout(Base, Max, _Configured) when Max >= Base ->
+    Max;
+clamp_max_timeout(Base, Max, true) ->
+    logger:warning("circuit_breaker_max_reset_timeout_ms (~b) is below "
+                   "circuit_breaker_reset_timeout_ms (~b); using ~b for both",
+                   [Max, Base, Base]),
+    Base;
+clamp_max_timeout(Base, Max, false) ->
+    logger:warning("circuit_breaker_reset_timeout_ms (~b) is above the default "
+                   "circuit_breaker_max_reset_timeout_ms (~b, not set or rejected); the maximum "
+                   "backoff is raised to ~b. Set circuit_breaker_max_reset_timeout_ms "
+                   "to choose it.",
+                   [Base, Max, Base]),
+    Base.
+
 handle_call(circuit_state, _From, #state{cb_state = CbState} = State) ->
     {reply, CbState, State};
 
@@ -266,9 +517,10 @@ handle_call({proxy_register, RegisterReq}, _From, State) ->
         {reject, State1} ->
             {reply, {error, circuit_open}, State1};
         {allow, State1} ->
+            Before = notify_counts(State1),
             Result = do_rpc('ProxyRegister', RegisterReq, register),
-            State2 = record_result(Result, State1),
-            {reply, Result, State2}
+            State2 = drain(record_result(Result, State1)),
+            {reply, public_result(Result), report_notify_counts(Before, State2)}
     end;
 
 handle_call({proxy_inventory, InventoryReport}, _From, State) ->
@@ -276,73 +528,92 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
         {reject, State1} ->
             {reply, {error, circuit_open}, State1};
         {allow, State1} ->
+            Before = notify_counts(State1),
             Result = do_rpc('ProxyInventory', InventoryReport, inventory),
-            State2 = record_result(Result, State1),
-            {reply, Result, State2}
+            State2 = drain(record_result(Result, State1)),
+            {reply, public_result(Result), report_notify_counts(Before, State2)}
     end;
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
-handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr, StreamHomeId},
-            #state{notify_pids = Pids, cb_state = CbState, cluster_id = ClusterId} = State) ->
-    %% Don't spawn notifications if circuit is open
-    case CbState of
-        open ->
-            logger:debug("Dropping stream status notification for ~s (circuit open)", [AgentId]),
-            %% HA WS-4 4.4 review fix (F2): this drop was previously
-            %% invisible — no telemetry, only a debug log line, matching
-            %% the guardian-forward path's own forward_dropped counter
-            %% (yuzu_gw_guardian_forward_tests.erl). A dropped CONNECTED for
-            %% an ADOPTED replay session (the reannounce mechanism this
-            %% slice added) means the server's placement stays wiped with
-            %% NO observable signal — an I6a false-assurance risk.
-            telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                              #{count => 1}, #{reason => <<"circuit_open">>}),
-            {noreply, State};
-        _ ->
-            case map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT of
-                true ->
-                    logger:debug("Dropping stream status notification for ~s (at capacity)", [AgentId]),
-                    telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                                      #{count => 1}, #{reason => <<"at_capacity">>}),
-                    {noreply, State};
-                false ->
-                    Notification = #{
-                        agent_id     => AgentId,
-                        session_id   => ensure_binary(SessionId),
-                        event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
-                        peer_addr    => PeerAddr,
-                        gateway_node => atom_to_binary(node(), utf8),
-                        %% HA WS-4 4.1 — this gateway's configured cluster id
-                        %% (yuzu_gw env `cluster_id` / YUZU_GW_CLUSTER_ID), so
-                        %% the server's routing directory can record which
-                        %% cluster owns this agent's live stream.
-                        cluster_id   => ClusterId,
-                        %% CC-03: advertised on every notification (connect and
-                        %% disconnect alike) — the server only needs to observe
-                        %% it once per gateway build, and sending it unconditionally
-                        %% avoids a connect-only special case here.
-                        wire_capabilities => [?WIRE_CAP_DISPATCH_TAG_V1],
-                        %% HA WS-4 (#4324) — opaque id minted once per
-                        %% yuzu_gw_agent process instance and passed through
-                        %% verbatim here on both CONNECTED and DISCONNECTED,
-                        %% so the server can fence a stale DISCONNECTED from
-                        %% tearing down a newer re-home under the same
-                        %% reused session id.
-                        stream_home_id => StreamHomeId
-                    },
-                    {Pid, _MonRef} = spawn_monitor(fun() ->
-                        case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
-                            {ok, _} -> ok;
-                            {error, Reason} ->
-                                logger:warning("Failed to notify stream status for ~s: ~p",
-                                               [AgentId, Reason])
-                        end
-                    end),
-                    {noreply, State#state{notify_pids = Pids#{Pid => true}}}
-            end
-    end;
+handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamHomeId},
+            #state{notify_pending = Pending, notify_probe = Probe,
+                   cluster_id = ClusterId} = State) ->
+    Before = notify_counts(State),
+    %% The peer address is agent supplied: make it encodable and bounded before
+    %% anything is built from it, so the held notification can never fail the
+    %% same way on every send (see the standing invariant in the module header).
+    PeerAddr = sanitize_peer_addr(AgentId, PeerAddr0),
+    Notification = #{
+        agent_id     => AgentId,
+        session_id   => ensure_binary(SessionId),
+        event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
+        peer_addr    => PeerAddr,
+        gateway_node => atom_to_binary(node(), utf8),
+        %% HA WS-4 4.1 — this gateway's configured cluster id
+        %% (yuzu_gw env `cluster_id` / YUZU_GW_CLUSTER_ID), so
+        %% the server's routing directory can record which
+        %% cluster owns this agent's live stream.
+        cluster_id   => ClusterId,
+        %% CC-03: advertised on every notification (connect and
+        %% disconnect alike) — the server only needs to observe
+        %% it once per gateway build, and sending it unconditionally
+        %% avoids a connect-only special case here.
+        wire_capabilities => [?WIRE_CAP_DISPATCH_TAG_V1],
+        %% HA WS-4 (#4324) — opaque id minted once per
+        %% yuzu_gw_agent process instance and passed through
+        %% verbatim here on both CONNECTED and DISCONNECTED,
+        %% so the server can match a DISCONNECTED to the
+        %% stream home it tears down. One process owns a
+        %% session for its whole life today, so this is a
+        %% matching key, not a guard against a second home.
+        stream_home_id => StreamHomeId
+    },
+    %% #4632: hold the notification instead of dropping it when no slot is free
+    %% or the breaker is not closed. Latest event wins within a key (so a
+    %% CONNECTED followed by a DISCONNECTED for one session sends only the
+    %% DISCONNECTED); two sessions of one agent are two keys. While a half_open
+    %% probe is out one slot is held back, so the probe's event always fits back
+    %% if the probe fails.
+    Key = {AgentId, maps:get(session_id, Notification), StreamHomeId},
+    %% The probe's own key is the exception: take/1 removed it from the store,
+    %% but its slot is already the one reserved above, so a newer event for that
+    %% key is a replacement of a held key and must not be charged a second slot
+    %% (else at a full store the newer event is dropped and the stale probe event
+    %% is requeued). If the probe fails, push_front/3 finds the newer event still
+    %% held (if a call path RPC closed the breaker meanwhile, the drain may
+    %% already have sent it, and the old event is then given back and sent after
+    %% it) and supersedes the old one; if the probe succeeds, the newer one is
+    %% sent later. Either way the store stays within notify_pending_max.
+    Reserved = case Probe of
+                   undefined         -> 0;
+                   #{key := Key}     -> 0;
+                   #{}               -> 1
+               end,
+    State1 =
+        case yuzu_gw_notify_queue:put(Key, {AgentId, Notification}, Reserved, Pending) of
+            {new, Pending1} ->
+                State#state{notify_pending = Pending1};
+            {replaced, Pending1} ->
+                telemetry:execute([yuzu, gw, upstream, notify_coalesced],
+                                  #{count => 1}, #{}),
+                State#state{notify_pending = Pending1};
+            {full, _Unchanged} ->
+                %% HA WS-4 4.4 review fix (F2): a drop is never invisible. A
+                %% dropped CONNECTED for an ADOPTED replay session (the
+                %% reannounce mechanism) leaves the server's placement wiped
+                %% with no other signal, so it is counted. This is admission
+                %% loss only: admitting the key would bring the held keys (plus the
+                %% key of a half_open probe in flight, which still counts) up to
+                %% notify_pending_max.
+                logger:debug("Dropping stream status notification for ~s (pending store full)",
+                             [yuzu_gw_env:log_text(AgentId)]),
+                telemetry:execute([yuzu, gw, upstream, notify_dropped],
+                                  #{count => 1}, #{reason => <<"at_capacity">>}),
+                State
+        end,
+    {noreply, report_notify_counts(Before, drain(State1))};
 
 handle_cast({forward_guardian_message, AgentId, ResponseFrame},
             #state{guardian_pids = GPids, cb_state = CbState} = State) ->
@@ -352,14 +623,16 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
     %% can't block the gen_server, and the count is bounded.
     case CbState of
         open ->
-            logger:debug("Dropping guardian message for ~s (circuit open)", [AgentId]),
+            logger:debug("Dropping guardian message for ~s (circuit open)",
+                         [yuzu_gw_env:log_text(AgentId)]),
             telemetry:execute([yuzu, gw, guardian, forward_dropped],
                               #{count => 1}, #{reason => <<"circuit_open">>}),
             {noreply, State};
         _ ->
             case map_size(GPids) >= ?MAX_GUARDIAN_INFLIGHT of
                 true ->
-                    logger:debug("Dropping guardian message for ~s (at capacity)", [AgentId]),
+                    logger:debug("Dropping guardian message for ~s (at capacity)",
+                                 [yuzu_gw_env:log_text(AgentId)]),
                     telemetry:execute([yuzu, gw, guardian, forward_dropped],
                                       #{count => 1}, #{reason => <<"at_capacity">>}),
                     {noreply, State};
@@ -370,11 +643,12 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
                                       #{count => 1}, #{}),
                     Request = #{agent_id => AgentId, response => ResponseFrame},
                     {Pid, _MonRef} = spawn_monitor(fun() ->
-                        case do_rpc('ForwardGuardianMessage', Request, guardian) of
+                        case public_result(do_rpc('ForwardGuardianMessage', Request,
+                                                  guardian)) of
                             {ok, _} -> ok;
                             {error, Reason} ->
                                 logger:warning("Failed to forward guardian message for ~s: ~p",
-                                               [AgentId, Reason])
+                                               [yuzu_gw_env:log_text(AgentId), Reason])
                         end
                     end),
                     {noreply, State#state{guardian_pids = GPids#{Pid => true}}}
@@ -442,6 +716,7 @@ handle_info(replay_next, #state{replay_queue = []} = State) ->
     {noreply, prune_recent_replays(State)};
 handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq} | Rest],
                                 replay_spacing = Spacing} = State) ->
+    Before = notify_counts(State),
     State2 =
         case check_circuit(State) of
             {reject, State1} ->
@@ -455,19 +730,24 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                 prune_recent_replays(State1#state{replay_queue = []});
             {allow, #state{notify_pids = Pids} = State1}
                     when map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT ->
-                %% HA WS-4 4.4 review fix (F2): a replay-ADOPTED session
-                %% triggers a reannounce-driven CONNECTED
-                %% (yuzu_gw_agent:reannounce/2 -> notify_stream_status),
-                %% which shares the SAME ?MAX_NOTIFY_INFLIGHT budget as
-                %% every other stream-status notify. Driving the drip at a
-                %% fixed spacing regardless of that budget risks the
-                %% notify being silently DROPPED at capacity (see
-                %% handle_cast({notify_stream_status,...}) above) right
-                %% when 4.4's convergence mechanism needs it most — a
-                %% fleet-scale recovery replay is exactly when
-                %% notify_pids is busiest. Retry the SAME head entry
-                %% later (replay_queue is NOT advanced) rather than
-                %% popping it and risking a dropped reannounce. replay_queue
+                %% Back-pressure, not drop avoidance (#4632). A replay-ADOPTED
+                %% session triggers a reannounce-driven CONNECTED
+                %% (yuzu_gw_agent:reannounce/2 -> notify_stream_status). That
+                %% cast is now HELD in the pending store when every notify
+                %% slot is busy, so it can no longer be dropped at capacity;
+                %% it only waits its turn behind the held entries. This
+                %% check still paces the drip to the notify budget so a
+                %% fleet-scale replay does not pile thousands of
+                %% reannounce CONNECTEDs into the pending store at once.
+                %% drain/1 keeps one slot free while replay_queue is
+                %% non-empty, so this clause normally fires only when the slots
+                %% were already full before the replay armed. It can also fire
+                %% when a half_open notify probe takes the tenth slot after a
+                %% verdict armed the replay (drain/1's half_open clause checks
+                %% ?MAX_NOTIFY_INFLIGHT directly, not notify_budget/1); the
+                %% same-head retry bounds the effect to one spacing tick or
+                %% until the probe resolves, and nothing is lost. Retry the
+                %% SAME head entry later (replay_queue is NOT advanced). replay_queue
                 %% is untouched (still `[{AgentId, SessionId, RegisterReq} |
                 %% Rest]`), so the same head retries on the next tick.
                 schedule_replay_next(State1#state.replay_queue, Spacing),
@@ -482,7 +762,7 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                             %% (older caller / test). Nothing to send — skip
                             %% it without disturbing the breaker.
                             logger:debug("Registration replay: skipping ~s (no stored request)",
-                                        [AgentId]),
+                                        [yuzu_gw_env:log_text(AgentId)]),
                             emit_queue_depth(length(Rest)),
                             {done, State1};
                         _ ->
@@ -530,7 +810,8 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                                     logger:debug(
                                         "Registration replay: skipping ~s (no longer live "
                                         "locally, or reconnected under a different session, "
-                                        "since this drip was queued)", [AgentId]),
+                                        "since this drip was queued)",
+                                        [yuzu_gw_env:log_text(AgentId)]),
                                     emit_queue_depth(length(Rest)),
                                     {done, State1}
                             end
@@ -543,21 +824,80 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                         prune_recent_replays(State1#state{replay_queue = []})
                 end
         end,
-    {noreply, State2};
+    %% The reserved slot is spent again as soon as the replay is over, and the
+    %% skip and abort paths above do not drain on their own.
+    {noreply, report_notify_counts(Before, drain(State2))};
 
-handle_info(circuit_half_open, State) ->
+handle_info(circuit_half_open, #state{cb_gen = Gen} = State) ->
     logger:info("Circuit breaker: open -> half_open (allowing probe RPC)"),
     telemetry:execute([yuzu, gw, upstream, circuit_state],
                       #{count => 1},
                       #{state => <<"half_open">>}),
-    {noreply, State#state{cb_state = half_open, cb_timer = undefined}};
+    %% The only entry into half_open, so the only place the generation moves. A
+    %% held notification is sent as the probe (drain/1).
+    Before = notify_counts(State),
+    State1 = State#state{cb_state = half_open, cb_timer = undefined, cb_gen = Gen + 1},
+    {noreply, report_notify_counts(Before, drain(State1))};
+
+%% The result of the half_open probe worker. A result from any pid but the
+%% recorded probe (a duplicate, or one that was already resolved) is ignored.
+handle_info({notify_probe_result, Pid, Gen, Result},
+            #state{notify_probe = #{pid := Pid}} = State) ->
+    Before = notify_counts(State),
+    State1 = resolve_probe(Gen, Result, State),
+    {noreply, report_notify_counts(Before, drain(State1))};
+handle_info({notify_probe_result, _Pid, _Gen, _Result}, State) ->
+    {noreply, State};
+
+%% The probe worker ended with no result (killed): the same as an error, once.
+handle_info({'DOWN', MonRef, process, Pid, Reason},
+            #state{notify_probe = #{pid := Pid, mref := MonRef, gen := Gen,
+                                    event := {AgentId, _Notification}}} = State) ->
+    %% Without this line the only trace of a killed probe is the half_open -> open
+    %% warning. The reason is redacted (a crash reason can carry the payload).
+    logger:warning("Notify probe worker for ~s exited without a result: ~p",
+                   [yuzu_gw_env:log_text(AgentId), redact_reason(Reason)]),
+    Before = notify_counts(State),
+    State1 = resolve_probe(Gen, {error, worker_down}, State),
+    {noreply, report_notify_counts(Before, drain(State1))};
+
+%% The probe's deadline (notify_probe_timeout_ms), the gateway's own bound on how
+%% long a half_open probe can hold the held store: the worker is killed and the
+%% probe fails as any failed probe does (the event is given back, the breaker
+%% reopens with the longer backoff, the next half_open cycle sends a new probe).
+%% Only the probe currently recorded, under its own generation, is acted on: the
+%% timer is cancelled when the probe resolves, but a message already delivered by
+%% then (or one for an earlier probe) is ignored. A result that is already in the
+%% mailbox wins over the deadline, so a probe that answered just in time is not
+%% requeued; a result sent after this check is ignored like any result of a
+%% probe that is no longer recorded (the event is then sent a second time).
+handle_info({notify_probe_timeout, Pid, Gen},
+            #state{notify_probe = #{pid := Pid, gen := Gen, event := {AgentId, _}},
+                   notify_probe_timeout_ms = Timeout} = State) ->
+    receive
+        {notify_probe_result, Pid, _ResultGen, _Result} = Reported ->
+            handle_info(Reported, State)
+    after 0 ->
+        exit(Pid, kill),
+        logger:warning("Notify probe worker for ~s did not answer within ~bms and was "
+                       "killed; the notification is held again",
+                       [yuzu_gw_env:log_text(AgentId), Timeout]),
+        Before = notify_counts(State),
+        State1 = resolve_probe(Gen, {error, probe_timeout}, State),
+        {noreply, report_notify_counts(Before, drain(State1))}
+    end;
+handle_info({notify_probe_timeout, _Pid, _Gen}, State) ->
+    {noreply, State};
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
             #state{notify_pids = Pids, guardian_pids = GPids} = State) ->
     %% A finished notify OR guardian-forward worker. Remove from whichever set
-    %% holds it (maps:remove on an absent key is a no-op, so both are safe).
-    {noreply, State#state{notify_pids = maps:remove(Pid, Pids),
-                          guardian_pids = maps:remove(Pid, GPids)}};
+    %% holds it (maps:remove on an absent key is a no-op, so both are safe). A
+    %% freed notify slot is refilled from the pending store at once.
+    Before = notify_counts(State),
+    State1 = State#state{notify_pids = maps:remove(Pid, Pids),
+                         guardian_pids = maps:remove(Pid, GPids)},
+    {noreply, report_notify_counts(Before, drain(State1))};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -579,6 +919,14 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
     Result = do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId),
     NewState =
         case Result of
+            {local_error, {Class, Why}} ->
+                %% The stored request could not be encoded here, so nothing was
+                %% sent: no verdict about the upstream, the breaker is not
+                %% touched (record_result_no_replay/2 ignores it).
+                logger:warning("Registration replay: ~s could not be encoded (~p:~p); "
+                               "skipped without touching the circuit breaker",
+                               [yuzu_gw_env:log_text(AgentId), Class, Why]),
+                record_result_no_replay(Result, State);
             {ok, #{accepted := false} = Response} ->
                 %% The server answered OK but did not install the session
                 %% (RegisterResponse.accepted = false, e.g. a rejected
@@ -596,7 +944,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% session id is logged.
                 logger:warning("Registration replay: ~s was not accepted by the server (~s); "
                                "disconnecting so the agent follows its own registration path",
-                               [AgentId, reject_reason_for_log(Response)]),
+                               [yuzu_gw_env:log_text(AgentId), reject_reason_for_log(Response)]),
                 yuzu_gw_agent:disconnect(Pid),
                 record_result_no_replay({ok, Response}, State);
             {ok, Response} when is_map(Response) ->
@@ -610,7 +958,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 AdoptedSession = maps:get(session_id, Response,
                                           maps:get(<<"session_id">>, Response, SessionId)),
                 logger:debug("Registration replay: re-proxied ~s (adopted session ~s)",
-                            [AgentId, AdoptedSession]),
+                            [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(AdoptedSession)]),
                 %% Tell the process (confirmed live and holding SessionId by
                 %% the caller's lookup_local_session/1 check) to re-send its
                 %% own CONNECTED — this is what converges the server's
@@ -627,7 +975,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% answered the registration, so this is a replay FAILURE like
                 %% an RPC error. Neither the body nor the session id is logged.
                 logger:warning("Registration replay: ~s got an upstream answer that is "
-                               "not a response message", [AgentId]),
+                               "not a response message", [yuzu_gw_env:log_text(AgentId)]),
                 record_result_no_replay({error, malformed_response}, State);
             {error, {Status, _Message}} when Status =:= ?GRPC_STATUS_FAILED_PRECONDITION ->
                 %% The presented session was superseded by a DIFFERENT, LIVE
@@ -642,11 +990,12 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 %% tearing down this process's stream; the agent's own
                 %% subsequent fresh Register carries no stale metadata.
                 logger:warning("Registration replay: ~s's presented session was superseded — "
-                              "forcing a fresh reconnect", [AgentId]),
+                              "forcing a fresh reconnect", [yuzu_gw_env:log_text(AgentId)]),
                 yuzu_gw_agent:disconnect(Pid),
                 record_result_no_replay({ok, superseded}, State);
             {error, Reason} ->
-                logger:warning("Registration replay: ~s failed: ~p", [AgentId, Reason]),
+                logger:warning("Registration replay: ~s failed: ~p",
+                               [yuzu_gw_env:log_text(AgentId), Reason]),
                 record_result_no_replay(Result, State)
         end,
     %% Gate 7 sre OBS-4 — registration-replay observability. `replayed`
@@ -654,7 +1003,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
     %% operator alert on a drip that never drains (UP-5 storm).
     telemetry:execute([yuzu, gw, upstream, registration_replay],
                       #{replayed => 1, queue_depth => QueueDepth}, #{}),
-    NewState.
+    drain(NewState).
 
 terminate(_Reason, _State) ->
     ok.
@@ -702,23 +1051,36 @@ format_status(Status) ->
                 (_Key, Value)    -> Value
              end, Status).
 
-redact_state(#state{replay_queue = Queue, recent_replays = Recent} = State)
+redact_state(#state{replay_queue = Queue, recent_replays = Recent,
+                    notify_pending = Pending, notify_probe = Probe} = State)
   when is_list(Queue), is_map(Recent) ->
     Fields = maps:from_list(lists:zip(record_info(fields, state),
                                       tl(tuple_to_list(State)))),
-    (maps:without([replay_queue, recent_replays], Fields))#{
+    (maps:without([replay_queue, recent_replays, notify_pending, notify_probe], Fields))#{
         replay_queue_len => length(Queue),
-        recent_replays_size => map_size(Recent)};
+        recent_replays_size => map_size(Recent),
+        notify_pending_len => notify_pending_len(Pending),
+        notify_probe_held => Probe =/= undefined};
 redact_state(_Other) ->
     '$redacted'.
 
-%% The messages that carry a request, an inventory report, session ids or a
-%% guardian frame; anything else is shown as is.
+%% The pending store is shown as a count; the held events carry session ids and
+%% peer addresses. A value that is not the store shows as '$redacted', so this
+%% callback stays total.
+notify_pending_len(Pending) ->
+    try yuzu_gw_notify_queue:size(Pending)
+    catch error:_ -> '$redacted'
+    end.
+
+%% The messages that carry a request, an inventory report, session ids, a peer
+%% address or a guardian frame; anything else is shown as is.
 redact_message({proxy_register, _Req})            -> {proxy_register, '$redacted'};
 redact_message({proxy_inventory, _Report})        -> {proxy_inventory, '$redacted'};
 redact_message({replay_sessions, _Ids})           -> {replay_sessions, '$redacted'};
 redact_message({forward_guardian_message, AgentId, _Frame}) ->
     {forward_guardian_message, AgentId, '$redacted'};
+redact_message({notify_stream_status, AgentId, _SessionId, Event, _PeerAddr, _Home}) ->
+    {notify_stream_status, AgentId, '$redacted', Event, '$redacted', '$redacted'};
 redact_message({'$gen_call', From, Msg})          -> {'$gen_call', From, redact_message(Msg)};
 redact_message({'$gen_cast', Msg})                -> {'$gen_cast', redact_message(Msg)};
 redact_message(Msg)                               -> Msg.
@@ -777,7 +1139,11 @@ redact_log(_Other)                 -> [].
 check_circuit(#state{cb_state = closed} = State) ->
     {allow, State};
 check_circuit(#state{cb_state = half_open} = State) ->
-    %% Allow exactly one probe RPC
+    %% Allows any call-path or replay RPC while half_open; this clause does not
+    %% count probes. The single-probe discipline for notifications lives in
+    %% drain/1 (one held entry at a time), and resolve_probe/3 guards the result
+    %% with the generation and state checks, because a call-path RPC can overlap
+    %% the notify probe and move the breaker first.
     {allow, State};
 check_circuit(#state{cb_state = open} = State) ->
     {reject, State}.
@@ -798,8 +1164,19 @@ record_result({ok, _}, State) ->
         {State1, noop} ->
             State1
     end;
+record_result({error, {Status, _Message}}, State) when ?IS_REQUEST_FAULT(Status) ->
+    %% The server answered that the request itself was wrong: a fact about the
+    %% request, not about the upstream. Neither a failure (it would open the
+    %% breaker on a request that says nothing about the upstream) nor a success (it would
+    %% reset real failures, and a closed breaker's success after failures
+    %% triggers a replay): the state is untouched.
+    State;
 record_result({error, _}, State) ->
-    on_failure(State).
+    on_failure(State);
+record_result({local_error, _}, State) ->
+    %% The request could not be encoded here and never left the gateway: not a
+    %% fact about the upstream, so neither a success nor a failure.
+    State.
 
 %% @doc Like record_result/2 but never triggers a registration replay.
 %% Used by the replay drip itself: a replay RPC must still advance the
@@ -808,8 +1185,12 @@ record_result({error, _}, State) ->
 record_result_no_replay({ok, _}, State) ->
     {State1, _Trigger} = on_success(State),
     State1;
+record_result_no_replay({error, {Status, _Message}}, State) when ?IS_REQUEST_FAULT(Status) ->
+    State;
 record_result_no_replay({error, _}, State) ->
-    on_failure(State).
+    on_failure(State);
+record_result_no_replay({local_error, _}, State) ->
+    State.
 
 %% @doc Returns {NewState, replay | noop}. `replay' means an RPC just
 %% succeeded after one or more failures — treat it as a reconnect.
@@ -878,6 +1259,206 @@ trip_circuit(#state{cb_cur_timeout = CurTimeout, cb_max_timeout = MaxTimeout} = 
 
 cancel_timer(undefined) -> ok;
 cancel_timer(TRef) -> erlang:cancel_timer(TRef).
+
+%%%===================================================================
+%%% Pending stream-status notifications (#4632)
+%%%===================================================================
+
+%% @doc The peer address of a notification, made safe by yuzu_gw_peer_addr. A
+%% change is logged at debug level with the agent id and the original size only,
+%% never the value itself.
+-spec sanitize_peer_addr(binary(), term()) -> binary().
+sanitize_peer_addr(AgentId, PeerAddr0) ->
+    %% The result is always the sanitiser's copy, also when the value is equal to
+    %% the input: the input may be a sub-binary that pins a large parent.
+    PeerAddr = yuzu_gw_peer_addr:sanitize(PeerAddr0),
+    case PeerAddr =:= PeerAddr0 of
+        true ->
+            ok;
+        false ->
+            logger:debug("Stream status notification for ~s: peer address replaced "
+                         "(original size ~b bytes)",
+                         [yuzu_gw_env:log_text(AgentId), peer_addr_size(PeerAddr0)])
+    end,
+    PeerAddr.
+
+peer_addr_size(Addr) when is_binary(Addr) -> byte_size(Addr);
+peer_addr_size(_Addr) -> 0.
+
+%% @doc Send held notifications, first in first out, subject to the breaker.
+%% Closed: drain up to the notify budget. Open: nothing is sent, every entry
+%% stays held. Half_open: only the single generation-aware probe is sent (the
+%% head held entry, one at a time) and every other entry stays held until the
+%% probe resolves. Called at the end of every handler that can free a slot,
+%% close the breaker or add an entry, so there is one send path and a new
+%% arrival never overtakes a held one.
+-spec drain(#state{}) -> #state{}.
+drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
+             replay_queue = Replay} = State) ->
+    case map_size(Pids) < notify_budget(Replay) of
+        false ->
+            State;
+        true ->
+            case yuzu_gw_notify_queue:take(Pending) of
+                empty ->
+                    State;
+                {_Key, {AgentId, Notification}, Pending1} ->
+                    {Pid, _MonRef} = spawn_monitor(fun() ->
+                        case public_result(do_rpc('NotifyStreamStatus', Notification,
+                                                  notify_stream)) of
+                            {ok, _} -> ok;
+                            {error, Reason} ->
+                                logger:warning("Failed to notify stream status for ~s: ~p",
+                                               [yuzu_gw_env:log_text(AgentId), Reason])
+                        end
+                    end),
+                    drain(State#state{notify_pending = Pending1,
+                                      notify_pids = Pids#{Pid => true}})
+            end
+    end;
+drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
+             notify_pending = Pending, cb_gen = Gen,
+             notify_probe_timeout_ms = ProbeTimeout} = State)
+        when map_size(Pids) < ?MAX_NOTIFY_INFLIGHT ->
+    case yuzu_gw_notify_queue:take(Pending) of
+        empty ->
+            State;
+        {Key, {AgentId, Notification} = Event, Pending1} ->
+            %% The probe: the head held entry, sent on a monitored worker like
+            %% any other, but it reports its result to this process (send before
+            %% exit, so the result reaches the mailbox before the 'DOWN'). The
+            %% message carries the result only, never the event.
+            Server = self(),
+            {Pid, MonRef} = spawn_monitor(fun() ->
+                Result = do_rpc('NotifyStreamStatus', Notification, notify_stream),
+                case Result of
+                    {ok, _} -> ok;
+                    {error, Reason} ->
+                        logger:warning("Failed to notify stream status for ~s: ~p",
+                                       [yuzu_gw_env:log_text(AgentId), Reason]);
+                    {local_error, _} ->
+                        %% Logged once, by resolve_probe/3, when it evicts the event.
+                        ok
+                end,
+                Server ! {notify_probe_result, self(), Gen, Result}
+            end),
+            %% The gateway's own deadline for the probe (the client's bounds are
+            %% library defaults an endpoint setting can remove): resolved or
+            %% cancelled with the probe, see handle_info({notify_probe_timeout, ...}).
+            Timer = erlang:send_after(ProbeTimeout, Server, {notify_probe_timeout, Pid, Gen}),
+            State#state{notify_pending = Pending1,
+                        notify_pids = Pids#{Pid => true},
+                        notify_probe = #{pid => Pid, mref => MonRef, timer => Timer,
+                                         gen => Gen, key => Key, event => Event}}
+    end;
+drain(State) ->
+    State.
+
+%% @doc Retire the probe attempt: clear the record and free its slot, decide the
+%% event, then (separately) decide the breaker. Called once per probe, by the
+%% first of its result, its 'DOWN' and its deadline (which kills the worker).
+%%
+%% The event: ok retires it; an error gives it back at the head of the store
+%% (the reserved slot guarantees it fits; a newer event for the same key wins and
+%% the old one is dropped and counted).
+%%
+%% A local encode exception ({local_error, _}) evicts the event instead and
+%% leaves the breaker untouched (the first clause).
+%%
+%% The breaker: moved only when it is still half_open AND Gen is the generation
+%% now current. In any other state the result is stale (a call path RPC closed or
+%% reopened the breaker meanwhile, or it went half_open again): the breaker is
+%% not touched, and on_success/on_failure have no clause for an open breaker.
+-spec resolve_probe(non_neg_integer(), rpc_result(), #state{}) -> #state{}.
+resolve_probe(_Gen, {local_error, {Class, Why}},
+              #state{notify_probe = #{pid := Pid, mref := MonRef, timer := Timer,
+                                      event := {AgentId, _}},
+                     notify_pids = Pids} = State) ->
+    %% The head held entry could not be encoded here, and the same payload fails
+    %% the same way on every probe: requeueing it would reopen the breaker for
+    %% ever. Evict it, once, and leave the breaker alone (it is not a fact about
+    %% the upstream); the caller's drain/1 then probes the next head at once. The
+    %% failure is already counted by rpc_errors_total{code="encode"}.
+    retire_probe(MonRef, Timer),
+    logger:warning("Evicted held stream status notification for ~s: it cannot be "
+                   "encoded (~p:~p); the circuit breaker is not affected",
+                   [yuzu_gw_env:log_text(AgentId), Class, Why]),
+    State#state{notify_probe = undefined,
+                notify_pids = maps:remove(Pid, Pids)};
+resolve_probe(_Gen, {error, {Status, _Message}},
+              #state{notify_probe = #{pid := Pid, mref := MonRef, timer := Timer},
+                     notify_pids = Pids} = State) when ?IS_REQUEST_FAULT(Status) ->
+    %% The server answered that this notification itself was wrong. Requeueing it
+    %% would be answered the same way by every probe, for ever (the breaker is
+    %% not touched by such an answer, so nothing would slow the loop), so it is
+    %% retired like an answered event. The worker already logged the failure; the
+    %% breaker is left as it is, as for a local encode exception.
+    retire_probe(MonRef, Timer),
+    State#state{notify_probe = undefined,
+                notify_pids = maps:remove(Pid, Pids)};
+resolve_probe(Gen, Result,
+              #state{notify_probe = #{pid := Pid, mref := MonRef, timer := Timer,
+                                      key := Key, event := Event},
+                     notify_pids = Pids, notify_pending = Pending,
+                     cb_state = CbState, cb_gen = CbGen} = State) ->
+    retire_probe(MonRef, Timer),
+    Pending1 =
+        case Result of
+            {ok, _} ->
+                Pending;
+            {error, _} ->
+                case yuzu_gw_notify_queue:push_front(Key, Event, Pending) of
+                    {inserted, Q} ->
+                        Q;
+                    {superseded, Q} ->
+                        telemetry:execute([yuzu, gw, upstream, notify_coalesced],
+                                          #{count => 1}, #{}),
+                        Q
+                end
+        end,
+    State1 = State#state{notify_probe = undefined,
+                         notify_pids = maps:remove(Pid, Pids),
+                         notify_pending = Pending1},
+    case CbState =:= half_open andalso Gen =:= CbGen of
+        true  -> record_result(Result, State1);
+        false -> State1
+    end.
+
+%% @doc The probe is over: drop its monitor (and any 'DOWN' already delivered)
+%% and its deadline timer. A timeout message that was already delivered is
+%% harmless: it names a probe that is no longer recorded.
+-spec retire_probe(reference(), reference()) -> ok.
+retire_probe(MonRef, Timer) ->
+    erlang:demonitor(MonRef, [flush]),
+    _ = erlang:cancel_timer(Timer),
+    ok.
+
+%% @doc How many notify workers drain/1 may have in flight. While a registration
+%% replay is active one slot is held back: the replay drip waits for fewer than
+%% ?MAX_NOTIFY_INFLIGHT workers, and a backlog that refills every freed slot at
+%% once would keep it waiting until the backlog is empty (#4632).
+-spec notify_budget([term()]) -> pos_integer().
+notify_budget([]) -> ?MAX_NOTIFY_INFLIGHT;
+notify_budget(_ReplayQueue) -> ?MAX_NOTIFY_INFLIGHT - 1.
+
+%% @doc The two numbers the notify_queue gauges report: held keys and workers.
+-spec notify_counts(#state{}) -> {non_neg_integer(), non_neg_integer()}.
+notify_counts(#state{notify_pending = Pending, notify_pids = Pids}) ->
+    {yuzu_gw_notify_queue:size(Pending), map_size(Pids)}.
+
+%% @doc Report the gauges once per handler, and only when the handler changed
+%% either number. Before is notify_counts/1 taken at the top of the handler.
+-spec report_notify_counts({non_neg_integer(), non_neg_integer()}, #state{}) -> #state{}.
+report_notify_counts(Before, State) ->
+    case notify_counts(State) of
+        Before                  -> ok;
+        {Pending, Inflight}     -> emit_notify_queue(Pending, Inflight)
+    end,
+    State.
+
+emit_notify_queue(Pending, Inflight) ->
+    telemetry:execute([yuzu, gw, upstream, notify_queue],
+                      #{pending => Pending, inflight => Inflight}, #{}).
 
 %% @doc Schedule the next replay step, unless the queue is now empty.
 %% Spacing the steps keeps each handle_info short and rate-limits the
@@ -1041,6 +1622,7 @@ rpc_types('NotifyStreamStatus') -> {'yuzu.gateway.v1.StreamStatusNotification',
 rpc_types('ForwardGuardianMessage') -> {'yuzu.gateway.v1.ForwardGuardianRequest',
                                         'yuzu.gateway.v1.ForwardGuardianAck'}.
 
+-spec do_rpc(atom(), map(), atom()) -> rpc_result().
 do_rpc(Method, Request, Tag) ->
     do_rpc(Method, Request, Tag, ctx:background()).
 
@@ -1059,12 +1641,13 @@ do_rpc_replay(Method, Request, Tag, SessionId) when is_binary(SessionId), Sessio
 do_rpc_replay(Method, Request, Tag, _SessionId) ->
     do_rpc(Method, Request, Tag, ctx:background()).
 
+-spec do_rpc(atom(), map(), atom(), term()) -> rpc_result().
 do_rpc(Method, Request, Tag, Ctx) ->
     {InputType, OutputType} = rpc_types(Method),
     Def = #grpcbox_def{
         service       = 'yuzu.gateway.v1.GatewayUpstream',
         message_type  = atom_to_binary(InputType, utf8),
-        marshal_fun   = fun(Msg) -> gateway_pb:encode_msg(Msg, InputType) end,
+        marshal_fun   = fun(Msg) -> encode_request(Msg, InputType) end,
         unmarshal_fun = fun(Bin) -> gateway_pb:decode_msg(Bin, OutputType) end
     },
     Path = <<"/yuzu.gateway.v1.GatewayUpstream/", (atom_to_binary(Method, utf8))/binary>>,
@@ -1076,19 +1659,35 @@ do_rpc(Method, Request, Tag, Ctx) ->
                  %% argument list (the request, with its credentials) in the
                  %% crash report if this exception reaches the gen_server.
                  %% Only the class and the redacted reason are kept.
+                 error:{?LOCAL_ENCODE_FAILED, Class, Why} ->
+                     %% Raised by encode_request/2 below, with the reason already
+                     %% redacted: the request never left this process.
+                     {rpc_exception, local, Class, Why};
                  Class:Why ->
-                     {rpc_exception, Class, redact_why(Why)}
+                     {rpc_exception, remote, Class, redact_why(Why)}
              end,
     Duration = erlang:monotonic_time(millisecond) - StartTime,
     case Result of
-        {rpc_exception, Class1, Why1} ->
+        {rpc_exception, Origin, Class1, Why1} ->
+            %% A local encode failure is counted under its own code, so a
+            %% systematic encoder fault (every Register answered INTERNAL while the
+            %% breaker stays closed) can be told from an exception out of the
+            %% client or the transport, which keeps `exception' and does open the
+            %% breaker.
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
-                                code => <<"exception">>}),
-            logger:warning("Upstream RPC ~s raised ~p:~p", [Method, Class1, Why1]),
-            {error, {internal, iolist_to_binary(
-                                 io_lib:format("rpc exception ~p:~p", [Class1, Why1]))}};
+                                code => case Origin of
+                                            local  -> <<"encode">>;
+                                            remote -> <<"exception">>
+                                        end}),
+            yuzu_gw_safe_call:warn_limited(rpc_raised, "Upstream RPC ~s raised ~p:~p",
+                                           [Method, Class1, Why1]),
+            case Origin of
+                %% Never reaches the breaker (record_result/2 ignores it).
+                local  -> {local_error, {Class1, Why1}};
+                remote -> {error, exception_reason(Class1, Why1)}
+            end;
         {ok, Response, _Headers} ->
             telemetry:execute([yuzu, gw, upstream, rpc_latency],
                               #{duration_ms => Duration},
@@ -1118,7 +1717,16 @@ do_rpc(Method, Request, Tag, Ctx) ->
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
                                 code => Status}),
-            logger:warning("Upstream RPC ~s failed: ~p ~s", [Method, Status, yuzu_gw_env:log_text(Message)]),
+            case is_request_fault(Status) of
+                true ->
+                    %% Provoked by the request, so by whoever sent it: limited.
+                    yuzu_gw_safe_call:warn_limited(rpc_answered_error,
+                                                   "Upstream RPC ~s failed: ~p ~s",
+                                                   [Method, Status, yuzu_gw_env:log_text(Message)]);
+                false ->
+                    logger:warning("Upstream RPC ~s failed: ~p ~s",
+                                   [Method, Status, yuzu_gw_env:log_text(Message)])
+            end,
             {error, {Status, Message}};
         {http_error, {Status, _}, _Trailers} ->
             %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 /
@@ -1159,6 +1767,38 @@ do_rpc(Method, Request, Tag, Ctx) ->
                                 code => Reason}),
             {error, {internal, iolist_to_binary(io_lib:format("~p", [Reason]))}}
     end.
+
+%% The request encoder handed to the gRPC client. grpcbox runs it in the calling
+%% process, after a connection was obtained and before anything is sent, so an
+%% exception from it is local: it is re-raised under a tag only this module
+%% raises (a server answer cannot carry it), with the reason redacted, so do_rpc
+%% can tell it from an exception of the client or the transport.
+encode_request(Msg, InputType) ->
+    try gateway_pb:encode_msg(Msg, InputType) of
+        Bin when byte_size(Bin) > ?MAX_REQUEST_BYTES ->
+            %% Raised from the `of' branch, so the catch below does not see it.
+            erlang:error({?LOCAL_ENCODE_FAILED, error, request_too_large});
+        Bin ->
+            Bin
+    catch Class:Why ->
+        erlang:error({?LOCAL_ENCODE_FAILED, Class, redact_why(Why)})
+    end.
+
+%% @doc The result as the callers of proxy_register/1 and proxy_inventory/1 and
+%% the log lines of the workers see it: a local encode exception reads as the
+%% same `{error, {internal, <<"rpc exception ...">>}}' as before. Only the breaker
+%% bookkeeping tells them apart.
+-spec public_result(rpc_result()) -> {ok, term()} | {error, term()}.
+public_result({local_error, {Class, Why}}) ->
+    {error, exception_reason(Class, Why)};
+public_result(Result) ->
+    Result.
+
+is_request_fault(Status) when ?IS_REQUEST_FAULT(Status) -> true;
+is_request_fault(_Status) -> false.
+
+exception_reason(Class, Why) ->
+    {internal, iolist_to_binary(io_lib:format("rpc exception ~p:~p", [Class, Why]))}.
 
 %% @private Classify whether an upstream transport error is a TLS handshake
 %% failure, returning {true, KindBin} (the alert/cause, for the metric label) or

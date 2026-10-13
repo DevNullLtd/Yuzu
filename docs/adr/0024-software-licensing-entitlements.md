@@ -162,7 +162,7 @@ rather than requesting an in-server exception:
 | `ProductRegistryStore` + `product_normalize` | D4/D6 | **core** | Deterministic identity resolution over pure fleet-internal aggregation (a generic engine, no external data) — the `software_catalog`-rollup tiebreaker. |
 | Ingest seam | D5 | **core** | Untrusted-input transport plumbing. |
 | Raw `/sle/agents/{id}` drill + discovery reads + their MCP twin `query_software_licenses` + `SoftwareLicensing` securable | D9/D10 | **core** | Raw-fact reads (like `/devices`), ancestor-aware scoped; the REST+MCP twin satisfies ADR-1005 D1. |
-| Agent-decommission erasure cascade | D11 | **core** | Platform-wide data-lifecycle mechanism (all five per-agent stores). |
+| Agent-decommission erasure cascade | D11 | **core** | Platform-wide data-lifecycle mechanism (the per-agent stores in the cascade). |
 | Per-user `user_ref` discovery | D11 | **core** (collection) | Estate collection; carries behavioural-PII data-processor obligations (see re-home note). |
 | Compliance evaluator (effective state, lapse, seat math, posture rollups) | D7 | **UCE** | Semantics baked into code — interpret facts for a purpose. |
 | Lapse/expiry/renewal notifications | D8 | **UCE** | Evaluator-derived. |
@@ -411,7 +411,12 @@ Decision numbers are stable, since other documents cite them.
    reconciliation are bounded to the in-server Licences view; the UCE host owns its own
    navigation for the deferred surfaces. Connector configuration admin-gating moves with
    the connector (Decision 13, UCE). *Rejected: a tab on `/inventory` (rev 1) — reversed
-   at owner direction.*
+   at owner direction.* *(Update 2026-10-12, #5682: the three-securable conjunction in
+   this Decision is superseded. `DELETE /api/v1/sle/agents/{id}` is gated on the single
+   per-device scoped `Decommission:Delete` securable (Wave 7 PR7.2, the reversal the
+   "revisit" clause above anticipated), over a seven-store cascade rather than five. The
+   code is authoritative: the gate is in `sle_routes.cpp` and the store list is
+   `AgentDecommissionStores` in `agent_decommission.hpp`.)*
 
 10. **List-read scoping follows ADR-0017. [split]** (Paths are shorthand for
     `/api/v1/sle/*`.) In-server core: the **single-agent raw drill `/sle/agents/{id}`**
@@ -460,11 +465,18 @@ Decision numbers are stable, since other documents cite them.
     `SoftwareLicensingStore`) and removes **only agent-scoped rows/links**;
     `ProductRegistryStore` holds fleet-wide canonical identities shared across agents and
     is **never** in the cascade (decommission drops an agent's match links, never a shared
-    canonical product). There is **no row-level erasure API**, a stated gap. The cascade's
+    canonical product). *(Update 2026-10-12, #5682: the cascade now covers **seven** stores.
+    Wave 7 PR7.2 added `AppUsageStore`, and #5682 added `OfflineEndpointStore`, whose
+    `endpoint_state` presence row holds the device's last-known hostname, OS, agent version
+    and architecture. The authoritative list is `AgentDecommissionStores` in
+    `agent_decommission.hpp`, whose registered-target count is pinned by `kCascadeStoreCount` in `test_agent_decommission.cpp`.
+    The conjunction named below as the cascade trigger's gate is superseded: the gate is the
+    single scoped `Decommission:Delete`, see the Decision 9 update note.)*
+    There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`
-    conjunction (Decision 9) — because this fan-out reaches the `Inventory`-securable
-    stores and the `GuaranteedState`-governed `AppPerfDailyStore`, not only the licensing
+    conjunction (Decision 9) (superseded, see the note above) — because this fan-out reaches the formerly `Inventory`-securable
+    stores and the formerly `GuaranteedState`-governed `AppPerfDailyStore`, not only the licensing
     one. The effective mode is **centrally verifiable**: the
     stable effective-mode value rides the canonical blob as a config-stable record
     (verifiable fleet-wide from stored state, including for offline agents), while
