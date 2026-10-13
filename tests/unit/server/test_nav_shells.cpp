@@ -28,6 +28,7 @@
 extern const char* const kDashboardIndexHtml;
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
+extern const char* const kApprovalsPageHtml;
 extern const char* const kTarPageHtml;
 extern const char* const kVizFleetPageHtml;
 extern const char* const kVizHostPageHtml;
@@ -97,7 +98,8 @@ TEST_CASE("app shell: keys and hrefs are unique and every top-level entry has an
         }
 }
 
-TEST_CASE("app shell: only Software and Fleet have sub-items; Settings is one admin-only entry",
+TEST_CASE("app shell: only Instructions Software and Fleet have sub-items; Settings is one "
+          "admin-only entry",
           "[nav][shell]") {
     std::vector<std::string> with_children;
     for (const auto& g : nav_groups())
@@ -106,7 +108,8 @@ TEST_CASE("app shell: only Software and Fleet have sub-items; Settings is one ad
                 with_children.push_back(std::string(it.key) + ">" + std::string(it.children[0].key));
             CHECK((it.key == "settings") == it.admin_only);
         }
-    CHECK(with_children == std::vector<std::string>{"software>auto", "fleet>network"});
+    CHECK(with_children ==
+          std::vector<std::string>{"instructions>approvals", "software>auto", "fleet>network"});
 
     const auto groups = nav_groups();
     REQUIRE(groups.back().title == "System");
@@ -124,6 +127,8 @@ TEST_CASE("app shell: breadcrumb is group / page, and a sub-item skips its paren
           std::vector<std::string>{"Estate", "Network"});
     CHECK(breadcrumb_trail({.active_key = "auto"}) ==
           std::vector<std::string>{"Estate", "Deployments"});
+    CHECK(breadcrumb_trail({.active_key = "approvals"}) ==
+          std::vector<std::string>{"Operate", "Approvals"});
 }
 
 TEST_CASE("app shell: a title extends the trail, a repeated label does not", "[nav][shell]") {
@@ -182,6 +187,16 @@ TEST_CASE("app shell: sub-items show only for the active family and light their 
 
     const auto on_network = render_shell({.active_key = "network"});
     CHECK(highlighted_hrefs(on_network) == std::vector<std::string>{"/viz/fleet", "/network"});
+
+    // Instructions' child (Operate pages): visible on the Instructions family only.
+    const auto on_instructions = render_shell({.active_key = "instructions"});
+    CHECK(count_of(on_instructions, "class=\"shell-sub\"") == 1);
+    CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/approvals\">Approvals</a>"));
+    const auto on_approvals = render_shell({.active_key = "approvals"});
+    CHECK_THAT(on_approvals,
+               ContainsSubstring("<a href=\"/approvals\" class=\"on\" aria-current=\"page\">"));
+    CHECK(highlighted_hrefs(on_approvals) ==
+          std::vector<std::string>{"/instructions", "/approvals"});
 }
 
 TEST_CASE("app shell: keeps the identity hooks, Sign out and the admin-only Settings entry",
@@ -351,6 +366,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
     const std::vector<Page> pages = {
         {"dashboard", kDashboardIndexHtml, {"/"}},
         {"instructions", kInstructionPageHtml, {"/instructions"}},
+        {"approvals", kApprovalsPageHtml, {"/instructions", "/approvals"}},
         {"result sets", yuzu::server::kResultSetsPageHtml, {"/result-sets"}},
         {"compliance", kComplianceHtml, {"/compliance"}},
         {"guardian", kGuardianHtml, {"/guardian"}},

@@ -19,6 +19,9 @@ namespace {
 // ── Nav model ────────────────────────────────────────────────────────────
 // Icon paths are the design's 24x24 line icons (stroke, no fill).
 
+constexpr NavItem kInstructionsSub[] = {
+    {.key = "approvals", .label = "Approvals", .href = "/approvals"},
+};
 constexpr NavItem kSoftwareSub[] = {
     {.key = "auto", .label = "Deployments", .href = "/auto"},
 };
@@ -31,7 +34,8 @@ constexpr NavItem kOperate[] = {
     {.key = "instructions",
      .label = "Instructions",
      .href = "/instructions",
-     .icon = "M6 3h9l4 4v14H6z M14 3v5h5 M9 13h7 M9 17h7"},
+     .icon = "M6 3h9l4 4v14H6z M14 3v5h5 M9 13h7 M9 17h7",
+     .children = kInstructionsSub},
     {.key = "result-sets",
      .label = "Result sets",
      .href = "/result-sets",

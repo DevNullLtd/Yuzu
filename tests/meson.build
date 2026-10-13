@@ -1684,6 +1684,7 @@ if build_server
       'unit/server/test_nav_shells.cpp',            # app shell: nav model, renderer, marker swap, per-page active item
       'unit/server/test_name_lookup_memo.cpp',      # Operate O1: the per-render definition-name memo (stop on first read failure)
       'unit/server/test_approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
+      'unit/server/test_operate_pages_ui.cpp',      # Operate O1: CSP/token/literal-bound pins for the Operate page templates, CSS and controller
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
