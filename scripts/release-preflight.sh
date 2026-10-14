@@ -158,8 +158,9 @@ if [ "$FULL" = "--full" ]; then
     # target resolves the pinned OTP itself at configure). ensure-erlang.sh
     # asks scripts/erlang_toolchain.py find-otp and activates what it picks; it
     # always returns 0, and leaves PATH unchanged when nothing passes the pin,
-    # so `command -v erl` below only checks presence - the floor is enforced by
-    # the helper's activation, not by this check.
+    # so `command -v erl` below only checks presence: a wrong-version erl
+    # already on PATH still passes it. The standalone rebar3 step does not
+    # enforce the floor; the Meson build does (it skips the gateway otherwise).
     # The explicit "" arg is load-bearing: a sourced script inherits the
     # caller's positional args, so without it the helper would receive "$1"
     # from THIS script (e.g. "v0.10.0") as its version. "" selects the pinned

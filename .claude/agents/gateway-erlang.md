@@ -273,7 +273,7 @@ factorial(0) -> 1.
 
 | Area | Issue | Solution |
 |------|-------|----------|
-| Erlang toolchain not on PATH | `meson compile` fails on the gateway custom_target even though C++ targets succeed | A Meson build resolves OTP itself (see Toolchain Activation); for by-hand rebar3, `source scripts/ensure-erlang.sh` then verify with `python3 scripts/erlang_toolchain.py find-otp` before any build or test command |
+| No Erlang/OTP passing the pin | `meson setup` prints `WARNING: Erlang gateway: SKIPPED.` (or, under `-Drequire_gateway=true`, a configure error); by-hand rebar3 uses whatever erl is on PATH | A Meson build resolves OTP itself (see Toolchain Activation); for by-hand rebar3, `source scripts/ensure-erlang.sh` then verify with `python3 scripts/erlang_toolchain.py find-otp` before any build or test command |
 | `erl -version` / `erl +V` | Both print the **emulator** (ERTS) version (16.x on OTP 28), not the OTP release | Read `releases/<rel>/OTP_VERSION` (the live `<rel>` is in `releases/start_erl.data`), or run `python3 scripts/erlang_toolchain.py find-otp` |
 | `rebar3 eunit` (bare) | Rejects orphan test modules with `Module X not found in project` | Always pass `--dir apps/yuzu_gw/test` (#337) |
 | `rebar3 eunit --module X` | Does NOT isolate — runs full suite first in the same BEAM, then the filter | Delete `_build/test` or use `erl -pa ...` directly for real isolation |

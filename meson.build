@@ -659,6 +659,10 @@ if _rebar3.found()
   # Exit codes (erlang_toolchain.main): 0 found, 1 no install passes the pin
   # (a legitimate skip), anything else is a usage error or a resolver crash -
   # never let that masquerade as "no matching OTP".
+  if _gw_otp.returncode() == 0 and _gw_otp.stdout().strip().split('\n').length() != 4
+    error('scripts/erlang_toolchain.py find-otp exited 0 but did not print exactly 4 lines:\n'
+          + _gw_otp.stdout())
+  endif
   if _gw_otp.returncode() == 0
     _gw_otp_out = _gw_otp.stdout().strip().split('\n')
     _gw_otp_bin = _gw_otp_out[0]

@@ -302,6 +302,11 @@ def find_otp(wanted=None):
     wanted = wanted or wanted_otp_version()
     report, matches = [], []
     for source, found_dir in otp_candidates():
+        if "\n" in found_dir or "\r" in found_dir:
+            # A line break would shift find-otp's line-oriented output, so the
+            # shell / Meson would read another line as the bin dir. Refuse it.
+            report.append(f"{source}: {found_dir!r} -> refused (line break in path)")
+            continue
         bin_dir, v = probe_install(found_dir)
         via = f" (resolves to {bin_dir})" if bin_dir and bin_dir != found_dir else ""
         report.append(f"{source}: {found_dir}{via} -> {v or 'no working erl here (expected its bin/ directory)'}")

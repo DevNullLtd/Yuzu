@@ -118,8 +118,10 @@ the bump, because branches not rebased onto it will refuse the new major.
 For running rebar3 or `erl` by hand, the sourceable helper asks the
 same resolver (`find-otp`) and activates what it picks in the current shell -
 on MSYS2 through a native Windows Python, converting the path with `cygpath`.
-Only when no suitable Python exists does it fall back to its own narrower
-search (kerl, asdf, Homebrew, the Windows installer).
+When no suitable Python exists, or the resolver errors or its pick fails to
+activate, it falls back to its own narrower search (kerl, asdf, Homebrew, the
+Windows installer). After `source scripts/ensure-erlang.sh <version>`, check
+with `find-otp --version <version>`; a bare `find-otp` checks the default pin.
 
 ```bash
 source scripts/ensure-erlang.sh           # the pin above: 28.4 or later 28.x

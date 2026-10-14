@@ -261,10 +261,34 @@ class OtpPinTests(unittest.TestCase):
         self.assertEqual(prefix[0].replace("/", "\\").lower(),
                          "c:\\program files\\erlang otp\\erts-16.3\\bin\\escript.exe")
 
+    def test_rebar3_prefix_with_only_c_erlang_finds_no_escript(self):
+        # Order-independent: with no Program Files install at all, a C:\Erlang
+        # root listed anywhere in the scan would be picked. It must not be.
+        self.WIN_FILES = {f for f in OtpPinTests.WIN_FILES if "program files" not in f}
+        os.environ.pop("YUZU_ESCRIPT", None)
+        p1, p2, p3, p4 = self._win_fs()
+        with p1, p2, p3, p4, \
+                mock.patch.object(et, "find_otp", return_value=(None, None, None, [])), \
+                mock.patch.object(et.sys, "stderr"), \
+                self.assertRaises(SystemExit):
+            et.rebar3_prefix()
+
+    def test_a_candidate_path_with_a_line_break_is_refused(self):
+        evil = make_install(os.path.join(self.home, ".kerl", "a\nb"), "77.4.1")
+        bin_dir, _, _, report = et.find_otp("77.4")
+        self.assertIsNone(bin_dir)
+        self.assertTrue(any("refused (line break in path)" in r for r in report), report)
+
     def test_start_erl_data_naming_a_path_is_not_followed(self):
         root = os.path.join(self.tmp, "crafted")
         bin_dir = make_install(root, "79.1", releases={"78": "78.4", "79": "79.1"},
                                start_erl="../../outside")
+        # A real OTP_VERSION at the traversal target, so following the path
+        # WOULD yield a version: the test fails if the digits rule is removed.
+        outside = os.path.join(root, "releases", "..", "..", "outside")
+        os.makedirs(outside, exist_ok=True)
+        with open(os.path.join(outside, "OTP_VERSION"), "w", encoding="ascii") as f:
+            f.write("78.9\n")
         failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
         with mock.patch.object(et.subprocess, "run", return_value=failed):
             self.assertIsNone(et.otp_version(bin_dir))

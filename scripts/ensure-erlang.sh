@@ -16,14 +16,16 @@
 #   - Is a no-op if `erl` is already on PATH, runs, AND passes the pin.
 #   - Otherwise asks the shared resolver (scripts/erlang_toolchain.py find-otp,
 #     the same search, tie-break and shim handling Meson uses) and activates
-#     what it picks. Only when no suitable Python exists does it fall back to
-#     its own narrower search: kerl -> asdf -> Homebrew (macOS) -> the Windows
+#     what it picks. When no suitable Python exists, or the resolver errors
+#     (exit 2/3) or its pick fails to activate, it falls back to its own
+#     narrower search: kerl -> asdf -> Homebrew (macOS) -> the Windows
 #     installer (MSYS2).
 #   - ALWAYS returns 0, including under a caller's `set -euo pipefail`, and
 #     leaves PATH unchanged when nothing passes the pin. So `command -v erl`
 #     is NOT a sufficient check afterwards - an erl of the wrong version may
-#     still be on PATH. Check the version, e.g.
-#       erl -noshell -eval 'io:format("~s",[erlang:system_info(otp_release)]),halt().'
+#     still be on PATH. Check with the resolver (pass --version V if you
+#     sourced this with an explicit version):
+#       python3 scripts/erlang_toolchain.py find-otp >/dev/null
 #
 # The default pin is DEFAULT_OTP_VERSION in scripts/erlang_toolchain.py; see
 # "Changing the Erlang/OTP pin" in docs/erlang-gateway-build.md.
@@ -89,7 +91,7 @@ _yz_bounded() {
     if [ -n "$_yz_timeout" ]; then
         "$_yz_timeout" 30 "$@"
     elif command -v perl >/dev/null 2>&1; then
-        perl -e 'alarm 30; exec @ARGV or exit 127' "$@"
+        perl -e 'alarm 30; exec { $ARGV[0] } @ARGV or exit 127' "$@"
     else
         "$@"
     fi
@@ -201,6 +203,10 @@ _yz_run_py() {
 if [ -n "$_yz_pykind" ] && [ -f "$_yz_script_dir/erlang_toolchain.py" ]; then
     _yz_rc=0
     _yz_out=$(_yz_run_py "$_yz_script_dir/erlang_toolchain.py" find-otp --version "$_yz_desired_erlang") || _yz_rc=$?
+    if [ "$_yz_rc" -eq 0 ] && [ "$(printf '%s\n' "$_yz_out" | tr -d '\r' | grep -c '' || true)" != 4 ]; then
+        _yz_log "scripts/erlang_toolchain.py find-otp exited 0 without exactly 4 output lines; ignoring it"
+        _yz_rc=3
+    fi
     if [ "$_yz_rc" -eq 0 ]; then
         _yz_bin=$(printf '%s\n' "$_yz_out" | head -n1 | tr -d '\r') || _yz_bin=""
         case "$_yz_uname" in

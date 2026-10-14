@@ -48,7 +48,9 @@ class EnsureErlangTests(unittest.TestCase):
             f.write("97.4.1\n")
         fake_erl(os.path.join(self.kerl_root, "bin", "erl"), "97.4.1")
         with open(os.path.join(self.kerl_root, "activate"), "w") as f:
-            f.write(f'export PATH="{self.kerl_root}/bin:$PATH"\n')
+            # Like kerl 4.4.0's activate: references an unset variable, so it
+            # aborts a `set -u` caller unless the helper relaxes strict mode.
+            f.write(f': "$_KERL_CLEANUP"\nexport PATH="{self.kerl_root}/bin:$PATH"\n')
         # A wrong-version erl first on PATH.
         self.path_dir = os.path.join(self.tmp, "wrong")
         os.makedirs(self.path_dir)
