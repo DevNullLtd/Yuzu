@@ -393,6 +393,11 @@ TEST_CASE("summary: a failed TOP estate read is never cached", "[home][route][ca
     CHECK(estate_calls == 3);
     CHECK(has(again->body, "Could not read The device roster. This is not zero."));
     CHECK_FALSE(has(again->body, "of 200 seen"));
+    fail = false; // the failed read did not restart the window or leave the old figure behind
+    auto recovered = sink.Get("/fragments/home/summary");
+    REQUIRE(recovered);
+    CHECK(estate_calls == 4);
+    CHECK(has(recovered->body, "of 200 seen in the last 30 days"));
 }
 
 // Kills: a scoped caller reading (or being served) the fleet-wide cached figure.
