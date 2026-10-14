@@ -44,9 +44,14 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -72,7 +77,11 @@ struct EnrollRoutesHarness {
     yuzu::server::test::TestRouteSink sink;
 
     std::string session_user{"admin"};
-    std::vector<AuditCall> audit_calls;
+    std::vector<AuditCall> audit_calls;   ///< AuditFn (void): outcome / denied rows
+    std::vector<AuditCall> attempt_calls; ///< AuditReadFn (bool): the fail-closed `attempt` rows
+    bool audit_persists{true};            ///< false: the bool hook reports a persist failure
+    std::vector<auth::AutoApproveRule> rules_at_attempt; ///< engine state seen BY the attempt hook
+    bool mode_at_attempt{false};
 
     explicit EnrollRoutesHarness(bool with_store = true) {
         if (with_store) {
@@ -94,12 +103,24 @@ struct EnrollRoutesHarness {
                                const std::string& target_id, const std::string& detail) {
             audit_calls.push_back({action, result, target_type, target_id, detail});
         };
+        auto audit_read_fn = [this](const httplib::Request&, const std::string& action,
+                                    const std::string& result, const std::string& target_type,
+                                    const std::string& target_id,
+                                    const std::string& detail) -> bool {
+            attempt_calls.push_back({action, result, target_type, target_id, detail});
+            rules_at_attempt = auto_approve.list_rules();
+            mode_at_attempt = auto_approve.require_all();
+            return audit_persists;
+        };
         auto gateway_count_fn = []() -> std::size_t { return 0; };
         auto agents_json_fn = []() -> std::string { return "[]"; };
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
-                               oidc_mu, oidc_provider);
+                               oidc_mu, oidc_provider, /*metrics_registry=*/nullptr,
+                               /*step_up_fn=*/{}, audit_read_fn);
+        // A browser sends these on every same-origin post; the cross-origin tests clear them.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     }
 
     /// The single audit row for `action` (fails the test if there isn't exactly one).
@@ -420,6 +441,11 @@ TEST_CASE("settings auto-approve: a valid add persists and audits exactly one ru
     CHECK(row.result == "success");
     CHECK(row.detail.find("by=admin") != std::string::npos);
     CHECK(h.audit_calls.size() == 1);
+    // ... preceded by one fail-closed `attempt` row carrying the same detail.
+    REQUIRE(h.attempt_calls.size() == 1);
+    CHECK(h.attempt_calls[0].action == "enrollment.auto_approve.rule_add");
+    CHECK(h.attempt_calls[0].result == "attempt");
+    CHECK(h.attempt_calls[0].detail == row.detail);
 }
 
 TEST_CASE("settings auto-approve: injection, bad CIDR and unknown type are 400, audited denied, "
@@ -444,6 +470,10 @@ TEST_CASE("settings auto-approve: injection, bad CIDR and unknown type are 400, 
         CHECK(r->status == 400);
         CHECK(h.only("enrollment.auto_approve.rule_add").result == "denied");
         CHECK(h.auto_approve.list_rules().empty());
+        CHECK(h.attempt_calls.empty()); // refused before any attempt row
+        // The dashboard reads the toast; an API caller reads the A4 envelope.
+        CHECK(r->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+        CHECK(nlohmann::json::parse(r->body)["error"]["code"] == 400);
     }
 }
 
@@ -553,6 +583,212 @@ TEST_CASE("settings auto-approve: an overlong numeric index is a denied no-op, n
     CHECK(row.target_id == huge);
     CHECK(h.auto_approve.list_rules().size() == 1);
     CHECK(h.auto_approve.list_rules()[0].enabled);
+}
+
+// ── Fail-closed on audit (ADR-0033 section 9): no persisted `attempt` row -> no mutation ──
+
+namespace {
+/// Seeds one enabled rule and mode `any`, then runs `drive` against each of the four writes.
+struct AutoApproveWrite {
+    const char* name;
+    std::function<std::shared_ptr<httplib::Response>(EnrollRoutesHarness&)> run;
+    const char* action;
+};
+
+std::vector<AutoApproveWrite> auto_approve_writes() {
+    return {
+        {"add",
+         [](EnrollRoutesHarness& h) {
+             return h.sink.Post("/api/settings/auto-approve",
+                                "type=hostname_glob&value=new.corp&label=n", kForm);
+         },
+         "enrollment.auto_approve.rule_add"},
+        {"mode",
+         [](EnrollRoutesHarness& h) {
+             return h.sink.Post("/api/settings/auto-approve/mode", "mode=all", kForm);
+         },
+         "enrollment.auto_approve.mode"},
+        {"toggle",
+         [](EnrollRoutesHarness& h) {
+             return h.sink.Post("/api/settings/auto-approve/0/toggle", "", kForm);
+         },
+         "enrollment.auto_approve.rule_toggle"},
+        {"remove",
+         [](EnrollRoutesHarness& h) { return h.sink.Delete("/api/settings/auto-approve/0"); },
+         "enrollment.auto_approve.rule_remove"},
+    };
+}
+} // namespace
+
+TEST_CASE("settings auto-approve: an audit row that is not persisted refuses the write (503), "
+          "and policy memory and file are unchanged",
+          "[settings_routes][enrollment][auto_approve][audit]") {
+    for (const auto& w : auto_approve_writes()) {
+        INFO(w.name);
+        EnrollRoutesHarness h(/*with_store=*/false);
+        yuzu::test::TempDbFile cfg{"yuzu_test_auto_approve_audit-"};
+        h.auto_approve.load(cfg.path);
+        REQUIRE(h.auto_approve.add_rule(
+            {auth::AutoApproveRuleType::hostname_glob, "*.corp", "corp", true}));
+        const auto file_before = [&] {
+            std::ifstream f(cfg.path);
+            return std::string(std::istreambuf_iterator<char>(f), {});
+        }();
+        h.audit_persists = false;
+
+        auto r = w.run(h);
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(nlohmann::json::parse(r->body)["error"]["code"] == 503);
+        REQUIRE(h.attempt_calls.size() == 1);
+        CHECK(h.attempt_calls[0].action == w.action);
+        CHECK(h.attempt_calls[0].result == "attempt");
+        CHECK(h.audit_calls.empty()); // no outcome row: nothing happened
+        const auto rules = h.auto_approve.list_rules();
+        REQUIRE(rules.size() == 1);
+        CHECK(rules[0].enabled);
+        CHECK(rules[0].value == "*.corp");
+        CHECK_FALSE(h.auto_approve.require_all());
+        const std::string file_after = [&] {
+            std::ifstream f(cfg.path);
+            return std::string(std::istreambuf_iterator<char>(f), {});
+        }();
+        CHECK(file_after == file_before);
+    }
+}
+
+TEST_CASE("settings auto-approve: the attempt row is written BEFORE the policy changes",
+          "[settings_routes][enrollment][auto_approve][audit]") {
+    // Observed from inside the audit hook: at the moment the attempt row is written the
+    // engine still holds the pre-write policy; afterwards it holds the post-write one.
+    for (const auto& w : auto_approve_writes()) {
+        INFO(w.name);
+        EnrollRoutesHarness h(/*with_store=*/false);
+        REQUIRE(h.auto_approve.add_rule(
+            {auth::AutoApproveRuleType::hostname_glob, "*.corp", "corp", true}));
+        auto r = w.run(h);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        REQUIRE(h.attempt_calls.size() == 1);
+        REQUIRE(h.rules_at_attempt.size() == 1);
+        CHECK(h.rules_at_attempt[0].value == "*.corp");
+        CHECK(h.rules_at_attempt[0].enabled);
+        CHECK_FALSE(h.mode_at_attempt);
+        REQUIRE(h.audit_calls.size() == 1);
+        CHECK(h.audit_calls[0].result == "success");
+        // ... and the write did happen afterwards.
+        const std::string name = w.name;
+        if (name == "add")
+            CHECK(h.auto_approve.list_rules().size() == 2);
+        else if (name == "mode")
+            CHECK(h.auto_approve.require_all());
+        else if (name == "toggle")
+            CHECK_FALSE(h.auto_approve.list_rules()[0].enabled);
+        else
+            CHECK(h.auto_approve.list_rules().empty());
+    }
+}
+
+TEST_CASE("settings auto-approve: a failed policy write is a 500 with an error outcome row and no "
+          "change",
+          "[settings_routes][enrollment][auto_approve][audit]") {
+    for (const auto& w : auto_approve_writes()) {
+        INFO(w.name);
+        EnrollRoutesHarness h(/*with_store=*/false);
+        REQUIRE(h.auto_approve.add_rule(
+            {auth::AutoApproveRuleType::hostname_glob, "*.corp", "corp", true}));
+        // From here every write fails: the directory of the config path does not exist.
+        h.auto_approve.load(std::filesystem::temp_directory_path() /
+                            "yuzu_test_no_such_dir_auto_approve_route" / "aa.cfg");
+        // load() of a missing file leaves the in-memory rule alone (returns false).
+        REQUIRE(h.auto_approve.list_rules().size() == 1);
+
+        auto r = w.run(h);
+        REQUIRE(r);
+        CHECK(r->status == 500);
+        CHECK(nlohmann::json::parse(r->body)["error"]["code"] == 500);
+        REQUIRE(h.audit_calls.size() == 1);
+        CHECK(h.audit_calls[0].action == w.action);
+        CHECK(h.audit_calls[0].result == "error");
+        const auto rules = h.auto_approve.list_rules();
+        REQUIRE(rules.size() == 1);
+        CHECK(rules[0].enabled);
+        CHECK_FALSE(h.auto_approve.require_all());
+    }
+}
+
+TEST_CASE("settings auto-approve: a cross-site write is refused before any audit attempt or change",
+          "[settings_routes][enrollment][auto_approve][csrf]") {
+    // Same helper as the MFA POSTs: a request naming another site is a 403; one with neither
+    // Origin nor Referer is a non-browser client (curl / automation) and passes.
+    const std::unordered_map<std::string, std::string> cross_site[] = {
+        {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+        {{"Host", "yuzu.test"}, {"Referer", "https://evil.test/page"}},
+    };
+    for (const auto& hdrs : cross_site) {
+        for (const auto& w : auto_approve_writes()) {
+            INFO(w.name);
+            EnrollRoutesHarness h(/*with_store=*/false);
+            REQUIRE(h.auto_approve.add_rule(
+                {auth::AutoApproveRuleType::hostname_glob, "*.corp", "corp", true}));
+            h.sink.default_headers = hdrs;
+            auto r = w.run(h);
+            REQUIRE(r);
+            CHECK(r->status == 403);
+            CHECK(h.attempt_calls.empty());
+            REQUIRE(h.audit_calls.size() == 1);
+            CHECK(h.audit_calls[0].action == "csrf.denied");
+            const auto rules = h.auto_approve.list_rules();
+            REQUIRE(rules.size() == 1);
+            CHECK(rules[0].enabled);
+            CHECK_FALSE(h.auto_approve.require_all());
+        }
+    }
+}
+
+TEST_CASE("settings auto-approve: caller text cannot forge adjacent audit fields",
+          "[settings_routes][enrollment][auto_approve][audit]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    // Spaces and '=' pass validation (they are legal in a glob); the audit detail must not
+    // let them open a second `k=v` pair.
+    auto r = h.sink.Post("/api/settings/auto-approve",
+                         "type=hostname_glob&value=x+result%3Ddenied+by%3Dother&label=a+b%3Dc",
+                         kForm);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    const auto row = h.only("enrollment.auto_approve.rule_add");
+    CHECK(row.detail.find("result=denied") == std::string::npos);
+    CHECK(row.detail.find("by=other") == std::string::npos);
+    CHECK(row.detail.find("by=admin") != std::string::npos);
+    CHECK(h.attempt_calls.at(0).detail == row.detail);
+
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Delete("/api/settings/auto-approve/0")->status == 200);
+    const auto rm = h.only("enrollment.auto_approve.rule_remove");
+    CHECK(rm.detail.find("result=denied") == std::string::npos);
+    CHECK(rm.detail.find("by=other") == std::string::npos);
+}
+
+TEST_CASE("settings auto-approve: match-everything rules and oversized text are refused",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    const std::string big(auth::kMaxRuleValueLen + 1, 'a');
+    const std::string biglabel(auth::kMaxRuleLabelLen + 1, 'b');
+    for (const std::string body :
+         {std::string("type=hostname_glob&value=*&label=x"),
+          std::string("type=ip_subnet&value=0.0.0.0%2F0&label=x"),
+          "type=hostname_glob&value=" + big + "&label=x",
+          "type=hostname_glob&value=ok&label=" + biglabel}) {
+        INFO(body.substr(0, 60));
+        h.audit_calls.clear();
+        auto r = h.sink.Post("/api/settings/auto-approve", body, kForm);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(h.only("enrollment.auto_approve.rule_add").result == "denied");
+    }
+    CHECK(h.auto_approve.list_rules().empty());
+    CHECK(h.attempt_calls.empty());
 }
 
 // A lapsed token cannot be minted without waiting out a TTL, so the store row's expiry is

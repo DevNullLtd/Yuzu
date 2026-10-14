@@ -144,7 +144,9 @@ Administrators can configure rules that automatically approve agents matching sp
 
 **Add an auto-approval rule:**
 
-The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments.
+The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments. The four writes below are dashboard writes: a request whose `Origin` (or `Referer`) names a different site is refused with `403`; a request with neither header (curl, automation) is accepted, as for the other Settings writes.
+
+Every write is recorded before it is applied: an `attempt` audit row is written first and, if it cannot be stored, the write is refused with `503` (`Sec-Audit-Failed: true`) and nothing changes. A rule that cannot be saved to disk is refused with `500` and nothing changes. Error responses are the standard JSON error body; the dashboard shows a toast.
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve \
@@ -154,7 +156,11 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve \
 
 This rule automatically approves any agent whose hostname matches the glob pattern `web-*.example.com`.
 
-Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`.
+Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. A value is at most 253 characters and a label at most 128. A rule that would match every machine (a hostname glob of only `*`, or an `ip_subnet` of `/0`) is refused.
+
+**These rules are not a strong admission control.** `hostname_glob` and `cloud_provider` match strings the registering agent states about itself (its hostname and attestation provider); any client that can reach the Register endpoint can claim a matching value, which makes such a rule no stronger than `*`. `ip_subnet` matches the connection's peer address. `trusted_ca` can never match today because Register does not yet populate the CA fingerprint. Verified proof for the first two is reserved for a later tier. Treat `any`-mode `hostname_glob`/`cloud_provider` rules as a convenience for a trusted network, not as a security boundary.
+
+If the saved policy file (`auto-approve.cfg`) is damaged (a line with an unknown type, a short line, or a `mode:` other than exactly `any` or `all`), the server activates no auto-approve rules at start (every agent waits for manual approval), logs an error, and keeps the original as `auto-approve.cfg.rejected`; re-create the rules in Settings.
 
 **Set the auto-approve match mode:**
 
