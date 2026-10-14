@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <expected>
 #include <algorithm>
@@ -61,6 +62,8 @@ struct HwHarness {
     authz::VisibleSet scope;            // FleetReadGate scope; nullopt = unfiltered, set = confine to these ids
     bool allow_execute = true;          // scoped Execution:Execute probe (sync affordance/actions)
     bool allow_tag_write = true;        // scoped Tag:Write probe (tag controls)
+    bool allow_tag_delete = true;       // scoped Tag:Delete probe (Remove control; Tags lens only)
+    std::vector<std::string> probes;    // "Type:Op" for every scoped probe, in call order
 
     std::vector<InventoryDeviceRow> roster_rows;
     bool roster_ci_degraded = false;
@@ -157,6 +160,9 @@ struct HwHarness {
         HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&) { return ci_detail; };
         HardwareRoutes::ScopedProbeFn probe = [this](const httplib::Request&, const std::string& type,
                                                      const std::string& op, const std::string&) {
+            probes.push_back(type + ":" + op);
+            if (type == "Tag" && op == "Delete")
+                return allow_tag_delete;
             if (type == "GuaranteedState" && op == "Read")
                 return allow_guaranteed_state;
             if (type == "Execution" && op == "Execute")
@@ -1385,4 +1391,183 @@ TEST_CASE("route: record header carries the lazy quarantine banner and takes no 
     CHECK(contains(res->body, "hx-get=\"/fragments/hardware/ci/containment?id=agent-1&banner=1\""));
     CHECK(h.security_read_probes.empty());
     CHECK(contains(res->body, "lens=containment"));
+}
+
+// Remove needs Tag:Delete, which is not Tag:Write: a Write-only viewer is offered Add and no
+// Remove (a control that can only 403). Kills: the Remove column keyed off can_write again.
+TEST_CASE("route: Tags lens offers Remove only behind a Tag:Delete probe and hosts the "
+          "properties fragment",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("agent-1", "TAG-HOST", "windows", true);
+    h.ci_detail.tags = std::vector<DeviceTag>{{"agent-1", "owner", "ops", "api", 0}};
+
+    auto full = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags");
+    REQUIRE(full);
+    CHECK(contains(full->body, "data-act=\"tag-add\""));
+    CHECK(contains(full->body, "data-act=\"tag-del\""));
+    CHECK(contains(full->body, "/fragments/hardware/ci/properties?id=agent-1"));
+    CHECK(contains(full->body, ">Tags and properties<"));
+
+    h.allow_tag_delete = false;
+    auto write_only = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags&lens_only=1");
+    REQUIRE(write_only);
+    CHECK(contains(write_only->body, "data-act=\"tag-add\""));
+    CHECK_FALSE(contains(write_only->body, "data-act=\"tag-del\""));
+
+    h.allow_tag_write = false;
+    h.allow_tag_delete = true;
+    auto delete_only = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags&lens_only=1");
+    REQUIRE(delete_only);
+    CHECK_FALSE(contains(delete_only->body, "data-act=\"tag-add\""));
+    CHECK(contains(delete_only->body, "data-act=\"tag-del\""));
+}
+
+// A record view on another lens must not pay a denied-probe audit row for a control it
+// never renders. Kills: moving the Tag:Delete probe into affordances_for (every lens).
+TEST_CASE("route: the Tag:Delete probe is taken only when the Tags lens is the active one",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("agent-1", "TAG-HOST", "windows", true);
+    h.ci_detail.tags = std::vector<DeviceTag>{};
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1"));
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=software"));
+    CHECK(std::count(h.probes.begin(), h.probes.end(), "Tag:Delete") == 0);
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags"));
+    CHECK(std::count(h.probes.begin(), h.probes.end(), "Tag:Delete") == 1);
+}
+
+// The tags lens moved off the inline hwTagSet/hwTagDelete handlers onto data-act controls
+// served by static/yuzu-device-data.js and the shared dialog (A8b: no window.confirm).
+// Kills: restoring an inline onclick on Add or Remove.
+TEST_CASE("tags lens: controls are data-act, carry no inline handler, and name the service "
+          "sentences",
+          "[hardware][tags][render]") {
+    const std::vector<DeviceTag> tags{{"agent-1", "service", "web", "api", 0},
+                                      {"agent-1", "owner", "ops", "api", 0}};
+    const auto html = yuzu::server::render_hardware_tags_lens("agent-1", tags, true, true);
+    CHECK_FALSE(contains(html, "onclick="));
+    CHECK_FALSE(contains(html, "hwTag"));
+    CHECK(contains(html, "data-act=\"tag-add\""));
+    // The hint lists the real categories including the closed environment set.
+    CHECK(contains(html, "environment (Dev, UAT or Production, exact case)"));
+    CHECK(contains(html, "management group if it does not exist"));
+    // The Remove sentence rides only on the service row.
+    const auto svc = html.find("data-key=\"service\"");
+    const auto own = html.find("data-key=\"owner\"");
+    REQUIRE(svc != std::string::npos);
+    REQUIRE(own != std::string::npos);
+    CHECK(contains(html.substr(svc, own - svc), "data-service-note="));
+    CHECK_FALSE(contains(html.substr(own), "data-service-note="));
+}
+
+TEST_CASE("hardware shell loads the dialog module before the device-data controls",
+          "[hardware][route]") {
+    HwHarness h;
+    auto page = h.sink.Get("/hardware");
+    REQUIRE(page);
+    const auto dlg = page->body.find("src=\"/static/yuzu-dialog.js\" defer");
+    const auto dd = page->body.find("src=\"/static/yuzu-device-data.js\" defer");
+    REQUIRE(dlg != std::string::npos);
+    REQUIRE(dd != std::string::npos);
+    CHECK(dlg < dd);
+    // The bulk bar's Apply buttons carry the service sentence hwBulkTag shows.
+    auto list = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(list);
+    CHECK(contains(list->body, "data-service-note="));
+}
+
+// ---- readouts over the scoped roster (median memory, manufacturer counts) -------------------
+
+namespace {
+yuzu::server::InventoryDeviceRow ci_row(const std::string& id, const std::string& ram,
+                                        const std::string& vendor) {
+    yuzu::server::InventoryDeviceRow r;
+    r.agent_id = id;
+    r.hostname = id;
+    r.ci_ram_bytes = ram;
+    r.ci_manufacturer = vendor;
+    return r;
+}
+constexpr const char* kGiB8 = "8589934592";
+constexpr const char* kGiB16 = "17179869184";
+constexpr const char* kGiB64 = "68719476736";
+} // namespace
+
+TEST_CASE("readouts: median memory over rows with a synced figure, odd and even",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    std::size_t n = 0;
+    CHECK(*median_ram_gb({ci_row("a", kGiB8, ""), ci_row("b", kGiB16, ""), ci_row("c", kGiB64, "")},
+                         &n) == 16.0);
+    CHECK(n == 3);
+    CHECK(*median_ram_gb({ci_row("a", kGiB8, ""), ci_row("b", kGiB16, "")}) == 12.0);
+    // Unsynced, "unknown", zero and non-numeric are not devices with hardware synced.
+    CHECK_FALSE(median_ram_gb({ci_row("a", "", ""), ci_row("b", "unknown", ""), ci_row("c", "0", ""),
+                               ci_row("d", "12x", "")}, &n));
+    CHECK(n == 0);
+}
+
+TEST_CASE("readouts: manufacturer counts fold case, sum the tail into Other and skip blanks",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    std::vector<InventoryDeviceRow> rows{ci_row("1", "", "Dell"), ci_row("2", "", " dell "),
+                                         ci_row("3", "", "HP"), ci_row("4", "", "unknown"),
+                                         ci_row("5", "", "")};
+    const auto c = count_by_manufacturer(rows);
+    REQUIRE(c.size() == 2);
+    CHECK(c[0].first == "Dell");
+    CHECK(c[0].second == 2);
+    CHECK(c[1].first == "HP");
+
+    rows.clear();
+    for (int i = 0; i < 10; ++i)
+        rows.push_back(ci_row("d" + std::to_string(i), "", "V" + std::to_string(i)));
+    const auto top = count_by_manufacturer(rows, 8);
+    REQUIRE(top.size() == 9);
+    CHECK(top.back().first == "Other");
+    CHECK(top.back().second == 2);
+    CHECK(count_by_manufacturer({}).empty());
+}
+
+TEST_CASE("readouts: list KPIs describe the scoped roster only and hide when nothing synced",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    // H12: only the rows the confinement gate admitted reach hardware_kpis, so a
+    // confined caller's figures cannot include an out-of-scope device.
+    const auto admitted = hardware_kpis({ci_row("in-1", kGiB8, "Dell"), ci_row("in-2", kGiB8, "Dell")});
+    CHECK(admitted.ram_devices == 2);
+    REQUIRE(admitted.by_manufacturer.size() == 1);
+    CHECK(admitted.by_manufacturer[0].second == 2);
+
+    HardwareListPage page;
+    page.kpis = admitted;
+    const auto shown = render_hardware_list_fragment(page, false, false);
+    CHECK(contains(shown, "Median memory, 2 devices with hardware synced"));
+    CHECK(contains(shown, "By manufacturer: Dell 2"));
+    // CI columns degraded: no readout (a blank would read as "none").
+    const auto degraded = render_hardware_list_fragment(page, true, false);
+    CHECK_FALSE(contains(degraded, "Median memory"));
+    // Nothing synced: hidden.
+    HardwareListPage bare;
+    bare.kpis = hardware_kpis({ci_row("x", "", "")});
+    const auto none = render_hardware_list_fragment(bare, false, false);
+    CHECK_FALSE(contains(none, "Median memory"));
+    CHECK_FALSE(contains(none, "By manufacturer"));
+}
+
+TEST_CASE("software lens header: count and last synced, never-synced told apart from degraded",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    const std::vector<SoftwareEntry> sw{SoftwareEntry{}};
+    HwSyncAffordance sync;
+    const auto synced = render_hardware_software_lens("a", sw, false, true, sync, 1700000000);
+    CHECK(contains(synced, "1 application, last synced 2023-11-14"));
+    CHECK(contains(render_hardware_software_lens("a", sw, false, true, sync, 0), "never synced"));
+    CHECK(contains(render_hardware_software_lens("a", sw, false, true, sync, std::nullopt),
+                   "last synced time unavailable"));
+    // Click-to-load hosts ride the same lens and nothing is fetched on render.
+    CHECK(contains(synced, "hx-trigger=\"click\""));
 }

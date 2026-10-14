@@ -155,6 +155,7 @@
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
+#include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
 #include "instruction_routes.hpp" // #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
 #include "execution_routes.hpp" // #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
@@ -15386,6 +15387,51 @@ private:
                              .store = custom_properties_store_.get(),
                          });
 
+        // Hardware record, "Tags and properties" lens: the read-only HTML twin of the
+        // custom-properties routes above. Probes run against a throwaway Response so a
+        // denied probe never writes the gate's 403 to the real one (htmx would drop it).
+        yuzu::server::device_data::register_device_data_routes(
+            inline_sink,
+            yuzu::server::device_data::Deps{
+                .auth_fn = auth_fn,
+                .scoped_probe_fn =
+                    [scoped_perm_fn](const httplib::Request& req, const std::string& type,
+                                     const std::string& op, const std::string& id) -> bool {
+                        httplib::Response probe;
+                        return scoped_perm_fn(req, probe, type, op, id);
+                    },
+                .global_probe_fn =
+                    [perm_fn](const httplib::Request& req, const std::string& type,
+                              const std::string& op) -> bool {
+                        httplib::Response probe;
+                        return perm_fn(req, probe, type, op);
+                    },
+                .properties_fn =
+                    [this](const std::string& id)
+                        -> std::optional<std::vector<yuzu::server::device_data::PropertyRow>> {
+                        if (!custom_properties_store_ || !custom_properties_store_->is_open())
+                            return std::nullopt;
+                        auto props = custom_properties_store_->get_properties(id);
+                        if (!props)
+                            return std::nullopt;
+                        std::vector<yuzu::server::device_data::PropertyRow> out;
+                        out.reserve(props->size());
+                        for (const auto& p : *props)
+                            out.push_back({p.key, p.value, p.type, p.updated_at});
+                        return out;
+                    },
+                .schemas_fn =
+                    [this]() -> std::optional<std::vector<yuzu::server::device_data::SchemaRow>> {
+                        if (!custom_properties_store_ || !custom_properties_store_->is_open())
+                            return std::nullopt;
+                        std::vector<yuzu::server::device_data::SchemaRow> out;
+                        for (const auto& s : custom_properties_store_->list_schemas())
+                            out.push_back({s.key, s.display_name, s.type, s.description,
+                                           s.validation_regex});
+                        return out;
+                    },
+            });
+
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the
         // first extracted route module whose handlers call it (see
         // result_set_routes.hpp's "NEW DEPS FIELD" doc comment for why no
@@ -18357,6 +18403,95 @@ private:
                 return *r;
             },
             audit_fn);
+
+        // Hardware record, Installed software lens: click-to-load HTML twins of the two
+        // drills above. Same gates (sle_gate_usable / require_scoped_permission) and the
+        // same fail-closed audit verbs, probed against a throwaway Response so a denied or
+        // degraded gate renders a 200 note instead of a body htmx would drop.
+        {
+            HttplibRouteSink usage_sink{*web_server_};
+            auto usage_probe = [app_usage_scoped_perm_fn](const httplib::Request& req,
+                                                          const std::string& type,
+                                                          const std::string& op,
+                                                          const std::string& id)
+                -> yuzu::server::device_data::UsageDeps::Probe {
+                using P = yuzu::server::device_data::UsageDeps::Probe;
+                httplib::Response probe;
+                if (app_usage_scoped_perm_fn(req, probe, type, op, id))
+                    return P::Allowed;
+                return probe.status == 503 ? P::Unavailable : P::Denied;
+            };
+            yuzu::server::device_data::register_device_usage_routes(
+                usage_sink,
+                yuzu::server::device_data::UsageDeps{
+                    .auth_fn = auth_fn,
+                    .probe_fn = usage_probe,
+                    .audit_fn = audit_fn,
+                    .usage_fn =
+                        [this](const std::string& id)
+                            -> std::optional<yuzu::server::device_data::AppUsageData> {
+                            if (!app_usage_store_)
+                                return std::nullopt;
+                            auto r = app_usage_store_->get_agent_usage_snapshot(id);
+                            if (!r.has_value())
+                                return std::nullopt;
+                            yuzu::server::device_data::AppUsageData out;
+                            out.collected_at = r->collected_at;
+                            out.rows.reserve(r->rows.size());
+                            for (const auto& u : r->rows)
+                                out.rows.push_back({u.exe_key, u.first_seen, u.last_seen,
+                                                    u.run_count_30d, u.total_seconds_30d});
+                            return out;
+                        },
+                    .licences_fn =
+                        [this](const std::string& id)
+                            -> std::optional<std::vector<yuzu::server::device_data::LicenceRow>> {
+                            if (!software_licensing_store_)
+                                return std::nullopt;
+                            auto rows = software_licensing_store_->agent_licenses(id);
+                            if (!rows)
+                                return std::nullopt;
+                            std::vector<yuzu::server::device_data::LicenceRow> out;
+                            out.reserve(rows->size());
+                            for (const auto& l : *rows)
+                                out.push_back({l.product, l.vendor, l.version, l.license_type,
+                                               l.state, l.channel, l.confidence, l.key_hint,
+                                               l.detector, l.expiry_at});
+                            return out;
+                        },
+                });
+        }
+
+        // Software page: the "Inventory sources" panel, the HTML twin of
+        // GET /api/v1/inventory/tables (same global Inventory:Read gate).
+        {
+            HttplibRouteSink sources_sink{*web_server_};
+            yuzu::server::device_data::register_inventory_sources_route(
+                sources_sink,
+                yuzu::server::device_data::SourcesDeps{
+                    .auth_fn = auth_fn,
+                    .global_probe_fn =
+                        [perm_fn](const httplib::Request& req, const std::string& type,
+                                  const std::string& op) -> bool {
+                            httplib::Response probe;
+                            return perm_fn(req, probe, type, op);
+                        },
+                    .sources_fn =
+                        [this]() -> std::optional<std::vector<yuzu::server::device_data::SourceRow>> {
+                        if (!inventory_store_ || !inventory_store_->is_open())
+                            return std::nullopt;
+                        auto tables = inventory_store_->list_tables();
+                        if (!tables)
+                            return std::nullopt;
+                        std::vector<yuzu::server::device_data::SourceRow> out;
+                        out.reserve(tables->size());
+                        for (const auto& t : *tables)
+                            out.push_back({t.plugin, static_cast<std::int64_t>(t.agent_count),
+                                           static_cast<std::int64_t>(t.last_collected)});
+                        return out;
+                    },
+                });
+        }
 
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /

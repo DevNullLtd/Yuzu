@@ -764,3 +764,16 @@ TEST_CASE("software page: shell script is CSP-safe and wires the page's behaviou
         REQUIRE_FALSE(has(s, never));
     REQUIRE(s.rfind("<script>", 0) == 0);
 }
+
+// The Inventory sources panel loads once with the full page and only there: the Results and
+// Rows swaps must not re-request it. Kills: moving the host into results_region.
+TEST_CASE("software page: Inventory sources host loads with the full page only",
+          "[inventory][ui]") {
+    const auto d = page();
+    const std::string html = full({}, d);
+    REQUIRE(has(html, "hx-get=\"/fragments/inventory/sources\" hx-trigger=\"load\""));
+    REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Results),
+                      "/fragments/inventory/sources"));
+    REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Rows),
+                      "/fragments/inventory/sources"));
+}

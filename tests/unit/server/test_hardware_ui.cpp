@@ -462,7 +462,7 @@ TEST_CASE("hardware lens bar: id, fixed 7-tab order, active class, oob gated on 
     CHECK(html.find("hx-swap-oob") == std::string::npos);
 
     // Fixed order + exact labels.
-    const std::vector<std::string> labels = {"Overview", "Installed software", "Tags",
+    const std::vector<std::string> labels = {"Overview", "Installed software", "Tags and properties",
                                               "DEX",      "Guardian",           "Live",
                                               "Actions"};
     std::size_t pos = 0;

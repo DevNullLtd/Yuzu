@@ -757,6 +757,10 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
     }
     h += "<div class=\"inv-panel inv-pb\">" + controls(f, d) + active_region(f, false) + "</div>";
     h += results_region(f, d);
+    // Inventory sources (the REST /inventory/tables twin): loads once with the page; its own
+    // fragment carries the fleet-wide gate and the note a confined caller sees.
+    h += "<div id=\"sw-sources\" hx-get=\"/fragments/inventory/sources\" hx-trigger=\"load\" "
+         "hx-swap=\"innerHTML\"></div>";
     h += "</div>";
     return h;
 }

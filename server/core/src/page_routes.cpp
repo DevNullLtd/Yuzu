@@ -37,6 +37,7 @@ extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bun
 extern const std::string kYuzuOperateJs; // server/core/src/yuzu_operate_js_bundle.cpp (Operate O1)
 extern const std::string kYuzuDialogJs;  // server/core/src/yuzu_dialog_js_bundle.cpp (shared dialog)
 extern const std::string kYuzuEstateJs;  // server/core/src/yuzu_estate_js_bundle.cpp (containment controls)
+extern const std::string kYuzuDeviceDataJs; // yuzu_device_data_js_bundle.cpp (Hardware record controls)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
 // server/core/vendor/ibm-plex/*.woff2 (SIL OFL)
 extern const std::string_view kIbmPlexSans400Woff2;
@@ -152,6 +153,12 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/static/yuzu-estate.js", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuEstateJs, "application/javascript; charset=utf-8");
+    });
+
+    // Hardware record tag / property controls; moves with the lens markup, so never cached.
+    sink.Get("/static/yuzu-device-data.js", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(yuzu::server::kYuzuDeviceDataJs, "application/javascript; charset=utf-8");
     });
     sink.Get("/static/cytoscape.min.js", [](const httplib::Request&,
                                             httplib::Response& res) {

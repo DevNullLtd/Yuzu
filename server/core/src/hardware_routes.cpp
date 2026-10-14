@@ -46,12 +46,14 @@ std::string page_shell(const std::string& title, const std::string& fragment_url
     };
     sub("{{TITLE}}", title);
     sub("{{FRAGMENT}}", fragment_url);
-    // The shared dialog module and the estate controller (quarantine, stored-data
-    // removal) load after the template's own scripts. Same-origin static files: the
-    // dashboard CSP needs no change.
+    // The shared dialog module, the estate controller (quarantine, stored-data removal) and the
+    // tags/properties controls load after the template's own scripts, in that order. The shell is
+    // shared with pages that load none of them, so only this route family adds them.
+    // Same-origin static files: the dashboard CSP needs no change.
     if (const auto end = html.rfind("</body>"); end != std::string::npos)
-        html.insert(end, "<script src=\"/static/yuzu-dialog.js\"></script>"
-                         "<script src=\"/static/yuzu-estate.js\"></script>\n");
+        html.insert(end, "<script src=\"/static/yuzu-dialog.js\" defer></script>"
+                         "<script src=\"/static/yuzu-estate.js\" defer></script>"
+                         "<script src=\"/static/yuzu-device-data.js\" defer></script>\n");
     // test_nav_shells.cpp pins that the shared shell carries the marker apply_shell fills.
     return shell::apply_shell(std::move(html), {.active_key = "hardware"});
 }
@@ -338,7 +340,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         const HardwareCiDetail detail = deps_.ci_detail_fn(id);
-        const HwCiAffordances aff = affordances_for(req, id, detail);
+        HwCiAffordances aff = affordances_for(req, id, detail);
+        if (lens == "tags")
+            aff.can_delete_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Delete", id);
 
         std::string verb = "inventory.device.ci";
         std::string state = !detail.ci.has_value() ? "store degraded"
