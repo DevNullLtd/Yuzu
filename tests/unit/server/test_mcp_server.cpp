@@ -20434,7 +20434,9 @@ TEST_CASE("MCP list_deployments / get_deployment: the A5 schemas are bounded and
     const auto& id = (*get)["inputSchema"]["properties"]["deployment_id"];
     CHECK(id["type"] == "string");
     CHECK(id["minLength"] == 1);
-    CHECK(id["maxLength"] == 64);
+    // The published bound is the enforced bound: tie the schema to the constant the handler uses.
+    CHECK(id["maxLength"] == static_cast<int>(yuzu::server::kDeploymentIdMaxLen));
+    CHECK(id["pattern"] == "^[0-9a-f]+$");
 
     // Output: typed, not {"data":{"type":"object"}}. Every field is declared and required.
     const auto& data = (*get)["outputSchema"]["properties"]["data"];
@@ -20579,6 +20581,13 @@ TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders,
         R"("arguments":{"deployment_id":")" + std::string(64, 'a') + R"("}}})");
     REQUIRE(atbound);
     CHECK(nlohmann::json::parse(atbound->body)["error"]["message"] == "deployment not found");
+    // Uppercase hex cannot exist either (ids are lowercase): refused, not looked up.
+    auto upperid = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"get_deployment",)"
+        R"("arguments":{"deployment_id":"00000000000000A1"}}})");
+    REQUIRE(upperid);
+    CHECK(nlohmann::json::parse(upperid->body)["error"]["message"] ==
+          "deployment_id must be lowercase hexadecimal");
     // An id that cannot exist (not lowercase hex, here with an embedded NUL) is refused before
     // the query layer can truncate it.
     auto nulid = ts.call(

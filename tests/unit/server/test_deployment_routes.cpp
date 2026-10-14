@@ -588,6 +588,14 @@ TEST_CASE("deployment routes: GET /api/v1/deployments is owner-scoped, newest fi
     REQUIRE(direct);
     CHECK(body["data"][0] == deployment_row_json(*direct));
 
+    // The dashboard fragment says when it shows only the newest rows (alice owns 3).
+    auto cut_frag = rig.sink.Get("/fragments/auto/deployments?limit=1");
+    REQUIRE(cut_frag);
+    CHECK(cut_frag->body.find("data-truncated=\"1\"") != std::string::npos);
+    auto whole_frag = rig.sink.Get("/fragments/auto/deployments?limit=50");
+    REQUIRE(whole_frag);
+    CHECK(whole_frag->body.find("data-truncated") == std::string::npos);
+
     // limit clamps to 1..100; garbage is a 400, not a silent default.
     auto one = rig.sink.Get("/api/v1/deployments?limit=1");
     REQUIRE(one);

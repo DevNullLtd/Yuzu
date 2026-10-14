@@ -2215,14 +2215,24 @@ TEST_CASE("NvdClient: the startup line names the proxy host and port and no cred
     CHECK(line.find("credentials in the URL are ignored") != std::string::npos);
 }
 
+namespace {
+std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + 1))
+        ++n;
+    return n;
+}
+} // namespace
+
 TEST_CASE("NvdClient: an unusable proxy is reported and every fetch is refused",
           "[nvd][proxy][security]") {
     yuzu::test::LogCapture capture;
     NvdFetchResult published;
     NvdFetchResult modified;
     {
-        NvdClient client{"", "http://svc:p?ss@proxy.lan:3128"};
-        // No network is touched: the refusal comes before any connection is made.
+        // A closed loopback port as the base URL: if the refusal ever regressed into a direct
+        // dial, this would fail to connect locally and never reach the real NVD host.
+        NvdClient client{"", "http://svc:p?ss@proxy.lan:3128", "http://127.0.0.1:1"};
         published = client.fetch_by_published_window("2026-01-01T00:00:00.000",
                                                      "2026-01-02T00:00:00.000");
         modified = client.fetch_modified_between("2026-01-01T00:00:00.000",
@@ -2235,12 +2245,50 @@ TEST_CASE("NvdClient: an unusable proxy is reported and every fetch is refused",
         CHECK(r->records.empty());
     }
     const auto text = capture.text();
+    CHECK(text.find("[error]") != std::string::npos);
     CHECK(text.find("no usable host") != std::string::npos);
-    CHECK(text.find("fetch refused") != std::string::npos);
+    // One refusal per entry point: both fetchers went through the refusal, and nothing else
+    // (no connection attempt) logged a failure of its own.
+    CHECK(count_of(text, "NVD fetch refused") == 2);
     // Nothing of the configured value is echoed.
     CHECK(text.find("svc") == std::string::npos);
     CHECK(text.find("p?ss") == std::string::npos);
     CHECK(text.find("@") == std::string::npos);
+}
+
+TEST_CASE("NvdClient: a whitespace-only proxy value is unusable and refuses fetches",
+          "[nvd][proxy][security]") {
+    yuzu::test::LogCapture capture;
+    NvdFetchResult r;
+    {
+        NvdClient client{"", "   ", "http://127.0.0.1:1"};
+        r = client.fetch_modified_between("2026-01-01T00:00:00.000", "2026-01-02T00:00:00.000");
+    }
+    capture.stop();
+    CHECK_FALSE(r.ok);
+    CHECK(r.reason == NvdFailureReason::kConnection);
+    CHECK(count_of(capture.text(), "NVD fetch refused") == 1);
+}
+
+TEST_CASE("NvdClient: a proxy without credentials does not mention credentials",
+          "[nvd][proxy]") {
+    yuzu::test::LogCapture capture;
+    { NvdClient client{"", "proxy.lan:3128"}; }
+    capture.stop();
+    const auto line = capture.text();
+    CHECK(line.find("proxy.lan:3128") != std::string::npos);
+    CHECK(line.find("credentials") == std::string::npos);
+}
+
+TEST_CASE("nvd_sync_wait: retries soon while backfilling and never spins",
+          "[nvd][sync]") {
+    using std::chrono::seconds;
+    CHECK(nvd_sync_wait(seconds{14400}, /*backfill_complete=*/false) == seconds{60});
+    CHECK(nvd_sync_wait(seconds{14400}, /*backfill_complete=*/true) == seconds{14400});
+    CHECK(nvd_sync_wait(seconds{30}, false) == seconds{60});
+    // An interval of 0 (the flag accepts it) must not make a zero wait.
+    CHECK(nvd_sync_wait(seconds{0}, true) == seconds{60});
+    CHECK(nvd_sync_wait(seconds{0}, false) == seconds{60});
 }
 
 TEST_CASE("NvdClient: no proxy configured logs nothing about a proxy", "[nvd][proxy]") {

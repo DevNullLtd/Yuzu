@@ -152,7 +152,7 @@ NvdClient::NvdClient(std::string api_key, std::string proxy_url, std::string bas
             proxy_unusable_ = true;
             spdlog::error("NVD proxy URL has no usable host (accepted forms: host:port, "
                           "http://host:port, https://host:port); NVD fetches are refused until "
-                          "it is fixed");
+                          "it is fixed and the server is restarted");
         } else {
             // Host and port only: the parse has already dropped any userinfo.
             spdlog::info("NVD client using proxy {}:{}", proxy_host_, proxy_port_);

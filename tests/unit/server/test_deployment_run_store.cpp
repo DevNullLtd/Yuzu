@@ -369,6 +369,13 @@ TEST_CASE("DeploymentRunStore list order is deterministic across rows sharing a 
         CHECK(two->rows[1].deployment_id == "e2");
         CHECK(two->truncated);
     }
+    // The admin query carries the same tie-break.
+    auto admin = store.list_deployments_checked("anyone", /*is_admin=*/true, 2);
+    REQUIRE(admin);
+    REQUIRE(admin->rows.size() == 2);
+    CHECK(admin->rows[0].deployment_id == "e3");
+    CHECK(admin->rows[1].deployment_id == "e2");
+    CHECK(admin->truncated);
 }
 
 TEST_CASE("DeploymentRunStore checked readers: a miss is not a fault, a fault is not a miss",
