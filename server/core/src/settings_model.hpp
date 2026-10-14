@@ -136,10 +136,32 @@ namespace yuzu::server::settings_model {
 /// defaults `0.0.0.0` to `localhost` for a copy-pasteable value).
 [[nodiscard]] nlohmann::json build_mcp_settings(const Config& cfg);
 
+/// The retention windows the three stores actually ENFORCE, in days (<= 0 means
+/// "never expire"). `std::nullopt` = unknown: the store is absent or not open,
+/// so the figure is reported as null rather than a number the store does not
+/// enforce. The stores copy their window at construction and never re-read
+/// `Config`, so this can differ from the stored/configured value.
+struct RetentionEnforced {
+    std::optional<int> response_retention_days;
+    std::optional<int> audit_retention_days;
+    std::optional<int> guardian_event_retention_days;
+};
+
 /// `GET /fragments/settings/data-retention` + `GET /api/v1/settings/data-retention`.
-/// ServerConfig:Read. {response_retention_days, audit_retention_days} — two
-/// integers, lowest sensitivity of the eight (#4028 Evidence).
-[[nodiscard]] nlohmann::json build_data_retention_settings(const Config& cfg);
+/// ServerConfig:Read. {response_retention_days, audit_retention_days,
+/// guardian_event_retention_days, enforced:{<same three>: int|null}} — a handful
+/// of integers, lowest sensitivity of the eight (#4028 Evidence). The top-level
+/// three are the configured/stored values (unchanged keys); `enforced` is what
+/// the stores really apply.
+[[nodiscard]] nlohmann::json build_data_retention_settings(const Config& cfg,
+                                                           const RetentionEnforced& enforced = {});
+
+/// The data-retention table (pure; every cell is an integer or a fixed string).
+/// Input is `build_data_retention_settings`' JSON. Per window: enforced N > 0
+/// "N days", N <= 0 "No expiry", unknown an idle "Unknown" pill (never "0"); a
+/// stored value that differs from the enforced one adds a warn pill and the
+/// action-bearing hint. Followed by the cleanup-semantics hint.
+[[nodiscard]] std::string render_retention_table(const nlohmann::json& retention);
 
 /// `GET /fragments/settings/analytics` + `GET /api/v1/settings/analytics`.
 /// AnalyticsConfig:Read. {enabled, drain_interval_seconds, batch_size,

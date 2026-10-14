@@ -248,6 +248,62 @@ TEST_CASE("GET /api/v1/settings/data-retention returns the A4 envelope and Serve
     CHECK(body.at("data").at("audit_retention_days").get<int>() == 365);
 }
 
+TEST_CASE("data-retention REST twin and fragment report the ENFORCED windows from the injected "
+          "reader",
+          "[settings][rest][settings-read-twins][retention]") {
+    SettingsReadTwinsHarness h;
+    h.cfg.response_retention_days = 400; // stored override, not in force
+    h.cfg.audit_retention_days = 365;
+    h.cfg.guardian_event_retention_days = 30;
+    h.routes.set_retention_enforced_fn([] {
+        settings_model::RetentionEnforced e;
+        e.response_retention_days = 90;
+        e.audit_retention_days = 365;
+        return e; // guardian store not open
+    });
+
+    auto rest = h.sink.Get("/api/v1/settings/data-retention");
+    REQUIRE(rest);
+    auto data = nlohmann::json::parse(rest->body).at("data");
+    CHECK(data.at("response_retention_days").get<int>() == 400);
+    CHECK(data.at("enforced").at("response_retention_days").get<int>() == 90);
+    CHECK(data.at("enforced").at("guardian_event_retention_days").is_null());
+
+    auto frag = h.sink.Get("/fragments/settings/data-retention");
+    REQUIRE(frag);
+    CHECK(frag->status == 200);
+    CHECK(frag->body.find("Stored value 400 days is not in force") != std::string::npos);
+    CHECK(frag->body.find("Guardian events") != std::string::npos);
+    CHECK(frag->body.find("Unknown") != std::string::npos);
+}
+
+TEST_CASE("data-retention fragment shows Unknown for every window when no reader is wired",
+          "[settings][rest][settings-read-twins][retention]") {
+    SettingsReadTwinsHarness h;
+    auto frag = h.sink.Get("/fragments/settings/data-retention");
+    REQUIRE(frag);
+    CHECK(frag->status == 200);
+    CHECK(frag->body.find("Unknown") != std::string::npos);
+    CHECK(frag->body.find(" days") == std::string::npos); // no number nothing verified
+}
+
+TEST_CASE("GET /settings/data is admin-gated with a redirect, like /settings",
+          "[settings][page][retention]") {
+    SettingsReadTwinsHarness h;
+
+    auto ok = h.sink.Get("/settings/data");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->body.find("Data and retention") != std::string::npos);
+    CHECK(ok->body.find("hx-get=\"/fragments/settings/data-retention\"") != std::string::npos);
+
+    h.allow_admin = false;
+    auto denied = h.sink.Get("/settings/data");
+    REQUIRE(denied);
+    CHECK(denied->status != 200);
+    CHECK(denied->body.find("Data and retention") == std::string::npos);
+}
+
 TEST_CASE("GET /api/v1/settings/analytics sanitizes the ClickHouse URL and gates on "
           "AnalyticsConfig:Read",
           "[settings][rest][settings-read-twins][security]") {

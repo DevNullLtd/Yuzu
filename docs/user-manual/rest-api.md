@@ -4697,9 +4697,9 @@ Update a single runtime configuration value. The key must be one of the allowed 
 | Key | Type | Takes effect | Description |
 |---|---|---|---|
 | `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline |
-| `response_retention_days` | integer | **stored only, applied at next restart** | Days to retain command response data |
-| `audit_retention_days` | integer | **stored only, applied at next restart** | Days to retain audit log entries |
-| `guardian_event_retention_days` | integer | **stored only, applied at next restart** | Days to retain guaranteed-state events |
+| `response_retention_days` | integer | **stored only, not enforced - see note** | Days to retain command response data |
+| `audit_retention_days` | integer | **stored only, not enforced - see note** | Days to retain audit log entries |
+| `guardian_event_retention_days` | integer | **stored only, not enforced - see note** | Days to retain guaranteed-state events |
 | `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
 | `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
 | `plugin_signing_required` | boolean | **records intent only - see note** | Server-side record of the Settings "Require signed plugins" toggle |
@@ -4723,12 +4723,14 @@ most keys:
 - **immediately** - only two keys. `heartbeat_timeout` is assigned into the live server config and
   re-read on every stale-session sweep; `log_level` is applied by `RuntimeConfigStore::set()` itself
   via `spdlog::set_level`.
-- **stored only, applied at next restart** - `response_retention_days`, `audit_retention_days`,
+- **stored only, not enforced** - `response_retention_days`, `audit_retention_days`,
   `guardian_event_retention_days`. The handler updates the in-memory config, so `GET /api/config`
-  and the Settings page immediately report the NEW value - but each store captured its retention
-  window when it was constructed and exposes no setter, so the store still enforcing retention keeps
-  the old value until the server restarts. **The API reports the stored value, not the value being
-  enforced.** Restart after changing a retention window.
+  reports the NEW value - but each store copied its retention window when it was constructed and
+  exposes no setter, so the stores keep enforcing the window they were built with. **The API
+  reports the stored value, not the value being enforced.** `GET /api/v1/settings/data-retention`
+  and the Data and retention page show the enforced value under `enforced`. To change a window, set
+  `--response-retention-days`, `--audit-retention-days`, `--guardian-event-retention-days` (or the
+  matching `YUZU_*` environment variable) and restart. No route removes a stored override.
 - **records intent only** - `plugin_signing_required` is read in exactly two places, both of which
   render the Settings status badge. **No server or agent code consumes it to require signatures**,
   and it is not carried in any proto field, so it never reaches an agent. Agent-side enforcement is
@@ -5045,14 +5047,29 @@ REST-only — see the #520 note above.
 
 #### `GET /api/v1/settings/data-retention`
 
-Response/audit data retention windows, in days.
+Response, audit and Guardian-event data retention windows, in days.
 
-**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (two
+**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (a few
 integers).
+
+The top-level fields are the configured/stored values. `enforced` holds the window each store is
+actually applying, in days (`0` or less means rows never expire); a value is `null` when the store
+is absent or not open, which is "unknown", not zero. The two differ after a runtime
+`PUT /api/config/<key>`, which is stored but not applied (see
+[When a change takes effect](#when-a-change-takes-effect)).
 
 ```json
 {
-  "data": { "response_retention_days": 90, "audit_retention_days": 365 },
+  "data": {
+    "response_retention_days": 90,
+    "audit_retention_days": 365,
+    "guardian_event_retention_days": 30,
+    "enforced": {
+      "response_retention_days": 90,
+      "audit_retention_days": 365,
+      "guardian_event_retention_days": 30
+    }
+  },
   "meta": { "api_version": "v1" }
 }
 ```

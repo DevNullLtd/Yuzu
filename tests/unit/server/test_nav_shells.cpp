@@ -35,6 +35,7 @@ extern const char* const kComplianceHtml;
 extern const char* const kGuardianHtml;
 extern const char* const kGuardianDetailPageHtml;
 extern const char* const kSettingsHtml;
+extern const char* const kSettingsDataHtml;
 
 using Catch::Matchers::ContainsSubstring;
 using namespace yuzu::server::shell;
@@ -97,16 +98,34 @@ TEST_CASE("app shell: keys and hrefs are unique and every top-level entry has an
         }
 }
 
-TEST_CASE("app shell: only Software and Fleet have sub-items; Settings is one admin-only entry",
+TEST_CASE("app shell: only Software, Fleet and Settings have sub-items; Settings is one "
+          "admin-only entry",
           "[nav][shell]") {
+    // Parent keys only: a System page PR adds its own child to kSettingsSub and
+    // must not have to edit this assertion.
     std::vector<std::string> with_children;
     for (const auto& g : nav_groups())
         for (const auto& it : g.items) {
             if (!it.children.empty())
-                with_children.push_back(std::string(it.key) + ">" + std::string(it.children[0].key));
+                with_children.push_back(std::string(it.key));
             CHECK((it.key == "settings") == it.admin_only);
         }
-    CHECK(with_children == std::vector<std::string>{"software>auto", "fleet>network"});
+    CHECK(with_children == std::vector<std::string>{"software", "fleet", "settings"});
+
+    // Settings sub-items keep the design order of the System pages.
+    const std::vector<std::string_view> order{"settings-general",     "settings-security",
+                                              "settings-integrations", "settings-pki",
+                                              "settings-plugins",     "settings-data",
+                                              "settings-licence",     "settings-developer"};
+    std::size_t at = 0;
+    for (const auto& g : nav_groups())
+        for (const auto& it : g.items)
+            if (it.key == "settings")
+                for (const auto& c : it.children) {
+                    while (at < order.size() && order[at] != c.key)
+                        ++at;
+                    CHECK(at < order.size());
+                }
 
     const auto groups = nav_groups();
     REQUIRE(groups.back().title == "System");
@@ -354,6 +373,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"guardian detail (shared shell default)", kGuardianDetailPageHtml, {"/guardian"}},
         {"tar", kTarPageHtml, {"/tar"}},
         {"settings", kSettingsHtml, {"/settings"}},
+        {"settings data", kSettingsDataHtml, {"/settings", "/settings/data"}},
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},

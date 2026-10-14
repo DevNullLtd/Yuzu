@@ -1115,6 +1115,7 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/https"
     "/fragments/settings/analytics"
     "/fragments/settings/data-retention"
+    "/settings/data"
     "/fragments/settings/mcp"
     "/fragments/settings/nvd"
     "/fragments/settings/directory"

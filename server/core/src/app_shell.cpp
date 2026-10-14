@@ -26,6 +26,12 @@ constexpr NavItem kFleetSub[] = {
     {.key = "network", .label = "Network", .href = "/network"},
 };
 
+// System pages under Settings: entries only for pages that exist, in design order
+// (General, Security, Integrations, PKI, Plugins, Data, Licence, Developer).
+constexpr NavItem kSettingsSub[] = {
+    {.key = "settings-data", .label = "Data and retention", .href = "/settings/data"},
+};
+
 constexpr NavItem kOperate[] = {
     {.key = "dashboard", .label = "Dashboard", .href = "/", .icon = "M4 17l6-6-6-6 M12 19h8"},
     {.key = "instructions",
@@ -75,6 +81,7 @@ constexpr NavItem kSystem[] = {
      .label = "Settings",
      .href = "/settings",
      .icon = "M4 6h10 M18 6h2 M4 12h4 M12 12h8 M4 18h12 M14 4v4 M10 10v4 M16 16v4",
+     .children = kSettingsSub,
      .admin_only = true},
 };
 

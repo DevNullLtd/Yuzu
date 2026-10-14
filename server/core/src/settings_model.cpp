@@ -216,11 +216,75 @@ nlohmann::json build_mcp_settings(const Config& cfg) {
     return j;
 }
 
-nlohmann::json build_data_retention_settings(const Config& cfg) {
+nlohmann::json build_data_retention_settings(const Config& cfg, const RetentionEnforced& enforced) {
+    const auto opt = [](const std::optional<int>& v) {
+        return v ? nlohmann::json(*v) : nlohmann::json(nullptr);
+    };
     nlohmann::json j;
     j["response_retention_days"] = cfg.response_retention_days;
     j["audit_retention_days"] = cfg.audit_retention_days;
+    j["guardian_event_retention_days"] = cfg.guardian_event_retention_days;
+    j["enforced"] = {{"response_retention_days", opt(enforced.response_retention_days)},
+                     {"audit_retention_days", opt(enforced.audit_retention_days)},
+                     {"guardian_event_retention_days", opt(enforced.guardian_event_retention_days)}};
     return j;
+}
+
+namespace {
+
+std::string days_text(int n) {
+    if (n <= 0)
+        return "No expiry";
+    return std::to_string(n) + (n == 1 ? " day" : " days");
+}
+
+} // namespace
+
+std::string render_retention_table(const nlohmann::json& v) {
+    struct Row {
+        const char* label;
+        const char* key;
+        const char* flag;
+    };
+    static constexpr Row kRows[] = {
+        {"Instruction responses", "response_retention_days", "--response-retention-days"},
+        {"Audit log", "audit_retention_days", "--audit-retention-days"},
+        {"Guardian events", "guardian_event_retention_days", "--guardian-event-retention-days"},
+    };
+    const auto& enforced = v.contains("enforced") ? v.at("enforced") : nlohmann::json::object();
+
+    std::string html =
+        "<div class=\"tw\"><table><thead><tr><th>Data</th><th>Kept for</th><th>Set with</th>"
+        "</tr></thead><tbody>";
+    for (const auto& r : kRows) {
+        html += "<tr><td>";
+        html += r.label;
+        html += "</td><td>";
+        const bool known = enforced.contains(r.key) && enforced.at(r.key).is_number_integer();
+        if (!known) {
+            html += "<span class=\"pill idle\">Unknown</span>";
+        } else {
+            const int in_force = enforced.at(r.key).get<int>();
+            html += days_text(in_force);
+            const int stored = v.value(r.key, in_force);
+            if (stored != in_force) {
+                html += " <span class=\"pill warn\">Stored value " + days_text(stored) +
+                        " is not in force</span><div class=\"hint\">Restarting does not apply it. "
+                        "Set the startup option to " +
+                        std::to_string(stored) + " and restart, or set the stored value back to " +
+                        std::to_string(in_force) + ".</div>";
+            }
+        }
+        html += "</td><td class=\"mono\">";
+        html += r.flag;
+        html += "</td></tr>";
+    }
+    html += "</tbody></table></div>"
+            "<p class=\"hint\" style=\"padding:12px 16px 14px\">A shorter window applies to rows "
+            "written after the change; existing rows keep the window they were written with. Audit "
+            "entries are removed at most 25,000 per cleanup pass, so the audit window is a minimum."
+            "</p>";
+    return html;
 }
 
 nlohmann::json build_analytics_settings(const Config& cfg) {

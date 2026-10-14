@@ -197,6 +197,11 @@ public:
     ResponseStore& operator=(const ResponseStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
+    /// The retention window this store was constructed with and actually
+    /// enforces (days; <= 0 means "never expire"). Read-only: the value is
+    /// copied at construction and never re-read, so this is the ENFORCED
+    /// figure, which can differ from Config / a stored runtime override.
+    [[nodiscard]] int retention_days() const noexcept { return retention_days_; }
 
     /// Wire a metrics registry for `yuzu_server_response_read_degrade_total{reason,source}`
     /// (degrade-distinguishable reads), `yuzu_server_response_ingest_dropped_total{reason}`
