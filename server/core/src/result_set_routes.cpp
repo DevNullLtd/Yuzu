@@ -104,10 +104,10 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
     };
     auto reeval_allowed = [deps, read_only_dispatch](const ResultSet& rs,
                                                     const httplib::Request& req) -> bool {
-        if (!deps.perm_fn)
-            return false;
-        httplib::Response probe; // a deny writes its 403 here, never to the page
-        if (!deps.perm_fn(req, probe, "Execution", "Execute"))
+        // A presentation check, re-run on every 5 s refresh of a pending set: the non-auditing
+        // probe, so a viewer without Execution:Execute leaves no denial rows. The POST that
+        // re-evaluates keeps the auditing gate.
+        if (!deps.probe_perm_fn || !deps.probe_perm_fn(req, "Execution", "Execute"))
             return false;
         if (rs.source_kind == source_kind::kTarQuery)
             return read_only_dispatch("tar", "sql");
@@ -267,10 +267,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
             if (!session)
                 return;
             auto allowed = [&](const char* type, const char* op) {
-                if (!deps.perm_fn)
-                    return false;
-                httplib::Response probe;
-                return deps.perm_fn(req, probe, type, op);
+                return deps.probe_perm_fn && deps.probe_perm_fn(req, type, op);
             };
             if (!allowed("Execution", "Execute") || !allowed("InstructionDefinition", "Read")) {
                 res.set_content(render_result_set_producers_denied(), "text/html; charset=utf-8");

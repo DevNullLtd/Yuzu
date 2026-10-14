@@ -15480,8 +15480,16 @@ private:
                              .tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),
                              .store = result_set_store_.get(),
                              // Operate extras: producer picker + re-evaluate verdict. The SAME
-                             // classifier the Console and MCP consult.
-                             .perm_fn = perm_fn,
+                             // classifier the Console and MCP consult. The permission checks
+                             // only decide what to draw, so they use the non-auditing probe:
+                             // a viewer without Execution:Execute would otherwise write an
+                             // auth.permission_required denial on every refresh. The POST
+                             // that acts keeps the auditing gate.
+                             .probe_perm_fn =
+                                 [this](const httplib::Request& req, const std::string& type,
+                                        const std::string& op) -> bool {
+                                     return auth_routes_->has_permission(req, type, op);
+                                 },
                              .classify_fn =
                                  [this](std::string_view p, std::string_view a) {
                                      return capability_registry_.classify(p, a);

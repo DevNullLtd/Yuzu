@@ -127,7 +127,8 @@ struct Harness {
     std::vector<std::string> all_agent_ids_override{"dev-1", "dev-2", "dev-3"};
 
     /// Operate extras: the producer picker and the re-evaluate verdict. `perm_ok` drives the
-    /// RBAC probe; `classify_wired` false leaves the classifier genuinely unwired.
+    /// non-auditing RBAC probe (`Deps::probe_perm_fn`; the module has no auditing perm_fn at
+    /// all); `classify_wired` false leaves the classifier genuinely unwired.
     InstructionStore* instruction_store{nullptr};
     bool perm_ok{true};
     bool wire_perm_fn{true};
@@ -141,11 +142,9 @@ struct Harness {
         deps.store = store;
         deps.instruction_store = instruction_store;
         if (wire_perm_fn) {
-            deps.perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                                  const std::string& type, const std::string& op) -> bool {
+            deps.probe_perm_fn = [this](const httplib::Request&, const std::string& type,
+                                        const std::string& op) -> bool {
                 perms_asked.push_back(type + ":" + op);
-                if (!perm_ok)
-                    res.status = 403;
                 return perm_ok;
             };
         }
@@ -1284,12 +1283,14 @@ TEST_CASE("result_set_routes: producers answers a 200 denied note, never a 4xx, 
     CHECK(r->status == 200);
     CHECK(r->body.find("data-denied=\"true\"") != std::string::npos);
     CHECK(r->body.find("<option") == std::string::npos);
-    // The first denial short-circuits; the unwired-perm_fn case below proves fail-closed.
+    // The first denial short-circuits; the unwired-probe case below proves fail-closed.
     CHECK(!h.perms_asked.empty());
     CHECK(h.perms_asked[0] == "Execution:Execute");
+    // A render-time probe, not an attempt: the page writes no audit row for the denial.
+    CHECK(h.audits.empty());
 }
 
-TEST_CASE("result_set_routes: an unwired perm_fn fails CLOSED on the producer picker",
+TEST_CASE("result_set_routes: an unwired permission probe fails CLOSED on the producer picker",
           "[server][routes][result_set_routes][extras][security]") {
     Harness h;
     h.wire_perm_fn = false;
@@ -1617,7 +1618,8 @@ TEST_CASE("result_set_routes: [pg] Re-evaluate is drawn only while the stored so
     CHECK_FALSE(shows_button(h, gone_id));        // definition deleted
     CHECK_FALSE(shows_button(h, bad_payload_id)); // no instruction_id
 
-    SECTION("a caller without Execution:Execute never sees it") {
+    SECTION("a caller without Execution:Execute never sees it, and the render writes no audit "
+            "row (the only permission path the module has is the non-auditing probe)") {
         Harness d;
         d.store = &w.store;
         d.instruction_store = &is;
@@ -1625,7 +1627,7 @@ TEST_CASE("result_set_routes: [pg] Re-evaluate is drawn only while the stored so
         d.wire();
         CHECK_FALSE(shows_button(d, ok_id));
     }
-    SECTION("an unwired perm_fn or classifier fails closed") {
+    SECTION("an unwired probe or classifier fails closed") {
         Harness np;
         np.store = &w.store;
         np.instruction_store = &is;
@@ -1663,6 +1665,9 @@ TEST_CASE("result_set_routes: [pg] the create route's re-rendered list is also d
         REQUIRE(r.ok());
     }
     // An empty create body is refused, and the refusal re-renders the owner's list.
+        CHECK(d.audits.empty());
+        REQUIRE_FALSE(d.perms_asked.empty());
+        CHECK(d.perms_asked[0] == "Execution:Execute");
     auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=",
                          "application/x-www-form-urlencoded");
     REQUIRE(r);

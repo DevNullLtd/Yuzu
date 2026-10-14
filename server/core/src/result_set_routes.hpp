@@ -241,12 +241,14 @@ struct Deps {
         std::function<bool(const httplib::Request&, httplib::Response&, const auth::Session&,
                            const std::string& securable_type, const std::string& operation)>;
 
-    /// Operate extras (B-6, re-evaluate verdict): the RBAC probe, same shape as every other
-    /// module's `perm_fn` (writes a 403 to `res` on deny). Used ONLY by the producer picker and
-    /// the re-evaluate button's visibility, always against a throwaway Response so a denial
-    /// becomes a 200 note, never a dropped 4xx body. Unwired `{}` = both read as denied.
-    using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
-                                      const std::string& type, const std::string& op)>;
+    /// Operate extras (B-6, re-evaluate verdict): a NON-AUDITING "does the caller hold this
+    /// permission" probe (`AuthRoutes::has_permission`). Used ONLY by the producer picker and
+    /// the re-evaluate button's visibility, which decide what to draw and refresh every few
+    /// seconds: the auditing gate would write an `auth.permission_required` denial for each
+    /// one. Never a gate; the route that acts keeps its own auditing check. Denied is a 200
+    /// note, never a dropped 4xx body. Unwired `{}` = both read as denied.
+    using ProbePermFn = std::function<bool(const httplib::Request&, const std::string& type,
+                                           const std::string& op)>;
     /// The SAME classifier the Console and MCP consult (`capability_registry_.classify`). Unwired
     /// `{}` = nothing classifies as read-only: the picker is empty and Re-evaluate is hidden
     /// (fail closed), never "everything is fine".
@@ -273,7 +275,7 @@ struct Deps {
     /// `custom_properties_store_`/`CustomPropertiesStore`, whose routes DO
     /// check `is_open()`).
     ResultSetStore* store{nullptr};
-    PermFn perm_fn;
+    ProbePermFn probe_perm_fn;
     ClassifyFn classify_fn;
     /// `ServerImpl::instruction_store_`; null or not open = the picker says "unavailable".
     InstructionStore* instruction_store{nullptr};
