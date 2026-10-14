@@ -9,7 +9,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -360,11 +362,14 @@ TEST_CASE("summary: the TOP estate read is cached 60 s on the server clock", "[h
     CHECK(estate_calls == 3);
 }
 
-// Kills: a failed read cached (or an expired value served in its place), which would render
-// an outage as a stale or zero fleet for a minute.
-TEST_CASE("summary: a failed TOP estate read is never cached", "[home][route][cache]") {
+// Kills: a failed read shown as (or replaced by) a stale or zero figure, and a failure that
+// is retried on every view (N viewers x the lease wait / statement timeout against a store
+// that is already down).
+TEST_CASE("summary: a failed TOP estate read is never a figure and backs off briefly",
+          "[home][route][cache]") {
     Deps d = top_deps();
-    std::int64_t now = 1'760'000'000;
+    const std::int64_t start = 1'760'000'000;
+    std::int64_t now = start;
     d.now_fn = [&] { return now; };
     int estate_calls = 0;
     bool fail = true;
@@ -381,27 +386,127 @@ TEST_CASE("summary: a failed TOP estate read is never cached", "[home][route][ca
     auto down = sink.Get("/fragments/home/summary");
     REQUIRE(down);
     CHECK(has(down->body, "Could not read The device roster. This is not zero."));
-    fail = false; // same second: the failure was not remembered
-    auto up = sink.Get("/fragments/home/summary");
-    REQUIRE(up);
+    fail = false; // recovered, but the backoff window is still open: no re-read, still not a figure
+    now = start + kEstateFailBackoffSecs - 1;
+    auto held = sink.Get("/fragments/home/summary");
+    REQUIRE(held);
+    CHECK(estate_calls == 1);
+    CHECK(has(held->body, "Could not read The device roster. This is not zero."));
+    CHECK_FALSE(has(held->body, "Nothing needs attention"));
+    now = start - 1; // a clock that stepped backwards ends the backoff instead of extending it
+    REQUIRE(sink.Get("/fragments/home/summary"));
     CHECK(estate_calls == 2);
-    CHECK(has(up->body, "of 200 seen in the last 30 days"));
+    // (that read succeeded and filled the cache; expire it and fail again below)
+    now += kEstateCacheTtlSecs;
     fail = true; // expired entry + failed read: Unavailable, not the old figure
-    now += 60;
     auto again = sink.Get("/fragments/home/summary");
     REQUIRE(again);
     CHECK(estate_calls == 3);
     CHECK(has(again->body, "Could not read The device roster. This is not zero."));
     CHECK_FALSE(has(again->body, "of 200 seen"));
-    fail = false; // the failed read did not restart the window or leave the old figure behind
+    fail = false;
+    now += kEstateFailBackoffSecs; // backoff over: the next view reads again and recovers
     auto recovered = sink.Get("/fragments/home/summary");
     REQUIRE(recovered);
     CHECK(estate_calls == 4);
     CHECK(has(recovered->body, "of 200 seen in the last 30 days"));
 }
 
-// Kills: a scoped caller reading (or being served) the fleet-wide cached figure.
-TEST_CASE("summary: a scoped caller never touches the estate seam or its cache", "[home][route][cache]") {
+// Kills: viewers queued behind a failing read each retrying it serially (the lock is held
+// across the read), so the last waits N x the failure latency with a worker held throughout.
+TEST_CASE("summary: viewers queued behind a failing TOP estate read share its failure",
+          "[home][route][cache]") {
+    Deps d = top_deps(); // fixed clock
+    std::atomic<int> estate_calls{0};
+    std::promise<void> entered, release;
+    auto release_gate = release.get_future().share();
+    d.fleet_estate_fn = [&](std::int64_t) -> std::optional<EstateCounts> {
+        if (estate_calls.fetch_add(1) == 0) {
+            entered.set_value();
+            release_gate.wait(); // the first read is in flight while the others arrive
+        }
+        return std::nullopt;
+    };
+    HomeRoutes r;
+    test::TestRouteSink sink;
+    r.register_routes(sink, std::move(d));
+
+    auto view = [&] { return sink.Get("/fragments/home/summary")->body; };
+    std::vector<std::future<std::string>> viewers;
+    viewers.push_back(std::async(std::launch::async, view));
+    entered.get_future().wait();
+    for (int i = 0; i < 3; ++i)
+        viewers.push_back(std::async(std::launch::async, view));
+    release.set_value();
+    for (auto& v : viewers)
+        CHECK(has(v.get(), "Could not read The device roster. This is not zero."));
+    CHECK(estate_calls.load() == 1);
+}
+
+// Kills: a cache that cannot expire because there is no clock to expire it on.
+TEST_CASE("summary: without a server clock the TOP estate read is not cached", "[home][route][cache]") {
+    Deps d = top_deps();
+    d.now_fn = nullptr;
+    int estate_calls = 0;
+    d.fleet_estate_fn = [&](std::int64_t) -> std::optional<EstateCounts> {
+        ++estate_calls;
+        return EstateCounts{10, 9, 0, 1};
+    };
+    test::TestRouteSink sink;
+    HomeRoutes r;
+    r.register_routes(sink, std::move(d));
+    REQUIRE(sink.Get("/fragments/home/summary"));
+    REQUIRE(sink.Get("/fragments/home/summary"));
+    CHECK(estate_calls == 2);
+}
+
+// Kills: a scoped caller reading (or being served) the fleet-wide cached figure, including
+// the one a TOP caller populated moments before.
+TEST_CASE("summary: a scoped caller is never served a TOP caller's cached estate",
+          "[home][route][cache]") {
+    Deps d = top_deps();
+    d.fleet_read_fn = [](const httplib::Request& req, httplib::Response&, const std::string&,
+                         const std::string&) {
+        authz::FleetReadGate g;
+        g.admitted = true;
+        g.scope = std::nullopt;
+        if (req.has_header("X-Test-Scoped"))
+            g.scope = std::unordered_set<std::string>{"a"};
+        return g;
+    };
+    int estate_calls = 0;
+    d.fleet_estate_fn = [&](std::int64_t) -> std::optional<EstateCounts> {
+        ++estate_calls;
+        return EstateCounts{999999, 999999, 0, 0};
+    };
+    d.roster_fn = [] {
+        InventoryDevicesResult res;
+        res.rows = {row("a", "linux", true), row("b", "linux", true)};
+        return res;
+    };
+    test::TestRouteSink sink;
+    HomeRoutes r;
+    r.register_routes(sink, std::move(d));
+
+    auto top = sink.Get("/fragments/home/summary");
+    REQUIRE(top);
+    CHECK(has(top->body, "999,999"));
+    CHECK(estate_calls == 1);
+    for (int i = 0; i < 3; ++i) {
+        auto scoped = sink.Get("/fragments/home/summary", {{"X-Test-Scoped", "1"}});
+        REQUIRE(scoped);
+        CHECK_FALSE(has(scoped->body, "999,999"));
+        CHECK(has(scoped->body, "of 1 seen in the last 30 days"));
+    }
+    CHECK(estate_calls == 1); // the scoped views never reached the seam or refreshed the cache
+    auto top_again = sink.Get("/fragments/home/summary");
+    REQUIRE(top_again);
+    CHECK(has(top_again->body, "999,999"));
+    CHECK(estate_calls == 1);
+}
+
+// Kills: a scoped caller reaching the estate seam at all (no cache populated first).
+TEST_CASE("summary: a scoped caller never touches the estate seam", "[home][route][cache]") {
     Deps d = top_deps();
     d.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&) {
         authz::FleetReadGate g;

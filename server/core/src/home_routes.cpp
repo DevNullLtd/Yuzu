@@ -113,16 +113,25 @@ EstateCounts tally_roster(const std::vector<InventoryDeviceRow>& rows) {
     return c;
 }
 
-std::optional<EstateCounts> HomeRoutes::cached_estate(std::int64_t now_epoch) const {
+std::optional<EstateCounts> HomeRoutes::cached_estate() const {
+    if (!deps_.now_fn)
+        return deps_.fleet_estate_fn(0);
     std::lock_guard lk(estate_mu_);
-    // A clock that stepped backwards is a miss, not a cache that never expires.
-    if (estate_cache_ && now_epoch >= estate_cached_at_ &&
-        now_epoch - estate_cached_at_ < kEstateCacheTtlSecs)
+    const std::int64_t now = deps_.now_fn();
+    // A clock that stepped backwards is a miss, not an entry or a backoff that never ends.
+    if (estate_cache_ && now >= estate_cached_at_ && now - estate_cached_at_ < kEstateCacheTtlSecs)
         return estate_cache_;
-    auto c = deps_.fleet_estate_fn(now_epoch * 1000);
+    if (estate_failed_at_ && now >= *estate_failed_at_ &&
+        now - *estate_failed_at_ < kEstateFailBackoffSecs)
+        return std::nullopt;
+    auto c = deps_.fleet_estate_fn(now * 1000);
     if (c) {
         estate_cache_ = c;
-        estate_cached_at_ = now_epoch;
+        estate_cached_at_ = now;
+        estate_failed_at_.reset();
+    } else {
+        // Stamped AFTER the read: viewers queued behind a slow failure see it as fresh.
+        estate_failed_at_ = deps_.now_fn();
     }
     return c;
 }
@@ -139,7 +148,7 @@ SummaryView HomeRoutes::build_summary(const httplib::Request& req) const {
         if (g.state != FactState::Ok) {
             v.devices = from_gate<EstateCounts>(g);
         } else if (!g.scope.has_value() && deps_.fleet_estate_fn) {
-            auto c = cached_estate(v.now_epoch);
+            auto c = cached_estate();
             v.devices = c ? Fact<EstateCounts>::make_ok(*c)
                           : Fact<EstateCounts>::with(FactState::Unavailable);
         } else if (!deps_.roster_fn) {
@@ -241,6 +250,7 @@ void HomeRoutes::register_routes(httplib::Server& svr, Deps deps) {
 void HomeRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     deps_ = std::move(deps);
     estate_cache_.reset();
+    estate_failed_at_.reset();
 
     // Page: auth-only chrome. The fragment carries every per-figure gate.
     sink.Get("/home", [this](const httplib::Request& req, httplib::Response& res) {
