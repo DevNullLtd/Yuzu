@@ -115,14 +115,16 @@ struct FetchOutcome {
 
 FetchOutcome fetch_discovery_then_jwks(const std::string& issuer) {
     FetchOutcome out;
-    auto doc = OidcProvider::fetch_discovery_document(issuer, /*skip_tls_verify=*/true, 5000);
+    auto doc = OidcProvider::fetch_discovery_document(issuer, /*skip_tls_verify=*/true,
+                                                      /*allow_private_networks=*/true, 5000);
     out.discovery_ok = doc.has_value();
     if (!doc) {
         out.discovery_error = doc.error();
         out.ran = true;
         return out;
     }
-    auto body = OidcProvider::http_get_bounded(doc->jwks_uri, /*skip_tls_verify=*/true, 5000);
+    auto body = OidcProvider::http_get_bounded(doc->jwks_uri, /*skip_tls_verify=*/true,
+                                               /*allow_private_networks=*/true, 5000);
     if (!body) {
         out.jwks_error = body.error();
         out.ran = true;
@@ -154,8 +156,8 @@ TEST_CASE("OIDC https: certificate verification is honored, and skip_tls_verify 
 
     SECTION(
         "verification on: an IdP whose certificate is not trusted is refused, nothing adopted") {
-        auto doc =
-            OidcProvider::fetch_discovery_document(idp.base(), /*skip_tls_verify=*/false, 5000);
+        auto doc = OidcProvider::fetch_discovery_document(idp.base(), /*skip_tls_verify=*/false,
+                                                          /*allow_private_networks=*/true, 5000);
         REQUIRE_FALSE(doc.has_value());
         CHECK(doc.error().starts_with("request failed: "));
         CHECK(doc.error().find("SSL") != std::string::npos); // a TLS error, not a refused connect
@@ -167,6 +169,7 @@ TEST_CASE("OIDC https: certificate verification is honored, and skip_tls_verify 
         cfg.client_id = "yuzu-test-client";
         cfg.redirect_uri = "https://yuzu.example.test/auth/callback";
         cfg.skip_tls_verify = false;
+        cfg.allow_private_networks = true; // the TLS IdP listens on loopback
         OidcProvider provider(cfg);
         try {
             (void)provider.start_auth_flow();
@@ -176,13 +179,14 @@ TEST_CASE("OIDC https: certificate verification is honored, and skip_tls_verify 
         }
         CHECK(provider.pending_flow_count_for_test() == 0);
         CHECK(idp.discovery_calls.load() == 0);
-        auto jwks = OidcProvider::http_get_bounded(idp.base() + "/jwks", false, 5000);
+        auto jwks = OidcProvider::http_get_bounded(idp.base() + "/jwks", false,
+                                                   /*allow_private_networks=*/true, 5000);
         CHECK_FALSE(jwks.has_value());
         CHECK(idp.jwks_calls.load() == 0);
     }
     SECTION("verification off: the same IdP is accepted and its document adopted") {
-        auto doc =
-            OidcProvider::fetch_discovery_document(idp.base(), /*skip_tls_verify=*/true, 5000);
+        auto doc = OidcProvider::fetch_discovery_document(idp.base(), /*skip_tls_verify=*/true,
+                                                          /*allow_private_networks=*/true, 5000);
         REQUIRE(doc.has_value());
         CHECK(doc->jwks_uri == idp.base() + "/jwks");
         CHECK(idp.discovery_calls.load() == 1);
@@ -192,6 +196,7 @@ TEST_CASE("OIDC https: certificate verification is honored, and skip_tls_verify 
         cfg.client_id = "yuzu-test-client";
         cfg.redirect_uri = "https://yuzu.example.test/auth/callback";
         cfg.skip_tls_verify = true;
+        cfg.allow_private_networks = true; // the TLS IdP listens on loopback
         OidcProvider provider(cfg);
         const auto flow = provider.start_auth_flow();
         CHECK(flow.url.starts_with(idp.base() + "/authorize?"));

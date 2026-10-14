@@ -117,6 +117,9 @@ struct OidcHarness {
 
     explicit OidcHarness(const std::string& dsn, bool open_store = true)
         : tmp(yuzu::test::unique_temp_path("yuzu_test_settings_oidc_")) {
+        // The mock IdPs listen on loopback, which the OIDC egress policy refuses by default; the
+        // refusal cases set it back to false.
+        cfg.oidc_allow_private_networks = true;
         if (open_store) {
             keys_dir.emplace("yuzu_test_keys_");
             key_provider.emplace(keys_dir->path);
@@ -477,5 +480,75 @@ TEST_CASE("Settings OIDC test connection: reports what a login will find",
         REQUIRE(r);
         CHECK(r->body.find("feedback-ok") != std::string::npos);
     }
+}
+TEST_CASE("Settings OIDC test connection: the egress policy refuses an internal typed issuer",
+          "[settings][oidc][oidc_egress]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    h.cfg.oidc_allow_private_networks = false; // the shipped default
+    const auto test = [&](const std::string& issuer) {
+        auto r = h.sink.Post("/api/settings/oidc/test", "issuer=" + issuer,
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        return r->body;
+    };
+
+    SECTION("a loopback issuer: the fixed text, no address, and the IdP sees nothing") {
+        const auto body = test(idp.base());
+        CHECK(body.find("feedback-error") != std::string::npos);
+        CHECK(body.find("address not permitted") != std::string::npos);
+        CHECK(body.find("127.0.0.1") == std::string::npos);
+        CHECK(idp.discovery_calls.load() == 0);
+    }
+    SECTION("the same issuer connects once the server operator allows private networks") {
+        h.cfg.oidc_allow_private_networks = true;
+        CHECK(test(idp.base()).find("feedback-ok") != std::string::npos);
+        CHECK(idp.discovery_calls.load() == 1);
+    }
+    SECTION("a cloud-metadata issuer is refused even then") {
+        h.cfg.oidc_allow_private_networks = true;
+        const auto body = test("http://169.254.169.254");
+        CHECK(body.find("feedback-error") != std::string::npos);
+        CHECK(body.find("address not permitted") != std::string::npos);
+        CHECK(body.find("169.254") == std::string::npos);
+    }
+    SECTION("a JWKS on a refused host is refused although the issuer was allowed") {
+        h.cfg.oidc_allow_private_networks = true;
+        idp.with([](MockIdp& m) {
+            m.discovery_body = R"({"issuer":")" + m.base() + R"(","authorization_endpoint":")" +
+                               m.base() + R"(/authorize","token_endpoint":")" + m.base() +
+                               R"(/token","jwks_uri":"http://169.254.169.254/jwks"})";
+        });
+        const auto body = test(idp.base());
+        CHECK(body.find("the JWKS could not be fetched") != std::string::npos);
+        CHECK(body.find("address not permitted") != std::string::npos);
+        CHECK(idp.jwks_calls.load() == 0);
+    }
+}
+
+TEST_CASE("Settings OIDC: the egress switch is OS-level and no form field can change it",
+          "[settings][oidc][oidc_egress][security]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    h.cfg.oidc_allow_private_networks = false;
+    for (const char* field : {"oidc_allow_private_networks", "allow_private_networks",
+                              "oidc-allow-private-networks", "oidc_allow_private"}) {
+        CAPTURE(field);
+        auto res = h.sink.Post("/api/settings/oidc", discovery_form(idp) + "&" + field + "=true",
+                               "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        REQUIRE(h.oidc_provider != nullptr);
+        CHECK_FALSE(h.cfg.oidc_allow_private_networks);
+        // The rebuilt provider still refuses the loopback IdP, and the IdP saw nothing.
+        CHECK_THROWS_AS(h.oidc_provider->start_auth_flow(), std::runtime_error);
+        CHECK(idp.discovery_calls.load() == 0);
+    }
+    // The Test Connection route does not read the field either.
+    auto r = h.sink.Post("/api/settings/oidc/test",
+                         "issuer=" + idp.base() + "&oidc_allow_private_networks=true",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->body.find("address not permitted") != std::string::npos);
+    CHECK(idp.discovery_calls.load() == 0);
 }
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN

@@ -4393,10 +4393,16 @@ public:
             oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
+            oidc_cfg.allow_private_networks = cfg_.oidc_allow_private_networks;
             oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;
             if (cfg_.oidc_skip_tls_verify)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
+            if (cfg_.oidc_allow_private_networks)
+                spdlog::info("OIDC egress: --oidc-allow-private-networks is set; loopback, "
+                             "RFC 1918, carrier-grade NAT and unique-local addresses are "
+                             "reachable for OIDC requests (link-local and cloud-metadata "
+                             "addresses stay refused)");
             // Endpoints and jwks_uri are NOT derived here: OidcProvider reads them from the
             // issuer's discovery document on first use (#5692).
             oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));

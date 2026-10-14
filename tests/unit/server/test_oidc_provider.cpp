@@ -1132,6 +1132,8 @@ OidcConfig binding_cfg(const std::string& token_endpoint = "http://127.0.0.1:1/t
     // Explicit, and refused instantly: were the per-field rule ever to regress, the flow fails
     // here instead of reaching a real discovery fetch.
     cfg.jwks_uri = "http://127.0.0.1:1/jwks";
+    // The mock IdPs listen on loopback, which the egress policy refuses by default.
+    cfg.allow_private_networks = true;
     return cfg;
 }
 
@@ -1358,6 +1360,8 @@ OidcConfig discovery_cfg(const MockIdp& idp) {
     cfg.issuer = idp.base();
     cfg.client_id = "yuzu-test-client";
     cfg.redirect_uri = "http://localhost:8443/auth/callback";
+    // The mock IdPs listen on loopback, which the egress policy refuses by default.
+    cfg.allow_private_networks = true;
     return cfg; // NO endpoints: every one comes from the discovery document
 }
 
@@ -1478,7 +1482,8 @@ TEST_CASE("OIDC discovery: every defective document fails closed at start with t
                 m.discovery_body.replace(at, 3, m.base());
         });
         // The operator-facing validator (also behind Test Connection) says why.
-        auto doc = OidcProvider::fetch_discovery_document(idp.base(), false);
+        auto doc = OidcProvider::fetch_discovery_document(idp.base(), false,
+                                                          /*allow_private_networks=*/true);
         REQUIRE_FALSE(doc.has_value());
         CHECK(doc.error().find(c.detail) != std::string::npos);
         // The login path gives only the fixed token, and stores nothing.
@@ -1835,7 +1840,8 @@ TEST_CASE("OIDC discovery: an issuer with a path prefix is fetched under that pr
         CAPTURE(prefix);
         const std::string issuer = idp.base() + prefix;
         idp.with([&](MockIdp& m) { m.discovery_issuer = issuer; });
-        auto doc = OidcProvider::fetch_discovery_document(issuer, false);
+        auto doc =
+            OidcProvider::fetch_discovery_document(issuer, false, /*allow_private_networks=*/true);
         REQUIRE(doc.has_value());
         CHECK(idp.discovery_path() == std::string(prefix) + "/.well-known/openid-configuration");
         CHECK(doc->jwks_uri == idp.base() + "/jwks");
@@ -1846,7 +1852,8 @@ TEST_CASE("OIDC http_get_bounded: a query on a bare-host URL is part of the path
           "[oidc][oidc_discovery]") {
     MockIdp idp;
     // `http://127.0.0.1:<port>?x=1` is the authority `127.0.0.1:<port>` and the path "/?x=1".
-    auto r = OidcProvider::http_get_bounded(idp.base() + "?x=1", false);
+    auto r =
+        OidcProvider::http_get_bounded(idp.base() + "?x=1", false, /*allow_private_networks=*/true);
     REQUIRE(r.has_value());
     CHECK(*r == "root");
     CHECK(idp.root_target() == "/?x=1");
@@ -1857,13 +1864,16 @@ TEST_CASE("OIDC http_get_bounded: a #fragment is never put on the request line",
     MockIdp idp;
     // RFC 3986 3.5: the fragment is client-side only. A bare host with a fragment is the origin
     // and the path "/"; a path with a query and a fragment keeps the query only.
-    auto bare = OidcProvider::http_get_bounded(idp.base() + "#frag", false);
+    auto bare = OidcProvider::http_get_bounded(idp.base() + "#frag", false,
+                                               /*allow_private_networks=*/true);
     REQUIRE(bare.has_value());
     CHECK(idp.root_target() == "/");
-    auto with_query = OidcProvider::http_get_bounded(idp.base() + "?a=b#frag?c", false);
+    auto with_query = OidcProvider::http_get_bounded(idp.base() + "?a=b#frag?c", false,
+                                                     /*allow_private_networks=*/true);
     REQUIRE(with_query.has_value());
     CHECK(idp.root_target() == "/?a=b");
-    auto jwks = OidcProvider::http_get_bounded(idp.base() + "/jwks#x", false);
+    auto jwks = OidcProvider::http_get_bounded(idp.base() + "/jwks#x", false,
+                                               /*allow_private_networks=*/true);
     REQUIRE(jwks.has_value()); // the route is "/jwks": "/jwks#x" would not match it
     CHECK(idp.jwks_calls.load() == 1);
 }
@@ -2042,7 +2052,10 @@ TEST_CASE("OIDC discovery: an https server dripping TLS handshake bytes cannot h
     const auto begin = std::chrono::steady_clock::now();
     const bool in_time = finished_within(
         std::chrono::seconds(8),
-        [&] { doc = OidcProvider::fetch_discovery_document(drip.base(), true, 1000); },
+        [&] {
+            doc = OidcProvider::fetch_discovery_document(drip.base(), true,
+                                                         /*allow_private_networks=*/true, 1000);
+        },
         [&] { drip.release(); });
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     CHECK(in_time); // false = the fetch outlived the bound by 6 s: the unbounded handshake
@@ -2061,6 +2074,7 @@ TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a drip
     cfg.redirect_uri = "http://localhost/cb";
     cfg.jwks_uri = drip.base() + "/jwks"; // explicit: the JWKS fetch is the one under test
     cfg.skip_tls_verify = true;
+    cfg.allow_private_networks = true; // the drip server listens on loopback
     OidcProvider provider(cfg);
     provider.set_http_timeouts_for_test(1000);
     const auto header = OidcProvider::base64url_encode(std::vector<uint8_t>{
@@ -2123,7 +2137,8 @@ constexpr const char* kLowFdEnvPrefix = "YUZU_TEST_OIDC_LOWFD_";
 int fetch_must_fail_within(const std::string& base, int limit_ms,
                            const std::string& required_error) {
     const auto begin = std::chrono::steady_clock::now();
-    const auto doc = OidcProvider::fetch_discovery_document(base, true, 1000);
+    const auto doc =
+        OidcProvider::fetch_discovery_document(base, true, /*allow_private_networks=*/true, 1000);
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     if (doc.has_value())
         return 10;
@@ -2290,14 +2305,16 @@ TEST_CASE("OIDC http_get_bounded: the watchdog does not cut a fast or a merely s
     MockIdp idp;
     SECTION("a fast fetch succeeds, and returns at once (the watchdog is woken, not waited for)") {
         const auto begin = std::chrono::steady_clock::now();
-        auto r = OidcProvider::http_get_bounded(idp.base() + "/jwks", false, 5000);
+        auto r = OidcProvider::http_get_bounded(idp.base() + "/jwks", false,
+                                                /*allow_private_networks=*/true, 5000);
         const auto elapsed = std::chrono::steady_clock::now() - begin;
         REQUIRE(r.has_value());
         CHECK(elapsed < std::chrono::seconds(2)); // the bound here is 10 s
     }
     SECTION("a response that takes a third of the per-operation timeout is not shut down") {
         idp.with([](MockIdp& m) { m.discovery_delay_ms = 300; });
-        auto doc = OidcProvider::fetch_discovery_document(idp.base(), false, 1000);
+        auto doc = OidcProvider::fetch_discovery_document(idp.base(), false,
+                                                          /*allow_private_networks=*/true, 1000);
         REQUIRE(doc.has_value());
     }
 }
@@ -2316,14 +2333,20 @@ TEST_CASE("OIDC http_get_bounded: fifty fetches leave the open descriptor count 
           "[oidc][oidc_discovery]") {
     MockIdp idp;
     // One fetch first, so lazily opened descriptors (resolver, locale, TLS) are already open.
-    REQUIRE(OidcProvider::http_get_bounded(idp.base() + "/jwks", false, 2000).has_value());
+    REQUIRE(OidcProvider::http_get_bounded(idp.base() + "/jwks", false,
+                                           /*allow_private_networks=*/true, 2000)
+                .has_value());
     const auto before = open_fd_count();
     for (int i = 0; i < 50; ++i)
-        REQUIRE(OidcProvider::http_get_bounded(idp.base() + "/jwks", false, 2000).has_value());
+        REQUIRE(OidcProvider::http_get_bounded(idp.base() + "/jwks", false,
+                                               /*allow_private_networks=*/true, 2000)
+                    .has_value());
     // A refused connection and a failed (404) answer take the early-exit paths.
     for (int i = 0; i < 10; ++i) {
-        CHECK_FALSE(OidcProvider::http_get_bounded("http://127.0.0.1:1/x", false, 2000));
-        CHECK_FALSE(OidcProvider::http_get_bounded(idp.base() + "/nope", false, 2000));
+        CHECK_FALSE(OidcProvider::http_get_bounded("http://127.0.0.1:1/x", false,
+                                                   /*allow_private_networks=*/true, 2000));
+        CHECK_FALSE(OidcProvider::http_get_bounded(idp.base() + "/nope", false,
+                                                   /*allow_private_networks=*/true, 2000));
     }
     // The mock's acceptor thread closes its end of the LAST connection when it notices the
     // client has gone, which can land just after the call returned (the count is then one off,
@@ -2590,6 +2613,7 @@ TEST_CASE("OIDC discovery: a refused connection fails closed", "[oidc][oidc_disc
     cfg.issuer = "http://127.0.0.1:1"; // connection refused, instantly
     cfg.client_id = "c";
     cfg.redirect_uri = "http://localhost/cb";
+    cfg.allow_private_networks = true; // else the egress policy, not the refused port, answers
     OidcProvider provider(cfg);
     try {
         (void)provider.start_auth_flow();
@@ -2609,6 +2633,7 @@ TEST_CASE("OIDC discovery: concurrent starts, signature checks and seam calls ag
     cfg.issuer = "http://127.0.0.1:1"; // connection refused, instantly
     cfg.client_id = "c";
     cfg.redirect_uri = "http://localhost/cb";
+    cfg.allow_private_networks = true; // else the egress policy, not the refused port, answers
     OidcProvider provider(cfg);
     provider.set_discovery_negative_cache_for_test(0); // every call really tries
     const auto header = OidcProvider::base64url_encode(std::vector<uint8_t>{
@@ -2741,17 +2766,19 @@ TEST_CASE("OIDC discovery: an issuer that is too long or has no host is refused 
           "request",
           "[oidc][oidc_discovery][security]") {
     // Nothing listens anywhere: these must fail on the issuer alone, and never reach the client.
-    CHECK_FALSE(
-        OidcProvider::fetch_discovery_document("https://" + std::string(50000, 'a'), false));
+    CHECK_FALSE(OidcProvider::fetch_discovery_document("https://" + std::string(50000, 'a'), false,
+                                                       /*allow_private_networks=*/true));
     const auto too_long = "https://" + std::string(2048 - 8 + 1, 'a');
     REQUIRE(too_long.size() == 2049);
-    auto r = OidcProvider::fetch_discovery_document(too_long, false);
+    auto r =
+        OidcProvider::fetch_discovery_document(too_long, false, /*allow_private_networks=*/true);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().find("2048") != std::string::npos);
     for (const char* issuer : {"https://", "http://", "https:///x", "https://?x", "https://:443",
                                "https://user@idp.test"}) {
         CAPTURE(issuer);
-        CHECK_FALSE(OidcProvider::fetch_discovery_document(issuer, false));
+        CHECK_FALSE(
+            OidcProvider::fetch_discovery_document(issuer, false, /*allow_private_networks=*/true));
         CHECK_FALSE(OidcProvider::parse_discovery_document(
             doc_with("jwks_uri", "https://idp.test/j"), issuer));
     }
@@ -2765,7 +2792,8 @@ TEST_CASE("OIDC discovery: an issuer with a query or a fragment is refused befor
          {"https://idp.test/realms/a#f", "https://idp.test?x=1", "https://idp.test/realms/a?x=1",
           "https://idp.test/realms/a?", "https://idp.test/realms/a#", "http://127.0.0.1:1/r#f"}) {
         CAPTURE(issuer);
-        auto r = OidcProvider::fetch_discovery_document(issuer, false);
+        auto r =
+            OidcProvider::fetch_discovery_document(issuer, false, /*allow_private_networks=*/true);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == "the issuer must not contain a query or fragment");
     }
@@ -2773,11 +2801,12 @@ TEST_CASE("OIDC discovery: an issuer with a query or a fragment is refused befor
 
 TEST_CASE("OIDC discovery: a URL with an absurd authority never reaches the HTTP client",
           "[oidc][oidc_discovery][security]") {
-    const auto r =
-        OidcProvider::http_get_bounded("https://" + std::string(200 * 1024, 'a') + "/x", false);
+    const auto r = OidcProvider::http_get_bounded("https://" + std::string(200 * 1024, 'a') + "/x",
+                                                  false, /*allow_private_networks=*/true);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == "not an http or https URL");
-    CHECK_FALSE(OidcProvider::http_get_bounded("https://h:99999999999/x", false));
+    CHECK_FALSE(OidcProvider::http_get_bounded("https://h:99999999999/x", false,
+                                               /*allow_private_networks=*/true));
 }
 
 #ifndef _WIN32
@@ -2887,7 +2916,8 @@ TEST_CASE("OIDC discovery: a configured issuer with a space or control byte is r
           std::string("https://idp.test/realm\xC2\x85"),
           std::string("https://idp.test/realm\xE2\x80\xA9")}) {
         CAPTURE(issuer);
-        auto r = OidcProvider::fetch_discovery_document(issuer, false);
+        auto r =
+            OidcProvider::fetch_discovery_document(issuer, false, /*allow_private_networks=*/true);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().find("space or control") != std::string::npos);
     }
@@ -3181,8 +3211,8 @@ TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own
 
 TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test, "
           "add_test_pending_flow, set_http_timeouts_for_test, "
-          "set_discovery_negative_cache_for_test or pending_flow_count_for_test "
-          "(source pin)",
+          "set_discovery_negative_cache_for_test, set_resolver_for_test or "
+          "pending_flow_count_for_test (source pin)",
           "[oidc][oidc_binding][source_pin]") {
     // The seams are public members of the production class and the first makes the binding
     // digest fail. Their only legitimate callers are tests; any file under server/core/src other
@@ -3192,6 +3222,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "add_test_pending_flow",
                                              "set_http_timeouts_for_test",
                                              "set_discovery_negative_cache_for_test",
+                                             "set_resolver_for_test",
                                              "pending_flow_count_for_test"};
     std::size_t scanned = 0;
     const fs::path src_dir = fs::path(YUZU_SERVER_SRC_DIR);

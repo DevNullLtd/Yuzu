@@ -876,6 +876,11 @@ int main(int argc, char* argv[]) {
     app.add_flag("--oidc-skip-tls-verify", cfg.oidc_skip_tls_verify,
                  "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
         ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
+    app.add_flag("--oidc-allow-private-networks", cfg.oidc_allow_private_networks,
+                 "Allow the OIDC discovery/JWKS/token requests to connect to loopback, RFC 1918, "
+                 "carrier-grade NAT and IPv6 unique-local addresses (an IdP on the internal "
+                 "network). Link-local and cloud-metadata addresses are refused either way")
+        ->envname("YUZU_OIDC_ALLOW_PRIVATE_NETWORKS");
     // ADR-2001 §1 — selects which validated ID token claim is used as the
     // SCIM-externalId join key at login. "sub" (default) matches Okta's
     // typical externalId; "oid" matches Entra (whose externalId rides the

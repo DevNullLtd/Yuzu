@@ -1,6 +1,7 @@
 #include "oidc_provider.hpp"
 
 #include "evp_raii.hpp"
+#include "oidc_egress_policy.hpp"
 #include "sha256_steps.hpp"
 
 #include <httplib.h>
@@ -8,10 +9,13 @@
 #include <spdlog/spdlog.h>
 #include <yuzu/log_token.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstring>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -25,7 +29,10 @@
 #include <utility>
 
 #ifndef _WIN32
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -738,6 +745,7 @@ bool authority_well_formed(std::string_view authority) {
 // The `scheme://host[:port]` a httplib::Client wants and the request path (with its query).
 struct HttpUrl {
     std::string origin;
+    std::string host; // the authority's host, brackets stripped (what httplib connects to)
     std::string path;
 };
 
@@ -762,6 +770,10 @@ std::optional<HttpUrl> split_http_url(const std::string& url) {
         return std::nullopt;
     HttpUrl out;
     out.origin = std::string(scheme) + std::string(authority);
+    // authority_well_formed vouched for the shape: "[hex:colons]" or "host" before an optional
+    // ":port". This is the same host httplib::Client's constructor extracts from the origin.
+    out.host = std::string(authority.starts_with('[') ? authority.substr(1, authority.find(']') - 1)
+                                                      : authority.substr(0, authority.find(':')));
     if (end == std::string_view::npos || rest[end] == '#') {
         out.path = "/";
         return out;
@@ -802,6 +814,118 @@ std::string_view truncate_utf8(std::string_view s, std::size_t max) {
     return s.substr(0, cut);
 }
 
+// ── Egress policy (oidc_egress_policy.hpp) ───────────────────────────────────
+
+// The fixed reasons a vetted target is not connected to. Neither names a resolved address.
+constexpr const char* kEgressRefusedReason = OidcProvider::kEgressRefused;
+constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
+
+// Decides where ONE fetch may connect, BEFORE any socket exists. A host that is an IP literal is
+// classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver
+// might read differently, such as `127.1`) is resolved here, with httplib's own bounded resolver,
+// and EVERY returned address is classified by its bytes. Returns the numeric addresses the
+// connection may be PINNED to (the permitted ones, in resolver order, at most kMaxPinnedAddresses),
+// or an EMPTY list when the host is an IP literal that needs no pin. A refusal or a resolver
+// failure is a fixed reason (never the address, never resolver text). Pinning closes the window
+// between this check and the connect: httplib is told to connect to that numeric address and does
+// no second lookup, so a DNS answer that changes in between cannot redirect the request. The
+// caller tries the permitted addresses in order while a connect fails (a host whose first address
+// family is unreachable still works, as it did when httplib walked the resolver's list itself). TLS
+// server-name indication and certificate verification keep using the host NAME (httplib keys them
+// on the host, not on the pinned address).
+constexpr std::size_t kMaxPinnedAddresses = 4;
+
+// The test resolver (OidcProvider::set_resolver_for_test); empty in production.
+std::mutex& test_resolver_mutex() {
+    static std::mutex m;
+    return m;
+}
+OidcProvider::ResolverForTest& test_resolver_slot() {
+    static OidcProvider::ResolverForTest r;
+    return r;
+}
+
+std::expected<std::vector<std::string>, const char*>
+vet_egress_target(const std::string& host, bool allow_private, int dns_timeout_ms) {
+    namespace egress = ::yuzu::server::oidc::egress;
+    const auto refuse = [&](egress::AddressClass cls) -> std::unexpected<const char*> {
+        spdlog::warn("OIDC egress: refused host '{}': {} address{}", ::yuzu::log_key_token(host),
+                     egress::class_name(cls),
+                     egress::decision(cls, true) == egress::Verdict::Allow
+                         ? " (permitted only with --oidc-allow-private-networks)"
+                         : " (never allowed)");
+        return std::unexpected(kEgressRefusedReason);
+    };
+
+    if (const auto literal = egress::classify_literal(host)) {
+        if (egress::decision(*literal, allow_private) != egress::Verdict::Allow)
+            return refuse(*literal);
+        return std::vector<std::string>{};
+    }
+
+    std::vector<std::string> pins;
+    std::optional<egress::AddressClass> first_refused;
+    const auto consider = [&](egress::AddressClass cls, const char* text) {
+        if (egress::decision(cls, allow_private) == egress::Verdict::Allow) {
+            if (pins.size() < kMaxPinnedAddresses &&
+                std::find(pins.begin(), pins.end(), text) == pins.end())
+                pins.emplace_back(text);
+        } else if (!first_refused) {
+            first_refused = cls;
+        }
+    };
+
+    OidcProvider::ResolverForTest test_resolver;
+    {
+        std::lock_guard lock(test_resolver_mutex());
+        test_resolver = test_resolver_slot();
+    }
+    if (test_resolver) {
+        for (const auto& text : test_resolver(host))
+            if (const auto cls = egress::classify_literal(text))
+                consider(*cls, text.c_str());
+    } else {
+        struct addrinfo hints;
+        std::memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo* result = nullptr;
+        const time_t dns_timeout_sec =
+            static_cast<time_t>(std::max(1, (dns_timeout_ms + 999) / 1000));
+        if (::httplib::detail::getaddrinfo_with_timeout(host.c_str(), "0", &hints, &result,
+                                                        dns_timeout_sec) != 0 ||
+            result == nullptr)
+            return std::unexpected(kEgressUnresolvedReason);
+        struct Freer {
+            struct addrinfo* p;
+            ~Freer() { ::freeaddrinfo(p); }
+        } freer{result};
+
+        for (const struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
+            char text[INET6_ADDRSTRLEN] = {};
+            if (ai->ai_family == AF_INET && ai->ai_addr != nullptr) {
+                egress::Ipv4 bytes{};
+                const auto* sin = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
+                std::memcpy(bytes.data(), &sin->sin_addr, bytes.size());
+                if (::inet_ntop(AF_INET, &sin->sin_addr, text, sizeof(text)) != nullptr)
+                    consider(egress::classify_ipv4(bytes), text);
+            } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr) {
+                egress::Ipv6 bytes{};
+                const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(ai->ai_addr);
+                std::memcpy(bytes.data(), &sin6->sin6_addr, bytes.size());
+                if (::inet_ntop(AF_INET6, &sin6->sin6_addr, text, sizeof(text)) != nullptr)
+                    consider(egress::classify_ipv6(bytes), text);
+            }
+            // any other address family is never connected to
+        }
+    }
+    if (!pins.empty())
+        return pins;
+    if (first_refused)
+        return refuse(*first_refused);
+    return std::unexpected(kEgressUnresolvedReason);
+}
+
 } // namespace
 
 // ── Token exchange ───────────────────────────────────────────────────────────
@@ -836,6 +960,20 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     std::string response_body;
 
 #ifdef _WIN32
+    // Egress policy. WinHTTP resolves and connects on its own and offers no way to pin the
+    // address, so this is a PRE-RESOLVE check only: the name is resolved and classified here,
+    // then WinHTTP resolves it again. A DNS answer that changes between the two lookups (DNS
+    // rebinding) is NOT covered on this path; the httplib paths (discovery, JWKS, and the token
+    // POST on Linux/macOS) pin the vetted address and have no such window.
+    const auto egress_target = split_http_url(*token_endpoint);
+    if (!egress_target)
+        return std::unexpected("invalid token endpoint URL");
+    if (const auto vet = vet_egress_target(egress_target->host, config_.allow_private_networks,
+                                           kHttpOperationTimeoutMs);
+        !vet) {
+        spdlog::error("OIDC token exchange: request refused: {}", vet.error());
+        return std::unexpected(std::string("token endpoint request failed: ") + vet.error());
+    }
     // Use WinHTTP on Windows — httplib's OpenSSL client fails from handler threads.
     response_body = winhttp_post(*token_endpoint, form_body, auth_header);
     if (response_body.empty()) {
@@ -856,22 +994,42 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         // Use heap-allocated client and explicit reset to work around httplib
         // 0.37.1 SSLClient destructor crash (invalid free in OpenSSL context
         // cleanup after HTTPS connections).
-        auto client = std::make_unique<httplib::Client>(target->origin);
-        client->set_connection_timeout(10);
-        client->set_read_timeout(15);
-        client->set_write_timeout(15);
-        client->enable_server_certificate_verification(!config_.skip_tls_verify);
-        httplib::Headers headers;
-        if (!auth_header.empty())
-            headers.emplace("Authorization", "Basic " + base64_encode(config_.client_id + ":" +
-                                                                      config_.client_secret));
-        auto result =
-            client->Post(target->path, headers, form_body, "application/x-www-form-urlencoded");
-        // Copy result data before destroying the client
-        status_code = result ? result->status : 0;
-        body_copy = result ? result->body : "";
-        err_str = result ? "" : httplib::to_string(result.error());
-        client.reset(); // Explicit destroy before any return
+        // Egress policy: vet the target and pin the connect to a vetted address (the same
+        // function the GETs use); nothing is sent to an address the policy refuses. A failed
+        // CONNECT moves on to the next permitted address (no request was sent, so a retry is
+        // safe); any other outcome is final.
+        const auto pins = vet_egress_target(target->host, config_.allow_private_networks, 10000);
+        if (!pins) {
+            spdlog::error("OIDC token exchange: request refused: {}", pins.error());
+            return std::unexpected(std::string("token endpoint request failed: ") + pins.error());
+        }
+        const std::size_t attempts = std::max<std::size_t>(1, pins->size());
+        for (std::size_t attempt = 0; attempt < attempts; ++attempt) {
+            auto client = std::make_unique<httplib::Client>(target->origin);
+            if (client->host() != target->host)
+                return std::unexpected(std::string("token endpoint request failed: ") +
+                                       kEgressRefusedReason);
+            if (!pins->empty())
+                client->set_hostname_addr_map({{target->host, (*pins)[attempt]}});
+            client->set_connection_timeout(10);
+            client->set_read_timeout(15);
+            client->set_write_timeout(15);
+            client->enable_server_certificate_verification(!config_.skip_tls_verify);
+            httplib::Headers headers;
+            if (!auth_header.empty())
+                headers.emplace("Authorization", "Basic " + base64_encode(config_.client_id + ":" +
+                                                                          config_.client_secret));
+            auto result =
+                client->Post(target->path, headers, form_body, "application/x-www-form-urlencoded");
+            // Copy result data before destroying the client
+            status_code = result ? result->status : 0;
+            body_copy = result ? result->body : "";
+            err_str = result ? "" : httplib::to_string(result.error());
+            const bool connect_failed = !result && result.error() == httplib::Error::Connection;
+            client.reset(); // Explicit destroy before any return
+            if (!connect_failed)
+                break;
+        }
     } catch (const std::exception& e) {
         status_code = 0;
         err_str = std::string("exception: ") + ::yuzu::log_key_token(e.what());
@@ -1052,7 +1210,8 @@ bool OidcProvider::fetch_jwks() {
     }
 
     spdlog::info("OidcProvider: fetching JWKS from {}", ::yuzu::log_key_token(*jwks_uri));
-    auto body = http_get_bounded(*jwks_uri, config_.skip_tls_verify, http_timeout_ms_.load());
+    auto body = http_get_bounded(*jwks_uri, config_.skip_tls_verify, config_.allow_private_networks,
+                                 http_timeout_ms_.load());
     if (!body) {
         spdlog::error("OidcProvider: JWKS fetch failed: {}", body.error());
         return false;
@@ -1463,43 +1622,76 @@ public:
 
 } // namespace
 
-std::expected<std::string, std::string>
-OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int timeout_ms) {
+std::expected<std::string, std::string> OidcProvider::http_get_bounded(const std::string& url,
+                                                                       bool skip_tls_verify,
+                                                                       bool allow_private_networks,
+                                                                       int timeout_ms) {
     const auto target = split_http_url(url);
     if (!target)
         return std::unexpected("not an http or https URL");
     try {
         // Declared BEFORE the client so it is destroyed after it (the client holds a reference).
         const auto t = std::chrono::milliseconds(timeout_ms);
+        const auto started = std::chrono::steady_clock::now();
         RequestDeadlineWatchdog watchdog(kHttpTotalBoundMultiplier * t);
         // Fail closed before any socket exists: without the reserved descriptor the watchdog
         // could not take hold of the socket (see RequestDeadlineWatchdog).
         if (!watchdog.reserved())
             return std::unexpected("request failed: no file descriptor available");
-        // Heap-allocated with an explicit reset: httplib 0.37.1's SSLClient destructor can crash
-        // after a failed connection to a non-routable host.
-        auto client = std::make_unique<httplib::Client>(target->origin);
-        client->set_connection_timeout(t);
-        client->set_read_timeout(t);
-        client->set_write_timeout(t);
-        // Those three are per operation: a server that sends one byte just inside each read
-        // timeout would hold the GET for as long as it likes. The connect is bounded by
-        // set_connection_timeout (per candidate address); set_max_timeout bounds the response
-        // waits on the established stream at twice the per-operation timeout (10 s by default),
-        // measured from the start of the request. Neither covers the TLS handshake, so on
-        // POSIX the watchdog shuts the socket down at the same deadline (and keeps doing so every
-        // 50 ms); on Windows the handshake phase has no total bound (see RequestDeadlineWatchdog).
-        client->set_max_timeout(kHttpTotalBoundMultiplier * t);
-        client->set_socket_options([&watchdog](socket_t sock) { watchdog.adopt(sock); });
-        client->set_payload_max_length(kHttpMaxBody);
-        client->set_follow_location(false);
-        client->enable_server_certificate_verification(!skip_tls_verify);
+        // Egress policy: resolve and classify the target BEFORE any socket exists, then pin the
+        // connect to a vetted address (see vet_egress_target). Name resolution is part of the
+        // total bound below.
+        const auto pins = vet_egress_target(target->host, allow_private_networks, timeout_ms);
+        if (!pins)
+            return std::unexpected(std::string("request failed: ") + pins.error());
 
-        auto result = client->Get(target->path);
-        const int status = result ? result->status : 0;
-        std::string body = result ? std::move(result->body) : std::string{};
-        const std::string err = result ? std::string{} : httplib::to_string(result.error());
-        client.reset();
+        // One attempt per permitted address while the CONNECT fails (a host whose first address
+        // family is unreachable still works); any other outcome, success or not, is final.
+        int status = 0;
+        std::string body;
+        std::string err;
+        const std::size_t attempts = std::max<std::size_t>(1, pins->size());
+        for (std::size_t attempt = 0; attempt < attempts; ++attempt) {
+            // Heap-allocated with an explicit reset: httplib 0.37.1's SSLClient destructor can
+            // crash after a failed connection to a non-routable host.
+            auto client = std::make_unique<httplib::Client>(target->origin);
+            // Fail closed if httplib would connect to a host other than the one just vetted.
+            if (client->host() != target->host)
+                return std::unexpected("request failed: " + std::string(kEgressRefusedReason));
+            if (!pins->empty())
+                client->set_hostname_addr_map({{target->host, (*pins)[attempt]}});
+            client->set_connection_timeout(t);
+            client->set_read_timeout(t);
+            client->set_write_timeout(t);
+            // Those three are per operation: a server that sends one byte just inside each read
+            // timeout would hold the GET for as long as it likes. The connect is bounded by
+            // set_connection_timeout (per candidate address); set_max_timeout bounds the
+            // response waits on the established stream at twice the per-operation timeout (10 s
+            // by default), measured from the start of the request. Neither covers the TLS
+            // handshake, so on POSIX the watchdog shuts the socket down at the same deadline (and
+            // keeps doing so every 50 ms); on Windows the handshake phase has no total bound (see
+            // RequestDeadlineWatchdog). The bound counts from the start of this call, so the
+            // time spent resolving the name (and on earlier attempts) comes off what this
+            // exchange may take.
+            client->set_max_timeout(
+                std::max(std::chrono::milliseconds(1),
+                         kHttpTotalBoundMultiplier * t -
+                             std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - started)));
+            client->set_socket_options([&watchdog](socket_t sock) { watchdog.adopt(sock); });
+            client->set_payload_max_length(kHttpMaxBody);
+            client->set_follow_location(false);
+            client->enable_server_certificate_verification(!skip_tls_verify);
+
+            auto result = client->Get(target->path);
+            status = result ? result->status : 0;
+            body = result ? std::move(result->body) : std::string{};
+            err = result ? std::string{} : httplib::to_string(result.error());
+            const bool connect_failed = !result && result.error() == httplib::Error::Connection;
+            client.reset();
+            if (!connect_failed)
+                break;
+        }
 
         if (status == 0)
             return std::unexpected("request failed: " + err);
@@ -1518,7 +1710,7 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
 
 std::expected<OidcProvider::DiscoveryDocument, std::string>
 OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_verify,
-                                       int timeout_ms) {
+                                       bool allow_private_networks, int timeout_ms) {
     if (issuer_scheme(issuer).empty())
         return std::unexpected("the issuer must be an http or https URL");
     if (issuer.size() > kMaxIdpUrlBytes)
@@ -1537,7 +1729,7 @@ OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_
         url.pop_back();
     url += "/.well-known/openid-configuration";
 
-    auto body = http_get_bounded(url, skip_tls_verify, timeout_ms);
+    auto body = http_get_bounded(url, skip_tls_verify, allow_private_networks, timeout_ms);
     if (!body)
         return std::unexpected(body.error());
     return parse_discovery_document(*body, issuer);
@@ -1647,6 +1839,7 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
                 spdlog::info("OidcProvider: fetching discovery for issuer {}",
                              ::yuzu::log_key_token(config_.issuer));
                 return fetch_discovery_document(config_.issuer, config_.skip_tls_verify,
+                                                config_.allow_private_networks,
                                                 http_timeout_ms_.load());
             } catch (const std::exception& e) {
                 return std::unexpected(std::string("discovery exception: ") +
@@ -1675,6 +1868,11 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
     return pick(*discovered_);
 }
 
+void OidcProvider::set_resolver_for_test(ResolverForTest resolver) {
+    std::lock_guard lock(test_resolver_mutex());
+    test_resolver_slot() = std::move(resolver);
+}
+
 void OidcProvider::set_http_timeouts_for_test(int ms) {
     http_timeout_ms_.store(ms);
 }
@@ -1697,6 +1895,31 @@ OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)) {
     // built (and a Settings save can succeed) while the IdP is briefly unreachable.
     spdlog::info("OidcProvider: issuer={} client_id={}", ::yuzu::log_key_token(config_.issuer),
                  ::yuzu::log_key_token(config_.client_id));
+
+    // Posture warnings about the configured issuer, once per construction, folded.
+    namespace egress = ::yuzu::server::oidc::egress;
+    if (const auto url = split_http_url(config_.issuer)) {
+        const auto literal = egress::classify_literal(url->host);
+        if (literal &&
+            egress::decision(*literal, config_.allow_private_networks) != egress::Verdict::Allow) {
+            const bool flag_helps = egress::decision(*literal, true) == egress::Verdict::Allow;
+            spdlog::warn("OIDC egress: the issuer host of {} is an IP address in a refused class "
+                         "({}); every OIDC request to it will be refused{}",
+                         ::yuzu::log_key_token(config_.issuer), egress::class_name(*literal),
+                         flag_helps ? " unless the server runs with --oidc-allow-private-networks"
+                                    : " (this class is never allowed)");
+        }
+        // A plain-http issuer sends the JWKS (the ID token signature trust root) and the client
+        // secret in the clear; fine for a loopback lab, an authentication bypass on a network an
+        // attacker can sit on. Not refused (documented as lab-only), but never silent.
+        if (config_.issuer.starts_with("http://") && url->host != "localhost" &&
+            literal != egress::AddressClass::Loopback)
+            spdlog::warn("OIDC issuer {} uses http:// on a non-loopback host: the signing keys "
+                         "(the trust root for every ID token) and the client secret travel "
+                         "unencrypted and anyone on the path can forge a sign-in; use an https "
+                         "issuer outside a lab",
+                         ::yuzu::log_key_token(config_.issuer));
+    }
 }
 
 bool OidcProvider::is_enabled() const {

@@ -382,6 +382,8 @@ oidc::OidcConfig flow_cfg(const std::string& token_endpoint) {
     // Explicit and refused instantly: were the per-field rule to regress, a flow fails here
     // instead of reaching a real discovery fetch.
     c.jwks_uri = "http://127.0.0.1:1/jwks";
+    // The mock IdPs listen on loopback, which the egress policy refuses by default.
+    c.allow_private_networks = true;
     return c;
 }
 
@@ -673,6 +675,7 @@ struct DiscoveryRig {
         cfg.issuer = idp.base();
         cfg.client_id = "yuzu-test-client";
         cfg.redirect_uri = "https://yuzu.example.test/auth/callback";
+        cfg.allow_private_networks = true; // the mock IdP listens on loopback
         if (explicit_authorize)
             cfg.authorization_endpoint = idp.base() + "/authorize";
         fix.oidc_provider = std::make_unique<oidc::OidcProvider>(cfg);

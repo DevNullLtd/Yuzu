@@ -4686,6 +4686,8 @@ void SettingsRoutes::register_routes(
             oidc_cfg.redirect_uri = redirect_uri;
             oidc_cfg.admin_group_id = admin_group;
             oidc_cfg.skip_tls_verify = skip_tls;
+            // OS-level egress switch: copied from the server config, never from the request.
+            oidc_cfg.allow_private_networks = cfg_->oidc_allow_private_networks;
             // ADR-2001 §1 gap (Task 2 follow-up): this hot-reload path builds its
             // own local OidcConfig and previously left scim_link_claim at its
             // struct default ("sub"), silently reverting an operator's
@@ -4802,10 +4804,12 @@ void SettingsRoutes::register_routes(
         // Copy the two saved values under the shared lock (a save writes them under the unique
         // lock); the network I/O below runs without it.
         bool saved_skip_tls = false;
+        bool allow_private = false; // OS-level egress switch; never read from the form
         std::string saved_issuer;
         {
             std::shared_lock lock(*oidc_mu_);
             saved_skip_tls = cfg_->oidc_skip_tls_verify;
+            allow_private = cfg_->oidc_allow_private_networks;
             saved_issuer = cfg_->oidc_issuer;
         }
         bool skip_tls = (skip_tls_str == "true") || saved_skip_tls;
@@ -4828,12 +4832,13 @@ void SettingsRoutes::register_routes(
                                 html_escape(what) + "</span>",
                             "text/html; charset=utf-8");
         };
-        auto doc = oidc::OidcProvider::fetch_discovery_document(issuer, skip_tls);
+        auto doc = oidc::OidcProvider::fetch_discovery_document(issuer, skip_tls, allow_private);
         if (!doc) {
             fail("Discovery failed: " + doc.error());
             return;
         }
-        auto jwks_body = oidc::OidcProvider::http_get_bounded(doc->jwks_uri, skip_tls);
+        auto jwks_body =
+            oidc::OidcProvider::http_get_bounded(doc->jwks_uri, skip_tls, allow_private);
         if (!jwks_body) {
             fail("Discovery succeeded but the JWKS could not be fetched: " + jwks_body.error());
             return;

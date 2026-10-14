@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -43,6 +44,13 @@ struct OidcConfig {
     std::string jwks_uri;        // JWKS endpoint for JWT signature verification
     std::string admin_group_id;  // Entra group ID that maps to admin role
     bool skip_tls_verify{false}; // Disable TLS cert verification (insecure, dev only)
+    // Egress policy (oidc_egress_policy.hpp): when false, the server refuses to connect to a
+    // loopback, RFC 1918, carrier-grade NAT, unique-local or other non-global address for any
+    // OIDC fetch. Link-local, cloud-metadata, multicast and unspecified addresses are refused
+    // either way. Set ONLY from the process operator's `--oidc-allow-private-networks`; never
+    // from the Settings form or a REST body (an admin who could set it could aim the server at
+    // the internal network).
+    bool allow_private_networks{false};
     // ADR-2001 §1 — which claim `validate_claims` treats as the SCIM link
     // key (`"sub"` default or `"oid"`), threaded from
     // Config::oidc_scim_link_claim. Only `"oid"` changes validate_claims'
@@ -161,6 +169,11 @@ public:
     /// route forwards the error into an audit event, so it never carries exception text.
     static constexpr const char* kCallbackInternalError = "OIDC callback processing failed";
 
+    /// The fixed reason in the error of a request the egress policy refused (the full text is
+    /// "request failed: " + this on the GET paths, "token endpoint request failed: " + this on the
+    /// token POST). Never carries the resolved address.
+    static constexpr const char* kEgressRefused = "address not permitted by the OIDC egress policy";
+
     /// The bounds on every IdP GET (discovery, JWKS, Test Connection), pinned by name in
     /// tests/unit/server/test_oidc_provider.cpp so a silent edit fails a test: the
     /// connect/read/write timeout PER OPERATION, the whole-request bound as a multiple of it
@@ -224,17 +237,26 @@ public:
     /// this instance's binding SHA-256 fail exactly as a broken crypto provider would;
     /// `add_test_pending_flow` plants a pending flow with a chosen binding hash (hex), bypassing
     /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
-    /// flow stores. TEST-ONLY: none of the five test seams in this block (these two,
-    /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test` and
-    /// `pending_flow_count_for_test`) has a production caller, and tests/unit/server/
-    /// test_oidc_provider.cpp pins (source scan) that no other file in server/core/src
-    /// references them.
+    /// flow stores. TEST-ONLY: none of the six test seams in this block (these two,
+    /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test`,
+    /// `set_resolver_for_test` and `pending_flow_count_for_test`) has a production caller, and
+    /// tests/unit/server/ test_oidc_provider.cpp pins (source scan) that no other file in
+    /// server/core/src references them.
     void set_binding_digest_failure_for_test(bool fail);
     void add_test_pending_flow(const std::string& state, std::string binding_hash);
     /// Test-only seam: replaces the 5 s per-operation connect/read/write timeouts of every IdP
     /// GET this instance makes (and so the total bound, which is twice this value), so a
     /// slow-IdP test never waits for a real timeout. Same source-scan pin.
     void set_http_timeouts_for_test(int ms);
+    /// Test-only seam: replaces the name resolver the egress policy uses (the OS resolver
+    /// otherwise) with `resolver`, which returns the numeric addresses a host name should resolve
+    /// to. The addresses go through the same classification and pinning, so a test can give a
+    /// name any answer (public, private, link-local, a mixed list) without DNS or an IdP on that
+    /// address; the connect still goes to the PINNED address, so a test can also prove a request
+    /// does not follow a second, different lookup. An empty function restores the OS resolver.
+    /// Process-wide: a test must restore it. Same source-scan pin.
+    using ResolverForTest = std::function<std::vector<std::string>(const std::string& host)>;
+    static void set_resolver_for_test(ResolverForTest resolver);
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);
@@ -273,14 +295,16 @@ public:
     /// carry the
     /// ISSUER'S scheme (an https issuer can never be downgraded to http endpoints). An issuer
     /// longer than 2048 bytes, or holding a space, control character or Unicode line break, is
-    /// refused before any request. No host restriction: Google serves
-    /// jwks_uri from another host. The error text is for the operator-facing Test Connection and
-    /// the log, not for the login answer; IdP-controlled text in it is neutralized for the log.
+    /// refused before any request. Hosts are not restricted by NAME (Google serves jwks_uri from
+    /// another host); the egress policy (`oidc_egress_policy.hpp`) restricts them by resolved
+    /// ADDRESS, see `http_get_bounded`. The error text is for the operator-facing Test
+    /// Connection and the log, not for the login answer; IdP-controlled text in it is
+    /// neutralized for the log.
     /// Shared by the login path (ensure_discovered) and Test Connection so the button validates
     /// exactly what a login will.
     [[nodiscard]] static std::expected<DiscoveryDocument, std::string>
     fetch_discovery_document(const std::string& issuer, bool skip_tls_verify,
-                             int timeout_ms = kHttpOperationTimeoutMs);
+                             bool allow_private_networks, int timeout_ms = kHttpOperationTimeoutMs);
 
     /// The validation half of `fetch_discovery_document`, on an already fetched body. Pure: no
     /// network. Public so the scheme rules can be pinned for an https issuer without a TLS IdP.
@@ -298,8 +322,18 @@ public:
     /// opened. A 256 KiB body cap, redirects NOT followed (a 3xx is a failure), TLS verification
     /// honored. The URL's authority must be a well-formed `host[:port]` (see
     /// `fetch_discovery_document`). Returns the body of a 200 response.
+    ///
+    /// EGRESS POLICY. Before any socket exists the host is resolved here (IP literals are
+    /// classified directly, no DNS), EVERY resolved address is classified by its bytes, and the
+    /// connect is PINNED to the first permitted address (httplib `set_hostname_addr_map`; TLS
+    /// server-name indication and certificate verification still use the host name). Link-local
+    /// (cloud metadata included), unspecified, multicast and reserved addresses are always
+    /// refused; loopback, RFC 1918, carrier-grade NAT and unique-local ones are refused unless
+    /// `allow_private_networks` (the operator's `--oidc-allow-private-networks`). A refusal is the
+    /// fixed `kEgressRefused` text and names no address. Name resolution is inside the total
+    /// bound. Only the first permitted address is tried (no fallback to the others).
     [[nodiscard]] static std::expected<std::string, std::string>
-    http_get_bounded(const std::string& url, bool skip_tls_verify,
+    http_get_bounded(const std::string& url, bool skip_tls_verify, bool allow_private_networks,
                      int timeout_ms = kHttpOperationTimeoutMs);
 
     /// Parse a JWKS document into verifying keys (RSA, `use` absent or "sig"; others skipped).
