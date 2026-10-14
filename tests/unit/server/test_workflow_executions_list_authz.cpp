@@ -75,11 +75,12 @@ struct ListRig {
         seed();
     }
 
-    std::string make(const std::string& dispatched_by, int64_t at, int targeted) {
+    std::string make(const std::string& dispatched_by, int64_t at, int targeted,
+                     const std::string& st = "completed") {
         Execution e;
         e.definition_id = "def-list-authz";
         e.dispatched_by = dispatched_by;
-        e.status = "completed";
+        e.status = st;
         e.dispatched_at = at;
         e.agents_targeted = targeted;
         auto id = tracker.create_execution(e);
@@ -124,7 +125,8 @@ struct ListRig {
     };
     // `use_tag_aware_auth`: route the gate through the AuthRoutes that has a TagStore, which
     // is what resolves a service-scoped token (production wires one AuthRoutes with both).
-    Resp get(const std::string& token, bool use_tag_aware_auth = false) {
+    Resp get(const std::string& token, bool use_tag_aware_auth = false,
+             const std::string& path = "/fragments/executions") {
         AuthRoutes& ar = use_tag_aware_auth ? *svc_auth : *rig.auth_routes;
         yuzu::server::test::TestRouteSink sink;
         WorkflowRoutes routes;
@@ -147,12 +149,18 @@ struct ListRig {
         };
         d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
                         const std::string&, const std::string&, const std::string&) {};
+        // Render-only probe, bound the way server.cpp binds it (a throwaway Response).
+        d.probe_perm_fn = [&ar](const httplib::Request& req, const std::string& t,
+                                const std::string& o) -> bool {
+            httplib::Response scratch;
+            return ar.require_permission(req, scratch, t, o);
+        };
         d.execution_tracker = &tracker;
         routes.register_routes(sink, std::move(d));
         std::unordered_map<std::string, std::string> hdrs;
         if (!token.empty())
             hdrs = {{"Authorization", "Bearer " + token}};
-        auto res = sink.dispatch("GET", "/fragments/executions", {}, "application/json", hdrs);
+        auto res = sink.dispatch("GET", path, {}, "application/json", hdrs);
         REQUIRE(res);
         Resp r{res->status, res->body, {}};
         const std::string needle = "data-execution-id=\"";
@@ -481,4 +489,97 @@ TEST_CASE("fragments/executions real gate: an unreachable tag store is a 503 for
     auto gary = r.get(r.mint("gary"), /*use_tag_aware_auth=*/true);
     CHECK(gary.status == 200);
     CHECK(gary.ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_alice, r.x_bob_own}));
+}
+
+// ── Operate Executions page (`view=page`) through the same real gate ─────────────────────────
+
+TEST_CASE("fragments/executions page view real gate: serves exactly the default view's ids",
+          "[pg][workflow][executions][list][confinement][authz][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    const std::string page = "/fragments/executions?view=page";
+
+    // Group-scoped operator: the same confined set as the drawer view, flagged confined, with
+    // nothing of the out-of-scope agent's data.
+    const auto bob = r.mint("bob");
+    auto def = r.get(bob);
+    auto pg = r.get(bob, false, page);
+    CHECK(pg.status == 200);
+    CHECK(pg.ids == def.ids);
+    CHECK(pg.ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_bob_own}));
+    CHECK(has(pg.body, "data-confined=\"1\""));
+    CHECK_FALSE(has(pg.body, "SECRET-ALICE"));
+    CHECK_FALSE(has(pg.body, "alice-agent"));
+    // Fleet-wide figures never reach a confined view, and never the default view.
+    CHECK_FALSE(has(pg.body, "readout stats"));
+    CHECK_FALSE(has(def.body, "readout stats"));
+
+    // Global principal: unfiltered, not flagged confined, with the fleet strip.
+    auto gary = r.get(r.mint("gary"), false, page);
+    CHECK(has(gary.body, "<section class=\"readout stats\" data-slot=\"stats\""));
+    CHECK(gary.ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_alice, r.x_bob_own}));
+    CHECK(has(gary.body, "data-confined=\"0\""));
+
+    // A principal with no Execution:Read: the 200 denied note, not a 403 and not a list.
+    auto dave = r.get(r.mint("dave"), true, page);
+    check_denied_note(dave);
+
+    // A service-scoped token keeps the narrowed set on the page view too.
+    auto svc = r.get(r.mint("gary", "printers"), true, page);
+    CHECK(svc.ids == ListRig::sorted({r.x_bob, r.x_mixed}));
+}
+
+TEST_CASE("fragments/executions/{id}/detail page view real gate: redacts, recomputes and "
+          "does not distinguish hidden from unknown",
+          "[pg][workflow][executions][detail][confinement][authz][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    const auto bob = r.mint("bob");
+    auto detail = [&](const std::string& token, const std::string& id) {
+        return r.get(token, false, "/fragments/executions/" + id + "/detail?view=page");
+    };
+
+    // x_mixed: carol dispatched, bob-agent and alice-agent answered. bob sees only his device.
+    auto mixed = detail(bob, r.x_mixed);
+    CHECK(mixed.status == 200);
+    CHECK(has(mixed.body, "data-slot=\"selected\""));
+    CHECK(has(mixed.body, "data-confined=\"1\""));
+    CHECK(has(mixed.body, "1 of 1 responded"));
+    CHECK_FALSE(has(mixed.body, "of 2 responded"));
+    CHECK_FALSE(has(mixed.body, "SECRET-ALICE"));
+    CHECK_FALSE(has(mixed.body, "alice-agent"));
+
+    // Hidden (alice-agent only, not bob's) and unknown: identical status and bytes.
+    auto hidden = detail(bob, r.x_alice);
+    auto unknown = detail(bob, "does-not-exist");
+    CHECK(hidden.status == 404);
+    CHECK(unknown.status == 404);
+    CHECK(hidden.body == unknown.body);
+
+    // The unconfined principal sees the real figures.
+    auto gary = detail(r.mint("gary"), r.x_mixed);
+    CHECK(gary.status == 200);
+    CHECK(has(gary.body, "data-confined=\"0\""));
+    CHECK(has(gary.body, "2 of 2 responded"));
+}
+
+TEST_CASE("fragments/executions/{id}/detail page view real gate: Cancel is probed and offered "
+          "only for a live execution",
+          "[pg][workflow][executions][detail][authz][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    const auto gary = r.mint("gary"); // global Execution:Read, no Execution:Execute
+    const auto live = r.make("carol", 1735689700, 1, "running");
+    auto detail = [&](const std::string& id) {
+        return r.get(gary, false, "/fragments/executions/" + id + "/detail?view=page");
+    };
+
+    // Live row: the probe ran and answered "no" (gary cannot execute).
+    auto running = detail(live);
+    CHECK(running.status == 200);
+    CHECK(has(running.body, "data-can-cancel=\"0\""));
+    // Finished row: no probe, no attribute at all.
+    auto done = detail(r.x_mixed);
+    CHECK(done.status == 200);
+    CHECK_FALSE(has(done.body, "data-can-cancel"));
 }

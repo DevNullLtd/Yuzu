@@ -28,6 +28,8 @@
 extern const char* const kDashboardIndexHtml;
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
+extern const char* const kApprovalsPageHtml;
+extern const char* const kExecutionsPageHtml;
 extern const char* const kTarPageHtml;
 extern const char* const kVizFleetPageHtml;
 extern const char* const kVizHostPageHtml;
@@ -97,7 +99,8 @@ TEST_CASE("app shell: keys and hrefs are unique and every top-level entry has an
         }
 }
 
-TEST_CASE("app shell: only Software and Fleet have sub-items; Settings is one admin-only entry",
+TEST_CASE("app shell: only Instructions Software and Fleet have sub-items; Settings is one "
+          "admin-only entry",
           "[nav][shell]") {
     std::vector<std::string> with_children;
     for (const auto& g : nav_groups())
@@ -106,7 +109,8 @@ TEST_CASE("app shell: only Software and Fleet have sub-items; Settings is one ad
                 with_children.push_back(std::string(it.key) + ">" + std::string(it.children[0].key));
             CHECK((it.key == "settings") == it.admin_only);
         }
-    CHECK(with_children == std::vector<std::string>{"software>auto", "fleet>network"});
+    CHECK(with_children ==
+          std::vector<std::string>{"instructions>executions", "software>auto", "fleet>network"});
 
     const auto groups = nav_groups();
     REQUIRE(groups.back().title == "System");
@@ -124,6 +128,10 @@ TEST_CASE("app shell: breadcrumb is group / page, and a sub-item skips its paren
           std::vector<std::string>{"Estate", "Network"});
     CHECK(breadcrumb_trail({.active_key = "auto"}) ==
           std::vector<std::string>{"Estate", "Deployments"});
+    CHECK(breadcrumb_trail({.active_key = "approvals"}) ==
+          std::vector<std::string>{"Operate", "Approvals"});
+    CHECK(breadcrumb_trail({.active_key = "executions"}) ==
+          std::vector<std::string>{"Operate", "Executions"});
 }
 
 TEST_CASE("app shell: a title extends the trail, a repeated label does not", "[nav][shell]") {
@@ -182,6 +190,20 @@ TEST_CASE("app shell: sub-items show only for the active family and light their 
 
     const auto on_network = render_shell({.active_key = "network"});
     CHECK(highlighted_hrefs(on_network) == std::vector<std::string>{"/viz/fleet", "/network"});
+
+    // Instructions' child (Operate pages): visible on the Instructions family only.
+    const auto on_instructions = render_shell({.active_key = "instructions"});
+    CHECK(count_of(on_instructions, "class=\"shell-sub\"") == 1);
+    CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/executions\">Executions</a>"));
+    CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/approvals\">Approvals<span class=\"shell-badge\""));
+    const auto on_executions = render_shell({.active_key = "executions"});
+    CHECK(highlighted_hrefs(on_executions) ==
+          std::vector<std::string>{"/instructions", "/executions"});
+    const auto on_approvals = render_shell({.active_key = "approvals"});
+    CHECK_THAT(on_approvals,
+               ContainsSubstring("<a href=\"/approvals\" class=\"on\" aria-current=\"page\">"));
+    CHECK(highlighted_hrefs(on_approvals) ==
+          std::vector<std::string>{"/instructions", "/approvals"});
 }
 
 TEST_CASE("app shell: keeps the identity hooks, Sign out and the admin-only Settings entry",
@@ -297,6 +319,9 @@ TEST_CASE("app shell: online counter is hidden until /api/health answers and pol
 
 TEST_CASE("app shell: toasts sit below the header so one never covers Sign out", "[nav][shell]") {
     CHECK_THAT(render_shell({}), ContainsSubstring(".toast-container{top:calc(var(--shell-top-h) + var(--sp-4))}"));
+    // At <=820px the sidebar becomes a wrapping row above a wrapped header, so no fixed top
+    // offset clears them: toasts move to the bottom edge instead of covering the nav links.
+    CHECK_THAT(render_shell({}), ContainsSubstring(".shell-search{flex-basis:100%;margin-left:0}\n.toast-container{top:auto;bottom:var(--sp-4)}\n}"));
 }
 
 // ── apply_shell / bake ──────────────────────────────────────────────────────
@@ -348,6 +373,8 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
     const std::vector<Page> pages = {
         {"dashboard", kDashboardIndexHtml, {"/"}},
         {"instructions", kInstructionPageHtml, {"/instructions"}},
+        {"approvals", kApprovalsPageHtml, {"/instructions", "/approvals"}},
+        {"executions", kExecutionsPageHtml, {"/instructions", "/executions"}},
         {"result sets", yuzu::server::kResultSetsPageHtml, {"/result-sets"}},
         {"compliance", kComplianceHtml, {"/compliance"}},
         {"guardian", kGuardianHtml, {"/guardian"}},
@@ -370,7 +397,47 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         CHECK_THAT(html, !ContainsSubstring("context-bar"));
         // One identity read per page — the shell's, not a per-page copy.
         CHECK(count_of(html, "fetch('/api/me')") == 1);
+        // Sign out is `hx-post="/logout"`, so every page must load htmx (Help once did not,
+        // and the button did nothing there).
+        CHECK_THAT(html, ContainsSubstring("/static/htmx.js"));
+        // The shell script owns the Ctrl+K hand-off, behind its typing guard. A page-local
+        // handler that navigates to the palette runs first and bypasses that guard, so
+        // outside the shell block no page may carry the `?palette=1` hand-off as a string
+        // (the dashboard only mentions it in a comment, and reads the parameter on load).
+        const auto sb = html.find(kShellBegin);
+        const auto se = html.find(kShellEnd);
+        REQUIRE(sb != std::string::npos);
+        REQUIRE(se != std::string::npos);
+        const auto page_only = html.substr(0, sb) + html.substr(se);
+        CHECK(count_of(page_only, "palette=1'") + count_of(page_only, "palette=1\"") == 0);
     }
+}
+
+TEST_CASE("app shell: approvals badge is hidden until the count answers, polls every 30 s and stops on a refusal",
+          "[nav][shell]") {
+    const std::string_view badge =
+        R"(<span class="shell-badge" id="nav-approvals-badge" hidden><span id="nav-approvals-n"></span>)"
+        R"(<span class="shell-sr"> pending</span></span>)";
+    for (const char* key : {"approvals", "executions", "instructions"})
+        CHECK(count_of(render_shell({.active_key = key}), badge) == 1);
+    CHECK(count_of(render_shell({.active_key = "dashboard"}), badge) == 0);
+
+    const auto html = render_shell({.active_key = "approvals"});
+    CHECK(count_of(html, "fetch('/api/approvals/pending/count',{signal:AbortSignal.timeout(5000)})") == 1);
+    CHECK(count_of(html, "setInterval(pollBadge,30000)") == 1);
+    // A decision on the Approvals page refreshes the badge at once.
+    CHECK(count_of(html, "document.addEventListener('yuzu:approvals-changed',pollBadge);") == 1);
+    CHECK(count_of(html, "if(r.status===401||r.status===403){bstop=true;") == 1);
+    CHECK(count_of(html, "if(!badge||bstop||document.hidden||binflight)return;") == 1);
+    CHECK(count_of(html, "if(typeof n!=='number')throw new Error('payload');") == 2);
+    CHECK(count_of(html, ".catch(function(){badge.hidden=true;})") == 1);
+    CHECK(count_of(html, "badge.hidden=n<=0;") == 1);
+    CHECK(count_of(html, "n>99?'99+'") == 1);
+    // Only the health poll omits credentials; the badge fetch rides the session cookie.
+    CHECK(count_of(html, "credentials:'omit'") == 1);
+    // No aria-label on the span (A18) and no event dispatch (O7).
+    CHECK_THAT(html, !ContainsSubstring("setAttribute('aria-label'"));
+    CHECK_THAT(html, !ContainsSubstring("yuzu:approvals-count"));
 }
 
 TEST_CASE("the shared detail shell re-targets to every route that reuses it", "[nav][shell][pages]") {

@@ -1,0 +1,1 @@
+- **Cancelling an execution that already finished now answers `409` ("execution already finished") instead of `503`,** audited as `execution.cancel` / `denied`; only a store failure stays `503`. Approval approve/reject reviewer comments are now capped at 4000 bytes and longer comments are refused.
