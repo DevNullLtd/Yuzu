@@ -1103,6 +1103,8 @@ log "═════════════════════════
 SETTINGS_FRAGMENTS=(
     "/fragments/settings/tls"
     "/fragments/settings/users"
+    "/fragments/access/users/list"
+    "/fragments/access/users/detail"
     "/fragments/settings/tokens"
     "/fragments/settings/pending"
     "/fragments/settings/auto-approve"

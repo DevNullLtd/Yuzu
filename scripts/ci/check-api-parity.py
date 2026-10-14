@@ -198,7 +198,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get_software_versions (both already "twinned", count unchanged). The raw route's
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
-BASELINE_UNTWINNED = 199
+# Access Users page (PR X-1): re-surfaces the untwinned Settings users list as two read-only
+# fragments, GET /fragments/access/users/list (planned:#2146) and .../detail (composed-of the
+# list), +2 -> 201. A GET /api/v1/users twin is not built here; the Settings rows and these two
+# are retired together when that twin lands. Measured at 201, not hand-picked.
+BASELINE_UNTWINNED = 201
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
