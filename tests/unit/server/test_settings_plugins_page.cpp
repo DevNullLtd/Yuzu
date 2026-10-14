@@ -26,6 +26,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -158,6 +159,7 @@ struct Harness {
     test::TestRouteSink sink;
     bool admin{true};
     bool session{true};
+    bool elevated{false};
     int admin_calls{0};
 
     void wire(settings_plugins::Deps deps = {}) {
@@ -177,6 +179,17 @@ struct Harness {
             auth::Session s;
             s.username = "alice";
             s.role = auth::Role::admin;
+            if (elevated) {
+                // is_elevated adjudicates against the monotonic steady deadline derived here.
+                const std::int64_t now_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+                REQUIRE(auth::AuthManager::derive_session_deadlines(
+                    s, now_ms, now_ms + 8LL * 3600 * 1000, now_ms, /*mfa_verified_ms=*/0,
+                    /*elevated_until_ms=*/now_ms + 5 * 60'000, /*elevation_issued_ms=*/now_ms,
+                    now_ms));
+            }
             return s;
         };
         settings_plugins::register_settings_plugins_routes(sink, std::move(deps));
@@ -277,6 +290,14 @@ yuzu::test::PgTestTemplate plug_page_rbac_tpl{"pluginroutesrbac", [](const std::
         throw std::runtime_error("pluginroutes rbac template: store failed to migrate");
 }};
 
+// Identical setup and key to test_product_pack_store.cpp: the registry's replay check needs it.
+yuzu::test::PgTestTemplate plug_page_packs_tpl{"productpackstore", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ProductPackStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("product_pack_store template: store failed to migrate");
+}};
+
 yuzu::test::PgTestTemplate plug_page_store_tpl{"pluginroutes", [](const std::string& dsn) {
     yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
@@ -374,6 +395,44 @@ TEST_CASE("plugin-config fragment: RBAC on with no grant is a denied note at 200
     CHECK_THAT(ks->body, ContainsSubstring("PluginConfig:Read"));
 }
 
+TEST_CASE("plugin fragments: RBAC on, no grant is denied; an active JIT elevation is admitted",
+          "[pg][plugins_page][plugins][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plug_page_store_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, plug_page_rbac_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(pack_db, plug_page_packs_tpl);
+    PgWired w{db.dsn()};
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 2}};
+    RbacStore rbac{rbac_pool};
+    REQUIRE(rbac.is_open());
+    yuzu::server::pg::PgPool pack_pool{{.conninfo = pack_db.dsn(), .size = 2}};
+    ProductPackStore packs{pack_pool};
+    REQUIRE(packs.is_open());
+    REQUIRE(w.store.set_config("email", "smtp.host", "mail.example.com", "alice"));
+    rbac.set_rbac_enabled(true); // enforcement on, no role granted to alice
+
+    Harness h;
+    settings_plugins::Deps deps;
+    deps.config_store = &w.store;
+    deps.rbac_store = &rbac;
+    deps.pack_store = &packs;
+    h.wire(std::move(deps));
+
+    // Not elevated: every panel names its missing grant (packs and the catalogue gate too).
+    auto packs_denied = h.sink.Get("/fragments/settings/product-packs");
+    REQUIRE(packs_denied);
+    CHECK_THAT(packs_denied->body, ContainsSubstring("ProductPack:Read"));
+    CHECK_FALSE(has(h.sink.Get("/fragments/settings/plugin-config")->body, "mail.example.com"));
+
+    // Elevated: full admin for the window, as AuthRoutes::require_list_read and require_permission.
+    h.elevated = true;
+    auto cfg = h.sink.Get("/fragments/settings/plugin-config");
+    REQUIRE(cfg);
+    CHECK_THAT(cfg->body, ContainsSubstring("mail.example.com"));
+    auto pk = h.sink.Get("/fragments/settings/product-packs");
+    REQUIRE(pk);
+    CHECK_FALSE(has(pk->body, "data-denied"));
+}
+
 TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are checked",
           "[pg][plugins_page][plugins]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plug_page_store_tpl);
@@ -435,14 +494,6 @@ TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are
 // ── Product packs: the ready path through the route (live ProductPackStore) ─────────────────
 
 namespace {
-
-// Identical setup and key to test_product_pack_store.cpp: the registry's replay check needs it.
-yuzu::test::PgTestTemplate plug_page_packs_tpl{"productpackstore", [](const std::string& dsn) {
-    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
-    ProductPackStore store{pool};
-    if (!store.is_open())
-        throw std::runtime_error("product_pack_store template: store failed to migrate");
-}};
 
 std::string pack_yaml(const std::string& name) {
     return "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: " + name +

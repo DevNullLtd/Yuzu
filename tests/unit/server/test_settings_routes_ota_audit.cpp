@@ -646,23 +646,29 @@ TEST_CASE("updates fragment: an encoded package URL reaches the handler decoded,
     svr.wait_until_ready();
 
     httplib::Client cli("127.0.0.1", port);
+    cli.set_read_timeout(10, 0); // a hung handler fails the case, not the CI job's patience
     const std::string enc = "/api/settings/updates/linux/x86_64/1.2%233%3Fx%25y%20z";
     auto roll = cli.Post(enc + "/rollout", "rollout_pct=55", "application/x-www-form-urlencoded");
     REQUIRE(roll);
     CHECK(roll->status == 200);
-    auto pkgs = h.registry->list_packages();
-    REQUIRE(pkgs.size() == 1);
-    CHECK(pkgs.front().version == "1.2#3?x%y z");
-    CHECK(pkgs.front().rollout_pct == 55);
-    REQUIRE_FALSE(h.audited.empty());
-    CHECK(h.audited.back().action == "ota.package.rollout_changed");
-    CHECK(h.audited.back().result == "success");
-    CHECK(h.audited.back().target_id == "linux/x86_64/1.2#3?x%y z");
-
+    const auto after_roll = h.registry->list_packages();
     auto del = cli.Delete(enc);
     REQUIRE(del);
     CHECK(del->status == 200);
+
+    // Stop and join before reading what the worker threads wrote: that is the happens-before
+    // edge a socket round-trip does not give a thread sanitizer.
+    svr.stop();
+    t.join();
+    REQUIRE(after_roll.size() == 1);
+    CHECK(after_roll.front().version == "1.2#3?x%y z");
+    CHECK(after_roll.front().rollout_pct == 55);
     CHECK(h.registry->list_packages().empty());
+    REQUIRE(h.audited.size() >= 2);
+    const auto& rolled = h.audited[h.audited.size() - 2];
+    CHECK(rolled.action == "ota.package.rollout_changed");
+    CHECK(rolled.result == "success");
+    CHECK(rolled.target_id == "linux/x86_64/1.2#3?x%y z");
     CHECK(h.audited.back().action == "ota.package.deleted");
     CHECK(h.audited.back().target_id == "linux/x86_64/1.2#3?x%y z");
 }

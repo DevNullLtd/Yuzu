@@ -238,6 +238,17 @@ header rather than a redirect, so a panel never swaps the sign-in page into itse
 must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
 that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
 
+## Behaviour change: kill-switch audit rows carry the operator's reason
+
+The `detail` of the `plugin_config.kill_switch.set` audit rows (both the `attempted` row and the
+`success` or `failure` row, over REST and MCP) now ends with `, reason="<text>"` when the caller gave a
+reason. Before, `detail` was exactly `enabled=true|false`, with `, protective_exempt=true` appended
+for a protective pair. A SIEM rule that matches the whole string (`detail == "enabled=false"`) stops
+matching a call that carries a reason: match `enabled=true|false` as a prefix instead. The reason is
+free text entered by an operator (at most 512 bytes before escaping; `\` and `"` are backslash-escaped),
+so do not parse it as structured data. A call without a reason is unchanged. See
+[Audit Log](audit-log.md).
+
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
 **What changed.** Deleting (deactivating) an account and demoting a local `admin` account now go through

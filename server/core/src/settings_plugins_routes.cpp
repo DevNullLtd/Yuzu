@@ -101,9 +101,12 @@ void register_settings_plugins_routes(HttpRouteSink& sink, Deps deps) {
                      panel.state = pp::PanelState::Denied;
                  } else if (!deps.rbac_store || !deps.rbac_store->is_open()) {
                      panel.state = pp::PanelState::Degraded;
-                 } else if (deps.rbac_store->authorize_list_read(session->username, "PluginConfig",
+                 } else if (!auth::is_elevated(*session) &&
+                            deps.rbac_store->authorize_list_read(session->username, "PluginConfig",
                                                                  "Read", deps.mgmt_store)
-                                .decision != ListReadDecision::AdmitAll) {
+                                    .decision != ListReadDecision::AdmitAll) {
+                     // An active JIT elevation is full admin for its window (as in
+                     // AuthRoutes::require_list_read); authorize_list_read has no such concept.
                      panel.state = pp::PanelState::Denied;
                  } else if (!deps.config_store || !deps.config_store->is_open()) {
                      panel.state = pp::PanelState::Degraded;
@@ -114,9 +117,11 @@ void register_settings_plugins_routes(HttpRouteSink& sink, Deps deps) {
                          panel.state = pp::PanelState::Degraded;
                      } else {
                          panel.truncated = truncated;
-                         for (const auto& e : *rows)
-                             panel.rows.push_back({e.plugin, e.key, e.value, e.updated_at_ms,
-                                                   e.updated_by});
+                         panel.rows.reserve(rows->size());
+                         for (auto& e : *rows)
+                             panel.rows.push_back({std::move(e.plugin), std::move(e.key),
+                                                   std::move(e.value), e.updated_at_ms,
+                                                   std::move(e.updated_by)});
                      }
                  }
                  res.set_content(pp::render_config_panel(panel), kHtml);

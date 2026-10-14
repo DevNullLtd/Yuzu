@@ -90,10 +90,11 @@ TEST_CASE("config panel: every field is escaped and a long value is clipped but 
     const auto h = render_config_panel(p);
     CHECK_FALSE(has(h, "<img"));
     CHECK_THAT(h, ContainsSubstring("&lt;img src=x onerror=1&gt;"));
-    // 1000 'v' + payload: the cell shows the first 160 bytes plus an ellipsis; the whole value
-    // (escaped) is the title.
+    // 1000 'v' + payload: the cell shows the first 160 bytes plus an ellipsis; the tooltip
+    // carries the first 512 bytes (escaped), so a page of 8 KiB values stays bounded.
     CHECK_THAT(h, ContainsSubstring(std::string(160, 'v') + "\xE2\x80\xA6"));
-    CHECK_THAT(h, ContainsSubstring("title=\"" + std::string(1000, 'v')));
+    CHECK_THAT(h, ContainsSubstring("title=\"" + std::string(512, 'v') + "\xE2\x80\xA6\""));
+    CHECK_FALSE(has(h, std::string(513, 'v')));
 }
 
 TEST_CASE("clip_for_display never cuts a UTF-8 sequence", "[plugin_page][plugins][ui]") {
@@ -149,6 +150,22 @@ TEST_CASE("kill switch panel: an unreadable layer is Unknown, never Enabled", "[
     const auto h = render_kill_switch_panel(p);
     CHECK_THAT(h, ContainsSubstring(">Unknown</span>"));
     CHECK_FALSE(has(h, ">Enabled</span>"));
+    // The deciding-row cell must not read as a definitive absence either.
+    CHECK_THAT(h, ContainsSubstring("<td>Unknown</td></tr>"));
+    CHECK_FALSE(has(h, "No switch set"));
+}
+
+TEST_CASE("kill switch panel: a blank action says action-level switches are not shown",
+          "[plugin_page][plugins][ui]") {
+    KillSwitchPanel p;
+    p.plugin = "tar";
+    p.layers = {layer("", SwitchState::Enabled)};
+    CHECK_THAT(render_kill_switch_panel(p), ContainsSubstring("action-level switch is not shown"));
+    p.action = "sql";
+    CHECK_FALSE(has(render_kill_switch_panel(p), "action-level switch is not shown"));
+    KillSwitchPanel empty;
+    CHECK_THAT(render_kill_switch_panel(empty),
+               ContainsSubstring("a switch on one action appears when you enter that action"));
 }
 
 TEST_CASE("kill switch panel: protective note and unseen-name warning", "[plugin_page][plugins][ui]") {

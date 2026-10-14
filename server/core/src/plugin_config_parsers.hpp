@@ -242,7 +242,7 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
 
 /// Reason cap — an operator-entered free-text explanation for a kill-switch
 /// flip. Capped so a pathological submission can't bloat the audit/kill-
-/// switch row indefinitely; control characters rejected (it renders in an
+/// switch row indefinitely; control characters other than tab rejected (it renders in an
 /// operator UI and lands in an audit `detail` string verbatim).
 inline constexpr std::size_t kMaxReasonBytes = 512;
 

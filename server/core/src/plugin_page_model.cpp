@@ -6,6 +6,9 @@ namespace yuzu::server::plugin_page {
 
 namespace {
 
+// The full value can be 8 KiB x 5000 rows; the tooltip is a convenience, not the record.
+constexpr std::size_t kTitleBytes = 512;
+
 std::string esc(const std::string& s) {
     return html_escape(s);
 }
@@ -65,7 +68,8 @@ std::string render_config_panel(const ConfigPanel& p) {
         h += "<tr><td colspan=\"5\" class=\"muted\">No plugin settings stored.</td></tr>";
     for (const auto& r : p.rows) {
         h += "<tr><td><code>" + esc(r.plugin) + "</code></td><td><code>" + esc(r.key) +
-             "</code></td><td class=\"wrap\" title=\"" + esc(r.value) + "\"><span class=\"mono\">" +
+             "</code></td><td class=\"wrap\" title=\"" + esc(clip_for_display(r.value, kTitleBytes)) +
+             "\"><span class=\"mono\">" +
              esc(clip_for_display(r.value)) + "</span></td><td>" + esc(r.updated_by) +
              "</td><td class=\"nw\">" + when_ms(r.updated_at_ms) + "</td></tr>";
     }
@@ -113,7 +117,9 @@ std::string render_kill_switch_panel(const KillSwitchPanel& p) {
                "</p></div>";
     if (p.plugin.empty())
         return h + "<div class=\"pb hint\">Enter a plugin to see its switch at the all-OS layer "
-                   "and each OS layer. A plugin with no switch set runs.</div>";
+                   "and each OS layer. A plugin with no switch set runs. With Action blank only the "
+                   "plugin-wide switch is shown; a switch on one action appears when you enter "
+                   "that action.</div>";
 
     if (p.protective)
         h += "<div class=\"pb\"><div class=\"alert alert-warning\" role=\"status\"><span>The "
@@ -130,10 +136,13 @@ std::string render_kill_switch_panel(const KillSwitchPanel& p) {
              "nothing.</span></div></div>";
     }
 
-    h += "<div class=\"pb hint\">Switches at the all-OS layer and each OS layer. A per-OS row "
-         "only narrows. Agents whose operating system is not yet known are not covered by a "
-         "per-OS switch; if the presence read is degraded the server refuses the command "
-         "instead.</div>";
+    h += "<div class=\"pb hint\">Switches at the all-OS layer and each OS layer"
+         + std::string(p.action.empty() ? " for the plugin as a whole (an action-level switch is "
+                                         "not shown until you enter that action)"
+                                       : "") +
+         ". A per-OS row only narrows. Agents whose operating system is not yet known are not "
+         "covered by a per-OS switch; if the presence read is degraded the server refuses the "
+         "command instead.</div>";
     h += "<div class=\"tw\"><table><thead><tr><th>Layer</th><th>State</th><th>Reason</th>"
          "<th>Set by</th><th>When</th><th>Decided by</th></tr></thead><tbody>";
     for (const auto& l : p.layers) {
@@ -154,7 +163,8 @@ std::string render_kill_switch_panel(const KillSwitchPanel& p) {
              "</td><td>" + (has_row ? esc(l.set_by) : std::string("\xE2\x80\x94")) +
              "</td><td class=\"nw\">" + (has_row ? when_ms(l.updated_at_ms) : "\xE2\x80\x94") +
              "</td><td>" +
-             (has_row ? "<code>" + esc(l.source) + "</code>" : std::string("No switch set")) +
+             (has_row ? "<code>" + esc(l.source) + "</code>"
+                      : std::string(l.state == SwitchState::Unknown ? "Unknown" : "No switch set")) +
              "</td></tr>";
     }
     h += "</tbody></table></div>";
