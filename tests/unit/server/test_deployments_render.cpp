@@ -99,7 +99,7 @@ TEST_CASE("deployment_detail_json: truncated reflects the exact run total",
     CHECK(j["truncated"] == false);
     CHECK(j["device_limit"] == 500);
     REQUIRE(j["devices"].size() == 2);
-    CHECK(j["devices"][1]["step"] == "pending");
+    CHECK(j["devices"][1]["step"] == "skipped"); // the parser's fail-safe: never claimed to have run
 
     auto part = row(); // total 10, only two device rows returned
     j = deployment_detail_json(part, {a, b}, 2);
