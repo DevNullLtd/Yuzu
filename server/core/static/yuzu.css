@@ -417,10 +417,13 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 .input:disabled, .in:disabled { opacity: 0.5; cursor: not-allowed; }
 .in.mono, .input.mono { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
 .fld textarea { height: auto; padding: 8px 10px; min-height: 84px; resize: vertical; font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+.form { display: grid; gap: 16px; padding: 16px; }
 .fld { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .fld > label { font-size: 13px; font-weight: 500; color: var(--ink2); }
 .fld .hint { color: var(--mut); font-size: 12.5px; }
 .fld .seg { align-self: flex-start; }
+.row2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; }
+.chk { accent-color: var(--primary); width: 16px; height: 16px; }
 /* Switch: a checkbox drawn as a track and knob (Compliance policy enable) */
 .sw { appearance: none; -webkit-appearance: none; width: 36px; height: 20px; flex: 0 0 36px; margin: 2px 0 0; position: relative;
       background: var(--line2); border: 0; border-radius: 3px; cursor: pointer; transition: background-color .12s; }
