@@ -38,6 +38,7 @@ extern const char* const kComplianceHtml;
 extern const char* const kGuardianHtml;
 extern const char* const kGuardianDetailPageHtml;
 extern const char* const kSettingsHtml;
+extern const char* const kAccessUsersHtml;
 
 using Catch::Matchers::ContainsSubstring;
 using namespace yuzu::server::shell;
@@ -72,7 +73,7 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
     std::vector<std::string_view> titles;
     for (const auto& g : nav_groups())
         titles.push_back(g.title);
-    CHECK(titles == std::vector<std::string_view>{"Operate", "Posture", "Estate", "System"});
+    CHECK(titles == std::vector<std::string_view>{"Operate", "Posture", "Estate", "Access", "System"});
 
     std::vector<std::string_view> labels;
     for (const auto& g : nav_groups())
@@ -80,7 +81,7 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
             labels.push_back(it.label);
     CHECK(labels == std::vector<std::string_view>{"Dashboard", "Instructions", "Result sets",
                                                   "Compliance", "Guardian", "DEX", "TAR",
-                                                  "Hardware", "Software", "Fleet", "Settings"});
+                                                  "Hardware", "Software", "Fleet", "Users", "Settings"});
 }
 
 TEST_CASE("app shell: keys and hrefs are unique and every top-level entry has an icon",
@@ -114,6 +115,13 @@ TEST_CASE("app shell: only Instructions Software and Fleet have sub-items; Setti
           std::vector<std::string>{"instructions>executions", "software>auto", "fleet>network"});
 
     const auto groups = nav_groups();
+    // Access is visible to every signed-in user: each panel is gated by its own fragment.
+    REQUIRE(groups.size() == 5);
+    CHECK(groups[3].title == "Access");
+    REQUIRE(groups[3].items.size() == 1);
+    CHECK(groups[3].items[0].key == "users");
+    CHECK(groups[3].items[0].href == "/access/users");
+    CHECK_FALSE(groups[3].items[0].admin_only);
     REQUIRE(groups.back().title == "System");
     REQUIRE(groups.back().items.size() == 1);
     CHECK(groups.back().items[0].href == "/settings");
@@ -397,6 +405,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"guardian detail (shared shell default)", kGuardianDetailPageHtml, {"/guardian"}},
         {"tar", kTarPageHtml, {"/tar"}},
         {"settings", kSettingsHtml, {"/settings"}},
+        {"users", kAccessUsersHtml, {"/access/users"}},
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},

@@ -76,6 +76,12 @@ constexpr NavItem kEstate[] = {
              "18",
      .children = kFleetSub},
 };
+constexpr NavItem kAccess[] = {
+    {.key = "users",
+     .label = "Users",
+     .href = "/access/users",
+     .icon = "M12 12a4 4 0 100-8 4 4 0 000 8z M4 21c0-4 3.6-7 8-7s8 3 8 7"},
+};
 constexpr NavItem kSystem[] = {
     {.key = "settings",
      .label = "Settings",
@@ -88,6 +94,7 @@ constexpr NavGroup kGroups[] = {
     {"Operate", kOperate},
     {"Posture", kPosture},
     {"Estate", kEstate},
+    {"Access", kAccess},
     {"System", kSystem},
 };
 

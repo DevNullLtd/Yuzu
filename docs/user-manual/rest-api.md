@@ -9584,6 +9584,28 @@ The following endpoints are under `/api/` (without the `v1` prefix). They predat
 
 ---
 
+### Access — Users
+
+These endpoints back the read-only **Access → Users** page (`/access/users`). They return HTMX fragments, not the JSON envelope, and require an admin session. Neither one changes anything, and neither writes a success audit row; a refusal is audited by the admin gate (`auth.admin_required`).
+
+**`GET /fragments/access/users/list`**
+
+Render the Users panel: one row per active account (name, source, account role).
+
+- **Permission:** Admin only
+- **Response (200):** HTML fragment. At most 500 rows are drawn; a banner states the true count when more exist. When the account store does not answer, the fragment is a red "could not be read" box with a Retry button and **no table**, still with status 200 (htmx discards 4xx/5xx bodies). It is never an empty table.
+- **Response (401):** The admin gate passed but the session could not be re-resolved.
+- **Response (403):** Not an administrator. The panel shows a "not available to your account" note.
+- **Response (500):** The resolved session has an empty username. The page refuses rather than render rows with no "Current user" marker.
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/users/detail?username=<name>`**
+
+Render the Account panel for one active account.
+
+- **Query:** `username` — URL-encoded (an SSO principal such as `oidc:https://idp/x#sub` must encode `#` as `%23`). Empty or absent returns the "select a user" placeholder.
+- **Permission, statuses, headers:** as for the list. An unknown name is a 200 "No such user" panel, distinct from the red unreadable-store box.
+
 ### Commands
 
 #### `POST /api/command`

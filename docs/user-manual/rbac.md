@@ -411,6 +411,25 @@ purely that an auditor reading the export or a closed campaign draws the
 wrong conclusion about what state RBAC was in — not that access control
 itself misbehaves.
 
+## Viewing accounts from the dashboard
+
+The **Users** page (`/access/users`, in the **Access** section of the sidebar) lists the
+accounts that can sign in to this server and shows one account's details beside the list.
+It is read-only: it shows each account's name, where it comes from (local, OIDC, SAML, AD or
+SCIM) and its account role. Adding, removing and changing accounts is done in **Settings**.
+
+- **Who can see it.** Any signed-in user can open the page. The two panels need the
+  Administrator account role; for anyone else each panel says it is not available to their
+  account. Each refused panel load is recorded in the audit log as an administrator-required
+  denial, so a non-administrator opening the page leaves up to two such rows.
+- **Account role versus RBAC role.** The account role (`admin` or `user`) is the legacy role:
+  it decides who can open Settings and what applies while RBAC enforcement is off. RBAC roles
+  apply once enforcement is on, and are managed through the RBAC API.
+- **Unreadable store.** If the account store does not answer, the Users panel shows a red
+  message with a Retry button. It never shows an empty list in that case, so a degraded store
+  cannot be mistaken for "nobody is here".
+- **Your own account.** Your row is marked "Current user" and has no Manage link.
+
 ## Concepts
 
 | Concept | Description |

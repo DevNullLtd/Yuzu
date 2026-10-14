@@ -207,7 +207,13 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # Both of the two changes above landed on 199; merged together the count is 201
 # (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
-BASELINE_UNTWINNED = 201
+#
+# Access Users page (PR X-1): re-surfaces the untwinned Settings users list as two read-only
+# fragments, GET /fragments/access/users/list (planned:#2146) and .../detail (composed-of the
+# list), +2. A GET /api/v1/users twin is not built here; the Settings rows and these two
+# are retired together when that twin lands. On top of the 201 above this is 203, the value the
+# checker reported on the merged tree, not hand-picked.
+BASELINE_UNTWINNED = 203
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
