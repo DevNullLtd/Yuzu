@@ -27,12 +27,14 @@ std::string plural(int n, std::string_view one, std::string_view many) {
 }
 
 // "-" for a missing instant, else the ISO text with the epoch the controller localises.
-std::string time_cell(int64_t secs) {
+std::string time_cell(int64_t secs, std::string_view data_c = {}) {
+    const std::string c =
+        data_c.empty() ? "" : " data-c=\"" + std::string(data_c) + "\"";
     if (secs <= 0)
-        return "<td class=\"tm\">-</td>";
+        return "<td class=\"tm\"" + c + ">-</td>";
     const std::string iso = esc(format_iso_utc(secs));
-    return "<td class=\"tm\" data-epoch-ms=\"" + std::to_string(secs * 1000) + "\" title=\"" + iso +
-           "\">" + iso + "</td>";
+    return "<td class=\"tm\"" + c + " data-epoch-ms=\"" + std::to_string(secs * 1000) +
+           "\" title=\"" + iso + "\">" + iso + "</td>";
 }
 
 std::string step_subtitle(const WorkflowStepView& s) {
@@ -176,14 +178,7 @@ std::string render_runs_list(const RunListView& v) {
         if (r.workflow_deleted)
             out += "<span class=\"sub\">Workflow deleted</span>";
         out += "</td>";
-        if (r.started_at <= 0) {
-            out += "<td class=\"tm\" data-c=\"started\">-</td>";
-        } else {
-            const std::string iso = esc(format_iso_utc(r.started_at));
-            out += "<td class=\"tm\" data-c=\"started\" data-epoch-ms=\"" +
-                   std::to_string(r.started_at * 1000) + "\" title=\"" + iso + "\">" + iso +
-                   "</td>";
-        }
+        out += time_cell(r.started_at, "started");
         out += "<td class=\"tm\">" + esc(duration_text(r.started_at, r.completed_at)) +
                "</td></tr>";
     }

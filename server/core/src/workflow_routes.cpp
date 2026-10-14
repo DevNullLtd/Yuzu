@@ -48,6 +48,16 @@ namespace yuzu::server {
 namespace {
 constexpr const char* kParamRejectRoute = "instruction_execute";
 constexpr const char* kParamRejectReasons[] = {"shape", "violation", "schema_invalid"};
+
+// The Workflows page fragments answer every refusal and degrade as a 200 note (htmx drops
+// 4xx/5xx bodies); nothing from the gate's own body reaches the fragment.
+void fragment_note(httplib::Response& res, const char* attr, std::string_view text) {
+    res.status = 200;
+    res.headers.erase("Retry-After");
+    res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
+                        html_escape(std::string(text)) + "</div>",
+                    "text/html; charset=utf-8");
+}
 } // namespace
 
 void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
@@ -1504,11 +1514,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // htmx drops 4xx/5xx bodies, so in the page view a 403 becomes a 200 note.
         const bool view_page = req.get_param_value("view") == "page";
         auto page_note = [&res](const char* attr, std::string_view text) {
-            res.status = 200;
-            res.headers.erase("Retry-After");
-            res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
-                                html_escape(std::string(text)) + "</div>",
-                            "text/html; charset=utf-8");
+            fragment_note(res, attr, text);
         };
         // deny_service_scoped_schedule_list already resolved (and validated)
         // the session via auth_fn — a second auth_fn call here would be
@@ -1670,11 +1676,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // htmx drops 4xx/5xx bodies: every refusal and degrade is a 200 note, and nothing from
         // the gate's own body (reason, role or permission names) reaches the fragment.
         auto note = [&res](const char* attr, std::string_view text) {
-            res.status = 200;
-            res.headers.erase("Retry-After");
-            res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
-                                html_escape(std::string(text)) + "</div>",
-                            "text/html; charset=utf-8");
+            fragment_note(res, attr, text);
         };
         if (!perm_fn(req, res, "Workflow", "Read")) {
             if (res.status == 403)
@@ -1725,13 +1727,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // The two run fragments answer every refusal and degrade as a 200 note (htmx drops 4xx
     // bodies) and never forward text from the gate's own body.
-    auto run_note = [](httplib::Response& res, const char* attr, std::string_view text) {
-        res.status = 200;
-        res.headers.erase("Retry-After");
-        res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
-                            html_escape(std::string(text)) + "</div>",
-                        "text/html; charset=utf-8");
-    };
+    auto run_note = fragment_note;
 
     // GET /fragments/workflow-runs -- run rows for the Workflows page (Operate WF-A, WF-2):
     // each workflow's newest run (`latest_per_workflow=true`) and one workflow's recent runs.
