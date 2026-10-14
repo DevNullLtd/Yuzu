@@ -62,9 +62,9 @@ template <class T> std::expected<T, ReadError> unavailable() {
 
 } // namespace
 
-Deps bind_stores(WebhookStore* wh, OffloadTargetStore* off, DirectorySync* dir,
+SyncDeps bind_stores(WebhookStore* wh, OffloadTargetStore* off, DirectorySync* dir,
                  const RbacStore* rbac) {
-    Deps d;
+    SyncDeps d;
     auto map_dir = [](DirectoryReadError e) {
         return e == DirectoryReadError::store_unavailable ? ReadError::unavailable
                                                           : ReadError::failed;
@@ -155,9 +155,9 @@ Deps bind_stores(WebhookStore* wh, OffloadTargetStore* off, DirectorySync* dir,
     return d;
 }
 
-void register_integrations_sync_routes(HttpRouteSink& sink, Deps deps) {
-    // The Deps are shared by every handler; one heap copy keeps lambdas small.
-    auto d = std::make_shared<const Deps>(std::move(deps));
+void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
+    // The SyncDeps are shared by every handler; one heap copy keeps lambdas small.
+    auto d = std::make_shared<const SyncDeps>(std::move(deps));
 
     sink.Get("/fragments/settings/webhooks", [d](const httplib::Request& req, httplib::Response& res) {
         if (!d->admin_fn(req, res))

@@ -8,7 +8,7 @@
 /// their own `Infrastructure:Write` / `Directory:Write` gates. No new write
 /// route and no dispatch path.
 ///
-/// Data arrives through injected closures (`Deps`) so route tests need no
+/// Data arrives through injected closures (`SyncDeps`) so route tests need no
 /// Postgres; `bind_stores` builds the production closures over the real stores.
 /// A closure's `ReadError` is the only way a read can fail: it is rendered as a
 /// failure box, never as an empty list.
@@ -31,7 +31,7 @@ class RbacStore;
 
 namespace yuzu::server::integrations {
 
-struct Deps {
+struct SyncDeps {
     /// `require_admin`: writes the 403 and its audit row itself when it denies.
     using AdminFn = std::function<bool(const httplib::Request&, httplib::Response&)>;
     /// Bool-returning audit hook; `false` = the row was not persisted. The
@@ -69,10 +69,10 @@ struct Deps {
 
 /// Production closures over the real stores. Any pointer may be null (every
 /// read then answers `ReadError::unavailable`).
-[[nodiscard]] Deps bind_stores(WebhookStore* webhooks, OffloadTargetStore* offload,
+[[nodiscard]] SyncDeps bind_stores(WebhookStore* webhooks, OffloadTargetStore* offload,
                                DirectorySync* directory, const RbacStore* rbac);
 
 /// Registers the six fragments and `GET /static/yuzu-integrations-sync.js`.
-void register_integrations_sync_routes(HttpRouteSink& sink, Deps deps);
+void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps);
 
 } // namespace yuzu::server::integrations

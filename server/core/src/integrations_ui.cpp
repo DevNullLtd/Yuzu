@@ -41,7 +41,7 @@ constexpr char kBody[] = R"HTM(<body>
 <main class="pg">
   <div class="page-header"><div>
     <h1>Integrations</h1>
-    <p class="subtitle">The MCP endpoint and the gateway.</p>
+    <p class="subtitle">Directory sync, webhooks, offload targets, the MCP endpoint and the gateway.</p>
   </div></div>
 
   <section class="panel" id="mcp-panel" aria-labelledby="h-mcp">
@@ -59,10 +59,15 @@ constexpr char kBody[] = R"HTM(<body>
          hx-trigger="load"
          hx-swap="innerHTML"><div class="pb muted">Loading...</div></div>
   </section>
+
+  <section id="webhooks-section" hx-get="/fragments/settings/webhooks" hx-trigger="load, refreshWebhooks from:body" hx-swap="innerHTML"></section>
+  <section id="offload-section" hx-get="/fragments/settings/offload-targets" hx-trigger="load, refreshOffload from:body" hx-swap="innerHTML"></section>
+  <section id="directory-section" hx-get="/fragments/settings/directory-sync" hx-trigger="load, refreshDirectory from:body" hx-swap="innerHTML"></section>
 </main>
 
 <div id="toast-container" class="toast-container"></div>
 <script src="/static/yuzu-integrations.js" defer></script>
+<script src="/static/yuzu-integrations-sync.js" defer></script>
 </body>
 </html>
 )HTM";

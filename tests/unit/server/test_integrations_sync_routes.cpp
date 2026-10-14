@@ -49,7 +49,7 @@ struct Harness {
     std::expected<std::vector<std::string>, ReadError> roles{std::vector<std::string>{"Operator"}};
 
     Harness() {
-        Deps d;
+        SyncDeps d;
         d.admin_fn = [this](const httplib::Request&, httplib::Response& res) {
             ++admin_calls;
             if (!admin)
