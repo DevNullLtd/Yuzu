@@ -118,6 +118,14 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/hardware/ci/stored-data",
+    "capability_id": "get.fragments-hardware-ci-stored-data",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:read-only probe of the Decommission:Delete gate that DELETE /api/v1/sle/agents/{agent_id} enforces; that route is registered through the SLE sink and carries no ledger row, so there is no capability id to compose and the panel only renders copy plus a button"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/hardware/ci/result",
     "capability_id": "get.fragments-hardware-ci-result",
     "rest_v1_twin": null,

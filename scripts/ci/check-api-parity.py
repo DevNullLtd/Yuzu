@@ -204,7 +204,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get.fragments-hardware-ci-containment is "composed-of:get.fragments-hardware-quarantine"
 # (a single-device read of the same active-record set; REST has no per-device GET). One
 # composed-of row, so 199 -> 200, measured by the checker, not hand-picked.
-BASELINE_UNTWINNED = 200
+#
+# Stored data panel (es-1): get.fragments-hardware-ci-stored-data is an "exception:" row (the
+# erase it fronts is DELETE /api/v1/sle/agents/{id}, which has no ledger row to compose), so
+# 200 -> 201, measured by the checker, not hand-picked.
+BASELINE_UNTWINNED = 201
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

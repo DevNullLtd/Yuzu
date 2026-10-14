@@ -10,6 +10,8 @@
  *   data-act="quarantine"       two steps: form (reason, whitelist) then a danger confirm
  *                               that performs POST /api/v1/quarantine.
  *   data-act="release"          danger confirm that performs DELETE /api/v1/quarantine/{id}.
+ *   data-act="stored-data-remove"  typed hostname (agent id when none) then a danger confirm
+ *                               that performs DELETE /api/v1/sle/agents/{id}.
  */
 (function () {
   'use strict';
@@ -144,6 +146,94 @@
     }).catch(function () { /* a dialog was already open */ });
   }
 
+  // Stored data. The result slot lives in the panel fragment (#hw-stored-data-result).
+  function slot() {
+    var r = document.getElementById('hw-stored-data-result');
+    if (r) r.textContent = '';
+    return r;
+  }
+
+  function banner(r, text, bad) {
+    if (!r) return null;
+    var d = document.createElement('div');
+    d.className = 'gp-banner' + (bad ? ' hw-degrade' : '');
+    d.textContent = text;
+    r.appendChild(d);
+    return d;
+  }
+
+  function showStores(r, stores) {
+    if (!r || !stores || typeof stores !== 'object') return;
+    var ul = document.createElement('ul');
+    Object.keys(stores).forEach(function (k) {
+      var li = document.createElement('li');
+      li.textContent = k + ': ' + String(stores[k]);
+      ul.appendChild(li);
+    });
+    r.appendChild(ul);
+  }
+
+  function removeStoredData(btn) {
+    var agent = btn.getAttribute('data-agent') || '';
+    var host = btn.getAttribute('data-host') || '';
+    var expected = btn.getAttribute('data-confirm') || agent;
+    var label = host || agent;
+    D.form({
+      title: 'Remove stored data for ' + label,
+      body: [
+        'Type ' + expected + ' to confirm. This is compared exactly, including case.',
+        'Agent id: ' + agent
+      ],
+      fields: [
+        { name: 'typed', label: 'Type ' + expected + ' to confirm', type: 'text', required: true,
+          autocomplete: 'off' }
+      ],
+      submitLabel: 'Continue',
+      validate: function (v) {
+        return (v.typed || '') === expected ? null : 'The text does not match ' + expected + '.';
+      }
+    }).then(function (v) {
+      if (!v) return null;
+      return D.form({
+        title: 'Remove stored data for ' + label + '?',
+        body: [
+          'This erases the device from seven stores: inventory, installed software, device ' +
+            'configuration, application performance, detected licences, application usage and the ' +
+            'endpoint presence row. It cannot be undone.',
+          'It does not unenrol the device; a connected agent will report again. Tags, custom ' +
+            'properties, quarantine records and property schemas are not removed.'
+        ],
+        fields: [],
+        danger: true,
+        submitLabel: 'Remove stored data',
+        submit: function () {
+          var r = slot();
+          return D.request('DELETE', '/api/v1/sle/agents/' + enc(agent)).then(function (res) {
+            if (res.ok && !res.auditFailed) { location.assign('/hardware'); return null; }
+            if (res.ok) {
+              banner(r, 'The stored data was erased, but the outcome audit entry could not be ' +
+                        'written. Record this erasure manually.', true);
+              return null;
+            }
+            var err = res.data && res.data.error;
+            var stores = err && err.details && err.details.stores;
+            if (res.status === 500 && stores) {
+              banner(r, 'Removal was incomplete. Re-issue to retry the failures (the cascade is ' +
+                        'idempotent).', true);
+              showStores(r, stores);
+              return null;
+            }
+            if (res.auditFailed) {
+              banner(r, 'The audit entry could not be written, so nothing was erased.', true);
+              return null;
+            }
+            return failMessage(res);
+          });
+        }
+      });
+    }).catch(function () { /* a dialog was already open */ });
+  }
+
   document.addEventListener('click', function (e) {
     var t = e.target && e.target.closest ? e.target.closest('[data-act]') : null;
     if (!t) return;
@@ -152,10 +242,12 @@
       e.stopPropagation();
       return;
     }
-    if (act === 'quarantine' || act === 'release') {
+    if (act === 'quarantine' || act === 'release' || act === 'stored-data-remove') {
       e.preventDefault();
       if (!D) return;
-      if (act === 'quarantine') quarantine(t); else release(t);
+      if (act === 'quarantine') quarantine(t);
+      else if (act === 'release') release(t);
+      else removeStoredData(t);
     }
   }, true);
 })();

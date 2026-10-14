@@ -9,6 +9,7 @@
 #include "hardware_routes.hpp"
 
 #include "device_containment_render.hpp"
+#include "device_estate_render.hpp"
 #include "web_utils.hpp"
 
 #include <cctype>
@@ -682,6 +683,8 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
             h += field("Architecture", r.arch);
             h += "</div></div>";
         }
+        // Stored data: click-to-load, so a viewer who never opens it pays no denied probe.
+        h += stored_data_placeholder(agent_id);
     }
     return h;
 }

@@ -128,7 +128,7 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 16 | 10 | 6 |
+| devices | 17 | 10 | 7 |
 | inventory | 3 | 3 | 0 |
 | dex | 26 | 18 | 8 |
 | guardian | 16 | 6 | 10 |
@@ -151,11 +151,11 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 13 | 61 |
-| **Total** | **284** | **84** | **200** |
+| **Total** | **285** | **84** | **201** |
 
 Registered `/api/vN/*` routes: 246. OpenAPI `paths` entries: 245. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 186.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 200.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 201.
 
 <!-- END GENERATED -->
 

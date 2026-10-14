@@ -580,6 +580,8 @@ yuzu_server_core_lib = static_library(
     'src/hardware_list_model.cpp',
     'src/device_containment_render.cpp',
     'src/device_containment_routes.cpp',
+    'src/device_estate_render.cpp',
+    'src/device_estate_routes.cpp',
     'src/hardware_routes.cpp',
     'src/hardware_ui.cpp',
     'src/hardware_actions_ui.cpp',

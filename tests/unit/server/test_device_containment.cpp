@@ -7,6 +7,8 @@
 
 #include "device_containment_render.hpp"
 #include "device_containment_routes.hpp"
+#include "device_estate_render.hpp"
+#include "device_estate_routes.hpp"
 #include "quarantine_visible.hpp"
 #include "test_route_sink.hpp"
 
@@ -519,4 +521,112 @@ TEST_CASE("yuzu-estate.js: no markup sinks, encoded ids, one delegated listener"
     // no path interpolates a raw id
     CHECK_FALSE(contains(js, "/api/v1/quarantine/' + agent"));
     CHECK_FALSE(contains(js, "id=' + agent"));
+}
+
+// ───────────────────────── Stored data panel ──────────────────────────────────
+
+namespace {
+
+struct EstateHarness {
+    DeviceEstateRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    int deny_status = 0; // 0 = allow
+    std::vector<std::string> probed;
+    std::optional<InventoryDeviceRow> identity;
+
+    EstateHarness() {
+        DeviceEstateRoutes::Deps d;
+        d.scoped_perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string& t,
+                                  const std::string& op, const std::string& id) {
+            probed.push_back(t + ":" + op + ":" + id);
+            if (deny_status != 0) {
+                res.status = deny_status;
+                return false;
+            }
+            return true;
+        };
+        d.identity_fn = [this](const std::string&)
+            -> std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> { return identity; };
+        routes.register_routes(sink, d);
+    }
+};
+
+} // namespace
+
+// Kills: dropping id_is_safe (control byte reaches the audit trail), a second probe.
+TEST_CASE("fragment: stored data — id safety, one Decommission:Delete probe, allow",
+          "[quarantine][route]") {
+    EstateHarness h;
+    auto bad = h.sink.Get("/fragments/hardware/ci/stored-data?id=a%0Ab");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK(h.probed.empty());
+
+    InventoryDeviceRow row;
+    row.agent_id = "a";
+    row.hostname = "HOST-A";
+    h.identity = row;
+    auto ok = h.sink.Get("/fragments/hardware/ci/stored-data?id=a");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.probed == std::vector<std::string>{"Decommission:Delete:a"});
+    CHECK(contains(ok->body, "data-act=\"stored-data-remove\""));
+    CHECK(contains(ok->body, "data-confirm=\"HOST-A\""));
+    CHECK(contains(ok->body, "data-agent=\"a\""));
+    CHECK(contains(ok->body, "Tags, custom properties, quarantine records and property schemas are "
+                             "not removed."));
+    CHECK(contains(ok->body, "does <b>not</b> unenrol"));
+    CHECK(contains(ok->body, "nothing is erased"));
+}
+
+// Kills: swallowing a 403 as non-2xx (htmx drops it), treating a non-403 probe failure as Denied.
+TEST_CASE("fragment: stored data — 403 is a 200 note, non-403 is 'could not be checked', 401 stays",
+          "[quarantine][route]") {
+    EstateHarness h;
+    h.deny_status = 403;
+    auto denied = h.sink.Get("/fragments/hardware/ci/stored-data?id=a");
+    REQUIRE(denied);
+    CHECK(denied->status == 200);
+    CHECK(contains(denied->body, "Decommission:Delete"));
+    CHECK_FALSE(contains(denied->body, "data-act=\"stored-data-remove\""));
+    CHECK(contains(denied->body, "disabled"));
+
+    h.deny_status = 500;
+    auto degraded = h.sink.Get("/fragments/hardware/ci/stored-data?id=a");
+    REQUIRE(degraded);
+    CHECK(degraded->status == 200);
+    CHECK(contains(degraded->body, "Permission could not be checked"));
+    CHECK_FALSE(contains(degraded->body, "data-act=\"stored-data-remove\""));
+
+    h.deny_status = 401;
+    auto anon = h.sink.Get("/fragments/hardware/ci/stored-data?id=a");
+    REQUIRE(anon);
+    CHECK(anon->status == 401);
+}
+
+// Kills: no hostname -> empty confirmation value (a blank typed field would match).
+TEST_CASE("fragment: stored data — agent id is the confirmation value when no hostname",
+          "[quarantine][route]") {
+    EstateHarness h;
+    auto res = h.sink.Get("/fragments/hardware/ci/stored-data?id=agent-9");
+    REQUIRE(res);
+    CHECK(contains(res->body, "data-confirm=\"agent-9\""));
+}
+
+TEST_CASE("stored data: placeholder is click-to-load and encodes the id", "[quarantine]") {
+    const std::string p = stored_data_placeholder("a b");
+    CHECK(contains(p, "hx-trigger=\"click\""));
+    CHECK(contains(p, "id=a%20b"));
+}
+
+TEST_CASE("yuzu-estate.js: stored data removal pins", "[quarantine][static-js]") {
+    const std::string& js = yuzu::server::kYuzuEstateJs;
+    CHECK(contains(js, "'/api/v1/sle/agents/' + enc(agent)"));
+    CHECK_FALSE(contains(js, "/api/v1/sle/agents/' + agent"));
+    CHECK(contains(js, "(v.typed || '') === expected"));       // exact, case-sensitive
+    CHECK(contains(js, "location.assign('/hardware')"));
+    CHECK(contains(js, "err.details.stores"));
+    CHECK(contains(js, "res.auditFailed"));
+    CHECK(contains(js, "Re-issue to retry the failures"));
+    CHECK(contains(js, "danger: true"));
 }
