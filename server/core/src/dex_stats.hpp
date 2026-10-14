@@ -45,8 +45,9 @@
  *     so floor each rate-ratio arm by DEVICES before calling (the ratio's own
  *     guard is on exposure, and one device over ten days passes it).
  *     Exception (maintainer ruling, 2026-10-14): the per-version crash/hang
- *     join of the fleet app-perf report (dex_app_perf_pure.hpp) carries no
- *     device floor; it is named in the routed Guardian/DEX row.
+ *     join of the fleet app-perf report (dex_app_perf_pure.hpp) and the Apps
+ *     list read (dex_app_stability_checked / DexApi::apps) carry no device
+ *     floor; both are named in the routed Guardian/DEX row.
  *   - `reliable` means "not flagged as small-count", never "precise":
  *     dex_rate(20, 1.0) is [12.2, 30.9]. A ratio with a zero-event denominator
  *     is always unreliable. Print the interval beside the flag, and send an

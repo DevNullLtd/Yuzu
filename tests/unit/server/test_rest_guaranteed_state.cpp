@@ -2604,6 +2604,35 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
             saw_chrome = true;
     CHECK(saw_chrome);
     CHECK(h.audit_log.empty()); // fleet aggregate — no per-agent identity
+
+    // Additive per-application and per-version figures.
+    CHECK(j["data"]["population"].is_number_integer());
+    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"].contains("stat_failures"));
+    const auto& first = j["data"]["apps"][0];
+    for (const char* k : {"share_affected", "rate_per_1000", "score", "version_count", "versions_truncated"})
+        CHECK(first.contains(k));
+    CHECK(first["versions"].is_array());
+    CHECK(res->body.find("below_floor") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: a degraded store read -> 503 with retry_after_ms, never an empty list",
+          "[pg][rest][dex][apps][degraded]") {
+    RestGsHarness h;
+    h.seed_obs("b1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
 }
 
 TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",

@@ -8184,6 +8184,53 @@ TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregat
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|success");
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.app.view") == std::string::npos);
+
+    // Rule 1: the MCP payload's key sets equal the shared serializer's.
+    yuzu::server::DexAppsModel one;
+    one.window = "all";
+    yuzu::server::DexAppStability app;
+    app.subject = "x.exe";
+    app.versions.emplace_back();
+    one.apps.push_back(app);
+    const auto shared = nlohmann::json::parse(yuzu::server::dex_apps_json(one));
+    auto keys = [](const nlohmann::json& o) {
+        std::set<std::string> k;
+        for (auto it = o.begin(); it != o.end(); ++it)
+            k.insert(it.key());
+        return k;
+    };
+    CHECK(keys(payload) == keys(shared));
+    CHECK(payload["population_basis"] == "windows_online");
+    CHECK(keys(payload["apps"][0]) == keys(shared["apps"][0]));
+    CHECK(keys(payload["apps"][0]["versions"][0]) == keys(shared["apps"][0]["versions"][0]));
+}
+
+TEST_CASE("MCP DEX: list_dex_apps reports a degraded read as an error, never an empty list",
+          "[pg][mcp][integration][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":980,"params":{"name":"list_dex_apps","arguments":{"window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(res->body.find("DEX store read degraded") != std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
+    CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "mcp.list_dex_apps|success");
 }
 
 TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown family -> "

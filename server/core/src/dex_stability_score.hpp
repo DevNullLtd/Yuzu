@@ -79,6 +79,10 @@
  *   behaviour. Callers pass kDexCohortFloor literally; the module enforces
  *   whatever floor it is handed. `reporting_devices` is the distinct devices
  *   that reported THIS application/version in the window, never fleet size.
+ *   Exception (maintainer ruling, 2026-10-14): the Apps list read
+ *   (DexApi::apps) passes floor 0, and N is the fleet reporting population
+ *   (Windows devices online now), since a per-application reporting count is
+ *   not available there.
  * - Missing or contradictory population data is withheld (score and band
  *   empty, `withheld` names why), never shown as 0 or 100. A missing or
  *   unusable rate_ratio is NOT withheld: the result is scored with an

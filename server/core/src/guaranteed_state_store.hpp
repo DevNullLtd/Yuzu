@@ -277,6 +277,19 @@ public:
     DexCrashSummary dex_crash_summary(const std::string& since = "",
                                       const std::string& platform = "") const;
     std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
+    /// Windows-scoped (`platform`) application AND per-version stability rows in
+    /// ONE statement (one snapshot): for the top `app_limit` applications by
+    /// crashes+hangs (the `dex_top_apps` ranking decides MEMBERSHIP), one total
+    /// row (`version` nullopt, plus `version_count`) and up to `version_limit`
+    /// version rows (most devices affected first). `per_device_cap` caps each
+    /// device's events in the `capped_*` sums (the stability score's caller
+    /// duty). `std::nullopt` on a degraded read (store-not-open / pool-timeout /
+    /// query-error), never collapsed into an empty vector, same contract as
+    /// `dex_signal_summary_checked`. The row order is a GROUPING order only:
+    /// the published ranking is restored by `dex_apps_model_from_rows`.
+    std::optional<std::vector<DexAppStabilityRow>>
+    dex_app_stability_checked(const std::string& since, const std::string& platform, int app_limit,
+                              int version_limit, std::int64_t per_device_cap) const;
     std::vector<DexAppCrashCount> dex_device_top_apps(const std::string& agent_id,
                                                       const std::string& since = "",
                                                       int limit = 50) const;

@@ -26,9 +26,13 @@
 /// (included below). Rule 1 (`docs/api-twin-recipe.md` §1): REST/MCP/the HTML
 /// fragment serialize from ONE function so their shapes cannot drift.
 
+#include "dex_score_policy.hpp"
+#include "dex_stability_score.hpp"
+#include "dex_stats.hpp"
 #include "dex_types.hpp" // ADR-0031 WS-A4: DEX leaf value types + DexFleet/DexSignalGroup (pure)
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -108,13 +112,56 @@ std::string dex_app_json(const DexAppModel& model, bool audit_persisted = true);
 
 // ── New twin #2: app-centric stability list (/fragments/dex/apps, GET /api/v1/dex/apps) ──
 
-/// The whole-fleet apps-by-reliability list — no per-agent identity (a
-/// distinct-device COUNT per app, never an agent_id), so this capability
-/// carries no confinement and no audit, matching the fragment's own posture.
+/// Figures published for one application or one version of it. Counts are
+/// Windows-scoped so they match the population (devices online now).
+struct DexStabilityFigures {
+    int64_t crashes{0};
+    int64_t hangs{0};
+    int64_t distinct_devices{0};
+    std::string last_seen;
+    std::optional<DexInterval> share_affected; ///< Wilson; null when no population / affected > population
+    std::optional<DexInterval> rate_per_1000;  ///< exact; events per 1,000 reporting devices
+    StabilityScore score;
+};
+
+struct DexAppVersionStability {
+    std::string version; ///< "" = the unknown-version bucket
+    DexStabilityFigures figures;
+};
+
+struct DexAppStability {
+    std::string subject;
+    DexStabilityFigures figures;
+    std::vector<DexAppVersionStability> versions;
+    int64_t version_count{0};
+    bool versions_truncated{false};
+};
+
+inline constexpr int kDexAppsLimit = 100;
+inline constexpr int kDexAppsVersionCap = 20;
+inline constexpr const char* kDexAppsPopulationBasis = "windows_online";
+
+/// The whole-fleet apps-by-reliability list - no per-agent identity (a
+/// distinct-device COUNT per app, never an agent_id). `degraded` means the
+/// read could not be completed (null store, failed read, or an invalid score
+/// policy): never render it as an empty or perfect list.
 struct DexAppsModel {
     std::string window;
-    std::vector<DexAppCrashCount> apps; ///< top 100 by the store's own ranking
+    std::optional<int64_t> population; ///< Windows devices online now; nullopt = unknown (never 0)
+    std::vector<DexAppStability> apps;
+    int stat_failures{0};
+    bool degraded{false};
 };
+
+/// PURE assembly of the Apps model from grouped store rows. OWNS the published
+/// order: applications by crashes+hangs DESC then subject ASC; each
+/// application's versions by devices affected DESC then version ASC. No device
+/// floor applies (maintainer ruling 2026-10-14): scores use floor 0, so an
+/// unknown or zero population still withholds `no_population`.
+DexAppsModel dex_apps_model_from_rows(const std::string& window,
+                                      const std::vector<DexAppStabilityRow>& rows,
+                                      std::optional<int64_t> population,
+                                      const DexScorePolicy& policy);
 
 std::string dex_apps_json(const DexAppsModel& model);
 

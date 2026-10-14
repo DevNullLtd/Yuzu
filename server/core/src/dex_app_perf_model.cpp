@@ -1,5 +1,6 @@
 #include "dex_app_perf_model.hpp"
 
+#include "dex_json_detail.hpp"
 #include "dex_perf_model.hpp" // kDexCohortFloor — the ONE cohort floor constant
 
 #include <nlohmann/json.hpp>
@@ -380,20 +381,6 @@ std::int64_t next_group(std::string_view& rest) {
     return v;
 }
 
-json interval_json(const DexInterval& i, bool ratio) {
-    const bool inf_upper = !std::isfinite(i.upper);
-    json o{{"lower", i.lower}, {"reliable", i.reliable}};
-    o["estimate"] = std::isfinite(i.estimate) ? json(i.estimate) : json(nullptr);
-    o["upper"] = inf_upper ? json(nullptr) : json(i.upper);
-    if (ratio)
-        o["unbounded"] = inf_upper;
-    return o;
-}
-
-json opt_i64(const std::optional<std::int64_t>& v) {
-    return v ? json(*v) : json(nullptr);
-}
-
 } // namespace
 
 bool app_perf_canon_version_less(std::string_view a, std::string_view b) {
@@ -529,13 +516,13 @@ std::string dex_app_perf_versions_json(const AppPerfFleetReport& report) {
         o["affected_devices"] = r.affected_devices;
         o["crashes"] = r.crashes;
         o["hangs"] = r.hangs;
-        o["exposure_devices"] = opt_i64(r.exposure_devices);
-        o["exposed_crashes"] = opt_i64(r.exposed_crashes);
-        o["exposed_hangs"] = opt_i64(r.exposed_hangs);
-        o["failure_rate"] = r.failure_rate ? interval_json(*r.failure_rate, false) : json(nullptr);
+        o["exposure_devices"] = dex_json_detail::opt_i64(r.exposure_devices);
+        o["exposed_crashes"] = dex_json_detail::opt_i64(r.exposed_crashes);
+        o["exposed_hangs"] = dex_json_detail::opt_i64(r.exposed_hangs);
+        o["failure_rate"] = r.failure_rate ? dex_json_detail::interval_json(*r.failure_rate, false) : json(nullptr);
         o["previous_version"] = r.previous_version.empty() ? json(nullptr) : json(r.previous_version);
         o["failure_rate_ratio"] =
-            r.failure_rate_ratio ? interval_json(*r.failure_rate_ratio, true) : json(nullptr);
+            r.failure_rate_ratio ? dex_json_detail::interval_json(*r.failure_rate_ratio, true) : json(nullptr);
         arr.push_back(std::move(o));
     }
     return arr.dump();

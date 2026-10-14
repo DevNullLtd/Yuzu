@@ -1,15 +1,18 @@
 #include "dex_read_builders.hpp" // the store-reaching build_dex_*_model_* (defined here); dex_device_app_perf_json has since moved to dex_app_perf_model.cpp
 #include "dex_read_model.hpp"
 
+#include "dex_json_detail.hpp"
 #include "dex_window.hpp" // dex_normalize_os_filter (PURE) -- replaces the dropped dex_routes.hpp
 #include "guaranteed_state_store.hpp" // GuaranteedStateStore methods -- no longer transitive via dex_read_model.hpp
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <cstdint>
+#include <map>
 
 namespace yuzu::server {
 
@@ -174,25 +177,165 @@ std::string dex_app_json(const DexAppModel& model, bool audit_persisted) {
 
 // ── New twin #2: app-centric stability list ──────────────────────────────────
 
-DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string& window,
-                                  const std::string& since) {
+namespace {
+
+DexStabilityFigures apps_figures(int64_t crashes, int64_t hangs, int64_t affected, int64_t capped_crashes,
+                                 int64_t capped_hangs, const std::string& last_seen,
+                                 std::optional<int64_t> population, const DexEffectivePolicy& eff,
+                                 int& stat_failures) {
+    DexStabilityFigures f;
+    f.crashes = crashes;
+    f.hangs = hangs;
+    f.distinct_devices = affected;
+    f.last_seen = last_seen;
+    // A refusal (unknown or zero population, affected > population) is not a
+    // failure; only a nullopt on input that met the preconditions is.
+    if (population && *population > 0) {
+        if (affected >= 0 && affected <= *population) {
+            f.share_affected = dex_proportion(affected, *population);
+            if (!f.share_affected)
+                ++stat_failures;
+        }
+        if (crashes + hangs >= 0) {
+            f.rate_per_1000 = dex_rate(crashes + hangs, static_cast<double>(*population) / 1000.0);
+            if (!f.rate_per_1000)
+                ++stat_failures;
+        }
+    }
+    StabilityInputs in;
+    in.reporting_devices = population.value_or(0);
+    in.devices_affected = affected;
+    in.crash_events = capped_crashes;
+    in.hang_events = capped_hangs;
+    // Floor 0: no device floor applies to the Apps list (maintainer ruling
+    // 2026-10-14); reporting <= 0 still withholds no_population. The regression
+    // term is not assessed here (no sampled exposure per version).
+    f.score = dex_score_under_policy(in, /*floor=*/0, eff);
+    return f;
+}
+
+json interval_or_null(const std::optional<DexInterval>& i) {
+    return i ? dex_json_detail::interval_json(*i, false) : json(nullptr);
+}
+
+json figures_json(const DexStabilityFigures& f) {
+    json deductions = json::array();
+    for (const auto& d : f.score.deductions)
+        deductions.push_back({{"name", d.name}, {"points", d.points}, {"assessed", d.assessed}});
+    json score{{"score", f.score.score ? json(stability_display_score(*f.score.score)) : json(nullptr)},
+               {"band", f.score.band ? json(stability_band_label(*f.score.band)) : json(nullptr)},
+               {"withheld", f.score.withheld[0] ? json(f.score.withheld) : json(nullptr)},
+               {"deductions", std::move(deductions)}};
+    return {{"crashes", f.crashes},
+            {"hangs", f.hangs},
+            {"distinct_devices", f.distinct_devices},
+            {"last_seen", f.last_seen},
+            {"share_affected", interval_or_null(f.share_affected)},
+            {"rate_per_1000", interval_or_null(f.rate_per_1000)},
+            {"score", std::move(score)}};
+}
+
+} // namespace
+
+DexAppsModel dex_apps_model_from_rows(const std::string& window,
+                                      const std::vector<DexAppStabilityRow>& rows,
+                                      std::optional<int64_t> population, const DexScorePolicy& policy) {
     DexAppsModel m;
     m.window = window;
-    if (store)
-        m.apps = store->dex_top_apps(since, 100);
+    m.population = population;
+    std::map<std::string, std::size_t> index; // subject -> position in m.apps
+    // Totals first, so a version row seen before its total still finds its app.
+    for (const auto& r : rows) {
+        if (r.version)
+            continue;
+        const DexEffectivePolicy eff = resolve_dex_score_policy(policy, r.subject);
+        DexAppStability a;
+        a.subject = r.subject;
+        a.figures = apps_figures(r.crashes, r.hangs, r.affected_devices, r.capped_crashes,
+                                 r.capped_hangs, r.last_seen, population, eff, m.stat_failures);
+        a.version_count = r.version_count;
+        a.versions_truncated = r.version_count > kDexAppsVersionCap;
+        index[a.subject] = m.apps.size();
+        m.apps.push_back(std::move(a));
+    }
+    for (const auto& r : rows) {
+        if (!r.version)
+            continue;
+        const auto it = index.find(r.subject);
+        if (it == index.end())
+            continue;
+        const DexEffectivePolicy eff = resolve_dex_score_policy(policy, r.subject);
+        DexAppVersionStability v;
+        v.version = *r.version;
+        v.figures = apps_figures(r.crashes, r.hangs, r.affected_devices, r.capped_crashes,
+                                 r.capped_hangs, r.last_seen, population, eff, m.stat_failures);
+        m.apps[it->second].versions.push_back(std::move(v));
+    }
+    std::stable_sort(m.apps.begin(), m.apps.end(), [](const DexAppStability& x, const DexAppStability& y) {
+        const int64_t ax = x.figures.crashes + x.figures.hangs;
+        const int64_t ay = y.figures.crashes + y.figures.hangs;
+        if (ax != ay)
+            return ax > ay;
+        return x.subject < y.subject;
+    });
+    for (auto& a : m.apps)
+        std::stable_sort(a.versions.begin(), a.versions.end(),
+                         [](const DexAppVersionStability& x, const DexAppVersionStability& y) {
+                             if (x.figures.distinct_devices != y.figures.distinct_devices)
+                                 return x.figures.distinct_devices > y.figures.distinct_devices;
+                             return x.version < y.version;
+                         });
     return m;
 }
 
+DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string& window,
+                                  const std::string& since, std::optional<int64_t> population,
+                                  const DexScorePolicy& policy) {
+    DexAppsModel m;
+    m.window = window;
+    // A score under an invalid policy is never published: the resolver requires
+    // a policy that passed dex_score_policy_fault.
+    if (const auto f = dex_score_policy_fault(policy)) {
+        spdlog::warn("build_dex_apps_model: score policy rejected: {}", dex_policy_fault_label(f->fault));
+        m.degraded = true;
+        return m;
+    }
+    if (!store) {
+        m.degraded = true;
+        return m;
+    }
+    // Windows-scoped numerator to match the Windows-online population.
+    const auto rows = store->dex_app_stability_checked(since, "windows", kDexAppsLimit, kDexAppsVersionCap,
+                                                       kStabilityPerDeviceEventCap);
+    if (!rows) {
+        m.degraded = true;
+        return m;
+    }
+    return dex_apps_model_from_rows(window, *rows, population, policy);
+}
+
 std::string dex_apps_json(const DexAppsModel& model) {
+    assert(!model.degraded && "a degraded Apps model must be refused by the caller, never serialised");
     json arr = json::array();
-    for (const auto& a : model.apps)
-        arr.push_back({{"subject", a.subject},
-                       {"crashes", a.crashes},
-                       {"hangs", a.hangs},
-                       {"distinct_devices", a.distinct_devices},
-                       {"last_seen", a.last_seen}});
+    for (const auto& a : model.apps) {
+        json o = figures_json(a.figures);
+        json versions = json::array();
+        for (const auto& v : a.versions) {
+            json vo = figures_json(v.figures);
+            vo["version"] = v.version;
+            versions.push_back(std::move(vo));
+        }
+        o["subject"] = a.subject;
+        o["versions"] = std::move(versions);
+        o["version_count"] = a.version_count;
+        o["versions_truncated"] = a.versions_truncated;
+        arr.push_back(std::move(o));
+    }
     json out{{"window", model.window}};
     out["apps"] = std::move(arr);
+    out["population"] = model.population ? json(*model.population) : json(nullptr);
+    out["population_basis"] = kDexAppsPopulationBasis;
+    out["stat_failures"] = model.stat_failures;
     return out.dump();
 }
 

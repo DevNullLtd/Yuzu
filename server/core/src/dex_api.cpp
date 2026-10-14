@@ -22,8 +22,8 @@ namespace yuzu::server {
 /// degrades to an empty/`-1` model; the builder-less reads guard on it).
 class LocalDexApi final : public DexApi {
 public:
-    LocalDexApi(GuaranteedStateStore* store, FleetFn fleet_fn)
-        : store_(store), fleet_fn_(std::move(fleet_fn)) {}
+    LocalDexApi(GuaranteedStateStore* store, FleetFn fleet_fn, DexScorePolicyFn policy_fn)
+        : store_(store), fleet_fn_(std::move(fleet_fn)), policy_fn_(std::move(policy_fn)) {}
 
     LocalDexApi(const LocalDexApi&) = delete;
     LocalDexApi& operator=(const LocalDexApi&) = delete;
@@ -56,7 +56,11 @@ public:
     }
 
     [[nodiscard]] DexAppsModel apps(const std::string& window) const override {
-        return build_dex_apps_model(store_, window, since_of(window));
+        // Absent FleetFn = unknown population (nullopt), not zero.
+        return build_dex_apps_model(
+            store_, window, since_of(window),
+            fleet_fn_ ? std::optional<int64_t>{fleet_fn_().windows_online} : std::nullopt,
+            policy_fn_ ? policy_fn_() : dex_default_score_policy());
     }
 
     [[nodiscard]] DexCatalogueModel catalogue(const std::string& os_filter,
@@ -130,10 +134,12 @@ private:
 
     GuaranteedStateStore* store_; ///< nullable — builders degrade; builder-less reads guard
     FleetFn fleet_fn_;
+    DexScorePolicyFn policy_fn_;
 };
 
-std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store, FleetFn fleet_fn) {
-    return std::make_shared<LocalDexApi>(store, std::move(fleet_fn));
+std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store, FleetFn fleet_fn,
+                                           DexScorePolicyFn policy_fn) {
+    return std::make_shared<LocalDexApi>(store, std::move(fleet_fn), std::move(policy_fn));
 }
 
 } // namespace yuzu::server

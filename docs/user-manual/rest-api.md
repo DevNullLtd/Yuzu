@@ -9097,11 +9097,14 @@ App blast-radius drill — crash/hang summary, faulting modules, exception codes
 
 #### `GET /api/v1/dex/apps`
 
-App-centric stability list — every application with a crash/hang signal in the window, ranked by activity. The machine-readable equivalent of the `/dex` **Apps** tab.
+App-centric stability list — every application with a crash/hang signal in the window, per application and per version. The machine-readable equivalent of the `/dex` **Apps** tab.
 
 - **Permission:** `GuaranteedState:Read`.
 - **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
-- **Response:** `data` object `{window, apps[]}` — `apps[]` each `{subject, crashes, hangs, distinct_devices, last_seen}`. No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
+- **Response:** `data` object `{window, population, population_basis, stat_failures, apps[]}`. `apps[]` (at most 100, ordered by crashes plus hangs descending, then name) each `{subject, crashes, hangs, distinct_devices, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (at most 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when more versions exist. `share_affected` is the share of the reporting population with at least one crash or hang (95 percent Wilson interval); `rate_per_1000` is events per 1,000 reporting devices (exact interval); both carry `reliable: false` under 20 events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
+- **Population and scope:** counts are Windows-scoped and `population` is the number of Windows devices online now (`population_basis: "windows_online"`; `null` means unknown, never 0). With an unknown or zero population there is no share and no rate, and the score is withheld as `no_population`. When more devices were affected in the window than are online now (the window outlives the devices online), `share_affected` is `null` and the score is withheld as `inconsistent`. No device floor applies: figures are published at any device count.
+- **Failure:** a failed store read or an invalid score policy returns `503` with `retry_after_ms: 2000`, never an empty list.
+- No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
 
 #### `GET /api/v1/dex/catalogue`
 

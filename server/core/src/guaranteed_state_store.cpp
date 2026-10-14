@@ -1244,6 +1244,80 @@ std::vector<DexAppCrashCount> GuaranteedStateStore::dex_top_apps(const std::stri
         });
 }
 
+std::optional<std::vector<DexAppStabilityRow>>
+GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const std::string& platform,
+                                                int app_limit, int version_limit,
+                                                std::int64_t per_device_cap) const {
+    static DegradeSampler sampler;
+    return dex_read_checked<std::vector<DexAppStabilityRow>>(
+        open_, pool_, metrics_, "dex_app_stability", sampler,
+        [&](PGconn* conn) -> std::optional<std::vector<DexAppStabilityRow>> {
+            // d: per (subject, version, device). top: membership of the top
+            // applications (the dex_top_apps ranking). ad: per (subject,
+            // device) across versions, so a device in two versions counts
+            // once in the application total. tot + vc + ver are UNIONed.
+            pg::PgResult res = pg::exec_params(
+                conn,
+                "WITH d AS ("
+                " SELECT subject, version, agent_id,"
+                "  COUNT(*) FILTER (WHERE obs_type = 'process.crashed') AS c,"
+                "  COUNT(*) FILTER (WHERE obs_type = 'process.hung') AS h,"
+                "  MAX(observed_at) AS ls"
+                " FROM guaranteed_state_store.guardian_observations"
+                " WHERE obs_type IN ('process.crashed', 'process.hung')"
+                "  AND observed_at >= $1 AND platform = $2"
+                " GROUP BY subject, version, agent_id),"
+                "top AS ("
+                " SELECT subject FROM d GROUP BY subject"
+                " ORDER BY SUM(c) + SUM(h) DESC, subject ASC LIMIT $3::bigint),"
+                "ad AS ("
+                " SELECT d.subject, d.agent_id, SUM(d.c) AS c, SUM(d.h) AS h, MAX(d.ls) AS ls"
+                " FROM d JOIN top USING (subject) GROUP BY d.subject, d.agent_id),"
+                "vc AS ("
+                " SELECT d.subject, COUNT(DISTINCT d.version) AS n"
+                " FROM d JOIN top USING (subject) GROUP BY d.subject),"
+                "ranked AS ("
+                " SELECT d.subject, d.version, SUM(d.c) AS c, SUM(d.h) AS h, COUNT(*) AS a,"
+                "  SUM(LEAST(d.c, $5::bigint)) AS cc, SUM(LEAST(d.h, $5::bigint)) AS ch,"
+                "  MAX(d.ls) AS ls,"
+                "  ROW_NUMBER() OVER (PARTITION BY d.subject"
+                "   ORDER BY COUNT(*) DESC, d.version ASC) AS rn"
+                " FROM d JOIN top USING (subject) GROUP BY d.subject, d.version) "
+                "SELECT ad.subject, NULL::text AS version, SUM(ad.c)::bigint, SUM(ad.h)::bigint,"
+                " COUNT(*)::bigint, SUM(LEAST(ad.c, $5::bigint))::bigint,"
+                " SUM(LEAST(ad.h, $5::bigint))::bigint, MAX(ad.ls), MAX(vc.n)::bigint "
+                "FROM ad JOIN vc USING (subject) GROUP BY ad.subject "
+                "UNION ALL "
+                "SELECT subject, version, c::bigint, h::bigint, a::bigint, cc::bigint, ch::bigint,"
+                " ls, 0::bigint FROM ranked WHERE rn <= $4::bigint "
+                "ORDER BY subject, version NULLS FIRST",
+                std::vector<std::string>{since, platform,
+                                         std::to_string(std::clamp(app_limit, 0, kMaxEventsLimit)),
+                                         std::to_string(std::clamp(version_limit, 0, kMaxEventsLimit)),
+                                         std::to_string(per_device_cap)});
+            if (res.status() != PGRES_TUPLES_OK)
+                return std::nullopt;
+            std::vector<DexAppStabilityRow> out;
+            const int n = PQntuples(res.get());
+            out.reserve(static_cast<std::size_t>(n));
+            for (int i = 0; i < n; ++i) {
+                DexAppStabilityRow r;
+                r.subject = text_col(res.get(), i, 0);
+                if (!PQgetisnull(res.get(), i, 1))
+                    r.version = text_col(res.get(), i, 1);
+                r.crashes = to_i64(PQgetvalue(res.get(), i, 2));
+                r.hangs = to_i64(PQgetvalue(res.get(), i, 3));
+                r.affected_devices = to_i64(PQgetvalue(res.get(), i, 4));
+                r.capped_crashes = to_i64(PQgetvalue(res.get(), i, 5));
+                r.capped_hangs = to_i64(PQgetvalue(res.get(), i, 6));
+                r.last_seen = text_col(res.get(), i, 7);
+                r.version_count = to_i64(PQgetvalue(res.get(), i, 8));
+                out.push_back(std::move(r));
+            }
+            return out;
+        });
+}
+
 std::vector<DexAppCrashCount>
 GuaranteedStateStore::dex_device_top_apps(const std::string& agent_id, const std::string& since,
                                           int limit) const {

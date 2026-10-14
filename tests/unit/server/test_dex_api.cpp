@@ -26,6 +26,7 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -65,6 +66,23 @@ void seed_crash(GuaranteedStateStore& store, const std::string& id, const std::s
     REQUIRE(store.insert_event(e));
 }
 
+// Like seed_crash, but any observation type and a reported app file version.
+void seed_obs_v(GuaranteedStateStore& store, const std::string& id, const std::string& agent,
+                const std::string& proc, const std::string& type, const std::string& version,
+                const std::string& ts) {
+    GuaranteedStateEventRow e;
+    e.event_id = id;
+    e.rule_id = "__observation__";
+    e.agent_id = agent;
+    e.event_type = type;
+    e.severity = "info";
+    e.detail_json = "{\"subject\":\"" + proc + "\",\"reason\":\"0xC0000005\",\"symbolic\":"
+                    "\"ACCESS_VIOLATION\",\"component\":\"ntdll.dll\",\"platform\":\"windows\","
+                    "\"version\":\"" + version + "\"}";
+    e.timestamp = ts;
+    REQUIRE(store.insert_event(e));
+}
+
 // Seed dates anchored a few days back from *now* so they stay inside the
 // default 7d window (same rationale as test_dex_routes.cpp's kDayA/kDayB).
 const std::string kTs = yuzu::server::dex_iso_since(2).substr(0, 10) + "T12:00:00Z";
@@ -87,6 +105,7 @@ TEST_CASE("DexApi: null store is the honest degrade, never a throw", "[pg][dex_a
     // Builder-backed degrade: score unavailable, empty model — never a crash.
     CHECK(api->device_score("a1", "7d").score == -1);
     CHECK(api->apps("7d").apps.empty());
+    CHECK(api->apps("7d").degraded); // a null store is a degrade, never an empty healthy list
 }
 
 TEST_CASE("DexApi: signals/scope/signal_detail match the direct store reads", "[pg][dex_api]") {
@@ -276,4 +295,149 @@ TEST_CASE("DexApi: builder-backed methods match their shared builders", "[pg][de
         CHECK(a.days.size() == b.days.size());
         CHECK(a.families.size() == b.families.size());
     }
+}
+
+// ── Apps read: per application and per version ───────────────────────────────
+//
+// Seeded events (all platform windows, inside the 7d window), FleetFn
+// windows_online = 20:
+//   app.exe     1.0.0.0  a1: 1 crash + 1 hang     a2: 1 crash
+//               2.0.0.0  a2: 1 crash   a3: 6 crashes (capped at 5)   a4: 1 crash
+//   aardvark.exe 1.0     b1: 1 crash   (lexically first, least active)
+// Hand-computed for app.exe: crashes 10, hangs 1, devices 4 (a2 is in both
+// versions and counts once), capped crash sum 1+2+5+1 = 9, capped hangs 1.
+// 2.0.0.0: 3 devices, 8 crashes, capped 1+5+1 = 7. 1.0.0.0: 2 devices,
+// 2 crashes + 1 hang.
+namespace {
+void seed_apps_fixture(GuaranteedStateStore& store) {
+    int n = 0;
+    auto id = [&] { return "ap" + std::to_string(++n); };
+    seed_obs_v(store, id(), "a1", "app.exe", "process.crashed", "1.0.0.0", kTs);
+    seed_obs_v(store, id(), "a1", "app.exe", "process.hung", "1.0.0.0", kTs);
+    seed_obs_v(store, id(), "a2", "app.exe", "process.crashed", "1.0.0.0", kTs);
+    seed_obs_v(store, id(), "a2", "app.exe", "process.crashed", "2.0.0.0", kTs);
+    for (int i = 0; i < 6; ++i)
+        seed_obs_v(store, id(), "a3", "app.exe", "process.crashed", "2.0.0.0", kTs);
+    seed_obs_v(store, id(), "a4", "app.exe", "process.crashed", "2.0.0.0", kTs);
+    seed_obs_v(store, id(), "b1", "aardvark.exe", "process.crashed", "1.0", kTs);
+}
+} // namespace
+
+TEST_CASE("DexApi: apps carries per-version figures, activity order and the population",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+
+    auto api = make_local_dex_api(&store, [] {
+        DexFleet f;
+        f.windows_online = 20;
+        return f;
+    });
+    const auto m = api->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    CHECK(m.population == std::optional<int64_t>{20});
+    REQUIRE(m.apps.size() == 2);
+    // Activity rank (11 events) beats lexical order ("aardvark.exe" sorts first).
+    CHECK(m.apps[0].subject == "app.exe");
+    CHECK(m.apps[1].subject == "aardvark.exe");
+
+    const auto& app = m.apps[0];
+    CHECK(app.figures.crashes == 10);
+    CHECK(app.figures.hangs == 1);
+    CHECK(app.figures.distinct_devices == 4);
+    REQUIRE(app.figures.share_affected);
+    CHECK(app.figures.share_affected->estimate == yuzu::server::dex_proportion(4, 20)->estimate);
+    REQUIRE(app.figures.rate_per_1000);
+    CHECK(app.figures.rate_per_1000->estimate == yuzu::server::dex_rate(11, 0.02)->estimate);
+    yuzu::server::StabilityInputs in;
+    in.reporting_devices = 20;
+    in.devices_affected = 4;
+    in.crash_events = 9;
+    in.hang_events = 1;
+    const auto expect = yuzu::server::compute_stability_score(in, 0);
+    REQUIRE(app.figures.score.score);
+    CHECK(*app.figures.score.score == *expect.score);
+
+    REQUIRE(app.versions.size() == 2);
+    CHECK(app.version_count == 2);
+    CHECK_FALSE(app.versions_truncated);
+    CHECK(app.versions[0].version == "2.0.0.0");
+    CHECK(app.versions[0].figures.distinct_devices == 3);
+    CHECK(app.versions[0].figures.crashes == 8);
+    in.devices_affected = 3;
+    in.crash_events = 7;
+    in.hang_events = 0;
+    CHECK(*app.versions[0].figures.score.score == *yuzu::server::compute_stability_score(in, 0).score);
+    CHECK(app.versions[1].version == "1.0.0.0");
+    CHECK(app.versions[1].figures.distinct_devices == 2);
+    CHECK(app.versions[1].figures.crashes == 2);
+    CHECK(app.versions[1].figures.hangs == 1);
+
+    // One affected device, published with every figure and no floor field.
+    CHECK(m.apps[1].figures.distinct_devices == 1);
+    CHECK(m.apps[1].figures.share_affected);
+    CHECK(m.apps[1].figures.score.score);
+    CHECK(yuzu::server::dex_apps_json(m).find("below_floor") == std::string::npos);
+}
+
+TEST_CASE("DexApi: apps without a FleetFn has an unknown population, scores withheld",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    const auto m = make_local_dex_api(&store, {})->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    CHECK_FALSE(m.population);
+    REQUIRE_FALSE(m.apps.empty());
+    CHECK_FALSE(m.apps[0].figures.share_affected);
+    CHECK_FALSE(m.apps[0].figures.rate_per_1000);
+    CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
+}
+
+TEST_CASE("DexApi: apps on a failed store read is degraded, never an empty list",
+          "[pg][dex][apps_model][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    const auto m = make_local_dex_api(&store, {})->apps("7d");
+    CHECK(m.degraded);
+    CHECK(m.apps.empty());
+}
+
+TEST_CASE("DexApi: apps caps versions at 20 and flags it", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    std::vector<std::string> versions;
+    for (int i = 1; i <= 21; ++i) {
+        const std::string v = "1.0.0." + std::to_string(i);
+        versions.push_back(v);
+        seed_obs_v(store, "v" + std::to_string(i), "d" + std::to_string(i), "many.exe",
+                   "process.crashed", v, kTs);
+    }
+    const auto m = make_local_dex_api(&store, {})->apps("7d");
+    REQUIRE(m.apps.size() == 1);
+    CHECK(m.apps[0].version_count == 21);
+    CHECK(m.apps[0].versions_truncated);
+    // Equal devices everywhere: the kept 20 are the lexically smallest, in order.
+    std::sort(versions.begin(), versions.end());
+    versions.resize(20);
+    REQUIRE(m.apps[0].versions.size() == 20);
+    for (std::size_t i = 0; i < 20; ++i)
+        CHECK(m.apps[0].versions[i].version == versions[i]);
 }
