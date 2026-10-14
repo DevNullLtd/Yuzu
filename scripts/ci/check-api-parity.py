@@ -200,6 +200,10 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
 # DEX Alerts tab (posture PR-E): GET /fragments/dex/alerts is "composed-of" the legacy
 # settings fragment (+1, 199 -> 200); the fragment's three POSTs stay planned:#2146.
+#
+# Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
+# is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
+# which counts as untwinned by design, so the count rises 199 -> 200.
 BASELINE_UNTWINNED = 200
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────

@@ -1383,6 +1383,7 @@ if build_server
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
+      'unit/server/test_compliance_fragments.cpp', # pure renderers for the Compliance page fragments + tag table
       'unit/server/test_policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes
       'unit/server/test_compliance_model.cpp',
       'unit/server/test_verify_routes.cpp',

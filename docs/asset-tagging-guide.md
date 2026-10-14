@@ -262,7 +262,7 @@ A fully compliant fleet returns an empty array: `{"data": []}`.
 
 ### Compliance in the Dashboard
 
-The **Settings** page includes a **Tag Compliance** section that shows a summary table:
+The **Compliance** page includes a **Compliance by tag** panel that shows a summary table:
 
 | Category | Tagged | Missing | % Compliant |
 |---|---|---|---|

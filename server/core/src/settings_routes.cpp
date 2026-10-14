@@ -13,6 +13,7 @@
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "compliance_fragments.hpp" // pure renderer for the tag-compliance table
 #include "config_secret_keys.hpp" // is_exactly_redaction_placeholder in the OIDC handler
 #include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
 #include "dex_blast_radius.hpp" // F1: BlastRadiusConfig defaults for the threshold form
@@ -2077,16 +2078,6 @@ std::string SettingsRoutes::render_auto_approve_fragment() {
 std::string SettingsRoutes::render_tag_compliance_fragment() {
     const auto& categories = get_tag_categories();
 
-    std::string html;
-    html += "<table class=\"user-table\">"
-            "<thead><tr>"
-            "<th>Category</th>"
-            "<th>Display Name</th>"
-            "<th>Agents Tagged</th>"
-            "<th>Agents Missing</th>"
-            "<th>Allowed Values</th>"
-            "</tr></thead><tbody>";
-
     // Two bulk reads (ADR-0050 — the pre-migration version issued up to nine
     // queries per render: gaps + agents_with_tag per category twice over).
     // Dashboard render caller: a degraded read returns an explicit error
@@ -2100,7 +2091,7 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
         auto values_res = tag_store_->get_values_for_keys(
             std::vector<std::string>(std::begin(kCategoryKeys), std::end(kCategoryKeys)));
         if (!gaps_res || !values_res) {
-            return "<div class=\"feedback-error\">Tag store unavailable — tag-compliance data "
+            return "<div class=\"note\">Tag store unavailable — tag-compliance data "
                    "cannot be read right now.</div>";
         }
         gaps = std::move(*gaps_res);
@@ -2121,42 +2112,19 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
             missing_count[k]++;
     }
 
+    std::vector<compliance_html::TagRow> rows;
     for (const auto& cat : categories) {
-        std::string key_str(cat.key);
-        int tagged = tagged_count.count(key_str) ? tagged_count[key_str] : 0;
-        int missing = missing_count.count(key_str) ? missing_count[key_str] : 0;
-
-        std::string vals_str;
-        if (cat.allowed_values.empty()) {
-            vals_str = "<span class=\"muted\">Free-form</span>";
-        } else {
-            for (size_t i = 0; i < cat.allowed_values.size(); ++i) {
-                if (i > 0)
-                    vals_str += ", ";
-                vals_str += std::string(cat.allowed_values[i]);
-            }
-        }
-
-        std::string missing_cls = missing > 0 ? "role-bad" : "role-ok";
-        html += "<tr><td><code>" + key_str + "</code></td>";
-        html += "<td>" + std::string(cat.display_name) + "</td>";
-        html += "<td>" + std::to_string(tagged) + "</td>";
-        html += "<td><span class=\"role-badge " + missing_cls + "\">" + std::to_string(missing) +
-                "</span></td>";
-        html += "<td>" + vals_str + "</td></tr>";
+        compliance_html::TagRow row;
+        row.key = std::string(cat.key);
+        row.display_name = std::string(cat.display_name);
+        row.tagged = tagged_count.count(row.key) ? tagged_count[row.key] : 0;
+        row.missing = missing_count.count(row.key) ? missing_count[row.key] : 0;
+        for (const auto& v : cat.allowed_values)
+            row.allowed_values.emplace_back(v);
+        rows.push_back(std::move(row));
     }
-
-    html += "</tbody></table>";
-
-    if (total_agents > 0) {
-        size_t compliant = total_agents - gaps.size();
-        html += "<div class=\"section-note\">"
-                "Compliance: " +
-                std::to_string(compliant) + "/" + std::to_string(total_agents) +
-                " agents have all required tags</div>";
-    }
-
-    return html;
+    return compliance_html::render_tag_compliance(rows, total_agents,
+                                                  total_agents > 0 ? total_agents - gaps.size() : 0);
 }
 
 std::string SettingsRoutes::render_management_groups_fragment() {

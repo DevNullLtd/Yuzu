@@ -2809,7 +2809,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | API Tokens | `/fragments/settings/api-tokens` | Create and revoke bearer tokens for REST API automation. |
 | Plugin Code Signing | `/fragments/settings/plugin-signing` | Upload a PEM trust bundle for agent plugin CMS signature verification, toggle the require-signed-plugins flag, and remove the bundle. The trust bundle persists at `<cert-dir>/plugin-trust-bundle.pem`; the require flag persists in `runtime_config` under key `plugin_signing_required`. Distribution to agents is operator-driven today (curl into a local file referenced by `--plugin-trust-bundle`); automatic agent-side fetch is a forthcoming change. See the user-manual *Agent Plugins → Plugin Code Signing* section. |
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
-| Tag Compliance | `/fragments/settings/tag-compliance` | View compliance summary across the fleet based on tag-driven policies. |
+| Tag Compliance | *(moved)* | Now the **Compliance by tag** panel on the Compliance page; see [Tag Compliance](#tag-compliance). |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
 | OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart reverts to the command-line/environment value, so a durable rotation must update that too; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
@@ -3987,13 +3987,16 @@ For the full RBAC model, see `docs/user-manual/rbac.md`.
 
 ## Tag Compliance
 
-The Tag Compliance section provides a fleet-wide view of compliance based on tag-driven policies.
+Tag compliance shows how many devices carry each structured tag category. It lives on the
+**Compliance** page, in the **Compliance by tag** panel (it was a Settings panel before).
 
-1. Navigate to **Settings > Tag Compliance**.
-2. View the compliance summary showing:
-   - Total devices, compliant count, non-compliant count.
-   - Breakdown by tag category.
-   - Devices missing required tags.
+1. Open **Compliance** and scroll to **Compliance by tag**.
+2. For each category the table shows the display name, how many devices are tagged, how many
+   are missing the tag, and the allowed values (**Free-form** when any value is accepted),
+   with a summary line of how many devices have every required tag.
+
+Reading it needs the `Tag:Read` permission; without it the panel says so and the rest of the
+page still loads.
 
 Tag compliance data is also available via the REST API (`GET /api/v1/tag-compliance`) for integration with external dashboards and reporting tools.
 
@@ -5049,7 +5052,7 @@ The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin r
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/fragments/settings/tag-compliance` | Render the tag compliance summary fragment (HTMX). |
+| `GET` | `/fragments/settings/tag-compliance` | Render the tag compliance table fragment (HTMX); loaded by the Compliance page. |
 | `GET` | `/api/v1/tag-compliance` | Tag compliance summary (JSON, via REST API v1). |
 
 ### DEX Alerts

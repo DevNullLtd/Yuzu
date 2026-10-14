@@ -46,7 +46,6 @@ constexpr std::array<Panel, 22> kPanels{{
     {"MCP (AI Integration)", "mcp-section", "/fragments/settings/mcp"},
     {"Vulnerability Management", "nvd-section", "/fragments/settings/nvd"},
     {"Management Groups", "mgmt-groups-section", "/fragments/settings/management-groups"},
-    {"Tag Compliance", "tag-compliance-section", "/fragments/settings/tag-compliance"},
     {"Directory Integration / OIDC SSO", "directory-section", "/fragments/settings/directory"},
 }};
 
