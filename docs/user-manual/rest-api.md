@@ -9315,7 +9315,7 @@ Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration c
 | `content` | string | Yes | PEM-encoded content (must contain `-----BEGIN`) |
 
 - **Response:** Re-rendered TLS Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Writes PEM content to the server cert directory. Key files are set to 0600 permissions. Config is updated immediately; HTTPS cert hot-reload will pick up changes within the polling interval.
+- **Effect:** Writes PEM content to the server cert directory. A `key` is created owner-only (0600) and replaced atomically by rename (a symlink at the destination is replaced, not followed); a certificate directory the server creates is 0700, and an existing directory's mode is left as it is. Config is updated immediately; HTTPS cert hot-reload will pick up changes within the polling interval.
 
 ---
 

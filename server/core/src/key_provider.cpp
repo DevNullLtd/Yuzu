@@ -314,32 +314,30 @@ bool FileKeyProvider::store_named_file(std::string_view file_name, std::string_v
                       std::string(file_name), bytes.size());
         return false;
     }
-#ifdef _WIN32
-    // Windows has no --cert-group sharing, and this directory already carries
-    // the owner-only DACL from the CA/KEK custody that writes into it at boot,
-    // so applying it again is the existing posture, not a new narrowing.
-    constexpr bool kTightenExistingDir = true;
-#else
-    // A pre-existing directory may be deliberately 0750 + group (--cert-group).
-    constexpr bool kTightenExistingDir = false;
-#endif
+    // An operator cert directory may be deliberately shared (POSIX 0750 + group via
+    // --cert-group; a Windows ACL an administrator extended for another account), so an
+    // existing directory is left alone: custody here is the 0600 / owner-only DACL on the
+    // FILE, applied at creation. A directory this call creates is tightened.
+    // The directory fsync after the rename is best-effort for this caller: the key is
+    // already published, and a filesystem that rejects directory fsync (some FUSE /
+    // virtiofs / network mounts) must not turn a completed replace into a reported failure.
     return write_file_atomic(file_name, base_dir_ / std::string(file_name),
                              {reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()},
-                             kTightenExistingDir);
+                             /*tighten_existing_dir=*/false, /*dir_fsync_fatal=*/false);
 }
 
 bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path& dest,
                                         std::span<const std::uint8_t> bytes,
-                                        bool tighten_existing_dir) {
+                                        bool tighten_existing_dir, bool dir_fsync_fatal) {
     std::error_code ec;
     const bool dir_created = fs::create_directories(base_dir_, ec);
     if (ec) {
         spdlog::error("key_provider: cannot create {}: {}", base_dir_.string(), ec.message());
         return false;
     }
-    // Owner-only directory so the brief pre-chmod window on the temp file is not
-    // exposed to other local users.
-    if (tighten_existing_dir || dir_created) {
+    // Owner-only directory: limits listing/traversal of the key directory to the owner.
+    const bool tighten_dir = tighten_existing_dir || dir_created;
+    if (tighten_dir) {
         fs::permissions(base_dir_, fs::perms::owner_all, fs::perm_options::replace, ec);
         if (ec)
             spdlog::warn("key_provider: could not set 0700 on {}: {}", base_dir_.string(),
@@ -349,17 +347,18 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
 #ifdef _WIN32
     // POSIX mode bits are advisory on Windows; the real owner-only control is
     // an explicit PROTECTED DACL on the directory + key file (S1; ADR-0010
-    // §Decision 2). Build it once, apply to the directory now (so the temp
-    // file does not inherit an ambient parent ACL even before its own DACL is
-    // set), and FAIL CLOSED if it cannot be built/applied — never write key
-    // material under an inherited ACL.
+    // §Decision 2). Build it once, apply it to the directory when this call
+    // tightens it (so the temp file does not inherit an ambient parent ACL even
+    // before its own DACL is set; the file is also created with the explicit
+    // DACL below), and FAIL CLOSED if it cannot be built/applied — never write
+    // key material under an inherited ACL.
     WinOwnerOnlyDacl dacl;
     if (!dacl.ok()) {
         spdlog::error("key_provider: could not build owner-only DACL — refusing to write key "
                       "file (ADR-0010 §Decision 2 Windows key custody)");
         return false;
     }
-    if (!dacl.apply_to(base_dir_.wstring())) {
+    if (tighten_dir && !dacl.apply_to(base_dir_.wstring())) {
         spdlog::error("key_provider: could not apply owner-only DACL to {} (err {}) — refusing",
                       base_dir_.string(), ::GetLastError());
         return false;
@@ -503,9 +502,15 @@ bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path&
             (void)::close(dfd);
         }
         if (!dir_synced) {
-            spdlog::error("key_provider: could not fsync {} after rename: {}", base_dir_.string(),
-                          std::strerror(errno));
-            return false;
+            const int sync_errno = errno;
+            if (dir_fsync_fatal) {
+                spdlog::error("key_provider: could not fsync {} after rename: {}",
+                              base_dir_.string(), std::strerror(sync_errno));
+                return false;
+            }
+            spdlog::warn("key_provider: could not fsync {} after rename ({}); the file is "
+                         "published but may not survive a power loss until the next flush",
+                         base_dir_.string(), std::strerror(sync_errno));
         }
     }
 #endif

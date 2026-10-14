@@ -4472,6 +4472,7 @@ void SettingsRoutes::register_routes(
 
         auto out_path = cert_dir / out_name;
         if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.upload", "failure", "Certificate", type, "write failed");
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
                             "text/html; charset=utf-8");
@@ -4560,6 +4561,7 @@ void SettingsRoutes::register_routes(
 
         auto out_path = cert_dir / out_name;
         if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.paste", "failure", "Certificate", type, "write failed");
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
                             "text/html; charset=utf-8");

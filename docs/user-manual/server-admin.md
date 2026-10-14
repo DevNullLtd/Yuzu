@@ -2986,6 +2986,7 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 - The certificate file may contain the full chain (leaf + intermediates).
 - The private key must not be password-protected.
 - On Unix, the private key file must not be readable by group or others. The server will refuse to start if permissions are too open. Fix with: `chmod 600 /path/to/key.pem`.
+- A key uploaded or pasted in Settings is created owner-only (0600) and replaced atomically by rename. Mount the certificate directory, not the single `server-key.pem` file, into a container: a single-file bind mount cannot be replaced and the upload fails with an error in the server log.
 - For production, use certificates signed by a trusted CA. Self-signed certificates work but require agents to trust the CA.
 
 ### Certificate Hot-Reload

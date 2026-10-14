@@ -11,28 +11,37 @@
 
 #include "key_provider.hpp"
 
-#include <spdlog/spdlog.h>
-
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <system_error>
 
+#ifndef _WIN32
+#include <cerrno>
+#include <sys/stat.h>
+#endif
+
 namespace yuzu::server::cert_upload {
 
-/// create_directories, plus 0700 when THIS call created the leaf directory
-/// (POSIX). An existing directory is left as the operator/installer set it.
+/// Create `dir` (and missing parents). On POSIX the leaf is created with mkdir(2) mode 0700,
+/// so it is never visible at a wider mode; parents keep the default mode. An existing
+/// directory is left as the operator/installer set it. On Windows this is create_directories
+/// (the key FILE carries its own owner-only DACL from creation).
 inline void create_cert_dir(const std::filesystem::path& dir, std::error_code& ec) {
-    [[maybe_unused]] const bool created = std::filesystem::create_directories(dir, ec);
 #ifndef _WIN32
-    if (!ec && created) {
-        std::error_code perm_ec;
-        std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
-                                     std::filesystem::perm_options::replace, perm_ec);
-        if (perm_ec)
-            spdlog::warn("cert upload: could not set 0700 on {}: {}", dir.string(),
-                         perm_ec.message());
+    ec.clear();
+    std::error_code probe_ec; // a missing path is the expected case, not an error
+    if (std::filesystem::is_directory(dir, probe_ec))
+        return;
+    if (dir.has_parent_path()) {
+        std::filesystem::create_directories(dir.parent_path(), ec);
+        if (ec)
+            return;
     }
+    if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST)
+        ec = std::error_code(errno, std::generic_category());
+#else
+    std::filesystem::create_directories(dir, ec);
 #endif
 }
 
@@ -45,7 +54,8 @@ inline void create_cert_dir(const std::filesystem::path& dir, std::error_code& e
     if (!f.is_open())
         return false;
     f.write(content.data(), static_cast<std::streamsize>(content.size()));
-    return true;
+    f.flush();
+    return f.good(); // a short write / disk-full must not read as a successful upload
 }
 
 } // namespace yuzu::server::cert_upload

@@ -37,6 +37,17 @@ namespace {
 constexpr const char* kSampleKey =
     "-----BEGIN PRIVATE KEY-----\nMIGHAgEA...test...\n-----END PRIVATE KEY-----\n";
 
+#ifndef _WIN32
+/// Sets the process umask for a scope and restores it on exit.
+struct UmaskGuard {
+    mode_t old;
+    explicit UmaskGuard(mode_t m) : old(::umask(m)) {}
+    ~UmaskGuard() { ::umask(old); }
+    UmaskGuard(const UmaskGuard&) = delete;
+    UmaskGuard& operator=(const UmaskGuard&) = delete;
+};
+#endif
+
 } // namespace
 
 TEST_CASE("FileKeyProvider: store/load roundtrip", "[key_provider]") {
@@ -78,9 +89,11 @@ TEST_CASE("FileKeyProvider: store_named_file writes 0600 regardless of umask",
     yuzu::test::TempDir dir{"yuzu_test_keyprov_"};
     FileKeyProvider provider(dir.path / "fresh"); // created by the call => 0700
 
-    const mode_t old = ::umask(0); // a plain create would now be 0666
-    const bool ok = provider.store_named_file("server-key.pem", kSampleKey);
-    ::umask(old);
+    bool ok = false;
+    {
+        UmaskGuard umask_zero{0}; // a plain create would now be 0666
+        ok = provider.store_named_file("server-key.pem", kSampleKey);
+    }
     REQUIRE(ok);
 
     const auto key = dir.path / "fresh" / "server-key.pem";

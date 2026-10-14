@@ -146,8 +146,9 @@ public:
 };
 
 /// File-backed key store. Keys live as `<base_dir>/<key_id>.key` with mode 0600
-/// inside a 0700 directory. `key_ref` is the absolute file path. Implements
-/// BOTH custody contracts: raw-PEM CA/TLS keys (`KeyProvider`) and the
+/// inside a 0700 directory (`store_named_file` writes an operator-named file the
+/// same way and leaves an existing directory's mode alone). `key_ref` is the
+/// absolute file path. Implements BOTH custody contracts: raw-PEM CA/TLS keys (`KeyProvider`) and the
 /// secrets KEK wrap/unwrap seam (`KekProvider`).
 class FileKeyProvider : public KeyProvider, public KekProvider {
 public:
@@ -186,11 +187,12 @@ public:
     /// key) as `<base_dir>/<file_name>` through the same exclusive-create 0600
     /// temp -> fsync -> rename path as store_key, so the bytes are never visible
     /// at a looser mode and a pre-existing symlink/file at the destination is
-    /// replaced, never followed. Unlike store_key it does NOT re-tighten an
-    /// existing base directory on POSIX (an operator cert directory may be
-    /// deliberately group-traversable via --cert-group); a directory this call
-    /// creates is 0700. On Windows the owner-only DACL is applied as store_key
-    /// does (no group sharing there; the dir already carries it from CA/KEK custody).
+    /// replaced (by rename), never followed. Unlike store_key it does NOT
+    /// re-tighten an EXISTING base directory on either platform (an operator cert
+    /// directory may be deliberately shared: POSIX 0750 + group via --cert-group,
+    /// or an extended Windows ACL); a directory this call creates is tightened. The
+    /// directory fsync after the rename is best-effort here (warn only). A
+    /// single-file bind mount of the destination cannot be replaced (EBUSY).
     /// `file_name` must be a bare safe component (same charset as a key_id).
     [[nodiscard]] bool store_named_file(std::string_view file_name, std::string_view bytes);
 
@@ -212,11 +214,13 @@ private:
     /// Atomic durable write: temp file (0600 from creation, O_EXCL) → fsync
     /// → rename. Shared by store_key and generate_kek.
     /// `tighten_existing_dir` = false leaves an already-present base dir's POSIX
-    /// mode alone (a dir this call creates is always 0700). The Windows
-    /// owner-only DACL on the dir is applied either way (callers there pass true).
+    /// mode and Windows ACL alone (a dir this call creates is always tightened).
+    /// `dir_fsync_fatal` = false downgrades a failed directory fsync after the
+    /// rename to a warning (the rename already published the file).
     [[nodiscard]] bool write_file_atomic(std::string_view key_id, const std::filesystem::path& dest,
                                          std::span<const std::uint8_t> bytes,
-                                         bool tighten_existing_dir = true);
+                                         bool tighten_existing_dir = true,
+                                         bool dir_fsync_fatal = true);
 
     /// Reject a key_id that is not a bare, safe filename component (prevents
     /// path traversal via a crafted id). Returns false on any of: empty, path

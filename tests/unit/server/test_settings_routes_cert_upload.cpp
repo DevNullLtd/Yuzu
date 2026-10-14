@@ -66,6 +66,7 @@ struct CertRoutesHarness {
     yuzu::server::test::TestRouteSink sink;
     fs::path cert_dir;
     int success_audits{0}; ///< cert.upload / cert.paste "success" rows
+    int failure_audits{0}; ///< cert.upload / cert.paste "failure" rows
 
     CertRoutesHarness() {
         cert_dir = root.path / "certs";
@@ -83,8 +84,12 @@ struct CertRoutesHarness {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&, const std::string&,
                                const std::string&) {
-            if ((action == "cert.upload" || action == "cert.paste") && result == "success")
-                ++success_audits;
+            if (action == "cert.upload" || action == "cert.paste") {
+                if (result == "success")
+                    ++success_audits;
+                else if (result == "failure")
+                    ++failure_audits;
+            }
         };
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -212,7 +217,7 @@ TEST_CASE("cert paste: an existing cert directory keeps its mode (cert-group sha
     CHECK(mode_of(h.cert_dir / "server-key.pem") == 0600);
 }
 
-TEST_CASE("cert paste: a failed secure write is a 500 with no config change and no success audit",
+TEST_CASE("cert paste: a failed secure write is a 500, no config change, a failure audit row",
           "[settings_routes][cert][posix]") {
     CertRoutesHarness h;
     REQUIRE(fs::create_directories(h.cert_dir));
@@ -225,6 +230,7 @@ TEST_CASE("cert paste: a failed secure write is a 500 with no config change and 
     CHECK(res->status == 500);
     CHECK(h.cfg.tls_server_key.empty());
     CHECK(h.success_audits == 0);
+    CHECK(h.failure_audits == 1); // a failed key replacement leaves an audit row
     // No staging temp left behind next to the blocker.
     std::size_t entries = 0;
     for (const auto& e : fs::directory_iterator(h.cert_dir)) {
