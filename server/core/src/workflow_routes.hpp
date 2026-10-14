@@ -176,9 +176,9 @@ public:
         /// `GET /api/v1/workflow-executions/{id}` (the seamed reads; the legacy
         /// unversioned GET routes and every mutator above keep their own
         /// `WorkflowEngine*` wiring, unaffected by this seam). Unwired
-        /// (default-constructed null `shared_ptr`) ⇒ each of the first three v1
-        /// routes answers its own pre-seam "workflow engine not available" 503
-        /// exactly (the list route is new and answers a plain 503 "service
+        /// (default-constructed null `shared_ptr`) ⇒ every seamed v1
+        /// route except the execution list answers its own pre-seam
+        /// "workflow engine not available" 503 exactly (the list route is new and answers a plain 503 "service
         /// unavailable"), since
         /// `workflow_api` is constructed if-and-only-if `workflow_engine_`
         /// is (server.cpp) — see `workflow_api.hpp`'s own doc comment for

@@ -1180,7 +1180,7 @@ ExecutionPageSql build_execution_page_sql(
     };
     out.limit = std::clamp(q.limit, 1, kWorkflowExecutionListMax);
     out.statement_timeout_sql =
-        "SET LOCAL statement_timeout = '" + std::to_string(statement_timeout.count()) + "ms'";
+        "SET LOCAL statement_timeout = '" + std::to_string(std::max<std::int64_t>(statement_timeout.count(), 1)) + "ms'"; // 0 means no timeout in PG
 
     out.sql = std::string("SELECT ") + (q.latest_per_workflow ? "DISTINCT ON (e.workflow_id) " : "") +
               "e.id, e.workflow_id, w.name, (w.deleted_at <> 0), e.status, e.current_step, "
