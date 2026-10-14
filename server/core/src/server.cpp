@@ -18214,8 +18214,11 @@ private:
                 // TOP callers: one SQL statement instead of the 100k-row-capped roster.
                 // Online is the registry's union count (local sessions + durable
                 // presence); past the presence row cap that is typed-unavailable, so
-                // the SQL durable-live count stands in. NOT confined: HomeRoutes only
-                // calls this when the gate returned `scope == nullopt`.
+                // the SQL durable-live count stands in. That count is durable presence
+                // only (local sessions not yet persisted are not in it) and uses the
+                // same TTL as the registry's presence read (cfg_.session_timeout).
+                // NOT confined: HomeRoutes only calls this when the gate returned
+                // `scope == nullopt`, and caches a successful answer for 60 s.
                 .fleet_estate_fn =
                     [this](std::int64_t now_ms) -> std::optional<home::EstateCounts> {
                     if (!offline_endpoint_store_)
