@@ -277,7 +277,7 @@ TEST_CASE("summary: TOP uses the SQL estate seam and never loads the roster", "[
     d.fleet_estate_fn = [&](std::int64_t now_ms) -> std::optional<EstateCounts> {
         ++estate_calls;
         CHECK(now_ms == 1'760'000'000LL * 1000);
-        return partition_estate(250000, 240000, 5000);
+        return EstateCounts{250000, 240000, 5000, 5000};
     };
     test::TestRouteSink sink;
     HomeRoutes r;

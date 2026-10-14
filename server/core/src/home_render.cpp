@@ -223,15 +223,6 @@ std::string fmt_int(std::int64_t v) {
     return neg ? "-" + out : out;
 }
 
-EstateCounts partition_estate(std::int64_t total, std::int64_t online, std::int64_t stale) noexcept {
-    EstateCounts c;
-    c.total = std::max<std::int64_t>(total, 0);
-    c.online = std::clamp<std::int64_t>(online, 0, c.total);
-    c.not_seen = std::clamp<std::int64_t>(stale, 0, c.total - c.online);
-    c.offline = c.total - c.online - c.not_seen;
-    return c;
-}
-
 FailedFigure failed_in_24h(const std::vector<FailedRow>& rows, std::int64_t now,
                            std::size_t row_cap) {
     FailedFigure f;

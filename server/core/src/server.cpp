@@ -18209,6 +18209,26 @@ private:
                         .count();
                 },
                 .roster_fn = build_hw_roster,
+                // TOP callers: one SQL statement instead of the 100k-row-capped roster.
+                // Online is the registry's union count (local sessions + durable
+                // presence); past the presence row cap that is typed-unavailable, so
+                // the SQL durable-live count stands in. NOT confined: HomeRoutes only
+                // calls this when the gate returned `scope == nullopt`.
+                .fleet_estate_fn =
+                    [this](std::int64_t now_ms) -> std::optional<home::EstateCounts> {
+                    if (!offline_endpoint_store_)
+                        return std::nullopt;
+                    auto c = offline_endpoint_store_->fleet_state_counts(
+                        now_ms, kHardwareRosterWindow,
+                        std::chrono::milliseconds(kHardwareStaleAfterMs), cfg_.session_timeout);
+                    if (!c)
+                        return std::nullopt;
+                    std::int64_t online = c->live;
+                    if (auto known = registry_.known_agent_count())
+                        online = static_cast<std::int64_t>(*known);
+                    const auto p = partition_fleet_state(c->total, online, c->stale);
+                    return home::EstateCounts{c->total, p.online, p.not_seen, p.offline};
+                },
                 .compliance_fn = [compliance_api]() -> std::optional<home::ComplianceFigure> {
                     if (!compliance_api)
                         return std::nullopt;

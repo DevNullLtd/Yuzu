@@ -15,6 +15,11 @@ using namespace yuzu::server::home;
 
 namespace {
 
+// Fixture builder: the three segments are given, never derived here.
+EstateCounts estate(std::int64_t online, std::int64_t not_seen, std::int64_t offline) {
+    return EstateCounts{online + not_seen + offline, online, not_seen, offline};
+}
+
 bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
@@ -24,7 +29,7 @@ constexpr std::int64_t kNow = 1'760'000'000;
 SummaryView all_ok() {
     SummaryView v;
     v.now_epoch = kNow;
-    v.devices = Fact<EstateCounts>::make_ok(partition_estate(437, 412, 25));
+    v.devices = Fact<EstateCounts>::make_ok(estate(412, 25, 0));
     v.compliance = Fact<ComplianceFigure>::make_ok({4386, 4210, 100, 76, 96.0});
     v.failed = Fact<FailedFigure>::make_ok({14, CountBound::Exact, kNow - 840});
     v.approvals = Fact<ApprovalFigure>::make_ok({2, kNow - 360});
@@ -34,26 +39,6 @@ SummaryView all_ok() {
 } // namespace
 
 // ── partitions ─────────────────────────────────────────────────────────────
-
-// Kills: subtracting offline and stale independently (they overlap on an
-// online-and-stale row and the segments then sum past the total).
-TEST_CASE("partition_estate: three segments always sum to the clamped total", "[home][render]") {
-    const struct { std::int64_t total, online, stale; } cases[] = {
-        {437, 412, 25}, {10, 10, 10}, {10, 0, 10}, {10, 3, 9}, {0, 5, 5}, {5, 99, 0}, {-3, 1, 1}, {7, -1, -1},
-    };
-    for (const auto& c : cases) {
-        INFO(c.total << "/" << c.online << "/" << c.stale);
-        const auto p = partition_estate(c.total, c.online, c.stale);
-        CHECK(p.online >= 0);
-        CHECK(p.not_seen >= 0);
-        CHECK(p.offline >= 0);
-        CHECK(p.online + p.not_seen + p.offline == std::max<std::int64_t>(c.total, 0));
-    }
-    // Online wins over stale: an online-and-stale row is counted once, as online.
-    const auto p = partition_estate(10, 10, 10);
-    CHECK(p.online == 10);
-    CHECK(p.not_seen == 0);
-}
 
 // ── failed executions ──────────────────────────────────────────────────────
 
@@ -212,7 +197,7 @@ TEST_CASE("attention: rows for every contributing figure, with resolved links", 
 TEST_CASE("attention: the green row appears only when every contributor is Ok and empty",
           "[home][render]") {
     SummaryView v = all_ok();
-    v.devices = Fact<EstateCounts>::make_ok(partition_estate(10, 10, 0));
+    v.devices = Fact<EstateCounts>::make_ok(estate(10, 0, 0));
     v.failed = Fact<FailedFigure>::make_ok({});
     v.approvals = Fact<ApprovalFigure>::make_ok({});
     CHECK(has(render_attention(v), "Nothing needs attention"));
@@ -222,7 +207,7 @@ TEST_CASE("attention: the green row appears only when every contributor is Ok an
 TEST_CASE("attention: a non-Ok contributor renders a note and no green row", "[home][render]") {
     for (auto s : {FactState::Denied, FactState::Limited, FactState::Unavailable, FactState::Unwired}) {
         SummaryView v = all_ok();
-        v.devices = Fact<EstateCounts>::make_ok(partition_estate(10, 10, 0));
+        v.devices = Fact<EstateCounts>::make_ok(estate(10, 0, 0));
         v.approvals = Fact<ApprovalFigure>::make_ok({});
         v.failed = Fact<FailedFigure>::with(s, "Execution:Read");
         const std::string html = render_attention(v);
@@ -235,7 +220,7 @@ TEST_CASE("attention: a non-Ok contributor renders a note and no green row", "[h
 TEST_CASE("attention: the enrolment row is omitted for non-admins and never runs the green row on its own",
           "[home][render]") {
     SummaryView v = all_ok();
-    v.devices = Fact<EstateCounts>::make_ok(partition_estate(10, 10, 0));
+    v.devices = Fact<EstateCounts>::make_ok(estate(10, 0, 0));
     v.failed = Fact<FailedFigure>::make_ok({});
     v.approvals = Fact<ApprovalFigure>::make_ok({});
     v.show_enrolment = false;

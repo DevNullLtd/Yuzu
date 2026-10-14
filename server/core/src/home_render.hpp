@@ -104,12 +104,6 @@ struct SummaryView {
 /// 12345 -> "12,345".
 [[nodiscard]] std::string fmt_int(std::int64_t v);
 
-/// Splits the 30-day roster into the three disjoint estate segments. Online
-/// wins; `not_seen` is capped at what is left; nothing is negative; the sum is
-/// `max(total, 0)`.
-[[nodiscard]] EstateCounts partition_estate(std::int64_t total, std::int64_t online,
-                                            std::int64_t stale) noexcept;
-
 /// One finished execution row, reduced to what the 24 h count needs.
 struct FailedRow {
     std::int64_t completed_at{0};
