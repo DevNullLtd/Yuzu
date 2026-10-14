@@ -28,6 +28,7 @@ namespace yuzu::server::home_panels {
 // Denied fact whose `need` is this sentinel (it is not a `Securable:Op`).
 using home::Fact;
 using home::FactState;
+using home::compliance_level; // "ok" >= 90, "warn" >= 70, else "bad"
 inline constexpr const char* kAdminOnlyNeed = "Administrator";
 
 // ── Compliance by policy ─────────────────────────────────────────────────
@@ -51,17 +52,12 @@ inline constexpr std::size_t kActivityRows = 8;
 /// (ties by name, then id); policies with no results follow, so a fresh policy
 /// is never mistaken for the worst one.
 [[nodiscard]] PolicyPanel select_lowest_policies(const std::vector<Policy>& policies,
-                                                 const std::vector<ComplianceSummary>& summaries,
-                                                 std::size_t limit = kPolicyRows);
+                                                 const std::vector<ComplianceSummary>& summaries);
 
 /// 0..100, clamped before it can reach `style=`. `total <= 0` -> 0 (callers
 /// must test `total == 0` first and show "No results yet").
 [[nodiscard]] int pass_percent(std::int64_t compliant, std::int64_t total);
 
-/// "ok" (>= 90), "warn" (70..89), "bad" (< 70): the same thresholds as
-/// `ComplianceRoutes::compliance_level`, restated because that helper is
-/// file-static there.
-[[nodiscard]] const char* compliance_level(int pct);
 
 [[nodiscard]] std::string render_policies_panel(const Fact<PolicyPanel>& f, std::int64_t as_of_secs);
 

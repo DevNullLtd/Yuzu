@@ -73,15 +73,8 @@ int pass_percent(std::int64_t compliant, std::int64_t total) {
     return static_cast<int>(compliant * 100 / total);
 }
 
-const char* compliance_level(int pct) {
-    if (pct >= 90) return "ok";
-    if (pct >= 70) return "warn";
-    return "bad";
-}
-
 PolicyPanel select_lowest_policies(const std::vector<Policy>& policies,
-                                   const std::vector<ComplianceSummary>& summaries,
-                                   std::size_t limit) {
+                                   const std::vector<ComplianceSummary>& summaries) {
     struct Ranked {
         PolicyBar bar;
         std::string id;
@@ -116,7 +109,7 @@ PolicyPanel select_lowest_policies(const std::vector<Policy>& policies,
     out.enabled_total = enabled;
     for (auto* v : {&with_results, &without})
         for (auto& r : *v) {
-            if (out.lowest.size() >= limit) break;
+            if (out.lowest.size() >= kPolicyRows) break;
             out.lowest.push_back(std::move(r.bar));
         }
     return out;
