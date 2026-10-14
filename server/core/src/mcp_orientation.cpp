@@ -310,7 +310,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"DEX signals", "digital-employee-experience reliability signals and their scope/detail",
      kDexSignals},
     {"DEX performance", "fleet, cohort, device, and per-app performance over time", kDexPerf},
-    {"Network quality", "fleet and per-device network-quality posture", kNetwork},
+    {"Network quality", "fleet and per-device network-quality posture, and hosts found by "
+                      "discovery scans",
+     kNetwork},
     {"Live execution", "dispatch plugin actions or bundles to endpoints and collect results",
      kExecution},
     {"Device remediation", "quarantine a device (destructive, approval-gated)", kRemediation},

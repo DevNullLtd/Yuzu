@@ -232,3 +232,24 @@ TEST_CASE("mcp route registration: wiring -- server.cpp still calls "
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("mcp_server_->register_routes(") != std::string::npos);
 }
+
+// The handler tests in test_mcp_server.cpp call these two setters themselves, so
+// deleting either production line would leave every one of them green while the real
+// server answers "unavailable" for list_deployments / get_deployment (deployment run
+// store) or list_discovered_devices (discovery reader). Same source-text tripwire as
+// above; both setters must also precede register_routes, which freezes the handlers.
+TEST_CASE("mcp route registration: wiring -- server.cpp wires the deployment store and "
+          "the discovery reader before register_routes",
+          "[server][routes][mcp]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto reg = src.find("mcp_server_->register_routes(");
+    const auto dep = src.find("mcp_server_->set_deployment_run_store(deployment_run_store_.get())");
+    const auto disc = src.find("mcp_server_->set_discovered_devices_reader(discovered_reader)");
+    REQUIRE(reg != std::string::npos);
+    REQUIRE(dep != std::string::npos);
+    REQUIRE(disc != std::string::npos);
+    CHECK(dep < reg);
+    CHECK(disc < reg);
+}

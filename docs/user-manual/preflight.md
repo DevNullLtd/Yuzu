@@ -267,6 +267,7 @@ they never create a run or a deployment.
 The REST routes above are unaudited on a successful read (the response is run scope/lifecycle metadata,
 not per-agent behavioural PII, matching the fragments' own posture) but audit a service-scoped-token
 denial under their own verb. Their MCP twins instead call the generic
-`mcp.list_preflight_runs`/`mcp.get_deployment_preview` success audit, matching the majority
+`mcp.list_preflight_runs`/`mcp.get_deployment_preview` (and, for the two deployment reads above,
+`mcp.list_deployments`/`mcp.get_deployment`) success audit, matching the majority
 convention for MCP read tools in this codebase — the two transports deliberately diverge here; see
 `docs/api-twin-recipe.md` §4 for why REST/MCP/dashboard audit postures are not required to agree.
