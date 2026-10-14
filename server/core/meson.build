@@ -196,6 +196,21 @@ yuzu_operate_js_embed = custom_target(
   ],
 )
 
+# Shared modal dialog + request helper (window.YuzuDialog). Symbol: kYuzuDialogJs
+# (std::string). First consumer: the Operate action dialogs.
+yuzu_dialog_js_embed = custom_target(
+  'yuzu_dialog_js_bundle',
+  input: 'static/yuzu-dialog.js',
+  output: 'yuzu_dialog_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuDialogJs',
+  ],
+)
+
 cytoscape_js_embed = custom_target(
   'cytoscape_js_bundle',
   input: 'static/cytoscape.min.js',
@@ -391,6 +406,7 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_dialog_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -478,6 +494,8 @@ yuzu_server_core_lib = static_library(
     'src/approvals_ui.cpp',
     'src/executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
     'src/executions_ui.cpp',
+    'src/workflows_ui.cpp',
+    'src/workflows_page_render.cpp', # Operate WF-A: the Workflows page's pure definitions and schedules renderers
     'src/rbac_store.cpp',
     'src/rbac_admin_authority_owner.cpp',
     'src/oidc_provider.cpp',
@@ -631,6 +649,7 @@ yuzu_server_core_lib = static_library(
     'src/app_perf_cohort_reader.cpp',
     'src/app_perf_ingestion.cpp',
     'src/app_perf_rollup.cpp',
+    'src/dex_app_version_failures_owner.cpp',
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
     'src/data_inventory_routes.cpp',

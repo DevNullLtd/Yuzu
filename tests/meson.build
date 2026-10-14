@@ -1383,6 +1383,7 @@ if build_server
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
+      'unit/server/test_compliance_fragments.cpp', # pure renderers for the Compliance page fragments + tag table
       'unit/server/test_policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes
       'unit/server/test_compliance_model.cpp',
       'unit/server/test_verify_routes.cpp',
@@ -1547,6 +1548,7 @@ if build_server
       # relative path.
       '../agents/plugins/tar/src/tar_schema_registry.cpp',
       'unit/server/test_dex_app_perf_model.cpp',
+      'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_dex_stability_score.cpp', # pure application/version stability score (dex_stability_score.hpp) - no store, no PG
@@ -1682,7 +1684,7 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
-      'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 23 panels + static h1 on the /settings page
+      'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 22 panels + static h1 on the /settings page
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
@@ -1691,6 +1693,9 @@ if build_server
       'unit/server/test_approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
       'unit/server/test_executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
       'unit/server/test_operate_pages_ui.cpp',      # Operate O1: CSP/token/literal-bound pins for the Operate page templates, CSS and controller
+      'unit/server/test_workflows_page_render.cpp', # Operate WF-A: the Workflows page's pure definitions/schedules renderers
+      'unit/server/test_workflows_page_routes.cpp', # Operate WF-A: the Workflows page fragments (fake gates, no PG)
+      'unit/server/test_workflows_page_authz.cpp',  # Operate WF-A: the Workflows page fragments over the real gates ([pg])
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',

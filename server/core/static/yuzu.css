@@ -299,6 +299,21 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 :is(.panel > .hd, .card-header) .end { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .panel > .pb, .card-body { padding: 16px; }
 
+/* -- Readout: one panel, figures separated by rules (replaces a row of KPI tiles) -- */
+.readout { display: flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: var(--rad-panel); background: var(--surface); }
+.readout > .ro { flex: 1 1 170px; padding: 14px 18px; border-left: 1px solid var(--line); min-width: 0; }
+.readout > .ro:first-child { border-left: 0; }
+.readout .v { font-size: 26px; font-weight: 500; letter-spacing: -.02em; line-height: 1.15; }
+.readout .v small { font-size: 14px; color: var(--mut); font-weight: 400; letter-spacing: 0; }
+.readout .l { color: var(--mut); font-size: 13px; margin-top: 2px; }
+.readout .d { font-size: 12.5px; margin-top: 4px; color: var(--mut); }
+.readout .d.up { color: var(--ok); }
+.readout .d.dn { color: var(--bad); }
+.readout .d.wn { color: var(--warn); }
+.readout > .ro.ok .v { color: var(--ok); }
+.readout > .ro.warn .v { color: var(--warn); }
+.readout > .ro.bad .v { color: var(--bad); }
+
 /* -- Buttons -------------------------------------------------------------
    .btn is the neutral button; .btn-secondary is that same look. The product
    writes variants both ways (`btn btn-danger` and a bare `btn-danger`), so
@@ -392,14 +407,27 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 :is(.data-table, table).compact td { font-size: var(--text-sm); }
 :is(.data-table, table):is(.compact, .comfortable) th { padding: 8px 16px; font-size: 12.5px; }
 
-/* -- Forms: .input is the text control -- */
-.input { height: var(--ctl); padding: 0 10px; background: var(--bg); color: var(--ink);
-         border: 1px solid var(--line2); border-radius: var(--rad-ctl); font: inherit; min-width: 0;
-         transition: border-color .12s; }
-.input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; border-color: var(--focus); }
-.input::placeholder { color: var(--faint); }
-.input:disabled { opacity: 0.5; cursor: not-allowed; }
-.input.mono { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+/* -- Forms: .input / .in are the text controls; .fld wraps a labelled field (the shared dialog builds these) -- */
+.input, .in, .fld select, .fld textarea { height: var(--ctl); padding: 0 10px; background: var(--bg); color: var(--ink);
+                                         border: 1px solid var(--line2); border-radius: var(--rad-ctl); font: inherit; min-width: 0;
+                                         transition: border-color .12s; }
+.in, .fld select, .fld textarea { width: 100%; }
+.input:focus-visible, .in:focus-visible, .fld select:focus-visible, .fld textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; border-color: var(--focus); }
+.input::placeholder, .in::placeholder { color: var(--faint); }
+.input:disabled, .in:disabled { opacity: 0.5; cursor: not-allowed; }
+.in.mono, .input.mono { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+.fld textarea { height: auto; padding: 8px 10px; min-height: 84px; resize: vertical; font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+.fld { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.fld > label { font-size: 13px; font-weight: 500; color: var(--ink2); }
+.fld .hint { color: var(--mut); font-size: 12.5px; }
+.fld .seg { align-self: flex-start; }
+/* Switch: a checkbox drawn as a track and knob (Compliance policy enable) */
+.sw { appearance: none; -webkit-appearance: none; width: 36px; height: 20px; flex: 0 0 36px; margin: 2px 0 0; position: relative;
+      background: var(--line2); border: 0; border-radius: 3px; cursor: pointer; transition: background-color .12s; }
+.sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 2px; background: var(--raise); transition: left .12s; }
+.sw:checked { background: var(--primary); }
+.sw:checked::after { left: 18px; background: var(--on-primary); }
+.sw:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
 /* -- Progress bar (.compliance-bar is the product's older name) -- */
 .bar, .compliance-bar { height: 6px; border-radius: 2px; background: var(--line); overflow: hidden; }
@@ -442,6 +470,18 @@ td > .bar { min-width: 110px; }
 .toast-error { border-color: color-mix(in srgb, var(--bad) 50%, var(--line2)); }
 .toast-warning { border-color: color-mix(in srgb, var(--warn) 50%, var(--line2)); }
 .toast-info { border-color: color-mix(in srgb, var(--info) 50%, var(--line2)); }
+
+/* ===== Dialog (shared: Operate, Access) - native <dialog class="dlg"> built by yuzu-dialog.js ===== */
+dialog.dlg { width: min(540px, calc(100vw - 32px)); max-width: none; padding: 0; margin: auto; color: var(--ink);
+             background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-over); box-shadow: var(--shadow); }
+dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
+.dlg > h2 { margin: 0; padding: 14px 16px; font-size: 15px; font-weight: 600; border-bottom: 1px solid var(--line); }
+.dlg > .b { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4); max-height: 70vh; overflow: auto; font-size: var(--text-base); }
+.dlg > .b p { margin: 0; color: var(--ink2); }
+.dlg > .b .note { margin: 0; }
+.dlg > .b .fld textarea { background: var(--bg); }
+.dlg .err { color: var(--bad); font-size: var(--text-sm); }
+.dlg > .f { display: flex; justify-content: flex-end; gap: var(--sp-2); padding: 12px 16px; border-top: 1px solid var(--line); }
 
 /* Icons (inline SVG via sprite) */
 .icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2;

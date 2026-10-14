@@ -848,6 +848,13 @@ TEST_CASE("executions page list: the status filter returns exactly the matching 
     std::sort(want.begin(), want.end());
     CHECK(ids == want);
     CHECK(all->body.find("data-count=\"3\"") != std::string::npos);
+    // Unconfined page view: the fleet strip comes first, counting finished executions only.
+    CHECK(all->body.rfind("<section class=\"readout stats\"", 0) == 0);
+    CHECK(all->body.find("<div class=\"v\">2</div><div class=\"l\">Finished, all time") !=
+          std::string::npos);
+    auto plain = h.sink.Get("/fragments/executions");
+    REQUIRE(plain);
+    CHECK(plain->body.find("readout stats") == std::string::npos);
     CHECK(all->body.find("Page def") != std::string::npos);
     // The page view is NOT the drawer markup, and the drawer view is not the page markup.
     CHECK(all->body.find("onclick=") == std::string::npos);
@@ -1105,6 +1112,121 @@ TEST_CASE("executions page detail: a confined panel redacts and recomputes",
     CHECK(res->body.find("of 3 responded") == std::string::npos);
     CHECK(res->body.find("agent-out") == std::string::npos);
     CHECK(res->body.find("SECRET-PANEL") == std::string::npos);
+}
+
+TEST_CASE("executions page detail: the devices slot follows the selected slot and the drawer is "
+          "unchanged",
+          "[pg][workflow][executions][detail][page][devices]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-V", "V def");
+    const auto eid = h.make_exec("def-V", "running", 3, 2, 1);
+    h.agent_status(eid, "agent-ok", "success");
+    h.agent_status(eid, "agent-bad", "failure", 1, "boom");
+
+    auto page = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    const auto sel = page->body.find("data-slot=\"selected\"");
+    const auto dev = page->body.find("data-slot=\"devices\"");
+    REQUIRE(sel != std::string::npos);
+    REQUIRE(dev != std::string::npos);
+    CHECK(sel < dev);
+    for (const char* stamp : {"id=\"exec-kpi-", "exec-kpi-value", "data-agent-id=\"agent-bad\"",
+                              "per-agent-row-", "per-agent-status", "per-agent-exit-code"})
+        CHECK(page->body.find(stamp) != std::string::npos);
+    CHECK(page->body.find("2 reported, <b>1</b> not yet") != std::string::npos);
+    CHECK(page->body.find("exec-detail-sidebar") == std::string::npos);
+
+    // The drawer keeps its sidebar and carries no slot wrapper at all.
+    auto drawer = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(drawer);
+    CHECK(drawer->body.find("exec-detail-sidebar") != std::string::npos);
+    CHECK(drawer->body.find("data-slot") == std::string::npos);
+    CHECK(drawer->body.find("exec-detail-grid") != std::string::npos);
+}
+
+TEST_CASE("executions page detail: the per-device table is capped in page view only",
+          "[pg][workflow][executions][detail][page][devices]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-C", "C def");
+    const auto eid = h.make_exec("def-C", "completed", 501, 501, 0);
+    for (int i = 0; i < 501; ++i)
+        h.agent_status(eid, "agent-" + std::to_string(i), "success");
+
+    auto page = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(page);
+    CHECK(occurrences(page->body, "id=\"per-agent-row-") == 500);
+    CHECK(page->body.find("Showing 500 of 501 reporting devices, failures first.") !=
+          std::string::npos);
+
+    auto drawer = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(drawer);
+    CHECK(occurrences(drawer->body, "id=\"per-agent-row-") == 501);
+    CHECK(drawer->body.find("Showing 500 of") == std::string::npos);
+}
+
+TEST_CASE("executions page detail: a confined devices slot hides the dispatched count and "
+          "out-of-scope devices",
+          "[pg][workflow][executions][detail][page][devices][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-X", "X def");
+    const auto eid = h.make_exec("def-X", "running", 3, 1, 0, 1735689600, "carol");
+    h.agent_status(eid, "agent-in", "success");
+    h.agent_status(eid, "agent-out-1", "success");
+    h.agent_status(eid, "agent-out-2", "failure", 1, "SECRET-DEV-ERR");
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("data-slot=\"devices\"") != std::string::npos);
+    CHECK(res->body.find("not yet") == std::string::npos);
+    CHECK(res->body.find("1 reported") != std::string::npos);
+    CHECK(res->body.find("agent-out") == std::string::npos);
+    CHECK(res->body.find("SECRET-DEV") == std::string::npos);
+    // Total is the visible count (1), never the stored targeted 3.
+    CHECK(res->body.find("<div class=\"v exec-kpi-value\">1</div><div class=\"l\">Total</div>") !=
+          std::string::npos);
+}
+
+TEST_CASE("executions page detail: the responses list is scope-filtered before the total and "
+          "capped at 50 rows",
+          "[pg][workflow][executions][detail][page][devices][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-R", "R def");
+    const auto eid = h.make_exec("def-R", "completed", 53, 53, 0);
+    std::unordered_set<std::string> visible;
+    for (int i = 0; i < 52; ++i) {
+        const auto agent = "agent-" + std::to_string(i);
+        visible.insert(agent);
+        h.store_response("def-R", agent, "visible-output-" + std::to_string(i), eid);
+    }
+    h.store_response("def-R", "agent-hidden", "HIDDEN-OUTPUT", eid);
+
+    // Unconfined: every stored row is counted, 50 are shown, and the cap note says so.
+    auto all = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(all);
+    REQUIRE(all->status == 200);
+    CHECK(all->body.find("Show responses (53)") != std::string::npos);
+    CHECK(all->body.find("Showing 50 of 53.") != std::string::npos);
+
+    // Confined: the out-of-scope row is neither shown nor counted.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{visible};
+    auto scoped = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(scoped);
+    REQUIRE(scoped->status == 200);
+    CHECK(scoped->body.find("Show responses (52)") != std::string::npos);
+    CHECK(scoped->body.find("Showing 50 of 52.") != std::string::npos);
+    CHECK(scoped->body.find("HIDDEN-OUTPUT") == std::string::npos);
+    CHECK(scoped->body.find("agent-hidden") == std::string::npos);
 }
 
 TEST_CASE("executions page detail: gate denial stays 403 and a tracker degrade stays 503",

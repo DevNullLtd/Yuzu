@@ -30,9 +30,13 @@
 ///     carried alongside the bucket-resolution percentiles for callers that need
 ///     a precise number.
 
+#include "dex_stats.hpp" // DexInterval — the one interval shape (pure, store-free)
+
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -115,6 +119,114 @@ struct AppPerfVersionSummary {
 /// headline picks the max day, and the sparkline series is sorted chronologically.
 [[nodiscard]] std::vector<AppPerfVersionSummary>
 app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points);
+
+// ── Per-version crash and hang join (the fleet app-perf report) ──────────────
+//
+// Joins the per-(version, day) performance series with the crash and hang
+// observations of the same application.
+//
+//   - BREADTH: `crashes`, `hangs` and `affected_devices` (the devices with a
+//     crash OR a hang) are fleet-wide event and device counts, always present.
+//     They cover every reporting device, not only the sampled ones.
+//   - EXPOSURE cohort = `exposure_devices`: devices with retained
+//     resource-significant samples for the version in the window (a selected
+//     subset, not a census). Unknown (no sample rows) is carried as null and is
+//     never zero. When it is known, `exposed_crashes`/`exposed_hangs` are the
+//     events on exposed devices and the rate is those events per exposed device
+//     over the window, so numerator and denominator describe one population; the
+//     rate ratio is published when both versions have a known, positive exposure.
+//
+// This join carries no device floor (maintainer ruling 2026-10-14, named in the
+// routed Guardian/DEX row and the SOC 2 exemption); the per-(version, day) point
+// floor of `points[]` is unchanged.
+//
+// Renderer duties for any panel built on this report: print the cohort beside
+// every figure; the absence of a version row is not the absence of failures;
+// the rate is per exposed device over the window, not per day of use.
+//
+// The join and the serializer live here, once, so the REST and MCP transports
+// cannot drift.
+
+/// Window length for the crash and hang read, in days, before the observation
+/// retention clamp (the effective value is reported on the wire).
+inline constexpr int kAppPerfFailureWindowDays = 30;
+
+/// Most versions one report joins (the newest by canonical version); the rest are
+/// dropped and `versions_truncated` is set.
+inline constexpr std::size_t kAppPerfVersionJoinCap = 20;
+
+/// One version's crash and hang counts as the store read returns them. The
+/// `exposed_*` counts are the events on devices that also have exposure rows;
+/// `exposure_devices` is nullopt when the version has no exposure rows at all.
+struct AppPerfVersionFailureRow {
+    std::string version;
+    std::optional<std::int64_t> exposure_devices;
+    std::int64_t crashes{0};
+    std::int64_t hangs{0};
+    std::int64_t affected_devices{0};
+    std::int64_t exposed_crashes{0};
+    std::int64_t exposed_hangs{0};
+};
+
+/// One version row of the report: the performance summary plus the failure
+/// figures. An absent optional means unknown, never zero.
+struct AppPerfVersionRow {
+    AppPerfVersionSummary perf;
+    std::int64_t affected_devices{0};
+    std::int64_t crashes{0}; ///< fleet-wide, always present
+    std::int64_t hangs{0};   ///< fleet-wide, always present
+    std::optional<std::int64_t> exposure_devices; ///< nullopt = exposure unknown
+    std::optional<std::int64_t> exposed_crashes;  ///< nullopt only when exposure is unknown
+    std::optional<std::int64_t> exposed_hangs;
+    /// Exposed events per exposed device over the window; nullopt when exposure
+    /// is unknown or zero.
+    std::optional<DexInterval> failure_rate;
+    std::string previous_version;            ///< "" = none
+    std::optional<DexInterval> failure_rate_ratio; ///< this version / previous version
+};
+
+/// The whole report: the unchanged trend points plus the joined version rows.
+struct AppPerfFleetReport {
+    std::vector<AppPerfTrendPoint> points;
+    std::vector<AppPerfVersionRow> versions;
+    bool versions_truncated{false};
+    int failure_window_days{0};
+    int stat_failures{0}; ///< statistics that returned nothing on valid input
+};
+
+/// PURE: numeric group-wise order of canonical four-part versions ("a.b.c.d"),
+/// a shorter version padded with zeros. "" (the unknown bucket) is less than
+/// every other version.
+[[nodiscard]] bool app_perf_canon_version_less(std::string_view a, std::string_view b);
+
+/// The versions a report covers: see `app_perf_newest_versions`.
+struct AppPerfNewestVersions {
+    std::vector<std::string> versions;
+    bool truncated{false}; ///< more distinct versions existed than the cap
+};
+
+/// PURE: the distinct versions of `points`, newest first by canonical version
+/// (the string breaks numeric ties, so the order never depends on input order),
+/// capped at `kAppPerfVersionJoinCap`. The ONE selection: the join keeps exactly
+/// these rows and the failure read is asked for exactly these versions, so a
+/// version dropped from the report is never counted.
+[[nodiscard]] AppPerfNewestVersions
+app_perf_newest_versions(const std::vector<AppPerfTrendPoint>& points);
+
+/// PURE: build the report from the trend points and the failure rows. Versions
+/// are ordered newest first by canonical version and capped at
+/// `kAppPerfVersionJoinCap`; "" (unknown) is kept but never chains as a previous
+/// version. A version with no failure row reads as zero failures with unknown
+/// exposure.
+[[nodiscard]] AppPerfFleetReport
+app_perf_version_failure_join(std::vector<AppPerfTrendPoint> points,
+                              const std::vector<AppPerfVersionFailureRow>& failures,
+                              int failure_window_days);
+
+/// PURE: the `versions[]` JSON array for `report`, at full double precision
+/// (never a two-decimal formatter). An unbounded upper bound is null with
+/// `unbounded: true`.
+[[nodiscard]] std::string dex_app_perf_versions_json(const AppPerfFleetReport& report);
 
 // ── Per-device drill (B1, audited PII) — pure output shapes only ─────────────
 //

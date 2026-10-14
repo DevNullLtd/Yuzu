@@ -19,41 +19,43 @@ const char* const kCompliancePageTemplate =
       padding: 22px 28px 36px; display: flex; flex-direction: column; gap: 22px;
     }
 
-    /* ── Page header (.page-header / .subtitle from yuzu.css) ── */
+    /* ── Page header ──────────────────────────────────────── */
+    .page-header {
+      display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 24px;
+    }
+    .page-header h1 {
+      font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2;
+      color: var(--ink);
+    }
+    .page-header .subtitle { font-size: 14px; color: var(--mut); margin-top: 4px; max-width: 70ch; }
     .page-header .btn { margin-left: auto; }
-    .page-header .btn .icon { width: 14px; height: 14px; }
 
-    /* ── Sections: flat group, or a bordered panel ─────────── */
-    .section { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-    .section-header {
-      display: flex; align-items: center; gap: 8px;
-      font-size: 14px; font-weight: 600; color: var(--ink);
-    }
-    .section.panel { gap: 0; }
-    .panel > .section-header { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    /* ── Layout: a stack of shared .readout / .panel blocks ──── */
     #compliance-summary { display: flex; flex-direction: column; gap: 16px; }
-
-    /* ── Readout row (fleet compliance + counts) ───────────── */
-    .compliance-hero {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-      overflow: hidden; background: var(--surface);
-      border: 1px solid var(--line); border-radius: var(--rad-panel);
-    }
-    .hero-cell {
-      padding: 14px 18px; min-width: 0;
-      box-shadow: -1px 0 0 var(--line), 0 -1px 0 var(--line);
-    }
-    .hero-v { font-size: 26px; font-weight: 500; letter-spacing: -.02em; line-height: 1.15; color: var(--ink); }
-    .hero-l { font-size: 13px; color: var(--mut); margin-top: 2px; }
-    /* Track and fill come from yuzu.css (.compliance-bar / .compliance-fill, .good / .warn / .bad) */
-    .hero-cell .compliance-bar { margin-top: 8px; }
+    .page-stack { display: flex; flex-direction: column; gap: 16px; }
+    .tw { overflow-x: auto; }
+    .panel > .pb + .tw { border-top: 1px solid var(--line); }
+    .compliance-bar { margin-top: 8px; }
 
     /* ── Tables ────────────────────────────────────────────── */
-    /* Row skin: yuzu.css (.tw table); the right-aligned action cell carries .r */
-    .policy-table, .detail-table { min-width: 640px; }
-    /* Cell classes carry the table prefix so they outrank look's .tw table td rule */
-    .policy-table .policy-idx { color: var(--faint); }
+    .policy-table, .detail-table { width: 100%; min-width: 640px; border-collapse: collapse; }
+    .policy-table th, .detail-table th {
+      text-align: left; padding: 8px 16px; white-space: nowrap;
+      font-size: 12.5px; font-weight: 500; color: var(--mut);
+      background: var(--surface2); border-bottom: 1px solid var(--line);
+    }
+    .policy-table td, .detail-table td {
+      padding: var(--cell-y) 16px; white-space: nowrap;
+      color: var(--ink2); border-bottom: 1px solid var(--line);
+    }
+    .policy-table tbody tr:last-child td, .detail-table tbody tr:last-child td { border-bottom: 0; }
+    .policy-table tbody tr:hover td, .detail-table tbody tr:hover td { background: var(--surface2); }
+    .policy-table td:last-child { text-align: right; }
+    /* Cell classes carry the table prefix so they outrank the table's own td rule above */
     .policy-table .policy-name { font-weight: 600; color: var(--ink); }
+    .policy-scope, .mono-id {
+      font-family: var(--mds-font-family-mono); font-size: 12.5px;
+    }
     .policy-table .policy-scope { color: var(--mut); white-space: normal; min-width: 14ch; }
     .policy-pct { font-weight: 600; }
     .policy-pct.good { color: var(--ok); }
@@ -64,9 +66,14 @@ const char* const kCompliancePageTemplate =
     .detail-table .cell-wrap { white-space: normal; }
 
     /* ── Mini compliance bars in table ─────────────────────── */
-    .compliance-bar.mini-bar {
-      width: 80px; display: inline-block; vertical-align: middle; margin-left: 8px;
+    .mini-bar {
+      width: 80px; height: 6px; background: var(--line); border-radius: 2px;
+      overflow: hidden; display: inline-block; vertical-align: middle; margin-left: 8px;
     }
+    .mini-fill { height: 100%; }
+    .mini-fill.good { background: var(--ok); }
+    .mini-fill.warn { background: var(--warn); }
+    .mini-fill.bad  { background: var(--bad); }
 
     /* ── Detail panel (per-policy agent breakdown) ──────── */
     .detail-panel h3 {
@@ -102,9 +109,19 @@ const char* const kCompliancePageTemplate =
     .htmx-indicator {
       display: none; color: var(--mut); font-size: 13px; font-weight: 400;
     }
-    .section-header .htmx-indicator { margin-left: auto; }
     .htmx-request .htmx-indicator,
     .htmx-request.htmx-indicator { display: inline; }
+
+    /* ── Actions: summary header, detail row, per-viewer visibility ──── */
+    .hd .acts, .detail-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .hd .acts { margin-left: auto; }
+    .detail-actions { padding: 0 16px 14px; }
+    /* Detail and fragment controls stay hidden until the summary probe says the
+       viewer holds the permission (body classes set from #policies-panel). */
+    [data-perm] { display: none; }
+    body.can-write [data-perm="write"], body.can-execute [data-perm="execute"],
+    body.can-delete [data-perm="delete"] { display: inline-flex; }
+    [hidden] { display: none !important; }
 
     @media (max-width: 640px) { .content { padding: 16px; } }
   </style>
@@ -117,42 +134,51 @@ const char* const kCompliancePageTemplate =
 
     <div class="page-header">
       <div>
-        <h1>Compliance Dashboard</h1>
+        <h1>Compliance</h1>
         <div class="subtitle">Policy compliance status across the fleet</div>
       </div>
       <button class="btn btn-secondary"
               hx-get="/fragments/compliance/summary"
               hx-target="#compliance-summary"
               hx-swap="innerHTML">
-        <svg class="icon"><use href="/static/icons.svg#refresh-cw"></use></svg>
+        <svg class="icon" style="width:14px;height:14px"><use href="/static/icons.svg#refresh-cw"></use></svg>
         Refresh
       </button>
     </div>
 
-    <!-- ── Fleet Compliance Summary ─────────────────────── -->
-    <div class="section">
-      <div class="section-header">
-        Fleet Compliance Overview
-        <span class="htmx-indicator">Refreshing...</span>
+    <div class="page-stack">
+      <div id="compliance-summary"
+           hx-get="/fragments/compliance/summary"
+           hx-trigger="load"
+           hx-swap="innerHTML"
+           data-denied="Needs the Policy Read permission.">
+        <div class="empty-state">Loading compliance data...</div>
       </div>
-      <div>
-        <div id="compliance-summary"
-             hx-get="/fragments/compliance/summary"
-             hx-trigger="load"
-             hx-swap="innerHTML">
-          <div class="empty-state">Loading compliance data...</div>
+
+      <div class="panel">
+        <div class="hd"><h2>Policy detail</h2><span class="sub">Per-device results for one policy</span></div>
+        <div id="compliance-detail" data-denied="Needs the Policy Read permission.">
+          <div class="empty-state">Click <strong>View</strong> on a policy above to see per-device compliance.</div>
         </div>
       </div>
-    </div>
 
-    <!-- ── Per-Policy Detail (loaded on demand) ─────────── -->
-    <div class="section panel">
-      <div class="section-header">
-        Policy Detail
+      <div id="policy-fragments"
+           hx-get="/fragments/policy-fragments"
+           hx-trigger="load"
+           hx-swap="innerHTML"
+           data-denied="Needs the Policy Read permission.">
+        <div class="empty-state">Loading policy fragments...</div>
       </div>
-      <div>
-        <div id="compliance-detail">
-          <div class="empty-state">Click <strong>View</strong> on a policy above to see per-agent compliance.</div>
+
+      <div class="panel">
+        <div class="hd"><h2>Compliance by tag</h2>
+          <span class="sub">Devices should have all structured tag categories assigned. Devices missing tags are flagged but keep working.</span></div>
+        <div id="tag-compliance"
+             hx-get="/fragments/settings/tag-compliance"
+             hx-trigger="load"
+             hx-swap="innerHTML"
+             data-denied="Needs the Tag Read permission.">
+          <div class="empty-state">Loading tag compliance...</div>
         </div>
       </div>
     </div>
@@ -161,7 +187,11 @@ const char* const kCompliancePageTemplate =
 
   <div id="toast-container" class="toast-container"></div>
 
-  <script>
+  <!-- Shared dialog module: must precede the page script. Absent (404) means the
+       page falls back to window.confirm and hides the YAML dialogs. -->
+  <script src="/static/yuzu-dialog.js"></script>
+)HTM"
+    R"HTM(  <script>
     /* ── Toast notification system ─────────────────────────── */
     function showToast(message, level) {
       var c = document.getElementById('toast-container');
@@ -184,6 +214,253 @@ const char* const kCompliancePageTemplate =
     document.body.addEventListener('showToast', function(e) {
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
+    });
+
+    /* htmx drops 4xx/5xx bodies and swaps nothing on a network failure, so a
+       refused or unreachable panel would sit on "Loading..." forever: say why
+       in the panel the request targeted. A 401 is an expired session, not a
+       missing permission: it goes to the login page, as done() does for the
+       action layer. text === null means the panel's own denied note. */
+    function panelNote(e, text) {
+      var t = (e.detail || {}).target;
+      if (!t || !t.hasAttribute || !t.hasAttribute('data-denied')) return;
+      t.textContent = text === null ? t.getAttribute('data-denied') : text;
+      t.className = 'empty-state';
+    }
+    document.body.addEventListener('htmx:responseError', function(e) {
+      var st = e.detail && e.detail.xhr ? e.detail.xhr.status : 0;
+      if (st === 401) { location.assign('/login'); return; }
+      panelNote(e, st === 403 ? null : 'Temporarily unavailable. Try Refresh in a moment.');
+    });
+    document.body.addEventListener('htmx:sendError', function(e) {
+      panelNote(e, 'Could not reach the server. Try Refresh in a moment.');
+    });
+    document.body.addEventListener('htmx:timeout', function(e) {
+      panelNote(e, 'The server is taking too long to answer. Try Refresh in a moment.');
+    });
+    /* With no session the server answers a fragment request with a 302 to
+       /login, which XHR follows silently: htmx would swap the login page into
+       the panel and raise no error at all. Catch it by the final URL. */
+    document.body.addEventListener('htmx:beforeSwap', function(e) {
+      var x = e.detail && e.detail.xhr;
+      var u = x && x.responseURL;
+      if (!u) return;
+      try { if (new URL(u).pathname !== '/login') return; } catch (err) { return; }
+      e.detail.shouldSwap = false;
+      location.assign('/login');
+    });
+    /* htmx has no request timeout by default, so a server that takes the
+       connection and never answers raises no event at all. */
+    if (window.htmx) htmx.config.timeout = 30000;
+
+    /* Per-viewer controls: the summary render probes Policy:Write/Execute/Delete
+       once and leaves the answer on #policies-panel; the detail and fragment
+       panels read it from there. No panel (summary refused or degraded) = none. */
+    function applyPerms() {
+      var p = document.getElementById('policies-panel');
+      var b = document.body.classList;
+      b.toggle('can-write', !!p && p.getAttribute('data-can-write') === '1');
+      b.toggle('can-execute', !!p && p.getAttribute('data-can-execute') === '1');
+      b.toggle('can-delete', !!p && p.getAttribute('data-can-delete') === '1');
+    }
+    function showDialogControls(root) {
+      if (!(window.YuzuDialog && window.YuzuDialog.form)) return;
+      var n = root.querySelectorAll('[data-needs-dialog]');
+      for (var i = 0; i < n.length; i++) n[i].hidden = false;
+    }
+    document.body.addEventListener('htmx:afterSwap', function(e) {
+      applyPerms();
+      showDialogControls(e.target || document);
+    });
+  </script>
+)HTM"
+    R"HTM(  <script>
+    /* ── Policy actions: one delegated listener over [data-act] ─────────
+       fetch() ignores HX-Trigger, so toasts are composed here from the JSON
+       body. Server text is only ever set with textContent. */
+    function api(method, url, body) {
+      var init = { method: method, credentials: 'same-origin', cache: 'no-store', headers: {} };
+      if (body !== undefined) {
+        init.headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(body);
+      }
+      return fetch(url, init).then(function(r) {
+        var audit = r.headers.get('Sec-Audit-Failed') === 'true';
+        return r.json().catch(function() { return null; }).then(function(d) {
+          return { ok: r.ok, status: r.status, data: d, audit: audit };
+        });
+      }, function() { return { ok: false, status: 0, data: null, audit: false }; });
+    }
+    function errText(r, fallback) {
+      var d = r.data;
+      if (d && typeof d.error === 'string') return d.error;
+      if (d && d.error && typeof d.error.message === 'string') return d.error.message;
+      if (r.status === 403) return 'You do not have permission for this action.';
+      if (r.status === 0) return 'The request may not have applied. Refresh to check.';
+      return fallback;
+    }
+    function done(r, okMsg, failMsg) {
+      if (r.status === 401) { location.assign('/login'); return false; }
+      if (!r.ok) { showToast(errText(r, failMsg), 'error'); return false; }
+      showToast(okMsg + (r.audit ? ' The audit record could not be written.' : ''),
+                r.audit ? 'warning' : 'success');
+      return true;
+    }
+    function confirmAct(title, lines, label, danger) {
+      if (window.YuzuDialog && window.YuzuDialog.confirm) {
+        return window.YuzuDialog.confirm({ title: title, body: lines, confirmLabel: label, danger: !!danger });
+      }
+      return Promise.resolve(window.confirm(title + '\n\n' + lines.join('\n')));
+    }
+    function reload(sel, url) {
+      if (window.htmx) htmx.ajax('GET', url, { target: sel, swap: 'innerHTML' });
+    }
+    function reloadSummary() { reload('#compliance-summary', '/fragments/compliance/summary'); }
+    function reloadFragments() { reload('#policy-fragments', '/fragments/policy-fragments'); }
+    function reloadDetail(id) { reload('#compliance-detail', '/fragments/compliance/' + encodeURIComponent(id)); }
+    function clearDetail(text) {
+      var d = document.getElementById('compliance-detail');
+      d.textContent = text;
+      d.className = 'empty-state';
+    }
+    var MAX_YAML = 1048576;
+    function yamlDialog(title, note, url, okMsg) {
+      return window.YuzuDialog.form({
+        title: title, note: note, submitLabel: 'Create',
+        fields: [{ name: 'yaml', label: 'YAML', type: 'textarea', rows: 14, required: true }],
+        validate: function(v) { return v.yaml.length > MAX_YAML ? 'The YAML is larger than 1 MiB.' : null; },
+        submit: function(v) {
+          return api('POST', url, { yaml_source: v.yaml }).then(function(r) {
+            if (r.ok) { showToast(okMsg, 'success'); return null; }
+            return errText(r, 'The server refused the YAML.');
+          });
+        }
+      });
+    }
+    var ACTS = {
+      'toggle-enabled': function(el, id, name) {
+        var on = el.getAttribute('data-enabled') !== '1';
+        var lines = on
+          ? ['It will be re-checked on its schedule, dispatching a read-only check to the devices in its scope.']
+          : ['Scheduled checks stop for this policy. Its last results stay on the page and go stale.'];
+        return confirmAct((on ? 'Enable ' : 'Disable ') + name + '?', lines, on ? 'Enable' : 'Disable', !on)
+          .then(function(ok) {
+            if (!ok) return;
+            return api('POST', '/api/policies/' + encodeURIComponent(id) + (on ? '/enable' : '/disable'))
+              .then(function(r) {
+                done(r, name + (on ? ' enabled.' : ' disabled.'), 'Could not change the policy.');
+                reloadSummary();
+              });
+          });
+      },
+      'evaluate': function(el, id, name) {
+        return api('POST', '/api/policies/' + encodeURIComponent(id) + '/evaluate').then(function(r) {
+          var eid = r.data && r.data.execution_id;
+          if (done(r, 'Evaluation of ' + name + ' dispatched' + (eid ? ' (execution ' + eid + ').' : '.'),
+                   'Could not evaluate the policy.')) reloadSummary();
+        });
+      },
+      'invalidate-all': function() {
+        return confirmAct('Invalidate all compliance results?', [
+          'Every policy result is reset to unknown, so fleet compliance reads 0% until devices check in again.',
+          'This cannot be undone.'], 'Invalidate all', true).then(function(ok) {
+          if (!ok) return;
+          return api('POST', '/api/policies/invalidate-all').then(function(r) {
+            done(r, 'All results invalidated.', 'Could not invalidate results.');
+            reloadSummary();
+          });
+        });
+      },
+      'invalidate': function(el, id, name) {
+        return confirmAct('Invalidate cache for ' + name + '?', [
+          'Its results reset to unknown until devices check in again, and fix attempt counts restart.'],
+          'Invalidate', true).then(function(ok) {
+          if (!ok) return;
+          return api('POST', '/api/policies/' + encodeURIComponent(id) + '/invalidate').then(function(r) {
+            if (done(r, 'Cache invalidated for ' + name + '.', 'Could not invalidate the policy.')) {
+              reloadSummary();
+              reloadDetail(id);
+            }
+          });
+        });
+      },
+      'remediate': function(el, id, name) {
+        var n = el.getAttribute('data-n');
+        var lines = [(n !== null ? 'Currently ' + n + ' non-compliant devices; the fix runs on whichever are non-compliant when you confirm.'
+                                : 'The fix runs on whichever devices are non-compliant when you confirm.'),
+          'It dispatches the policy fragment\u2019s fix instruction directly, with no approval step. Review the fragment before you proceed.'];
+        return confirmAct('Remediate ' + name + '?', lines, 'Remediate', true).then(function(ok) {
+          if (!ok) return;
+          return api('POST', '/api/policies/' + encodeURIComponent(id) + '/remediate', {}).then(function(r) {
+            var d = r.data || {};
+            if (done(r, 'Remediation dispatched' + (d.agents !== undefined ? ' to ' + d.agents + ' devices' : '') +
+                        (d.execution_id ? ' (execution ' + d.execution_id + ').' : '.'),
+                     'Could not remediate the policy.')) {
+              reloadSummary();
+              reloadDetail(id);
+            }
+          });
+        });
+      },
+      'delete-policy': function(el, id, name) {
+        return confirmAct('Delete ' + name + '?', [
+          'The policy and its compliance results are removed. This cannot be undone.'],
+          'Delete', true).then(function(ok) {
+          if (!ok) return;
+          return api('DELETE', '/api/policies/' + encodeURIComponent(id)).then(function(r) {
+            /* The route answers 200 {"deleted":false} when nothing was removed. */
+            if (r.ok && !(r.data && r.data.deleted === true)) {
+              showToast(name + ' was not deleted; it may already be gone.', 'warning');
+              reloadSummary();
+              return;
+            }
+            if (done(r, name + ' deleted.', 'Could not delete the policy.')) {
+              clearDetail('Policy deleted.');
+              reloadSummary();
+              reloadFragments();
+            }
+          });
+        });
+      },
+      'delete-fragment': function(el, id, name) {
+        return confirmAct('Delete fragment ' + name + '?', [
+          'This cannot be undone. A fragment that a policy still uses is refused.'],
+          'Delete', true).then(function(ok) {
+          if (!ok) return;
+          return api('DELETE', '/api/policy-fragments/' + encodeURIComponent(id)).then(function(r) {
+            if (r.ok && !(r.data && r.data.deleted === true)) {
+              showToast(name + ' was not deleted; a policy may still use it.', 'warning');
+            } else if (!done(r, name + ' deleted.', 'Could not delete the fragment.')) {
+              return;
+            }
+            reloadFragments();
+          });
+        });
+      },
+      'new-policy': function() {
+        return yamlDialog('New policy',
+          'Paste a Policy YAML document (kind: Policy). Once enabled it dispatches a read-only check on a schedule.',
+          '/api/policies', 'Policy created.').then(function(v) { if (v) reloadSummary(); });
+      },
+      'new-fragment': function() {
+        return yamlDialog('New fragment',
+          'Paste a PolicyFragment YAML document (kind: PolicyFragment). Its fix instruction runs on devices when a policy using it is remediated, so author it with the care of any instruction.',
+          '/api/policy-fragments', 'Fragment created.').then(function(v) { if (v) reloadFragments(); });
+      }
+    };
+    var busy = false;
+    document.addEventListener('click', function(e) {
+      var el = e.target.closest ? e.target.closest('[data-act]') : null;
+      if (!el || el.disabled) return;
+      var fn = ACTS[el.getAttribute('data-act')];
+      if (!fn) return;
+      /* A switch must not flip until the server confirms: the refresh redraws it. */
+      if (el.type === 'checkbox') e.preventDefault();
+      if (busy) return;
+      busy = true;
+      Promise.resolve(fn(el, el.getAttribute('data-id') || '', el.getAttribute('data-name') || ''))
+        .catch(function() { showToast('The action did not complete.', 'error'); })
+        .then(function() { busy = false; });
     });
   </script>
 </body>

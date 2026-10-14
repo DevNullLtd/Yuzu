@@ -610,23 +610,6 @@ const char* const kSettingsPageTemplate =
       </div>
     </div>
 
-    <!-- ── Tag Compliance ──────────────────────────────────── -->
-    <div class="section">
-      <div class="section-header">Tag Compliance</div>
-      <div class="section-body">
-        <p class="section-intro">
-          Devices should have all 4 structured tag categories assigned.
-          Devices missing tags are flagged but continue to function normally.
-        </p>
-        <div id="tag-compliance-section"
-             hx-get="/fragments/settings/tag-compliance"
-             hx-trigger="load"
-             hx-swap="innerHTML">
-          <span class="muted">Loading...</span>
-        </div>
-      </div>
-    </div>
-
     <!-- ── Directory Integration / OIDC SSO ──────────────── -->
     <div class="section">
       <div class="section-header">Directory Integration / OIDC SSO</div>
