@@ -35,6 +35,18 @@ struct DexGroupOption {
     std::string name;
 };
 
+/// What the trend fragment knows about the per-version crash and hang join.
+/// `Ready` carries the report the REST/MCP twins serve (`report` non-null);
+/// `ReadFailed` is the join's authoritative degrade (the REST 503), rendered as a
+/// failed-read state with a retry link, never an empty or zero table;
+/// `NotShown` is a scope the join does not cover (a management group or a device
+/// model: failures are recorded fleet-wide) or a caller that never asks for it.
+struct DexVersionFailureView {
+    enum class State { NotShown, Ready, ReadFailed };
+    State state{State::NotShown};
+    const AppPerfFleetReport* report{nullptr};
+};
+
 /// PURE: the app picker — every application with retained fleet perf history, each
 /// row a drill into its per-version trend. `truncated` adds the honest cap note.
 /// `q` (default "" = unfiltered) case-insensitive substring-filters by app name.
@@ -91,7 +103,26 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                                       std::int64_t group_floor, int window_days,
                                       const std::string& active_version = "",
                                       const std::vector<std::string>& model_values = {},
-                                      const std::string& active_model = "");
+                                      const std::string& active_model = "",
+                                      const DexVersionFailureView& failures = {});
+
+/// PURE: the per-version crash and hang table of the fleet trend (also embedded
+/// by `render_dex_app_perf_trend`). Every figure carries its population (the
+/// exposed-device count sits beside each rate), nothing is labelled good or bad,
+/// and an unknown value is never shown as zero:
+///   - `crashes`/`hangs`/`affected_devices` are fleet-wide counts at any device
+///     count (the join has no floor); a present `0` means no events;
+///   - `exposure_devices` null = "unknown" (distinct from `0`); the rate is shown
+///     only for a positive exposure, with its 95 percent interval and a
+///     `reliable` marker (under 20 events is flagged, never hidden);
+///   - the rate ratio against the next older version shows only when the report
+///     carries one; an unbounded upper end reads "no upper bound";
+///   - the window (`last N days`), the sampled-not-census exposure basis, the
+///     20-version cap and a non-zero `stat_failures` fault are all stated.
+/// `app_name`, `window_days` and `active_version` build the retry link only.
+std::string render_dex_app_perf_version_failures(const std::string& app_name, int window_days,
+                                                 const std::string& active_version,
+                                                 const DexVersionFailureView& failures);
 
 /// PURE: the version-row "which devices" drill — one row per device that
 /// reported `(app_name, version)` among its retained top-N resource consumers,
