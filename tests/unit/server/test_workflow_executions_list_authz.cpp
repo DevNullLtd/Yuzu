@@ -75,11 +75,12 @@ struct ListRig {
         seed();
     }
 
-    std::string make(const std::string& dispatched_by, int64_t at, int targeted) {
+    std::string make(const std::string& dispatched_by, int64_t at, int targeted,
+                     const std::string& st = "completed") {
         Execution e;
         e.definition_id = "def-list-authz";
         e.dispatched_by = dispatched_by;
-        e.status = "completed";
+        e.status = st;
         e.dispatched_at = at;
         e.agents_targeted = targeted;
         auto id = tracker.create_execution(e);
@@ -148,6 +149,12 @@ struct ListRig {
         };
         d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
                         const std::string&, const std::string&, const std::string&) {};
+        // Render-only probe, bound the way server.cpp binds it (a throwaway Response).
+        d.probe_perm_fn = [&ar](const httplib::Request& req, const std::string& t,
+                                const std::string& o) -> bool {
+            httplib::Response scratch;
+            return ar.require_permission(req, scratch, t, o);
+        };
         d.execution_tracker = &tracker;
         routes.register_routes(sink, std::move(d));
         std::unordered_map<std::string, std::string> hdrs;
@@ -554,4 +561,25 @@ TEST_CASE("fragments/executions/{id}/detail page view real gate: redacts, recomp
     CHECK(gary.status == 200);
     CHECK(has(gary.body, "data-confined=\"0\""));
     CHECK(has(gary.body, "2 of 2 responded"));
+}
+
+TEST_CASE("fragments/executions/{id}/detail page view real gate: Cancel is probed and offered "
+          "only for a live execution",
+          "[pg][workflow][executions][detail][authz][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ListRig r{db.dsn()};
+    const auto gary = r.mint("gary"); // global Execution:Read, no Execution:Execute
+    const auto live = r.make("carol", 1735689700, 1, "running");
+    auto detail = [&](const std::string& id) {
+        return r.get(gary, false, "/fragments/executions/" + id + "/detail?view=page");
+    };
+
+    // Live row: the probe ran and answered "no" (gary cannot execute).
+    auto running = detail(live);
+    CHECK(running.status == 200);
+    CHECK(has(running.body, "data-can-cancel=\"0\""));
+    // Finished row: no probe, no attribute at all.
+    auto done = detail(r.x_mixed);
+    CHECK(done.status == 200);
+    CHECK_FALSE(has(done.body, "data-can-cancel"));
 }
