@@ -35,7 +35,7 @@ void register_home_panel_routes(HttpRouteSink& sink, Deps deps) {
         const auto now = deps.now_fn();
         if (service_scoped_refused(deps, req,
                                    "service-scoped tokens may not read the Home policies panel")) {
-            serve(res, render_policies_panel(Fact<PolicyPanel>::of(FactState::Denied, "Policy:Read"),
+            serve(res, render_policies_panel(Fact<PolicyPanel>::with(FactState::Denied, "Policy:Read"),
                                              now));
             return;
         }
@@ -45,16 +45,16 @@ void register_home_panel_routes(HttpRouteSink& sink, Deps deps) {
         const auto gate = deps.fleet_read_fn(req, scratch, "Policy", "Read");
         if (!gate.admitted) {
             const auto s = scratch.status == 503 ? FactState::Unavailable : FactState::Denied;
-            serve(res, render_policies_panel(Fact<PolicyPanel>::of(s, "Policy:Read"), now));
+            serve(res, render_policies_panel(Fact<PolicyPanel>::with(s, "Policy:Read"), now));
             return;
         }
         if (gate.scope.has_value()) { // engaged: the aggregate is unfiltered, never show it
-            serve(res, render_policies_panel(Fact<PolicyPanel>::of(FactState::Limited), now));
+            serve(res, render_policies_panel(Fact<PolicyPanel>::with(FactState::Limited), now));
             return;
         }
         auto panel = deps.policies_fn();
-        serve(res, render_policies_panel(panel ? Fact<PolicyPanel>::ok(std::move(*panel))
-                                               : Fact<PolicyPanel>::of(FactState::Unavailable),
+        serve(res, render_policies_panel(panel ? Fact<PolicyPanel>::make_ok(std::move(*panel))
+                                               : Fact<PolicyPanel>::with(FactState::Unavailable),
                                          now));
     });
 
@@ -66,7 +66,7 @@ void register_home_panel_routes(HttpRouteSink& sink, Deps deps) {
         };
         if (service_scoped_refused(deps, req,
                                    "service-scoped tokens may not read the Home activity panel")) {
-            out(Fact<Rows>::of(FactState::Denied, "AuditLog:Read"));
+            out(Fact<Rows>::with(FactState::Denied, "AuditLog:Read"));
             return;
         }
         auto session = deps.auth_fn(req, res);
@@ -74,17 +74,17 @@ void register_home_panel_routes(HttpRouteSink& sink, Deps deps) {
         // Role pre-check BEFORE any gate call: a non-holder must not write a
         // denial row into the very panel they would read (REVIEW A7).
         if (auth::effective_role(*session) != auth::Role::admin) {
-            out(Fact<Rows>::of(FactState::AdminOnly));
+            out(Fact<Rows>::with(FactState::Denied, kAdminOnlyNeed));
             return;
         }
         httplib::Response scratch;
         if (!deps.perm_fn(req, scratch, "AuditLog", "Read")) {
-            out(Fact<Rows>::of(scratch.status == 503 ? FactState::Unavailable : FactState::Denied,
+            out(Fact<Rows>::with(scratch.status == 503 ? FactState::Unavailable : FactState::Denied,
                                "AuditLog:Read"));
             return;
         }
         auto events = deps.audit_fn(static_cast<int>(kActivityRows));
-        out(events ? Fact<Rows>::ok(to_activity_rows(*events)) : Fact<Rows>::of(FactState::Unavailable));
+        out(events ? Fact<Rows>::make_ok(to_activity_rows(*events)) : Fact<Rows>::with(FactState::Unavailable));
     });
 }
 

@@ -73,7 +73,7 @@ TEST_CASE("home_panels: no-result policies fill remaining rows and never read as
     auto out = select_lowest_policies({pol("a", "Alpha"), pol("e", "Fresh")}, {sum("a", 3, 4)});
     REQUIRE(out.lowest.size() == 2);
     CHECK(out.lowest[1].name == "Fresh");
-    auto html = render_policies_panel(Fact<PolicyPanel>::ok(out), kNow);
+    auto html = render_policies_panel(Fact<PolicyPanel>::make_ok(out), kNow);
     CHECK(has(html, "No results yet"));
     CHECK(has(html, "3/4 (75%)"));
     CHECK(has(html, "Lowest 2 of 2 policies"));
@@ -88,22 +88,22 @@ TEST_CASE("home_panels: equal percentages tie-break by name then id", "[server][
 }
 
 TEST_CASE("home_panels: policies panel states are distinct sentences", "[server][home]") {
-    auto d = render_policies_panel(Fact<PolicyPanel>::of(FactState::Denied, "Policy:Read"), kNow);
-    auto l = render_policies_panel(Fact<PolicyPanel>::of(FactState::Limited), kNow);
-    auto u = render_policies_panel(Fact<PolicyPanel>::of(FactState::Unavailable), kNow);
+    auto d = render_policies_panel(Fact<PolicyPanel>::with(FactState::Denied, "Policy:Read"), kNow);
+    auto l = render_policies_panel(Fact<PolicyPanel>::with(FactState::Limited), kNow);
+    auto u = render_policies_panel(Fact<PolicyPanel>::with(FactState::Unavailable), kNow);
     CHECK(has(d, "It needs Policy:Read."));
     CHECK(has(l, "limited to a group of devices"));
     CHECK(has(u, "This is not zero."));
     CHECK_FALSE(has(u, "No policies are defined."));
     PolicyPanel empty;
-    CHECK(has(render_policies_panel(Fact<PolicyPanel>::ok(empty), kNow), "No policies are defined."));
+    CHECK(has(render_policies_panel(Fact<PolicyPanel>::make_ok(empty), kNow), "No policies are defined."));
 }
 
 TEST_CASE("home_panels: bar width is clamped and level class follows thresholds", "[server][home]") {
     PolicyPanel p;
     p.enabled_total = 3;
     p.lowest = {{"Hi", 95, 100}, {"Mid", 75, 100}, {"Over", 500, 10}};
-    auto html = render_policies_panel(Fact<PolicyPanel>::ok(p), kNow);
+    auto html = render_policies_panel(Fact<PolicyPanel>::make_ok(p), kNow);
     CHECK(has(html, "style=\"width:95%\""));
     CHECK(has(html, "style=\"width:75%\""));
     CHECK(has(html, "style=\"width:100%\""));
@@ -115,7 +115,7 @@ TEST_CASE("home_panels: hostile policy name is escaped", "[server][home]") {
     PolicyPanel p;
     p.enabled_total = 1;
     p.lowest = {{"<script>alert(1)</script>", 1, 2}};
-    auto html = render_policies_panel(Fact<PolicyPanel>::ok(p), kNow);
+    auto html = render_policies_panel(Fact<PolicyPanel>::make_ok(p), kNow);
     CHECK_FALSE(has(html, "<script>"));
     CHECK(has(html, "&lt;script&gt;"));
 }
@@ -135,7 +135,7 @@ TEST_CASE("home_panels: to_activity_rows copies only the five safe fields", "[se
     e.result = "success";
     auto rows = to_activity_rows({e});
     REQUIRE(rows.size() == 1);
-    auto html = render_activity_panel(Fact<std::vector<ActivityRow>>::ok(rows), kNow, "/access/audit");
+    auto html = render_activity_panel(Fact<std::vector<ActivityRow>>::make_ok(rows), kNow, "/access/audit");
     for (const char* leak : {"DETAIL-LEAK", "10.9.9.9", "UA-LEAK", "SESSION-LEAK", "admin-secret-role"})
         CHECK_FALSE(has(html, leak));
     CHECK(has(html, "Policy:p1"));
@@ -151,7 +151,7 @@ TEST_CASE("home_panels: activity result pill classes and escaping", "[server][ho
     rows.push_back({kNow, "<script>x</script>", "a", std::string(130, 'T'), "failure"});
     rows.push_back({kNow, "u", "a", "", "denied"});
     rows.push_back({kNow, "u", "a", "", "weird"});
-    auto html = render_activity_panel(Fact<std::vector<ActivityRow>>::ok(rows), kNow, "");
+    auto html = render_activity_panel(Fact<std::vector<ActivityRow>>::make_ok(rows), kNow, "");
     CHECK(has(html, "pill bad"));
     CHECK(has(html, "pill warn"));
     CHECK(has(html, "pill idle"));
@@ -165,12 +165,12 @@ TEST_CASE("home_panels: activity result pill classes and escaping", "[server][ho
 
 TEST_CASE("home_panels: activity states", "[server][home]") {
     using R = Fact<std::vector<ActivityRow>>;
-    CHECK(has(render_activity_panel(R::ok({}), kNow, ""), "No activity recorded yet."));
-    CHECK(has(render_activity_panel(R::of(FactState::AdminOnly), kNow, ""),
+    CHECK(has(render_activity_panel(R::make_ok({}), kNow, ""), "No activity recorded yet."));
+    CHECK(has(render_activity_panel(R::with(FactState::Denied, kAdminOnlyNeed), kNow, ""),
               "administrators only"));
-    CHECK(has(render_activity_panel(R::of(FactState::Denied, "AuditLog:Read"), kNow, ""),
+    CHECK(has(render_activity_panel(R::with(FactState::Denied, "AuditLog:Read"), kNow, ""),
               "It needs AuditLog:Read."));
-    CHECK(has(render_activity_panel(R::of(FactState::Unavailable), kNow, ""),
+    CHECK(has(render_activity_panel(R::with(FactState::Unavailable), kNow, ""),
               "This is not zero."));
 }
 
@@ -204,7 +204,7 @@ TEST_CASE("home_panels: degraded health names the failing stores and never rende
     CHECK_FALSE(h->healthy);
     CHECK_FALSE(h->pg_reachable);
     REQUIRE(h->failing_stores.size() == 2);
-    auto html = render_health_panel(Fact<HealthPanel>::ok(*h), kNow);
+    auto html = render_health_panel(Fact<HealthPanel>::make_ok(*h), kNow);
     CHECK(has(html, "Degraded"));
     CHECK(has(html, "audit, pg_reachable")); // nlohmann object keys are sorted
     CHECK(has(html, "PostgreSQL not reachable"));
@@ -218,13 +218,13 @@ TEST_CASE("home_panels: health executions row follows the optional value", "[ser
     h.healthy = true;
     h.pg_reachable = true;
     h.executions_running = 7;
-    CHECK(has(render_health_panel(Fact<HealthPanel>::ok(h), kNow), "Executions running"));
+    CHECK(has(render_health_panel(Fact<HealthPanel>::make_ok(h), kNow), "Executions running"));
     h.executions_running.reset();
-    CHECK_FALSE(has(render_health_panel(Fact<HealthPanel>::ok(h), kNow), "Executions running"));
+    CHECK_FALSE(has(render_health_panel(Fact<HealthPanel>::make_ok(h), kNow), "Executions running"));
 }
 
 TEST_CASE("home_panels: unreadable health is a distinct sentence", "[server][home]") {
-    auto html = render_health_panel(Fact<HealthPanel>::of(FactState::Unavailable), kNow);
+    auto html = render_health_panel(Fact<HealthPanel>::with(FactState::Unavailable), kNow);
     CHECK(has(html, "Server health could not be read."));
     CHECK_FALSE(has(html, "Healthy"));
 }

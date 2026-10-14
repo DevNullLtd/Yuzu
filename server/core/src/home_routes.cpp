@@ -96,6 +96,7 @@ Links resolve_links(std::span<const shell::NavGroup> groups) {
         l.executions = std::string(it->href) + "?status=failed";
     l.devices = href_or(groups, "hardware", l.devices);
     l.enrolment = href_or(groups, "groups", l.enrolment);
+    l.audit = href_or(groups, "audit", l.audit);
     return l;
 }
 

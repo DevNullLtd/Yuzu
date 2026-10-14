@@ -457,12 +457,14 @@ TEST_CASE("resolve_links falls back to today's pages and follows the nav when a 
     CHECK(fallback.executions == "/instructions");
     CHECK(fallback.devices == "/hardware");
     CHECK(fallback.enrolment == "/settings#pending-section");
+    CHECK(fallback.audit.empty()); // no audit nav item: the Activity button is omitted
 
     static const shell::NavItem items[] = {
         {"approvals", "Approvals", "/ap", ""},
         {"executions", "Executions", "/ex", ""},
         {"hardware", "Hardware", "/hw", ""},
         {"groups", "Groups", "/gr", ""},
+        {"audit", "Audit", "/au", ""},
     };
     static const shell::NavGroup groups[] = {{"All", items}};
     const auto followed = resolve_links(groups);
@@ -470,6 +472,7 @@ TEST_CASE("resolve_links falls back to today's pages and follows the nav when a 
     CHECK(followed.executions == "/ex?status=failed");
     CHECK(followed.devices == "/hw");
     CHECK(followed.enrolment == "/gr");
+    CHECK(followed.audit == "/au");
 }
 
 // ── pure roster tally ─────────────────────────────────────────────────────

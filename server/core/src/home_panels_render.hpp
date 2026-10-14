@@ -13,6 +13,7 @@
 /// never a zero (P17).
 
 #include "compliance_types.hpp" // Policy, ComplianceSummary
+#include "home_render.hpp"     // Fact<T>, FactState
 #include "audit_store.hpp"      // AuditEvent
 
 #include <cstdint>
@@ -23,24 +24,11 @@
 
 namespace yuzu::server::home_panels {
 
-enum class FactState {
-    Ok,          ///< typed read succeeded; `value` is real
-    Denied,      ///< the gate refused; the note names `securable`
-    Limited,     ///< admitted with an engaged scope on a fleet aggregate
-    Unavailable, ///< typed read degraded or store unwired: "not zero"
-    AdminOnly,   ///< Activity only: caller is not an effective administrator
-};
-
-template <typename T> struct Fact {
-    FactState state{FactState::Unavailable};
-    T value{};
-    std::string securable; ///< "Policy:Read", used by Denied
-
-    static Fact ok(T v) { return {FactState::Ok, std::move(v), {}}; }
-    static Fact of(FactState s, std::string securable = {}) {
-        return {s, T{}, std::move(securable)};
-    }
-};
+// HM-1's `Fact<T>` carries every figure. Activity's "administrators only" is a
+// Denied fact whose `need` is this sentinel (it is not a `Securable:Op`).
+using home::Fact;
+using home::FactState;
+inline constexpr const char* kAdminOnlyNeed = "Administrator";
 
 // ── Compliance by policy ─────────────────────────────────────────────────
 

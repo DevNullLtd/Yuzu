@@ -18343,8 +18343,9 @@ private:
                                                          .time_since_epoch())
                                                      .count());
             };
-            // No audit page exists at this tip (Access PR-3 adds nav key `audit`):
-            // an empty href omits the "Audit log" button.
+            // Nav-resolved: empty when no `audit` nav item exists, which omits the
+            // "Audit log" button.
+            hp.audit_href = home::resolve_links(shell::nav_groups()).audit;
             yuzu::server::home_panels::register_home_panel_routes(home_panels_sink, std::move(hp));
         }
 

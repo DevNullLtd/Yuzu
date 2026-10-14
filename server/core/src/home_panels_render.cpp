@@ -39,11 +39,11 @@ std::string note(const std::string& text, bool bad = false) {
 std::string state_note(FactState s, const std::string& securable, const char* what) {
     switch (s) {
     case FactState::Denied:
+        if (securable == kAdminOnlyNeed)
+            return note("Recent activity is shown to administrators only.");
         return note("You do not have access to this panel. It needs " + securable + ".");
     case FactState::Limited:
         return note("Fleet totals are not shown to accounts limited to a group of devices.");
-    case FactState::AdminOnly:
-        return note("Recent activity is shown to administrators only.");
     case FactState::Unavailable:
     default:
         return note(std::string("Could not read ") + what + ". This is not zero.", true);
@@ -125,7 +125,7 @@ PolicyPanel select_lowest_policies(const std::vector<Policy>& policies,
 std::string render_policies_panel(const Fact<PolicyPanel>& f, std::int64_t as_of_secs) {
     if (f.state != FactState::Ok)
         return section("home-policies", header("Compliance by policy", {}, as_of_secs),
-                       state_note(f.state, f.securable, "policy compliance"));
+                       state_note(f.state, f.need, "policy compliance"));
     const auto& p = f.value;
     if (p.enabled_total == 0)
         return section("home-policies", header("Compliance by policy", {}, as_of_secs),
@@ -179,7 +179,7 @@ std::string render_activity_panel(const Fact<std::vector<ActivityRow>>& f, std::
         head.insert(pos, btn);
     }
     if (f.state != FactState::Ok)
-        return section("home-activity", head, state_note(f.state, f.securable, "recent activity"));
+        return section("home-activity", head, state_note(f.state, f.need, "recent activity"));
     if (f.value.empty())
         return section("home-activity", head, note("No activity recorded yet."));
     std::string t = "<table class=\"tw\"><thead><tr><th>Time</th><th>Who</th><th>Action</th>"
@@ -251,7 +251,7 @@ std::string render_health_panel(const Fact<HealthPanel>& f, std::int64_t as_of_s
     if (f.state != FactState::Ok) {
         if (f.state == FactState::Unavailable)
             return section("home-health", head, note("Server health could not be read.", true));
-        return section("home-health", head, state_note(f.state, f.securable, "server health"));
+        return section("home-health", head, state_note(f.state, f.need, "server health"));
     }
     const auto& h = f.value;
     auto row = [](const std::string& k, const std::string& v) {

@@ -78,6 +78,7 @@ struct Links {
     std::string executions{"/instructions"};
     std::string devices{"/hardware"};
     std::string enrolment{"/settings#pending-section"};
+    std::string audit; ///< "" when the nav has no `audit` item (the Activity button is omitted)
 };
 
 struct SummaryView {

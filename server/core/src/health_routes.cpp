@@ -899,7 +899,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             if (deps.deny_service_scoped_fn(req, scratch, "home.fragment.access_denied",
                                             "service-scoped tokens may not read the Home health panel",
                                             "", "")) {
-                serve(Fact<HealthPanel>::of(FactState::Denied, "an interactive session"));
+                serve(Fact<HealthPanel>::with(FactState::Denied, "an interactive session"));
                 return;
             }
         }
@@ -912,7 +912,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         const bool doc_ok = doc.status == 200 || doc.status == -1;
         auto panel = doc_ok ? home_panels::parse_health_json(doc.body) : std::nullopt;
         if (!panel) {
-            serve(Fact<HealthPanel>::of(FactState::Unavailable));
+            serve(Fact<HealthPanel>::with(FactState::Unavailable));
             return;
         }
         // `agents.online` is the same unauthenticated /api/health field and is
@@ -926,7 +926,7 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!show_exec)
             panel->executions_running.reset();
-        serve(Fact<HealthPanel>::ok(std::move(*panel)));
+        serve(Fact<HealthPanel>::make_ok(std::move(*panel)));
     });
 
     // -- Health summary dashboard fragment (7.2) ----------------------------
