@@ -32,6 +32,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 
 extern const char* const kSettingsSecurityHtml;
 
@@ -525,6 +526,30 @@ TEST_CASE("Security fragments render from cfg_, escape it, and stay admin-only",
         REQUIRE(r);
         CHECK(r->status == 403);
     }
+}
+
+TEST_CASE("Security write routes refuse a non-admin and change nothing",
+          "[settings][security_page][routes]") {
+    SecurityRoutes h;
+    h.cfg.oidc_issuer = "https://before.example/";
+    h.cfg.tls_enabled = false;
+    h.is_admin = false;
+
+    const std::pair<const char*, const char*> writes[] = {
+        {"/api/settings/oidc", "issuer=https%3A%2F%2Fevil.example%2F&client_id=x&client_secret=y"},
+        {"/api/settings/oidc/test", "issuer=https%3A%2F%2Fevil.example%2F"},
+        {"/api/settings/cert-paste",
+         "type=cert&content=-----BEGIN%20X-----%0A-----END%20X-----"},
+        {"/api/settings/tls", "tls_enabled=true"},
+    };
+    for (const auto& [path, body] : writes) {
+        INFO(path);
+        auto res = h.sink.Post(path, body, kForm);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(h.cfg.oidc_issuer == "https://before.example/");
+    CHECK_FALSE(h.cfg.tls_enabled);
 }
 
 TEST_CASE("OIDC save: a missing issuer is a 400 whose message is INSIDE the fragment",

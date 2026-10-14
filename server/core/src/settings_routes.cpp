@@ -4216,7 +4216,13 @@ void SettingsRoutes::register_routes(
         // one, and it covers every other caller (PUT /api/config included).
         if (is_exactly_redaction_placeholder(client_secret))
             client_secret.clear();
-        auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
+        // Read the stored secret under the shared lock: a concurrent save writes it under the
+        // unique lock below, and an unlocked std::string read racing that write is undefined.
+        std::string effective_secret = client_secret;
+        if (effective_secret.empty()) {
+            std::shared_lock lock(*oidc_mu_);
+            effective_secret = cfg_->oidc_client_secret;
+        }
         bool skip_tls = (skip_tls_verify == "true");
 
         std::unique_ptr<oidc::OidcProvider> new_provider;
@@ -4354,10 +4360,15 @@ void SettingsRoutes::register_routes(
 
         auto issuer = extract_form_value(req.body, "issuer");
         auto skip_tls_str = extract_form_value(req.body, "skip_tls_verify");
-        bool skip_tls = (skip_tls_str == "true") || cfg_->oidc_skip_tls_verify;
-
-        if (issuer.empty())
-            issuer = cfg_->oidc_issuer;
+        bool skip_tls = (skip_tls_str == "true");
+        {
+            // Same lock as the save handler's write (oidc_mu_), so a concurrent save cannot
+            // tear the stored issuer string or the flag read here.
+            std::shared_lock lock(*oidc_mu_);
+            skip_tls = skip_tls || cfg_->oidc_skip_tls_verify;
+            if (issuer.empty())
+                issuer = cfg_->oidc_issuer;
+        }
 
         if (issuer.empty()) {
             res.set_content("<span class=\"feedback-error\">Enter an Issuer URL first.</span>",
