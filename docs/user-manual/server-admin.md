@@ -233,6 +233,27 @@ separately.
 
 ---
 
+## Settings: General page
+
+**Settings → General** (`/settings/general`, admin only; every panel it shows also stays on the
+`/settings` page).
+
+- **Appearance** holds the table-density preference (Comfortable or Compact). It is saved in this
+  browser only and applies to the Dashboard results table.
+- **Server** holds the two runtime settings that change on a running server, written through
+  `PUT /api/config/{key}`: the **agent heartbeat timeout** (`heartbeat_timeout`; seconds of silence
+  after which this server drops an agent connected directly to it) and the **log level**
+  (`log_level`). Both apply to this server process only, are stored, and are re-applied at restart;
+  the log level then wins over `--log-level`. Neither is the dashboard sign-in expiry: that is the
+  read-only **Dashboard idle timeout** (`--session-inactivity-secs`) and **Dashboard session
+  lifetime** (fixed, 8 hours) rows in the server-configuration table below the form. The audit row
+  for a runtime change is best-effort: if the audit write fails the change still applies and the
+  page shows a banner.
+- **Analytics** shows the event-collection status and the most recent buffered events (type,
+  source, severity, time; no host or user).
+
+---
+
 ## Upgrade Notes
 
 ### vNEXT - `--gateway-upstream` refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs)

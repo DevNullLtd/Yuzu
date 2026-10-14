@@ -198,7 +198,15 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get_software_versions (both already "twinned", count unchanged). The raw route's
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
-BASELINE_UNTWINNED = 199
+#
+# System "General and appearance" page: two UI-only fragments, GET
+# /fragments/settings/general-runtime (composed-of:get.api-config) and GET
+# /fragments/settings/analytics-events (composed-of:get.api-analytics-recent). Each composes an
+# existing JSON route that is itself `planned:#2146` with no REST v1 or MCP twin (the legacy
+# runtime-config and analytics routes), so there is no twin to point at and each counts as
+# untwinned. Reviewed: a fragment is UI, not a machine surface (ADR-1005 Decision 4), and the
+# routes they compose are the ledgered gap. 199 + 2 = 201, measured post-change.
+BASELINE_UNTWINNED = 201
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
