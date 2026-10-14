@@ -5048,7 +5048,7 @@ The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin r
 | `GET` | `/fragments/access/principals/list` | Engine principal list (HTMX). Administrator account role only (the same gate as the Settings panel). Writes an `engine_principal.list` audit row. |
 | `GET` | `/fragments/access/principals/detail` | One principal with its active credentials and roles (HTMX). `?id=engine:<slug>`. Same gate. Writes `engine_principal.get` and `engine_principal.role.listed` audit rows. |
 
-The principal panels, and the no-administrator check above them, are requested only when the token list shows the caller is an administrator, so other users do not generate a denied-access audit row by opening the page. The no-administrator result is a statement about the roles and grants the server could read: a role read that degrades is not distinguishable from "no roles" on that route, so the page words a clean result accordingly. Device tokens are not shown: the device token store is not constructed on this server.
+The principal panels, and the no-administrator check at the top of the principals panel (which also needs the `AuditLog:Read` permission), are requested only when the token list shows the caller is an administrator, so other users do not generate a denied-access audit row by opening the page. The no-administrator result is a statement about the roles and grants the server could read: a role read that degrades is not distinguishable from "no roles" on that route, so the page words a clean result accordingly. Device tokens are not shown on this page.
 
 ### OTA Updates
 

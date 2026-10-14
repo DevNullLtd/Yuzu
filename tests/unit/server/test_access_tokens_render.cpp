@@ -122,6 +122,12 @@ TEST_CASE("tokens render: status and type cover rotation, expiry and engine cred
         render_tokens_list(view({expired, rotating, successor, mcp, eng, scoped}, true, true), flags());
     CHECK_THAT(html, ContainsSubstring("Expired"));
     CHECK_THAT(html, ContainsSubstring("Rotating, retires"));
+    auto elapsed = tok("ovr");
+    elapsed.overlap_expires_at = kNow - 60;
+    elapsed.rotation_group = "g2";
+    const auto late = render_tokens_list(view({elapsed}), flags());
+    CHECK_THAT(late, ContainsSubstring("Overlap ended, still valid until retired"));
+    CHECK_THAT(late, !ContainsSubstring("Rotating, retires"));
     CHECK_THAT(html, ContainsSubstring("Awaiting confirmation"));
     CHECK_THAT(html, ContainsSubstring("MCP operator"));
     CHECK_THAT(html, ContainsSubstring("Engine"));
@@ -412,7 +418,37 @@ TEST_CASE("revoke detail is the newest committed revoke; a later failure's error
     AuditEvent older;
     older.result = "success";
     older.detail = "older-success";
-    CHECK(committed_revoke_detail({fail, denied, ok, older}) == "credentials_revoked=2");
+    // Newest first: the original revoke is the OLDEST success (an idempotent retry on a revoked
+    // principal writes a newer success row with credentials_revoked=0).
+    ok.detail = "credentials_revoked=0 (retry)";
+    older.detail = "credentials_revoked=2; superseded_by=engine:new";
+    CHECK(committed_revoke_detail({fail, denied, ok, older}) == "credentials_revoked=2; superseded_by=engine:new");
     CHECK(committed_revoke_detail({fail, denied}).empty());
+    CHECK(committed_revoke_detail({fail, ok}) == "credentials_revoked=0 (retry)");
     CHECK(committed_revoke_detail({}).empty());
+}
+
+TEST_CASE("every store-sourced field is escaped in every cell it reaches",
+          "[access-tokens][render]") {
+    PrincipalsView v;
+    auto gone = principal("x", "revoked");
+    gone.owner_username = kXss;
+    gone.superseded_by = kXss;
+    v.rows = {gone};
+    v.roles = std::vector<PrincipalRole>{{"engine", gone.principal_id, kXss}};
+    CHECK_THAT(render_principals_list(v), !ContainsSubstring("<img"));
+
+    PrincipalDetail d;
+    d.row = gone;
+    d.row.classification = kXss;
+    d.credentials = std::vector<ApiToken>{};
+    d.roles = std::vector<PrincipalRole>{};
+    d.revoke_detail = kXss;
+    const auto detail = render_principal_detail(d, d.row.principal_id);
+    CHECK_THAT(detail, !ContainsSubstring("<img"));
+    CHECK_THAT(detail, ContainsSubstring("&lt;img src=x onerror=1&gt;"));
+
+    auto t = tok("t1");
+    t.mcp_tier = kXss;
+    CHECK_THAT(render_tokens_list(view({t}), flags()), !ContainsSubstring("<img"));
 }

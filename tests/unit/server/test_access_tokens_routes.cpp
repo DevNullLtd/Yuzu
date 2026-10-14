@@ -348,8 +348,26 @@ TEST_CASE("principals routes: list renders, audits the twin's verb and reads onc
     CHECK_THAT(res->body, ContainsSubstring("data-count=\"1\""));
     CHECK_THAT(res->body, ContainsSubstring("Reader"));
     CHECK(h.principal_list_calls == 1);
-    CHECK(h.audit_actions == std::vector<std::string>{"engine_principal.list"});
+    // The Roles column is a bulk privilege enumeration and is audited as the REST twin does.
+    CHECK(h.audit_actions ==
+          std::vector<std::string>{"engine_principal.list", "engine_principal.role.listed"});
     CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+}
+
+TEST_CASE("principals routes: the list is newest first so the 500 cap keeps the newest",
+          "[access-tokens][routes]") {
+    Harness h;
+    h.principals = std::vector<EnginePrincipalRow>{principal("oldest"), principal("middle"),
+                                                   principal("newest")};
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/fragments/access/principals/list");
+    REQUIRE(res);
+    const auto a = res->body.find("data-principal-id=\"engine:newest\"");
+    const auto b = res->body.find("data-principal-id=\"engine:middle\"");
+    const auto c = res->body.find("data-principal-id=\"engine:oldest\"");
+    REQUIRE(a != std::string::npos);
+    CHECK(a < b);
+    CHECK(b < c);
 }
 
 TEST_CASE("principals routes: a dropped audit row sets Sec-Audit-Failed and still renders",
@@ -387,6 +405,8 @@ TEST_CASE("principals routes: unanswered stores degrade to a fixed sentence, nev
         CHECK_THAT(res->body, ContainsSubstring("Not shown"));
         CHECK_THAT(res->body, !ContainsSubstring("rbac down"));
         CHECK_THAT(res->body, !ContainsSubstring("<td>None</td>"));
+        // No role enumeration happened, so none is audited.
+        CHECK(h.audit_actions == std::vector<std::string>{"engine_principal.list"});
     }
 }
 
@@ -496,11 +516,11 @@ TEST_CASE("tokens routes: the static glue is served uncached as JavaScript",
 TEST_CASE("tokens routes: server.cpp binds the real admin gate, rbac view and checked reads",
           "[access-tokens][routes]") {
     // Every case above stubs the gate and would pass with a permissive lambda; pin the wiring.
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
     namespace fs = std::filesystem;
-    fs::path p = fs::path(__FILE__).parent_path();
-    for (int i = 0; i < 6 && !fs::exists(p / "server/core/src/server.cpp"); ++i)
-        p = p.parent_path();
-    const fs::path src = p / "server/core/src/server.cpp";
+    const fs::path src = fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp";
     REQUIRE(fs::exists(src));
     std::ifstream in(src, std::ios::binary);
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

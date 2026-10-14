@@ -9,7 +9,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <stdexcept>
+#include <variant>
 
 namespace yuzu::server {
 
@@ -120,6 +122,8 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  }
                  PrincipalsView view;
                  view.rows = std::move(*rows);
+                 // The store returns oldest first; the cap banner promises the newest.
+                 std::ranges::reverse(view.rows);
                  if (auto roles = deps.all_roles_fn(); roles)
                      view.roles = std::move(*roles);
                  else {
@@ -131,6 +135,11 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, "engine_principal.list",
                                                      "success", "EnginePrincipal", "",
                                                      "count=" + std::to_string(view.rows.size()));
+                 // The Roles column is a bulk privilege enumeration; the REST twin audits it too.
+                 if (std::holds_alternative<std::vector<PrincipalRole>>(view.roles))
+                     (void)detail::emit_behavioral_audit(
+                         deps.audit_fn, req, res, "engine_principal.role.listed", "success",
+                         "EnginePrincipal", "", "count=" + std::to_string(view.rows.size()));
                  respond_fragment(res, render_principals_list(view));
              });
 

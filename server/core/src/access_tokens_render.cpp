@@ -38,8 +38,13 @@ Status token_status(const ApiToken& t, std::int64_t now) {
         return {"bad", "Expired"};
     if (!t.supersedes_token_id.empty())
         return {"warn", "Awaiting confirmation"};
-    if (t.overlap_expires_at > 0)
+    if (t.overlap_expires_at > 0) {
+        // Validation checks only revoked and expires_at, so a predecessor stays usable after its
+        // overlap ends until the retirement sweep revokes it; say so rather than "retires <past>".
+        if (t.overlap_expires_at <= now)
+            return {"warn", "Overlap ended, still valid until retired"};
         return {"warn", "Rotating, retires " + date_cell(t.overlap_expires_at, "")};
+    }
     return {"ok", "Active"};
 }
 
@@ -106,9 +111,11 @@ bool sees_all_owners(const auth::Session& s) {
 }
 
 std::string committed_revoke_detail(const std::vector<AuditEvent>& newest_first) {
-    for (const auto& ev : newest_first)
-        if (ev.result == "success")
-            return ev.detail;
+    // The original revoke is the OLDEST success: the REST DELETE is idempotent, so a retry on an
+    // already-revoked principal writes a newer success row with `credentials_revoked=0`.
+    for (auto it = newest_first.rbegin(); it != newest_first.rend(); ++it)
+        if (it->result == "success")
+            return it->detail;
     return {};
 }
 
@@ -152,7 +159,7 @@ std::string render_tokens_list(const std::variant<TokensView, Unavailable>& v, c
                              "data-state=\"all\">Show all</button>");
         } else {
             out += empty_box(view->all_owners ? "No API tokens." : "You have no API tokens.",
-                             "Tokens are created in Settings until this page takes over actions.");
+                             "Tokens are created in Settings.");
         }
         return out + "</div>";
     }
@@ -179,8 +186,9 @@ std::string render_principals_list(const std::variant<PrincipalsView, Unavailabl
                failbox("Engine principals could not be read.", kPrincipalsUnavailable, kRetryPrincipals) +
                "</div>";
 
-    std::string out = "<div id=\"principals-root\" data-count=\"" + std::to_string(view->rows.size()) +
-                      "\">";
+    // data-count is the number of rows rendered below (the strip words it as "listed below").
+    std::string out = "<div id=\"principals-root\" data-count=\"" +
+                      std::to_string(std::min(view->rows.size(), kRenderCap)) + "\">";
     if (view->rows.empty())
         return out + empty_box("No engine principals.",
                                "Engine principals are named identities for automation and agentic workers.") +

@@ -11,7 +11,10 @@
 ///   /static/yuzu-tokens.js                 the page's client glue
 ///
 /// No mutating route is added and none is called from this page: creating, rotating and
-/// revoking stay in Settings. Gates are never wider than the REST twin (see the .cpp).
+/// revoking stay in Settings. The principal fragments use the Administrator account role
+/// (the Settings panel's gate; RBAC grants are not consulted, so this can differ from the
+/// REST twin's EnginePrincipal:Read in both directions). The all-owner token view is a
+/// cookie-session administrator view with no REST twin.
 
 #include <yuzu/server/auth.hpp>
 

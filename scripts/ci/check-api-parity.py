@@ -199,7 +199,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
 #
-# Tokens and principals page (TGN-1): re-surfaces the untwinned Settings token and principal
+# Tokens and principals page: re-surfaces the untwinned Settings token and principal
 # lists as three read-only fragments, GET /fragments/access/tokens/list, .../principals/list
 # and .../principals/detail (each planned:#2146: the REST token twin is self-scope only and the
 # principal twins sit behind EnginePrincipal:Read, where the page keeps the stricter admin gate),

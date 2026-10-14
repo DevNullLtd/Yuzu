@@ -68,12 +68,12 @@ TEST_CASE("tokens glue: every URL sink takes a fixed path, and data reaches it o
     // The one data-derived URL is the principal id, appended after '?id=' and percent-encoded;
     // the state toggle is clamped to the two literals.
     CHECK_THAT(js, ContainsSubstring("side.dataset.src + '?id=' + encodeURIComponent(id)"));
-    CHECK_THAT(js, ContainsSubstring("(b.dataset.state === 'all' ? 'all' : 'active')"));
-    // Every ajax() call site: a clamped literal, a static data-src, or the encoded id above.
-    std::size_t calls = 0;
-    for (std::size_t p = js.find("ajax("); p != std::string::npos; p = js.find("ajax(", p + 1))
-        ++calls;
-    CHECK(calls == 6);  // definition, its htmx.ajax body, 4 call sites
+    CHECK_THAT(js, ContainsSubstring("tokensState = b.dataset.state === 'all' ? 'all' : 'active';"));
+    // Retry re-sends the remembered id, also encoded; the filter is the clamped literal.
+    CHECK_THAT(js, ContainsSubstring("'?id=' + encodeURIComponent(lastPrincipalId)"));
+    CHECK_THAT(js, ContainsSubstring("TOKENS + '?state=' + tokensState"));
+    // A failed token list must not be reported as "you lack the administrator role".
+    CHECK_THAT(js, ContainsSubstring("if (!root) {"));
 }
 
 TEST_CASE("tokens glue: principals are requested only for an effective administrator",

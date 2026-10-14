@@ -17,6 +17,8 @@
   var NO_ADMIN = '/api/v1/engine-principals/audit/no-admin';
   var AUDIT_FAILED = 'An audit record for this read could not be saved. The data shown is still current.';
   var principalsAsked = false;
+  var tokensState = 'active';
+  var lastPrincipalId = '';
 
   function el(tag, cls, text) {
     var n = document.createElement(tag);
@@ -25,6 +27,13 @@
     return n;
   }
   function byId(id) { return document.getElementById(id); }
+
+  function waitBox(target) {
+    var box = el('div', 'empty');
+    box.appendChild(el('b', null, 'Waiting for the token list'));
+    box.appendChild(el('span', null, 'Principals load once the token list has loaded. Retry the token list above.'));
+    target.replaceChildren(box);
+  }
 
   function deniedBox(target) {
     var box = el('div', 'empty');
@@ -100,7 +109,7 @@
         if (d.ok && d.violations.length === 0) {
           // The auditor reports no count, so the listed total is stated as listed, not as checked.
           setNote([noteBox('No violations found in the roles and grants the server could read. ' +
-                           count + ' principals are listed below.')]);
+                           count + (count === '1' ? ' principal is' : ' principals are') + ' listed below.')]);
           return;
         }
         var box = el('div', 'failbox');
@@ -128,6 +137,12 @@
     var root = byId('tokens-root');
     var admin = root && root.dataset.effectiveAdmin === '1';
     var body = byId('principals-body');
+    // No root means the token list itself failed: whether this caller is an administrator is
+    // unknown, so do not claim they lack the role.
+    if (!root) {
+      if (body) waitBox(body);
+      return;
+    }
     if (!admin) {
       if (body) deniedBox(body);
       return;
@@ -182,18 +197,25 @@
     if (!b) return;
     var act = b.dataset.tk;
     if (act === 'tokens-state') {
-      ajax(TOKENS + '?state=' + (b.dataset.state === 'all' ? 'all' : 'active'), 'tokens-body');
+      tokensState = b.dataset.state === 'all' ? 'all' : 'active';
+      ajax(TOKENS + '?state=' + tokensState, 'tokens-body');
     } else if (act === 'principal-select') {
       var side = byId('side-principal');
       var id = b.dataset.principalId;
       if (!side || !id) return;
+      lastPrincipalId = id;
       document.querySelectorAll('#principals-body tr.sel').forEach(function (r) { r.classList.remove('sel'); });
       var row = b.closest('tr');
       if (row) row.classList.add('sel');
       ajax(side.dataset.src + '?id=' + encodeURIComponent(id), 'side-principal');
     } else if (act === 'reload') {
       var t = byId(b.dataset.target);
-      if (t && t.dataset.src) ajax(t.dataset.src, t.id);
+      if (!t || !t.dataset.src) return;
+      // Keep the caller's place: the active filter, or the selected principal.
+      if (t.id === 'tokens-body') ajax(TOKENS + '?state=' + tokensState, t.id);
+      else if (t.id === 'side-principal' && lastPrincipalId)
+        ajax(t.dataset.src + '?id=' + encodeURIComponent(lastPrincipalId), t.id);
+      else ajax(t.dataset.src, t.id);
     }
   });
 })();

@@ -15440,8 +15440,8 @@ private:
                     AuditQuery q;
                     q.target_type = "EnginePrincipal";
                     q.target_id = id;
-                    q.action_prefixes = {"engine_principal.revoke"};
-                    q.limit = 50;  // newest first; the committed revoke is picked below
+                    q.action = "engine_principal.revoke";
+                    q.limit = 200;  // newest first; the original committed revoke is picked below
                     auto events = audit_store_->query(q);
                     if (!events)
                         return std::unexpected(std::string("audit store did not answer"));
