@@ -4903,6 +4903,23 @@ void SettingsRoutes::register_routes(
             return;
         }
         if (!auth_mgr_->upsert_user(username, password, role)) {
+            // upsert_user's `false` is "too short" OR a store refusal. A password that already
+            // passed the policy was refused by the store: the name is still held by a removed
+            // (deactivated) account, or the store failed. Do not call that a weak password.
+            if (auth::check_password_policy(password) == auth::PasswordPolicyVerdict::kOk) {
+                spdlog::warn("POST /api/settings/users: create refused for '{}' "
+                             "(name held by a removed account, or the user store failed)",
+                             username);
+                audit_fn_(req, "user.create", "denied", "User", username, "create_refused");
+                const std::string msg =
+                    "The account could not be created. The name may still belong to a removed "
+                    "account, or the user store did not answer.";
+                res.status = 409;
+                res.set_header("HX-Trigger",
+                               std::format(R"({{"showToast":{{"message":"{}","level":"error"}}}})", msg));
+                res.set_content(detail::a4_error(res, msg), "application/json");
+                return;
+            }
             spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
                          "(weak_password — minimum {} bytes)",
                          username, auth::kMinPasswordBytes);

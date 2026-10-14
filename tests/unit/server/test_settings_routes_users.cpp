@@ -475,6 +475,33 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other use
     CHECK(h.has_audit("user.delete", "success", "User", "bob"));
 }
 
+TEST_CASE("SettingsRoutes POST /api/settings/users: re-creating a removed username is refused "
+          "honestly, not as a weak password",
+          "[pg][settings][users]") {
+    SettingsAdr2001Harness h;
+    REQUIRE(h.delete_user("bob")->status == 200);
+    h.audit_calls.clear();
+
+    // A policy-valid password: the store (not the policy) refuses, because the removed account's
+    // row still holds the name.
+    auto res = h.sink.Post("/api/settings/users", "username=bob&password=anotherpassword1",
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->body.find("removed account") != std::string::npos);
+    CHECK(res->body.find("at least") == std::string::npos);
+    CHECK(h.audit_detail("user.create", "denied", "bob") == "create_refused");
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
+
+    // A genuinely short password is still the weak-password answer.
+    res = h.sink.Post("/api/settings/users", "username=carol&password=short",
+                      "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("at least") != std::string::npos);
+    CHECK(h.audit_detail("user.create", "denied", "carol") == "weak_password");
+}
+
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: a null ApiTokenStore fails CLOSED "
          "(503) rather than skip-and-proceed — MUTATION-CHECK target, see the comment below",
          "[settings][users][adr2001][failclosed]") {
