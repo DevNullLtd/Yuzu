@@ -1350,7 +1350,7 @@ is configured (DEX → Alerts tab; `runtime_config` key
 | `yuzu_fleet_perf_cohort_reporting{cohort}` | gauge | Reporting devices per exported cohort |
 | `yuzu_fleet_perf_cohort_clipped` | gauge | Exportable cohorts dropped by the top-50 cardinality cap (a measured 0 when nothing was cut; **absent when the export is off** — use this gauge, not `absent()` on the cohort families, as the export-liveness probe) |
 
-Cohorts under 10 reporting devices and cohorts beyond the top-50-by-population
+Empty cohorts (the one-device floor) and cohorts beyond the top-50-by-population
 cap never export; devices without the key export as `cohort="(untagged)"`.
 Families clear on every sweep — series go absent, never stale. Alerting
 recipe: `max_over_time(yuzu_fleet_perf_cohort_clipped[1m])` for liveness,

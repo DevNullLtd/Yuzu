@@ -4,13 +4,13 @@
 /// Core-only JSON helpers shared by the DEX read-model serializers, so the
 /// per-version join and the application list publish one interval shape.
 
-#include "dex_stats.hpp"
-
-#include <nlohmann/json.hpp>
-
 #include <cmath>
 #include <cstdint>
 #include <optional>
+
+#include <nlohmann/json.hpp>
+
+#include "dex_stats.hpp"
 
 namespace yuzu::server::dex_json_detail {
 

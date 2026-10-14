@@ -1389,7 +1389,7 @@ Server-side N-distinct-device incident detector (`server/core/src/dex_blast_radi
 
 Cohort-floor suppression on fleet/group app-perf reads (the floor is one device since the maintainer ruling of 2026-10-14: a single-device point is published as a fleet-wide aggregate by application and version with no `agent_id`; only an empty point is suppressed) and audit-on-open per-device lenses (§21.6). *(Referenced from `docs/yuzu-guardian-design-v1.1.md` §24 invariants cited in `CLAUDE.md`; not independently re-derived this session.)*
 
-### 32.7 Experience Scoring and Sentiment :x: `T3` *(verified 2026-09-07)*
+### 32.7 Experience Scoring and Sentiment :large_orange_diamond: `T3` *(verified 2026-10-14)*
 
 Partly implemented — deliberately narrow. A transparent, decomposed secondary composite (0-100 stability score with its named deductions) is published beside the measured rates and intervals on `GET /api/v1/dex/apps` / `list_dex_apps`; nothing in the product acts on it. Opaque composite experience scores and sentiment scoring (which would additionally need the §14.4 survey primitive as an input) remain out.
 

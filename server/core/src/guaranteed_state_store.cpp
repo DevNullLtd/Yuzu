@@ -1255,7 +1255,8 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
             // d: per (subject, version, device). top: membership of the top
             // applications (the dex_top_apps ranking). ad: per (subject,
             // device) across versions, so a device in two versions counts
-            // once in the application total. tot + vc + ver are UNIONed.
+            // once in the application total. The application rows (ad JOIN vc) and
+            // the capped version rows (ranked, rn <= $4) are UNIONed.
             pg::PgResult res = pg::exec_params(
                 conn,
                 "WITH d AS ("

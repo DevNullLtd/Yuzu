@@ -174,18 +174,12 @@ TEST_CASE("apps model: a per-image override changes one application's band only"
     }
 }
 
-TEST_CASE("apps builder: an invalid policy or a null store degrades, never scores", "[dex][apps_model]") {
-    DexScorePolicy bad;
-    DexScoreOverride o;
-    o.image = "dup.exe";
-    bad.overrides = {o, o};
-    REQUIRE(dex_score_policy_fault(bad));
-    const auto a = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z", 50, bad);
-    CHECK(a.degraded);
-    CHECK(a.apps.empty());
-    const auto b = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z", 50, def());
-    CHECK(b.degraded);
-    CHECK(b.apps.empty());
+// The invalid-policy arm needs an open store to discriminate, so it lives in
+// test_dex_api.cpp; a null store degrades regardless of the policy.
+TEST_CASE("apps builder: a null store degrades, never scores", "[dex][apps_model]") {
+    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z", 50, def());
+    CHECK(m.degraded);
+    CHECK(m.apps.empty());
 }
 
 TEST_CASE("apps json: exact golden for the unknown-population model", "[dex][apps_model]") {

@@ -145,9 +145,9 @@ server-side series store).
   key from the selector — e.g. an `image` key compares a vanilla VDI image
   against a layered one on identical hardware). Cohorts come from tags, not
   from a central inventory column: tag the fleet via the tag API (see the
-  asset-tagging guide) and the comparison appears. Honesty rules: cohorts
-  under **10 reporting devices** show "n too small" instead of noisy
-  percentiles, and devices without the chosen key always appear as an explicit
+  asset-tagging guide) and the comparison appears. Honesty rules: the one-device floor
+  means a cohort is published whenever at least one device reported (only an empty
+  cohort shows "n too small"), and devices without the chosen key always appear as an explicit
   **(untagged)** residual row.
 - **Everything drills.** Each metric card opens the worst devices by that
   metric; the Reporting card opens the devices *not* reporting; each cohort
@@ -616,8 +616,8 @@ key:
 | `yuzu_fleet_perf_cohort_reporting{cohort}` | reporting devices per exported cohort |
 | `yuzu_fleet_perf_cohort_clipped` | exportable cohorts dropped by the cardinality cap (a measured 0 when nothing was cut; absent when the export is off) |
 
-Cardinality is bounded by design: only cohorts with **≥ 10 reporting devices**
-export, capped at the **top 50 by population**, and clipping is visible via
+Cardinality is bounded by design: only cohorts with **at least one reporting device**
+export (the one-device floor: an empty cohort is withheld), capped at the **top 50 by population**, and clipping is visible via
 the `_clipped` gauge rather than silent. Devices without the key export as
 `cohort="(untagged)"`. The export refreshes on the same sweep — and through
 the same validation — as the fleet gauges, so Grafana, the REST API and the

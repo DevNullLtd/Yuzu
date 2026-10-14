@@ -2454,7 +2454,16 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
     // A2 discovery: the per-device DEX endpoint is enumerable from the live server.
     REQUIRE(res->body.find(R"("/dex/devices/{id}":)") != std::string::npos);
     // And the embedded spec remains valid JSON after the insertion.
-    REQUIRE_NOTHROW(nlohmann::json::parse(res->body));
+    nlohmann::json spec;
+    REQUIRE_NOTHROW(spec = nlohmann::json::parse(res->body));
+    // The Apps list is enumerable with its success shape and its degrade response.
+    REQUIRE(spec["paths"].contains("/dex/apps"));
+    const auto& apps_rsp = spec["paths"]["/dex/apps"]["get"]["responses"];
+    REQUIRE(apps_rsp.contains("200"));
+    REQUIRE(apps_rsp.contains("503"));
+    const auto desc = apps_rsp["200"]["description"].get<std::string>();
+    CHECK(desc.find("versions_truncated") != std::string::npos);
+    CHECK(desc.find("population_basis") != std::string::npos);
 }
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ═══
@@ -2614,6 +2623,19 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
         CHECK(first.contains(k));
     CHECK(first["versions"].is_array());
     CHECK(res->body.find("below_floor") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not a 503",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["apps"].is_array());
+    CHECK(j["data"]["apps"].empty());
+    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(res->body.find("retry_after_ms") == std::string::npos);
 }
 
 TEST_CASE("REST dex/apps: a degraded store read -> 503 with retry_after_ms, never an empty list",

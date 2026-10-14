@@ -179,14 +179,14 @@ std::string dex_app_json(const DexAppModel& model, bool audit_persisted) {
 
 namespace {
 
-DexStabilityFigures apps_figures(int64_t crashes, int64_t hangs, int64_t affected, int64_t capped_crashes,
-                                 int64_t capped_hangs, const std::string& last_seen,
-                                 std::optional<int64_t> population, const DexEffectivePolicy& eff) {
+DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int64_t> population,
+                                 const DexEffectivePolicy& eff) {
+    const int64_t crashes = r.crashes, hangs = r.hangs, affected = r.affected_devices;
     DexStabilityFigures f;
     f.crashes = crashes;
     f.hangs = hangs;
     f.distinct_devices = affected;
-    f.last_seen = last_seen;
+    f.last_seen = r.last_seen;
     // An unknown or zero population, or affected > population, is a refusal
     // (null share / rate), not a failure.
     if (population && *population > 0) {
@@ -198,12 +198,14 @@ DexStabilityFigures apps_figures(int64_t crashes, int64_t hangs, int64_t affecte
     StabilityInputs in;
     in.reporting_devices = population.value_or(0);
     in.devices_affected = affected;
-    in.crash_events = capped_crashes;
-    in.hang_events = capped_hangs;
+    in.crash_events = r.capped_crashes;
+    in.hang_events = r.capped_hangs;
     // The one cohort floor (one device, maintainer ruling 2026-10-14): every
     // figure is published at any device count; reporting <= 0 withholds
     // no_population. The regression term is not assessed here (no sampled
-    // exposure per version).
+    // exposure per version). kDexCohortFloor rather than 0 on purpose: at one
+    // device below_floor is unreachable here (no_population is checked first),
+    // and any later floor change reaches this read through the one constant.
     f.score = dex_score_under_policy(in, kDexCohortFloor, eff);
     return f;
 }
@@ -245,8 +247,7 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
         const DexEffectivePolicy eff = resolve_dex_score_policy(policy, r.subject);
         DexAppStability a;
         a.subject = r.subject;
-        a.figures = apps_figures(r.crashes, r.hangs, r.affected_devices, r.capped_crashes,
-                                 r.capped_hangs, r.last_seen, population, eff);
+        a.figures = apps_figures(r, population, eff);
         a.version_count = r.version_count;
         a.versions_truncated = r.version_count > kDexAppsVersionCap;
         index[a.subject] = m.apps.size();
@@ -261,8 +262,7 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
         const DexEffectivePolicy eff = resolve_dex_score_policy(policy, r.subject);
         DexAppVersionStability v;
         v.version = *r.version;
-        v.figures = apps_figures(r.crashes, r.hangs, r.affected_devices, r.capped_crashes,
-                                 r.capped_hangs, r.last_seen, population, eff);
+        v.figures = apps_figures(r, population, eff);
         m.apps[it->second].versions.push_back(std::move(v));
     }
     std::stable_sort(m.apps.begin(), m.apps.end(), [](const DexAppStability& x, const DexAppStability& y) {

@@ -110,7 +110,8 @@ struct DexAppModel {
 /// (`build_dex_app_model` — the store-reaching builder — is in `dex_read_builders.hpp`.)
 std::string dex_app_json(const DexAppModel& model, bool audit_persisted = true);
 
-// ── New twin #2: app-centric stability list (/fragments/dex/apps, GET /api/v1/dex/apps) ──
+// ── New twin #2: app-centric stability list (GET /api/v1/dex/apps, MCP list_dex_apps; the
+// /fragments/dex/apps tab still reads dex_top_apps until it is rewired) ──
 
 /// Figures published for one application or one version of it. Counts are
 /// Windows-scoped so they match the population (devices online now).

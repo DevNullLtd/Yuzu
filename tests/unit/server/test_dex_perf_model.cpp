@@ -5,7 +5,7 @@
  *    latency, nullopt on inf/nan/negative/garbage) + the nearest-rank pin
  *    (n=2 → p90 = MAX, the A4 grill fix — shared with recompute_metrics).
  *  - fleet_now: absent-not-zero (no reporters → nullopt stats, never 0).
- *  - cohorts: n≥10 floor suppression, "(untagged)" residual sorts last,
+ *  - cohorts: empty-cohort suppression at the one-device floor, "(untagged)" residual sorts last,
  *    population-descending order.
  *  - device_list: worst-first sort, not-reporting complement (Windows only),
  *    cohort filter incl. the untagged residual, limit cap.

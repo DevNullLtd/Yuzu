@@ -8349,6 +8349,33 @@ TEST_CASE("MCP DEX: get_dex_catalogue is listed with schemas", "[mcp][dex]") {
     CHECK(found);
 }
 
+// list_dex_apps' outputSchema is machine metadata: pin the required keys and the
+// nullable population, and that each row and version carry the additive figures.
+TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    bool found = false;
+    for (const auto& t : tools) {
+        if (t["name"] != "list_dex_apps")
+            continue;
+        found = true;
+        REQUIRE(t.contains("outputSchema"));
+        const auto& out = t["outputSchema"];
+        CHECK(out["required"] ==
+              nlohmann::json::array({"window", "apps", "population", "population_basis"}));
+        CHECK(out["properties"]["population"]["type"] == nlohmann::json::array({"integer", "null"}));
+        const auto& row = out["properties"]["apps"]["items"]["properties"];
+        for (const char* k : {"share_affected", "rate_per_1000", "score", "versions", "version_count",
+                              "versions_truncated"})
+            CHECK(row.contains(k));
+        CHECK(row["versions"]["items"]["properties"].contains("version"));
+    }
+    CHECK(found);
+}
+
 TEST_CASE("MCP DEX: get_dex_health suppressed with no reporting agents, real fleet -> real score",
           "[pg][mcp][integration][dex]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);

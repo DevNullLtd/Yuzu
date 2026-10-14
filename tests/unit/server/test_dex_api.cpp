@@ -27,6 +27,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -69,7 +70,7 @@ void seed_crash(GuaranteedStateStore& store, const std::string& id, const std::s
 // Like seed_crash, but any observation type and a reported app file version.
 void seed_obs_v(GuaranteedStateStore& store, const std::string& id, const std::string& agent,
                 const std::string& proc, const std::string& type, const std::string& version,
-                const std::string& ts) {
+                const std::string& ts, const std::string& platform = "windows") {
     GuaranteedStateEventRow e;
     e.event_id = id;
     e.rule_id = "__observation__";
@@ -77,7 +78,7 @@ void seed_obs_v(GuaranteedStateStore& store, const std::string& id, const std::s
     e.event_type = type;
     e.severity = "info";
     e.detail_json = "{\"subject\":\"" + proc + "\",\"reason\":\"0xC0000005\",\"symbolic\":"
-                    "\"ACCESS_VIOLATION\",\"component\":\"ntdll.dll\",\"platform\":\"windows\","
+                    "\"ACCESS_VIOLATION\",\"component\":\"ntdll.dll\",\"platform\":\"" + platform + "\","
                     "\"version\":\"" + version + "\"}";
     e.timestamp = ts;
     REQUIRE(store.insert_event(e));
@@ -440,4 +441,130 @@ TEST_CASE("DexApi: apps caps versions at 20 and flags it", "[pg][dex][apps_model
     REQUIRE(m.apps[0].versions.size() == 20);
     for (std::size_t i = 0; i < 20; ++i)
         CHECK(m.apps[0].versions[i].version == versions[i]);
+}
+
+namespace {
+// 20 Windows devices online: the population every Apps case below uses.
+yuzu::server::DexFleet fleet20() {
+    yuzu::server::DexFleet f;
+    f.windows_online = 20;
+    return f;
+}
+} // namespace
+
+// The injected score policy reaches the Apps read: a valid override moves one
+// application's (and its version's) band; an invalid one degrades the whole read
+// with the store open, so the policy branch (not the null-store one) decides.
+TEST_CASE("DexApi: apps uses the injected score policy, and an invalid one degrades",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    using yuzu::server::StabilityBand;
+
+    // Default edges: app.exe scores 86.12 (Good, edge 90), its 2.0.0.0 scores 89.6.
+    const auto base = make_local_dex_api(&store, fleet20)->apps("7d");
+    REQUIRE(base.apps.size() == 2);
+    REQUIRE(base.apps[0].figures.score.band);
+    CHECK(*base.apps[0].figures.score.band == StabilityBand::Good);
+
+    auto lowered = [] {
+        yuzu::server::DexScorePolicy p;
+        yuzu::server::DexScoreOverride o;
+        o.image = "app.exe";
+        o.excellent = 80.0;
+        p.overrides.push_back(o);
+        return p;
+    };
+    REQUIRE_FALSE(yuzu::server::dex_score_policy_fault(lowered()));
+    const auto m = make_local_dex_api(&store, fleet20, lowered)->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    REQUIRE(m.apps.size() == 2);
+    REQUIRE(m.apps[0].figures.score.band);
+    CHECK(*m.apps[0].figures.score.band == StabilityBand::Excellent);
+    REQUIRE(m.apps[0].versions.size() == 2);
+    REQUIRE(m.apps[0].versions[0].figures.score.band);
+    CHECK(*m.apps[0].versions[0].figures.score.band == StabilityBand::Excellent);
+    // The override is per image: aardvark.exe keeps the default edges.
+    REQUIRE(m.apps[1].figures.score.band);
+    CHECK(*m.apps[1].figures.score.band == *base.apps[1].figures.score.band);
+
+    auto duplicated = [] {
+        yuzu::server::DexScorePolicy p;
+        yuzu::server::DexScoreOverride o;
+        o.image = "dup.exe";
+        p.overrides = {o, o};
+        return p;
+    };
+    REQUIRE(yuzu::server::dex_score_policy_fault(duplicated()));
+    const auto bad = make_local_dex_api(&store, fleet20, duplicated)->apps("7d");
+    CHECK(bad.degraded);
+    CHECK(bad.apps.empty());
+}
+
+// Counts are Windows-scoped: Linux and macOS rows never reach the numerator, and
+// a subject seen only off Windows is not listed at all.
+TEST_CASE("DexApi: apps counts Windows rows only", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    seed_obs_v(store, "lx1", "a9", "app.exe", "process.crashed", "1.0.0.0", kTs, "linux");
+    seed_obs_v(store, "lx2", "a9", "app.exe", "process.crashed", "3.0.0.0", kTs, "linux");
+    for (int i = 1; i <= 3; ++i)
+        seed_obs_v(store, "mc" + std::to_string(i), "m1", "linux-only.exe", "process.crashed", "1.0",
+                   kTs, "macos");
+    const auto m = make_local_dex_api(&store, fleet20)->apps("7d");
+    REQUIRE(m.apps.size() == 2);
+    CHECK(m.apps[0].subject == "app.exe");
+    CHECK(m.apps[1].subject == "aardvark.exe");
+    CHECK(m.apps[0].figures.crashes == 10);
+    CHECK(m.apps[0].figures.hangs == 1);
+    CHECK(m.apps[0].figures.distinct_devices == 4);
+    CHECK(m.apps[0].version_count == 2);
+}
+
+// 102 subjects: the top 100 by activity are kept, ties fall to subject order, and
+// the cut is made on activity rank, not on name.
+TEST_CASE("DexApi: apps keeps the top 100 applications by activity", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int n = 0;
+    auto crashes = [&](const std::string& subject, int count) {
+        for (int i = 0; i < count; ++i)
+            seed_obs_v(store, "cap" + std::to_string(++n), "d" + subject, subject, "process.crashed",
+                       "1.0", kTs);
+    };
+    crashes("zz-top.exe", 3);  // most active, lexically last
+    crashes("a-least.exe", 1); // least active, lexically first
+    for (int i = 1; i <= 100; ++i) {
+        char name[16];
+        std::snprintf(name, sizeof name, "m%03d.exe", i);
+        crashes(name, 2); // a 100-wide tie that spans the cut
+    }
+    const auto m = make_local_dex_api(&store, fleet20)->apps("7d");
+    REQUIRE_FALSE(m.degraded);
+    REQUIRE(m.apps.size() == static_cast<std::size_t>(yuzu::server::kDexAppsLimit));
+    CHECK(m.apps.front().subject == "zz-top.exe");
+    CHECK(m.apps.back().subject == "m099.exe");
+    for (const auto& a : m.apps) {
+        CHECK(a.subject != "a-least.exe");
+        CHECK(a.subject != "m100.exe");
+    }
+}
+
+// An intact store with no observations is a successful empty read, not a degrade.
+TEST_CASE("DexApi: apps on an intact empty store is a healthy empty list", "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    const auto m = make_local_dex_api(&store, {})->apps("7d");
+    CHECK_FALSE(m.degraded);
+    CHECK(m.apps.empty());
 }
