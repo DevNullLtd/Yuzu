@@ -1738,6 +1738,7 @@ if build_server
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_settings_security_ui.cpp', # Security and sign-in page: pure panel renderers + page pins + no-PG route cases
       'unit/server/test_nav_shells.cpp',            # app shell: nav model, renderer, marker swap, per-page active item
       'unit/server/test_integrations_panels.cpp',   # System Integrations: MCP/Gateway panels, MCP form parser + POST handler
       'unit/server/test_integrations_page.cpp',     # System Integrations: page route, page + script pins
