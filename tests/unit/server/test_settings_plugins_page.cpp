@@ -12,8 +12,10 @@
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "plugin_config_store.hpp"
+#include "product_pack_store.hpp"
 #include "rbac_store.hpp"
 #include "settings_plugins_routes.hpp"
+#include "settings_routes.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -24,6 +26,9 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -410,4 +415,161 @@ TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are
     REQUIRE(bad);
     CHECK_THAT(bad->body, ContainsSubstring("is not valid"));
     CHECK_FALSE(has(bad->body, "<script>"));
+}
+
+// ── Product packs: the ready path through the route (live ProductPackStore) ─────────────────
+
+namespace {
+
+// Identical setup and key to test_product_pack_store.cpp: the registry's replay check needs it.
+yuzu::test::PgTestTemplate plug_page_packs_tpl{"productpackstore", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ProductPackStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("product_pack_store template: store failed to migrate");
+}};
+
+std::string pack_yaml(const std::string& name) {
+    return "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: " + name +
+           "\nversion: 1.0.0\ndescription: pack " + name +
+           "\n---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nname: item-" + name +
+           "\n";
+}
+
+} // namespace
+
+TEST_CASE("product-packs fragment: live packs are mapped and the first-N banner is exact",
+          "[pg][plugins_page][plugins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plug_page_packs_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+    auto install_fn = [](const std::string&, const std::string& name)
+        -> std::expected<std::string, std::string> { return "id-" + name; };
+    REQUIRE(store.install(pack_yaml("alpha"), install_fn).has_value());
+
+    Harness h;
+    settings_plugins::Deps deps;
+    deps.pack_store = &store;
+    h.wire(std::move(deps));
+
+    auto one = h.sink.Get("/fragments/settings/product-packs");
+    REQUIRE(one);
+    CHECK(one->status == 200);
+    CHECK_THAT(one->body, ContainsSubstring("<b>alpha</b>"));
+    CHECK_THAT(one->body, ContainsSubstring("<code>1.0.0</code>"));
+    CHECK_THAT(one->body, ContainsSubstring("1 item"));
+    CHECK_THAT(one->body, ContainsSubstring("Unsigned"));
+    CHECK_THAT(one->body, ContainsSubstring("/api/v1/product-packs/"));
+    CHECK_FALSE(has(one->body, "shown. Page through the rest"));
+
+    // 101 packs: exactly one more than the 100 shown, so the banner appears.
+    for (int i = 0; i < 100; ++i)
+        REQUIRE(store.install(pack_yaml("bulk" + std::to_string(i)), install_fn).has_value());
+    auto many = h.sink.Get("/fragments/settings/product-packs");
+    REQUIRE(many);
+    CHECK_THAT(many->body, ContainsSubstring("First 100 shown. Page through the rest"));
+    CHECK(count_of(many->body, "<details>") == 100);
+}
+
+// ── Plugin signing panel: every state of the three edited behaviours ────────────────────────
+
+namespace {
+
+plugin_signing::TrustBundleStats bundle_of(int certs, std::size_t subjects) {
+    plugin_signing::TrustBundleStats b;
+    b.cert_count = certs;
+    b.sha256_hex = std::string(64, 'a');
+    for (std::size_t i = 0; i < subjects; ++i)
+        b.subjects.push_back("CN=signer" + std::to_string(i));
+    return b;
+}
+
+std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>> some(
+    plugin_signing::TrustBundleStats b) {
+    return std::expected<plugin_signing::TrustBundleStats, std::string>(std::move(b));
+}
+
+/// The opening tag of the first <form> whose hx-post targets `path`.
+std::string form_tag(const std::string& html, const std::string& path) {
+    const auto at = html.find("hx-post=\"" + path + "\"");
+    if (at == std::string::npos)
+        return {};
+    const auto open = html.rfind("<form", at);
+    return html.substr(open, html.find('>', at) - open + 1);
+}
+
+} // namespace
+
+TEST_CASE("plugin signing panel: a truncated subject list says first N of M",
+          "[plugins_page][plugins][signing]") {
+    auto capped = render_plugin_signing_panel(some(bundle_of(40, 16)), false, false);
+    CHECK_THAT(capped, ContainsSubstring("Subjects (first 16 of 40)"));
+    auto whole = render_plugin_signing_panel(some(bundle_of(3, 3)), false, false);
+    CHECK_THAT(whole, ContainsSubstring("<label>Subjects</label>"));
+    CHECK_FALSE(has(whole, "Subjects (first"));
+}
+
+TEST_CASE("plugin signing panel: replacing a bundle asks, a first upload does not",
+          "[plugins_page][plugins][signing]") {
+    auto none = render_plugin_signing_panel(std::nullopt, false, false);
+    const auto first = form_tag(none, "/api/settings/plugin-signing/upload");
+    REQUIRE_FALSE(first.empty());
+    CHECK_FALSE(has(first, "hx-confirm"));
+    CHECK_FALSE(has(none, "/api/settings/plugin-signing/require"));
+
+    auto have = render_plugin_signing_panel(some(bundle_of(2, 2)), false, false);
+    const auto replace = form_tag(have, "/api/settings/plugin-signing/upload");
+    CHECK_THAT(replace, ContainsSubstring("hx-confirm=\"Replace the trust bundle (2 certificate(s), "
+                                          "SHA-256 " + std::string(64, 'a') + ")?"));
+}
+
+TEST_CASE("plugin signing panel: the require save confirms only when it can turn the flag on",
+          "[plugins_page][plugins][signing]") {
+    auto off = render_plugin_signing_panel(some(bundle_of(2, 2)), false, false);
+    const auto off_form = form_tag(off, "/api/settings/plugin-signing/require");
+    REQUIRE_FALSE(off_form.empty());
+    CHECK_THAT(off_form, ContainsSubstring("hx-confirm=\"Save this setting? If Require signed "
+                                           "plugins is ticked:"));
+    CHECK_FALSE(has(off, " checked"));
+
+    auto on = render_plugin_signing_panel(some(bundle_of(2, 2)), true, false);
+    const auto on_form = form_tag(on, "/api/settings/plugin-signing/require");
+    REQUIRE_FALSE(on_form.empty());
+    CHECK_FALSE(has(on_form, "hx-confirm"));
+    CHECK_THAT(on, ContainsSubstring(" checked"));
+    // Both states say where enforcement lives: the agent, not this server.
+    for (const auto& html : {off, on})
+        CHECK_THAT(squash(html), ContainsSubstring("Each agent enforces its own"));
+
+    // An unreadable flag shows no write control at all.
+    auto unknown = render_plugin_signing_panel(some(bundle_of(2, 2)), false, true);
+    CHECK_FALSE(has(unknown, "/api/settings/plugin-signing/require"));
+}
+
+// ── Production wiring ───────────────────────────────────────────────────────
+
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+
+TEST_CASE("plugins page: the shipped server registers the page and its fragments",
+          "[plugins_page][plugins]") {
+    // The route tests above register the helper straight onto a TestRouteSink, so deleting
+    // the production call would leave them green and ship a Settings nav entry that 404s.
+    // Same source-scan precedent as test_body_cap_route_inventory.cpp.
+    std::ifstream f(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(f);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    CHECK(has(ss.str(), "settings_plugins::register_settings_plugins_routes("));
+    // And the helper itself serves exactly the page plus the three new fragments.
+    std::ifstream r(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "settings_plugins_routes.cpp");
+    REQUIRE(r);
+    std::stringstream rs;
+    rs << r.rdbuf();
+    for (const char* path : {"/settings/plugins", "/fragments/settings/plugin-config",
+                             "/fragments/settings/kill-switch", "/fragments/settings/product-packs"})
+        CHECK(has(rs.str(), std::string("sink.Get(\"") + path + "\""));
 }

@@ -552,7 +552,7 @@ TEST_CASE("update package rows encode each path part, and offer no action for an
 // blank value is read as 100 by the handler), no inline handler, percent-encoded package
 // URLs, and the data-* the page's confirm listener reads.
 
-TEST_CASE("updates fragment: rollout is a required number input, prefilled, with no inline handler",
+TEST_CASE("updates fragment: rollout is a required whole-number input, prefilled, with no inline handler",
           "[ota][settings_routes][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
     OtaAuditHarness h{db.dsn()};
@@ -562,8 +562,8 @@ TEST_CASE("updates fragment: rollout is a required number input, prefilled, with
     REQUIRE(res);
     REQUIRE(res->status == 200);
     const auto& b = res->body;
-    CHECK(b.find("<input type=\"number\" name=\"rollout_pct\" min=\"0\" max=\"100\" step=\"1\" "
-                 "required value=\"37\"") != std::string::npos);
+    CHECK(b.find("<input type=\"text\" inputmode=\"numeric\" name=\"rollout_pct\" "
+                 "pattern=\"(100|[1-9]?[0-9])\" required value=\"37\"") != std::string::npos);
     CHECK(b.find("type=\"range\"") == std::string::npos);
     CHECK(b.find("onchange=") == std::string::npos);
     CHECK(b.find("hx-on") == std::string::npos);
@@ -573,9 +573,15 @@ TEST_CASE("updates fragment: rollout is a required number input, prefilled, with
     CHECK(b.find("data-signed=\"no\"") != std::string::npos);
     CHECK(b.find("<tr data-platform=\"linux\" data-arch=\"x86_64\" data-version=\"1.2.3\" "
                  "data-rollout=\"37\">") != std::string::npos);
+    // The operator guidance the edit added: what names the version, the signature limits, and
+    // what a rollout percentage means.
+    CHECK(b.find("The file name becomes the version.") != std::string::npos);
+    CHECK(b.find("PEM CMS block, up to 64 KB.") != std::string::npos);
+    CHECK(b.find("chosen by device identity") != std::string::npos);
     // The upload form asks for confirmation too, and its rollout cannot be blank.
     CHECK(b.find("data-confirm=\"ota-upload\"") != std::string::npos);
-    CHECK(b.find("name=\"rollout_pct\" min=\"0\" max=\"100\" step=\"1\" required value=\"100\"") !=
+    CHECK(b.find("inputmode=\"numeric\" name=\"rollout_pct\" pattern=\"(100|[1-9]?[0-9])\" required "
+                 "value=\"100\"") !=
           std::string::npos);
 }
 
@@ -630,6 +636,13 @@ TEST_CASE("updates fragment: an encoded package URL reaches the handler decoded,
     const int port = svr.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
     std::thread t([&svr] { svr.listen_after_bind(); });
+    // A failing REQUIRE below throws; the guard stops and joins so it reports red instead of
+    // terminating the whole test binary on a joinable thread.
+    yuzu::test::ScopeExit stop_server{[&] {
+        svr.stop();
+        if (t.joinable())
+            t.join();
+    }};
     svr.wait_until_ready();
 
     httplib::Client cli("127.0.0.1", port);
@@ -652,7 +665,4 @@ TEST_CASE("updates fragment: an encoded package URL reaches the handler decoded,
     CHECK(h.registry->list_packages().empty());
     CHECK(h.audited.back().action == "ota.package.deleted");
     CHECK(h.audited.back().target_id == "linux/x86_64/1.2#3?x%y z");
-
-    svr.stop();
-    t.join();
 }
