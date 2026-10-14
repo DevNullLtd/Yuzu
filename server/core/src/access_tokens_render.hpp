@@ -61,7 +61,6 @@ struct PageFlags {
 
 struct TokensView {
     std::vector<ApiToken> rows;  ///< store order (newest first)
-    std::string caller;          ///< session username
     bool all_owners{false};      ///< true when rows span every owner
     bool show_all{false};        ///< "All" toggle; false = active only
 };

@@ -39,7 +39,6 @@ ApiToken tok(std::string id, std::string name = "ci", std::string owner = "alice
 TokensView view(std::vector<ApiToken> rows, bool all_owners = true, bool show_all = false) {
     TokensView v;
     v.rows = std::move(rows);
-    v.caller = "alice";
     v.all_owners = all_owners;
     v.show_all = show_all;
     return v;

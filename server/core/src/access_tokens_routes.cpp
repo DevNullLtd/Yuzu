@@ -103,7 +103,6 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  }
                  TokensView view;
                  view.rows = std::move(*rows);
-                 view.caller = session->username;
                  view.all_owners = all_owners;
                  view.show_all = req.get_param_value("state") == "all";  // anything else = active
                  respond_fragment(res, render_tokens_list(view, flags));
