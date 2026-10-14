@@ -574,30 +574,105 @@ class AssertGatewayTests(unittest.TestCase):
                         self.assertIn('runner.temp', cache)
         self.assertEqual(legs, {'linux'})
 
+    @staticmethod
+    def _macos_erlang_step_problems(step):
+        """Problems in the macOS 'Install Erlang/OTP and rebar3' step, [] when clean.
+
+        The step installs a prebuilt OTP + rebar3 into RUNNER_TEMP instead of
+        erlef/setup-beam, whose rmRF + re-copy of the tool cache both BigMags agents
+        share raced. What makes that substitute safe, and so what is pinned here: no
+        action, no tool cache, every download verified against a pinned SHA-256 BEFORE
+        anything else reads it (rebar3 has no upstream attestation, so its hash IS
+        its only integrity control). Matching is on comment-stripped lines, so a
+        commented-out verify does not count; whole-line comments only, which is the
+        only comment form the step uses.
+        """
+        problems = []
+        if 'uses' in step:
+            problems.append('step must be a run: step, not an action')
+        env, run = step.get('env') or {}, str(step.get('run') or '')
+        if not re.match(r'^\d+\.\d+', str(env.get('OTP_VERSION'))):
+            problems.append('OTP_VERSION missing')
+        for var in ('OTP_SHA256', 'REBAR3_SHA256'):
+            if not re.fullmatch(r'[0-9a-f]{64}', str(env.get(var))):
+                problems.append(var + ' is not a 64-hex pin')
+        code = [ln for ln in run.splitlines() if ln.strip() and not ln.lstrip().startswith('#')]
+        text = '\n'.join(code)
+        if not any(re.fullmatch(r'\s*set -euo pipefail\s*', ln) for ln in code):
+            problems.append('set -euo pipefail missing')
+        if '$RUNNER_TEMP' not in text:
+            problems.append('install root is not under $RUNNER_TEMP')
+        if 'tool_cache' in text.lower() or 'tool_cache' in str(env).lower():
+            problems.append('step touches the tool cache')
+        if 'openssl dgst -sha256' not in text or 'test "$got" = "$1"' not in text:
+            problems.append('verify() no longer compares a computed sha256')
+        fetches = [(i, m.group(1)) for i, ln in enumerate(code)
+                   for m in [re.fullmatch(r'\s*fetch "[^"]+" "([^"]+)" \d+\s*', ln)] if m]
+        verifies = {m.group(2): (i, m.group(1)) for i, ln in enumerate(code)
+                    for m in [re.fullmatch(r'\s*verify "\$(OTP_SHA256|REBAR3_SHA256)" "([^"]+)"\s*', ln)] if m}
+        if sorted(v for _, v in verifies.values()) != ['OTP_SHA256', 'REBAR3_SHA256']:
+            problems.append('each of OTP_SHA256 and REBAR3_SHA256 must be verified exactly once')
+        if len(fetches) != 2:
+            problems.append('expected exactly two fetch calls, found %d' % len(fetches))
+        for fi, dest in fetches:
+            if dest not in verifies:
+                problems.append('download %s is never verified' % dest)
+                continue
+            vi = verifies[dest][0]
+            first_use = next((i for i in range(fi + 1, len(code)) if dest in code[i]), None)
+            if vi != first_use:
+                problems.append('%s is used before it is verified' % dest)
+        return problems
+
     def test_ci_macos_erlang_step_is_hash_pinned_and_not_setup_beam(self):
-        # The macOS leg installs a prebuilt OTP + rebar3 into RUNNER_TEMP instead of
-        # erlef/setup-beam, whose rmRF + re-copy of the tool cache both BigMags agents
-        # share raced. Pin what makes that substitute safe: no action, no tool cache,
-        # and BOTH downloads checked against a pinned SHA-256 (rebar3 has no upstream
-        # attestation, so the hash IS its only integrity control).
         import yaml
         with open(os.path.join(ROOT, '.github', 'workflows', 'ci.yml'), encoding='utf-8') as f:
             steps = yaml.safe_load(f)['jobs']['macos']['steps']
         self.assertFalse([s for s in steps if 'setup-beam' in str(s.get('uses', '')).lower()])
         step, = [s for s in steps if s.get('name') == 'Install Erlang/OTP and rebar3']
-        self.assertNotIn('uses', step)
-        env, run = step.get('env') or {}, str(step.get('run') or '')
-        self.assertRegex(str(env.get('OTP_VERSION')), r'^\d+\.\d+')
-        for var in ('OTP_SHA256', 'REBAR3_SHA256'):
-            with self.subTest(pin=var):
-                self.assertRegex(str(env.get(var)), r'^[0-9a-f]{64}$')
-                self.assertRegex(run, r'verify "\$%s" ' % var)
-        self.assertEqual(run.count('verify "$'), 2)
-        self.assertIn('openssl dgst -sha256', run)
-        self.assertRegex(run, r'(?m)^\s*set -euo pipefail')
-        self.assertIn('$RUNNER_TEMP', run)
-        self.assertNotIn('tool_cache', run.lower())
-        self.assertNotIn('tool_cache', str(step.get('env')).lower())
+        self.assertEqual(self._macos_erlang_step_problems(step), [])
+
+    def test_macos_erlang_step_gate_rejects_regressions(self):
+        # In-memory mutations: each one must make the gate report a problem, so its
+        # patterns cannot silently go stale (docs/testing/unit-test-conventions.md).
+        import copy
+        import yaml
+        with open(os.path.join(ROOT, '.github', 'workflows', 'ci.yml'), encoding='utf-8') as f:
+            steps = yaml.safe_load(f)['jobs']['macos']['steps']
+        clean, = [s for s in steps if s.get('name') == 'Install Erlang/OTP and rebar3']
+        run = clean['run']
+        otp_v = 'verify "$OTP_SHA256" "$root/otp.tar.gz"'
+        reb_v = 'verify "$REBAR3_SHA256" "$root/bin/rebar3"'
+        self.assertIn(otp_v, run)
+        self.assertIn(reb_v, run)
+        mutations = {
+            'otp verify removed': lambda s: s['run'].replace(otp_v + '\n', ''),
+            'rebar3 verify removed': lambda s: s['run'].replace(reb_v + '\n', ''),
+            'otp verify commented out': lambda s: s['run'].replace(otp_v, '# ' + otp_v),
+            'rebar3 verify commented out': lambda s: s['run'].replace(reb_v, '# ' + reb_v),
+            'third download without verify': lambda s: s['run'].replace(
+                reb_v + '\n', reb_v + '\nfetch "https://example.invalid/x" "$root/bin/x" 60\n'),
+            'rebar3 verify after use': lambda s: s['run'].replace(reb_v + '\n', '').replace(
+                'chmod 755 "$root/bin/rebar3"\n', 'chmod 755 "$root/bin/rebar3"\n' + reb_v + '\n'),
+            'install root moves to the tool cache': lambda s: s['run'].replace(
+                'root="$RUNNER_TEMP/erlang"', 'root="$RUNNER_TOOL_CACHE/erlang"; : $RUNNER_TEMP'),
+            'verify no longer compares': lambda s: s['run'].replace('test "$got" = "$1"', 'true'),
+            'pipefail dropped': lambda s: s['run'].replace('set -euo pipefail', 'set -eu'),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(mutation=name):
+                bad = copy.deepcopy(clean)
+                bad['run'] = mutate(bad)
+                self.assertNotEqual(bad['run'], run, 'mutation did not change the step')
+                self.assertTrue(self._macos_erlang_step_problems(bad), name)
+        with self.subTest(mutation='setup-beam action'):
+            bad = copy.deepcopy(clean)
+            bad['uses'] = 'ErLef/Setup-Beam@v1'
+            self.assertTrue(self._macos_erlang_step_problems(bad))
+        with self.subTest(mutation='hash pin emptied'):
+            bad = copy.deepcopy(clean)
+            bad['env']['REBAR3_SHA256'] = ''
+            self.assertTrue(self._macos_erlang_step_problems(bad))
 
 
 if __name__ == '__main__':
