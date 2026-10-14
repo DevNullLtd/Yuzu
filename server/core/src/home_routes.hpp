@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -42,6 +43,10 @@ inline constexpr std::size_t kFailedReadCap = 100;
 /// Row cap of the roster read behind `Deps::roster_fn`. A full read is a lower bound,
 /// not the fleet. server.cpp pins this to `OfflineEndpointStore::kQueryRowCap`.
 inline constexpr std::size_t kRosterReadCap = 100000;
+
+/// How long a successful TOP-caller estate read is reused. `fleet_state_counts` is
+/// uncached by design and costs seconds at fleet scale, so Home owns the cache.
+inline constexpr std::int64_t kEstateCacheTtlSecs = 60;
 
 struct Deps {
     using AuthFn =
@@ -62,7 +67,9 @@ struct Deps {
     using RosterFn = std::function<InventoryDevicesResult()>;
     /// Fleet-wide SQL estate counts (HB-1 seam), partitioned. `nullopt` = degraded.
     /// Optional: when empty the roster path serves every caller. NOT CONFINED: only
-    /// ever called for a caller whose gate returned `scope == nullopt`.
+    /// ever called for a caller whose gate returned `scope == nullopt`. HomeRoutes
+    /// caches a successful answer for `kEstateCacheTtlSecs` on `now_fn`; a failure is
+    /// never cached.
     using FleetEstateFn = std::function<std::optional<EstateCounts>(std::int64_t now_ms)>;
     /// `ComplianceApi::fleet_compliance()` reduced to the figure. `nullopt` = degraded.
     using ComplianceFn = std::function<std::optional<ComplianceFigure>()>;
@@ -100,8 +107,15 @@ public:
 
 private:
     [[nodiscard]] SummaryView build_summary(const httplib::Request& req) const;
+    /// TOP-caller estate read through the TTL cache. Single flight: the lock is held
+    /// across the read so concurrent viewers wait for one scan instead of each
+    /// running their own; a failed read leaves the cache untouched.
+    [[nodiscard]] std::optional<EstateCounts> cached_estate(std::int64_t now_epoch) const;
 
     Deps deps_;
+    mutable std::mutex estate_mu_;
+    mutable std::optional<EstateCounts> estate_cache_;
+    mutable std::int64_t estate_cached_at_{0};
 };
 
 } // namespace yuzu::server::home

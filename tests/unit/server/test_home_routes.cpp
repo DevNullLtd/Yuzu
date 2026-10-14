@@ -327,6 +327,105 @@ TEST_CASE("summary: a failed TOP estate read is Unavailable, never zero, and nev
     CHECK_FALSE(has(out->body, "Nothing needs attention"));
 }
 
+// Kills: a cache that never expires, expires early, or keys on anything but the injected
+// server clock (the SQL scan costs seconds at fleet scale, so TOP callers share one read).
+TEST_CASE("summary: the TOP estate read is cached 60 s on the server clock", "[home][route][cache]") {
+    Deps d = top_deps();
+    std::int64_t now = 1'760'000'000;
+    d.now_fn = [&] { return now; };
+    int estate_calls = 0;
+    d.fleet_estate_fn = [&](std::int64_t now_ms) -> std::optional<EstateCounts> {
+        ++estate_calls;
+        CHECK(now_ms == now * 1000);
+        return EstateCounts{100 + estate_calls, 90, 5, 5};
+    };
+    test::TestRouteSink sink;
+    HomeRoutes r;
+    r.register_routes(sink, std::move(d));
+
+    REQUIRE(sink.Get("/fragments/home/summary"));
+    CHECK(estate_calls == 1);
+    now += 59;
+    auto hit = sink.Get("/fragments/home/summary");
+    REQUIRE(hit);
+    CHECK(estate_calls == 1);
+    CHECK(has(hit->body, "of 101 seen in the last 30 days"));
+    now += 1; // 60 s after the read
+    auto miss = sink.Get("/fragments/home/summary");
+    REQUIRE(miss);
+    CHECK(estate_calls == 2);
+    CHECK(has(miss->body, "of 102 seen in the last 30 days"));
+    now -= 5; // a clock that stepped backwards is a miss, never a stale hit
+    REQUIRE(sink.Get("/fragments/home/summary"));
+    CHECK(estate_calls == 3);
+}
+
+// Kills: a failed read cached (or an expired value served in its place), which would render
+// an outage as a stale or zero fleet for a minute.
+TEST_CASE("summary: a failed TOP estate read is never cached", "[home][route][cache]") {
+    Deps d = top_deps();
+    std::int64_t now = 1'760'000'000;
+    d.now_fn = [&] { return now; };
+    int estate_calls = 0;
+    bool fail = true;
+    d.fleet_estate_fn = [&](std::int64_t) -> std::optional<EstateCounts> {
+        ++estate_calls;
+        if (fail)
+            return std::nullopt;
+        return EstateCounts{200, 190, 5, 5};
+    };
+    test::TestRouteSink sink;
+    HomeRoutes r;
+    r.register_routes(sink, std::move(d));
+
+    auto down = sink.Get("/fragments/home/summary");
+    REQUIRE(down);
+    CHECK(has(down->body, "Could not read The device roster. This is not zero."));
+    fail = false; // same second: the failure was not remembered
+    auto up = sink.Get("/fragments/home/summary");
+    REQUIRE(up);
+    CHECK(estate_calls == 2);
+    CHECK(has(up->body, "of 200 seen in the last 30 days"));
+    fail = true; // expired entry + failed read: Unavailable, not the old figure
+    now += 60;
+    auto again = sink.Get("/fragments/home/summary");
+    REQUIRE(again);
+    CHECK(estate_calls == 3);
+    CHECK(has(again->body, "Could not read The device roster. This is not zero."));
+    CHECK_FALSE(has(again->body, "of 200 seen"));
+    fail = false; // the failed read did not restart the window or leave the old figure behind
+    auto recovered = sink.Get("/fragments/home/summary");
+    REQUIRE(recovered);
+    CHECK(estate_calls == 4);
+    CHECK(has(recovered->body, "of 200 seen in the last 30 days"));
+}
+
+// Kills: a scoped caller reading (or being served) the fleet-wide cached figure.
+TEST_CASE("summary: a scoped caller never touches the estate seam or its cache", "[home][route][cache]") {
+    Deps d = top_deps();
+    d.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&) {
+        authz::FleetReadGate g;
+        g.admitted = true;
+        g.scope = std::unordered_set<std::string>{"a"};
+        return g;
+    };
+    int estate_calls = 0;
+    d.fleet_estate_fn = [&](std::int64_t) -> std::optional<EstateCounts> {
+        ++estate_calls;
+        return EstateCounts{999999, 999999, 0, 0};
+    };
+    d.roster_fn = [] { return InventoryDevicesResult{}; };
+    test::TestRouteSink sink;
+    HomeRoutes r;
+    r.register_routes(sink, std::move(d));
+    for (int i = 0; i < 3; ++i) {
+        auto out = sink.Get("/fragments/home/summary");
+        REQUIRE(out);
+        CHECK_FALSE(has(out->body, "999,999"));
+    }
+    CHECK(estate_calls == 0);
+}
+
 // Kills: a scoped caller's capped roster presented as an exact count (PLAN section 2:
 // "bounded at 100k and labelled"). Below the cap the figure stays exact.
 TEST_CASE("summary: a scoped roster read at the row cap is labelled a lower bound",

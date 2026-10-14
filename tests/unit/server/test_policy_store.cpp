@@ -1067,6 +1067,74 @@ TEST_CASE("PolicyStore: compliance_by_policy_checked groups per policy, agrees w
             CHECK(row.compliant == 1);
 }
 
+TEST_CASE("PolicyStore: compliance_by_policy_checked shape, all five statuses, and 60 s expiry",
+          "[policy_store][pg][compliance]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+
+    // No status rows at all: an empty success, not an error.
+    auto none = store.compliance_by_policy_checked();
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto p1 = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(p1.has_value());
+    auto p2 = store.create_policy(make_policy_yaml(frag.value(), "second-policy"));
+    REQUIRE(p2.has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a1", "compliant").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a2", "non_compliant").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a3", "unknown").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a4", "fixing").has_value());
+    REQUIRE(store.update_agent_status(p1.value(), "a5", "error").has_value());
+    REQUIRE(store.update_agent_status(p2.value(), "a1", "compliant").has_value());
+
+    auto fake_now = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    store.set_cache_clock_for_test([&fake_now] { return fake_now; });
+
+    auto by = store.compliance_by_policy_checked();
+    REQUIRE(by.has_value());
+    REQUIRE(by->size() == 2);
+    CHECK((*by)[0].policy_id < (*by)[1].policy_id); // ordered by policy_id
+    for (const auto& row : *by) {
+        if (row.policy_id != p1.value())
+            continue;
+        CHECK(row.compliant == 1);
+        CHECK(row.non_compliant == 1);
+        CHECK(row.unknown == 1);
+        CHECK(row.fixing == 1);
+        CHECK(row.error == 1);
+        CHECK(row.total == 5);
+    }
+
+    // Bypass the store's own write hook, then step the injected clock.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(static_cast<bool>(lease));
+        PgResult r{PQexec(lease.get(),
+                          "UPDATE policy_store.policy_status SET status = 'non_compliant' "
+                          "WHERE agent_id = 'a1' AND status = 'compliant'")};
+        REQUIRE(r.ok());
+    }
+    auto count_compliant = [&](const std::vector<yuzu::server::ComplianceSummary>& v) {
+        std::int64_t n = 0;
+        for (const auto& row : v)
+            n += row.compliant;
+        return n;
+    };
+    fake_now += std::chrono::seconds(59);
+    auto at59 = store.compliance_by_policy_checked();
+    REQUIRE(at59.has_value());
+    CHECK(count_compliant(*at59) == 2); // still the cached value
+    fake_now += std::chrono::seconds(1);
+    auto at60 = store.compliance_by_policy_checked();
+    REQUIRE(at60.has_value());
+    CHECK(count_compliant(*at60) == 0); // expired: recomputed
+}
+
 TEST_CASE("PolicyStore: compliance_by_policy_checked is kDegraded on a closed store, "
           "never an empty list",
           "[policy_store]") {

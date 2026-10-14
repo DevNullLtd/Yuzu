@@ -22,6 +22,7 @@
 #include "policy_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_compliance_api_double.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -237,6 +238,27 @@ TEST_CASE("ComplianceApi: fleet_compliance forwards to the store",
     CHECK(fc->total_checks == 2);
     CHECK(fc->compliant == 1);
     CHECK(fc->non_compliant == 1);
+}
+
+TEST_CASE("FnComplianceApi: compliance_by_policy is a typed error unwired, and forwards when set",
+          "[compliance_api]") {
+    yuzu::server::test::FnComplianceApi api;
+    auto unwired = api.compliance_by_policy();
+    REQUIRE_FALSE(unwired.has_value());
+    CHECK(unwired.error() == yuzu::server::PolicyReadError::kDegraded);
+
+    api.compliance_by_policy_fn = [] {
+        yuzu::server::ComplianceSummary cs;
+        cs.policy_id = "sentinel";
+        cs.compliant = 7;
+        return std::expected<std::vector<yuzu::server::ComplianceSummary>,
+                             yuzu::server::PolicyReadError>{std::vector{cs}};
+    };
+    auto wired = api.compliance_by_policy();
+    REQUIRE(wired.has_value());
+    REQUIRE(wired->size() == 1);
+    CHECK((*wired)[0].policy_id == "sentinel");
+    CHECK((*wired)[0].compliant == 7);
 }
 
 TEST_CASE("ComplianceApi: compliance_by_policy forwards to the store",
