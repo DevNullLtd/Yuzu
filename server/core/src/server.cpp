@@ -156,7 +156,7 @@
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
-#include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
+#include "access_routes.hpp" // Access pages (Phase 2 UI): the Users and roles page (/access/users)
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
@@ -15611,9 +15611,11 @@ private:
                              .store = custom_properties_store_.get(),
                          });
 
-        // Access pages (Phase 2 UI): the read-only /access/users page, its two fragments and
-        // the page's static glue. Placed after audit_fn (which it binds for the Access PRs
-        // that follow). The read goes through AuthDB::list_users() (a std::expected: a store
+        // Access pages (Phase 2 UI): the Users and roles page /access/users, its fragments
+        // (users, roles, role permissions, role assignments, enforcement) and the static glue.
+        // Placed after audit_fn. The lambdas below capture `this` and are quiesced by the
+        // web_thread_ join in stop(), before rbac_store_ is reset. The read goes through
+        // AuthDB::list_users() (a std::expected: a store
         // fault reaches the page as "could not be read", never as an empty list); the
         // in-memory AuthManager::list_users() fallback is deliberately not used.
         yuzu::server::access::register_access_routes(

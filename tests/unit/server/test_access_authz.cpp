@@ -31,8 +31,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <expected>
 #include <memory>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -147,7 +149,9 @@ TEST_CASE("access authz: Administrator with RBAC off reads every panel and may a
     }
     const auto assign = r.get(kAssign, c);
     CHECK_THAT(assign->body, ContainsSubstring("data-act=\"assign\""));
-    CHECK_THAT(assign->body, !ContainsSubstring("ITServiceOwner\""));
+    // The real catalogue, filtered to the closed assignable list: six names, never ITServiceOwner.
+    CHECK_THAT(assign->body,
+               ContainsSubstring("data-roles=\"Administrator,ApiTokenManager,Operator,PlatformEngineer,Reviewer,Viewer\""));
     CHECK_THAT(r.get(kEnforce, c)->body, ContainsSubstring("data-act=\"enforce\""));
     CHECK(r.denied_rows() == 0);
     // The grant-table read leaves its own audit row, exactly as its REST twin.
@@ -229,17 +233,56 @@ TEST_CASE("access authz: RBAC on, a user with no role gets the loud denial on ev
     YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
     Rig r{db_.dsn()};
     r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.is_rbac_enabled()); // a vacuous pass here would be the RBAC-off case again
     const auto c = r.cookie("bob", auth::Role::user);
 
-    for (const char* p : {kUsers, kRoles, kPerms, kAssign}) {
+    for (const char* p : {kRoles, kPerms, kAssign}) {
         INFO(p);
         const auto res = r.get(p, c);
         REQUIRE(res);
         CHECK(res->status == 403);
+        CHECK_THAT(res->body, ContainsSubstring("permission"));
     }
+    CHECK(r.get(kUsers, c)->status == 403);
     CHECK(r.user_reads == 0);
     CHECK(r.route_audits.empty());
     CHECK(r.denied_rows() == 4);
+}
+
+TEST_CASE("access authz: RBAC on, an Administrator grant keeps the page usable for the account that flipped it",
+          "[pg][access][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
+    Rig r{db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "root", "Administrator"}).has_value());
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.is_rbac_enabled());
+    const auto c = r.cookie("root", auth::Role::admin);
+
+    for (const char* p : {kUsers, kRoles, kPerms, kAssign, kEnforce}) {
+        INFO(p);
+        const auto res = r.get(p, c);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    CHECK_THAT(r.get(kAssign, c)->body, ContainsSubstring("data-act=\"assign\""));
+    CHECK_THAT(r.get(kEnforce, c)->body, ContainsSubstring("data-act=\"enforce\""));
+    CHECK_THAT(r.get(kEnforce, c)->body, ContainsSubstring("checked")); // enforcement is on
+}
+
+TEST_CASE("access authz: RBAC on, a base admin with NO grant is refused the RBAC-gated panels",
+          "[pg][access][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.is_rbac_enabled());
+    const auto c = r.cookie("root", auth::Role::admin);
+
+    // The account list is gated on the account role (admin_fn); the catalogue and the grant
+    // table follow the RBAC grants, which this account does not hold.
+    CHECK(r.get(kUsers, c)->status == 200);
+    CHECK(r.get(kRoles, c)->status == 403);
+    CHECK(r.get(kAssign, c)->status == 403);
+    CHECK(r.route_audits.empty());
 }
 
 TEST_CASE("access authz: a request with no session is refused by every fragment and reads nothing",

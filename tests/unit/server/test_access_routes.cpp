@@ -373,6 +373,26 @@ TEST_CASE("access routes: the assignments panel refuses an empty session usernam
     }
 }
 
+TEST_CASE("access routes: the caller's own Administrator grant is drawn without a Remove control",
+          "[access][routes]") {
+    Harness h;
+    h.session_username = "alice";
+    h.assigns_result = std::vector<PrincipalRole>{grant("user", "alice", "Administrator"),
+                                                  grant("user", "bob", "Administrator")};
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/fragments/access/roles/assignments");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // bob's grant is removable; alice's (the session user's) is not, whatever the page script does.
+    CHECK_THAT(res->body, ContainsSubstring("data-principal-id=\"bob\""));
+    CHECK_THAT(res->body, ContainsSubstring("You cannot remove your own Administrator"));
+    std::size_t removes = 0;
+    for (auto at = res->body.find("data-act=\"unassign\""); at != std::string::npos;
+         at = res->body.find("data-act=\"unassign\"", at + 1))
+        ++removes;
+    CHECK(removes == 1);
+}
+
 TEST_CASE("access routes: the static glue is served uncached", "[access][routes]") {
     Harness h;
     h.wire();

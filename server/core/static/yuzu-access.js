@@ -506,13 +506,18 @@
     var s = e.detail.xhr.status;
     if (s === 401) { location.assign('/login'); return; }
     keepPermsSrc(e, t);
+    if (pendingOut && pendingOut.panelId === t.id) pendingOut = null; // the redraw it waits for failed
     if (s === 403) denied(t); else unavailable(t);
     if (t.id === 'acc-assignments') derive();
   });
 
   document.body.addEventListener('htmx:sendError', function (e) {
     var t = e.detail.target;
-    if (t && t.hasAttribute('data-denied')) { keepPermsSrc(e, t); unavailable(t); }
+    if (t && t.hasAttribute('data-denied')) {
+      keepPermsSrc(e, t);
+      if (pendingOut && pendingOut.panelId === t.id) pendingOut = null;
+      unavailable(t);
+    }
     if (t && t.id === 'acc-assignments') derive();
   });
 })();

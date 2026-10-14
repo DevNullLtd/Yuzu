@@ -103,7 +103,7 @@ TEST_CASE("access glue: enforcement, elevation and the permission check keep the
           "the role store may not have answered: check again.", "data-slot=\"out\"",
           // Gate-fix round: Retry on the role-permissions panel, the unverified-account note, the
           // enforcement warning inside both confirmations.
-          "function keepPermsSrc(e, t)", "A name made only of dots cannot be used.", "t.dataset.src = rp", "target_provisioned === 'unknown'",
+          "function keepPermsSrc(e, t)", "pendingOut = null; // the redraw it waits for failed", "A name made only of dots cannot be used.", "t.dataset.src = rp", "target_provisioned === 'unknown'",
           "'immediately, and a person with no management group role sees no devices.', ENFORCE_NOTE]",
           "'most things and change nothing.', ENFORCE_NOTE]"}) {
         INFO(token);

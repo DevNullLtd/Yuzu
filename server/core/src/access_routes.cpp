@@ -226,7 +226,7 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
                          spdlog::warn("/fragments/access/roles/assignments: role list: {}", roles.error());
                      }
                  }
-                 respond_fragment(res, render_assignments(view));
+                 respond_fragment(res, render_assignments(std::move(view)));
              });
 
     // Enforcement: the twin is GET /api/v1/me, which reports rbac_enabled to any signed-in

@@ -48,11 +48,12 @@ struct Deps {
     /// 403. The `auth.admin_required` row is withheld for a cookie session (a page that
     /// auto-loads its panels must not fill the audit log with denials) and kept for any token.
     using AdminFn = std::function<bool(const httplib::Request&, httplib::Response&)>;
-    /// Same shape as `dashboard_api::Deps::PermFn`. Bound now so the Access PRs that follow
-    /// do not each re-add it; this PR's routes do not call it.
+    /// Same shape as `dashboard_api::Deps::PermFn`. The Roles and Role assignments
+    /// fragments gate on it (UserManagement:Read, AccessReview:Read).
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string&, const std::string&)>;
-    /// Same shape as the server's `audit_fn`. Bound for the same reason as `perm_fn`.
+    /// Same shape as the server's `audit_fn`. The Role assignments fragment writes
+    /// `rbac.assignments.list` through it.
     using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;

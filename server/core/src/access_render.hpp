@@ -136,11 +136,12 @@ std::string render_assignments(const std::variant<AssignmentsView, Unavailable>&
                                std::size_t cap = kAssignmentsRenderCap);
 
 /// UI hint: may this session even try the RBAC administration routes (assign/unassign role,
-/// enforcement switch)? Both need a durable Administrator, which needs the caller's own LOCAL
-/// account to hold the admin role, so the base role on a local cookie session is a NECESSARY
-/// condition: the hint may overstate, never understate. It reads the base role, never the
-/// effective one (a JIT elevation does not satisfy the server's predicate). The server re-checks
-/// on every call and its refusal is shown as it came.
+/// enforcement switch)? A local cookie session whose BASE role is admin (never the effective
+/// one: a JIT elevation does not satisfy the server's predicate). It is a hint in both
+/// directions: it may overstate (the server also needs a durable Administrator) and, with RBAC
+/// enforcement on, it may understate (a local account whose base role is user but which holds the
+/// Administrator grant is admitted by the server and gets no controls here; REST and MCP still
+/// work). The server re-checks on every call and its refusal is shown as it came.
 bool may_attempt_rbac_admin(const auth::Session& s);
 
 // ---- Your account -------------------------------------------------------------------------

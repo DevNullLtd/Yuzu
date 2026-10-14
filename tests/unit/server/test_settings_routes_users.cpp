@@ -490,6 +490,8 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: re-creating a removed userna
     CHECK(res->status == 409);
     CHECK(res->body.find("removed account") != std::string::npos);
     CHECK(res->body.find("at least") == std::string::npos);
+    CHECK(res->body.find("anotherpassword1") == std::string::npos); // never echoed
+    CHECK(res->get_header_value("HX-Trigger").find("anotherpassword1") == std::string::npos);
     CHECK(h.audit_detail("user.create", "denied", "bob") == "create_refused");
     CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
 
