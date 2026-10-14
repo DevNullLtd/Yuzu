@@ -7,7 +7,7 @@
 ///                                                   / the record-header banner
 ///
 /// Read-only twins of `GET /api/v1/quarantine`: the same admit-then-filter rules, via the
-/// shared `quarantine_visible_records` / `quarantine_probe_record` (quarantine_visible.hpp).
+/// shared `quarantine_visible_records` (quarantine_visible.hpp).
 /// Create and release are NOT here: the page JS calls the existing `POST` and
 /// `DELETE /api/v1/quarantine` through the shared dialog module.
 ///

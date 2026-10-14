@@ -12,8 +12,8 @@
  *       -> Promise<{ok, status, data, auditFailed, warning, message}>   (never rejects)
  *
  *   body:   string | string[] (one <p> each) | Node
- *   fields: [{name, label, type: text|password|textarea|select, hint, autocomplete,
- *             inputmode, maxlength, rows, placeholder, required, value, options}]
+ *   fields: [{name, label, type: text|password|textarea, hint, autocomplete,
+ *             inputmode, maxlength, rows, placeholder, required, value}]
  *
  * submit() runs with the buttons disabled and keeps the dialog open: null closes it and
  * resolves the values, a string is shown in the error slot. One dialog at a time (a second
@@ -210,13 +210,6 @@
     if (spec.type === 'textarea') {
       input = el('textarea');
       input.rows = spec.rows || 3;
-    } else if (spec.type === 'select') {
-      input = el('select');
-      (spec.options || []).forEach(function (o) {
-        var opt = el('option', '', o.label);
-        opt.value = o.value;
-        input.appendChild(opt);
-      });
     } else {
       input = el('input');
       input.type = spec.type === 'password' ? 'password' : 'text';

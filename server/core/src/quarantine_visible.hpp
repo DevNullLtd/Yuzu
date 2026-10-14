@@ -15,11 +15,6 @@
 ///     degraded engine-principal lookup, a 503 from an RBAC/tag-store degrade) is
 ///     anomalous mid-request and fails the WHOLE read closed as `ProbeDegraded`;
 ///   * an unwired gate is `ScopeUnwired` (REST answers 500) — never an unfiltered list.
-///
-/// Both the loop (`quarantine_visible_records`) and the single-record case
-/// (`quarantine_probe_record`, used by the Containment lens after a point
-/// `get_status`) route through ONE per-record probe, so a second copy of the 403-vs-other
-/// rule cannot drift.
 
 #include "quarantine_store.hpp"
 
@@ -42,19 +37,6 @@ using QuarantineScopedPermFn =
 
 /// The authoritative list read; `nullopt` = degraded (store/pool/query failure).
 using QuarantineListFn = std::function<std::optional<std::vector<QuarantineRecord>>()>;
-
-enum class QuarantineRecordProbe { Visible, Denied, Degraded };
-
-/// One record's `Security:Read` admit probe. Explicit 403 = Denied; any other failing
-/// outcome = Degraded (fail closed, see the file banner).
-inline QuarantineRecordProbe quarantine_probe_record(const httplib::Request& req,
-                                                     const QuarantineScopedPermFn& scoped_perm_fn,
-                                                     const std::string& agent_id) {
-    httplib::Response probe; // throwaway: per-record admit probe, never sent
-    if (scoped_perm_fn(req, probe, "Security", "Read", agent_id))
-        return QuarantineRecordProbe::Visible;
-    return probe.status == 403 ? QuarantineRecordProbe::Denied : QuarantineRecordProbe::Degraded;
-}
 
 enum class QuarantineReadStatus { Ok, StoreDegraded, ProbeDegraded, ScopeUnwired };
 
@@ -96,13 +78,11 @@ inline QuarantineVisible quarantine_visible_records(const httplib::Request& req,
             out.more = true;
             break;
         }
-        switch (quarantine_probe_record(req, scoped_perm_fn, r.agent_id)) {
-        case QuarantineRecordProbe::Visible:
+        httplib::Response probe; // throwaway: per-record Security:Read admit probe, never sent
+        if (scoped_perm_fn(req, probe, "Security", "Read", r.agent_id)) {
             out.records.push_back(std::move(r));
-            break;
-        case QuarantineRecordProbe::Denied:
-            break;
-        case QuarantineRecordProbe::Degraded:
+        } else if (probe.status != 403) {
+            // Anything but an explicit 403 is anomalous: fail the whole read closed.
             out.status = QuarantineReadStatus::ProbeDegraded;
             out.records.clear();
             out.more = false;
