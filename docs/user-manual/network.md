@@ -13,9 +13,9 @@ or app problem — something a network-only tool cannot do.
 
 ## Access
 
-Network is a **sub-view of DEX**, not a standalone top-level nav item: open
-**DEX** in the top navigation bar and choose the **Network** tab, or go to
-`/network` directly. Permission required: **`GuaranteedState:Read`** (the same
+Network is a sub-item of **Fleet** in the sidebar (**Fleet > Network**), not a
+top-level item. It is also the **Network** tab of the DEX page's sub-navigation,
+or go to `/network` directly. Permission required: **`GuaranteedState:Read`** (the same
 permission that gates the Guardian and DEX read surfaces).
 
 ## Overview tab

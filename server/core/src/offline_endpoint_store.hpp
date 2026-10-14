@@ -116,6 +116,16 @@ public:
     /// the real value rather than a hardcoded duplicate.
     static constexpr int kQueryRowCap = 100000;
 
+    /// #5678 / #1545 UP-4 endpoint prune: rows are deleted only once unseen for
+    /// the roster read window PLUS this margin. The prune keys on the PG-authored
+    /// `last_seen_at`; the roster still reads the replica-authored
+    /// `last_heartbeat_ms`, so a cutoff can reach a roster-visible row only under
+    /// >7 d replica/PG clock disagreement.
+    static constexpr std::chrono::hours kPruneMargin{24 * 7};
+    /// Per-replica, per-pass delete cap (must stay > 0 or every pass is a no-op).
+    static constexpr int kPruneCapPerPass = 1000;
+    static_assert(kPruneCapPerPass > 0, "a zero cap makes every prune pass a silent no-op");
+
     /// Borrows the shared pool and runs the `endpoint_state` schema migration
     /// on a pinned lease. `is_open()` is false if the lease was empty or the
     /// migration failed (the server fails closed before reaching here, so in
@@ -155,6 +165,14 @@ public:
     /// blank out what this store already learned from the owning replica. A
     /// non-blank value still overwrites, so a genuine hostname/OS change
     /// lands on the next session-hit heartbeat.
+    ///
+    /// `session_id` (#5678) blank-preserves the same way: a raced-lookup
+    /// heartbeat on a LIVE agent keeps its stored session and stays present. A
+    /// blank session on a NEW or just-departed row leaves it blank, so the
+    /// agent is not present (see query_live_ids) until a session-carrying
+    /// heartbeat arrives — including a departed gateway agent that reconnects
+    /// through a replica with a degraded session-directory lookup, for the
+    /// duration of the degradation.
     bool upsert(std::string_view agent_id, std::string_view hostname, std::string_view os,
                 std::int64_t last_heartbeat_ms, std::int64_t agent_ts,
                 std::string_view agent_version = {}, std::string_view arch = {},
@@ -178,7 +196,15 @@ public:
     /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
     /// DATABASE clock (`now()` in-SQL, never the replica's own
     /// `system_clock` — the #3715 precedent), for cross-replica
-    /// scope-evaluation visibility.
+    /// scope-evaluation visibility, and whose `session_id` is non-blank — a
+    /// gracefully departed agent (session cleared by remove_if_session) is
+    /// absent from THIS read. AgentRegistry::live_presence() caches the result
+    /// for kPresenceCacheTtl (3 s) and disconnect does not invalidate that
+    /// cache, so a replica's scope evaluation can still see a departed agent
+    /// for up to 3 s — unchanged from the pre-#5678 DELETE, which left the
+    /// deleted row cached the same 3 s. The same cache feeds /hardware's
+    /// `online` flag (AgentRegistry::all_ids() = local sessions UNION cached
+    /// durable presence), so the same <= 3 s applies there.
     ///
     /// #4981 PR-1 (Finding B): type-distinguishable — `std::unexpected` on a
     /// genuine read failure (`StoreUnavailable`: no connection in time;
@@ -199,19 +225,35 @@ public:
     [[nodiscard]] std::expected<std::vector<PresenceIdentity>, PresenceReadError>
     query_live_ids(std::chrono::seconds ttl);
 
-    /// Session-guarded delete (HA WS-5): removes the row ONLY when its
-    /// stored `session_id` matches — mirrors
+    /// Session-guarded presence CLEAR (HA WS-5, #5678): blanks the row's
+    /// `session_id` ONLY when the stored value matches — mirrors
     /// `AgentRegistry::remove_agent_if_session`, so a stale/superseded
-    /// session's disconnect can never delete a NEWER session's presence
-    /// row. Called on graceful disconnect so a departed agent's row does
-    /// not linger for the full liveness window — needed to keep the
-    /// single-replica monolith's `evaluate_scope` outcome unchanged from
-    /// pre-WS-5 behavior (an agent gone from the local registry must also
-    /// be gone from presence, not just eventually-stale). Best-effort like
-    /// `upsert()`: a failure here just means the row lingers until TTL
-    /// expiry, which is always safe (over-inclusion never grants dispatch
-    /// authority).
+    /// session's disconnect can never clear a NEWER session's presence. The row
+    /// itself is KEPT so /hardware and the viz keep listing the device offline
+    /// with its real last heartbeat; query_live_ids no longer reports it, which
+    /// keeps the single-replica monolith's `evaluate_scope` outcome unchanged
+    /// from pre-WS-5 behaviour. Returns true when the current session was
+    /// cleared. Best-effort like `upsert()`: a failure just means the agent is
+    /// counted present until last_seen_at ages past the TTL, which is always
+    /// safe (over-inclusion never grants dispatch authority). Residual: an
+    /// in-flight heartbeat that resolved the OLD session before the disconnect
+    /// but upserts after the clear re-sets `session_id`, so the agent reads
+    /// present again until last_seen_at ages past the TTL — same as the old
+    /// DELETE + reinsert, bounded by the TTL, and grants no dispatch authority.
     bool remove_if_session(std::string_view agent_id, std::string_view session_id);
+
+    /// #5678 / #1545 UP-4: clock-guarded, capped delete of rows unseen for
+    /// `roster_window + kPruneMargin`. Returns rows deleted; 0 on
+    /// decline / lock-skip / nothing to do; -1 on error or a store that is not
+    /// open (the preflight_run_store contract).
+    int run_retention_prune(std::chrono::seconds roster_window);
+    /// Decommission erasure (#5682, `AgentDecommissionStores::offline_endpoint`):
+    /// deletes the agent's row whatever its `session_id`, unlike
+    /// `remove_if_session`. Returns true iff the DELETE ran (zero rows
+    /// included, so a re-issued decommission stays idempotent); false on an
+    /// empty id, a closed store, no lease in time, or a SQL error, so the
+    /// cascade records `Failed`, never a false erasure.
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
 private:
     pg::PgPool& pool_;

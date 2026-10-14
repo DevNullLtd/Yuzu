@@ -200,6 +200,18 @@ migration is needed. Two new counters report the effect:
 `yuzu_server_response_export_truncated_total{surface,cause}`
 ([Metrics](metrics.md#response-store-metrics)).
 
+## Behaviour change: the software installs read validates its inputs and audits an out-of-scope target
+
+**Breaking for scripts that relied on a malformed value being tolerated.** `GET /api/v1/inventory/software` and MCP `query_installed_software` now share one parser with the catalogue routes:
+
+- A `name`, `agent_id`, `version`, `kind`, `ecosystem`, `source` or `cursor` holding a NUL byte or invalid UTF-8, or one over its bound (`name`/`version` 1024 bytes, the others 256, `cursor` 2048), is `400` (`-32602` on MCP). A NUL byte used to reach the store and come back as a retryable `503`.
+- `limit` must be one whole integer: `limit=12abc` is `400` (it was read as `12`), and an empty `limit=` now means the default (it was `400`).
+- **MCP only:** a wrongly typed argument is refused with `-32602` instead of being ignored or converted. `version: 2.0` used to be dropped and read the whole fleet unfiltered, `agent_id: 123` was read as `"123"`, and an unsigned `limit` above `9223372036854775807` wrapped. `agent_id`, `name`, `version` and `cursor` must be strings and `limit` an integer that fits an int64; an in-range `limit` (for example `50000`) still clamps as before, and unknown argument names are still ignored.
+
+**Audit trail addition.** A `denied` audit row (`inventory.software.query`, or `inventory.software.export` for an export; `mcp.query_installed_software` on MCP) is now also written when a request names an `agent_id` outside the caller's scope. The response is unchanged (under push-down: an empty page, `devices_omitted` `0`). A SIEM rule that counted `denied` rows from these routes will see them for this case too.
+
+**Who is affected, and what to do.** Scripts that sent a malformed or over-long value, or a non-string MCP argument: send well-formed values. Scripts that retried a `503` on a NUL byte: it is a `400` now and will not succeed on retry.
+
 ## Behaviour change: a cut visualization, results fragment or TAR scan is reported (#4644)
 
 The execution visualization route (`GET /api/v1/executions/{id}/visualization`), the dashboard
@@ -291,6 +303,86 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
   `os_gate_unreadable`) and its output schema now requires `agents_kill_switched_os` in every
   zero-reach branch. The kill-switch REST responses gain additive `os` and `source` fields,
   and the `/api/command` response gains `withheld_kill_switched_os`.
+
+## Behaviour change: protective actions exempt from plugin enablement
+
+**What changed.** Five `plugin.action` pairs are now *protective*: the quarantine plugin's
+`quarantine.quarantine`, `quarantine.unquarantine`, `quarantine.status` and `quarantine.whitelist`,
+and the Guardian rule push `__guard__.push_rules`. No plugin-enablement gate refuses them any more:
+not the per-plugin/action kill switch, not the per-OS kill switch (or its agent-presence read), not
+the plugin-presence filter, and not a degraded plugin-config store. The set is closed. The four
+quarantine actions are **newly** exempt; before this change only the containment gate exempted
+them. Decision record: the 2026-10-12 update in [ADR-3005](../adr/3005-plugin-config-store.md).
+
+A kill-switch row for one of these pairs is still accepted and displayed, but it is **kept and
+inert**: it no longer stops dispatch. A plugin-level `quarantine` / `__guard__` row never stops the
+plugin's protective actions either, and still gates any non-protective action the plugin declares
+(none today: `quarantine` declares only the four, and `__guard__` dispatches only `push_rules`). A
+`PUT` on one is audited with `protective_exempt=true` in the `plugin_config.kill_switch.set`
+detail and logs a warning. If you stopped Guardian rule delivery by switching
+`__guard__.push_rules` off, that stop **ends when you upgrade**: rules deploy on the next Baseline
+deploy or heartbeat reconcile.
+
+**Before upgrading.**
+
+1. **Find held rows.** There is no list route. Search the audit log for
+   `plugin_config.kill_switch.set` entries whose `target_id` is `__guard__.push_rules`,
+   `quarantine.<action>` or the plugin-level `__guard__` / `quarantine`, each with an optional `@<os>`
+   suffix. Each write leaves two rows (`attempted`, then `success` or `failure`) and a later
+   `enabled=true` supersedes an earlier OFF, so take the latest `result=success` row per `target_id`.
+   Confirm each with `GET /api/v1/plugin-config/<plugin>/kill-switch` at every layer: the
+   plugin row, the action row (`?action=<action>`) and each `?os=windows|linux|darwin` variant, reading `source` in the response: it names the row that wins.
+2. **Re-establish the stop through the rule lever first**, because the hold ends on upgrade. Disable
+   the Guards (`PUT /api/v1/guaranteed-state/rules/<id>` with `{"enabled": false}`) or remove them.
+   This is state-only: it disarms each Guard on the agent's next Baseline deploy or heartbeat
+   reconcile, so the latency is the reconcile cadence. It disarms the rule; it does not freeze a push
+   already in flight. No lever stops delivery while leaving armed Guards armed: the old switch did
+   that, but disabling or removing a rule disarms it on the next reconcile. It needs `GuaranteedState:Write` (disable) or `GuaranteedState:Delete`
+   (remove). `PluginConfig:Write` alone no longer stops anything, and a service-scoped token is
+   denied on rule writes. A `quarantine.*` hold has no replacement switch: those actions are
+   governed by their permission (`Security:Execute` on the catalogue rows) and any approval policy,
+   not by enablement.
+
+Also be aware of:
+
+- **Rollback.** An older server has no exemption and honours stored OFF rows again, which can strand
+  a quarantine release or hold back a rule push. Before rolling back, `PUT enabled=true` on every
+  protective-pair OFF row you found (each layer and OS), then roll back.
+- **Mixed versions.** During a rolling upgrade an older replica still honours a held row (or a degraded store or
+  plugin-inventory gap) and refuses a protective dispatch while an upgraded replica delivers it, so the outcome depends on which replica serves the
+  heartbeat or the reconcile. Lifting a hold arms rules fleet-wide on the next reconcile, including
+  `enforce` rules, so expect a burst of arming rather than a gradual one.
+- **Agents without the quarantine plugin.** The server no longer withholds a protective dispatch
+  because the agent's reported plugin inventory lacks the plugin. `dispatch_confirmed` means the
+  plugin registry **accepted the frame**; it is never proof of isolation. A
+  device whose agent lacks the plugin answers its own "plugin not found", and
+  `YuzuQuarantineEndpointUnconfirmed` can fire for it. Verify containment with `quarantine.status`,
+  and upgrade agents before you rely on quarantine.
+- **Integrations.** The kill-switch `GET` and `PUT` responses are unchanged: `enabled=false` for a
+  protective pair is a stored row, not the dispatch decision. The `os_gate_unreadable`,
+  `plugin_not_found` and `kill_switched_os` zero-reach causes are never produced for a protective
+  action.
+## Behaviour change: Guardian full_sync agent log lines and in-place `rule:` rows (#4415)
+
+Three changes are live on every agent on upgrade, on both detection paths. The skip of healthy,
+unchanged rules that motivated them runs only on the Spark path, which production does not enable
+(`prefer_spark` is off); see the [Spark flip gate](../spark-flip-gate.md) AC-18.
+
+- **Log line renamed.** `Guardian: full_sync cleared N prior rule(s)` is now
+  `Guardian: full_sync removed N prior rule(s) absent from the push`, and it is not logged when no
+  stored row is removed. Log rules or dashboards keyed on the old string go silent. Do not use the
+  old line as a "a full push happened" marker.
+- **New line on every full push.** `Guardian: full_sync preserved N rule(s) (skipped re-arm) ids=[...] more=M`
+  is logged by every agent on every full push that reaches the end of its rule loop. Use it as the
+  full-push marker instead. Legacy-path agents always log `preserved 0`.
+- **Rows updated in place.** The agent's stored `rule:` rows are no longer cleared and reinserted
+  on a full push: only the rows for rules the push omits are deleted, and a row whose bytes are
+  unchanged is not rewritten. A crash after the omitted rows are removed and before the carried
+  rules are rewritten leaves the previous rows for carried rules until the next push (a restart then
+  re-arms those, including a rule the push had disabled or changed).
+- **Rollback.** The row format is unchanged. An older agent reads the rows without complaint, and
+  its own full_sync clear-and-reinsert restores the old write pattern. A newer agent rewrites any
+  row whose bytes differ. There is no migration and a downgrade is safe.
 
 ## ⚠️ Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it (0.14.0 → 0.14.1, #5370)
 
@@ -557,6 +649,12 @@ plus one new prerequisite.**
   rows (`auth.fleet_read_required` with `result=denied`), the panel text, and, for the ceiling case,
   `yuzu_server_rbac_read_degrade_total`. `GET /api/v1/executions` is unchanged and keeps its real
   `403`/`503`.
+- **Approvals fragment and Executions filters answer 200 with a note.** `GET /fragments/approvals` now
+  answers a `403` as `200` with `data-denied="true"`, a store failure as `200` with
+  `data-degraded="store"` and an unknown `status` as `200` with `data-invalid="status"`; the
+  executions fragment answers a malformed `definition_id` (default view too) or an unknown `status`
+  with `200` and `data-invalid`. **Monitoring blind spot:** an HTTP-status monitor of these fragments
+  sees `200` for those cases; detect the attributes instead.
 - **Runbook, degrade note on the Executions panel.** `data-degraded="tracker"` means the execution
   tracker or its agent-status read failed: check `ExecutionTracker` warnings in the server log and
   PostgreSQL availability. `data-degraded="unavailable"` is a misconfiguration or bug branch (the
@@ -749,6 +847,16 @@ On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could
 **Counters/alerts to watch during and after upgrade:** `yuzu_server_guardian_read_degrade_total` (alert `YuzuGuardianReadDegraded`; this release adds a new `source="guardian_rules"` value alongside the pre-existing `source="guardian_state"`, both now pre-seeded to 0 at boot across all three `reason` values) and `yuzu_server_mgmt_group_read_degrade_total` (alert `YuzuMgmtGroupReadDegraded`, now also counting the `get_members_checked` member-read degrade). A sustained non-zero rate on either during the upgrade window means the affected reads are answering retryable errors, not that devices or groups actually shrank.
 
 No config or data migration is required.
+
+## Behaviour change: devices that disconnect cleanly stay on `/hardware` as Offline (#5678)
+
+**Not a Breaking lead:** no flag, wire format or API shape changes. In 0.14.0 a graceful agent disconnect deleted the device's `endpoint_state` row, so the device vanished from `/hardware` instead of showing as Offline. A graceful disconnect now clears only the row's presence session, so the device stays listed with its real last-seen time.
+
+- **Migration v4 runs automatically** at server start. It is additive (`CREATE TABLE IF NOT EXISTS endpoint_state.retention_meta`), so rolling back to the previous server binary is safe: the old binary ignores the table.
+- **Devices that disconnected under 0.14.0 were deleted and are not restored.** Each reappears on `/hardware` the next time it connects.
+- **`/viz/fleet` and MCP `get_fleet_topology`** now also show a departed device, flagged stale, for 7 days, so `yuzu_viz_offline_hosts_total` rises after the upgrade.
+- **Retention.** A row is deleted 37 days after its device was last seen (the 30-day roster window plus a 7-day margin). Each replica runs the prune hourly and deletes at most 12,000 rows per hour. The first pass runs about a minute after the server starts. On the first start after the upgrade it only records its clock anchor, so deletions begin with the next hourly pass; on every later start it already deletes; a large backlog inherited from an older release drains at that rate (100,000 rows in about 8 hours).
+- **Decommission erases the row.** `DELETE /api/v1/sle/agents/{id}` deletes the device's `endpoint_state` row (#5682), so a decommissioned device leaves `/hardware`. A still-enrolled agent that heartbeats again re-creates it, so stop the agent first. A device that is never decommissioned ages out under the 37-day rule.
 
 ## Behaviour change: a failed device-roster read is reported instead of shown as an empty fleet (#5531)
 
@@ -4039,7 +4147,7 @@ Before upgrading any component:
     and ignores them).
   - **At the Spark flip (not part of this upgrade), upgraded agents.** They hold the policy generation and keep being re-pushed while a
     wedged rule or a compensating teardown is outstanding (each re-push writes a `guaranteed_state.reconcile` audit row, about once per
-    heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s; if a healthy rule of the hung call's mechanism type is in the push, every re-push after the first of those is applied in full; see the Same-type condition in the wedged-rule hold note of [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only)).
+    heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s; if a rule of the hung call's mechanism type that the push changes, or that is not healthy, is in the push, every re-push after the first of those is applied in full (a healthy, unchanged rule is skipped since #4415); see the Same-type condition in the wedged-rule hold note of [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only)).
   - **At the Spark flip, agents without the #5459 retry suppression.** Every agent built from PR #4529 up to the #5459 change carries the
     earlier three-re-apply waiver; builds from before PR #4529 (release 0.13.0 and earlier) have no waiver and no acknowledgment ledger at all.
     Such an agent can acknowledge the generation after three re-applies of a wedged rule (and, without the
@@ -4431,10 +4539,11 @@ If a migration fails:
 [REST API § Software Licensing (SLE)](rest-api.md#software-licensing-sle)) used to gate on a
 **three-securable conjunction**: `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and**
 `GuaranteedState:Delete`, all required together. A companion Wave 7 PR7.2 package adds a sixth
-per-agent store (`app_usage`) to the cascade, and rather than grow the conjunction to a fourth
-securable, ADR-0024 Decision 9 was amended ahead of that landing to promote a single dedicated
-**`Decommission`** securable — the route now
-gates on **`Decommission:Delete` alone**, replacing the old conjunction outright (not adding to it).
+per-agent store (`app_usage`) to the cascade (and #5682 a seventh, `offline_endpoint`, for seven
+in total), and rather than grow the conjunction to a fourth securable, ADR-0024 Decision 9 was
+amended ahead of that landing to promote a single dedicated **`Decommission`** securable — the
+route now gates on **`Decommission:Delete` alone**, replacing the old conjunction outright (not
+adding to it).
 
 **Seeded roles are auto-preserved** — the same `INSERT OR IGNORE` role-default seeding as the SLE
 securable above runs on every boot, so `Administrator` (full CRUD via the generic per-securable
@@ -4477,6 +4586,13 @@ Grant `Decommission:Delete` to any custom role in that list that must retain the
 decommissioned device's data. `SoftwareLicensing:Delete`, `Inventory:Delete`, and
 `GuaranteedState:Delete` continue to gate their own unrelated surfaces exactly as before — only the
 erasure cascade's gate moved.
+
+**Rolling upgrade (the seventh store, `offline_endpoint`).** During a rolling upgrade, a DELETE
+served by a replica that has not been upgraded runs the old cascade, returns `200`, and does not
+erase the presence row; a response whose `stores` map has no `offline_endpoint` key did not erase
+it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores
+(no `offline_endpoint`), so it is not evidence the presence row was erased. Re-issue the DELETE
+once every replica runs this version.
 
 ### vNEXT — Hardware CI list requires `Inventory:Read`, not the old Devices page's `Infrastructure:Read` (breaking for custom roles)
 

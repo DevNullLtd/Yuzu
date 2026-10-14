@@ -90,8 +90,10 @@ std::string highlight_yaml(std::string_view source) {
             line = std::string(source.substr(pos, nl - pos));
             pos = nl + 1;
         }
-        result +=
-            "<div class=\"yl\"><span class=\"ln\">" + std::to_string(line_num++) + "</span>";
+        // The text sits in one .yt span so a flex .yl row keeps its indentation (a bare
+        // whitespace text node is not rendered as a flex item).
+        result += "<div class=\"yl\"><span class=\"ln\">" + std::to_string(line_num++) +
+                  "</span><span class=\"yt\">";
         auto trimmed_start = line.find_first_not_of(' ');
         if (trimmed_start == std::string::npos) {
             result += "&nbsp;";
@@ -113,7 +115,7 @@ std::string highlight_yaml(std::string_view source) {
         } else {
             result += html_escape(line);
         }
-        result += "</div>";
+        result += "</span></div>";
     }
     return result;
 }
@@ -160,10 +162,10 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
             bool can_author = (auth::effective_role(*session) == auth::Role::admin);
 
             std::string html;
-            // Toolbar with New button for Platform Engineers
-            html += "<div class=\"toolbar\"><div>";
+            // Panel header with New button for Platform Engineers
+            html += "<section class=\"panel\"><div class=\"hd\"><h2>";
             html += "<strong>" + std::to_string(defs.size()) + "</strong> definitions";
-            html += "</div><div>";
+            html += "</h2><div class=\"end\">";
             if (can_author) {
                 html += "<button class=\"btn btn-primary\" onclick=\"openEditor()\">"
                         "New Definition</button>";
@@ -176,22 +178,21 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                     html += " Click <strong>New Definition</strong> to create one.";
                 html += "</div>";
             } else {
-                html += "<table><thead><tr><th>Name</th><th>Plugin:Action</th><th>Type</"
-                        "th><th>Enabled</th><th>Set</th><th></th></tr></thead><tbody>";
+                html += "<div class=\"tw\"><table><thead><tr><th>Name</th><th>Plugin:Action</"
+                        "th><th>Type</th><th>Enabled</th><th>Set</th><th></th></tr></thead>"
+                        "<tbody>";
                 for (const auto& d : defs) {
-                    auto type_cls = d.type == "question" ? "status-running" : "status-pending";
                     bool is_legacy = d.id.starts_with("legacy.");
                     html += "<tr><td><strong>" + html_escape(d.name) + "</strong>";
                     if (is_legacy)
                         html += " <span class=\"legacy-badge\">legacy</span>";
-                    html += "<br><span style=\"font-size:0.65rem;color:#8b949e\">" +
-                            html_escape(d.id.substr(0, 12)) +
+                    html += "<span class=\"sub-id\">" + html_escape(d.id.substr(0, 12)) +
                             "</span></td>"
                             "<td><code>" +
                             html_escape(d.plugin) + ":" + html_escape(d.action) +
                             "</code></td>"
-                            "<td><span class=\"status-badge " +
-                            type_cls + "\">" + html_escape(d.type) +
+                            "<td><span class=\"status-badge status-idle\">" +
+                            html_escape(d.type) +
                             "</span></td>"
                             "<td>" +
                             std::string(d.enabled ? "Yes" : "No") +
@@ -201,7 +202,7 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                                             ? "-"
                                             : d.instruction_set_id.substr(0, 8)) +
                             "</td>"
-                            "<td>";
+                            "<td class=\"act\">";
                     // d.id is operator-chosen since #402 (JSON create) /
                     // #1993 (YAML metadata.id). The store now bounds NEW
                     // ids to [A-Za-z0-9._-]{1,128}, but a row that predates
@@ -228,8 +229,9 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             "hx-confirm=\"Delete definition '" +
                             html_escape(d.name) + "'?\">Delete</button></td></tr>";
                 }
-                html += "</tbody></table>";
+                html += "</tbody></table></div>";
             }
+            html += "</section>";
             res.set_content(html, "text/html; charset=utf-8");
         });
 

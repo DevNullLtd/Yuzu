@@ -451,10 +451,10 @@ TEST_CASE("DEX golden: catalogue group fragment — App reliability drill-down, 
                         "class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">Linux"
                         "</span></td><td class=\"gp-num\">0</td><td class=\"gp-num\">&mdash;</td>"
                         "<td>watched</td></tr>") != std::string::npos);
-        CHECK(html.find("<tr class=\"gp-mute\" hx-get=\"/fragments/dex/catalogue/signal?"
+        CHECK(html.find("<tr class=\"gp-mute dx-off\" hx-get=\"/fragments/dex/catalogue/signal?"
                         "type=process.crashed_managed&window=all&os=linux\" "
                         "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                        "style=\"cursor:pointer;opacity:.5\"><td>App crash (.NET)</td><td>"
+                        "style=\"cursor:pointer\"><td>App crash (.NET)</td><td>"
                         "<span class=\"gp-pill draft\">not collected on linux</span></td>"
                         "<td class=\"gp-num\">&mdash;</td><td class=\"gp-num\">&mdash;</td>"
                         "<td>&mdash;</td></tr>") != std::string::npos);
@@ -744,8 +744,8 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
         CHECK(html.find("<div class=\"gp-tile\"><div class=\"n good\">100</div><div "
                         "class=\"l\">Network</div><div class=\"sx\">connectivity</div></div>") !=
              std::string::npos);
-        CHECK(html.find("<b style=\"color:#4ed27e\">2 great</b> &middot; <b "
-                        "style=\"color:#ffcc00\">0 fair</b> &middot; <b style=\"color:#ff5765\">"
+        CHECK(html.find("<b class=\"gp-ok\">2 great</b> &middot; <b "
+                        "class=\"gp-drift\">0 fair</b> &middot; <b class=\"gp-err\">"
                         "0 poor</b>.") != std::string::npos);
         CHECK(html.find("<tr><td><a hx-get=\"/fragments/dex/device?id=dex-gold-1&window=all\" "
                         "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
@@ -1062,8 +1062,7 @@ TEST_CASE("DEX golden: observation fragment — every field, byte-exact", "[dex]
     r.platform = "windows";
 
     const auto html = render_dex_observation_fragment(r);
-    CHECK(html == "<div class=\"gp-sech\">App crash <span class=\"gp-mute\" "
-                  "style=\"font-family:var(--mono);text-transform:none;letter-spacing:0\">"
+    CHECK(html == "<div class=\"gp-sech\">App crash <span class=\"gp-mute dx-mono\">"
                   "process.crashed</span></div><div class=\"gp-spec\"><span class=\"k\">When"
                   "</span><code>2026-01-01T00:00:00Z</code><span class=\"k\">Subject</span>"
                   "<code>notepad.exe</code><span class=\"k\">Code</span><code>0xC0000005</code>"

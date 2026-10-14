@@ -2,7 +2,7 @@
 /// HTTP-level coverage for the page-shell/static-asset route module (#2542)
 /// — driven in-process through TestRouteSink (no httplib acceptor, #438),
 /// mirroring test_plugin_config_routes.cpp's Harness shape. None of these
-/// 25 routes touches Postgres (no store), so every case here runs without
+/// 34 routes touches Postgres (no store), so every case here runs without
 /// YUZU_TEST_POSTGRES_DSN.
 
 #include "page_routes.hpp"
@@ -80,7 +80,7 @@ struct Harness {
 
 } // namespace
 
-// ── Static assets (12) + / (1): no gate, pure constant-serving ───────────
+// ── Static assets + /: no gate, pure constant-serving ───────────
 
 namespace {
 struct AssetExpectation {
@@ -99,8 +99,14 @@ const std::vector<AssetExpectation> kStaticAssets = {
     {"/static/three-orbit-controls.js", "application/javascript; charset=utf-8", "max-age=86400"},
     {"/static/yuzu-viz.js", "application/javascript; charset=utf-8", "no-cache"},
     {"/static/yuzu-viz-host.js", "application/javascript; charset=utf-8", "no-cache"},
+    {"/static/yuzu-operate.js", "application/javascript; charset=utf-8", "no-cache"},
+    {"/static/yuzu-dialog.js", "application/javascript; charset=utf-8", "no-cache"},
     {"/static/cytoscape.min.js", "application/javascript; charset=utf-8", "max-age=86400"},
-    {"/static/fonts/InterVariable.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-sans-latin-400-normal.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-sans-latin-500-normal.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-sans-latin-600-normal.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-mono-latin-400-normal.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-mono-latin-500-normal.woff2", "font/woff2", "max-age=2592000"},
     {"/static/yuzu-charts.js", "application/javascript; charset=utf-8", "max-age=86400"},
 };
 } // namespace
@@ -132,6 +138,97 @@ TEST_CASE("page_routes: / serves the dashboard shell, ungated", "[server][routes
     CHECK(r->status == 200);
     CHECK(r->get_header_value("Content-Type") == "text/html; charset=utf-8");
     CHECK_FALSE(r->body.empty());
+}
+
+// The store-degraded results row is <td class="empty-state result-degrade-banner">. A bare
+// `.result-degrade-banner` rule (0,1,0) loses its padding, colour and bottom border to
+// `#results-table td.empty-state` (1,1,1), so the page CSS must carry the td form. That form only
+// ties at (1,1,1), so it wins on source order: it must follow td.empty-state, and the frame rule
+// that swaps its border for an inset shadow (a collapsed header rule paints the top edge neutral)
+// must follow it in turn.
+TEST_CASE("page_routes: / dashboard CSS keeps the degraded results banner above td.empty-state",
+          "[server][routes][page_routes]") {
+    Harness h;
+    h.wire();
+
+    auto r = h.sink.Get("/");
+    REQUIRE(r);
+    const auto empty = r->body.find("#results-table td.empty-state {");
+    const auto banner =
+        r->body.find(".result-degrade-banner, #results-table td.result-degrade-banner {");
+    const auto frame = r->body.find("border: 0; box-shadow: inset 0 0 0 1px");
+    REQUIRE(empty != std::string::npos);
+    REQUIRE(banner != std::string::npos);
+    REQUIRE(frame != std::string::npos);
+    CHECK(banner > empty);
+    CHECK(frame > banner);
+}
+
+// ── No hx-on on the dashboard or Result sets ──────────────────────────────
+//
+// htmx compiles `hx-on:*` with `new Function()`, which the shipped CSP (`script-src 'self'
+// 'unsafe-inline'`, no `unsafe-eval`) blocks at runtime, so the handler silently does nothing.
+// Both pages carried one: the dashboard's `clearChartDeck()` on #instr-form and Result sets'
+// create-form reset. They now run from CSP-safe listeners, and nothing in the served HTML,
+// comments included, may carry the token again.
+TEST_CASE("page_routes: / and /result-sets serve no hx-on handler (the CSP has no unsafe-eval)",
+          "[server][routes][page_routes]") {
+    Harness h;
+    h.wire();
+
+    for (const std::string path : {"/", "/result-sets"}) {
+        INFO(path);
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+        CHECK(r->body.find("hx-on") == std::string::npos);
+    }
+}
+
+// The listener that replaces the dashboard's dead attribute. It must call clearChartDeck()
+// for the form's own request, and only that one: the autocomplete input inside #instr-form
+// fires a bubbling htmx:beforeRequest on every keystroke, which must not wipe the chart.
+TEST_CASE("page_routes: / clears the chart deck from the instruction form's beforeRequest listener",
+          "[server][routes][page_routes]") {
+    Harness h;
+    h.wire();
+
+    auto r = h.sink.Get("/");
+    REQUIRE(r);
+    const std::string_view body = r->body;
+    const auto open = body.find("instrForm.addEventListener('htmx:beforeRequest'");
+    REQUIRE(open != std::string_view::npos);
+    const auto close = body.find("});", open);
+    REQUIRE(close != std::string_view::npos);
+    const auto listener = body.substr(open, close - open);
+    CHECK(listener.find("clearChartDeck()") != std::string_view::npos);
+    CHECK(listener.find("e.target === instrForm") != std::string_view::npos);
+    // The call sits behind the target guard, never ahead of it.
+    CHECK(listener.find("clearChartDeck()") > listener.find("e.target === instrForm"));
+}
+
+TEST_CASE("page_routes: /result-sets resets its create form from a delegated afterRequest listener",
+          "[server][routes][page_routes]") {
+    Harness h;
+    h.wire();
+
+    auto r = h.sink.Get("/result-sets");
+    REQUIRE(r);
+    const std::string_view body = r->body;
+    // The form keeps its htmx target and gains the id the listener keys on.
+    CHECK(body.find("id=\"rs-create-form\"") != std::string_view::npos);
+    CHECK(body.find("hx-post=\"/fragments/result-sets/create\"") != std::string_view::npos);
+    CHECK(body.find("hx-target=\"#rs-sidebar\"") != std::string_view::npos);
+    const auto open = body.find("document.body.addEventListener('htmx:afterRequest'");
+    REQUIRE(open != std::string_view::npos);
+    const auto close = body.find("});", open);
+    REQUIRE(close != std::string_view::npos);
+    const auto listener = body.substr(open, close - open);
+    // Only the create form's own successful request resets it; the sidebar's 15 s poll fires
+    // htmx:afterRequest too and must not.
+    CHECK(listener.find("el.id === 'rs-create-form'") != std::string_view::npos);
+    CHECK(listener.find("e.detail.successful") != std::string_view::npos);
+    CHECK(listener.find("el.reset()") != std::string_view::npos);
 }
 
 // ── Legacy redirects (2) ──────────────────────────────────────────────────
@@ -236,7 +333,7 @@ TEST_CASE("page_routes: /api/help* serves real registry output when perm allows 
     CHECK(palette->get_header_value("Content-Type") == "text/html");
 }
 
-// ── /help, /tar, /result-sets, /instructions (help/tar/result-sets/viz/instructions) ──
+// ── /help, /tar, /result-sets, /instructions, /approvals, /executions, /workflows ──
 
 TEST_CASE("page_routes: /help serves the help page, ungated", "[server][routes][page_routes]") {
     Harness h;
@@ -249,13 +346,16 @@ TEST_CASE("page_routes: /help serves the help page, ungated", "[server][routes][
     CHECK_FALSE(r->body.empty());
 }
 
-TEST_CASE("page_routes: /tar, /result-sets, /instructions deny without auth (redirect to /login)",
+TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executions, /workflows deny "
+          "without auth "
+          "(redirect to /login)",
           "[server][routes][page_routes]") {
     Harness h;
     h.session_present = false;
     h.wire();
 
-    for (const std::string path : {"/tar", "/result-sets", "/instructions"}) {
+    for (const std::string path : {"/tar", "/result-sets", "/instructions", "/approvals",
+                                   "/executions", "/workflows"}) {
         INFO("path: " << path);
         auto r = h.sink.Get(path);
         REQUIRE(r);
@@ -264,7 +364,8 @@ TEST_CASE("page_routes: /tar, /result-sets, /instructions deny without auth (red
     }
 }
 
-TEST_CASE("page_routes: /tar, /result-sets, /instructions serve 200 when authed",
+TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executions, /workflows serve "
+          "200 when authed",
           "[server][routes][page_routes]") {
     Harness h;
     h.wire();
@@ -286,6 +387,24 @@ TEST_CASE("page_routes: /tar, /result-sets, /instructions serve 200 when authed"
     CHECK(instr->status == 200);
     CHECK(instr->get_header_value("Content-Type") == "text/html; charset=utf-8");
     CHECK_FALSE(instr->body.empty());
+
+    auto approvals = h.sink.Get("/approvals");
+    REQUIRE(approvals);
+    CHECK(approvals->status == 200);
+    CHECK(approvals->get_header_value("Content-Type") == "text/html; charset=utf-8");
+    CHECK(approvals->body.find("data-page=\"approvals\"") != std::string::npos);
+
+    auto executions = h.sink.Get("/executions");
+    REQUIRE(executions);
+    CHECK(executions->status == 200);
+    CHECK(executions->get_header_value("Content-Type") == "text/html; charset=utf-8");
+    CHECK(executions->body.find("data-page=\"executions\"") != std::string::npos);
+
+    auto workflows = h.sink.Get("/workflows");
+    REQUIRE(workflows);
+    CHECK(workflows->status == 200);
+    CHECK(workflows->get_header_value("Content-Type") == "text/html; charset=utf-8");
+    CHECK(workflows->body.find("data-page=\"workflows\"") != std::string::npos);
 }
 
 // ── /viz/fleet + /viz/host/:id (auth + kill switch) ───────────────────────
@@ -397,14 +516,22 @@ TEST_CASE("page_routes: /viz/host/:id rejects a malformed agent id with 400",
 
 // ── Registration order / shape ────────────────────────────────────────────
 
-TEST_CASE("page_routes: registers exactly 25 routes, with /viz/fleet reachable independently "
+// Routes that are not a kStaticAssets row: "/", the pages, /viz/*, the help API, the fragments.
+// A new static asset is one kStaticAssets row and leaves this alone, so two PRs that each add
+// an asset no longer collide on a hand-kept total. Add or remove any other route and this moves.
+constexpr std::size_t kNonAssetRoutes = 16;
+
+TEST_CASE("page_routes: route count is assets + pages, with /viz/fleet reachable independently "
           "of /viz/host/:id (the documented registration order — /viz/fleet before the "
           "per-host regex — never lets one swallow the other)",
           "[server][routes][page_routes]") {
     Harness h;
     h.wire();
 
-    CHECK(h.sink.route_count() == 25);
+    INFO("kStaticAssets has " << kStaticAssets.size() << " rows, kNonAssetRoutes is "
+                              << kNonAssetRoutes << "; a route was added or removed without "
+                              << "updating one of them");
+    CHECK(h.sink.route_count() == kStaticAssets.size() + kNonAssetRoutes);
 
     auto fleet = h.sink.Get("/viz/fleet");
     REQUIRE(fleet);
