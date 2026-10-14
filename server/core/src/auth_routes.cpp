@@ -3710,6 +3710,28 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub, claims.iss,
                                                            claims.groups, admin_gid, mfa_at);
 
+        // `create_oidc_session` returns an EMPTY token when the durable session row could not be
+        // persisted (ADR-0007 fail-safe). That is a failed login, not a success: no session
+        // cookie, no `auth.oidc_login` ok row and no ok counter for a session that does not exist.
+        // Same shape as the sibling failure branches above (generic redirect, failure audit row,
+        // error counter); the IdP-controlled username is folded in the log and never put in the
+        // event.
+        if (session_token.empty()) {
+            spdlog::error("OIDC callback: session could not be created for '{}', login refused",
+                          ::yuzu::log_key_token(username));
+            audit_log_for_principal(req, "auth.oidc_login_failed", "failure", username, "user", "",
+                                    "", "reason=session_create_failed");
+            emit_event("auth.oidc_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "session_create_failed"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}})
+                    .increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
+
         // #1852 — auto-provision a durable auth.db row for this stable
         // principal so JIT admin elevation has something to key on
         // (elevation_eligible / role survive across logins). Deliberately

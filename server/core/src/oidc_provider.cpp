@@ -9,6 +9,7 @@
 #include <yuzu/log_token.hpp>
 
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <typeinfo>
 #include <utility>
 
 #ifndef _WIN32
@@ -396,11 +398,13 @@ std::expected<IdTokenClaims, std::string> OidcProvider::parse_id_token(const std
             claims.nbf = static_cast<int64_t>(v);
     }
 
-    // aud can be a string or array
+    // aud can be a string or array. An array is read through its first element only when that
+    // element is a string; any other shape (empty, non-string first element, object) leaves
+    // `aud` empty, which validate_claims refuses, rather than throwing.
     if (j.contains("aud")) {
         if (j["aud"].is_string()) {
             claims.aud = j["aud"].get<std::string>();
-        } else if (j["aud"].is_array() && !j["aud"].empty()) {
+        } else if (j["aud"].is_array() && !j["aud"].empty() && j["aud"][0].is_string()) {
             claims.aud = j["aud"][0].get<std::string>();
         }
     }
@@ -899,8 +903,14 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     }
 
     if (j.contains("error")) {
-        auto err = j["error"].get<std::string>();
-        auto desc = j.value("error_description", "");
+        // IdP-controlled JSON: a non-string `error` / `error_description` is read as empty, never
+        // thrown on (a 200 carrying an error body of the wrong type must still be a clean failure).
+        const auto str_member = [&j](const char* key) {
+            const auto it = j.find(key);
+            return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string{};
+        };
+        auto err = str_member("error");
+        auto desc = str_member("error_description");
         // `error` and `error_description` are IdP-controlled. Fold `err` where the returned string
         // is built so the caller's "OIDC callback failed: {}" line and event attribute are safe.
         const auto safe_err = ::yuzu::log_key_token(err);
@@ -1053,6 +1063,15 @@ bool OidcProvider::fetch_jwks() {
         return false;
     }
     std::lock_guard lock(jwks_mu_);
+    // A document with zero usable keys (a transient or hostile empty set, or one whose members
+    // all failed to parse) must not displace a good cached set: it is treated as a failed fetch
+    // and the cache stays as it was. An already-empty cache just stays empty, as before.
+    if (keys->empty() && !jwks_cache_.empty()) {
+        spdlog::error("OidcProvider: JWKS document held no usable signing keys, keeping the {} "
+                      "cached keys",
+                      jwks_cache_.size());
+        return false;
+    }
     jwks_cache_ = std::move(*keys);
     jwks_fetched_at_ = std::chrono::steady_clock::now();
     spdlog::info("OidcProvider: cached {} JWKS signing keys", jwks_cache_.size());
@@ -1078,8 +1097,16 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
         return std::unexpected("JWT header parse error");
     }
 
-    auto alg = hdr.value("alg", "");
-    auto kid = hdr.value("kid", "");
+    // IdP-controlled JSON: a header that is not an object, or whose `alg` / `kid` is not a string,
+    // is a clean verification failure (an empty `alg` is refused just below), never a throw.
+    if (!hdr.is_object())
+        return std::unexpected("JWT header is not an object");
+    const auto header_string = [&hdr](const char* key) {
+        const auto it = hdr.find(key);
+        return (it != hdr.end() && it->is_string()) ? it->get<std::string>() : std::string{};
+    };
+    auto alg = header_string("alg");
+    auto kid = header_string("kid");
 
     // Reject alg:none — the classic JWT bypass attack
     if (alg.empty() || alg == "none" || alg == "None" || alg == "NONE")
@@ -1365,7 +1392,15 @@ public:
     // and before connect(). Replaces the socket held for a candidate address that failed.
     void adopt(socket_t sock) noexcept {
         std::lock_guard lock(mu_);
-        if (fd_.fd < 0 || ::dup2(sock, fd_.fd) < 0) {
+        // dup2 can be interrupted by a signal (EINTR) before it did anything: retry that, and
+        // fail closed on every other error.
+        int rc = -1;
+        if (fd_.fd >= 0) {
+            do {
+                rc = ::dup2(sock, fd_.fd);
+            } while (rc < 0 && errno == EINTR);
+        }
+        if (rc < 0) {
             failed_ = true;
             // Best effort: the socket cannot be watched, so shut its read side down at once so
             // that the connect or handshake fails fast instead of running unbounded (persists on
@@ -1436,7 +1471,7 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
     try {
         // Declared BEFORE the client so it is destroyed after it (the client holds a reference).
         const auto t = std::chrono::milliseconds(timeout_ms);
-        RequestDeadlineWatchdog watchdog(2 * t);
+        RequestDeadlineWatchdog watchdog(kHttpTotalBoundMultiplier * t);
         // Fail closed before any socket exists: without the reserved descriptor the watchdog
         // could not take hold of the socket (see RequestDeadlineWatchdog).
         if (!watchdog.reserved())
@@ -1454,7 +1489,7 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
         // measured from the start of the request. Neither covers the TLS handshake, so on
         // POSIX the watchdog shuts the socket down at the same deadline (and keeps doing so every
         // 50 ms); on Windows the handshake phase has no total bound (see RequestDeadlineWatchdog).
-        client->set_max_timeout(2 * t);
+        client->set_max_timeout(kHttpTotalBoundMultiplier * t);
         client->set_socket_options([&watchdog](socket_t sock) { watchdog.adopt(sock); });
         client->set_payload_max_length(kHttpMaxBody);
         client->set_follow_location(false);
@@ -1792,52 +1827,67 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(
         pending_challenges_.erase(it); // single-use
     }
 
-    spdlog::info("OIDC handle_callback: found challenge, redirect_uri={}", challenge.redirect_uri);
+    // Everything below handles IdP-controlled bytes. The parsers type-guard what they read, but
+    // this is the backstop: whatever escapes (a JSON type_error, bad_alloc) becomes an ordinary
+    // failure so the route still writes its audit row, bumps its counter and clears the binding
+    // cookie. The flow is already consumed above and `*binding_verified` is left as set there.
+    // The returned string is FIXED: the route forwards it into emit_event, and e.what() can
+    // quote IdP bytes.
+    try {
+        spdlog::info("OIDC handle_callback: found challenge, redirect_uri={}",
+                     challenge.redirect_uri);
 
-    // Exchange code for tokens (use the same redirect_uri from the authorize step)
-    auto id_token_result = exchange_code(code, challenge.code_verifier, challenge.redirect_uri);
-    if (!id_token_result) {
-        spdlog::error("OIDC handle_callback: token exchange failed: {}", id_token_result.error());
-        return std::unexpected(id_token_result.error());
+        // Exchange code for tokens (use the same redirect_uri from the authorize step)
+        auto id_token_result = exchange_code(code, challenge.code_verifier, challenge.redirect_uri);
+        if (!id_token_result) {
+            spdlog::error("OIDC handle_callback: token exchange failed: {}",
+                          id_token_result.error());
+            return std::unexpected(id_token_result.error());
+        }
+
+        spdlog::info("OIDC handle_callback: got id_token (len={})", id_token_result->size());
+
+        // Verify JWT signature before trusting any claims (G2-SEC-A1-001)
+        auto sig_check = verify_jwt_signature(*id_token_result);
+        if (!sig_check) {
+            spdlog::error("OIDC handle_callback: JWT signature verification failed: {}",
+                          sig_check.error());
+            if (sig_check.error() == kJwksUnavailable)
+                return std::unexpected(std::string(kJwksUnavailable)); // fixed token, no prefix
+            return std::unexpected("JWT signature verification failed: " + sig_check.error());
+        }
+
+        // Parse ID token (claims can now be trusted)
+        auto claims_result = parse_id_token(*id_token_result);
+        if (!claims_result) {
+            spdlog::error("OIDC handle_callback: JWT parse failed: {}", claims_result.error());
+            return std::unexpected(claims_result.error());
+        }
+
+        spdlog::info(
+            "OIDC handle_callback: parsed claims sub={} iss={} aud={} nonce={}",
+            ::yuzu::log_key_token(claims_result->sub), ::yuzu::log_key_token(claims_result->iss),
+            ::yuzu::log_key_token(claims_result->aud), ::yuzu::log_key_token(claims_result->nonce));
+
+        // Validate claims
+        auto validation = validate_claims(*claims_result, challenge.nonce);
+        if (!validation) {
+            spdlog::error("OIDC handle_callback: claim validation failed: {}", validation.error());
+            return std::unexpected(validation.error());
+        }
+
+        spdlog::info(
+            "OIDC auth succeeded: sub={} email={} name={}",
+            ::yuzu::log_key_token(claims_result->sub),
+            claims_result->email.empty() ? "(none)" : ::yuzu::log_key_token(claims_result->email),
+            claims_result->name.empty() ? "(none)" : ::yuzu::log_key_token(claims_result->name));
+
+        return claims_result;
+    } catch (const std::exception& e) {
+        spdlog::error("OIDC handle_callback: unexpected {} while processing the IdP response",
+                      typeid(e).name());
+        return std::unexpected(std::string(kCallbackInternalError));
     }
-
-    spdlog::info("OIDC handle_callback: got id_token (len={})", id_token_result->size());
-
-    // Verify JWT signature before trusting any claims (G2-SEC-A1-001)
-    auto sig_check = verify_jwt_signature(*id_token_result);
-    if (!sig_check) {
-        spdlog::error("OIDC handle_callback: JWT signature verification failed: {}",
-                       sig_check.error());
-        if (sig_check.error() == kJwksUnavailable)
-            return std::unexpected(std::string(kJwksUnavailable)); // fixed token, no prefix
-        return std::unexpected("JWT signature verification failed: " + sig_check.error());
-    }
-
-    // Parse ID token (claims can now be trusted)
-    auto claims_result = parse_id_token(*id_token_result);
-    if (!claims_result) {
-        spdlog::error("OIDC handle_callback: JWT parse failed: {}", claims_result.error());
-        return std::unexpected(claims_result.error());
-    }
-
-    spdlog::info(
-        "OIDC handle_callback: parsed claims sub={} iss={} aud={} nonce={}",
-        ::yuzu::log_key_token(claims_result->sub), ::yuzu::log_key_token(claims_result->iss),
-        ::yuzu::log_key_token(claims_result->aud), ::yuzu::log_key_token(claims_result->nonce));
-
-    // Validate claims
-    auto validation = validate_claims(*claims_result, challenge.nonce);
-    if (!validation) {
-        spdlog::error("OIDC handle_callback: claim validation failed: {}", validation.error());
-        return std::unexpected(validation.error());
-    }
-
-    spdlog::info(
-        "OIDC auth succeeded: sub={} email={} name={}", ::yuzu::log_key_token(claims_result->sub),
-        claims_result->email.empty() ? "(none)" : ::yuzu::log_key_token(claims_result->email),
-        claims_result->name.empty() ? "(none)" : ::yuzu::log_key_token(claims_result->name));
-
-    return claims_result;
 }
 
 void OidcProvider::cleanup_expired_states() {

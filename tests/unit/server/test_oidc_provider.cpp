@@ -26,11 +26,13 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -3291,3 +3293,255 @@ TEST_CASE("OIDC discovery: the in-flight mark is set once, cleared only by an RA
     CHECK(in_guard("lock.lock();") == 1);
     CHECK(in_guard("owns_lock()") == 1);
 }
+
+// ── The fetch bounds, by name (#5692 QE-2) ───────────────────────────────────
+
+TEST_CASE("OIDC: the 5 s per-operation timeout, the 2x total bound and the 30 s negative cache are "
+          "pinned by name",
+          "[oidc][oidc_discovery]") {
+    // The values the user manual and the header promise. A silent edit fails here, and the scan
+    // below proves the code uses the constants rather than a second copy of the number.
+    STATIC_REQUIRE(OidcProvider::kHttpOperationTimeoutMs == 5000);
+    STATIC_REQUIRE(OidcProvider::kHttpTotalBoundMultiplier == 2);
+    STATIC_REQUIRE(OidcProvider::kDiscoveryNegativeCacheMs == 30000);
+
+    const auto read = [](const char* name) {
+        std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / name, std::ios::binary);
+        REQUIRE(in.good());
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+    const auto count = [](const std::string& text, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto pos = text.find(needle); pos != std::string::npos;
+             pos = text.find(needle, pos + 1))
+            ++n;
+        return n;
+    };
+    const auto hpp = read("oidc_provider.hpp");
+    const auto cpp = read("oidc_provider.cpp");
+    CHECK(count(hpp, "http_timeout_ms_{kHttpOperationTimeoutMs}") == 1);
+    CHECK(count(hpp, "discovery_retry_window_{kDiscoveryNegativeCacheMs}") == 1);
+    CHECK(count(hpp, "int timeout_ms = kHttpOperationTimeoutMs") == 2);
+    CHECK(count(cpp, "kHttpTotalBoundMultiplier * t") == 2); // the watchdog and set_max_timeout
+}
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+
+// ── IdP-controlled JSON of the wrong type never throws out of handle_callback (#5692) ────────
+//
+// The token response, the id_token header and the id_token claims are all IdP-controlled. A value
+// of the wrong type is a refused sign-in (an error the route audits and counts), never an
+// exception: an exception would skip the route's audit row, metric and binding-cookie clear.
+
+namespace {
+
+std::string b64url(const std::string& s) {
+    return OidcProvider::base64url_encode(std::vector<uint8_t>(s.begin(), s.end()));
+}
+
+// An id_token with a hand-written header and payload. The signature is junk: the header shapes
+// below are refused before the signature is looked at, and a header that gets past the guards
+// then fails verification cleanly.
+std::string forged_jwt(const std::string& header_json, const std::string& payload_json) {
+    return b64url(header_json) + "." + b64url(payload_json) + "." + b64url("sig");
+}
+
+struct CallbackOutcome {
+    std::optional<std::expected<IdTokenClaims, std::string>> result;
+    bool binding_verified{false};
+};
+
+// One full callback against `idp` with a fresh flow. The token endpoint answers what the caller
+// set in `idp` beforehand (`id_token` or `token_body`). Fails the test when handle_callback
+// throws.
+CallbackOutcome run_callback(yuzu::server::test::MockIdp& idp, OidcProvider& provider) {
+    const auto flow = provider.start_auth_flow();
+    CallbackOutcome out;
+    REQUIRE_NOTHROW(out.result = provider.handle_callback(
+                        "the-code", yuzu::server::test::url_query_param(flow.url, "state"),
+                        flow.binding_secret, &out.binding_verified));
+    REQUIRE(out.result.has_value());
+    CHECK(idp.token_calls.load() >= 1);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE(
+    "OIDC callback: an id_token header of the wrong type is a refused sign-in, not an exception",
+    "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    const auto payload = yuzu::server::test::id_token_payload(cfg, "n");
+
+    const char* headers[] = {
+        R"({"alg":123,"kid":"mock-kid-1"})",
+        R"({"alg":[],"kid":"mock-kid-1"})",
+        R"({"alg":{"a":1},"kid":"mock-kid-1"})",
+        R"({"alg":null,"kid":"mock-kid-1"})",
+        R"({"alg":"RS256","kid":null})",
+        R"({"alg":"RS256","kid":5})",
+        R"({"alg":"RS256","kid":[1]})",
+        R"([])",
+        R"("a string")",
+        R"(5)",
+        R"(null)",
+    };
+    for (const char* h : headers) {
+        CAPTURE(h);
+        idp.set_id_token(forged_jwt(h, payload));
+        const auto out = run_callback(idp, provider);
+        REQUIRE_FALSE(out.result->has_value());
+        // A clean verification failure from the guards themselves, not the catch-all backstop.
+        CHECK(out.result->error() != OidcProvider::kCallbackInternalError);
+        CHECK(out.binding_verified); // the flow was matched and spent before the refusal
+    }
+}
+
+TEST_CASE(
+    "OIDC callback: a token-endpoint error body of the wrong type is a refused sign-in, not an "
+    "exception",
+    "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+
+    const char* bodies[] = {
+        R"({"error":5})",
+        R"({"error":{"code":1}})",
+        R"({"error":null})",
+        R"({"error":"invalid_grant","error_description":null})",
+        R"({"error":"invalid_grant","error_description":7})",
+        R"({"error":"invalid_grant","error_description":["x"]})",
+    };
+    for (const char* body : bodies) {
+        CAPTURE(body);
+        idp.with([&](MockIdp& m) { m.token_body = body; });
+        const auto out = run_callback(idp, provider);
+        REQUIRE_FALSE(out.result->has_value());
+        CHECK(out.result->error().starts_with("token endpoint error: "));
+        CHECK(out.binding_verified);
+    }
+    // The IdP's own text still arrives (folded) when it IS a string.
+    idp.with([](MockIdp& m) { m.token_body = R"({"error":"invalid_grant"})"; });
+    const auto named = run_callback(idp, provider);
+    REQUIRE_FALSE(named.result->has_value());
+    CHECK(named.result->error() == "token endpoint error: invalid_grant");
+}
+
+TEST_CASE("OIDC callback: an aud claim of the wrong type is a refused sign-in, not an exception",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+
+    const char* auds[] = {R"([123])", R"([])", R"({})", R"([null])", R"([[1]])", R"(5)", R"(null)"};
+    for (const char* aud : auds) {
+        CAPTURE(aud);
+        auto payload = nlohmann::json::parse(yuzu::server::test::id_token_payload(cfg, "n"));
+        payload["aud"] = nlohmann::json::parse(aud);
+        // Signed with the key the IdP's JWKS publishes, so the guard under test is reached AFTER a
+        // successful signature check (the claims parser is only trusted past it).
+        idp.set_id_token(yuzu::server::test::rs256_sign(idp.token_kid, payload.dump()));
+        const auto out = run_callback(idp, provider);
+        REQUIRE_FALSE(out.result->has_value());
+        CHECK(out.result->error() !=
+              OidcProvider::kCallbackInternalError); // the guard, not the backstop
+        CHECK(out.binding_verified);
+    }
+    // A well-formed array is still read: its first string element is the audience.
+    {
+        auto payload = nlohmann::json::parse(yuzu::server::test::id_token_payload(cfg, "n"));
+        payload["aud"] = nlohmann::json::array({cfg.client_id, "someone-else"});
+        const auto claims = OidcProvider::parse_id_token(
+            yuzu::server::test::rs256_sign(idp.token_kid, payload.dump()));
+        REQUIRE(claims.has_value());
+        CHECK(claims->aud == cfg.client_id);
+    }
+}
+
+TEST_CASE("OIDC callback: anything else that throws while processing the IdP's answer is a refused "
+          "sign-in with a fixed error",
+          "[oidc][oidc_discovery][security]") {
+    // `1e999` overflows a double: nlohmann reports it as out_of_range (not parse_error), a type
+    // the parsers' own handlers do not catch. It is the backstop's real-world trigger, and its
+    // text quotes IdP bytes, so the error the route forwards into an event must be the fixed one.
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+
+    SECTION("in the token response") {
+        idp.with([](MockIdp& m) { m.token_body = R"({"id_token":"x","pad":1e999})"; });
+    }
+    SECTION("in the claims of a correctly signed id_token") {
+        auto payload = nlohmann::json::parse(yuzu::server::test::id_token_payload(cfg, "n"));
+        std::string text = payload.dump();
+        text.insert(text.size() - 1, R"(,"x1e999":1e999)");
+        idp.set_id_token(yuzu::server::test::rs256_sign(idp.token_kid, text));
+    }
+    yuzu::test::LogCapture cap;
+    const auto out = run_callback(idp, provider);
+    cap.stop();
+    REQUIRE_FALSE(out.result->has_value());
+    CHECK(out.result->error() == OidcProvider::kCallbackInternalError);
+    CHECK(out.result->error().find("1e999") == std::string::npos);
+    CHECK(out.binding_verified); // left exactly as set before the throw: the flow was spent
+    CHECK(provider.pending_flow_count_for_test() == 0);
+    CHECK(cap.text().find("unexpected") != std::string::npos); // non-vacuity: the catch ran
+}
+
+// ── An empty key set never replaces a good one (#5692 UP-3) ──────────────────
+
+TEST_CASE("OIDC JWKS: a document with no usable keys does not displace the cached keys",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == 1);
+
+    // The IdP now serves an empty key set (a transient fault, or a hostile answer). A token under a
+    // kid the cache does not hold forces a refetch: the empty answer is a failed fetch.
+    idp.with([](MockIdp& m) { m.jwks_key_count = 0; });
+    (void)provider.verify_jwt_signature(signed_token(cfg, "never-published"));
+    CHECK(idp.jwks_calls.load() == 2);
+
+    // The good key is still there: it verifies WITHOUT another fetch.
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == 2);
+
+    // A later good answer is adopted as usual.
+    idp.with([](MockIdp& m) {
+        m.jwks_key_count = 1;
+        m.token_kid = "mock-kid-2";
+    });
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-2")).has_value());
+}
+
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+
+TEST_CASE("OIDC discovery: an issuer carrying NEL, LS and PS in a failed document reaches the "
+          "'discovery failed' log line neutralized",
+          "[oidc][oidc_discovery][security]") {
+    // A document whose `issuer` differs from the configured one is refused with a message that
+    // quotes the document's value. That message is then logged by the discovery-failure line: the
+    // folds in parse_discovery_document and ensure_discovered are the only barrier between an
+    // IdP-chosen NEL/LS/PS and a forged second log line.
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_issuer = std::string("https://evil") + kUnicodeBreaks; });
+    OidcProvider provider(discovery_cfg(idp));
+    yuzu::test::LogCapture cap;
+    REQUIRE_THROWS(provider.start_auth_flow()); // the fixed kDiscoveryUnavailable
+    cap.stop();
+    const auto logs = cap.text();
+    CHECK(logs.find("discovery failed for issuer") != std::string::npos);
+    CHECK(logs.find("issuer mismatch") != std::string::npos); // non-vacuity: the value was quoted
+    check_no_unicode_breaks(logs);
+}
+
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN

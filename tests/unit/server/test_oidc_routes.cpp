@@ -25,7 +25,9 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "oidc_provider.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "session_store.hpp"
 #include "test_oidc_mock_idp.hpp"
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
@@ -747,6 +749,129 @@ TEST_CASE("OIDC discovery route: discovery down at the callback is a refused sig
     REQUIRE_FALSE(events.empty());
     CHECK(events.front().action == "auth.oidc_login_failed");
     CHECK(events.front().result == "failure");
+}
+
+// ---------------------------------------------------------------------------
+// IdP-controlled JSON of the wrong type (#5692): the provider answers with an error, never an
+// exception, so the route still audits the failure, counts it and spends the binding cookie.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string forged_jwt(const std::string& header_json, const std::string& payload_json) {
+    const auto b64 = [](const std::string& s) {
+        return oidc::OidcProvider::base64url_encode(std::vector<uint8_t>(s.begin(), s.end()));
+    };
+    return b64(header_json) + "." + b64(payload_json) + "." + b64("sig");
+}
+
+} // namespace
+
+TEST_CASE(
+    "OIDC binding route: IdP JSON of the wrong type is a failed sign-in that is audited, counted "
+    "and spends the binding cookie",
+    "[pg][oidc][oidc_binding][oidc_discovery][auth_routes]") {
+    BindingRig rig;
+    Browser a;
+    const auto flow = rig.start(a);
+    // The key `start` registered for this flow: lets a SIGNED token reach the claims parser.
+    const std::string kid = "kid-" + flow.state.substr(0, 8);
+    const std::string payload = yuzu::server::test::id_token_payload(rig.cfg, "n");
+
+    SECTION("a header whose alg is a number") {
+        rig.idp.set_id_token(forged_jwt(R"({"alg":123,"kid":")" + kid + R"("})", payload));
+    }
+    SECTION("a header whose alg is an array") {
+        rig.idp.set_id_token(forged_jwt(R"({"alg":[],"kid":")" + kid + R"("})", payload));
+    }
+    SECTION("a header whose kid is null") {
+        rig.idp.set_id_token(forged_jwt(R"({"alg":"RS256","kid":null})", payload));
+    }
+    SECTION("a header whose kid is a number") {
+        rig.idp.set_id_token(forged_jwt(R"({"alg":"RS256","kid":5})", payload));
+    }
+    SECTION("a token-endpoint error body whose error is a number") {
+        rig.idp.with([](yuzu::server::test::MockIdp& m) { m.token_body = R"({"error":5})"; });
+    }
+    SECTION("a token-endpoint error body whose error_description is null") {
+        rig.idp.with([](yuzu::server::test::MockIdp& m) {
+            m.token_body = R"({"error":"invalid_grant","error_description":null})";
+        });
+    }
+    SECTION("a signed token whose aud is an array holding a number") {
+        auto claims = nlohmann::json::parse(payload);
+        claims["aud"] = nlohmann::json::array({123});
+        rig.idp.set_id_token(yuzu::server::test::rs256_sign(kid, claims.dump()));
+    }
+    SECTION("a document that throws something the parsers do not catch (number overflow)") {
+        rig.idp.with([](yuzu::server::test::MockIdp& m) {
+            m.token_body = R"({"id_token":"x","pad":1e999})";
+        });
+    }
+
+    auto r = rig.get(a, "/auth/callback?code=c&state=" + flow.state);
+    CHECK(r->status == 302);
+    CHECK(r->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK(binding_cookie_cleared(*r)); // the flow was matched and spent
+    CHECK_FALSE(has_cookie_named(*r, "yuzu_session="));
+    CHECK(rig.idp.token_calls.load() == 1);
+    const auto events = rig.fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
+    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+}
+
+// create_oidc_session returns an EMPTY token when the durable session row cannot be written
+// (ADR-0007 fail-safe). The callback must treat that as a failed sign-in: no cookie, no ok audit
+// row, no ok counter.
+TEST_CASE(
+    "OIDC binding route: a session that cannot be persisted is a failed sign-in, not a success",
+    "[pg][oidc][oidc_binding][auth_routes]") {
+    BindingRig rig;
+    yuzu::server::SessionStore store{*rig.fix.audit_pool};
+    REQUIRE(store.is_open());
+    rig.fix.auth_mgr.set_session_store(&store);
+    // Declared after `store`, so it is destroyed first: the manager never outlives its store.
+    struct Detach {
+        auth::AuthManager& mgr;
+        ~Detach() { mgr.set_session_store(nullptr); }
+    } detach{rig.fix.auth_mgr};
+
+    // Control: with the store intact the same flow signs in.
+    Browser ok_browser;
+    const auto ok_flow = rig.start(ok_browser, "alice-sub");
+    auto ok = rig.callback(ok_browser, ok_flow);
+    REQUIRE(ok->get_header_value("Location") == "/");
+    REQUIRE(has_cookie_named(*ok, "yuzu_session="));
+
+    // Fault: drop the durable session schema so the next INSERT fails.
+    {
+        auto lease = rig.fix.audit_pool->acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::exec_params(lease.get(), "DROP SCHEMA session_store CASCADE",
+                                      std::vector<std::string>{});
+    }
+    Browser b;
+    const auto flow = rig.start(b, "bob-sub");
+    auto r = rig.callback(b, flow);
+    CHECK(r->status == 302);
+    CHECK(r->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK_FALSE(has_cookie_named(*r, "yuzu_session="));
+    CHECK(binding_cookie_cleared(*r));
+
+    const auto events = rig.fix.audit_events(10);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
+    CHECK(events.front().detail == "reason=session_create_failed");
+    const auto ok_rows = std::count_if(events.begin(), events.end(), [](const AuditEvent& e) {
+        return e.action == "auth.oidc_login" && e.result == "ok";
+    });
+    CHECK(ok_rows == 1); // only the control login: the failed one wrote no ok row
+    CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
 }
 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN

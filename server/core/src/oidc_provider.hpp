@@ -156,6 +156,19 @@ public:
     /// JWKS fetch failed. A FIXED token.
     static constexpr const char* kJwksUnavailable = "JWKS signing keys unavailable";
 
+    /// The error `handle_callback` returns when something unexpected was thrown while processing
+    /// the IdP's response (the backstop behind the per-claim type guards). A FIXED token: the
+    /// route forwards the error into an audit event, so it never carries exception text.
+    static constexpr const char* kCallbackInternalError = "OIDC callback processing failed";
+
+    /// The bounds on every IdP GET (discovery, JWKS, Test Connection), pinned by name in
+    /// tests/unit/server/test_oidc_provider.cpp so a silent edit fails a test: the
+    /// connect/read/write timeout PER OPERATION, the whole-request bound as a multiple of it
+    /// (10 s by default), and the window during which a failed discovery is not retried.
+    static constexpr int kHttpOperationTimeoutMs = 5000;
+    static constexpr int kHttpTotalBoundMultiplier = 2;
+    static constexpr int kDiscoveryNegativeCacheMs = 30000;
+
     /// What `start_auth_flow` hands the route: the IdP redirect and the initiating-browser
     /// binding secret. The route sets the secret as a cookie on the SAME response and requires
     /// it back at the callback; the provider retains only its SHA-256, so the secret is never
@@ -267,7 +280,7 @@ public:
     /// exactly what a login will.
     [[nodiscard]] static std::expected<DiscoveryDocument, std::string>
     fetch_discovery_document(const std::string& issuer, bool skip_tls_verify,
-                             int timeout_ms = 5000);
+                             int timeout_ms = kHttpOperationTimeoutMs);
 
     /// The validation half of `fetch_discovery_document`, on an already fetched body. Pure: no
     /// network. Public so the scheme rules can be pinned for an https issuer without a TLS IdP.
@@ -286,7 +299,8 @@ public:
     /// honored. The URL's authority must be a well-formed `host[:port]` (see
     /// `fetch_discovery_document`). Returns the body of a 200 response.
     [[nodiscard]] static std::expected<std::string, std::string>
-    http_get_bounded(const std::string& url, bool skip_tls_verify, int timeout_ms = 5000);
+    http_get_bounded(const std::string& url, bool skip_tls_verify,
+                     int timeout_ms = kHttpOperationTimeoutMs);
 
     /// Parse a JWKS document into verifying keys (RSA, `use` absent or "sig"; others skipped).
     [[nodiscard]] static std::expected<std::vector<CachedJwk>, std::string>
@@ -337,7 +351,7 @@ private:
     bool fetch_jwks();
 
     OidcConfig config_;
-    std::atomic<int> http_timeout_ms_{5000}; // test seam only
+    std::atomic<int> http_timeout_ms_{kHttpOperationTimeoutMs}; // test seam only
     mutable std::mutex mu_;
 
     // Lazy discovery (ensure_discovered). Guards the four members below.
@@ -345,8 +359,8 @@ private:
     std::optional<DiscoveryDocument> discovered_;
     bool discovery_in_flight_{false}; // one fetcher at a time; the others fail fast
     std::chrono::steady_clock::time_point discovery_retry_after_{};
-    // 30 s by default; see set_discovery_negative_cache_for_test.
-    std::chrono::milliseconds discovery_retry_window_{30000};
+    // kDiscoveryNegativeCacheMs by default; see set_discovery_negative_cache_for_test.
+    std::chrono::milliseconds discovery_retry_window_{kDiscoveryNegativeCacheMs};
     std::unordered_map<std::string, PkceChallenge> pending_challenges_;
     std::atomic<bool> binding_digest_forced_failure_{false}; // test seam only
 

@@ -567,7 +567,7 @@ begin
   OIDCCheckbox.OnClick := @OIDCCheckboxClick;
 
   Y := 28;
-  OIDCIssuerLabel := MakeLabel(IdentityPage, Y, 'Issuer URL (e.g. https://login.microsoftonline.com/{tenant}/v2.0):');
+  OIDCIssuerLabel := MakeLabel(IdentityPage, Y, 'Issuer URL (e.g. https://login.microsoftonline.com/<tenant-guid>/v2.0):');
   Y := Y + 18;
   OIDCIssuerEdit := MakeEdit(IdentityPage, Y, EditW, GetCmdParam('OIDC_ISSUER'));
   Y := Y + 28;

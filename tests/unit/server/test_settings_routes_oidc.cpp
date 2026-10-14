@@ -179,9 +179,31 @@ namespace {
 std::string oidc_form(const std::string& secret, const std::string& issuer = "https://idp.example",
                       const std::string& client_id = "cid") {
     return "issuer=" + issuer + "&client_id=" + client_id + "&client_secret=" + secret +
-           "&redirect_uri=&admin_group=&skip_tls_verify=false";
+           "&redirect_uri=https://yuzu.example/auth/callback&admin_group=&skip_tls_verify=false";
 }
 } // namespace
+
+// A blank Redirect URI is a configuration that cannot sign in (no discovery, /auth/oidc/start
+// answers 500), so the route refuses it with a red 400 naming the field instead of a success toast.
+TEST_CASE("Settings OIDC: a blank Redirect URI is refused with a 400 naming the field",
+          "[settings][oidc]") {
+    OidcHarness h{"", /*open_store=*/false};
+    for (const char* blank : {"", "+", "%20%09"}) {
+        CAPTURE(blank);
+        auto res = h.sink.Post(
+            "/api/settings/oidc",
+            std::string("issuer=https://idp.example&client_id=cid&client_secret=s&redirect_uri=") +
+                blank + "&admin_group=&skip_tls_verify=false",
+            "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("feedback-error") != std::string::npos);
+        CHECK(res->body.find("Redirect URI is required") != std::string::npos);
+        CHECK(res->body.find("could NOT be saved") == std::string::npos);
+        CHECK(h.oidc_provider == nullptr); // nothing was built or swapped in
+        CHECK(h.audited.empty());          // and no configure event was claimed
+    }
+}
 
 TEST_CASE("Settings OIDC: the redaction placeholder means UNCHANGED, never a new secret",
           "[pg][settings][oidc][secret]") {

@@ -9043,11 +9043,11 @@ outcome's granularity.
 | `issuer` | string | Yes | OIDC issuer URL, exactly as the IdP's discovery document states it in `issuer` (e.g., Entra ID: `https://login.microsoftonline.com/<tenant-guid>/v2.0`, the tenant ID form; Keycloak: `https://<keycloak>/realms/<realm>`) |
 | `client_id` | string | Yes | Application (client) ID from Azure portal |
 | `client_secret` | string | No | Client secret value. If empty and a secret already exists, the existing secret is preserved. |
-| `redirect_uri` | string | No | Callback URL; set it, and register it at the IdP. An empty value is NOT auto-computed on this route (only the startup flag path fills in a localhost default): the provider then never fetches discovery and `GET /auth/oidc/start` answers `500` "OIDC redirect_uri not configured". |
+| `redirect_uri` | string | Yes | Callback URL; register exactly this value at the IdP. A blank value is refused with `400` and a red message naming the field (a provider without one never fetches discovery and `GET /auth/oidc/start` would answer `500` "OIDC redirect_uri not configured"). It is NOT auto-computed on this route: only the startup flag path fills in a localhost default. |
 | `admin_group` | string | No | Entra group object ID for admin role mapping |
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
-- **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success.
+- **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success. `400` with a red message when `issuer` or `client_id` is missing, or `redirect_uri` is blank; nothing is saved in that case.
 - **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts to that value. Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
 **`POST /api/settings/oidc/test`** — Test OIDC discovery and signing-key connectivity.

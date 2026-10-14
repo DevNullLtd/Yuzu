@@ -853,7 +853,7 @@ int main(int argc, char* argv[]) {
 
     // OIDC SSO options
     app.add_option("--oidc-issuer", cfg.oidc_issuer,
-                   "OIDC issuer URL (e.g. https://login.microsoftonline.com/{tenant}/v2.0)")
+                   "OIDC issuer URL (e.g. https://login.microsoftonline.com/<tenant-guid>/v2.0)")
         ->envname("YUZU_OIDC_ISSUER");
     app.add_option("--oidc-client-id", cfg.oidc_client_id, "OIDC client ID (app registration)")
         ->envname("YUZU_OIDC_CLIENT_ID");
@@ -867,7 +867,8 @@ int main(int argc, char* argv[]) {
                    "--oidc-client-secret / YUZU_OIDC_CLIENT_SECRET.")
         ->envname("YUZU_OIDC_CLIENT_SECRET_FILE");
     app.add_option("--oidc-redirect-uri", cfg.oidc_redirect_uri,
-                   "OIDC redirect URI (default: auto-computed from web address/port)")
+                   "OIDC redirect URI (default: http(s)://localhost:<port>/auth/callback; "
+                   "set it explicitly for any real IdP)")
         ->envname("YUZU_OIDC_REDIRECT_URI");
     app.add_option("--oidc-admin-group", cfg.oidc_admin_group,
                    "Entra group object ID that maps to admin role")

@@ -1435,6 +1435,7 @@ if build_server
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
+      'unit/server/test_oidc_https.cpp', # #5692: discovery + JWKS over TLS, incl. the handler-thread leg
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',

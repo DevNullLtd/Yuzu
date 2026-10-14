@@ -3066,7 +3066,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "value=\"" +
             html_escape(cfg_->oidc_issuer) +
             "\" "
-            "placeholder=\"https://login.microsoftonline.com/{tenant}/v2.0\" "
+            "placeholder=\"https://login.microsoftonline.com/&lt;tenant-guid&gt;/v2.0\" "
             "style=\"flex:1;min-width:0\">"
             "</div>";
 
@@ -4638,6 +4638,18 @@ void SettingsRoutes::register_routes(
             auto html = render_directory_fragment() +
                         "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
                         "hx-swap-oob=\"true\">Issuer URL and Client ID are required.</div>";
+            res.set_content(html, "text/html; charset=utf-8");
+            return;
+        }
+        // A provider without a redirect_uri never fetches discovery and /auth/oidc/start answers
+        // 500, so a blank value is a configuration that cannot sign in: refuse it here rather than
+        // report a saved one. (Only the startup flag path fills in a localhost default.)
+        if (redirect_uri.find_first_not_of(" \t\r\n") == std::string::npos) {
+            res.status = 400;
+            auto html = render_directory_fragment() +
+                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
+                        "hx-swap-oob=\"true\">Redirect URI is required: enter the callback URL "
+                        "registered at the IdP (https://&lt;server&gt;/auth/callback).</div>";
             res.set_content(html, "text/html; charset=utf-8");
             return;
         }
