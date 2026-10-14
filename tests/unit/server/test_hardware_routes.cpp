@@ -1227,7 +1227,7 @@ TEST_CASE("route: list pill — one Security:Read gate decision; only on-page id
     CHECK(h.security_gate_calls == 1);
     CHECK(h.security_read_probes.empty());
     CHECK(h.quarantine_list_calls == 1);
-    CHECK(h.last_quarantine_ids.size() == 2);
+    CHECK(h.last_quarantine_ids.size() == 2); // the read is restricted to the page's ids
     // exactly one Quarantined pill, and it is in a-on-page's row
     const auto first = res->body.find("hw-pill bad\">Quarantined");
     REQUIRE(first != std::string::npos);
@@ -1244,7 +1244,7 @@ TEST_CASE("route: list pill — one Security:Read gate decision; only on-page id
 }
 
 // Kills: a confined caller's scope not narrowing what the store is asked for.
-TEST_CASE("route: list pill — the caller's scope narrows the pills and the store query",
+TEST_CASE("route: list pill — the caller's scope narrows the pills",
           "[hardware][route][quarantine]") {
     HwHarness h(false, false, true);
     h.roster_rows = {make_row("mine", "MINE-HOST", "linux", true),
@@ -1253,7 +1253,8 @@ TEST_CASE("route: list pill — the caller's scope narrows the pills and the sto
     h.security_scope = authz::VisibleSet{std::unordered_set<std::string>{"mine"}};
     auto res = h.sink.Get("/fragments/hardware/list");
     REQUIRE(res);
-    CHECK(h.last_quarantine_ids == std::vector<std::string>{"mine"});
+    CHECK(h.last_quarantine_ids.size() == 2); // both candidates were read; only "mine" is shown
+    CHECK(h.security_gate_calls == 1);
     const auto pill = res->body.find("hw-pill bad\">Quarantined");
     REQUIRE(pill != std::string::npos);
     CHECK(res->body.find("hw-pill bad\">Quarantined", pill + 1) == std::string::npos);
@@ -1272,7 +1273,7 @@ TEST_CASE("route: list pill — an unavailable gate or a degraded read raises th
         REQUIRE(res);
         CHECK(contains(res->body, "Quarantine state unavailable"));
         CHECK_FALSE(contains(res->body, "hw-pill bad\">Quarantined"));
-        CHECK(h.quarantine_list_calls == 0);
+        CHECK(h.security_gate_calls == 1);
     }
     {
         HwHarness h(false, false, true);
@@ -1295,7 +1296,23 @@ TEST_CASE("route: list pill — an explicit 403 from the gate hides pills withou
     REQUIRE(res);
     CHECK_FALSE(contains(res->body, "hw-pill bad\">Quarantined"));
     CHECK_FALSE(contains(res->body, "Quarantine state unavailable"));
-    CHECK(h.quarantine_list_calls == 0);
+    CHECK(h.security_gate_calls == 1);
+}
+
+// Kills: the gate being called (and a denied audit row written) on every Hardware page load,
+// including pages and callers with nothing quarantined.
+TEST_CASE("route: list pill — no quarantine on the page means no list-gate call",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true);
+    h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
+    h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("elsewhere")};
+    h.security_gate_status = 403; // would be a denied audit row if it were ever asked
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    CHECK(h.quarantine_list_calls == 1);
+    CHECK(h.security_gate_calls == 0);
+    CHECK_FALSE(contains(res->body, "hw-pill bad\">Quarantined"));
+    CHECK_FALSE(contains(res->body, "Quarantine state unavailable"));
 }
 
 TEST_CASE("route: list — full render carries the Quarantined panel placeholder, results_only does not",

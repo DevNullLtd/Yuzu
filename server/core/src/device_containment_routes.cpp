@@ -65,8 +65,17 @@ void DeviceContainmentRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const authz::FleetReadGate gate = deps_.fleet_read_fn(req, res, "Security", "Read");
-        if (!gate.admitted)
-            return; // response already written by fleet_read_fn
+        if (!gate.admitted) {
+            if (res.status == 503) {
+                // The authorization store is unavailable: htmx would drop the 503 body and
+                // leave the placeholder empty, so say so instead (a 401/403 stays as written).
+                res = httplib::Response{};
+                res.status = 200;
+                view.read = QuarantinePanelView::Read::ProbeDegraded;
+                send_html(res, render_quarantine_panel(view));
+            }
+            return; // otherwise the response was already written by fleet_read_fn
+        }
         QuarantineVisibleOptions opt;
         opt.max_visible = kPanelCap;
         const QuarantineVisible vis = quarantine_visible_records(gate.scope, deps_.list_fn, opt);

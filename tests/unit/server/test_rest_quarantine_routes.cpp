@@ -292,6 +292,13 @@ TEST_CASE("REST POST /api/v1/quarantine flags a lost outcome row with Sec-Audit-
     CHECK(res->status == 201); // the attempt row recorded who asked; the change applied
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(h.is_quarantined("agent-B"));
+
+    // DELETE: the release applied, and its lost outcome row is flagged the same way.
+    auto del = h.del("agent-B");
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(del->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(h.is_quarantined("agent-B"));
 }
 
 TEST_CASE("REST POST /api/v1/quarantine is denied per-target by the scoped gate (403, no write) "

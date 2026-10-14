@@ -393,17 +393,19 @@ struct ContainmentHarness {
             }
             return true;
         };
-        if (!routes_unwired_gate_ctor)
-        d.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res, const std::string& t,
-                                 const std::string& op) -> authz::FleetReadGate {
-            ++gate_calls;
-            gate_asked = t + ":" + op;
-            if (!gate_admits) {
-                res.status = gate_status;
-                return {};
-            }
-            return {true, scope};
-        };
+        if (!routes_unwired_gate_ctor) {
+            d.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                     const std::string& t,
+                                     const std::string& op) -> authz::FleetReadGate {
+                ++gate_calls;
+                gate_asked = t + ":" + op;
+                if (!gate_admits) {
+                    res.status = gate_status;
+                    return {};
+                }
+                return {true, scope};
+            };
+        }
         d.list_fn = [this](const std::vector<std::string>* ids, std::size_t limit)
             -> std::optional<std::vector<QuarantineRecord>> {
             ++list_calls;
@@ -522,6 +524,32 @@ TEST_CASE("fragment: quarantined panel — a refused gate writes its own status 
         CHECK(res->status == 200);
         CHECK(contains(res->body, "could not be checked against your permissions"));
         CHECK_FALSE(contains(res->body, ">a</a>"));
+        CHECK(h.list_calls == 0);
+    }
+}
+
+// Kills: a transient authorization-store outage leaving the panel empty (htmx drops the 503).
+TEST_CASE("fragment: quarantined panel — an unavailable list gate (503) is a 200 banner, a 401 stays 401",
+          "[quarantine][route]") {
+    {
+        ContainmentHarness h;
+        h.list = std::vector<QuarantineRecord>{rec("a")};
+        h.gate_admits = false;
+        h.gate_status = 503;
+        auto res = h.sink.Get("/fragments/hardware/quarantine");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "could not be checked against your permissions"));
+        CHECK_FALSE(contains(res->body, ">a</a>"));
+        CHECK(h.list_calls == 0);
+    }
+    {
+        ContainmentHarness h;
+        h.gate_admits = false;
+        h.gate_status = 401;
+        auto res = h.sink.Get("/fragments/hardware/quarantine");
+        REQUIRE(res);
+        CHECK(res->status == 401);
         CHECK(h.list_calls == 0);
     }
 }

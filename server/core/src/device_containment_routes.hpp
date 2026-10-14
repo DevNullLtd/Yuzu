@@ -7,13 +7,15 @@
 ///                                                   / the record-header banner
 ///
 /// Read-only twins of `GET /api/v1/quarantine`: the same admit-then-filter rules, via the
-/// shared `quarantine_visible_records` (quarantine_visible.hpp).
+/// shared `quarantine_visible_records` (quarantine_visible.hpp) and ONE `Security:Read`
+/// list-gate decision per panel view (ADR-0017).
 /// Create and release are NOT here: the page JS calls the existing `POST` and
 /// `DELETE /api/v1/quarantine` through the shared dialog module.
 ///
-/// htmx does not swap a non-2xx body, so every gate refusal and every degraded read is
-/// answered 200 with an honest note (the gate itself is probed against a throwaway
-/// Response); only an unauthenticated caller gets the real 401.
+/// htmx does not swap a non-2xx body, so every degraded read, an unavailable list gate
+/// (503) and an unwired gate are answered 200 with an honest note; an unauthenticated
+/// caller gets the real 401 and a caller without `Security:Read` the gate's own 403 (the
+/// panel is then simply not drawn, which is the intended outcome for that caller).
 
 #include "authz_gates.hpp"      // authz::FleetReadGate
 #include "inventory_routes.hpp" // InventoryRoutes::AuthFn / HostnamesFn, InventoryDeviceRow

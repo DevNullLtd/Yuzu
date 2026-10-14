@@ -30,6 +30,8 @@ struct QuarantinePanelRow {
 };
 
 struct QuarantinePanelView {
+    /// StoreDegraded = the store read failed; ProbeDegraded = the caller's authority could not
+    /// be derived (the list gate was unwired or unavailable).
     enum class Read { Ok, StoreDegraded, ProbeDegraded } read{Read::Ok};
     std::vector<QuarantinePanelRow> rows; ///< visible, newest first, already capped
     bool more{false};                     ///< the cap stopped the walk
