@@ -538,3 +538,63 @@ TEST_CASE("update package rows encode each path part, and offer no action for an
     // The three dot-only packages are listed but carry no rollout/delete action.
     CHECK(res->body.find("identifier not supported for actions") != std::string::npos);
 }
+
+// ── The hosted Agent Updates fragment (System > Plugins and updates, SYS-3) ───
+//
+// The same fragment backs /settings and /settings/plugins. These pin the form edits the
+// System page relies on: a required number input prefilled with the current rollout (a
+// blank value is read as 100 by the handler), no inline handler, percent-encoded package
+// URLs, and the data-* the page's confirm listener reads.
+
+TEST_CASE("updates fragment: rollout is a required number input, prefilled, with no inline handler",
+          "[ota][settings_routes][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/37, /*mandatory=*/true);
+
+    auto res = h.sink.Get("/fragments/settings/updates");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto& b = res->body;
+    CHECK(b.find("<input type=\"number\" name=\"rollout_pct\" min=\"0\" max=\"100\" step=\"1\" "
+                 "required value=\"37\"") != std::string::npos);
+    CHECK(b.find("type=\"range\"") == std::string::npos);
+    CHECK(b.find("onchange=") == std::string::npos);
+    CHECK(b.find("hx-on") == std::string::npos);
+    // What the page's confirm listener reads: the rollout form and the row it sits in.
+    CHECK(b.find("data-confirm=\"rollout\"") != std::string::npos);
+    CHECK(b.find("data-mandatory=\"yes\"") != std::string::npos);
+    CHECK(b.find("data-signed=\"no\"") != std::string::npos);
+    CHECK(b.find("<tr data-platform=\"linux\" data-arch=\"x86_64\" data-version=\"1.2.3\" "
+                 "data-rollout=\"37\">") != std::string::npos);
+    // The upload form asks for confirmation too, and its rollout cannot be blank.
+    CHECK(b.find("data-confirm=\"ota-upload\"") != std::string::npos);
+    CHECK(b.find("name=\"rollout_pct\" min=\"0\" max=\"100\" step=\"1\" required value=\"100\"") !=
+          std::string::npos);
+}
+
+TEST_CASE("updates fragment: package URLs are percent-encoded", "[ota][settings_routes][pg]") {
+    // is_safe_package_filename refuses only empty, `.`, `..` and `/ \ :`, so `#`, `?`, `%`
+    // and a space are legal in a version stem. html_escape alone sent Roll out / Delete to
+    // the wrong URL for them.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    UpdatePackage pkg;
+    pkg.platform = "linux";
+    pkg.arch = "x86_64";
+    pkg.version = "1.2#3?x%y z";
+    pkg.sha256 = std::string(64, 'b');
+    pkg.filename = "yuzu-agent-odd";
+    pkg.rollout_pct = 10;
+    pkg.file_size = 1024;
+    REQUIRE(h.registry->upsert_package(pkg));
+
+    auto res = h.sink.Get("/fragments/settings/updates");
+    REQUIRE(res);
+    const auto& b = res->body;
+    const std::string enc = "/api/settings/updates/linux/x86_64/1.2%233%3Fx%25y%20z";
+    CHECK(b.find("hx-post=\"" + enc + "/rollout\"") != std::string::npos);
+    CHECK(b.find("hx-delete=\"" + enc + "\"") != std::string::npos);
+    // The displayed version and the data attribute stay human-readable, escaped.
+    CHECK(b.find("data-version=\"1.2#3?x%y z\"") != std::string::npos);
+}

@@ -71,6 +71,7 @@
 // overload the way KekRoutes does).
 #include "http_route_sink.hpp"
 #include "plugin_config_routes.hpp"
+#include "settings_plugins_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "upload_grant_store.hpp"
 #include "file_retrieval_routes.hpp"
@@ -20232,6 +20233,20 @@ private:
                     .auth_fn = auth_fn,
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
+                });
+
+            // System > Plugins and updates: the page and the plugin read fragments.
+            settings_plugins::register_settings_plugins_routes(
+                operator_surface_sink,
+                settings_plugins::Deps{
+                    .config_store = plugin_config_store_.get(),
+                    .pack_store = product_pack_store_.get(),
+                    .rbac_store = rbac_store_.get(),
+                    .mgmt_store = mgmt_group_store_.get(),
+                    .admin_fn = [this](const httplib::Request& req,
+                                       httplib::Response& res) { return require_admin(req, res); },
+                    .auth_fn = auth_fn,
+                    .help_json_fn = [this]() { return registry_.help_json(); },
                 });
 
             register_file_retrieval_routes(
