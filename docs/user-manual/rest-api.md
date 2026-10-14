@@ -6127,7 +6127,11 @@ cadence the scheduler really applies (the time-of-day, weekday and day-of-month 
 and ignored), Count and Last run, and an owner flag computed from the session. A schedule the
 caller did not create shows only All devices or Targeted: the scope expression, interval, approval
 flag, parameters and creator are in no read that carries another user's schedule (REST v1, MCP) and
-are not rendered for one. The default view is unchanged.
+are not rendered for one. The page view also carries `data-can-write`, `data-can-enable` and
+`data-can-delete` on its list root (render hints probed once per render from `Schedule:Write`,
+`Execution:Execute` and `Schedule:Delete`, never a gate; each probe refused writes one
+`auth.permission_required` audit row) and per-row Enable/Disable and Delete buttons, disabled for
+a row the caller did not create. The default view is unchanged.
 
 #### `GET /fragments/workflows`
 
