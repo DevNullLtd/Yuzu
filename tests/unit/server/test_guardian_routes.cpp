@@ -51,12 +51,15 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 // The /guardian page shell (defined in guardian_ui.cpp).
 extern const char* const kGuardianHtml;
 
 using namespace yuzu::server;
+
+extern const char* const kGuardianDetailPageHtml;
 
 namespace {
 
@@ -172,6 +175,10 @@ struct Harness {
     // Every perm_fn call, so a test can prove a polled fragment makes exactly
     // its own one gate check and no extra capability probes (S2).
     int perm_calls{0};
+    // Step-up stub: records each labelled call; `step_up_pass=false` writes the
+    // production 401 envelope (meta.mfa_step_up_required) and refuses.
+    bool step_up_pass{true};
+    std::vector<std::string> step_up_labels;
 
     // Real MetricsRegistry (#4252) so tests can assert on
     // yuzu_server_guardian_platform_matrix_stale_total{spark_type} — the
@@ -242,7 +249,25 @@ struct Harness {
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, store.get(),
                                baselines.get(), agents_json_fn, push_fn,
-                               with_metrics ? &metrics : nullptr);
+                               with_metrics ? &metrics : nullptr,
+                               [this](const httplib::Request&, httplib::Response& res,
+                                      const auth::Session&, const std::string& label) -> bool {
+                                   step_up_labels.push_back(label);
+                                   if (step_up_pass)
+                                       return true;
+                                   res.status = 401;
+                                   res.set_content(
+                                       R"({"error":{"code":401,"message":"step-up required"},)"
+                                       R"("meta":{"mfa_step_up_required":true,)"
+                                       R"("challenge_url":"/login/mfa/stepup"}})",
+                                       "application/json");
+                                   return false;
+                               });
+    }
+
+    // Same-site headers a browser fetch would carry.
+    static std::unordered_map<std::string, std::string> same_site() {
+        return {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     }
 
     void seed_guard(const std::string& rule_id, const std::string& name) {
@@ -1774,4 +1799,224 @@ TEST_CASE("fleet status shows a 24 h drift readout that excludes older events",
     // The 7-day card still counts all three detections.
     CHECK(res->body.find("warn\">3</div><div class=\"stat-label\">Drift detected") !=
           std::string::npos);
+}
+
+// -- N3: Guard edit / delete twins ----------------------------------------------------
+
+namespace {
+constexpr const char* kGuardUpdate = "/fragments/guardian/guard/g1/update";
+constexpr const char* kGuardDelete = "/fragments/guardian/guard/g1/delete";
+constexpr const char* kForm = "application/x-www-form-urlencoded";
+
+// A Watch (audit-mode) Guard: make_rule() defaults to enforce.
+void seed_watch(Harness& h) {
+    auto r = make_rule("g1", "GuardOne");
+    r.enforcement_mode = "audit";
+    h.seed_rule(r);
+}
+} // namespace
+
+TEST_CASE("guard update: saves metadata, bumps the version, audits the update verb",
+          "[pg][guardian_routes][guard][update]") {
+    Harness h;
+    seed_watch(h);
+    auto res = h.sink.dispatch("POST", std::string(kGuardUpdate), "name=Renamed&severity=high&enabled=0",
+                               kForm, Harness::same_site());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto row = h.store->get_rule("g1");
+    REQUIRE(row);
+    REQUIRE(*row);
+    CHECK((*row)->name == "Renamed");
+    CHECK((*row)->severity == "high");
+    CHECK_FALSE((*row)->enabled);
+    CHECK((*row)->version == 2);
+    CHECK(h.audit_count("guaranteed_state.rule.update", "success") == 1);
+    REQUIRE(h.step_up_labels.size() == 1);
+    CHECK(h.step_up_labels[0] == "POST /fragments/guardian/guard/{id}/update");
+}
+
+TEST_CASE("guard update: step-up refusal leaves the Guard untouched and passes the 401 envelope",
+          "[pg][guardian_routes][guard][update]") {
+    Harness h;
+    seed_watch(h);
+    h.step_up_pass = false;
+    auto res = h.sink.dispatch("POST", std::string(kGuardUpdate), "name=Renamed", kForm,
+                               Harness::same_site());
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(res->body.find("mfa_step_up_required") != std::string::npos);
+    CHECK((**h.store->get_rule("g1")).name == "GuardOne");
+    CHECK(h.audit_count("guaranteed_state.rule.update", "success") == 0);
+}
+
+TEST_CASE("guard update and delete: a service-scoped token is denied before any mutation",
+          "[pg][guardian_routes][guard][update][delete]") {
+    Harness h;
+    seed_watch(h);
+    h.session_token_scope_service = "svc";
+    auto u = h.sink.dispatch("POST", std::string(kGuardUpdate), "name=X", kForm, Harness::same_site());
+    auto d = h.sink.dispatch("POST", std::string(kGuardDelete), "confirm_name=GuardOne", kForm,
+                             Harness::same_site());
+    REQUIRE(u);
+    REQUIRE(d);
+    CHECK(u->status == 403);
+    CHECK(d->status == 403);
+    CHECK(h.step_up_labels.empty());
+    CHECK((**h.store->get_rule("g1")).name == "GuardOne");
+    CHECK(h.audit_count("guaranteed_state.rule.update", "denied") == 1);
+    CHECK(h.audit_count("guaranteed_state.rule.delete", "denied") == 1);
+}
+
+TEST_CASE("guard update and delete: a cross-origin or header-less post is refused with csrf_denied",
+          "[pg][guardian_routes][guard][update][delete]") {
+    Harness h;
+    seed_watch(h);
+    std::unordered_map<std::string, std::string> evil{{"Host", "yuzu.test"},
+                                                      {"Origin", "https://evil.example"}};
+    auto u = h.sink.dispatch("POST", std::string(kGuardUpdate), "name=X", kForm, evil);
+    auto d = h.sink.dispatch("POST", std::string(kGuardDelete), "confirm_name=GuardOne", kForm);
+    REQUIRE(u);
+    REQUIRE(d);
+    CHECK(u->status == 403);
+    CHECK(d->status == 403);
+    CHECK(h.step_up_labels.empty());
+    REQUIRE(h.store->get_rule("g1").has_value());
+    CHECK(*h.store->get_rule("g1"));
+    bool csrf = false;
+    for (const auto& a : h.audit_log)
+        csrf = csrf || (a.result == "denied" && a.detail == "csrf_denied");
+    CHECK(csrf);
+}
+
+TEST_CASE("guard update: a different Mode is a 400 and Watch/echoed Mode is accepted",
+          "[pg][guardian_routes][guard][update]") {
+    Harness h;
+    seed_watch(h);
+
+    auto bad = h.sink.dispatch("POST", std::string(kGuardUpdate), "mode=enforce&name=X", kForm,
+                               Harness::same_site());
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK((**h.store->get_rule("g1")).name == "GuardOne");
+    CHECK(h.audit_count("guaranteed_state.rule.update", "denied") == 1);
+    auto ok = h.sink.dispatch("POST", std::string(kGuardUpdate), "mode=watch&name=Y", kForm,
+                              Harness::same_site());
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("guard update: unknown Guard is 404, bad severity and empty name are 400",
+          "[pg][guardian_routes][guard][update]") {
+    Harness h;
+    seed_watch(h);
+    auto nf = h.sink.dispatch("POST", "/fragments/guardian/guard/nope/update", "name=X", kForm,
+                              Harness::same_site());
+    auto sev = h.sink.dispatch("POST", std::string(kGuardUpdate), "severity=bogus", kForm,
+                               Harness::same_site());
+    auto nm = h.sink.dispatch("POST", std::string(kGuardUpdate), "name=", kForm, Harness::same_site());
+    REQUIRE(nf);
+    REQUIRE(sev);
+    REQUIRE(nm);
+    CHECK(nf->status == 404);
+    CHECK(sev->status == 400);
+    CHECK(nm->status == 400);
+}
+
+TEST_CASE("guard update: promoting-risk check refuses an enforce Guard on a denylisted target",
+          "[pg][guardian_routes][guard][update]") {
+    Harness h;
+    auto r = make_rule("g1", "GuardOne");
+    r.enforcement_mode = "enforce";
+    r.spec_json = R"({"spark":{"type":"registry-change"},"assertion":{"type":"registry-value-equals",)"
+                  R"("params":{"key":"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",)"
+                  R"("value_name":"x","expected":"1"}},"remediation":{}})";
+    h.seed_rule(r);
+    auto res = h.sink.dispatch("POST", std::string(kGuardUpdate), "name=Renamed", kForm,
+                               Harness::same_site());
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK((**h.store->get_rule("g1")).name == "GuardOne");
+}
+
+TEST_CASE("guard delete: requires the typed name, then removes the Guard and audits the verb",
+          "[pg][guardian_routes][guard][delete]") {
+    Harness h;
+    seed_watch(h);
+    auto no = h.sink.dispatch("POST", std::string(kGuardDelete), "confirm_name=guardone", kForm,
+                              Harness::same_site());
+    REQUIRE(no);
+    CHECK(no->status == 400);
+    CHECK(*h.store->get_rule("g1"));
+    auto yes = h.sink.dispatch("POST", std::string(kGuardDelete), "confirm_name=GuardOne", kForm,
+                               Harness::same_site());
+    REQUIRE(yes);
+    CHECK(yes->status == 200);
+    CHECK_FALSE(*h.store->get_rule("g1"));
+    CHECK(h.audit_count("guaranteed_state.rule.delete", "success") == 1);
+    REQUIRE_FALSE(h.step_up_labels.empty());
+    CHECK(h.step_up_labels.back() == "POST /fragments/guardian/guard/{id}/delete");
+    auto gone = h.sink.dispatch("POST", std::string(kGuardDelete), "confirm_name=GuardOne", kForm,
+                                Harness::same_site());
+    REQUIRE(gone);
+    CHECK(gone->status == 404);
+}
+
+TEST_CASE("guard update and delete are gated on GuaranteedState Write and Delete",
+          "[pg][guardian_routes][guard][update][delete]") {
+    Harness h;
+    seed_watch(h);
+    h.denied = {"GuaranteedState:Write", "GuaranteedState:Delete"};
+    auto u = h.sink.dispatch("POST", std::string(kGuardUpdate), "name=X", kForm, Harness::same_site());
+    auto d = h.sink.dispatch("POST", std::string(kGuardDelete), "confirm_name=GuardOne", kForm,
+                             Harness::same_site());
+    REQUIRE(u);
+    REQUIRE(d);
+    CHECK(u->status == 403);
+    CHECK(d->status == 403);
+    CHECK(h.step_up_labels.empty());
+}
+
+TEST_CASE("guard page: Edit and Delete are drawn only when the Write / Delete probe passes",
+          "[pg][guardian_routes][guard][page]") {
+    Harness h;
+    seed_watch(h);
+    const std::string page = "/fragments/guardian/guard/g1/page";
+    auto all = h.sink.Get(page);
+    REQUIRE(all);
+    CHECK(all->body.find("data-gp-act=\"edit\"") != std::string::npos);
+    CHECK(all->body.find("data-gp-act=\"delete\"") != std::string::npos);
+    CHECK(all->body.find("onclick=\"gpEdit") == std::string::npos);
+
+    h.denied = {"GuaranteedState:Delete"};
+    auto no_del = h.sink.Get(page);
+    REQUIRE(no_del);
+    CHECK(no_del->status == 200); // the probe's 403 never reaches the real response
+    CHECK(no_del->body.find("data-gp-act=\"edit\"") != std::string::npos);
+    CHECK(no_del->body.find("data-gp-act=\"delete\"") == std::string::npos);
+
+    h.denied = {"GuaranteedState:Write", "GuaranteedState:Delete"};
+    auto ro = h.sink.Get(page);
+    REQUIRE(ro);
+    CHECK(ro->body.find("data-gp-act=") == std::string::npos);
+
+    // Exactly Read + Write + Delete per page render; the polled events fragment adds none.
+    h.denied.clear();
+    h.perm_calls = 0;
+    h.sink.Get(page);
+    CHECK(h.perm_calls == 3);
+}
+
+TEST_CASE("guard page shell: dialog module loads first and the delete copy is the #4304 sentence",
+          "[guardian_routes][guard][page][ui]") {
+    const std::string html = kGuardianDetailPageHtml;
+    const auto dlg = html.find("/static/yuzu-dialog.js");
+    const auto ctl = html.find("data-gp-act");
+    REQUIRE(dlg != std::string::npos);
+    REQUIRE(ctl != std::string::npos);
+    CHECK(dlg < ctl);
+    CHECK(html.find("Deletes the Guard and its live compliance state; agents already enforcing it keep enforcing until the next push (#4304).") !=
+          std::string::npos);
+    CHECK(html.find("Last write wins") != std::string::npos);
+    CHECK(html.find("(read-only)") != std::string::npos);
 }

@@ -1111,6 +1111,151 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
     res.set_content(render_guards_fragment(), "text/html; charset=utf-8");
 }
 
+bool GuardianRoutes::deny_cross_origin_(const httplib::Request& req, httplib::Response& res,
+                                        const std::string& audit_action,
+                                        const std::string& target_id) const {
+    const std::string origin = req.get_header_value("Origin");
+    const std::string referer = req.get_header_value("Referer");
+    const bool same_site =
+        !(origin.empty() && referer.empty()) &&
+        origin_is_same_site(req.get_header_value("Host"), origin, referer, csrf_trusted_origins_);
+    if (same_site)
+        return false;
+    res.status = 403;
+    res.set_content(detail::a4_denial(res, 403, "cross-origin request refused"),
+                    "application/json");
+    if (audit_fn_) {
+        try {
+            audit_fn_(req, audit_action, "denied", "GuaranteedState", target_id, "csrf_denied");
+        } catch (const std::exception& e) {
+            spdlog::warn("{}: audit_fn_ threw: {}", audit_action, e.what());
+        } catch (...) {
+            spdlog::warn("{}: audit_fn_ threw (non-std)", audit_action);
+        }
+    }
+    return true;
+}
+
+void GuardianRoutes::update_guard_action(const httplib::Request& req, httplib::Response& res,
+                                         const std::string& rule_id) {
+    static constexpr const char* kVerb = "guaranteed_state.rule.update";
+    auto fail = [&](int status, const std::string& msg) {
+        res.status = status;
+        res.set_content(detail::a4_error(res, msg), "application/json");
+        audit_fn_(req, kVerb, "denied", "GuaranteedState", rule_id, msg);
+    };
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return;
+    if (step_up_fn_ && !step_up_fn_(req, res, *session, "POST /fragments/guardian/guard/{id}/update"))
+        return; // step-up wrote the 401 envelope (or the redirect)
+    if (!store_ || !store_->is_open()) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, "Guardian store unavailable"), "application/json");
+        return;
+    }
+    auto found = store_->get_rule(rule_id);
+    if (!found) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, "Guardian store degraded"), "application/json");
+        return;
+    }
+    if (!*found)
+        return fail(404, "rule not found");
+    auto updated = **found;
+
+    auto get = [&](const char* k) -> std::string {
+        return req.has_param(k) ? req.get_param_value(k) : std::string{};
+    };
+    // Mode (Watch/Enforce) is immutable: echoing the current value is fine, a
+    // different one is a 400, never a silent flip (same rule as the REST PUT).
+    if (req.has_param("mode")) {
+        std::string m = get("mode");
+        if (m == "watch")
+            m = "audit";
+        if (m != updated.enforcement_mode)
+            return fail(400, "mode is immutable — create a new Guard for a different posture "
+                             "(Watch vs Enforce)");
+    }
+    if (req.has_param("name")) {
+        updated.name = get("name");
+        if (updated.name.empty())
+            return fail(400, "Name is required.");
+    }
+    if (req.has_param("enabled"))
+        updated.enabled = get("enabled") == "1";
+    if (req.has_param("severity")) {
+        const std::string sv = get("severity");
+        // Closed enum: severity renders into a CSS class (same as create).
+        if (sv != "critical" && sv != "high" && sv != "medium" && sv != "low")
+            return fail(400, "Severity must be critical, high, medium or low.");
+        updated.severity = sv;
+    }
+    updated.version = (*found)->version + 1;
+
+    // Single source with the REST PUT and the create form. A metadata-only body
+    // (no spark/assertion/remediation) returns structured=false and keeps the stored spec.
+    auto spec = guardian::derive_rule_spec(nlohmann::json::object(), updated.name,
+                                           updated.version, updated.enabled,
+                                           updated.enforcement_mode);
+    if (spec.error)
+        return fail(400, spec.error->message);
+    // derive_rule_spec did not run the assertion validator over the stored spec, so
+    // re-check an enforce Guard against the dangerous-target denylist (contract §6).
+    if (updated.enforcement_mode == "enforce")
+        if (std::string why = guardian::dangerous_enforce_in_spec(updated.spec_json); !why.empty())
+            return fail(400, "enforce mode not permitted: this guard targets " + why);
+
+    updated.updated_at = format_iso_utc(now_epoch_seconds());
+    updated.updated_by = session->username;
+    if (auto r = store_->update_rule(updated); !r) {
+        return fail(is_conflict_error(r.error()) ? 409 : 400,
+                    std::string(strip_conflict_prefix(r.error())));
+    }
+    // Last write wins: no concurrency check (#4303), same as the REST PUT.
+    audit_fn_(req, kVerb, "success", "GuaranteedState", rule_id, updated.name);
+    res.set_content(nlohmann::json{{"updated", true}, {"version", updated.version}}.dump(),
+                    "application/json");
+}
+
+void GuardianRoutes::delete_guard_action(const httplib::Request& req, httplib::Response& res,
+                                         const std::string& rule_id) {
+    static constexpr const char* kVerb = "guaranteed_state.rule.delete";
+    auto fail = [&](int status, const std::string& msg) {
+        res.status = status;
+        res.set_content(detail::a4_error(res, msg), "application/json");
+        audit_fn_(req, kVerb, "denied", "GuaranteedState", rule_id, msg);
+    };
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return;
+    if (step_up_fn_ && !step_up_fn_(req, res, *session, "POST /fragments/guardian/guard/{id}/delete"))
+        return;
+    if (!store_ || !store_->is_open()) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, "Guardian store unavailable"), "application/json");
+        return;
+    }
+    auto found = store_->get_rule(rule_id);
+    if (!found) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, "Guardian store degraded"), "application/json");
+        return;
+    }
+    if (!*found)
+        return fail(404, "rule not found");
+    // Typed-name confirm, enforced here as well as in the dialog: the request must
+    // carry the Guard's exact name.
+    if (!req.has_param("confirm_name") || req.get_param_value("confirm_name") != (*found)->name)
+        return fail(400, "type the Guard's exact name to confirm the delete");
+    if (auto r = store_->delete_rule(rule_id); !r)
+        return fail(404, r.error());
+    // Does NOT unarm agents already enforcing it (#4304): they keep enforcing until
+    // the next push converges them.
+    audit_fn_(req, kVerb, "success", "GuaranteedState", rule_id, (*found)->name);
+    res.set_content(nlohmann::json{{"deleted", true}}.dump(), "application/json");
+}
+
 void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib::Response& res) {
     auto get = [&](const std::string& k) -> std::string {
         return req.has_param(k) ? req.get_param_value(k) : std::string{};
@@ -2020,9 +2165,11 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     return h;
 }
 
-std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_id) const {
+std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_id, bool can_write,
+                                                       bool can_delete) const {
     std::string name = guard_id, severity, os = "all", os_target_raw = "windows", yaml, spec_json;
     bool real_rule = false, enabled = true, enforcing = false;
+    int64_t version = 0;
     if (store_ && store_->is_open()) {
         // get_rule is now three-state (ADR-0038): found / genuinely absent / degraded.
         // Both "not found" and "degraded" fall through to the same "Guard not found"
@@ -2038,6 +2185,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             os = rr.os_target.empty() ? "all" : rr.os_target;
             yaml = rr.yaml_source;
             spec_json = rr.spec_json;
+            version = rr.version;
         }
     }
     if (!real_rule)
@@ -2210,7 +2358,20 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
          "<button class=\"gp-btn accent\" onclick=\"location.reload()\">Refresh</button>"
          "<button class=\"gp-btn\" onclick=\"gpAction('POST','/fragments/guardian/guard/" +
          html_escape(guard_id) + "/enabled?value=" + (enabled ? "0" : "1") + "')\">" +
-         (enabled ? "Disable" : "Enable") + "</button></div></div>";
+         (enabled ? "Disable" : "Enable") + "</button>";
+    // Edit / Delete: drawn only when the render-time probe passed. Plain data-
+    // attributes; the page shell's delegated handler opens the YuzuDialog (and
+    // hides these buttons when the module did not load).
+    const std::string gp_data = " data-gp-id=\"" + html_escape(guard_id) + "\" data-gp-name=\"" +
+                                html_escape(name) + "\"";
+    if (can_write)
+        h += "<button class=\"gp-btn\" data-gp-act=\"edit\"" + gp_data + " data-gp-severity=\"" +
+             html_escape(severity) + "\" data-gp-enabled=\"" + (enabled ? "1" : "0") +
+             "\" data-gp-mode=\"" + mode + "\" data-gp-version=\"" + std::to_string(version) +
+             "\">Edit</button>";
+    if (can_delete)
+        h += "<button class=\"gp-btn\" data-gp-act=\"delete\"" + gp_data + ">Delete</button>";
+    h += "</div></div>";
 
     // What it checks.
     h += "<div class=\"gp-sech\">What it checks</div>";
@@ -2384,7 +2545,8 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                                      BaselineStore* baseline_store,
                                      AgentsJsonFn agents_json_fn,
                                      PushFn push_fn,
-                                     yuzu::MetricsRegistry* metrics) {
+                                     yuzu::MetricsRegistry* metrics,
+                                     StepUpFn step_up_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload below (mirrors RestApiV1 / SettingsRoutes;
     // see http_route_sink.hpp). Lets the handlers be unit-tested in-process via
@@ -2392,7 +2554,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(emit_event_fn), store, baseline_store, std::move(agents_json_fn),
-                    std::move(push_fn), metrics);
+                    std::move(push_fn), metrics, std::move(step_up_fn));
 }
 
 void GuardianRoutes::register_routes(HttpRouteSink& sink,
@@ -2404,7 +2566,8 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                                      BaselineStore* baseline_store,
                                      AgentsJsonFn agents_json_fn,
                                      PushFn push_fn,
-                                     yuzu::MetricsRegistry* metrics) {
+                                     yuzu::MetricsRegistry* metrics,
+                                     StepUpFn step_up_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
@@ -2414,6 +2577,7 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     agents_json_fn_ = std::move(agents_json_fn);
     push_fn_ = std::move(push_fn);
     metrics_ = metrics;
+    step_up_fn_ = std::move(step_up_fn);
     if (metrics_) {
         // Pre-seed the closed spark_type label set (#4252), per
         // docs/observability-conventions.md: a bounded-label counter is
@@ -2546,7 +2710,14 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                     audit_fn_(req, "guaranteed_state.rule.view", "success", "GuaranteedState",
                               guard_id,
                               "per-guard fleet-wide agent status drilldown via dashboard fragment");
-                res.set_content(render_guard_page_fragment(guard_id), "text/html; charset=utf-8");
+                // Render-only capability probe, once per page load: a scratch response
+                // absorbs perm_fn_'s 403 so a denial never touches the real one.
+                httplib::Response probe;
+                const bool can_write = perm_fn_(req, probe, "GuaranteedState", "Write");
+                probe = httplib::Response{};
+                const bool can_delete = perm_fn_(req, probe, "GuaranteedState", "Delete");
+                res.set_content(render_guard_page_fragment(guard_id, can_write, can_delete),
+                                "text/html; charset=utf-8");
             });
 
     // -- Baselines list ----------------------------------------------------
@@ -2627,6 +2798,31 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  const bool enable = req.has_param("value") && req.get_param_value("value") == "1";
                  apply_guard_change(req, res, id, enable);
+             });
+
+    // -- Guard edit / delete twins (N3) -----------------------------------
+    // Fetch-driven (YuzuDialog.request): JSON answers with real statuses so the
+    // 401 step-up envelope reaches the dialog. Gate order: service-scope deny,
+    // same-site (csrf_denied audit), RBAC, then step-up + the mutation itself.
+    sink.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/update)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.rule.update", id))
+                     return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.rule.update", id)) return;
+                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
+                 update_guard_action(req, res, id);
+             });
+    sink.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/delete)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Delete",
+                                                   "guaranteed_state.rule.delete", id))
+                     return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.rule.delete", id)) return;
+                 if (!perm_fn_(req, res, "GuaranteedState", "Delete")) return;
+                 delete_guard_action(req, res, id);
              });
 
     // -- Structured create (Baseline) -------------------------------------
