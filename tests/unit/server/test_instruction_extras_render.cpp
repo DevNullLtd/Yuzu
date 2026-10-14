@@ -48,10 +48,29 @@ instruction_yaml::DefinitionFields yaml_fields() {
     f.plugin = "os_info";
     f.action = "os_version";
     f.description = "new description";
+    f.has_description = true;
     return f; // version/type/concurrency/approval omitted
 }
 
 } // namespace
+
+TEST_CASE("instruction_extras: a YAML that omits description keeps the stored one; an explicit "
+          "empty one clears it",
+          "[instruction_extras][merge]") {
+    auto stored = stored_row();
+    stored.description = "kept description";
+
+    auto f = yaml_fields();
+    f.description.clear();
+    f.has_description = false; // the YAML does not mention a description
+    CHECK(ex::merge_yaml_into_stored(stored, f, "y", "editor").description == "kept description");
+
+    f.has_description = true; // `description: ""`
+    CHECK(ex::merge_yaml_into_stored(stored, f, "y", "editor").description.empty());
+
+    f.description = "edited";
+    CHECK(ex::merge_yaml_into_stored(stored, f, "y", "editor").description == "edited");
+}
 
 TEST_CASE("instruction_extras: merge carries forward every column the YAML cannot express",
           "[instruction_extras][merge]") {

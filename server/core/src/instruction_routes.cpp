@@ -5,6 +5,7 @@
 #include "instruction_store.hpp"
 #include "instruction_yaml.hpp"
 #include "json_extract.hpp"
+#include "rest_a4_envelope_http.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp"
 
@@ -12,6 +13,9 @@
 #include <spdlog/spdlog.h>
 
 #include <cctype>
+#include <charconv>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 // Editor fragment HTML templates — defined in instruction_ui.cpp (a
@@ -325,7 +329,9 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             // between the load and this write, and would re-run the write-time schema check
             // on a legacy row.
             def.parameter_schema.clear();
-            auto result = deps.store->update_definition(def);
+            // Optimistic concurrency: only apply if the row is still the one loaded above, so
+            // a concurrent edit is a 409 rather than silently overwritten by this stale copy.
+            auto result = deps.store->update_definition(def, def.updated_at);
             if (!result) {
                 // ADR-0058: a genuine DB/lease failure 503s; "not_found: " -> 404 (mirrors
                 // the DELETE route immediately below); everything else is a 400 validation
@@ -349,10 +355,13 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                              "InstructionDefinition", id, "not_found");
                 if ((db_error || not_found) && !audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
-                res.status = db_error ? 503 : (not_found ? 404 : 400);
+                const bool conflict = !db_error && is_conflict_error(result.error());
+                res.status = db_error ? 503 : (not_found ? 404 : (conflict ? 409 : 400));
                 res.set_content(nlohmann::json({{"error", db_error
                                                                ? "instruction store unavailable"
-                                                               : result.error()}})
+                                                               : (conflict
+                                                                      ? std::string(strip_conflict_prefix(result.error()))
+                                                                      : result.error())}})
                                     .dump(),
                                 "application/json");
                 return;
@@ -596,15 +605,27 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         InstructionSet s;
         s.name = name;
         s.description = desc;
-        auto result = deps.store->create_set(s);
-        // Every outcome is audited (#3598 / REVIEW amendment 6): success, a store
-        // failure, a duplicate-id conflict and a rejected input. A failed audit
-        // write is surfaced to the caller as Sec-Audit-Failed, matching delete.
+        // Every outcome is audited (#3598 / REVIEW amendment 6). The ATTEMPT row is written
+        // BEFORE the mutation and the write is refused (503, Sec-Audit-Failed) when it cannot
+        // be stored (ADR-0033 section 9: no audit row -> no mutation); the outcome row after
+        // it records what the store did. A failed outcome-row write still surfaces as
+        // Sec-Audit-Failed.
         auto audit = [&](const char* outcome, const std::string& id, const std::string& detail) {
             if (!deps.audit_fn(req, "instruction_set.create", outcome, "InstructionSet", id,
                                detail))
                 res.set_header("Sec-Audit-Failed", "true");
         };
+        if (!deps.audit_fn(req, "instruction_set.create", "attempted", "InstructionSet", "",
+                           audit_token(name))) {
+            res.set_header("Sec-Audit-Failed", "true");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "the audit record could not be persisted, so "
+                                                  "the set was NOT created; retry once the audit "
+                                                  "store recovers"),
+                            "application/json");
+            return;
+        }
+        auto result = deps.store->create_set(s);
         if (!result) {
             // ADR-0058: a genuine DB/lease failure 503s, never falls through to
             // the conflict/validation split below.
@@ -627,7 +648,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
             return;
         }
-        audit("success", *result, name);
+        audit("success", *result, audit_token(name));
         res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
     });
 
@@ -645,16 +666,27 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
-        // ADR-0058: delete_set now returns std::expected<void, std::string> — a
+        auto audit = [&](const char* outcome, const std::string& detail) {
+            if (!deps.audit_fn(req, "instruction_set.delete", outcome, "InstructionSet", id,
+                               detail))
+                res.set_header("Sec-Audit-Failed", "true");
+        };
+        // ATTEMPT row first, fail closed (see create): the id is known before the call.
+        if (!deps.audit_fn(req, "instruction_set.delete", "attempted", "InstructionSet", id, "")) {
+            res.set_header("Sec-Audit-Failed", "true");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "the audit record could not be persisted, so "
+                                                  "the set was NOT deleted; retry once the audit "
+                                                  "store recovers"),
+                            "application/json");
+            return;
+        }
+        // ADR-0058: delete_set returns std::expected<void, std::string> - a
         // genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
         // ProductPackStore::uninstall's identical REST contract change).
         auto del_result = deps.store->delete_set(id);
-        // R2 / gov Gate 4 consistency-auditor finding: these 404/503 denial branches are
-        // audited, and success is audited below (create_set audits every outcome too).
         if (!del_result && del_result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0) {
-            if (!deps.audit_fn(req, "instruction_set.delete", "error", "InstructionSet", id,
-                               "db_error"))
-                res.set_header("Sec-Audit-Failed", "true");
+            audit("error", "db_error");
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
@@ -662,17 +694,14 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (!del_result) {
-            if (!deps.audit_fn(req, "instruction_set.delete", "denied", "InstructionSet", id,
-                               "not_found"))
-                res.set_header("Sec-Audit-Failed", "true");
+            audit("denied", "not_found");
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"instruction set not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
-        if (!deps.audit_fn(req, "instruction_set.delete", "success", "InstructionSet", id, ""))
-            res.set_header("Sec-Audit-Failed", "true");
+        audit("success", "");
         res.set_content(nlohmann::json({{"deleted", true}}).dump(), "application/json");
     });
 
@@ -708,6 +737,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 };
                 replace("{{TITLE}}", "Edit Definition");
                 replace("{{DEF_ID}}", def.id);
+                replace("{{DEF_UPDATED_AT}}", std::to_string(def.updated_at));
                 replace("{{DEF_NAME}}", def.name);
                 replace("{{DEF_VERSION}}", def.version);
                 replace("{{DEF_PLUGIN}}", def.plugin);
@@ -772,6 +802,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             };
             replace("{{TITLE}}", "New Definition");
             clear("{{DEF_ID}}");
+            clear("{{DEF_UPDATED_AT}}");
             clear("{{DEF_NAME}}");
             clear("{{DEF_VERSION}}");
             clear("{{DEF_PLUGIN}}");
@@ -896,6 +927,21 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             // a fresh definition over an unread row is exactly the data loss
             // this merge exists to prevent.
             std::string approval_detail;
+            // The editor sends the updated_at it LOADED; a save is applied only if the row is
+            // still at that version (409 otherwise), so two operators cannot silently overwrite
+            // each other's approval/enabled/set changes. A caller that sends none (API use) is
+            // checked against the version read here, which narrows the race to this handler.
+            std::optional<std::int64_t> expected_updated_at;
+            if (const auto sent = req.get_param_value("updated_at"); !sent.empty()) {
+                std::int64_t v = 0;
+                const auto [ptr, ec] = std::from_chars(sent.data(), sent.data() + sent.size(), v);
+                if (ec != std::errc{} || ptr != sent.data() + sent.size()) {
+                    res.status = 400;
+                    respond("Update failed: updated_at must be an integer", false);
+                    return;
+                }
+                expected_updated_at = v;
+            }
             auto stored_result = deps.store->get_definition(def_id);
             if (!stored_result) {
                 spdlog::warn("instruction yaml update: stored read failed: id={} error={}",
@@ -906,6 +952,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             }
             if (*stored_result) {
                 const auto& stored = **stored_result;
+                if (!expected_updated_at)
+                    expected_updated_at = stored.updated_at;
                 def = instruction_extras::merge_yaml_into_stored(stored, fields, yaml_source,
                                                                  session->username);
                 if (def.approval_mode != stored.approval_mode)
@@ -913,10 +961,17 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                       def.approval_mode;
             }
             def.id = def_id;
-            auto result = deps.store->update_definition(def);
+            auto result = deps.store->update_definition(def, expected_updated_at);
             if (!result) {
                 spdlog::warn("instruction yaml update failed: id={} error={}",
                              log_safe(def_id), result.error());
+                if (is_conflict_error(result.error())) {
+                    res.status = 409;
+                    respond("Update failed: this definition was changed by someone else since you "
+                            "opened it - reload the editor and re-apply your change",
+                            false);
+                    return;
+                }
                 // A db_error-prefixed message can carry libpq internals (PQerrorMessage
                 // fragments) — generic-ize it before it reaches the operator, matching
                 // workflow_routes.cpp's product_pack_client_message convention (gov Gate 4

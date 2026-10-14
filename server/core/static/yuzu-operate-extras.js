@@ -7,7 +7,11 @@
    - every request is same-origin and goes through YuzuDialog.request (15 s timeout);
    - every destructive or fan-out action goes through YuzuDialog first, because none of
      the routes it calls carries a step-up;
-   - secret parameters (grant_secret, grant_id) are write-only password inputs. */
+   - secret parameters (the server's `secret_params` list on the definition detail) are
+     write-only password inputs;
+   - Execute stays disabled until the definition detail has loaded, and the legacy inline
+     dispatcher refuses to run unless this module is present, so a missing script or a failed
+     detail request never leaves a one-click, unconfirmed dispatch. */
 (function () {
   'use strict';
 
@@ -15,8 +19,11 @@
   var page = doc.body && doc.body.dataset ? doc.body.dataset.page : '';
   var D = window.YuzuDialog;
   if (page !== 'instructions' || !D) return;
+  // The legacy inline executeInstruction() refuses to dispatch unless this is set.
+  window.__yuzuExtrasReady = true;
 
-  var SECRET_PARAMS = { grant_secret: true, grant_id: true };
+  // Parameter names the server marks write-only (definition detail `secret_params`).
+  var secretParams = {};
 
   function $(id) { return doc.getElementById(id); }
   function el(tag, cls, text) {
@@ -267,14 +274,26 @@
 
   function onDefChange() {
     detail = null;
+    secretParams = {};
     var id = $('exec-def-select').value;
+    var btn = $('exec-btn');
     if (!id) return;
+    // The legacy handler enables Execute the moment a row is picked; hold it until the
+    // detail (approval mode, plugin, action, secret parameters) is in hand.
+    if (btn) btn.disabled = true;
     // The legacy list row carries no parameter_schema; the v1 detail does (F11).
     D.request('GET', '/api/v1/instructions/' + enc(id)).then(function (r) {
+      if ($('exec-def-select').value !== id) return;
       var d = payload(r);
-      if ($('exec-def-select').value !== id || !r.ok || !d) return;
+      if (!r.ok || !d) {
+        note('Could not load this instruction\'s details, so it cannot be dispatched. Reload the page and try again.', 'warn');
+        return;
+      }
+      note('');
       detail = d;
+      (Array.isArray(d.secret_params) ? d.secret_params : []).forEach(function (k) { secretParams[k] = true; });
       renderParams(d.parameter_schema);
+      if (btn) btn.disabled = false;
     });
   }
 
@@ -295,7 +314,7 @@
       var inp = el('input');
       inp.name = 'param_' + k;
       inp.placeholder = p.description || p.type || '';
-      if (SECRET_PARAMS[k]) {
+      if (secretParams[k]) {
         inp.type = 'password';
         inp.autocomplete = 'off';
         inp.placeholder = 'Write-only';
@@ -356,7 +375,13 @@
   }
 
   function confirmDispatch() {
-    var d = detail || {};
+    // Never confirm a dispatch the operator cannot read: without the detail the dialog
+    // would show "?" for the plugin/action and omit the approval line.
+    if (!detail) {
+      note('The instruction details have not loaded yet. Wait a moment, or reload the page.', 'warn');
+      return Promise.resolve(false);
+    }
+    var d = detail;
     var sel = $('exec-def-select');
     var name = d.name || (sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : '');
     var lines = ['Instruction: ' + name + ' (' + (d.plugin || '?') + ':' + (d.action || '?') + ', ' +

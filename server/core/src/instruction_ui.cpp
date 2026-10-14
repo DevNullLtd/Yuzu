@@ -506,6 +506,12 @@ function executeInstruction() {
   if (!selectedDef) return;
   var btn = document.getElementById('exec-btn');
   var status = document.getElementById('exec-status');
+  // The confirmation dialog lives in yuzu-operate-extras.js; without it this would be a
+  // one-click dispatch to the whole scope, so refuse.
+  if (!window.__yuzuExtrasReady) {
+    status.textContent = 'Page scripts did not load. Reload the page before dispatching.';
+    return;
+  }
   btn.disabled = true;
   status.textContent = 'Dispatching...';
 
@@ -957,6 +963,7 @@ extern const char* const kInstructionEditorHtml = R"HTM(
     <div id="yaml-mode" style="display:none">
         <form hx-post="/api/instructions/yaml" hx-target="#editor-alerts" hx-swap="innerHTML">
             <input type="hidden" name="id" value="{{DEF_ID}}">
+            <input type="hidden" name="updated_at" value="{{DEF_UPDATED_AT}}">
             <div class="form-group full">
                 <label>YAML Source (apiVersion: yuzu.io/v1alpha1)</label>
                 <div class="yaml-legend">

@@ -5,12 +5,15 @@
  * every destructive or fan-out action through the shared dialog.
  */
 
+#include "instruction_definition_model.hpp"
 #include "instruction_extras_render.hpp"
+#include "sensitive_instruction_params.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 extern const char* const kInstructionPageHtml;
 extern const char* const kInstructionEditorHtml;
@@ -19,6 +22,7 @@ extern const std::string kYuzuOperateExtrasJs;
 }
 
 namespace ex = yuzu::server::instruction_extras;
+using yuzu::server::InstructionDefinition;
 using yuzu::server::InstructionSet;
 using yuzu::server::ResponseTemplate;
 
@@ -51,6 +55,38 @@ TEST_CASE("instruction extras ui: nothing the page had before is lost",
     for (const char* s : {"id=\"form-mode\"", "id=\"yaml-mode\"", "id=\"yaml-editor\"",
                           "id=\"yaml-preview\"", "id=\"yaml-errors\""})
         CHECK(has(editor, s));
+}
+
+TEST_CASE("instruction extras ui: the legacy inline dispatcher refuses to run without the module",
+          "[ui][instruction_extras]") {
+    // If yuzu-operate-extras.js (the only place the confirmation dialog lives) fails to load,
+    // the inline executeInstruction() would be a one-click dispatch to the whole scope.
+    const std::string page(kInstructionPageHtml);
+    const auto fn = page.find("function executeInstruction()");
+    REQUIRE(fn != std::string::npos);
+    const auto guard = page.find("window.__yuzuExtrasReady", fn);
+    const auto first_fetch = page.find("fetch('/api/instructions/'", fn);
+    REQUIRE(guard != std::string::npos);
+    REQUIRE(first_fetch != std::string::npos);
+    CHECK(guard < first_fetch); // refused BEFORE any request is built or sent
+}
+
+TEST_CASE("instruction definition detail: secret_params comes from the shared list, and the "
+          "export omits it",
+          "[ui][instruction_extras][model]") {
+    InstructionDefinition d;
+    d.id = "x";
+    const auto detail = yuzu::server::instruction_definition_detail_json(d);
+    REQUIRE(detail.contains("secret_params"));
+    REQUIRE(detail["secret_params"].is_array());
+    std::vector<std::string> got;
+    for (const auto& k : detail["secret_params"])
+        got.push_back(k.get<std::string>());
+    std::vector<std::string> want;
+    for (auto k : yuzu::server::kRedactedInstructionParamKeys)
+        want.emplace_back(k);
+    CHECK(got == want);
+    CHECK_FALSE(yuzu::server::instruction_definition_export_json(d).contains("secret_params"));
 }
 
 TEST_CASE("instruction extras ui: the page loads the dialog before the controller and hooks it",
@@ -92,7 +128,13 @@ TEST_CASE("instruction extras ui: the controller is CSP-clean and gates every wr
     CHECK(has(js, "title: 'Delete response template'"));
     CHECK(has(js, "title: 'Dispatch instruction'"));
     // Secret parameters are write-only password inputs.
-    CHECK(has(js, "var SECRET_PARAMS = { grant_secret: true, grant_id: true };"));
+    // ... classified by the server's shared list, never a copy in the page script.
+    CHECK_FALSE(has(js, "grant_secret"));
+    CHECK(has(js, "d.secret_params"));
+    // Execute is held until the detail loads, and the dispatch confirmation refuses without it.
+    CHECK(has(js, "if (btn) btn.disabled = true;"));
+    CHECK(has(js, "The instruction details have not loaded yet."));
+    CHECK(has(js, "window.__yuzuExtrasReady = true;"));
     CHECK(has(js, "inp.type = 'password';"));
     // A pending-approval answer never claims the instruction ran.
     CHECK(has(js, "Nothing has run yet."));

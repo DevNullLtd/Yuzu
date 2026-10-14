@@ -32,7 +32,10 @@ InstructionDefinition merge_yaml_into_stored(const InstructionDefinition& stored
     def.name = f.name;
     def.plugin = f.plugin;
     def.action = f.action; // lowercased by the parser
-    def.description = f.description;
+    // Keep the stored description when the YAML does not mention one; an explicit
+    // `description: ""` still clears it.
+    if (f.has_description)
+        def.description = f.description;
     def.version = pick(f.version, stored.version, "1.0.0");
     def.type = pick(f.type, stored.type, "question");
     def.concurrency_mode = pick(f.concurrency, stored.concurrency_mode, "per-device");

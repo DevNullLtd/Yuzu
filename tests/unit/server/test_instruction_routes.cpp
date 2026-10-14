@@ -777,8 +777,8 @@ TEST_CASE("instruction_routes: POST import refuses an invalid or over-cap parame
     }
 }
 
-TEST_CASE("instruction_routes: instruction-set create/list/delete audit success, and a "
-          "repeated delete audits the not-found denial",
+TEST_CASE("instruction_routes: instruction-set create/list/delete write an attempt row BEFORE "
+          "the change and an outcome row after, and a repeated delete audits the not-found denial",
           "[pg][server][routes][instruction_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
     PgWired w{db.dsn()};
@@ -792,11 +792,14 @@ TEST_CASE("instruction_routes: instruction-set create/list/delete audit success,
     CHECK(create->status == 200);
     auto id = body(create->body)["id"].get<std::string>();
     REQUIRE(!id.empty());
-    REQUIRE(h.audits.size() == 1);
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "instruction_set.create");
-    CHECK(h.audits[0].result == "success");
-    CHECK(h.audits[0].target_type == "InstructionSet");
-    CHECK(h.audits[0].target_id == id);
+    CHECK(h.audits[0].result == "attempted"); // before the change, so no id yet
+    CHECK(h.audits[0].target_id.empty());
+    CHECK(h.audits[1].action == "instruction_set.create");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_type == "InstructionSet");
+    CHECK(h.audits[1].target_id == id);
 
     auto list = h.sink.Get("/api/instruction-sets");
     REQUIRE(list);
@@ -805,41 +808,90 @@ TEST_CASE("instruction_routes: instruction-set create/list/delete audit success,
     for (const auto& s : body(list->body)["sets"])
         found = found || (s["id"] == id);
     CHECK(found);
-    CHECK(h.audits.size() == 1); // GET stays unaudited
+    CHECK(h.audits.size() == 2); // GET stays unaudited
 
     auto del = h.sink.Delete("/api/instruction-sets/" + id);
     REQUIRE(del);
     CHECK(del->status == 200);
-    REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[1].action == "instruction_set.delete");
-    CHECK(h.audits[1].result == "success");
-    CHECK(h.audits[1].target_id == id);
+    REQUIRE(h.audits.size() == 4);
+    CHECK(h.audits[2].action == "instruction_set.delete");
+    CHECK(h.audits[2].result == "attempted");
+    CHECK(h.audits[2].target_id == id);
+    CHECK(h.audits[3].action == "instruction_set.delete");
+    CHECK(h.audits[3].result == "success");
+    CHECK(h.audits[3].target_id == id);
 
     auto redelete = h.sink.Delete("/api/instruction-sets/" + id);
     REQUIRE(redelete);
     CHECK(redelete->status == 404);
-    REQUIRE(h.audits.size() == 3);
-    CHECK(h.audits[2].action == "instruction_set.delete");
-    CHECK(h.audits[2].result == "denied");
+    REQUIRE(h.audits.size() == 6);
+    CHECK(h.audits[4].result == "attempted");
+    CHECK(h.audits[5].action == "instruction_set.delete");
+    CHECK(h.audits[5].result == "denied");
 }
 
-TEST_CASE("instruction_routes: a failed audit write on set create/delete surfaces "
-          "Sec-Audit-Failed",
+TEST_CASE("instruction_routes: a set create/delete whose attempt audit row is not stored is "
+          "refused with 503 and changes nothing (ADR-0033 section 9)",
           "[pg][server][routes][instruction_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
     PgWired w{db.dsn()};
     Harness h;
     h.store = &w.store;
-    h.audit_succeeds = false;
     h.wire();
-    auto create = h.sink.Post("/api/instruction-sets", json{{"name", "Audit Fail"}}.dump());
+
+    // A set that exists before the audit store fails.
+    auto seeded = h.sink.Post("/api/instruction-sets", json{{"name", "Keep Me"}}.dump());
+    REQUIRE(seeded);
+    auto keep_id = body(seeded->body)["id"].get<std::string>();
+    const auto sets_before = w.store.list_sets();
+    REQUIRE(sets_before);
+
+    h.audit_succeeds = false;
+    auto create = h.sink.Post("/api/instruction-sets", json{{"name", "Never Created"}}.dump());
     REQUIRE(create);
-    CHECK(create->status == 200);
+    CHECK(create->status == 503);
     CHECK(create->get_header_value("Sec-Audit-Failed") == "true");
-    auto id = body(create->body)["id"].get<std::string>();
-    auto del = h.sink.Delete("/api/instruction-sets/" + id);
+    CHECK(body(create->body)["error"]["code"] == 503);
+    auto del = h.sink.Delete("/api/instruction-sets/" + keep_id);
     REQUIRE(del);
+    CHECK(del->status == 503);
     CHECK(del->get_header_value("Sec-Audit-Failed") == "true");
+
+    h.audit_succeeds = true;
+    const auto sets_after = w.store.list_sets();
+    REQUIRE(sets_after);
+    CHECK(sets_after->size() == sets_before->size()); // nothing created, nothing deleted
+    bool still_there = false;
+    for (const auto& s : *sets_after)
+        still_there = still_there || s.id == keep_id;
+    CHECK(still_there);
+}
+
+TEST_CASE("instruction_routes: a set name or description over the page's bounds is a 400",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    auto long_name = h.sink.Post(
+        "/api/instruction-sets",
+        json{{"name", std::string(kMaxInstructionSetNameLen + 1, 'n')}}.dump());
+    REQUIRE(long_name);
+    CHECK(long_name->status == 400);
+    auto long_desc = h.sink.Post(
+        "/api/instruction-sets",
+        json{{"name", "ok"}, {"description", std::string(kMaxInstructionSetDescriptionLen + 1, 'd')}}
+            .dump());
+    REQUIRE(long_desc);
+    CHECK(long_desc->status == 400);
+    auto at_limit = h.sink.Post(
+        "/api/instruction-sets",
+        json{{"name", std::string(kMaxInstructionSetNameLen, 'n')},
+             {"description", std::string(kMaxInstructionSetDescriptionLen, 'd')}}
+            .dump());
+    REQUIRE(at_limit);
+    CHECK(at_limit->status == 200);
 }
 
 TEST_CASE("instruction_routes: instruction-set create with the SAME name twice "
@@ -861,7 +913,7 @@ TEST_CASE("instruction_routes: instruction-set create with the SAME name twice "
     REQUIRE(second);
     CHECK(second->status == 200); // NOT 409 -- see the TEST_CASE name
     CHECK(body(first->body)["id"] != body(second->body)["id"]);
-    CHECK(h.audits.size() == 2); // each create is its own audited success
+    CHECK(h.audits.size() == 4); // each create is its own attempted + success pair
 }
 
 TEST_CASE("instruction_routes: GET editor fragment pre-fills from a real definition, "
@@ -1074,6 +1126,57 @@ TEST_CASE("instruction_routes: a YAML editor save carries forward every column t
     CHECK((**w.store.get_definition("test.route.yaml.merge")).approval_mode == "auto");
     REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[1].detail == "approval_mode: always -> auto");
+}
+
+TEST_CASE("instruction_routes: a YAML save made against a stale editor copy is a 409 and "
+          "changes nothing; one made against the current copy lands",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    InstructionDefinition d;
+    d.id = "test.route.yaml.stale";
+    d.name = "Stale Test";
+    d.version = "1.0.0";
+    d.type = "action";
+    d.plugin = "os_info";
+    d.action = "os_name";
+    d.approval_mode = "always";
+    d.yaml_source = "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+                    "id: test.route.yaml.stale\n  displayName: Stale Test\nspec:\n  plugin: "
+                    "os_info\n  action: os_name\n";
+    REQUIRE(w.store.create_definition(d).has_value());
+    const auto loaded = (**w.store.get_definition("test.route.yaml.stale")).updated_at;
+
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: test.route.yaml.stale\n  displayName: Renamed\nspec:\n  plugin: os_info\n  "
+        "action: os_name\n";
+    auto stale = h.sink.Post("/api/instructions/yaml",
+                             "id=test.route.yaml.stale&updated_at=" + std::to_string(loaded - 1) +
+                                 "&yaml_source=" + url_encode_form(yaml),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(stale);
+    CHECK(stale->status == 409);
+    CHECK((**w.store.get_definition("test.route.yaml.stale")).name == "Stale Test");
+
+    auto bad = h.sink.Post("/api/instructions/yaml",
+                           "id=test.route.yaml.stale&updated_at=abc&yaml_source=" +
+                               url_encode_form(yaml),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+
+    auto fresh = h.sink.Post("/api/instructions/yaml",
+                             "id=test.route.yaml.stale&updated_at=" + std::to_string(loaded) +
+                                 "&yaml_source=" + url_encode_form(yaml),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(fresh);
+    CHECK(fresh->body.find("Definition updated") != std::string::npos);
+    CHECK((**w.store.get_definition("test.route.yaml.stale")).name == "Renamed");
 }
 
 TEST_CASE("instruction_routes: POST validate-yaml against a real store still needs no "

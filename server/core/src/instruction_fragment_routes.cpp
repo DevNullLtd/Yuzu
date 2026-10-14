@@ -174,8 +174,6 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
             q.name_filter = req.get_param_value("name");
             q.plugin_filter = req.get_param_value("plugin");
             q.type_filter = req.get_param_value("type");
-            const bool filtered =
-                !q.name_filter.empty() || !q.plugin_filter.empty() || !q.type_filter.empty();
             if (q.name_filter.size() > kMaxFilterLen || q.plugin_filter.size() > kMaxFilterLen ||
                 q.type_filter.size() > kMaxFilterLen) {
                 res.set_content("<div class=\"empty-state\">Filter text is too long.</div>",
@@ -338,27 +336,19 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                 } else if (!sets_read) {
                     html += instruction_extras::render_sets_degraded();
                 } else {
-                    // Counts need every definition, not the filtered/truncated page.
-                    const std::vector<InstructionDefinition>* all = &defs;
-                    std::expected<std::vector<InstructionDefinition>, std::string> full;
-                    if (filtered || truncated) {
-                        InstructionQuery all_q;
-                        all_q.limit = 10000; // ponytail: store max; counts show "N+" beyond it
-                        full = deps.store->query_definitions(all_q);
-                        all = full ? &*full : nullptr;
-                    }
-                    if (!all) {
+                    // Exact per-set counts from a GROUP BY: independent of the filtered /
+                    // truncated library page, and never capped.
+                    auto counts = deps.store->count_definitions_per_set();
+                    if (!counts) {
                         html += instruction_extras::render_sets_degraded();
                     } else {
                         std::vector<instruction_extras::SetRow> rows;
                         for (const auto& st : *sets_read) {
-                            std::size_t n = 0;
-                            for (const auto& d : *all)
-                                n += (d.instruction_set_id == st.id) ? 1 : 0;
-                            rows.push_back({st, n});
+                            const auto it = counts->find(st.id);
+                            rows.push_back({st, it == counts->end() ? 0 : it->second});
                         }
                         html += instruction_extras::render_instruction_sets_panel(
-                            rows, all->size() >= 10000, set_write, set_delete);
+                            rows, /*counts_partial=*/false, set_write, set_delete);
                     }
                 }
             }
