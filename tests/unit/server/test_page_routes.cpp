@@ -2,7 +2,7 @@
 /// HTTP-level coverage for the page-shell/static-asset route module (#2542)
 /// — driven in-process through TestRouteSink (no httplib acceptor, #438),
 /// mirroring test_plugin_config_routes.cpp's Harness shape. None of these
-/// 34 routes touches Postgres (no store), so every case here runs without
+/// 35 routes touches Postgres (no store), so every case here runs without
 /// YUZU_TEST_POSTGRES_DSN.
 
 #include "page_routes.hpp"
@@ -517,14 +517,14 @@ TEST_CASE("page_routes: /viz/host/:id rejects a malformed agent id with 400",
 
 // ── Registration order / shape ────────────────────────────────────────────
 
-TEST_CASE("page_routes: registers exactly 34 routes, with /viz/fleet reachable independently "
+TEST_CASE("page_routes: registers exactly 35 routes, with /viz/fleet reachable independently "
           "of /viz/host/:id (the documented registration order — /viz/fleet before the "
           "per-host regex — never lets one swallow the other)",
           "[server][routes][page_routes]") {
     Harness h;
     h.wire();
 
-    CHECK(h.sink.route_count() == 34);
+    CHECK(h.sink.route_count() == 35);
 
     auto fleet = h.sink.Get("/viz/fleet");
     REQUIRE(fleet);
