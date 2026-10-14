@@ -803,11 +803,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      html += "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>";
                      // Clear any chart deck from a prior query — help is
                      // a no-chart command so any lingering deck would
-                     // overlay the help table. The hx-on::before-request
-                     // JS hook on #instr-form clears it client-side too;
+                     // overlay the help table. The htmx:beforeRequest
+                     // listener on #instr-form clears it client-side too;
                      // this OOB swap is defence-in-depth so a future
-                     // refactor of the form-handler attribute can't
-                     // silently leave stale charts on the page.
+                     // refactor of that listener can't silently leave
+                     // stale charts on the page.
                      html += "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>";
                      res.set_content(html, "text/html; charset=utf-8");
                      return;

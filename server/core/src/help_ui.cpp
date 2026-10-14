@@ -9,6 +9,7 @@ const char* const kHelpPageTemplate = R"HTM(<!DOCTYPE html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu — Help</title>
 <link rel="stylesheet" href="/static/yuzu.css">
+<script src="/static/htmx.js"></script>
 <style>
 .help-content{padding:22px 28px 36px}
 .help-content a{color:var(--primary);text-decoration:none}
@@ -51,15 +52,6 @@ function showToast(message, level) {
 document.body.addEventListener('showToast', function(e) {
   var d = e.detail || {};
   showToast(d.message || 'Done', d.level || 'success');
-});
-</script>
-<script>
-/* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-document.addEventListener('keydown', function(e) {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-    e.preventDefault();
-    window.location.href = '/?palette=1';
-  }
 });
 </script>
 </body></html>

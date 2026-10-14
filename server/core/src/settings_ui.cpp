@@ -1015,13 +1015,6 @@ const char* const kSettingsPageTemplate =
         }
       });
     });
-    /* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-    document.addEventListener('keydown', function(e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        window.location.href = '/?palette=1';
-      }
-    });
   </script>
 </body>
 </html>
