@@ -220,6 +220,8 @@
 #include "verify_api_local.hpp" // ADR-0031 WS-A4 #4250: core-only VERIFY seam factory
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
+#include "device_containment_routes.hpp"
+#include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
@@ -18038,6 +18040,19 @@ private:
             }
             return detail;
         };
+        // agent_id -> hostname, one bulk read of the 30-day roster. Shared by the Software
+        // devices tables and the Quarantined devices panel.
+        auto hw_hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
+            std::unordered_map<std::string, std::string> out;
+            if (!offline_endpoint_store_)
+                return out;
+            // #5531 exception: display-only; a failed read leaves hostnames
+            // unresolved and the page falls back to the agent_id.
+            for (auto& e : offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)
+                               .value_or(std::vector<OfflineEndpoint>{}))
+                out.emplace(std::move(e.agent_id), std::move(e.hostname));
+            return out;
+        };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
             *web_server_,
@@ -18096,18 +18111,7 @@ private:
                 // agent_id -> hostname for the host type-ahead / devices tables. One bulk read
                 // per render; endpoint_state's hostname is written on every heartbeat whether
                 // the device is online or not, so the 30-day window covers both.
-                .hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
-                    std::unordered_map<std::string, std::string> out;
-                    if (!offline_endpoint_store_)
-                        return out;
-                    // #5531 exception: display-only; a failed read leaves hostnames
-                    // unresolved and the page falls back to the agent_id.
-                    for (auto& e : offline_endpoint_store_->query_stale_within(
-                                       kHardwareRosterWindow)
-                                       .value_or(std::vector<OfflineEndpoint>{}))
-                        out.emplace(std::move(e.agent_id), std::move(e.hostname));
-                    return out;
-                },
+                .hostnames_fn = hw_hostnames_fn,
                 // Last synced column: the same datum the Hardware record shows as
                 // `software_last_seen`, read in bulk for one devices page.
                 .last_synced_fn = [this](const std::vector<std::string>& ids)
@@ -18258,7 +18262,56 @@ private:
                                      return dex_device_score(guaranteed_state_store_.get(), id,
                                                              dex_iso_since(7));
                                  },
+                             // List pill: the authoritative active-quarantine read (one per
+                             // list render; the snapshot the dispatch gate keeps is a 20 s
+                             // cache and is deliberately not reused for an operator display).
+                             .quarantine_list_fn =
+                                 [this](const std::vector<std::string>* ids, std::size_t limit)
+                                     -> std::optional<std::vector<QuarantineRecord>> {
+                                     if (!quarantine_store_ || !quarantine_store_->is_open())
+                                         return std::nullopt;
+                                     return quarantine_store_->list_quarantined_in(ids, limit);
+                                 },
                          });
+
+        // Containment (quarantine) fragments — read-only twins of GET /api/v1/quarantine.
+        // The mutations are the existing POST/DELETE /api/v1/quarantine, called from page JS.
+        device_containment_routes_ = std::make_unique<DeviceContainmentRoutes>();
+        {
+            HttplibRouteSink containment_sink(*web_server_);
+            device_containment_routes_->register_routes(
+                containment_sink,
+                DeviceContainmentRoutes::Deps{
+                    .auth_fn = auth_fn,
+                    .scoped_perm_fn = scoped_perm_fn,
+                    .fleet_read_fn = fleet_read_fn,
+                    .list_fn = [this](const std::vector<std::string>* ids, std::size_t limit)
+                        -> std::optional<std::vector<QuarantineRecord>> {
+                        if (!quarantine_store_ || !quarantine_store_->is_open())
+                            return std::nullopt;
+                        return quarantine_store_->list_quarantined_in(ids, limit);
+                    },
+                    .status_fn = [this](const std::string& id)
+                        -> std::expected<std::optional<QuarantineRecord>, std::string> {
+                        if (!quarantine_store_ || !quarantine_store_->is_open())
+                            return std::unexpected(std::string("quarantine store unavailable"));
+                        return quarantine_store_->get_status(id);
+                    },
+                    .identity_fn = hw_identity_fn,
+                    .hostnames_fn = hw_hostnames_fn,
+                });
+        }
+
+        // Stored data panel — read-only twin of the gate on DELETE /api/v1/sle/agents/{id}.
+        device_estate_routes_ = std::make_unique<DeviceEstateRoutes>();
+        {
+            HttplibRouteSink estate_sink(*web_server_);
+            device_estate_routes_->register_routes(
+                estate_sink, DeviceEstateRoutes::Deps{
+                                 .scoped_perm_fn = scoped_perm_fn,
+                                 .identity_fn = hw_identity_fn,
+                             });
+        }
 
         // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the
         // NEW SoftwareLicensing securable via the FAIL-CLOSED enforcement primitive
@@ -21416,6 +21469,8 @@ private:
     std::unique_ptr<DeviceLensRoutes> device_lens_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<HardwareRoutes> hardware_routes_;
+    std::unique_ptr<DeviceContainmentRoutes> device_containment_routes_;
+    std::unique_ptr<DeviceEstateRoutes> device_estate_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;
     std::unique_ptr<AppUsageRoutes> app_usage_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;

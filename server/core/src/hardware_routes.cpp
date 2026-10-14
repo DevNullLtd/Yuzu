@@ -25,6 +25,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp).
 extern const char* const kGuardianDetailPageHtml;
@@ -45,10 +46,13 @@ std::string page_shell(const std::string& title, const std::string& fragment_url
     };
     sub("{{TITLE}}", title);
     sub("{{FRAGMENT}}", fragment_url);
-    // The tags lens and the bulk bar open dialogs and post through the shared module; the
-    // shell is shared with pages that load neither, so only this route family adds them.
+    // The shared dialog module, the estate controller (quarantine, stored-data removal) and the
+    // tags/properties controls load after the template's own scripts, in that order. The shell is
+    // shared with pages that load none of them, so only this route family adds them.
+    // Same-origin static files: the dashboard CSP needs no change.
     if (const auto end = html.rfind("</body>"); end != std::string::npos)
         html.insert(end, "<script src=\"/static/yuzu-dialog.js\" defer></script>"
+                         "<script src=\"/static/yuzu-estate.js\" defer></script>"
                          "<script src=\"/static/yuzu-device-data.js\" defer></script>\n");
     // test_nav_shells.cpp pins that the shared shell carries the marker apply_shell fills.
     return shell::apply_shell(std::move(html), {.active_key = "hardware"});
@@ -84,6 +88,15 @@ bool bad_hw_ident(std::string_view v) {
         return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
                  c == '_' || c == '.' || c == '-');
     });
+}
+
+std::string hw_lens_or_overview(const std::string& raw) {
+    static constexpr std::string_view kLenses[] = {"overview", "software", "tags",    "containment",
+                                                   "dex",      "guardian", "live",    "actions"};
+    for (const auto l : kLenses)
+        if (raw == l)
+            return raw;
+    return "overview";
 }
 
 std::int64_t now_secs() {
@@ -181,8 +194,13 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!session) { res.set_redirect("/login"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        send_html(res, page_shell("Yuzu \xE2\x80\x94 Hardware",
-                                  "/fragments/hardware/ci?id=" + url_encode_id(id)));
+        // `lens` is forwarded so a link can open a specific lens (the row's Quarantine
+        // link). It is only a hint here: the fragment applies the allowlist, and the value
+        // is URL-encoded so it can never break out of the fragment URL.
+        std::string fragment = "/fragments/hardware/ci?id=" + url_encode_id(id);
+        if (req.has_param("lens"))
+            fragment += "&lens=" + url_encode_id(req.get_param_value("lens"));
+        send_html(res, page_shell("Yuzu \xE2\x80\x94 Hardware", fragment));
     });
 
     // -- Fragment: CI list --
@@ -233,6 +251,38 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             for (auto& row : page.rows)
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
 
+        // Quarantined pill. Phase 1 reads which of THIS PAGE's devices have an active record
+        // (the read is restricted to the page's ids, so its cost is bounded by the page size
+        // and nothing is shown yet). Only if there is a candidate does phase 2 make ONE
+        // Security:Read list-gate decision (ADR-0017) and keep the candidates inside its
+        // scope — so a caller without Security:Read, or a page with no quarantines, costs no
+        // gate call and no denied audit row. The gate answers into a throwaway Response (the
+        // list itself is the response): a 403 means "this caller may not see pills" and draws
+        // none; an unavailable or unwired gate, or a degraded store, sets the banner flag and
+        // no pill (absence is then not evidence).
+        if (deps_.quarantine_list_fn && !page.rows.empty()) {
+            std::vector<std::string> page_ids;
+            page_ids.reserve(page.rows.size());
+            for (const auto& row : page.rows)
+                page_ids.push_back(row.agent_id);
+            const auto candidates = deps_.quarantine_list_fn(&page_ids, 0);
+            if (!candidates) {
+                page.quarantine_degraded = true;
+            } else if (!candidates->empty()) {
+                httplib::Response gate_res;
+                const authz::FleetReadGate qgate =
+                    deps_.fleet_read_fn ? deps_.fleet_read_fn(req, gate_res, "Security", "Read")
+                                        : authz::FleetReadGate{};
+                if (qgate.admitted) {
+                    for (const auto& r : *candidates)
+                        if (authz::in_scope(qgate.scope, r.agent_id))
+                            page.quarantined_ids.insert(r.agent_id);
+                } else if (!deps_.fleet_read_fn || gate_res.status != 403) {
+                    page.quarantine_degraded = true; // gate unwired/401/503: not a scope refusal
+                }
+            }
+        }
+
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list: devices=" + std::to_string(page.total_matching) +
@@ -257,7 +307,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
-        const std::string lens = req.has_param("lens") ? req.get_param_value("lens") : "overview";
+        // Allowlisted: the value reaches the audit detail and echoed markup, so an unknown
+        // or oversized `lens` falls back to the overview rather than being carried through.
+        const std::string lens = hw_lens_or_overview(req.has_param("lens") ? req.get_param_value("lens")
+                                                                          : std::string{});
         const bool lens_only = req.has_param("lens_only") && req.get_param_value("lens_only") == "1";
         if (!deps_.ci_detail_fn) {
             res.status = 503;
