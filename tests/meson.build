@@ -1418,7 +1418,15 @@ if build_server
       'unit/server/test_access_tokens_routes.cpp', # Tokens and principals page: routes, gates, audit, degraded states
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
+<<<<<<< HEAD
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+=======
+      'unit/server/test_access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
+      'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
+      'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
+      'unit/server/test_access_audit_golden.cpp', # Audit and reviews page: rendered-fragment goldens
+      'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
+>>>>>>> 4acfee227 (test(ui): Audit page renderers, routes, template pins, goldens, persona matrix and wiring gate)
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -3500,6 +3508,15 @@ test('access users production wiring lexical gate',
   _python3_test,
   args: [files('test_access_wiring_lexical.py')],
   suite: 'docs',
+  timeout: 30,
+)
+
+# Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
+# audit store read that returns nullopt for a closed store). Source-text only, so Python.
+test('access audit production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_audit_wiring_lexical.py')],
+  suite: 'server',
   timeout: 30,
 )
 
