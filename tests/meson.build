@@ -1687,6 +1687,7 @@ if build_server
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
       'unit/server/test_nav_shells.cpp',            # app shell: nav model, renderer, marker swap, per-page active item
+      'unit/server/test_integrations_panels.cpp',   # System Integrations: MCP/Gateway panels, MCP form parser + POST handler
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',

@@ -401,6 +401,7 @@ yuzu_server_core_lib = static_library(
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
+    'src/integrations_render.cpp', # System Integrations: pure MCP/Gateway panels + MCP form parser
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
