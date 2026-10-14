@@ -2024,7 +2024,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (v.sso_href.empty() && saml_provider_ && saml_provider_->is_enabled())
             v.sso_href = "/auth/saml/start";
         v.mfa_note = cfg_.mfa_enforcement != "optional";
-        if (auto session = resolve_session(req)) {
+        // A visitor with no credential at all never reaches the session store: this page
+        // is open to the internet, and resolving an empty token would cost a database
+        // read per view.
+        const bool has_credential = !extract_session_cookie(req).empty() ||
+                                    !req.get_header_value("Authorization").empty() ||
+                                    !req.get_header_value("X-Yuzu-Token").empty();
+        if (auto session = has_credential ? resolve_session(req) : std::nullopt) {
             v.who = home_ui::SignedIn{
                 .name = session->display_name.empty() ? session->username : session->display_name,
                 .role = session->role == auth::Role::admin ? "Administrator" : "Viewer"};
