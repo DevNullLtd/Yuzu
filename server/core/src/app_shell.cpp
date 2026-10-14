@@ -305,6 +305,7 @@ constexpr std::string_view kBellScript = R"JS(<script>
             dismiss:'Dismisses this for every operator. The dismissal is recorded in the audit log and cannot be undone from the console.'};
   function el(i){return document.getElementById(i);}
   function mk(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;}
+  function txt(v){return v==null?'':String(v);}
   var root=el('shell-bell'); if(!root)return;
   var sum=el('shell-bell-sum'), chip=el('shell-bell-n'), list=el('shell-bell-list'), note=el('shell-bell-note');
   var inflight=false, stopped=false, readOnly=false, failed=false, actErr=false, shown=0, total=0, armed=null, armTimer=0, last=Date.now(), paused=false;
@@ -360,14 +361,14 @@ constexpr std::string_view kBellScript = R"JS(<script>
   }
   function empty(){list.textContent='';list.appendChild(mk('p','shell-pop-empty','No unread notifications.'));}
   function render(d){
-    disarm();list.textContent='';
+    disarm();var held=list.contains(document.activeElement);list.textContent='';
     shown=d.notifications.length;total=d.unread_count;
     if(!shown)empty();
     d.notifications.forEach(function(n){
       var lv=Object.prototype.hasOwnProperty.call(LV,n.level)?n.level:'info';
       var it=mk('div','shell-pop-i');it.setAttribute('role','listitem');it.setAttribute('data-level',lv);
-      var t=mk('b','shell-pop-t');t.appendChild(mk('i','sd '+LV[lv]));t.appendChild(document.createTextNode(String(n.title)));
-      var msg=String(n.message).slice(0,MSG_MAX);
+      var t=mk('b','shell-pop-t');t.appendChild(mk('i','sd '+LV[lv]));t.appendChild(document.createTextNode(txt(n.title)));
+      var msg=txt(n.message).slice(0,MSG_MAX);
       var m=mk('p','shell-pop-m',msg);m.setAttribute('title',msg);
       var s=mk('small',null,when(n.timestamp));s.setAttribute('title',new Date(n.timestamp).toLocaleString());
       it.appendChild(t);it.appendChild(m);it.appendChild(s);
@@ -377,9 +378,11 @@ constexpr std::string_view kBellScript = R"JS(<script>
       list.appendChild(it);
     });
     setChip(total);failed=false;refreshNote();root.hidden=false;
+    if(held)sum.focus();
   }
   function poll(force){
     if(stopped||inflight||(!force&&(document.hidden||root.open)))return;
+    if(!force&&Date.now()-last>IDLE_MS){paused=true;return;}
     inflight=true;
     fetch('/api/notifications?limit='+LIMIT,{signal:AbortSignal.timeout(TIMEOUT_MS)}).then(function(r){
       if(r.status===401||r.status===403){root.hidden=true;stopped=true;return null;}
@@ -396,10 +399,7 @@ constexpr std::string_view kBellScript = R"JS(<script>
   /* No polling after IDLE_MS without input (the poll renews the session idle window); the next input resumes and fetches at once. */
   function input(){last=Date.now();if(paused){paused=false;poll(false);}}
   ['keydown','pointerdown','pointermove','scroll'].forEach(function(e){document.addEventListener(e,input,{passive:true});});
-  setInterval(function(){
-    if(Date.now()-last>IDLE_MS){paused=true;return;}
-    poll(false);
-  },POLL_MS);
+  setInterval(function(){poll(false);},POLL_MS);
   document.addEventListener('visibilitychange',function(){poll(false);});
   root.addEventListener('toggle',function(){if(root.open)poll(true);else disarm();});
   document.addEventListener('keydown',function(e){if(e.key==='Escape'&&root.open){root.open=false;sum.focus();}});

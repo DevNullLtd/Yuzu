@@ -365,7 +365,8 @@ TEST_CASE("app shell: both bell actions take the two-click confirm", "[nav][shel
 TEST_CASE("app shell: bell polling is gated on recent input", "[nav][shell][bell]") {
     const auto html = render_shell({});
     CHECK_THAT(html, ContainsSubstring("['keydown','pointerdown','pointermove','scroll'].forEach("));
-    CHECK_THAT(html, ContainsSubstring("if(Date.now()-last>IDLE_MS){paused=true;return;}"));
+    // The age check lives in poll() so the timer and a foregrounded tab share it.
+    CHECK_THAT(html, ContainsSubstring("if(!force&&Date.now()-last>IDLE_MS){paused=true;return;}"));
     CHECK_THAT(html, ContainsSubstring("function input(){last=Date.now();if(paused){paused=false;poll(false);}}"));
     // Not polled while the tab is hidden or the panel is open.
     CHECK_THAT(html, ContainsSubstring("(!force&&(document.hidden||root.open))"));
@@ -381,7 +382,7 @@ TEST_CASE("app shell: bell renders server text as text only", "[nav][shell][bell
     }
     CHECK_THAT(html, ContainsSubstring("textContent"));
     // The message is clamped before it reaches the paragraph or the title attribute.
-    const auto clamp = html.find("String(n.message).slice(0,MSG_MAX)");
+    const auto clamp = html.find("txt(n.message).slice(0,MSG_MAX)");
     REQUIRE(clamp != std::string::npos);
     CHECK(clamp < html.find("m.setAttribute('title',msg)"));
     // The level goes through a fixed map; the raw string is never a class.
