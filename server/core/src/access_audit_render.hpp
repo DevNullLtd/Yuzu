@@ -65,7 +65,6 @@ inline constexpr std::string_view kLogDenied =
     "Administrator account role.";
 inline constexpr std::string_view kLogUnavailable =
     "The audit store did not answer, so the log is unknown right now. This is not no activity.";
-inline constexpr std::string_view kSampleDenied = kLogDenied;
 inline constexpr std::string_view kSampleUnavailable =
     "The audit store did not answer, so no sample could be drawn.";
 inline constexpr std::string_view kRetentionDenied =

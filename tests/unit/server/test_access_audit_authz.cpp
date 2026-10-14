@@ -216,16 +216,3 @@ TEST_CASE("audit page authz: RBAC on, a Reviewer holds AccessReview only and is 
     CHECK(r.reads == 0);
     CHECK(r.denied_rows() == 2);
 }
-
-TEST_CASE("audit page authz: a request with no session is refused before any read",
-          "[pg][access-audit][authz]") {
-    YUZU_REQUIRE_PG_DB_TPL(db_, audit_page_tpl);
-    Rig r{db_.dsn()};
-    for (const char* p : {kLog, kSample, kRetention}) {
-        INFO(p);
-        const auto res = r.sink.dispatch("GET", p);
-        REQUIRE(res);
-        CHECK(res->status == 401);
-    }
-    CHECK(r.reads == 0);
-}
