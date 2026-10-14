@@ -10060,6 +10060,8 @@ complete-cohort admission check for a confined caller; a **global** grant is nev
 #### `POST /api/executions/{id}/cancel`
 
 **Permission:** `Execution:Execute` AND `Execution:Read`, same confinement rule as `rerun`.
+**Response (409):** the execution already finished (`succeeded`, `completed` or `cancelled`);
+nothing changed. Audited as `execution.cancel` / `denied`. A degraded execution store is a `503`.
 **Response (404):** unknown execution id (this route no longer reports a false success for a
 nonexistent id), outside-scope, or an incomplete/partial target cohort. **Escape hatch:** an
 execution whose targeted cohort never fully reports (an agent gone offline mid-run, for example)
