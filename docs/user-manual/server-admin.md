@@ -5197,6 +5197,19 @@ An agent id seen for the first time must also use only letters, digits, `.`, `_`
 
 Each panel loads on its own. A refused browser session writes no denied-access audit row for any of them (the panels load automatically, so opening the page must not fill the audit log); a refused API or MCP token that reaches a fragment URL does. The no-administrator check at the top of the principals panel (a call to `/api/v1/engine-principals/audit/no-admin`, which needs `AuditLog:Read`) runs only when the principals fragment reports that the caller holds that permission. The `AuditLog:Read` checks that decide this (and whether a revoked principal's free-text detail is shown) are quiet for browser sessions only: a non-browser caller that holds `EnginePrincipal:Read` but not `AuditLog:Read` writes one ordinary permission-denied row per principals-list load and per revoked-principal detail load. The no-administrator result is a statement about the roles and grants the server could read: a role read that degrades is not distinguishable from "no roles" on that route, so the page words a clean result accordingly. Device tokens are not shown on this page.
 
+### Audit and reviews page
+
+`/access/audit` (Access group in the navigation) shows the audit log, an authentication sample and the audit retention period. It is read-only. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty. See [Audit Log](audit-log.md#dashboard-viewer) for what each panel shows.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/access/audit` | The page. Redirects to `/login` without a session. |
+| `GET` | `/fragments/access/audit/log` | Audit log panel (HTMX). Gated on `AuditLog:Read`. Query: `range` (`1h`, `24h` or `7d`), `principal`, `action` (exact), `offset` (0 to 10000). Fixed 50-row pages; `limit` is never read. Writes no audit row. |
+| `GET` | `/fragments/access/audit/sample` | Authentication sample (HTMX). Gated on `AuditLog:Read`. Query: `limit` (1 to 1000). Requested only by the **Draw sample** button; writes an `audit.auth_sample.exported` row. |
+| `GET` | `/fragments/access/audit/retention` | Retention panel (HTMX). Gated on `ServerConfig:Read`. Requested only by the **Show retention** button. |
+
+A request the page cannot honour (an unknown range, an `offset` past 10000, a NUL byte in a filter, a bad sample size) is answered with status 200 and a short note, because htmx discards 4xx and 5xx bodies; nothing is read from the store.
+
 ### OTA Updates
 
 | Method | Route | Description |

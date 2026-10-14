@@ -1,7 +1,7 @@
 # Audit Log
 
 Yuzu records every operator action as a structured audit event. The audit log
-provides a tamper-evident trail suitable for compliance reporting, incident
+provides an access-controlled, retention-managed trail suitable for compliance reporting, incident
 investigation, and forwarding to external SIEM platforms such as Splunk or
 Elastic.
 
@@ -527,11 +527,37 @@ curl -s -b cookies.txt \
 
 ## Dashboard viewer
 
-The Yuzu dashboard includes a built-in audit log viewer accessible from the
-navigation menu. The viewer renders audit events as an HTMX-powered table with
-live filtering by principal, action, and date range. No additional
-configuration is required. It is backed by `GET /api/audit`, so the same
-`AuditLog:Read` rule applies (admin-only while RBAC is disabled).
+The audit trail is readable from the dashboard at **Access > Audit and reviews**
+(`/access/audit`). The page is open to every signed-in user, but each panel is gated by its own
+permission and a panel your account cannot read says so instead of rendering empty.
+
+**Audit log.** Needs `AuditLog:Read` (admin-only while RBAC is disabled). It reads the same
+store, with the same gate and the same filters, as `GET /api/v1/audit` and shows only the
+fields that route returns: time, principal, action, target, result and `detail`, plus the
+event id in the row detail. The source address and the principal's role, which the legacy
+`GET /api/audit` route also returns, are not shown. Filters:
+
+- a time range of the last hour, 24 hours or 7 days (the page sets `since`; `until` is open);
+- Principal and Action, both **exact matches**, not searches.
+
+Rows are newest first, 50 to a page, and the page does not show a filtered total. Paging
+stops at row 10,000 (the same `offset` ceiling as the REST routes); the page says so and asks
+you to narrow the time range, it never silently shows a different page than the one asked
+for. The log is live, so an event written while you page can shift later pages. If the audit
+store does not answer, the panel is a red box, never an empty table: an unreadable log is not
+the same thing as no activity. Reading the log writes no audit row, exactly like the REST
+route.
+
+**Authentication sample.** A random sample of sign-in, MFA, session and engine-principal
+events for evidence, drawn only when you press **Draw sample** (never on load). It is
+`GET /api/v1/audit/auth-sample` with the window left open; the sample size is 1 to 1000. The
+panel states how many candidates the sample was drawn from and whether the pool was capped to
+the newest events. Each draw is itself recorded as `audit.auth_sample.exported`; if that row
+cannot be written the panel says so.
+
+**Retention.** Shows the configured retention period (`--audit-retention-days`, 365 days by
+default) and that cleanup runs hourly. It needs `ServerConfig:Read`, which is
+Administrator-only, so it is fetched on request rather than on every page view. It is read only.
 
 ## Retention and cleanup
 
