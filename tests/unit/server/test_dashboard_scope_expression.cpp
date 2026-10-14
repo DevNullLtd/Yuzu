@@ -62,6 +62,10 @@ struct Harness {
     yuzu::server::test::TestRouteSink sink;
     std::vector<DispatchCall> calls;
     std::vector<AuditRow> audits;
+    std::vector<AuditRow> persisted; // rows that went through the persist-reporting sink
+    std::vector<std::string> order;  // "audit:<result>" / "dispatch", in call order
+    bool persist_ok = true;          // false = the audit store refuses the row
+    int sent = 3;
     std::pair<std::string, std::string> resolve_to{kReadOnly.first, kReadOnly.second};
 
     Harness() {
@@ -83,8 +87,9 @@ struct Harness {
                    const std::vector<std::string>& ids, const std::string& scope,
                    const std::unordered_map<std::string, std::string>&,
                    const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            order.push_back("dispatch");
             calls.push_back({plugin, action, scope, ids});
-            return {.sent = 3, .command_id = "cmd-" + std::to_string(calls.size())};
+            return {.sent = sent, .command_id = "cmd-" + std::to_string(calls.size())};
         };
         routes.register_routes(
             sink, auth_fn, perm_fn, audit_fn, /*response_store=*/nullptr, /*mg=*/nullptr,
@@ -97,6 +102,14 @@ struct Harness {
             [this](const std::string&) { return resolve_to; }, &metrics,
             /*instruction_store=*/nullptr);
         routes.set_capability_classify_fn(yuzu::test::real_classify_fn());
+        routes.set_persist_audit_fn([this](const httplib::Request&, const std::string& a,
+                                           const std::string& r, const std::string&,
+                                           const std::string&, const std::string& d) {
+            order.push_back("audit:" + r);
+            if (persist_ok)
+                persisted.push_back({a, r, d});
+            return persist_ok;
+        });
     }
 
     std::unique_ptr<httplib::Response> post(const std::string& body) {
@@ -292,4 +305,68 @@ TEST_CASE("scope_expression rule 5: the Destructive targeting gate still refuses
     auto res = h.post("instruction=purge&scope_expression=" + enc(R"(ostype == "windows")"));
     CHECK(h.calls.empty());
     CHECK(contains(res->body, std::string(yuzu::server::kDestructiveUntargetedMessage)));
+}
+
+// ── ADR-0033 section 9: no audit row, no mutation ──────────────────────────────────────────
+
+TEST_CASE("scope_expression audit: the attempted row is stored BEFORE the dispatch",
+          "[server][dashboard][execute][scope_expression][audit]") {
+    Harness h;
+    const std::string expr = R"(ostype == "windows")";
+    auto res = h.post("instruction=version&scope_expression=" + enc(expr));
+    CHECK(res->status == 200);
+    REQUIRE(h.persisted.size() == 1);
+    CHECK(h.persisted[0].action == "command.dispatch");
+    CHECK(h.persisted[0].result == "attempted");
+    CHECK(contains(h.persisted[0].detail, "os_info:os_version"));
+    CHECK(contains(h.persisted[0].detail, "scope_expression="));
+    REQUIRE(h.order.size() >= 2);
+    CHECK(h.order[0] == "audit:attempted");
+    CHECK(h.order[1] == "dispatch");
+}
+
+TEST_CASE("scope_expression audit: a row that is not stored means NOTHING is dispatched",
+          "[server][dashboard][execute][scope_expression][audit][security]") {
+    Harness h;
+    h.persist_ok = false;
+    auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+    CHECK(res->status == 503);
+    CHECK(res->has_header("Sec-Audit-Failed"));
+    CHECK(contains(res->body, "audit_unavailable"));
+    CHECK(h.calls.empty());
+    // No success row claims a send that did not happen.
+    for (const auto& a : h.audits)
+        CHECK(a.result != "success");
+}
+
+TEST_CASE("scope_expression audit: an unwired persist sink refuses rather than dispatches",
+          "[server][dashboard][execute][scope_expression][audit][security]") {
+    Harness h;
+    h.routes.set_persist_audit_fn({});
+    auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+    CHECK(res->status == 503);
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("scope_expression audit: refusals burn no attempted row, and plain sends skip the sink",
+          "[server][dashboard][execute][scope_expression][audit]") {
+    Harness h;
+    h.post("instruction=version&scope_expression=" + enc(R"(ostypo != "windows")"));
+    h.post("instruction=version&scope=__all__&scope_expression=" + enc(R"(ostype == "windows")"));
+    h.post("instruction=version&scope=agent-1");
+    CHECK(h.persisted.empty());
+    CHECK(h.order == std::vector<std::string>{"dispatch"});
+}
+
+TEST_CASE("scope_expression audit: a send that reaches no agent records a failure outcome",
+          "[server][dashboard][execute][scope_expression][audit]") {
+    Harness h;
+    h.sent = 0;
+    h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+    bool failure = false;
+    for (const auto& a : h.audits)
+        if (a.action == "command.dispatch" && a.result == "failure" &&
+            contains(a.detail, "scope_expression="))
+            failure = true;
+    CHECK(failure);
 }

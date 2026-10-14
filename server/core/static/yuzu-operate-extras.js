@@ -40,10 +40,18 @@
     return fallback;
   }
 
-  /* grant_secret and grant_id are redacted at persistence by the server; the
-     same keys are masked here wherever typed text is echoed back. */
-  var SECRET_RE = /\b(grant_secret|grant_id)=("[^"]*"|'[^']*'|\S+)/gi;
-  function maskSecrets(s) { return String(s).replace(SECRET_RE, '$1=•••'); }
+  /* Typed text is masked wherever it is echoed back (confirm dialog, history). The key list
+     is the server's own classification (sensitive_instruction_params.hpp), rendered into
+     <body data-secret-params> by the page; this file keeps no list of its own. With no list
+     the text is withheld, never echoed unmasked. */
+  var SECRET_KEYS = String(body && body.dataset && body.dataset.secretParams || '')
+    .split(',').filter(function (k) { return /^[A-Za-z0-9_]+$/.test(k); });
+  var SECRET_RE = SECRET_KEYS.length
+    ? new RegExp('\\b(' + SECRET_KEYS.join('|') + ')=("[^"]*"|\'[^\']*\'|\\S+)', 'gi') : null;
+  function maskSecrets(s) {
+    return SECRET_RE ? String(s).replace(SECRET_RE, '$1=•••')
+                     : '(hidden: the secret parameter list is unavailable)';
+  }
 
   /* Confirm through the shared dialog. title, paragraphs[], facts[[k,v]], pre (a
      bounded verbatim block), confirmLabel, danger. Resolves true only on the
@@ -299,6 +307,9 @@
         confirmLabel: 'Send'
       }).then(function (ok) { if (ok) d.issueRequest(true); });
     });
+    /* The page's own htmx:confirm guard on #instr-form holds every Send until this flag is
+       set, so a missing dialog module or script can never leave a one-click fan-out. */
+    if (window.YuzuDialog) window.__yuzuDashboardConfirmReady = true;
 
     /* ---- History: the Console's History panel has had no caller since the
        HTMX refactor (e39654155); feed it from a completed send, masked. ---- */
@@ -325,7 +336,7 @@
           path.indexOf('/api/dashboard/tar-execute') !== 0) return;
       if (x.status === 403) {
         setContext('Your role may not run instructions. Ask an administrator for the Execution permission.', true);
-      } else if (x.status === 400 && path.indexOf('/api/dashboard/execute') === 0) {
+      } else if ((x.status === 400 || x.status === 503) && path.indexOf('/api/dashboard/execute') === 0) {
         /* The route's refusal reason rides in an OOB span; read its text, never its markup. */
         var msg = '';
         try {

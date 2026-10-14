@@ -18520,6 +18520,9 @@ private:
         // handlers capture `this` at registration and read the member per
         // request, so setting it afterwards would never reach a live route.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // ADR-0033 section 9: the expression-targeted Send writes its `attempted` row through
+        // this persist-reporting sink BEFORE it dispatches (unwired = that path refuses).
+        dashboard_routes_->set_persist_audit_fn(audit_fn);
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software (fleet_read_fn, defined
         // above); wiring it here too so /fragments/results migrates onto

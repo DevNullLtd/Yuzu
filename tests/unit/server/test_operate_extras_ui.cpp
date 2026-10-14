@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "operate_extras_ui.hpp"
+#include "sensitive_instruction_params.hpp"
 #include "result_sets_ui.hpp"
 
 #include <cstring>
@@ -52,7 +53,7 @@ TEST_CASE("operate extras: the shared CSS chunk stays under the MSVC literal cei
 TEST_CASE("operate extras: the Dashboard page hosts the controller and the scope helper",
           "[ui][operate_extras]") {
     const std::string page = kDashboardIndexHtml;
-    CHECK(has(page, "<body data-page=\"dashboard\">"));
+    CHECK(has(page, "<body data-page=\"dashboard\" data-secret-params=\""));
     CHECK(has(page, "src=\"/static/yuzu-operate-extras.js\""));
     CHECK(has(page, "id=\"ox-expr\""));
     CHECK(has(page, "id=\"ox-validate\""));
@@ -114,7 +115,7 @@ TEST_CASE("operate extras: the scope helper uses the real routes and bounds its 
     CHECK(has(js, "PREVIEW_IDS = 25"));
     // The preview route's caution text promises an approval rule that does not
     // exist: the field is never read.
-    CHECK_FALSE(has(js, "warning"));
+    CHECK_FALSE(has(js, ".warning"));
     // Validate is syntax only.
     CHECK(has(js, "Unknown attributes are refused on Send."));
 }
@@ -127,7 +128,8 @@ TEST_CASE("operate extras: fan-out confirm, history masking and the 403 listener
     CHECK(has(js, "'htmx:responseError'"));
     CHECK(has(js, "/api/dashboard/tar-execute"));
     // History and the confirm echo both pass typed text through the mask.
-    CHECK(has(js, "grant_secret|grant_id"));
+    CHECK(has(js, "body.dataset.secretParams"));
+    CHECK(has(js, "(hidden: the secret parameter list is unavailable)"));
     CHECK(has(js, "window.addHistory(maskSecrets(cmd)"));
     CHECK(has(js, "['Command', maskSecrets(cmd)]"));
     // The TAR form explains the substring blocklist (S10).
@@ -204,4 +206,37 @@ TEST_CASE("operate extras: the TAR page's Ad-hoc SQL frame is retired and points
     CHECK(has(js, "name: 'parent'"));
     CHECK(has(js, "name: 'name'"));
     CHECK(has(js, "include_empty:"));
+}
+
+TEST_CASE("operate extras: the masked-parameter list is the server's own classification",
+          "[ui][operate_extras][security]") {
+    const auto& js = yuzu::server::kYuzuOperateExtrasJs;
+    // The masking code keeps no key list of its own (a second copy drifts from the server's).
+    CHECK_FALSE(has(js, "grant_secret|grant_id"));
+    // The page-rendered attribute is exactly kRedactedInstructionParamKeys, in order.
+    std::string expected;
+    for (auto key : yuzu::server::kRedactedInstructionParamKeys) {
+        if (!expected.empty())
+            expected += ',';
+        expected += std::string(key);
+    }
+    CHECK(std::string(YUZU_OX_SECRET_PARAMS) == expected);
+    const std::string page = kDashboardIndexHtml;
+    CHECK(page.find("data-secret-params=\"" + expected + "\"") != std::string::npos);
+}
+
+TEST_CASE("operate extras: Send fails closed until the confirmation script has loaded",
+          "[ui][operate_extras][security]") {
+    const auto& js = yuzu::server::kYuzuOperateExtrasJs;
+    const std::string page = kDashboardIndexHtml;
+    // The page holds every Send at htmx:confirm unless the script's ready flag is set, so a
+    // missing script or YuzuDialog never leaves a one-click fleet send.
+    const auto guard = page.find("instrForm.addEventListener('htmx:confirm'");
+    REQUIRE(guard != std::string::npos);
+    const auto guard_end = page.find("});", guard);
+    const std::string block = page.substr(guard, guard_end - guard);
+    CHECK(has(block, "window.__yuzuDashboardConfirmReady"));
+    CHECK(has(block, "e.preventDefault()"));
+    // The script sets the flag only when the dialog module exists.
+    CHECK(has(js, "if (window.YuzuDialog) window.__yuzuDashboardConfirmReady = true;"));
 }

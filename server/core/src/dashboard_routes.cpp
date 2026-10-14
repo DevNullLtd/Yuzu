@@ -5,6 +5,7 @@
 #include "scope_attribute_guard.hpp" // E-1: unknown-attribute refusal for expression sends
 #include "mcp_input_bounds.hpp"    // kExecInstrScopeMaxLen
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
+#include "rest_audit.hpp" // detail::try_persist_audit (E-1: audit-before-dispatch)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
 #include "tar_tree_routes.hpp" // TarRetentionPausedScan/TarPausedSourceRow/tar_retention_paused_json (#4027)
 
@@ -1189,11 +1190,43 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
+                 // ADR-0033 section 9, "no audit row, no mutation": an expression-targeted
+                 // send is a new fan-out surface, so its `attempted` row is stored BEFORE the
+                 // dispatch and a row that is not stored (or a sink that is not wired) refuses
+                 // the send with a 503 and dispatches nothing. Every refusal above returned
+                 // before this point, so a rejected request burns no `attempted` row. The
+                 // outcome row ("success"/"failure") follows the dispatch.
+                 if (expression_supplied) {
+                     const bool stored =
+                         persist_audit_fn_ &&
+                         yuzu::server::detail::try_persist_audit(
+                             persist_audit_fn_, req, "command.dispatch", "attempted", "command",
+                             "",
+                             plugin + ":" + action + " scope_expression=" +
+                                 onbehalf::sanitize_for_log(target_expression, 256));
+                     if (!stored) {
+                         res.status = 503;
+                         res.set_header("Sec-Audit-Failed", "true");
+                         res.set_content(
+                             "<span id=\"result-context\" hx-swap-oob=\"true\""
+                             " class=\"result-context is-error\""
+                             " data-reason=\"audit_unavailable\">The audit record could not "
+                             "be stored, so nothing was sent. Retry once the audit store "
+                             "recovers.</span>",
+                             "text/html; charset=utf-8");
+                         return;
+                     }
+                 }
+
                  auto dispatch_outcome =
                      dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
                  if (sent == 0) {
+                     if (expression_supplied)
+                         audit_fn_(req, "command.dispatch", "failure", "command", command_id,
+                                   "reason=no_agents_reached scope_expression=" +
+                                       onbehalf::sanitize_for_log(target_expression, 256));
                      // #3424/#3511: don't blame connectivity for a fail-closed
                      // containment gate, a quarantine denial, or a withheld
                      // plugin-absent dispatch — same discrimination /api/command

@@ -150,6 +150,16 @@ public:
         csrf_trusted_origins_ = std::move(origins);
     }
 
+    /// ADR-0033 section 9 ("no audit row, no mutation") for the expression-targeted Send
+    /// (`scope_expression` on POST /api/dashboard/execute): the SAME audit sink as `AuditFn`
+    /// but returning the persist outcome, so the route can write an `attempted` row BEFORE
+    /// dispatch and refuse (503) when it is not stored. Unset = the expression path fails
+    /// CLOSED (503), never "dispatch without evidence". Set before `register_routes`.
+    using PersistAuditFn = std::function<bool(const httplib::Request&, const std::string&,
+                                              const std::string&, const std::string&,
+                                              const std::string&, const std::string&)>;
+    void set_persist_audit_fn(PersistAuditFn fn) { persist_audit_fn_ = std::move(fn); }
+
     /// #1712 / #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing `/fragments/results`'
     /// real per-agent/service confinement (same shape as
@@ -249,6 +259,7 @@ public:
 
 private:
     std::vector<std::string> csrf_trusted_origins_;
+    PersistAuditFn persist_audit_fn_;
     AuthFn auth_fn_;
     PermFn perm_fn_;
     FleetReadFn fleet_read_fn_;

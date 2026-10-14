@@ -360,7 +360,7 @@ const char* const kDashboardIndexTemplate =
     // the MSVC C2026 16380-byte raw-string-literal limit after the round-2
     // visualization additions. Adjacent string literals concatenate at
     // compile time, so the runtime HTML is byte-identical.
-    R"HTM(<body data-page="dashboard">
+    R"HTM(<body data-page="dashboard" data-secret-params=")HTM" YUZU_OX_SECRET_PARAMS R"HTM(">
 
   <!--yuzu:shell--><!--/yuzu:shell-->
 
@@ -1253,6 +1253,17 @@ const char* const kDashboardIndexTemplate =
        autocomplete input inside it fires bubbling beforeRequest events. */
     var instrForm = document.getElementById('instr-form');
     if (instrForm) {
+      /* Fail closed: the fan-out confirmation lives in yuzu-operate-extras.js (and needs
+         YuzuDialog). Until that script sets its ready flag, a Send is held, never sent. */
+      instrForm.addEventListener('htmx:confirm', function(e) {
+        if (e.target !== instrForm || window.__yuzuDashboardConfirmReady) return;
+        e.preventDefault();
+        var c = document.getElementById('result-context');
+        if (c) {
+          c.textContent = 'Send is unavailable: the confirmation dialog did not load. Reload the page.';
+          c.className = 'result-context is-error';
+        }
+      });
       instrForm.addEventListener('htmx:beforeRequest', function(e) {
         if (typeof closeAC === 'function') closeAC();
         if (e.target === instrForm) clearChartDeck();
