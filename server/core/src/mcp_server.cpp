@@ -603,7 +603,7 @@ static const ToolDef kTools[] = {
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
-     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
+     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string","description":"Exact target id; requires target_type"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500},"offset":{"type":"integer","default":0,"minimum":0,"maximum":10000}}})",
      R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}}},"required":["entries"]})j"},
 
     {"list_definitions",
@@ -8436,6 +8436,30 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.principal = param_str(args, "principal");
                 aq.action = param_str(args, "action");
                 aq.target_type = param_str(args, "target_type");
+                // Strict: a present wrong-typed value is refused, not dropped
+                // (a dropped filter would widen the evidence read silently).
+                auto target_id_opt = param_string_strict(args, "target_id");
+                auto offset_opt = param_int_strict(args, "offset", 0);
+                if (!target_id_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "target_id must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                if (!offset_opt || *offset_opt < 0 || *offset_opt > kAuditMaxOffset) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "offset must be an integer 0..10000"),
+                        "application/json");
+                    return;
+                }
+                aq.target_id = *target_id_opt;
+                aq.offset = static_cast<int>(*offset_opt);
+                if (!aq.target_id.empty() && aq.target_type.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "target_id requires target_type"),
+                        "application/json");
+                    return;
+                }
                 aq.since = param_int(args, "since");
                 aq.until = param_int(args, "until");
                 // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the

@@ -2,6 +2,7 @@
 
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
+#include "response_query_params.hpp"
 #include "data_export.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp" // extract_json_string — shared JSON body-extraction helper
@@ -137,6 +138,16 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+        // Same ceilings as the v1 and MCP twins: an unbounded limit/offset asks
+        // Postgres for the whole table (#4644/#4703 class).
+        if (q.offset > kAuditMaxOffset) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"offset must be 0..10000"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        q.limit = cap_query_limit(q.limit);
 
         // ADR-0040: reads are degrade-distinguishable. A store/pool failure
         // returns nullopt — surface 503, NEVER a false-empty 200 (an audit

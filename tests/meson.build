@@ -1368,6 +1368,7 @@ if build_server
       'unit/server/test_log_token.cpp',
       'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
+      'unit/server/test_rest_audit_query.cpp',
       'unit/server/test_rest_audit_helper.cpp',
       'unit/server/test_rest_scope_v1_routes.cpp', # #2146 Batch B2: POST /api/v1/scope/validate + /preview
       'unit/server/test_tag_store.cpp',

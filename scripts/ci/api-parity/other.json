@@ -89,9 +89,9 @@
     "method": "GET",
     "path": "/api/audit",
     "capability_id": "get.api-audit",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {"method": "GET", "path": "/api/v1/audit"},
+    "mcp_twin": "query_audit_log",
+    "status": "twinned"
   },
   {
     "method": "POST",

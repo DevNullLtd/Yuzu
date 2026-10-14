@@ -561,6 +561,37 @@ TEST_CASE("dashboard_api_routes: /api/audit rejects limit < 1 with 400 against a
     CHECK(r->status == 400);
 }
 
+TEST_CASE("dashboard_api_routes: /api/audit bounds limit and offset like its v1/MCP twins",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    AuditEvent e;
+    e.principal = "alice";
+    e.action = "auth.login";
+    e.result = "success";
+    REQUIRE(audit.log(e));
+
+    Harness h;
+    h.audit_store = &audit;
+    h.wire();
+
+    // An oversized limit is accepted (clamped to 1000 before the store), not an
+    // unbounded fetch and not an error.
+    auto r = h.sink.Get("/api/audit?limit=2147483647");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(json::parse(r->body)["events"].size() == 1);
+    // offset is capped at kAuditMaxOffset; the cap itself is valid.
+    r = h.sink.Get("/api/audit?offset=10001");
+    REQUIRE(r);
+    CHECK(r->status == 400);
+    r = h.sink.Get("/api/audit?offset=10000");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+}
+
 TEST_CASE("dashboard_api_routes: /api/analytics/status reports real pending/total counts",
           "[pg][server][routes][dashboard_api_routes]") {
     yuzu::test::AnalyticsEventStorePg analytics;
