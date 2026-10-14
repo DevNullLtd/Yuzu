@@ -33,6 +33,7 @@
 ///   GET /static/yuzu-operate-extras.js      -                      (Operate extras page controllers)
 ///   GET /static/yuzu-estate.js              -                      (device containment controls)
 ///   GET /static/yuzu-device-data.js         -                      (Hardware record tag/property controls)
+///   GET /static/yuzu-system.js              -                      (System pages' shared write helper)
 ///   GET /static/cytoscape.min.js            -
 ///   GET /static/fonts/ibm-plex-sans-latin-400-normal.woff2   -
 ///   GET /static/fonts/ibm-plex-sans-latin-500-normal.woff2   -
