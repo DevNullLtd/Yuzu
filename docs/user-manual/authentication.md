@@ -220,7 +220,7 @@ Returns `200 OK` with `{"status":"ok"}`. The session is invalidated server-side 
 
 ### Session lifetime
 
-Dashboard cookie sessions have an **absolute lifetime of 8 hours** from login. When this expires the operator is redirected to `/login`. Sessions are also invalidated server-side by an **explicit action** — logout, session revocation (Settings → User Management → Revoke sessions, or "Sign out everywhere"), a role change, or removing elevation eligibility. For Postgres-backed deployments a session is a durable row (`SessionStore`, HA WS-1/1a, ADR-2002 §4) and therefore **survives a server restart** — a restart no longer drops it. Only config-file-only (non-Postgres) deployments keep the old behavior where a restart clears all sessions. See `docs/auth-architecture.md` "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
+Dashboard cookie sessions have an **absolute lifetime of 8 hours** from login. When this expires the operator is redirected to the sign-in page at `/home`, which remembers the screen that was requested (see `GET /home` in [server-admin.md](server-admin.md)). Sessions are also invalidated server-side by an **explicit action** — logout, session revocation (Settings → User Management → Revoke sessions, or "Sign out everywhere"), a role change, or removing elevation eligibility. For Postgres-backed deployments a session is a durable row (`SessionStore`, HA WS-1/1a, ADR-2002 §4) and therefore **survives a server restart** — a restart no longer drops it. Only config-file-only (non-Postgres) deployments keep the old behavior where a restart clears all sessions. See `docs/auth-architecture.md` "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
 
 An optional **idle (inactivity) timeout** can shorten this. When `--session-inactivity-secs` (`YUZU_SESSION_INACTIVITY_SECS`) is set to a positive value, a session idle longer than that window is invalidated server-side and the operator is prompted to log in again — regardless of the 8-hour absolute limit. The default `0` disables it (only the absolute lifetime applies). The window is **sliding**: any authenticated request resets it. Scope is **cookie sessions only** — API tokens and MCP tokens are never idle-timed-out, and OIDC users simply re-authenticate via SSO. A recommended hardened value is `900` (15 minutes).
 
@@ -304,7 +304,7 @@ Example startup:
 
 ### OIDC Login Flow
 
-1. User clicks "Sign in with SSO" on the login page.
+1. User clicks "Sign in with single sign-on" on the sign-in page (`/home`; the link appears only when a provider is configured).
 2. Browser is redirected to `GET /auth/oidc/start`, which generates a PKCE challenge, sets the browser-binding cookie, and redirects to the IdP's authorization endpoint.
 3. User authenticates at the IdP.
 4. IdP redirects back to `GET /auth/callback` with an authorization code. The browser presents the binding cookie.
