@@ -112,7 +112,7 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
     }
 
     if (degraded) {
-        return "<div class=\"detail-panel\"><div class=\"empty-state\">"
+        return "<div class=\"cmp-panel\"><div class=\"empty-state\">"
                "Policy data temporarily unavailable (store degraded) — try again shortly."
                "</div></div>";
     }
@@ -122,7 +122,7 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
     if (api_) {
         auto fc_res = api_->fleet_compliance();
         if (!fc_res) {
-            return "<div class=\"detail-panel\"><div class=\"empty-state\">"
+            return "<div class=\"cmp-panel\"><div class=\"empty-state\">"
                    "Fleet compliance temporarily unavailable (store degraded) — try again "
                    "shortly.</div></div>";
         }
@@ -132,24 +132,25 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
 
     std::string html;
 
-    // Hero: fleet compliance percentage + bar
+    // Readout row: fleet compliance (with its level bar), policy and device-check counts
     html += "<div class=\"compliance-hero\">"
-            "<div class=\"compliance-pct ";
+            "<div class=\"hero-cell\">"
+            "<div class=\"hero-v\">" + std::to_string(fleet_pct) + "%</div>"
+            "<div class=\"hero-l\">Fleet compliance</div>"
+            "<div class=\"compliance-bar\"><div class=\"compliance-fill ";
     html += compliance_level(fleet_pct);
-    html += "\">" + std::to_string(fleet_pct) + "%</div>"
-            "<div class=\"compliance-bar-wrap\">"
-            "<div class=\"compliance-bar\">"
-            "<div class=\"compliance-fill ";
-    html += compliance_level(fleet_pct);
-    html += "\" style=\"width:" + std::to_string(fleet_pct) + "%\"></div>"
+    html += "\" style=\"width:" + std::to_string(fleet_pct) + "%\"></div></div>"
             "</div>"
-            "<div class=\"compliance-stats\">"
-            "<span><strong>" + std::to_string(static_cast<int>(policies.size())) + "</strong> policies active</span>"
-            "<span><strong>" + std::to_string(static_cast<int>(fc.total_checks)) + "</strong> device checks</span>"
-            "</div></div></div>";
+            "<div class=\"hero-cell\"><div class=\"hero-v\">" +
+            std::to_string(static_cast<int>(policies.size())) +
+            "</div><div class=\"hero-l\">Policies active</div></div>"
+            "<div class=\"hero-cell\"><div class=\"hero-v\">" +
+            std::to_string(static_cast<int>(fc.total_checks)) +
+            "</div><div class=\"hero-l\">Device checks</div></div>"
+            "</div>";
 
     // Policy table
-    html += "<table class=\"policy-table\">"
+    html += "<div class=\"cmp-panel\"><div class=\"tw\"><table class=\"policy-table\">"
             "<thead><tr>"
             "<th>#</th><th>Policy</th><th>Scope</th>"
             "<th>Compliance</th><th></th><th></th>"
@@ -164,7 +165,7 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
         for (const auto& p : policies) {
             ++row;
             html += "<tr>"
-                    "<td style=\"color:var(--muted)\">" + std::to_string(row) + "</td>"
+                    "<td class=\"policy-idx\">" + std::to_string(row) + "</td>"
                     "<td class=\"policy-name\">" + html_escape(p.name) + "</td>"
                     "<td class=\"policy-scope\">" + html_escape(p.scope) + "</td>"
                     "<td>"
@@ -173,7 +174,7 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
                     "<div class=\"mini-bar\"><div class=\"mini-fill " + std::string(compliance_level(p.pct)) +
                     "\" style=\"width:" + std::to_string(p.pct) + "%\"></div></div>"
                     "</td>"
-                    "<td style=\"font-size:0.7rem;color:var(--muted)\">"
+                    "<td class=\"policy-count\">"
                     + std::to_string(p.compliant) + "/" + std::to_string(p.total) +
                     "</td>"
                     "<td>"
@@ -186,7 +187,7 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
         }
     }
 
-    html += "</tbody></table>";
+    html += "</tbody></table></div></div>";
     return html;
 }
 
@@ -275,7 +276,7 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
         // "the store could not be asked".
         return "<div class=\"detail-panel\">"
                "<h3>" + html_escape(policy_name) +
-               " <span style=\"font-size:0.7rem;font-weight:400;color:var(--muted)\">"
+               " <span class=\"detail-id\">"
                "(" + html_escape(policy_id) + ")</span></h3>"
                "<div class=\"empty-state\">Compliance data temporarily unavailable (store "
                "degraded) — try again shortly.</div></div>";
@@ -283,7 +284,7 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
     if (agents.empty()) {
         return "<div class=\"detail-panel\">"
                "<h3>" + html_escape(policy_name) +
-               " <span style=\"font-size:0.7rem;font-weight:400;color:var(--muted)\">"
+               " <span class=\"detail-id\">"
                "(" + html_escape(policy_id) + ")</span></h3>"
                "<div class=\"empty-state\">No compliance data yet. "
                "Agents will report status once the policy triggers fire.</div></div>";
@@ -300,11 +301,11 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
     std::string html;
     html += "<div class=\"detail-panel\">"
             "<h3>" + html_escape(policy_name) +
-            " <span style=\"font-size:0.7rem;font-weight:400;color:var(--muted)\">"
+            " <span class=\"detail-id\">"
             "(" + html_escape(policy_id) + ")</span></h3>";
 
     // Status summary badges
-    html += "<div style=\"display:flex;gap:1rem;margin-bottom:0.75rem;font-size:0.75rem\">"
+    html += "<div class=\"detail-badges\">"
             "<span class=\"status-compliant\">" + std::to_string(compliant) + " compliant</span>"
             "<span class=\"status-non-compliant\">" + std::to_string(non_compliant) + " non-compliant</span>"
             "<span class=\"status-pending-eval\">" + std::to_string(unknown) + " unknown</span>"
@@ -312,7 +313,7 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
             "</div>";
 
     // Per-agent table
-    html += "<table class=\"detail-table\">"
+    html += "<div class=\"tw\"><table class=\"detail-table\">"
             "<thead><tr>"
             "<th>Agent</th><th>Hostname</th><th>OS</th>"
             "<th>Status</th><th>Last Check</th><th>Detail</th>"
@@ -333,17 +334,16 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
         else if (status_label == "error") status_label = "Error";
 
         html += "<tr>"
-                "<td style=\"font-family:var(--mono);font-size:0.7rem;color:var(--yellow)\">"
-                + html_escape(a.agent_id) + "</td>"
+                "<td class=\"mono-id\">" + html_escape(a.agent_id) + "</td>"
                 "<td>" + html_escape(a.hostname) + "</td>"
-                "<td style=\"font-size:0.75rem;color:var(--muted)\">" + html_escape(a.os) + "</td>"
+                "<td class=\"cell-mut\">" + html_escape(a.os) + "</td>"
                 "<td><span class=\"" + status_class + "\">" + status_label + "</span></td>"
-                "<td style=\"font-size:0.7rem;color:var(--muted)\">" + html_escape(a.last_check) + "</td>"
-                "<td style=\"font-size:0.75rem\">" + html_escape(a.detail) + "</td>"
+                "<td class=\"cell-mut\">" + html_escape(a.last_check) + "</td>"
+                "<td class=\"cell-wrap\">" + html_escape(a.detail) + "</td>"
                 "</tr>";
     }
 
-    html += "</tbody></table></div>";
+    html += "</tbody></table></div></div>";
     return html;
 }
 

@@ -807,7 +807,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // Wave 7b PR7b.1 execution_artifacts — PluginConfigStore backs the
             // plugin kill switch; action_allowed() fails closed when the store
             // is not open, so a store that failed to open would silently deny
-            // every kill-switched action. Same readyz-vs-healthz drift class
+            // every kill-switched action (never a protective action —
+            // yuzu::protective). Same readyz-vs-healthz drift class
             // the rows above document; boot state only (latched, #3061).
             {"plugin_config_store", deps.plugin_config_store && deps.plugin_config_store->is_open()},
         };

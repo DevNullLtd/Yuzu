@@ -2,7 +2,7 @@
 /// HTTP-level coverage for the page-shell/static-asset route module (#2542)
 /// — driven in-process through TestRouteSink (no httplib acceptor, #438),
 /// mirroring test_plugin_config_routes.cpp's Harness shape. None of these
-/// 25 routes touches Postgres (no store), so every case here runs without
+/// 29 routes touches Postgres (no store), so every case here runs without
 /// YUZU_TEST_POSTGRES_DSN.
 
 #include "page_routes.hpp"
@@ -80,7 +80,7 @@ struct Harness {
 
 } // namespace
 
-// ── Static assets (12) + / (1): no gate, pure constant-serving ───────────
+// ── Static assets (16) + / (1): no gate, pure constant-serving ───────────
 
 namespace {
 struct AssetExpectation {
@@ -100,7 +100,11 @@ const std::vector<AssetExpectation> kStaticAssets = {
     {"/static/yuzu-viz.js", "application/javascript; charset=utf-8", "no-cache"},
     {"/static/yuzu-viz-host.js", "application/javascript; charset=utf-8", "no-cache"},
     {"/static/cytoscape.min.js", "application/javascript; charset=utf-8", "max-age=86400"},
-    {"/static/fonts/InterVariable.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-sans-latin-400-normal.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-sans-latin-500-normal.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-sans-latin-600-normal.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-mono-latin-400-normal.woff2", "font/woff2", "max-age=2592000"},
+    {"/static/fonts/ibm-plex-mono-latin-500-normal.woff2", "font/woff2", "max-age=2592000"},
     {"/static/yuzu-charts.js", "application/javascript; charset=utf-8", "max-age=86400"},
 };
 } // namespace
@@ -132,6 +136,30 @@ TEST_CASE("page_routes: / serves the dashboard shell, ungated", "[server][routes
     CHECK(r->status == 200);
     CHECK(r->get_header_value("Content-Type") == "text/html; charset=utf-8");
     CHECK_FALSE(r->body.empty());
+}
+
+// The store-degraded results row is <td class="empty-state result-degrade-banner">. A bare
+// `.result-degrade-banner` rule (0,1,0) loses its padding, colour and bottom border to
+// `#results-table td.empty-state` (1,1,1), so the page CSS must carry the td form. That form only
+// ties at (1,1,1), so it wins on source order: it must follow td.empty-state, and the frame rule
+// that swaps its border for an inset shadow (a collapsed header rule paints the top edge neutral)
+// must follow it in turn.
+TEST_CASE("page_routes: / dashboard CSS keeps the degraded results banner above td.empty-state",
+          "[server][routes][page_routes]") {
+    Harness h;
+    h.wire();
+
+    auto r = h.sink.Get("/");
+    REQUIRE(r);
+    const auto empty = r->body.find("#results-table td.empty-state {");
+    const auto banner =
+        r->body.find(".result-degrade-banner, #results-table td.result-degrade-banner {");
+    const auto frame = r->body.find("border: 0; box-shadow: inset 0 0 0 1px");
+    REQUIRE(empty != std::string::npos);
+    REQUIRE(banner != std::string::npos);
+    REQUIRE(frame != std::string::npos);
+    CHECK(banner > empty);
+    CHECK(frame > banner);
 }
 
 // ── Legacy redirects (2) ──────────────────────────────────────────────────
@@ -397,14 +425,14 @@ TEST_CASE("page_routes: /viz/host/:id rejects a malformed agent id with 400",
 
 // ── Registration order / shape ────────────────────────────────────────────
 
-TEST_CASE("page_routes: registers exactly 25 routes, with /viz/fleet reachable independently "
+TEST_CASE("page_routes: registers exactly 29 routes, with /viz/fleet reachable independently "
           "of /viz/host/:id (the documented registration order — /viz/fleet before the "
           "per-host regex — never lets one swallow the other)",
           "[server][routes][page_routes]") {
     Harness h;
     h.wire();
 
-    CHECK(h.sink.route_count() == 25);
+    CHECK(h.sink.route_count() == 29);
 
     auto fleet = h.sink.Get("/viz/fleet");
     REQUIRE(fleet);

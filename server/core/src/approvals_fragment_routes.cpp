@@ -34,12 +34,12 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
             if (approvals.empty()) {
                 html = "<div class=\"empty-state\">No approval requests.</div>";
             } else {
-                html = "<table><thead><tr><th>ID</th><th>Status</th><th>Submitted "
-                       "By</th><th>Scope</th><th></th></tr></thead><tbody>";
+                html = "<section class=\"panel\"><div class=\"hd\"><h2>Approvals</h2></div>"
+                       "<div class=\"tw\"><table><thead><tr><th>ID</th><th>Status</th>"
+                       "<th>Submitted By</th><th>Scope</th><th></th></tr></thead><tbody>";
                 for (const auto& a : approvals) {
                     auto status_cls = "status-" + a.status;
-                    html += "<tr><td><code style=\"font-size:0.7rem\">" +
-                            html_escape(a.id.substr(0, 12)) +
+                    html += "<tr><td><code>" + html_escape(a.id.substr(0, 12)) +
                             "</code></td>"
                             "<td><span class=\"status-badge " +
                             status_cls + "\">" + html_escape(a.status) +
@@ -47,29 +47,26 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             "<td>" +
                             html_escape(a.submitted_by) +
                             "</td>"
-                            "<td><code style=\"font-size:0.7rem\">" +
+                            "<td><code>" +
                             html_escape(a.scope_expression) +
                             "</code></td>"
-                            "<td>";
+                            "<td class=\"act\">";
                     if (a.status == "pending") {
                         if (a.submitted_by == session->username) {
                             // Self-review is denied server-side
                             // (ApprovalManager: "reviewer cannot be the
                             // same as the submitter") — don't render
                             // buttons that can only silently fail (#1821).
-                            html += "<span style=\"font-size:0.65rem;color:var(--muted)\">"
+                            html += "<span class=\"hint\">"
                                     "You submitted this — another reviewer must "
                                     "approve</span>";
                         } else {
-                            html += "<button class=\"btn btn-primary\" "
-                                    "style=\"font-size:0.65rem;padding:0.15rem "
-                                    "0.5rem;margin-right:0.3rem\" "
+                            html += "<button class=\"btn btn-primary btn-sm\" "
                                     "hx-post=\"/api/approvals/" +
                                     a.id +
                                     "/approve\" hx-target=\"#tab-approvals\" "
                                     "hx-swap=\"innerHTML\">Approve</button>"
-                                    "<button class=\"btn btn-danger\" "
-                                    "style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
+                                    " <button class=\"btn btn-danger btn-sm\" "
                                     "hx-post=\"/api/approvals/" +
                                     a.id +
                                     "/reject\" hx-target=\"#tab-approvals\" "
@@ -78,7 +75,7 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                     }
                     html += "</td></tr>";
                 }
-                html += "</tbody></table>";
+                html += "</tbody></table></div></section>";
             }
             res.set_content(html, "text/html; charset=utf-8");
         });

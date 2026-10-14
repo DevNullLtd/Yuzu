@@ -303,7 +303,7 @@ std::string SettingsRoutes::render_server_config_fragment() {
 
     std::string html;
 
-    html += "<table class=\"user-table\" style=\"font-size:0.8rem\">"
+    html += "<table class=\"user-table\">"
             "<thead><tr><th>Setting</th><th>Value</th></tr></thead>"
             "<tbody>";
 
@@ -375,7 +375,7 @@ std::string SettingsRoutes::render_tls_fragment() {
     const bool tls_enabled = v.at("enabled").get<bool>();
 
     std::string checked = tls_enabled ? " checked" : "";
-    std::string status_color = tls_enabled ? "#3fb950" : "#f85149";
+    std::string status_cls = tls_enabled ? "role-ok" : "role-bad";
     std::string status_text = tls_enabled ? "Enabled" : "Disabled";
     std::string fields_opacity = tls_enabled ? "1" : "0.4";
 
@@ -398,8 +398,8 @@ std::string SettingsRoutes::render_tls_fragment() {
         "           hx-swap=\"innerHTML\">"
         "    <span class=\"slider\"></span>"
         "  </label>"
-        "  <span style=\"font-size:0.75rem;color:" +
-        status_color + ";margin-left:0.5rem\">" + status_text +
+        "  <span class=\"role-badge " +
+        status_cls + "\">" + status_text +
         "</span>"
         "</div>"
         "<div style=\"margin-top:1rem;opacity:" +
@@ -423,7 +423,7 @@ std::string SettingsRoutes::render_tls_fragment() {
         cert_name +
         "</span>"
         "      </form>"
-        "      <details style=\"margin-top:0.5rem\">"
+        "      <details>"
         "        <summary class=\"btn btn-secondary\" "
         "          style=\"cursor:pointer;display:inline-block\">Paste PEM</summary>"
         "        <form hx-post=\"/api/settings/cert-paste\" "
@@ -431,10 +431,7 @@ std::string SettingsRoutes::render_tls_fragment() {
         "              style=\"margin-top:0.5rem\">"
         "          <input type=\"hidden\" name=\"type\" value=\"cert\">"
         "          <textarea name=\"content\" "
-        "            style=\"width:100%;min-height:150px;font-family:monospace;"
-        "                   font-size:0.75rem;background:var(--bg);color:var(--fg);"
-        "                   border:1px solid var(--border);border-radius:4px;"
-        "                   padding:0.5rem;resize:vertical\" "
+        "            style=\"width:100%;min-height:150px;resize:vertical\" "
         "            placeholder=\"-----BEGIN CERTIFICATE-----&#10;...paste PEM content...&#10;"
         "-----END CERTIFICATE-----\"></textarea>"
         "          <button type=\"submit\" class=\"btn btn-primary\" "
@@ -461,7 +458,7 @@ std::string SettingsRoutes::render_tls_fragment() {
         key_name +
         "</span>"
         "      </form>"
-        "      <details style=\"margin-top:0.5rem\">"
+        "      <details>"
         "        <summary class=\"btn btn-secondary\" "
         "          style=\"cursor:pointer;display:inline-block\">Paste PEM</summary>"
         "        <form hx-post=\"/api/settings/cert-paste\" "
@@ -469,10 +466,7 @@ std::string SettingsRoutes::render_tls_fragment() {
         "              style=\"margin-top:0.5rem\">"
         "          <input type=\"hidden\" name=\"type\" value=\"key\">"
         "          <textarea name=\"content\" "
-        "            style=\"width:100%;min-height:150px;font-family:monospace;"
-        "                   font-size:0.75rem;background:var(--bg);color:var(--fg);"
-        "                   border:1px solid var(--border);border-radius:4px;"
-        "                   padding:0.5rem;resize:vertical\" "
+        "            style=\"width:100%;min-height:150px;resize:vertical\" "
         "            placeholder=\"-----BEGIN PRIVATE KEY-----&#10;...paste PEM content...&#10;"
         "-----END PRIVATE KEY-----\"></textarea>"
         "          <button type=\"submit\" class=\"btn btn-primary\" "
@@ -499,7 +493,7 @@ std::string SettingsRoutes::render_tls_fragment() {
         ca_name +
         "</span>"
         "      </form>"
-        "      <details style=\"margin-top:0.5rem\">"
+        "      <details>"
         "        <summary class=\"btn btn-secondary\" "
         "          style=\"cursor:pointer;display:inline-block\">Paste PEM</summary>"
         "        <form hx-post=\"/api/settings/cert-paste\" "
@@ -507,10 +501,7 @@ std::string SettingsRoutes::render_tls_fragment() {
         "              style=\"margin-top:0.5rem\">"
         "          <input type=\"hidden\" name=\"type\" value=\"ca\">"
         "          <textarea name=\"content\" "
-        "            style=\"width:100%;min-height:150px;font-family:monospace;"
-        "                   font-size:0.75rem;background:var(--bg);color:var(--fg);"
-        "                   border:1px solid var(--border);border-radius:4px;"
-        "                   padding:0.5rem;resize:vertical\" "
+        "            style=\"width:100%;min-height:150px;resize:vertical\" "
         "            placeholder=\"-----BEGIN CERTIFICATE-----&#10;...paste PEM content...&#10;"
         "-----END CERTIFICATE-----\"></textarea>"
         "          <button type=\"submit\" class=\"btn btn-primary\" "
@@ -525,14 +516,14 @@ std::string SettingsRoutes::render_tls_fragment() {
     // Insecure-skip-client-verify (one-way TLS) — color red when enabled to flag the
     // weakened posture in the operator dashboard, not just the warm-orange "warning" hue.
     const bool insecure_skip = v.at("insecure_skip_client_verify").get<bool>();
-    std::string owt_color = insecure_skip ? "#f85149" : "#8b949e";
+    std::string owt_cls = insecure_skip ? "role-badge role-bad" : "role-badge";
     std::string owt_text = insecure_skip
                                ? "Client cert verification DISABLED (--insecure-skip-client-verify)"
                                : "Disabled (mTLS enforced)";
     html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"
             "  <label>Insecure Skip Client Verify</label>"
-            "  <span style=\"font-size:0.8rem;color:" +
-            owt_color + "\">" + owt_text +
+            "  <span class=\"" +
+            owt_cls + "\">" + owt_text +
             "</span>"
             "</div>";
 
@@ -546,10 +537,9 @@ std::string SettingsRoutes::render_tls_fragment() {
     std::string mgmt_ca = path_or_using_agent(v.at("mgmt_ca_cert_path"));
 
     html +=
-        "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
-        "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
-        "margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em\">"
-        "Management Listener TLS Override</div>"
+        "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--line)\">"
+        "<div class=\"sub-head\" style=\"margin-top:0\">"
+        "Management listener TLS override</div>"
         "<div class=\"form-row\">"
         "  <label>Mgmt Certificate</label>"
         "  <span class=\"file-name\">" +
@@ -581,7 +571,7 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                        "  <tbody>";
 
     if (users.empty()) {
-        html += "<tr><td colspan=\"3\" style=\"color:#484f58\">No users</td></tr>";
+        html += "<tr><td colspan=\"3\" class=\"muted\">No users</td></tr>";
     } else {
         std::size_t row_index = 0;
         for (const auto& u : users) {
@@ -619,8 +609,7 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             const std::string pw_row_id = "pw-row-" + std::to_string(this_row);
             html += "<tr><td>" + html_escape(u.username);
             if (is_sso) {
-                html += " <span class=\"role-badge\" style=\"background:#1f6feb22;"
-                        "color:#58a6ff;font-size:0.6rem;margin-left:0.3rem\" "
+                html += " <span class=\"role-badge role-admin\" style=\"margin-left:0.3rem\" "
                         "title=\"Auto-provisioned via SSO (identity_source=" +
                         html_escape(u.identity_source) + ")\">SSO</span>";
             }
@@ -643,12 +632,10 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                 // re-authenticates) and routes through `/api/v1/sessions/me`
                 // so the audit row records `session.revoke_all.self`.
                 html += "<span class=\"current-user-badge\" "
-                        "style=\"color:#484f58;font-size:0.7rem;"
-                        "font-style:italic;margin-right:0.5rem\" "
+                        "style=\"color:var(--mut);font-size:12.5px;margin-right:0.5rem\" "
                         "title=\"You cannot remove your own account\">"
                         "Current user</span>"
                         "<button class=\"btn btn-secondary\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                         "hx-delete=\"/api/v1/sessions/me\" hx-swap=\"none\" "
                         "data-signout-everywhere=\"1\" "
                         "hx-confirm=\"Sign out of every device AND revoke "
@@ -665,8 +652,7 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                 // never ran.
                 if (pw_button) {
                     html += "<button type=\"button\" class=\"btn btn-secondary\" "
-                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
-                            "margin-left:0.3rem\" "
+                            "style=\"margin-left:0.3rem\" "
                             "data-pw-toggle=\"" +
                             pw_row_id + "\">Change password</button>";
                 }
@@ -681,8 +667,7 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                 // `html_escape` is still applied to the confirm-dialog TEXT
                 // below (a body-text rendering, not a URL).
                 html += "<button class=\"btn btn-danger\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
-                        "margin-right:0.3rem\" "
+                        "style=\"margin-right:0.3rem\" "
                         "hx-delete=\"/api/v1/sessions?username=" +
                         url_encode(u.username) +
                         "\" "
@@ -702,7 +687,6 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                 // docs/auth-architecture.md).
                 if (!is_sso) {
                     html += "<button class=\"btn btn-danger\" "
-                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                             "hx-delete=\"/api/settings/users/" +
                             html_escape(u.username) +
                             "\" "
@@ -714,8 +698,7 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                 }
                 if (pw_button) {
                     html += "<button type=\"button\" class=\"btn btn-secondary\" "
-                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
-                            "margin-left:0.3rem\" "
+                            "style=\"margin-left:0.3rem\" "
                             "data-pw-toggle=\"" +
                             pw_row_id + "\">Reset password</button>";
                 }
@@ -739,7 +722,7 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                             "required></div>";
                 }
                 html += "<div class=\"mini-field\"><label>New password <span "
-                        "style=\"color:#8b949e;font-weight:normal;font-size:0.7rem\">"
+                        "class=\"hint\">"
                         "(12-1024 bytes)</span></label>"
                         "<input type=\"password\" name=\"new_password\" "
                         "autocomplete=\"new-password\" minlength=\"12\" maxlength=\"1024\" "
@@ -769,8 +752,7 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             "    <input type=\"text\" name=\"username\" placeholder=\"username\" required>"
             "  </div>"
             "  <div class=\"mini-field\">"
-            "    <label>Password <span style=\"color:#8b949e;font-weight:normal;"
-            "font-size:0.7rem\">(12-1024 bytes)</span></label>"
+            "    <label>Password <span class=\"hint\">(12-1024 bytes)</span></label>"
             "    <input type=\"password\" name=\"password\" placeholder=\"password\" "
             "           minlength=\"12\" maxlength=\"1024\" required>"
             "  </div>"
@@ -833,8 +815,8 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
                  "  <code>" +
                  html_escape(new_raw_token) +
                  "</code><br>"
-                 "  <button class=\"btn btn-secondary\" "
-                 "style=\"margin-top:0.5rem;font-size:0.7rem\" "
+                 "  <button class=\"btn btn-secondary btn-sm\" "
+                 "style=\"margin-top:0.5rem\" "
                  "          data-copy-token>Copy to Clipboard</button>"
                  "</div>";
     }
@@ -848,7 +830,7 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
                        "  <tbody>";
 
     if (tokens.empty()) {
-        html += "<tr><td colspan=\"6\" style=\"color:#484f58\">No tokens created</td></tr>";
+        html += "<tr><td colspan=\"6\" class=\"muted\">No tokens created</td></tr>";
     } else {
         for (const auto& t : tokens) {
             auto uses = t.max_uses == 0
@@ -885,7 +867,7 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
                     "<td>" +
                     uses +
                     "</td>"
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     exp +
                     "</td>"
                     "<td><span class=\"role-badge " +
@@ -894,7 +876,6 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
                     "<td>";
             if (!t.revoked) {
                 html += "<button class=\"btn btn-danger\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                         "hx-delete=\"/api/settings/enrollment-tokens/" +
                         html_escape(t.token_id) +
                         "\" "
@@ -920,12 +901,12 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
             "  <div class=\"mini-field\">"
             "    <label>Max Uses</label>"
             "    <input type=\"text\" name=\"max_uses\" placeholder=\"0 = unlimited\" "
-            "style=\"width:80px\">"
+            "style=\"width:120px\">"
             "  </div>"
             "  <div class=\"mini-field\">"
             "    <label>TTL (hours)</label>"
             "    <input type=\"text\" name=\"ttl_hours\" placeholder=\"0 = never\" "
-            "style=\"width:80px\">"
+            "style=\"width:120px\">"
             "  </div>"
             "  <button class=\"btn btn-primary\" type=\"submit\">Generate Token</button>"
             "</form>"
@@ -939,7 +920,7 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
 std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_raw_token,
                                                        const std::string& filter_principal) {
     if (!api_token_store_ || !api_token_store_->is_open()) {
-        return "<span style=\"color:#484f58\">API token store unavailable.</span>";
+        return "<span class=\"muted\">API token store unavailable.</span>";
     }
 
     auto fmt_epoch = [](int64_t epoch) -> std::string {
@@ -973,13 +954,13 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
     if (!tokens_res.has_value()) {
         // Authoritative store (ADR-0012 §1): surface a read failure rather than
         // render an empty "No API tokens" table that could hide a live credential.
-        html += "<tr><td colspan=\"9\" style=\"color:#f85149\">"
+        html += "<tr><td colspan=\"9\" class=\"feedback-error\">"
                 "Token store unavailable — please retry.</td></tr></tbody></table>";
         return html;
     }
     const auto& tokens = *tokens_res;
     if (tokens.empty()) {
-        html += "<tr><td colspan=\"9\" style=\"color:#484f58\">No API tokens created</td></tr>";
+        html += "<tr><td colspan=\"9\" class=\"muted\">No API tokens created</td></tr>";
     } else {
         auto now = std::chrono::duration_cast<std::chrono::seconds>(
                        std::chrono::system_clock::now().time_since_epoch())
@@ -997,33 +978,33 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
                 status_cls = "role-user";
                 status_txt = "Expired";
             } else {
-                status_cls = "role-admin";
+                status_cls = "role-ok";
                 status_txt = "Active";
             }
 
             std::string type_text = t.mcp_tier.empty() ? "API" : "MCP";
             std::string type_detail =
                 t.mcp_tier.empty() ? "" : " (" + html_escape(t.mcp_tier) + ")";
-            std::string type_color = t.mcp_tier.empty() ? "#484f58" : "#8957e5";
+            std::string type_cls = t.mcp_tier.empty() ? "role-badge" : "role-badge role-admin";
 
             html += "<tr><td><code>" + html_escape(t.token_id) +
                     "</code></td>"
                     "<td>" +
                     html_escape(t.name) +
                     "</td>"
-                    "<td><span class=\"role-badge\" style=\"background:" +
-                    type_color + ";color:#fff\">" + type_text + "</span>" + type_detail +
+                    "<td><span class=\"" +
+                    type_cls + "\">" + type_text + "</span>" + type_detail +
                     "</td>"
                     "<td>" +
                     html_escape(t.principal_id) +
                     "</td>"
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     fmt_epoch(t.created_at) +
                     "</td>"
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     exp +
                     "</td>"
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     fmt_epoch(t.last_used_at) +
                     "</td>"
                     "<td><span class=\"role-badge " +
@@ -1032,7 +1013,6 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
                     "<td>";
             if (!t.revoked) {
                 html += "<button class=\"btn btn-danger\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                         "hx-delete=\"/api/settings/api-tokens/" +
                         html_escape(t.token_id) +
                         "\" "
@@ -1058,11 +1038,11 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
             "  <div class=\"mini-field\">"
             "    <label>TTL (hours)</label>"
             "    <input type=\"text\" name=\"ttl_hours\" placeholder=\"0 = never\" "
-            "style=\"width:80px\">"
+            "style=\"width:120px\">"
             "  </div>"
             "  <div class=\"mini-field\">"
             "    <label>MCP Tier</label>"
-            "    <select name=\"mcp_tier\" style=\"width:120px\">"
+            "    <select name=\"mcp_tier\" style=\"width:150px\">"
             "      <option value=\"\">(none — API)</option>"
             "      <option value=\"readonly\">readonly</option>"
             "      <option value=\"operator\">operator</option>"
@@ -1081,8 +1061,8 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
                 "  <code>" +
                 html_escape(new_raw_token) +
                 "</code><br>"
-                "  <button class=\"btn btn-secondary\" "
-                "style=\"margin-top:0.5rem;font-size:0.7rem\" "
+                "  <button class=\"btn btn-secondary btn-sm\" "
+                "style=\"margin-top:0.5rem\" "
                 "          data-copy-token>Copy to Clipboard</button>"
                 "</div>";
     }
@@ -1092,7 +1072,7 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
 
 std::string SettingsRoutes::render_engine_principals_fragment() {
     if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
-        return "<span style=\"color:#484f58\">Engine Principals store unavailable "
+        return "<span class=\"muted\">Engine Principals store unavailable "
                "(not configured — requires PostgreSQL, design doc §3.1).</span>";
     }
 
@@ -1123,11 +1103,11 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                        "  <tbody>";
 
     if (principals.empty()) {
-        html += "<tr><td colspan=\"8\" style=\"color:#484f58\">No engine principals</td></tr>";
+        html += "<tr><td colspan=\"8\" class=\"muted\">No engine principals</td></tr>";
     } else {
         for (const auto& p : principals) {
             const bool active = p.lifecycle_state == "active";
-            const std::string status_cls = active ? "role-admin" : "role-user";
+            const std::string status_cls = active ? "role-ok" : "role-user";
             const std::string status_txt = active ? "Active" : "Revoked";
 
             std::size_t active_creds = 0;
@@ -1155,7 +1135,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             if (!active) {
                 std::string linkage =
                     p.superseded_by.empty()
-                        ? "<em style=\"color:#484f58\">no successor recorded</em>"
+                        ? "<em class=\"muted\">no successor recorded</em>"
                         : ("superseded by <code>" + html_escape(p.superseded_by) + "</code>");
                 std::string audit_detail = "(not recorded)";
                 if (audit_store_) {
@@ -1174,12 +1154,10 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         audit_detail = events->front().detail;
                 }
                 revocation_cell = linkage +
-                                  "<br><span style=\"font-size:0.7rem;color:"
-                                  "var(--mds-color-theme-text-tertiary)\">Detail: " +
+                                  "<br><span class=\"hint\">Detail: " +
                                   html_escape(audit_detail) + "</span>";
                 if (p.revoked_at > 0) {
-                    revocation_cell += "<br><span style=\"font-size:0.7rem;color:"
-                                        "var(--mds-color-theme-text-tertiary)\">" +
+                    revocation_cell += "<br><span class=\"hint\">" +
                                         fmt_epoch(p.revoked_at) + "</span>";
                 }
             }
@@ -1201,7 +1179,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     "<td>" +
                     std::to_string(active_creds) +
                     "</td>"
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     revocation_cell +
                     "</td>"
                     "<td>";
@@ -1246,7 +1224,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                             "\">"
                             "<input type=\"hidden\" name=\"ttl_days\" value=\"90\">"
                             "<button class=\"btn btn-secondary\" type=\"submit\" "
-                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\">"
+                            ">"
                             "Mint</button></form> ";
                 } else {
                     // Rotate credential — overlap-pair rotation (design doc §7).
@@ -1256,7 +1234,6 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                             "\">"
                             "<input type=\"hidden\" name=\"overlap_secs\" value=\"86400\">"
                             "<button class=\"btn btn-secondary\" type=\"submit\" "
-                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                             "data-confirm=\"Rotate credential for &quot;" +
                             html_escape(p.principal_id) +
                             "&quot;? A 24h overlap window keeps both credentials valid.\">"
@@ -1270,9 +1247,9 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         html_escape(p.principal_id) +
                         "\">"
                         "<input type=\"text\" name=\"new_owner\" placeholder=\"new owner\" "
-                        "style=\"width:90px;font-size:0.7rem\" required>"
+                        "style=\"width:110px\" required>"
                         "<button class=\"btn btn-secondary\" type=\"submit\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\">"
+                        ">"
                         "Transfer</button></form> ";
 
                 // Revoke — terminal, never un-revocable (design doc §3.1 /
@@ -1287,9 +1264,8 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         "\">"
                         "<input type=\"text\" name=\"superseded_by\" "
                         "placeholder=\"successor id (optional)\" "
-                        "style=\"width:130px;font-size:0.7rem\">"
+                        "style=\"width:190px\">"
                         "<button class=\"btn btn-danger\" type=\"submit\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                         "data-confirm=\"Revoke engine principal &quot;" +
                         html_escape(p.principal_id) +
                         "&quot;? This is TERMINAL — never un-revocable; recovery mints a "
@@ -1399,7 +1375,7 @@ function arFeedback(msg, isError) {
   var fb = document.getElementById('ar-feedback');
   if (!fb) return;
   fb.textContent = msg;
-  fb.style.color = isError ? '#f85149' : '#3fb950';
+  fb.style.color = isError ? 'var(--bad)' : 'var(--ok)';
 }
 function arPost(url, body, onSuccess) {
   fetch(url, {
@@ -1481,7 +1457,7 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
     html += "<div class=\"feedback\" id=\"ar-feedback\"></div>";
 
     html += "<div style=\"margin-bottom:0.75rem\">"
-            "<a class=\"btn btn-secondary\" style=\"padding:0.3rem 0.8rem;font-size:0.75rem\" "
+            "<a class=\"btn btn-secondary btn-sm\" "
             "href=\"/api/v1/access-reviews/export?format=csv\">Download CSV</a>"
             "</div>";
 
@@ -1499,14 +1475,14 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
         // §1): surface the failure rather than render an empty table that
         // could be misread as "zero grants exist" — a false negative in
         // exactly the evidence this feature exists to produce.
-        html += "<tr><td colspan=\"7\" style=\"color:#f85149\">Access review data unavailable (" +
+        html += "<tr><td colspan=\"7\" class=\"feedback-error\">Access review data unavailable (" +
                 html_escape(rows_res.error()) + ") — please retry.</td></tr></tbody></table>";
         return html;
     }
 
     const auto& rows = *rows_res;
     if (rows.empty()) {
-        html += "<tr><td colspan=\"7\" style=\"color:#484f58\">No principals found</td></tr>";
+        html += "<tr><td colspan=\"7\" class=\"muted\">No principals found</td></tr>";
     } else {
         // Render-capped so a large RBAC population can't emit an unbounded
         // HTML fragment (mirrors inventory_ui.cpp's kDeviceRenderCap
@@ -1533,18 +1509,17 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
             html += "<tr><td><span class=\"role-badge\">" + html_escape(r.principal_type) +
                     "</span> " + html_escape(principal_label);
             if (!r.owner_or_email.empty()) {
-                html += "<br><span style=\"font-size:0.7rem;color:"
-                        "var(--mds-color-theme-text-tertiary)\">" +
+                html += "<br><span class=\"hint\">" +
                         html_escape(r.owner_or_email) + "</span>";
             }
             html += "</td>"
-                    "<td style=\"font-size:0.8rem\">" +
+                    "<td>" +
                     html_escape(roles_joined) +
                     "</td>"
                     "<td>" +
                     std::to_string(r.effective_permission_count) +
                     "</td>"
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     html_escape(last_activity) +
                     "</td>"
                     "<td>" +
@@ -1559,8 +1534,7 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
         }
         html += "</tbody></table>";
         if (total > kAccessReviewRenderCap) {
-            html += "<div style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
-                    "margin-top:0.3rem\">Showing " +
+            html += "<div class=\"hint\" style=\"margin-top:0.3rem\">Showing " +
                     std::to_string(shown) + " of " + std::to_string(total) +
                     " principals — the CSV export above has the complete evidence set.</div>";
         }
@@ -1604,7 +1578,7 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     }
 
     if (!access_review_store_ || !access_review_store_->is_open()) {
-        html += "<div style=\"color:#f85149\">Access review campaign store unavailable — "
+        html += "<div class=\"feedback-error\">Access review campaign store unavailable — "
                 "please retry.</div></div>";
         return html;
     }
@@ -1614,7 +1588,7 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
         // Covers both the store's machine-checkable "not_found: ..." (unknown
         // campaign id) and a genuine read failure — either way, an honest
         // notice rather than a blank panel.
-        html += "<div style=\"color:#f85149\">" + html_escape(view_res.error()) + "</div></div>";
+        html += "<div class=\"feedback-error\">" + html_escape(view_res.error()) + "</div></div>";
         return html;
     }
     const auto& view = *view_res;
@@ -1626,8 +1600,7 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     html += "<h4 style=\"margin:1rem 0 0.25rem\">Campaign: " + html_escape(view.campaign.title) +
             " <span class=\"role-badge " + (is_open_campaign ? "role-admin" : "role-user") +
             "\">" + html_escape(view.campaign.status) + "</span></h4>";
-    html += "<div style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
-            "margin-bottom:0.5rem\">" +
+    html += "<div class=\"hint\" style=\"margin-bottom:0.5rem\">" +
             std::to_string(view.pending_count) + " pending of " +
             std::to_string(view.attestations.size()) + " grant(s) reviewed — opened by " +
             html_escape(view.campaign.created_by);
@@ -1637,8 +1610,8 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     html += "</div>";
 
     if (can_attest && is_open_campaign) {
-        html += "<button class=\"btn btn-secondary\" "
-                "style=\"padding:0.3rem 0.8rem;font-size:0.75rem;margin-bottom:0.5rem\" "
+        html += "<button class=\"btn btn-secondary btn-sm\" "
+                "style=\"margin-bottom:0.5rem\" "
                 "data-campaign-id=\"" +
                 html_escape(campaign_id) + "\" onclick=\"arCloseCampaign(this)\">Close campaign</button>";
     }
@@ -1651,12 +1624,13 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
 
     if (view.attestations.empty()) {
         html += "<tr><td colspan=\"" + std::to_string(can_attest ? 7 : 5) +
-                "\" style=\"color:#484f58\">No frozen grants in this campaign</td></tr>";
+                "\" class=\"muted\">No frozen grants in this campaign</td></tr>";
     } else {
         for (const auto& a : view.attestations) {
             bool pending = a.decision == "pending";
-            std::string decision_cls = pending || a.decision == "flagged_revoke" ? "role-user"
-                                                                                  : "role-admin";
+            std::string decision_cls = pending                         ? "role-user"
+                                       : a.decision == "flagged_revoke" ? "role-warn"
+                                                                        : "role-ok";
             html += "<tr><td><span class=\"role-badge\">" + html_escape(a.principal_type) +
                     "</span> " + html_escape(a.principal_id) +
                     "</td>"
@@ -1669,20 +1643,19 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                     "<td>" +
                     (a.reviewer.empty() ? "—" : html_escape(a.reviewer)) +
                     "</td>"
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     ar_fmt_epoch_ms(a.decided_at_ms) + "</td>";
             if (can_attest) {
                 html += "<td>";
                 if (pending && is_open_campaign) {
                     html += "<input type=\"text\" data-ar-justification placeholder=\"optional\" "
-                            "style=\"width:110px;font-size:0.7rem\">";
+                            "style=\"width:140px\">";
                 } else {
                     html += a.justification.empty() ? "—" : html_escape(a.justification);
                 }
                 html += "</td><td>";
                 if (pending && is_open_campaign) {
                     html += "<button class=\"btn btn-primary\" "
-                            "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
                             "data-campaign-id=\"" +
                             html_escape(campaign_id) + "\" data-principal-type=\"" +
                             html_escape(a.principal_type) + "\" data-principal-id=\"" +
@@ -1691,7 +1664,6 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                             "\" data-decision=\"attested\" "
                             "onclick=\"arAttest(this)\">Attest</button> "
                             "<button class=\"btn btn-danger\" "
-                            "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
                             "data-campaign-id=\"" +
                             html_escape(campaign_id) + "\" data-principal-type=\"" +
                             html_escape(a.principal_type) + "\" data-principal-id=\"" +
@@ -1723,13 +1695,13 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
     //   3. Enrolled — status + "Regenerate recovery codes" + "Disable" buttons
     auto* auth_db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
     if (!auth_db) {
-        return "<span style=\"color:#484f58\">MFA store unavailable (no AuthDB configured).</span>";
+        return "<span class=\"muted\">MFA store unavailable (no AuthDB configured).</span>";
     }
 
     std::string html;
     if (!error_msg.empty()) {
-        html += "<div class=\"error-msg\" role=\"alert\" style=\"color: var(--red); "
-                "font-size: 0.8rem; margin-bottom: 0.75rem;\">" +
+        html += "<div class=\"error-msg feedback-error\" role=\"alert\" "
+                "style=\"margin-bottom: 0.75rem;\">" +
                 html_escape(error_msg) + "</div>";
     }
 
@@ -1758,28 +1730,24 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
                     "  </div>";
             if (!qr_svg.empty()) {
                 html += "  <div style=\"display:flex;justify-content:center;margin:0.75rem 0\">"
-                        "    <div style=\"background:#fff;padding:8px;border-radius:6px;"
+                        "    <div style=\"background:white;padding:8px;border-radius:var(--rad-panel);"
                         "line-height:0\">" +
                         qr_svg +
                         "</div>"
                         "  </div>"
-                        "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
-                        "text-align:center\">Can't scan? Enter the secret below manually.</div>";
+                        "  <div class=\"hint\" style=\"text-align:center\">Can't scan? Enter the secret below manually.</div>";
             }
-            html += "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
-                    "margin-top:0.5rem\">Base32 secret (manual entry):</div>"
+            html += "  <div class=\"hint\" style=\"margin-top:0.5rem\">Base32 secret (manual entry):</div>"
                     "  <code>" +
                     html_escape(new_secret_b32) +
                     "</code>"
-                    "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
-                    "margin-top:0.5rem\">otpauth URI:</div>"
+                    "  <div class=\"hint\" style=\"margin-top:0.5rem\">otpauth URI:</div>"
                     "  <code style=\"display:block;word-break:break-all\">" +
                     html_escape(new_otpauth_uri) +
                     "</code>"
                     "</div>";
         } else {
-            html += "<div style=\"font-size:0.8rem;color:var(--mds-color-theme-text-tertiary);"
-                    "margin-bottom:0.75rem\">"
+            html += "<div class=\"hint\" style=\"margin-bottom:0.75rem\">"
                     "Codes refresh every 30 seconds — wait for the next code shown by your "
                     "authenticator and try again. If you have lost the original QR code, "
                     "press <strong>Disable MFA</strong> below and restart enrollment."
@@ -1820,9 +1788,9 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
         }
         return html +
                (store_unavailable
-                    ? "<span style=\"color:#484f58\">MFA status is temporarily unavailable "
+                    ? "<span class=\"muted\">MFA status is temporarily unavailable "
                       "(authentication store error) — retry shortly.</span>"
-                    : "<span style=\"color:#484f58\">User not found for MFA status.</span>");
+                    : "<span class=\"muted\">User not found for MFA status.</span>");
     }
     const auto& status = *status_res;
 
@@ -1840,22 +1808,22 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
 
     html += "<div style=\"display:flex;align-items:center;gap:1rem;margin-bottom:1rem\">";
     if (status.enrolled) {
-        html += "<span class=\"yb\">Enabled</span>"
-                "<span style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+        html += "<span class=\"role-badge role-ok\">Enabled</span>"
+                "<span class=\"hint\">"
                 "Enrolled " +
                 html_escape(status.enrolled_at) + " UTC</span>";
     } else if (!status.disabled_at.empty()) {
-        html += "<span class=\"yn\">Disabled</span>"
-                "<span style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+        html += "<span class=\"role-badge\">Disabled</span>"
+                "<span class=\"hint\">"
                 "Last disabled " +
                 html_escape(status.disabled_at) + " UTC</span>";
     } else {
-        html += "<span class=\"yn\">Not enrolled</span>";
+        html += "<span class=\"role-badge\">Not enrolled</span>";
     }
     html += "</div>";
 
     if (status.enrolled) {
-        html += "<div style=\"font-size:0.8rem;margin-bottom:0.75rem\">"
+        html += "<div style=\"margin-bottom:0.75rem\">"
                 "Recovery codes remaining: <strong>" +
                 std::to_string(status.recovery_codes_remaining) +
                 "</strong></div>"
@@ -1899,23 +1867,23 @@ std::string SettingsRoutes::render_pending_fragment() {
                        "  <tbody>";
 
     if (agents.empty()) {
-        html += "<tr><td colspan=\"6\" style=\"color:#484f58\">No pending agents</td></tr>";
+        html += "<tr><td colspan=\"6\" class=\"muted\">No pending agents</td></tr>";
     } else {
         for (const auto& a : agents) {
             auto status_str = auth::pending_status_to_string(a.status);
-            std::string status_cls, status_style;
+            std::string status_cls;
             if (a.status == auth::PendingStatus::approved) {
-                status_cls = "role-admin";
+                status_cls = "role-ok";
             } else if (a.status == auth::PendingStatus::denied) {
-                status_cls = "role-user";
+                status_cls = "role-bad";
             } else {
-                status_style = "background:var(--yellow);color:#000";
+                status_cls = "role-warn";
             }
 
             auto short_id = a.agent_id.size() > 12 ? a.agent_id.substr(0, 12) + "..." : a.agent_id;
 
             html += "<tr>"
-                    "<td><code style=\"font-size:0.7rem\">" +
+                    "<td><code>" +
                     html_escape(short_id) +
                     "</code></td>"
                     "<td>" +
@@ -1928,20 +1896,19 @@ std::string SettingsRoutes::render_pending_fragment() {
                     html_escape(a.agent_version) +
                     "</td>"
                     "<td><span class=\"role-badge " +
-                    status_cls + "\" style=\"" + status_style + "\">" + html_escape(status_str) +
+                    status_cls + "\">" + html_escape(status_str) +
                     "</span></td>"
                     "<td>";
 
             if (a.status == auth::PendingStatus::pending) {
                 html += "<button class=\"btn btn-primary\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;margin-right:0.3rem\" "
+                        "style=\"margin-right:0.3rem\" "
                         "hx-post=\"/api/settings/pending-agents/" +
                         html_escape(a.agent_id) +
                         "/approve\" "
                         "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
                         ">Approve</button>"
                         "<button class=\"btn btn-danger\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                         "hx-post=\"/api/settings/pending-agents/" +
                         html_escape(a.agent_id) +
                         "/deny\" "
@@ -1956,7 +1923,7 @@ std::string SettingsRoutes::render_pending_fragment() {
                 // reverse the decision with no audit trail. There is no other
                 // action to offer here, so no button renders; the row stays
                 // visible in the queue as the durable evidence of the denial.
-                html += "<span style=\"color:#484f58;font-size:0.7rem\">denial recorded</span>";
+                html += "<span class=\"muted\">denial recorded</span>";
             }
 
             html += "</td></tr>";
@@ -1972,7 +1939,6 @@ std::string SettingsRoutes::render_pending_fragment() {
     if (pending_count > 1) {
         html += "<div style=\"margin-top:0.75rem;display:flex;gap:0.5rem\">"
                 "<button class=\"btn btn-primary\" "
-                "style=\"padding:0.3rem 0.8rem;font-size:0.75rem\" "
                 "onclick=\"twoClickConfirm(this, function() { "
                 "htmx.ajax('POST','/api/settings/pending-agents/bulk-approve',"
                 "{target:'#pending-section',swap:'innerHTML'}); })\">"
@@ -1980,7 +1946,6 @@ std::string SettingsRoutes::render_pending_fragment() {
                 std::to_string(pending_count) +
                 ")</button>"
                 "<button class=\"btn btn-danger\" "
-                "style=\"padding:0.3rem 0.8rem;font-size:0.75rem\" "
                 "onclick=\"twoClickConfirm(this, function() { "
                 "htmx.ajax('POST','/api/settings/pending-agents/bulk-deny',"
                 "{target:'#pending-section',swap:'innerHTML'}); })\">"
@@ -2019,7 +1984,7 @@ std::string SettingsRoutes::render_auto_approve_fragment() {
             "<th>Enabled</th><th></th></tr></thead><tbody>";
 
     if (rules.empty()) {
-        html += "<tr><td colspan=\"5\" style=\"color:#484f58\">No auto-approve rules "
+        html += "<tr><td colspan=\"5\" class=\"muted\">No auto-approve rules "
                 "configured</td></tr>";
     } else {
         auto type_str = [](auth::AutoApproveRuleType t) -> std::string {
@@ -2043,7 +2008,7 @@ std::string SettingsRoutes::render_auto_approve_fragment() {
                     "<td>" +
                     html_escape(type_str(r.type)) +
                     "</td>"
-                    "<td><code style=\"font-size:0.75rem\">" +
+                    "<td><code>" +
                     html_escape(r.value) +
                     "</code></td>"
                     "<td>" +
@@ -2058,7 +2023,6 @@ std::string SettingsRoutes::render_auto_approve_fragment() {
                     "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\">"
                     "<span class=\"slider\"></span></label></td>"
                     "<td><button class=\"btn btn-danger\" "
-                    "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                     "hx-delete=\"/api/settings/auto-approve/" +
                     idx +
                     "\" "
@@ -2123,7 +2087,7 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
         auto values_res = tag_store_->get_values_for_keys(
             std::vector<std::string>(std::begin(kCategoryKeys), std::end(kCategoryKeys)));
         if (!gaps_res || !values_res) {
-            return "<div style=\"color:#f85149\">Tag store unavailable — tag-compliance data "
+            return "<div class=\"feedback-error\">Tag store unavailable — tag-compliance data "
                    "cannot be read right now.</div>";
         }
         gaps = std::move(*gaps_res);
@@ -2151,7 +2115,7 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
 
         std::string vals_str;
         if (cat.allowed_values.empty()) {
-            vals_str = "<span style=\"color:#8b949e\">Free-form</span>";
+            vals_str = "<span class=\"muted\">Free-form</span>";
         } else {
             for (size_t i = 0; i < cat.allowed_values.size(); ++i) {
                 if (i > 0)
@@ -2160,11 +2124,12 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
             }
         }
 
-        std::string missing_style = missing > 0 ? "color:#f85149;font-weight:600" : "color:#3fb950";
+        std::string missing_cls = missing > 0 ? "role-bad" : "role-ok";
         html += "<tr><td><code>" + key_str + "</code></td>";
         html += "<td>" + std::string(cat.display_name) + "</td>";
         html += "<td>" + std::to_string(tagged) + "</td>";
-        html += "<td style=\"" + missing_style + "\">" + std::to_string(missing) + "</td>";
+        html += "<td><span class=\"role-badge " + missing_cls + "\">" + std::to_string(missing) +
+                "</span></td>";
         html += "<td>" + vals_str + "</td></tr>";
     }
 
@@ -2172,7 +2137,7 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
 
     if (total_agents > 0) {
         size_t compliant = total_agents - gaps.size();
-        html += "<div style=\"margin-top:0.75rem;font-size:0.75rem;color:#8b949e\">"
+        html += "<div class=\"section-note\">"
                 "Compliance: " +
                 std::to_string(compliant) + "/" + std::to_string(total_agents) +
                 " agents have all required tags</div>";
@@ -2183,7 +2148,7 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
 
 std::string SettingsRoutes::render_management_groups_fragment() {
     if (!mgmt_group_store_ || !mgmt_group_store_->is_open())
-        return "<span style=\"color:#484f58\">Management group store not available</span>";
+        return "<span class=\"muted\">Management group store not available</span>";
 
     auto groups = mgmt_group_store_->list_groups();
 
@@ -2206,7 +2171,7 @@ std::string SettingsRoutes::render_management_groups_fragment() {
 
     std::string html;
 
-    html += "<div style=\"margin-bottom:0.75rem;font-size:0.75rem;color:#8b949e\">"
+    html += "<div class=\"hint\" style=\"margin-bottom:0.75rem\">"
             "Total groups: " +
             std::to_string(groups.size()) + " &middot; Total memberships: " +
             std::to_string(mgmt_group_store_->count_all_members()) + "</div>";
@@ -2228,16 +2193,14 @@ std::string SettingsRoutes::render_management_groups_fragment() {
         for (int i = 0; i < depth; ++i)
             indent += "&nbsp;&nbsp;&nbsp;&nbsp;";
         if (depth > 0)
-            indent += "<span style=\"color:#484f58\">&boxur;</span> ";
+            indent += "<span class=\"muted\">&boxur;</span> ";
 
         std::string name_style = is_root ? "font-weight:600" : "";
         std::string type_badge;
         if (g->membership_type == "dynamic") {
-            type_badge = "<span style=\"background:#1f6feb;color:#fff;padding:1px 6px;"
-                         "border-radius:3px;font-size:0.7rem\">dynamic</span>";
+            type_badge = "<span class=\"role-badge role-admin\">dynamic</span>";
         } else {
-            type_badge = "<span style=\"background:#484f58;color:#c9d1d9;padding:1px 6px;"
-                         "border-radius:3px;font-size:0.7rem\">static</span>";
+            type_badge = "<span class=\"role-badge\">static</span>";
         }
 
         html += "<tr>";
@@ -2247,16 +2210,14 @@ std::string SettingsRoutes::render_management_groups_fragment() {
         html += "<td>" + std::to_string(member_count) + "</td>";
         html += "<td>";
         if (!is_root) {
-            html += "<button class=\"btn btn-sm\" "
+            html += "<button class=\"btn btn-danger btn-sm\" "
                     "hx-delete=\"/api/settings/management-groups/" +
                     html_escape(g->id) +
                     "\" "
                     "hx-target=\"#mgmt-groups-section\" "
                     "hx-confirm=\"Delete group '" +
                     html_escape(g->name) +
-                    "' and all children?\" "
-                    "style=\"font-size:0.7rem;padding:1px 6px;color:#f85149;border-color:#f85149"
-                    "\">Delete</button>";
+                    "' and all children?\">Delete</button>";
         }
         html += "</td></tr>";
 
@@ -2278,34 +2239,26 @@ std::string SettingsRoutes::render_management_groups_fragment() {
     html += "</tbody></table>";
 
     html += "<div style=\"margin-top:0.75rem\">"
-            "<details><summary style=\"cursor:pointer;color:#58a6ff;font-size:0.8rem\">"
+            "<details><summary style=\"cursor:pointer;color:var(--primary)\">"
             "Create group</summary>"
-            "<form hx-post=\"/api/settings/management-groups\" "
+            "<form class=\"add-user-form\" hx-post=\"/api/settings/management-groups\" "
             "hx-target=\"#mgmt-groups-section\" "
-            "hx-swap=\"innerHTML\" "
-            "style=\"display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.5rem;align-items:end\">"
-            "<div><label style=\"font-size:0.7rem;color:#8b949e\">Name</label>"
-            "<input type=\"text\" name=\"name\" required "
-            "style=\"display:block;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;"
-            "padding:4px 8px;border-radius:4px;font-size:0.8rem\"></div>"
-            "<div><label style=\"font-size:0.7rem;color:#8b949e\">Parent</label>"
-            "<select name=\"parent_id\" "
-            "style=\"display:block;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;"
-            "padding:4px 8px;border-radius:4px;font-size:0.8rem\">"
+            "hx-swap=\"innerHTML\">"
+            "<div class=\"mini-field\"><label>Name</label>"
+            "<input type=\"text\" name=\"name\" required></div>"
+            "<div class=\"mini-field\"><label>Parent</label>"
+            "<select name=\"parent_id\">"
             "<option value=\"\">— root —</option>";
     for (const auto& g : groups) {
         html += "<option value=\"" + html_escape(g.id) + "\">" + html_escape(g.name) + "</option>";
     }
     html += "</select></div>"
-            "<div><label style=\"font-size:0.7rem;color:#8b949e\">Type</label>"
-            "<select name=\"membership_type\" "
-            "style=\"display:block;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;"
-            "padding:4px 8px;border-radius:4px;font-size:0.8rem\">"
+            "<div class=\"mini-field\"><label>Type</label>"
+            "<select name=\"membership_type\">"
             "<option value=\"static\">static</option>"
             "<option value=\"dynamic\">dynamic</option>"
             "</select></div>"
-            "<button type=\"submit\" class=\"btn\" "
-            "style=\"font-size:0.8rem;padding:4px 12px\">Create</button>"
+            "<button type=\"submit\" class=\"btn btn-secondary\">Create</button>"
             "</form></details></div>";
 
     return html;
@@ -2314,12 +2267,12 @@ std::string SettingsRoutes::render_management_groups_fragment() {
 std::string SettingsRoutes::render_updates_fragment() {
     std::string html;
 
-    std::string ota_color = cfg_->ota_enabled ? "#3fb950" : "#484f58";
+    std::string ota_cls = cfg_->ota_enabled ? "role-badge role-ok" : "role-badge";
     std::string ota_text = cfg_->ota_enabled ? "Enabled" : "Disabled";
     html += "<div class=\"form-row\">"
             "  <label>OTA Updates</label>"
-            "  <span style=\"font-size:0.8rem;color:" +
-            ota_color + ";font-weight:600\">" + ota_text +
+            "  <span class=\"" +
+            ota_cls + "\">" + ota_text +
             "</span>"
             "</div>";
 
@@ -2336,7 +2289,7 @@ std::string SettingsRoutes::render_updates_fragment() {
         // OTA is ON by default (opt-out via --no-ota / --update-dir not
         // writable); there is no --ota-enabled flag to tell the operator to
         // pass. Reaching here means it was explicitly disabled.
-        html += "<span style=\"color:#484f58\">OTA updates are disabled "
+        html += "<span class=\"muted\">OTA updates are disabled "
                 "(start the server without <code>--no-ota</code> to "
                 "enable).</span>";
         return html;
@@ -2357,14 +2310,10 @@ std::string SettingsRoutes::render_updates_fragment() {
         } catch (...) {}
 
         if (!version_counts.empty()) {
-            html += "<div style=\"margin-bottom:1rem;padding:0.5rem 0.75rem;"
-                    "background:#0d1117;border:1px solid #30363d;border-radius:0.3rem\">"
-                    "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
-                    "margin-bottom:0.3rem;text-transform:uppercase;letter-spacing:0.05em\">"
-                    "Fleet Versions</div>";
+            html += "<div class=\"callout\" style=\"margin-bottom:1rem\">"
+                    "<div class=\"sub-head\" style=\"margin-top:0\">Fleet versions</div>";
             for (const auto& [ver, cnt] : version_counts) {
-                html += "<span style=\"display:inline-block;margin-right:1rem;"
-                        "font-size:0.75rem\"><code>" +
+                html += "<span style=\"display:inline-block;margin-right:1rem\"><code>" +
                         html_escape(ver) + "</code> &times; " + std::to_string(cnt) + "</span>";
             }
             html += "</div>";
@@ -2378,7 +2327,7 @@ std::string SettingsRoutes::render_updates_fragment() {
             "<tbody>";
 
     if (packages.empty()) {
-        html += "<tr><td colspan=\"8\" style=\"color:#484f58\">"
+        html += "<tr><td colspan=\"8\" class=\"muted\">"
                 "No update packages uploaded</td></tr>";
     } else {
         for (const auto& pkg : packages) {
@@ -2393,10 +2342,10 @@ std::string SettingsRoutes::render_updates_fragment() {
                     "<td>" +
                     html_escape(pkg.arch) +
                     "</td>"
-                    "<td><code style=\"font-size:0.75rem\">" +
+                    "<td><code>" +
                     html_escape(pkg.version) +
                     "</code></td>"
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     size_str +
                     "</td>"
                     // Read from disk, not from a stored flag: the sidecar is the
@@ -2404,7 +2353,7 @@ std::string SettingsRoutes::render_updates_fragment() {
                     // fleet will see rather than what the upload intended. Without
                     // it an operator has no way to tell a signed package from an
                     // unsigned one short of reading server logs.
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     // The SAME decision CheckForUpdate makes, not just exists():
                     // an over-cap, unreadable or zero-byte sidecar is present on
                     // disk but served as UNSIGNED, so exists() alone would tell
@@ -2421,10 +2370,11 @@ std::string SettingsRoutes::render_updates_fragment() {
                          ? (signature_sidecar_covers_binary(
                                 update_registry_->binary_path(pkg),
                                 update_registry_->signature_path(pkg))
-                                ? std::string("<span title=\"A detached signature is stored "
+                                ? std::string("<span class=\"role-badge role-ok\" "
+                                              "title=\"A detached signature is stored "
                                               "for this package\">signed</span>")
                                 : std::string(
-                                      "<span style=\"color:#d29922\" title=\"The stored "
+                                      "<span class=\"role-badge role-warn\" title=\"The stored "
                                       "signature is NEWER than the binary beside it, so it "
                                       "cannot be confirmed to cover it. Usually an upload that "
                                       "did not complete; a restore that did not preserve "
@@ -2432,7 +2382,7 @@ std::string SettingsRoutes::render_updates_fragment() {
                                       "that does not verify, in both modes. Re-upload the "
                                       "binary and its signature together to clear "
                                       "it.\">signature mismatch</span>"))
-                         : std::string("<span style=\"color:#8b949e\" title=\"No usable "
+                         : std::string("<span class=\"role-badge\" title=\"No usable "
                                        "signature is being served: either none is stored, or "
                                        "the stored one is unreadable, empty or over the size "
                                        "cap (see the server log). Agents running "
@@ -2452,17 +2402,16 @@ std::string SettingsRoutes::render_updates_fragment() {
                     "\" "
                     "style=\"width:60px\" "
                     "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
-                    "<span style=\"font-size:0.7rem;width:2.5em\">" +
+                    "<span style=\"width:2.5em\">" +
                     std::to_string(pkg.rollout_pct) +
                     "%</span>"
                     "<button class=\"btn btn-secondary\" type=\"submit\" "
-                    "style=\"padding:0.15rem 0.5rem;font-size:0.65rem\">Set</button>"
+                    ">Set</button>"
                     "</form></td>"
-                    "<td style=\"font-size:0.75rem\">" +
+                    "<td>" +
                     std::string(pkg.mandatory ? "Yes" : "No") +
                     "</td>"
                     "<td><button class=\"btn btn-danger\" "
-                    "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                     "hx-delete=\"/api/settings/updates/" +
                     html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "/" +
                     html_escape(pkg.version) +
@@ -2521,7 +2470,7 @@ std::string SettingsRoutes::render_updates_fragment() {
             "<input type=\"file\" name=\"signature\"></div>"
             "<div class=\"mini-field\">"
             "<label>Rollout %</label>"
-            "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:50px\"></div>"
+            "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:64px\"></div>"
             "<div class=\"mini-field\" style=\"display:flex;align-items:center;gap:0.3rem\">"
             "<label>Mandatory</label>"
             "<input type=\"checkbox\" name=\"mandatory\" value=\"true\"></div>"
@@ -2538,22 +2487,21 @@ std::string SettingsRoutes::render_gateway_fragment() {
     auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
     const auto v = settings_model::build_gateway_settings(*cfg_, gateway_enabled_, count);
     bool enabled = v.at("enabled").get<bool>();
-    std::string status_color = enabled ? "#3fb950" : "#484f58";
+    std::string status_cls = enabled ? "role-badge role-ok" : "role-badge";
     std::string status_text = enabled ? "Enabled" : "Disabled";
 
     std::string html;
 
     html += "<div class=\"form-row\">"
             "  <label>Upstream Service</label>"
-            "  <span style=\"font-size:0.8rem;color:" +
-            status_color + ";font-weight:600\">" + status_text +
+            "  <span class=\"" + status_cls + "\">" + status_text +
             "</span>"
             "</div>";
 
     if (enabled) {
         html += "<div class=\"form-row\">"
                 "  <label>Listen Address</label>"
-                "  <code style=\"font-size:0.8rem\">" +
+                "  <code>" +
                 html_escape(v.at("listen_address").get<std::string>()) +
                 "</code>"
                 "</div>";
@@ -2561,8 +2509,8 @@ std::string SettingsRoutes::render_gateway_fragment() {
         const bool gw_mode = v.at("gateway_mode").get<bool>();
         html += "<div class=\"form-row\">"
                 "  <label>Gateway Mode</label>"
-                "  <span style=\"font-size:0.8rem;color:" +
-                std::string(gw_mode ? "#3fb950" : "#8b949e") + "\">" +
+                "  <span class=\"" +
+                std::string(gw_mode ? "role-badge role-ok" : "role-badge") + "\">" +
                 (gw_mode ? "Active" : "Inactive") +
                 "</span>"
                 "</div>";
@@ -2570,12 +2518,12 @@ std::string SettingsRoutes::render_gateway_fragment() {
         auto shown_count = v.at("active_sessions").get<std::int64_t>();
         html += "<div class=\"form-row\">"
                 "  <label>Active Sessions</label>"
-                "  <span style=\"font-size:0.8rem\">" +
+                "  <span>" +
                 std::to_string(shown_count) + " agent" + (shown_count != 1 ? "s" : "") +
                 " via gateway</span>"
                 "</div>";
     } else {
-        html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
+        html += "<p class=\"section-note\">"
                 "The gateway upstream service is not running. Start the server with "
                 "<code>--gateway-upstream 0.0.0.0:50055</code> to enable it. The service "
                 "requires an authorized gateway peer: pin the gateway's key with "
@@ -2586,11 +2534,10 @@ std::string SettingsRoutes::render_gateway_fragment() {
                 "refuses to start. Pins are read once at boot; changing them needs a restart.</p>";
     }
 
-    html += "<div style=\"margin-top:1rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
-            "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
-            "margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em\">"
-            "Erlang Gateway Environment Variables</div>"
-            "<table class=\"user-table\" style=\"font-size:0.75rem\">"
+    html += "<div style=\"margin-top:1rem;padding-top:0.75rem;border-top:1px solid var(--line)\">"
+            "<div class=\"sub-head\" style=\"margin-top:0\">"
+            "Erlang gateway environment variables</div>"
+            "<table class=\"user-table\">"
             "<thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead>"
             "<tbody>"
             "<tr><td><code>YUZU_GW_UPSTREAM_ADDR</code></td>"
@@ -2627,19 +2574,18 @@ std::string SettingsRoutes::render_https_fragment() {
 
     std::string html;
 
-    std::string status_color = https_enabled ? "#3fb950" : "#484f58";
+    std::string status_cls = https_enabled ? "role-badge role-ok" : "role-badge";
     std::string status_text = https_enabled ? "Enabled" : "Disabled";
 
     html += "<div class=\"form-row\">"
             "  <label>HTTPS</label>"
-            "  <span style=\"font-size:0.8rem;color:" +
-            status_color + ";font-weight:600\">" + status_text +
+            "  <span class=\"" + status_cls + "\">" + status_text +
             "</span>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>HTTPS Port</label>"
-            "  <code style=\"font-size:0.8rem\">" +
+            "  <code>" +
             std::to_string(v.at("port").get<int>()) +
             "</code>"
             "</div>";
@@ -2665,17 +2611,16 @@ std::string SettingsRoutes::render_https_fragment() {
             "</div>";
 
     const bool redirect = v.at("redirect").get<bool>();
-    std::string redir_color = redirect ? "#3fb950" : "#8b949e";
+    std::string redir_cls = redirect ? "role-badge role-ok" : "role-badge";
     std::string redir_text = redirect ? "Enabled" : "Disabled";
     html += "<div class=\"form-row\">"
             "  <label>HTTP Redirect</label>"
-            "  <span style=\"font-size:0.8rem;color:" +
-            redir_color + "\">" + redir_text +
+            "  <span class=\"" + redir_cls + "\">" + redir_text +
             "</span>"
             "</div>";
 
     if (!https_enabled) {
-        html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
+        html += "<p class=\"section-note\">"
                 "Start the server with <code>--https --https-cert &lt;path&gt; --https-key "
                 "&lt;path&gt;</code> to enable.</p>";
     }
@@ -2695,68 +2640,65 @@ std::string SettingsRoutes::render_analytics_fragment() {
 
     std::string html;
 
-    std::string status_color = v.at("enabled").get<bool>() ? "#3fb950" : "#484f58";
+    std::string status_cls = v.at("enabled").get<bool>() ? "role-badge role-ok" : "role-badge";
     std::string status_text = v.at("enabled").get<bool>() ? "Enabled" : "Disabled";
 
     html += "<div class=\"form-row\">"
             "  <label>Analytics</label>"
-            "  <span style=\"font-size:0.8rem;color:" +
-            status_color + ";font-weight:600\">" + status_text +
+            "  <span class=\"" + status_cls + "\">" + status_text +
             "</span>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>Drain Interval</label>"
-            "  <code style=\"font-size:0.8rem\">" +
+            "  <code>" +
             std::to_string(v.at("drain_interval_seconds").get<int>()) +
             "s</code>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>Batch Size</label>"
-            "  <code style=\"font-size:0.8rem\">" +
+            "  <code>" +
             std::to_string(v.at("batch_size").get<int>()) +
             "</code>"
             "</div>";
 
     bool ch_configured = v.at("clickhouse_configured").get<bool>();
-    std::string ch_color = ch_configured ? "#3fb950" : "#484f58";
+    std::string ch_cls = ch_configured ? "file-name" : "role-badge";
     std::string ch_text =
         ch_configured ? html_escape(v.at("clickhouse_url").get<std::string>()) : "Not configured";
 
     html +=
-        "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
-        "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
-        "margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em\">"
-        "ClickHouse Integration</div>";
+        "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--line)\">"
+        "<div class=\"sub-head\" style=\"margin-top:0\">"
+        "ClickHouse integration</div>";
     html += "<div class=\"form-row\">"
             "  <label>URL</label>"
-            "  <span style=\"font-size:0.8rem;color:" +
-            ch_color + "\">" + ch_text +
+            "  <span class=\"" + ch_cls + "\">" + ch_text +
             "</span>"
             "</div>";
     if (ch_configured) {
         html += "<div class=\"form-row\">"
                 "  <label>Database</label>"
-                "  <code style=\"font-size:0.8rem\">" +
+                "  <code>" +
                 html_escape(v.at("clickhouse_database").get<std::string>()) +
                 "</code>"
                 "</div>";
         html += "<div class=\"form-row\">"
                 "  <label>Table</label>"
-                "  <code style=\"font-size:0.8rem\">" +
+                "  <code>" +
                 html_escape(v.at("clickhouse_table").get<std::string>()) +
                 "</code>"
                 "</div>";
         std::string username = v.at("clickhouse_username").get<std::string>();
         html += "<div class=\"form-row\">"
                 "  <label>Username</label>"
-                "  <code style=\"font-size:0.8rem\">" +
+                "  <code>" +
                 (username.empty() ? std::string("(default)") : html_escape(username)) +
                 "</code></div>";
         html += "<div class=\"form-row\">"
                 "  <label>Password</label>"
-                "  <span style=\"font-size:0.8rem;color:#8b949e\">" +
+                "  <span class=\"muted\">" +
                 (v.at("clickhouse_password_set").get<bool>() ? std::string("********")
                                                               : std::string("(not set)")) +
                 "</span></div>";
@@ -2784,14 +2726,14 @@ std::string SettingsRoutes::render_data_retention_fragment() {
 
     html += "<div class=\"form-row\">"
             "  <label>Response Data</label>"
-            "  <code style=\"font-size:0.8rem\">" +
+            "  <code>" +
             std::to_string(v.at("response_retention_days").get<int>()) +
             " days</code>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>Audit Logs</label>"
-            "  <code style=\"font-size:0.8rem\">" +
+            "  <code>" +
             std::to_string(v.at("audit_retention_days").get<int>()) +
             " days</code>"
             "</div>";
@@ -2824,8 +2766,7 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
     std::string html;
 
     // ── Blast-radius alert shape ─────────────────────────────────────────────
-    html += "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
-            "margin-bottom:0.4rem\">FLEET BLAST-RADIUS THRESHOLDS</div>";
+    html += "<div class=\"sub-head\">Fleet blast-radius thresholds</div>";
     html += "<form hx-post=\"/api/settings/dex-alerts/blast\" "
             "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">";
     auto num_row = [&](const char* label, const char* name, const std::string& value,
@@ -2833,7 +2774,7 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
         html += "<div class=\"form-row\"><label>" + std::string(label) +
                 "</label><input type=\"number\" name=\"" + name + "\" value=\"" +
                 html_escape(value) +
-                "\" style=\"width:7rem\"> <span style=\"font-size:0.7rem;color:#8b949e\">" +
+                "\" style=\"width:7rem;flex:0 0 auto\"> <span class=\"hint\">" +
                 hint + "</span></div>";
     };
     num_row("Min devices", "min_devices", min_dev, "distinct devices that make an incident (>= 2)");
@@ -2843,9 +2784,8 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
             "style=\"margin-top:0.3rem\">Save thresholds</button></form>";
 
     // ── Cohort metrics export (F2a PR3 — Grafana) ────────────────────────────
-    html += "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
-            "margin:1rem 0 0.4rem\">COHORT METRICS EXPORT (PROMETHEUS)</div>"
-            "<p style=\"font-size:0.72rem;color:#8b949e;margin-bottom:0.5rem\">"
+    html += "<div class=\"sub-head\">Cohort metrics export (Prometheus)</div>"
+            "<p class=\"hint\" style=\"margin-bottom:0.5rem\">"
             "When a tag key is set, per-cohort fleet performance gauges "
             "(<code>yuzu_fleet_perf_cohort_*</code>) are exported on /metrics for that key's "
             "cohorts &mdash; top 50 by population, 10-device statistical floor, a "
@@ -2859,16 +2799,15 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
             "<div class=\"form-row\"><label>Export tag key</label>"
             "<input type=\"text\" name=\"export_key\" value=\"" +
             html_escape(export_key) +
-            "\" placeholder=\"e.g. model\" style=\"width:12rem\"> "
-            "<span style=\"font-size:0.7rem;color:#8b949e\">[A-Za-z0-9_.:-], max 64; empty = "
+            "\" placeholder=\"e.g. model\" style=\"width:12rem;flex:0 0 auto\"> "
+            "<span class=\"hint\">[A-Za-z0-9_.:-], max 64; empty = "
             "off</span></div>"
             "<button type=\"submit\" class=\"btn btn-secondary\" "
             "style=\"margin-top:0.3rem\">Save export key</button></form>";
 
     // ── Per-signal routing ───────────────────────────────────────────────────
-    html += "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
-            "margin:1rem 0 0.4rem\">PER-SIGNAL ALERTS</div>"
-            "<p style=\"font-size:0.72rem;color:#8b949e;margin-bottom:0.5rem\">"
+    html += "<div class=\"sub-head\">Per-signal alerts</div>"
+            "<p class=\"hint\" style=\"margin-bottom:0.5rem\">"
             "A routed signal raises an operator notification and fires the "
             "<code>dex.signal</code> webhook event, once per device per hour. "
             "Nothing is routed by default — blast-radius incidents always alert.</p>";
@@ -2881,16 +2820,16 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
         for (const char* t : g.types)
             if (routed.count(t)) any_routed = true;
         html += std::string("<details") + (any_routed ? " open" : "") +
-                "><summary style=\"cursor:pointer;font-size:0.78rem;padding:0.2rem 0\">" +
+                "><summary style=\"cursor:pointer;padding:0.2rem 0\">" +
                 html_escape(g.name) + "</summary><div style=\"padding:0.2rem 0 0.4rem 1rem\">";
         for (const char* t : g.types) {
             known.insert(t);
             const bool checked = routed.count(t) > 0;
-            html += std::string("<label style=\"display:block;font-size:0.75rem;"
+            html += std::string("<label style=\"display:block;"
                                 "padding:0.1rem 0\"><input type=\"checkbox\" name=\"types\" "
                                 "value=\"") +
                     t + "\"" + (checked ? " checked" : "") + "> " + dex_signal_label(t) +
-                    " <code style=\"font-size:0.65rem;color:#8b949e\">" + t + "</code></label>";
+                    " <code class=\"muted\">" + t + "</code></label>";
         }
         html += "</div></details>";
     }
@@ -2899,11 +2838,11 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
     std::string strays;
     for (const auto& t : routed)
         if (!known.count(t))
-            strays += "<label style=\"display:block;font-size:0.75rem\"><input "
+            strays += "<label style=\"display:block\"><input "
                       "type=\"checkbox\" name=\"types\" value=\"" +
                       html_escape(t) + "\" checked> <code>" + html_escape(t) + "</code></label>";
     if (!strays.empty())
-        html += "<details open><summary style=\"font-size:0.78rem\">Other routed types"
+        html += "<details open><summary style=\"cursor:pointer\">Other routed types"
                 "</summary><div style=\"padding:0.2rem 0 0.4rem 1rem\">" +
                 strays + "</div></details>";
     html += "<button type=\"submit\" class=\"btn btn-secondary\" "
@@ -2919,19 +2858,18 @@ std::string SettingsRoutes::render_mcp_fragment() {
     std::string html;
     bool mcp_enabled = v.at("enabled").get<bool>();
 
-    std::string status_color = mcp_enabled ? "#3fb950" : "#484f58";
+    std::string status_cls = mcp_enabled ? "role-badge role-ok" : "role-badge";
     std::string status_text = mcp_enabled ? "Enabled" : "Disabled";
 
     html += "<div class=\"form-row\">"
             "  <label>Status</label>"
-            "  <span style=\"font-size:0.8rem;color:" +
-            status_color + ";font-weight:600\">" + status_text +
+            "  <span class=\"" + status_cls + "\">" + status_text +
             "</span>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>Endpoint</label>"
-            "  <code style=\"font-size:0.8rem\">POST /mcp/v1/</code>"
+            "  <code>POST /mcp/v1/</code>"
             "</div>";
 
     std::string enabled_checked = mcp_enabled ? " checked" : "";
@@ -2950,7 +2888,7 @@ std::string SettingsRoutes::render_mcp_fragment() {
 
     const bool mcp_read_only = v.at("read_only").get<bool>();
     std::string readonly_checked = mcp_read_only ? " checked" : "";
-    std::string readonly_color = mcp_read_only ? "#d29922" : "#484f58";
+    std::string readonly_cls = mcp_read_only ? "role-badge role-warn" : "role-badge";
     std::string readonly_text = mcp_read_only ? "Read-Only" : "Full Access";
     html += "<div class=\"form-row\">"
             "  <label>Access Mode</label>"
@@ -2962,14 +2900,14 @@ std::string SettingsRoutes::render_mcp_fragment() {
             " hx-swap=\"innerHTML\" hx-include=\"closest form\">"
             "    <span class=\"slider\"></span>"
             "  </label>"
-            "  <span style=\"font-size:0.75rem;color:" +
-            readonly_color + ";margin-left:0.5rem\">" + readonly_text +
+            "  <span class=\"" +
+            readonly_cls + "\">" + readonly_text +
             "</span>"
             "</div>";
 
     html += "</form>";
 
-    html += "<p style=\"font-size:0.7rem;color:#484f58;margin-top:0.75rem\">"
+    html += "<p class=\"section-note\">"
             "MCP authentication uses API Tokens with an MCP tier. "
             "Create tokens in the <strong>API Tokens</strong> section above — "
             "select an MCP tier (readonly, operator, or supervised) from the dropdown."
@@ -2977,15 +2915,13 @@ std::string SettingsRoutes::render_mcp_fragment() {
 
     std::string url = v.at("endpoint_url").get<std::string>();
 
-    html += "<div style=\"margin-top:0.75rem;padding:0.75rem;background:#0d1117;"
-            "border:1px solid var(--border);border-radius:0.3rem\">"
-            "  <div style=\"font-size:0.7rem;color:#8b949e;margin-bottom:0.3rem;"
-            "font-weight:600\">MCP CLIENT CONNECTION</div>"
-            "  <div style=\"font-size:0.75rem;margin-bottom:0.3rem\">"
+    html += "<div class=\"callout\" style=\"margin-top:0.75rem\">"
+            "  <div class=\"sub-head\" style=\"margin-top:0\">MCP client connection</div>"
+            "  <div style=\"margin-bottom:0.3rem\">"
             "    Endpoint: <code>" +
             html_escape(url) +
             "</code></div>"
-            "  <div style=\"font-size:0.7rem;color:#484f58\">"
+            "  <div class=\"hint\">"
             "    Transport: HTTP + JSON-RPC 2.0 &nbsp;|&nbsp; "
             "    Auth: <code>Authorization: Bearer &lt;mcp-token&gt;</code>"
             "  </div>"
@@ -2997,40 +2933,39 @@ std::string SettingsRoutes::render_mcp_fragment() {
 std::string SettingsRoutes::render_nvd_fragment() {
     std::string html;
 
-    std::string status_color = cfg_->nvd_sync_enabled ? "#3fb950" : "#484f58";
+    std::string status_cls = cfg_->nvd_sync_enabled ? "role-badge role-ok" : "role-badge";
     std::string status_text = cfg_->nvd_sync_enabled ? "Enabled" : "Disabled";
 
     html += "<div class=\"form-row\">"
             "  <label>NVD Sync</label>"
-            "  <span style=\"font-size:0.8rem;color:" +
-            status_color + ";font-weight:600\">" + status_text +
+            "  <span class=\"" + status_cls + "\">" + status_text +
             "</span>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>Sync Interval</label>"
-            "  <code style=\"font-size:0.8rem\">" +
+            "  <code>" +
             std::to_string(cfg_->nvd_sync_interval.count() / 3600) +
             " hours</code>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>API Key</label>"
-            "  <span style=\"font-size:0.8rem;color:#8b949e\">" +
+            "  <span class=\"muted\">" +
             (cfg_->nvd_api_key.empty() ? std::string("Not configured (lower rate limits)")
                                        : std::string("Configured")) +
             "</span></div>";
 
     html += "<div class=\"form-row\">"
             "  <label>HTTP Proxy</label>"
-            "  <span style=\"font-size:0.8rem\">" +
+            "  <span>" +
             (cfg_->nvd_proxy.empty()
-                 ? std::string("<span style=\"color:#8b949e\">None</span>")
+                 ? std::string("<span class=\"muted\">None</span>")
                  : std::string("<code>") + html_escape(cfg_->nvd_proxy) + "</code>") +
             "</span></div>";
 
     if (!cfg_->nvd_sync_enabled) {
-        html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
+        html += "<p class=\"section-note\">"
                 "Start the server without <code>--no-nvd-sync</code> (or unset "
                 "<code>YUZU_NO_NVD_SYNC</code>) to enable CVE feed synchronization.</p>";
     }
@@ -3045,15 +2980,11 @@ std::string SettingsRoutes::render_directory_fragment() {
 
     if (oidc_configured) {
         html += "<div style=\"margin-bottom:1rem\">"
-                "  <span style=\"font-size:0.75rem;background:#238636;color:#fff;"
-                "padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">"
-                "Configured</span>"
+                "  <span class=\"role-badge role-ok\">Configured</span>"
                 "</div>";
     } else {
         html += "<div style=\"margin-bottom:1rem\">"
-                "  <span style=\"font-size:0.75rem;background:#9e6a03;color:#fff;"
-                "padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">"
-                "Not configured</span>"
+                "  <span class=\"role-badge role-warn\">Not configured</span>"
                 "</div>";
     }
 
@@ -3061,7 +2992,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "hx-target=\"#directory-section\" hx-swap=\"innerHTML\">";
 
     html += "<div class=\"form-row\">"
-            "  <label style=\"min-width:140px\">Issuer URL</label>"
+            "  <label>Issuer URL</label>"
             "  <input type=\"text\" name=\"issuer\" "
             "value=\"" +
             html_escape(cfg_->oidc_issuer) +
@@ -3071,7 +3002,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "</div>";
 
     html += "<div class=\"form-row\">"
-            "  <label style=\"min-width:140px\">Client ID</label>"
+            "  <label>Client ID</label>"
             "  <input type=\"text\" name=\"client_id\" "
             "value=\"" +
             html_escape(cfg_->oidc_client_id) +
@@ -3081,7 +3012,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "</div>";
 
     html += "<div class=\"form-row\">"
-            "  <label style=\"min-width:140px\">Client Secret</label>"
+            "  <label>Client Secret</label>"
             "  <input type=\"password\" name=\"client_secret\" "
             "value=\"\" "
             "placeholder=\"" +
@@ -3092,7 +3023,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "</div>";
 
     html += "<div class=\"form-row\">"
-            "  <label style=\"min-width:140px\">Redirect URI</label>"
+            "  <label>Redirect URI</label>"
             "  <input type=\"text\" name=\"redirect_uri\" "
             "value=\"" +
             html_escape(cfg_->oidc_redirect_uri) +
@@ -3102,7 +3033,7 @@ std::string SettingsRoutes::render_directory_fragment() {
             "</div>";
 
     html += "<div class=\"form-row\">"
-            "  <label style=\"min-width:140px\">Admin Group ID</label>"
+            "  <label>Admin Group ID</label>"
             "  <input type=\"text\" name=\"admin_group\" "
             "value=\"" +
             html_escape(cfg_->oidc_admin_group) +
@@ -3113,14 +3044,14 @@ std::string SettingsRoutes::render_directory_fragment() {
 
     std::string tls_checked = cfg_->oidc_skip_tls_verify ? " checked" : "";
     html += "<div class=\"form-row\">"
-            "  <label style=\"min-width:140px\">Skip TLS Verify</label>"
+            "  <label>Skip TLS Verify</label>"
             "  <label class=\"toggle\">"
             "    <input type=\"checkbox\" name=\"skip_tls_verify\" value=\"true\"" +
             tls_checked +
             ">"
             "    <span class=\"slider\"></span>"
             "  </label>"
-            "  <span style=\"font-size:0.7rem;color:#f85149;margin-left:0.5rem\">"
+            "  <span class=\"role-badge role-bad\">"
             "Insecure — dev only</span>"
             "</div>";
 
@@ -3223,24 +3154,23 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     const bool enabled = v.at("enabled").get<bool>();
 
     // Status badge
-    std::string badge_color, badge_text;
+    std::string badge_cls, badge_text;
     if (required_status_unknown) {
-        badge_color = "#da3633"; // red -- distinct from every real state below
+        badge_cls = "role-bad"; // red -- distinct from every real state below
         badge_text = "Require-signature status unknown (config store unavailable)";
     } else if (enabled && required) {
-        badge_color = "#238636"; // green
+        badge_cls = "role-ok"; // green
         badge_text = "Enforced (required)";
     } else if (enabled) {
-        badge_color = "#9e6a03"; // amber
+        badge_cls = "role-warn"; // amber
         badge_text = "Trust bundle loaded (transitional)";
     } else {
-        badge_color = "#484f58"; // muted
+        badge_cls = ""; // muted
         badge_text = "Disabled";
     }
     html += "<div style=\"margin-bottom:1rem\">"
-            "  <span style=\"font-size:0.75rem;background:" +
-            badge_color + ";color:#fff;padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">" +
-            badge_text + "</span></div>";
+            "  <span class=\"role-badge " +
+            badge_cls + "\">" + badge_text + "</span></div>";
     if (required_status_unknown) {
         html += "<div class=\"feedback feedback-error\">Runtime config store is unavailable, "
                 "so the Require-signature toggle's saved value could not be read. This flag "
@@ -3255,20 +3185,20 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     // Current state
     if (enabled) {
         html += "<div class=\"form-row\"><label>Trust anchors</label>"
-                "<span style=\"font-size:0.8rem\">" +
+                "<span>" +
                 std::to_string(v.at("cert_count").get<int>()) + " certificate(s)</span></div>";
         html += "<div class=\"form-row\"><label>Bundle SHA-256</label>"
-                "<code style=\"font-size:0.7rem;word-break:break-all\">" +
+                "<code style=\"word-break:break-all\">" +
                 v.at("sha256").get<std::string>() + "</code></div>";
         const auto subjects = v.at("subjects").get<std::vector<std::string>>();
         if (!subjects.empty()) {
             html += "<div class=\"form-row\" style=\"align-items:flex-start\">"
                     "<label>Subjects</label>"
-                    "<div style=\"font-size:0.75rem;flex:1;min-width:0\">";
+                    "<div style=\"flex:1;min-width:0\">";
             for (const auto& s : subjects) {
                 html += "<div "
-                        "style=\"font-family:monospace;color:var(--mds-color-theme-text-secondary);"
-                        "overflow-wrap:anywhere\">" +
+                        "style=\"font-family:var(--mds-font-family-mono);font-size:12.5px;"
+                        "color:var(--ink2);overflow-wrap:anywhere\">" +
                         html_escape(s) + "</div>";
             }
             html += "</div></div>";
@@ -3277,7 +3207,7 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
         html += "<div class=\"feedback feedback-error\">Bundle on disk is unreadable: " +
                 html_escape(v.at("bundle_error").get<std::string>()) + "</div>";
     } else {
-        html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+        html += "<p class=\"muted\">"
                 "No trust bundle uploaded. Plugin signature verification is off "
                 "for every agent connected to this server.</p>";
     }
@@ -3287,9 +3217,7 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     // the in-tree plugins will reject every Yuzu-shipped plugin
     // fleet-wide on next agent restart. Make the risk explicit before
     // they touch the toggle (governance hardening round 1, ER-1).
-    html += "<div class=\"feedback feedback-warning\" "
-            "style=\"font-size:0.75rem;background:#664d03;color:#fff;"
-            "padding:0.5rem 0.75rem;border-radius:4px;margin-top:0.5rem\">"
+    html += "<div class=\"feedback feedback-warning\">"
             "<strong>Heads up.</strong> Yuzu-shipped plugins do not yet "
             "include CMS signatures. Enabling <em>Require signed plugins</em> "
             "will cause agents to reject every Yuzu-bundled plugin at next "
@@ -3299,13 +3227,13 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "</div>";
 
     // Upload form (multipart so curl/UI both work)
-    html += "<hr style=\"border:none;border-top:1px solid var(--mds-color-theme-border-secondary);"
+    html += "<hr style=\"border:none;border-top:1px solid var(--line);"
             "margin:1rem 0\">";
     html += "<form hx-post=\"/api/settings/plugin-signing/upload\" "
             "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
             "hx-encoding=\"multipart/form-data\">";
     html += "<div class=\"form-row\" style=\"align-items:center\">"
-            "<label style=\"min-width:140px\">PEM trust bundle</label>"
+            "<label>PEM trust bundle</label>"
             "<input type=\"file\" name=\"file\" accept=\".pem,.crt,application/x-pem-file\" "
             "required style=\"flex:1;min-width:0\"></div>";
     html += "<div class=\"form-row\"><label></label>"
@@ -3329,11 +3257,11 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
                 "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
                 "style=\"margin-top:0.75rem\">";
         html += "<div class=\"form-row\">"
-                "<label style=\"min-width:140px\">Require signed plugins</label>"
+                "<label>Require signed plugins</label>"
                 "<label style=\"display:flex;align-items:center;gap:0.5rem;flex:1\">"
                 "<input type=\"checkbox\" name=\"required\" value=\"true\"" +
                 std::string(required ? " checked" : "") +
-                "><span style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+                "><span class=\"hint\">"
                 "Reject unsigned plugins instead of allowing them through (transitional vs "
                 "enforced).</span>"
                 "</label></div>";
@@ -3363,10 +3291,9 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     }
 
     // Operator help
-    html += "<hr style=\"border:none;border-top:1px solid var(--mds-color-theme-border-secondary);"
+    html += "<hr style=\"border:none;border-top:1px solid var(--line);"
             "margin:1rem 0\">";
-    html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
-            "margin-bottom:0.4rem\"><strong>Agent distribution.</strong> The bundle "
+    html += "<p class=\"section-note\" style=\"margin-top:0\"><strong>Agent distribution.</strong> The bundle "
             "is served at <code>GET /api/v2/agent/plugin-policy</code> "
             "(<em>admin-only</em> — operators distribute to agents via the "
             "standard config-management flow; the deprecated "
@@ -3375,7 +3302,7 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "file via <code>--plugin-trust-bundle</code>; automatic agent-side "
             "fetch is a forthcoming change, at which point this endpoint will "
             "gain a dedicated agent identity.</p>";
-    html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+    html += "<p class=\"section-note\">"
             "<strong>Signing recipe:</strong> "
             "<code>openssl cms -sign -binary -nodetach=false -signer signer.pem "
             "-inkey signer.key -in plugin.so -outform pem -out plugin.so.sig</code>. "
@@ -4857,37 +4784,37 @@ void SettingsRoutes::register_routes(
                 std::string token_ep = j.value("token_endpoint", "");
                 if (!auth_ep.empty() && !token_ep.empty()) {
                     res.set_content(
-                        "<span class=\"feedback-ok\" style=\"color:#3fb950;font-size:0.8rem\">"
+                        "<span class=\"feedback-ok\">"
                         "Connected &#x2014; discovered authorization and token endpoints</span>",
                         "text/html; charset=utf-8");
                 } else {
                     res.set_content(
-                        "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                        "<span class=\"feedback-error\">"
                         "Discovery succeeded but missing authorization/token endpoints.</span>",
                         "text/html; charset=utf-8");
                 }
             } else if (status_code == 0) {
                 res.set_content(
-                    "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                    "<span class=\"feedback-error\">"
                     "Discovery failed: " +
                         html_escape(err_str) + "</span>",
                     "text/html; charset=utf-8");
             } else {
                 res.set_content(
-                    "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                    "<span class=\"feedback-error\">"
                     "Discovery failed: HTTP " +
                         std::to_string(status_code) + "</span>",
                     "text/html; charset=utf-8");
             }
         } catch (const nlohmann::json::exception& e) {
             res.set_content(
-                "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                "<span class=\"feedback-error\">"
                 "Discovery response is not valid JSON: " +
                     html_escape(e.what()) + "</span>",
                 "text/html; charset=utf-8");
         } catch (const std::exception& e) {
             res.set_content(
-                "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                "<span class=\"feedback-error\">"
                 "Discovery failed: " +
                     html_escape(e.what()) + "</span>",
                 "text/html; charset=utf-8");

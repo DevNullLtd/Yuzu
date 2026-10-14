@@ -121,12 +121,12 @@ std::string render_frame(const std::vector<DeviceRow>& devices) {
     // Filter bar — client-side state + anomalies + text filters (no round-trip;
     // re-applied after every tree swap via the htmx:afterSettle listener).
     h += "<div class=\"tar-tree-filterbar\">";
-    h += "<span class=\"tt-filter-label\">Show</span>";
+    h += "<span class=\"tt-filter-label\">Show</span><span class=\"tar-seg\">";
     h += "<a class=\"tar-chip on\" data-statechip=\"all\" onclick=\"tarTreeState('all',this)\">All</a>";
     h += "<a class=\"tar-chip\" data-statechip=\"running\" onclick=\"tarTreeState('running',this)\">"
          "Running</a>";
     h += "<a class=\"tar-chip\" data-statechip=\"exited\" onclick=\"tarTreeState('exited',this)\">"
-         "Exited</a>";
+         "Exited</a></span>";
     h += "<label class=\"tt-anom-toggle\"><input type=\"checkbox\" id=\"tar-tree-anom-only\" "
          "onchange=\"applyTarTreeFilters()\"> Anomalies only</label>";
     h += "<input id=\"tar-tree-filter\" class=\"tar-tree-filter\" type=\"text\" "

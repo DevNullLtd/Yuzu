@@ -85,6 +85,16 @@ std::string render_devices(const NetPerfSnapshot& snap, NetPerfMetric metric, bo
                                            not_reporting, cooc, cohort_filter, limit);
 }
 
+// Exactly one <style> block, and it carries the DEX sheet (a known .dx- rule).
+bool one_dx_style(const std::string& h) {
+    const auto open = h.find("<style>");
+    if (open == std::string::npos || h.find("<style>", open + 1) != std::string::npos)
+        return false;
+    const auto close = h.find("</style>", open);
+    const auto rule = h.find(".dx-ctl{", open);
+    return close != std::string::npos && rule != std::string::npos && rule < close;
+}
+
 } // namespace
 
 // ── network_perf_rules ───────────────────────────────────────────────────────
@@ -270,6 +280,15 @@ TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
     CHECK(html.find("not a verdict") != std::string::npos);           // honest evidence, never a verdict
 }
 
+TEST_CASE("network fragments: overview and devices each carry exactly one DEX style block",
+          "[network][ui]") {
+    NetPerfSnapshot snap;
+    snap.devices.push_back(dev("lnx-1", 40.0, 0.4, 3.0e6));
+    CHECK(one_dx_style(render_network_overview_fragment(net_perf_fleet_now(snap))));
+    CHECK(one_dx_style(
+        render_devices(snap, NetPerfMetric::kRtt, false, NetCoocFilter::kNone, std::nullopt, 50)));
+}
+
 TEST_CASE("overview render: empty population is honest", "[network][ui]") {
     NetPerfSnapshot snap;
     snap.devices.push_back(dev("silent", std::nullopt, std::nullopt, std::nullopt));
@@ -363,13 +382,14 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
         REQUIRE(page);
         CHECK(page->status == 200);
         CHECK(page->body.find("/fragments/network/overview") != std::string::npos);
-        // IA: Network is a DEX sub-view — the /network page shell marks DEX active
-        // in the global nav, and there is NO standalone Network top-nav link.
-        // Assert on the href (structurally stable) so a reintroduced top-nav link
-        // with any class/attribute spelling still trips this. The Network tab in
-        // the DEX sub-nav uses hx-get (not href="/network"), so this stays clean.
-        CHECK(page->body.find("class=\"nav-link active\">DEX</a>") != std::string::npos);
-        CHECK(page->body.find("href=\"/network\"") == std::string::npos);
+        // IA: Network is the sub-item of Fleet in the app shell — /network lights the Fleet
+        // family and its Network sub-item, and DEX stays unlit. (The Network tab in the
+        // DEX sub-nav uses hx-get, not href="/network", so the sub-item is the only link.)
+        CHECK(page->body.find("class=\"shell-nav on\" href=\"/viz/fleet\"") != std::string::npos);
+        CHECK(page->body.find("<a href=\"/network\" class=\"on\" aria-current=\"page\">Network</a>") !=
+              std::string::npos);
+        CHECK(page->body.find("class=\"shell-nav on\" href=\"/dex\"") == std::string::npos);
+        CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>Network</b>") != std::string::npos);
     }
 }
 

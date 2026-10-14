@@ -117,6 +117,7 @@
 #include <utility>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include "pg/pg_pool.hpp"
 
 using namespace yuzu::server::mcp;
@@ -1913,6 +1914,47 @@ TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness
     for (const auto& t : tools)
         live.insert(t["name"].get<std::string>());
     CHECK(family_tools == live);
+}
+
+// The kill-switch tools' published descriptions are decision-grade machine
+// metadata: an agentic worker reads them to decide whether a switch is a real
+// emergency stop. They must keep carrying the protective-action caveat (the
+// quarantine control actions and __guard__.push_rules are never refused by a
+// switch), or a stale "reliable emergency stop" claim can reappear unnoticed.
+TEST_CASE("MCP kill-switch tools advertise the protective-action caveat",
+          "[mcp][protective]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    nlohmann::json getter, setter;
+    for (const auto& t : tools) {
+        if (t["name"] == "get_plugin_kill_switch")
+            getter = t;
+        else if (t["name"] == "set_plugin_kill_switch")
+            setter = t;
+    }
+    REQUIRE_FALSE(getter.is_null());
+    REQUIRE_FALSE(setter.is_null());
+
+    const auto check_mentions = [](const nlohmann::json& j,
+                                   std::initializer_list<const char*> needles) {
+        const auto text = j.get<std::string>();
+        for (const char* n : needles)
+            CHECK(text.find(n) != std::string::npos);
+    };
+    // Both descriptions name the closed pair list and their own effect.
+    check_mentions(getter["description"],
+                   {"protective", "unquarantine", "whitelist", "__guard__.push_rules",
+                    "dispatch still proceeds"});
+    check_mentions(getter["inputSchema"]["properties"]["os"]["description"],
+                   {"protective", "never gates"});
+    check_mentions(setter["description"],
+                   {"protective", "unquarantine", "whitelist", "__guard__.push_rules",
+                    "no dispatch effect"});
+    check_mentions(setter["inputSchema"]["properties"]["enabled"]["description"],
+                   {"protective", "no dispatch effect"});
 }
 
 // #2146 A2-R1 Gate 8 fix: a TARGETED regression for the specific defect
@@ -19351,13 +19393,17 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch actually flips PluginCon
     // Baseline: no row yet -> the fail-closed dispatch gate reads "not killed".
     CHECK(w.store.action_allowed("firewall", "block"));
 
+    yuzu::test::LogCapture logs;
     auto off_res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"set_plugin_kill_switch",)"
         R"("arguments":{"plugin":"firewall","action":"block","enabled":false,"reason":"incident 99"}}})");
+    logs.stop();
     REQUIRE(off_res);
+    CHECK(logs.text().find("covers a protective action") == std::string::npos); // ordinary pair: no warning
     auto off_payload = operator_surface_payload(off_res);
     CHECK(off_payload["enabled"] == false);
     CHECK(off_payload["set_by"] == "test-user");
+    CHECK(ts.audit_details[0] == "enabled=false"); // ordinary pair: no protective label
 
     // The proof: the REAL fail-closed chokepoint every dispatch caller
     // shares — not a re-read through get_plugin_kill_switch — now says no.
@@ -19456,17 +19502,18 @@ TEST_CASE("MCP operator surface: set/get_plugin_kill_switch carry the os argumen
           std::unordered_set<std::string>{"windows"});
 }
 
-// #3265 adversarial-review K1/C2-K1: the store/dispatch-chokepoint tests in
+// #3265 adversarial-review K1/C2-K1: the store tests in
 // test_plugin_config_store_pg.cpp prove __guard__.push_rules is
 // kill-switch-addressable, but nothing exercised this SPECIFIC operator
-// surface (the MCP tool, documented in guaranteed-state.md as an equivalent
-// way to flip the switch) with a reserved-namespace plugin name — a future
+// surface (the MCP tool) with a reserved-namespace plugin name — a future
 // MCP-only regression (e.g. reverting this handler to plain
-// is_valid_identifier validation) would silently break emergency-stop access
-// to Guardian rule delivery via MCP while every other test here stayed green.
-TEST_CASE("MCP operator surface: set_plugin_kill_switch reaches the real dispatch chokepoint "
-          "for the reserved-namespace __guard__.push_rules capability, not just an ordinary "
-          "plugin.action",
+// is_valid_identifier validation) would silently reject the reserved-name
+// write while every other test here stayed green. The row is stored and
+// echoed but has no dispatch effect for push_rules (a protective action —
+// test_protective_action_dispatch_gate.cpp covers the dispatch decision).
+TEST_CASE("MCP operator surface: set_plugin_kill_switch writes the reserved-namespace "
+          "__guard__.push_rules row through the real store (addressability only - not the "
+          "dispatch decision - see test_protective_action_dispatch_gate.cpp)",
           "[pg][mcp][integration][operator_surface]") {
     YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_plugincfg_tpl);
     PluginConfigPgWired w{db.dsn()};
@@ -19478,15 +19525,31 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch reaches the real dispatc
     // read allowed, not fail-closed-to-denied).
     CHECK(w.store.action_allowed("__guard__", "push_rules"));
 
+    yuzu::test::LogCapture logs;
     auto off_res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"set_plugin_kill_switch",)"
         R"("arguments":{"plugin":"__guard__","action":"push_rules","enabled":false,"reason":"incident"}}})");
+    logs.stop();
     REQUIRE(off_res);
+
+    // Exactly one warning, naming the scope key, emitted after the successful store.
+    const auto text = logs.text();
+    const auto first = text.find("covers a protective action");
+    CHECK(first != std::string::npos);
+    CHECK(text.find("covers a protective action", first + 1) == std::string::npos);
+    CHECK(text.find("__guard__.push_rules") != std::string::npos);
     auto off_payload = operator_surface_payload(off_res);
     CHECK(off_payload["enabled"] == false);
 
-    // Proven against the real chokepoint, same as the ordinary-plugin case
-    // above — not by trusting the tool's own echoed response.
+    // The audit evidence says the row is inert for dispatch: a stored OFF row
+    // on a protective pair must never read as proof of a stop.
+    REQUIRE(ts.audit_details.size() >= 2);
+    CHECK(ts.audit_details[0] == "enabled=false, protective_exempt=true");
+    CHECK(ts.audit_details[1] == "enabled=false, protective_exempt=true");
+
+    // Proven against the real store accessor, same as the ordinary-plugin case
+    // above — not by trusting the tool's own echoed response. This is the
+    // stored row, not the dispatch decision (a protective pair is exempt).
     CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
 
     auto on_res = ts.call(
@@ -19494,6 +19557,28 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch reaches the real dispatc
         R"("arguments":{"plugin":"__guard__","action":"push_rules","enabled":true,"reason":"resolved"}}})");
     REQUIRE(on_res);
     CHECK(w.store.action_allowed("__guard__", "push_rules"));
+}
+
+TEST_CASE("MCP operator surface: a protective kill-switch write refused at the audit gate "
+          "logs no \"row stored\" warning and stores nothing",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_plugincfg_tpl);
+    PluginConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.plugin_config_store_for_test = &w.store;
+    ts.audit_succeeds_ = false; // the pre-mutation audit row cannot persist
+    ts.start();
+
+    yuzu::test::LogCapture logs;
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"set_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"__guard__","action":"push_rules","enabled":false,"reason":"x"}}})");
+    logs.stop();
+    REQUIRE(res);
+    // Refused at the audit gate (not earlier): the response names the cause.
+    CHECK(res->body.find("could not be persisted") != std::string::npos);
+    CHECK(logs.text().find("covers a protective action") == std::string::npos);
+    CHECK(w.store.action_allowed("__guard__", "push_rules")); // no row was written
 }
 
 TEST_CASE("MCP operator surface: mint_upload_grant writes a real UploadGrantStore row — proven "

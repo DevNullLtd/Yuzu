@@ -11,6 +11,7 @@
 
 #include "inventory_routes.hpp"
 
+#include "app_shell.hpp"
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial
 #include "rest_audit.hpp" // detail::try_persist_audit — throw-safe set-and-proceed audit kernel (#1647)
@@ -168,11 +169,8 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         };
         sub("{{TITLE}}", "Yuzu \xE2\x80\x94 Software");
         sub("{{FRAGMENT}}", "/fragments/inventory/software");
-        // Mark the Software nav item active, Guardian (the shell default) inactive.
-        sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
-            "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-        sub("<a href=\"/software\" class=\"nav-link\">Software</a>",
-            "<a href=\"/software\" class=\"nav-link active\">Software</a>");
+        // The shared shell is baked with Guardian active; re-target it to Software.
+        html = shell::apply_shell(std::move(html), {.active_key = "software"});
         // The page's own CSP-safe script (hash <-> filters, expansion toggles) rides the shell.
         if (const auto p = html.rfind("</body>"); p != std::string::npos)
             html.insert(p, software_page_script());

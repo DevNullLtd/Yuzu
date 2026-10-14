@@ -389,3 +389,18 @@ TEST_CASE("settings enrollment: bulk approve/deny with the store down are 503 + 
     CHECK(h.sink.Post("/api/settings/pending-agents/bulk-deny", "", kForm)->status == 503);
     CHECK(h.only("enrollment.bulk_deny").result == "failure");
 }
+
+// The table has no Expired state, so an Active pill is shown for a lapsed token too; it must
+// never wear the green OK colour (role-ok), which would assert health for a dead credential.
+// A lapsed token cannot be minted without a clock wait, so this pins the shared Active branch.
+TEST_CASE("settings enrollment: the Active token pill is not the green OK pill",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    REQUIRE(h.sink.Post("/api/settings/enrollment-tokens", "label=x&max_uses=1&ttl_hours=1",
+                        kForm));
+
+    auto res = h.sink.Get("/fragments/settings/tokens");
+    REQUIRE(res);
+    CHECK(res->body.find("role-badge role-admin\">Active") != std::string::npos);
+    CHECK(res->body.find("role-ok\">Active") == std::string::npos);
+}
