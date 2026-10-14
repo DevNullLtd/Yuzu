@@ -664,8 +664,6 @@ td > .bar { min-width: 110px; }
 .split { display: flex; flex-wrap: wrap; gap: 22px; align-items: flex-start; }
 .split > .grow { flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 22px; }
 .split > .side2 { flex: 1 1 320px; max-width: 400px; min-width: 0; display: flex; flex-direction: column; gap: 22px; }
-.side2 td, .side2 th { white-space: normal; padding-left: 10px; padding-right: 10px; }
-.panel > .hd .sub { font-weight: 400; }
 .panel table td.long, .panel .hd h2.long { white-space: normal; overflow-wrap: anywhere; }
 .panel table td.long { max-width: 340px; min-width: 140px; }
 .panel .empty { padding: 26px 16px; color: var(--mut); text-align: center; }
