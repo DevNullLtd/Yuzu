@@ -4834,6 +4834,7 @@ void SettingsRoutes::register_routes(
         // of dots is refused too: a browser resolves "." and ".." out of a request path, so such
         // an account could never be addressed (removed, or have its role changed) by URL.
         if (!is_valid_username(username) || username.find_first_not_of('.') == std::string::npos) {
+            audit_fn_(req, "user.create", "denied", "User", username, "invalid_username");
             res.status = 400;
             res.set_header(
                 "HX-Trigger",

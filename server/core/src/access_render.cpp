@@ -110,7 +110,7 @@ std::string detail_panel(const UserDetail& d) {
     if (d.is_self)
         out += hint("You cannot change your own role.");
     else if (!is_local(u))
-        out += hint("Not available for SSO or SCIM accounts here.");
+        out += hint("Not available for SSO or SCIM accounts here: manage the account in your identity provider.");
     else
         out += hint("Changing it signs the person out.");
     out += "</div></div>";

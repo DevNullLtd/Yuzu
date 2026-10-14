@@ -90,6 +90,9 @@
 
   function failure(r) {
     var text = r.message || ('The request was refused (HTTP ' + r.status + ').');
+    // The server's own next step (for a SAML session at step-up: where to re-authenticate).
+    var rem = remediation(r);
+    if (rem && text.indexOf(rem) < 0) text += (/[.!?]$/.test(text) ? ' ' : '. ') + rem;
     if (!unknown(r)) return text;
     // A server message that already states what happened ("... session cleanup failed ...") is
     // kept as the definite part; only an unexplained 5xx or dropped connection is "may or may not".
@@ -395,8 +398,9 @@
     return r.data && r.data.error && typeof r.data.error.remediation === 'string' ? r.data.error.remediation : '';
   }
 
-  var ENFORCE_NOTE = 'You must hold a fleet-wide Administrator grant and a local admin account, or the server refuses ' +
-                     'so you cannot lock yourself out. You may be asked for an MFA code.';
+  var ENFORCE_NOTE = 'You must hold a fleet-wide Administrator grant and a local admin account. The server keeps at least ' +
+                     'one eligible administrator on record; it does not check that anyone can still sign in (second factor, ' +
+                     'single sign-on only mode). You may be asked for an MFA code. Recovery is in the RBAC manual, Enabling RBAC.';
 
   ACTS.enforce = function (sw) {
     var want = sw.checked;

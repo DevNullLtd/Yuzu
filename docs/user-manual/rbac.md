@@ -520,6 +520,9 @@ Settings uses, so the two stay equivalent.
   roles and changing enforcement still need your own standing Administrator role, and
   changing an account role (Change role) needs your own account role to be admin: the server refuses it
   for a session that is only admin through an elevation.
+- **Large directories.** The Users panel draws at most 500 accounts and the Role assignments panel at most 2000 grants, with a note saying how many exist. An account or grant beyond the cap is not reachable from this page (there is no search yet): use the Settings user table or the REST routes for it, and the derived "RBAC roles" and "Assigned" cells read "Not shown" when the grant table was capped.
+- **What the audit trail shows.** Add user, Remove user and Change role are written by the Settings routes, whose audit write is not checked: if the audit store fails, the action still succeeds and the row can be missing (the page cannot raise the audit banner for them; watch the `audit_log: AuditStore::log failed` server log line). Opening or refreshing the Role assignments panel writes one `rbac.assignments.list` row per view, including the refresh that follows an elevation, step-down or enforcement change, so one session can write several rows with the same count.
+- **SAML sessions.** A session that signed in through SAML cannot complete the second-factor step-up for Remove user, Change role or Revoke sessions; the page shows the server's refusal and its remediation text. Use a local administrator account or an administrator API token for those actions.
 - **Unreadable store.** If the account store does not answer, the Users panel shows a red
   message with a Retry button. It never shows an empty list in that case, so a degraded store
   cannot be mistaken for "nobody is here".
