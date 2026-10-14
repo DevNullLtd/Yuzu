@@ -69,6 +69,7 @@ struct WebhookRouteHarness {
     yuzu::test::WebhookStorePg store;
     bool perm_grant{true};
     std::vector<AuditRecord> audit_log;
+    std::vector<nlohmann::json> emitted; // "webhook.created" payloads
     yuzu::server::test::TestRouteSink sink;
     WebhookRoutes routes;
 
@@ -94,8 +95,10 @@ struct WebhookRouteHarness {
             audit_log.push_back({a, r, tt, ti, d});
             return true;
         };
-        auto emit_event_fn = [](const std::string&, const httplib::Request&,
-                                const nlohmann::json&, const nlohmann::json&) {};
+        auto emit_event_fn = [this](const std::string&, const httplib::Request&,
+                                    const nlohmann::json&, const nlohmann::json& payload) {
+            emitted.push_back(payload);
+        };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_event_fn,
                                with_store ? store.get() : nullptr);
@@ -146,6 +149,47 @@ TEST_CASE("REST webhooks[pg]: create returns 200, id, and has_secret", "[rest][w
     CHECK(lj["webhooks"][0]["has_secret"] == true);
     CHECK_FALSE(lj["webhooks"][0].contains("secret"));
     CHECK(list_res->body.find("s3cret") == std::string::npos);
+}
+
+TEST_CASE("REST webhooks[pg]: the analytics event carries scheme and host only",
+         "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    nlohmann::json body = {{"url", "https://hooks.example.invalid/services/T0/B0/SECRETPATH"}};
+    auto res = h.sink.Post("/api/webhooks", body.dump());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.emitted.size() == 1);
+    CHECK(h.emitted[0]["url"] == "https://hooks.example.invalid");
+    CHECK(h.emitted[0].dump().find("SECRETPATH") == std::string::npos);
+    // The audit row keeps the full URL: it is the record of where data went.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].detail ==
+          "https://hooks.example.invalid/services/T0/B0/SECRETPATH");
+}
+
+TEST_CASE("REST webhooks[pg]: POST 400 on userinfo and on control bytes, nothing stored",
+         "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    auto a = h.sink.Post("/api/webhooks", R"({"url":"https://user:hunter2@h.example/x"})");
+    REQUIRE(a);
+    CHECK(a->status == 400);
+    nlohmann::json crlf = {{"url", "https://h.example/x\r\nX-Forged: 1"}};
+    auto b = h.sink.Post("/api/webhooks", crlf.dump());
+    REQUIRE(b);
+    CHECK(b->status == 400);
+    nlohmann::json types = {{"url", "https://h.example/x"}, {"event_types", "a\nb"}};
+    auto c = h.sink.Post("/api/webhooks", types.dump());
+    REQUIRE(c);
+    CHECK(c->status == 400);
+    for (const auto& rec : h.audit_log) {
+        CHECK(rec.result == "failure");
+        CHECK(rec.detail == "invalid_url");
+        CHECK(rec.detail.find("hunter2") == std::string::npos);
+    }
+    auto list = h.sink.Get("/api/webhooks");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["webhooks"].empty());
+    CHECK(h.emitted.empty());
 }
 
 TEST_CASE("REST webhooks[pg]: create without a secret sets has_secret=false",

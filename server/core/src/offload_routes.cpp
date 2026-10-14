@@ -155,8 +155,11 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       return;
                   }
                   const int64_t id = *result;
+                  // Same `name=.. url=..` shape as the delete row, so the
+                  // create row also records where data was sent (the control
+                  // byte and userinfo guards in create_target make this safe).
                   audit_fn(req, "offload_target.create", "success", "offload_target",
-                           std::to_string(id), name);
+                           std::to_string(id), "name=" + name + " url=" + url);
                   res.status = 201;
                   res.set_content(
                       nlohmann::json({{"id", id}, {"status", "created"}}).dump(),

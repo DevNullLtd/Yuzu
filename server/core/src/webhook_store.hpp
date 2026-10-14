@@ -161,6 +161,12 @@ public:
     [[nodiscard]] std::vector<WebhookDelivery> get_deliveries(int64_t webhook_id,
                                                                int limit = 50) const;
 
+    /// Same read, but `nullopt` = the read FAILED (closed store, lease
+    /// timeout, query error) so a caller that renders history can tell a
+    /// failed read from a genuinely empty log. `get_deliveries` delegates here.
+    [[nodiscard]] std::optional<std::vector<WebhookDelivery>>
+    get_deliveries_checked(int64_t webhook_id, int limit = 50) const;
+
     /// Fire an event to all matching, enabled webhooks asynchronously. Each
     /// delivery runs on the bounded worker pool (see `delivery_pool_` below)
     /// - never a raw thread - so concurrency and thread creation are both
