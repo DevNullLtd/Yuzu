@@ -565,6 +565,31 @@ You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarant
 releasing — the usual repair when a device has been contained without a reachable management
 address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
+### Containment from the Hardware page
+
+The dashboard shows and drives quarantine records without a separate page:
+
+- **Quarantined devices** panel on `/hardware` lists the active records you may read
+  (newest first, at most 200), with who quarantined the device, when, why, the whitelist and
+  how far containment has been shown to reach it: *Recorded* (the server holds the record),
+  *Applied, not confirmed* (a re-dispatch was accepted) or *Confirmed on device* (a status
+  read reported the quarantine active). A read that cannot be completed is a banner, never
+  "no device is quarantined".
+- A **Quarantined** pill marks rows on the Hardware list, and the record header carries a
+  banner while the device has an active record. Instructions to a quarantined device are
+  withheld until it is released; Sync now still works.
+- The record's **Containment** tab shows the same state and offers **Quarantine device**
+  (a reason is required in the dialog) and **Release from quarantine**. Both call
+  `POST /api/v1/quarantine` and `DELETE /api/v1/quarantine/{agent_id}`: they need
+  `Security:Execute` on the device and, like those routes, do **not** apply the approval step
+  the quarantine plugin's own actions require.
+- **Release ends the server record only.** It does not remove the device's firewall rules;
+  run the plugin's `unquarantine` action from the Actions tab for that. Once the record is
+  released the lens reads "No active quarantine record" and cannot say whether the rules
+  were removed, so check the plugin's `status` action.
+- An offline device can be quarantined: the record is stored now and applied when the device
+  next connects.
+
 ### Quarantine now blocks instruction dispatch (#881)
 
 A quarantined device is refused at the **server's dispatch chokepoint**, not only at its own

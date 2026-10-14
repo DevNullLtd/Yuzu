@@ -757,14 +757,12 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
     } else {
         h += kpi_strip(f, *d.kpis, d.now_secs);
     }
-    // A confined caller never reaches here with fleet counts (that view printed its own notice).
-    if (!d.confined)
-        h += "<div class=\"inv-caveat\">Scope (ADR-0017): these fleet-wide counts need a global "
-             "<span class=\"inv-mono\">Inventory:Read</span> grant. A management-group-confined "
-             "account is refused the fleet view and sees only the devices in its own groups; every "
-             "read is audited.</div>";
     h += "<div class=\"inv-panel inv-pb\">" + controls(f, d) + active_region(f, false) + "</div>";
     h += results_region(f, d);
+    // Inventory sources (the REST /inventory/tables twin): loads once with the page; its own
+    // fragment carries the fleet-wide gate and the note a confined caller sees.
+    h += "<div id=\"sw-sources\" hx-get=\"/fragments/inventory/sources\" hx-trigger=\"load\" "
+         "hx-swap=\"innerHTML\"></div>";
     h += "</div>";
     return h;
 }

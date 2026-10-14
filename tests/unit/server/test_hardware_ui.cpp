@@ -264,6 +264,13 @@ TEST_CASE("hardware row: DEX badge tone — ok from 90 and warn from 75 and bad 
 
 // ── Status pill ────────────────────────────────────────────────────────────────
 
+// The Status cell is the pill followed by the row's Containment link (es-1); these pins are
+// about the pill, so compare only what precedes the link.
+std::string status_pill_only(const std::string& cell) {
+    const auto link = cell.find(" <a class=\"hw-lab\" data-act=\"row-containment\"");
+    return link == std::string::npos ? cell : cell.substr(0, link);
+}
+
 // Kills: dropping or swapping the status pill tone, or collapsing the stale branch into offline.
 // Online wins over stale; offline (not stale) is the neutral pill with no tone class.
 TEST_CASE("hardware row: status pill — online ok and stale warn and offline neutral",
@@ -273,19 +280,19 @@ TEST_CASE("hardware row: status pill — online ok and stale warn and offline ne
     row.hostname = "WS-1";
 
     row.online = true;
-    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"pill ok\">online</span>");
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill ok\">online</span>");
 
     row.online = true;
     row.stale = true; // a live stream outranks a stale heartbeat
-    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"pill ok\">online</span>");
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill ok\">online</span>");
 
     row.online = false;
     row.stale = true;
-    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"pill warn\">stale</span>");
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill warn\">stale</span>");
 
     row.online = false;
     row.stale = false;
-    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"pill idle\">offline</span>");
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill idle\">offline</span>");
 }
 
 // ── IP cell ────────────────────────────────────────────────────────────────────
@@ -455,7 +462,7 @@ TEST_CASE("hardware lens bar: id, fixed 7-tab order, active class, oob gated on 
     CHECK(html.find("hx-swap-oob") == std::string::npos);
 
     // Fixed order + exact labels.
-    const std::vector<std::string> labels = {"Overview", "Installed software", "Tags",
+    const std::vector<std::string> labels = {"Overview", "Installed software", "Tags and properties",
                                               "DEX",      "Guardian",           "Live",
                                               "Actions"};
     std::size_t pos = 0;
@@ -522,6 +529,24 @@ TEST_CASE("hardware lens body (overview): General block renders agent identity f
     CHECK(html.find("OS</span>Linux") != std::string::npos); // os_label("linux")
     CHECK(html.find("Agent version</span>0.14.2") != std::string::npos);
     CHECK(html.find("Architecture</span>x86_64") != std::string::npos);
+}
+
+// Kills: dropping the stored_data_placeholder() call from the Overview lens (the feature's
+// only entry point) or rendering it on a non-Overview lens.
+TEST_CASE("hardware lens body: Stored data placeholder is on Overview only, click-triggered",
+          "[hardware][ui][estate]") {
+    InventoryDeviceRow identity;
+    identity.os = "linux";
+    HardwareCiDetail detail;
+    detail.identity = identity;
+    HwCiAffordances aff;
+
+    const auto overview = render_hardware_lens_body("agent-42", detail, "", 0, aff);
+    CHECK(overview.find("hx-get=\"/fragments/hardware/ci/stored-data?id=agent-42\"") !=
+          std::string::npos);
+    CHECK(overview.find("hx-trigger=\"click\"") != std::string::npos);
+    CHECK(render_hardware_lens_body("agent-42", detail, "tags", 0, aff).find("hw-stored-data") ==
+          std::string::npos);
 }
 
 // ── #5531: failed roster read is never an empty fleet / "not found" ───────────

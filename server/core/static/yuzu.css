@@ -546,17 +546,6 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
   font-size: 11px; font-family: var(--font-mono); color: var(--mut);
 }
 
-/* Responsive. The dashboard's own breakpoints live in dashboard_ui.cpp (its
-   "Narrow windows" block); the old .main-grid / .dashboard-grid / .history
-   rules that sat here matched no element once the dashboard moved to
-   .dash-grid and were removed. The rule below is kept as it was: .scope is no
-   longer a dashboard panel (that is .scope-panel), but the DEX trends OS cards
-   (dex_routes.cpp, guardian_page_ui.cpp) still carry a .scope element, so it
-   is not provably dead. */
-@media (max-width: 1440px) {
-  .scope { width: 220px !important; }
-}
-
 /* YAML split-panel editor */
 .yaml-split {
   display: grid; grid-template-columns: 1fr 1fr; gap: 1px;

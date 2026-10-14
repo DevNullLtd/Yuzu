@@ -37,6 +37,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <regex>
 #include <string>
 #include <string_view>
 
@@ -1162,6 +1163,19 @@ TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and 
     CHECK_THAT(armed, ContainsSubstring("filter: none"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuCss has no unscoped .scope rule", "[static-js][yuzu-css]") {
+    // The DEX trends OS cards (dex_routes.cpp) carry a bare `.scope` element and
+    // style it themselves (`.gp-oscard .scope`, guardian_page_ui.cpp). A bare
+    // `.scope` selector in the shared sheet reaches that element on every page
+    // that loads it: the old `@media (max-width: 1440px) { .scope { width: 220px
+    // !important } }` pinned the card line to 220 px below 1440 px. The dashboard
+    // panel is `.scope-panel`; `.scope-*` classes are different tokens and stay.
+    // A selector starts after the sheet start, `{`, `}`, `,` or a comment end; `.scope` followed
+    // by `-` or a word character is another class and does not match.
+    const std::regex bare_scope(R"((^|[{},/])\s*\.scope(?![-\w]))");
+    CHECK_FALSE(std::regex_search(yuzu::server::kYuzuCss, bare_scope));
+}
+
 TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs", "[static-js][yuzu-css]") {
     CHECK(yuzu::server::kYuzuCss.find('\0') == std::string::npos);
     // (See kEChartsJs counterpart — stray-delimiter check is tautological
@@ -1500,4 +1514,25 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",
     CHECK(html.find("cdn.") == std::string::npos);
     CHECK(html.find("unpkg.") == std::string::npos);
     CHECK(html.find("jsdelivr.") == std::string::npos);
+}
+
+// ── Shared dialog module (yuzu-dialog.js) ───────────────────────────────────
+
+namespace yuzu::server {
+extern const std::string kYuzuDialogJs;
+} // namespace yuzu::server
+
+TEST_CASE("static_js_bundle: kYuzuDialogJs exposes YuzuDialog and carries no markup sink",
+          "[static-js][dialog][security]") {
+    const std::string& js = yuzu::server::kYuzuDialogJs;
+    CHECK(js.size() >= 4000);
+    CHECK(js.find('\0') == std::string::npos);
+    CHECK_THAT(js, ContainsSubstring("window.YuzuDialog"));
+    CHECK_THAT(js, ContainsSubstring("showModal"));
+    CHECK_THAT(js, ContainsSubstring("AbortSignal.timeout(15000)"));
+    CHECK(js.find("innerHTML") == std::string::npos);
+    CHECK(js.find("insertAdjacentHTML") == std::string::npos);
+    CHECK(js.find("eval(") == std::string::npos);
+    CHECK(js.find("new Function") == std::string::npos);
+    CHECK(js.find("document.write") == std::string::npos);
 }

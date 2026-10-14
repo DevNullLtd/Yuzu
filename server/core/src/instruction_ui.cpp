@@ -13,6 +13,8 @@ const char* const kInstructionPageTemplate =
 <title>Yuzu — Instructions</title>
 <link rel="stylesheet" href="/static/yuzu.css">
 <script src="/static/htmx.js"></script>
+<script src="/static/yuzu-dialog.js" defer></script>
+<script src="/static/yuzu-operate-extras.js" defer></script>
 <style>
 body{padding:0}
 button,input,select,textarea{font:inherit;color:inherit}
@@ -40,6 +42,13 @@ td.act{text-align:right;white-space:nowrap}
 .btn-danger{background:var(--raise);color:var(--bad);border-color:color-mix(in srgb,var(--bad) 45%,var(--line2))}
 .btn-danger:hover:not(:disabled){background:color-mix(in srgb,var(--bad) 12%,transparent);border-color:var(--bad)}
 .btn-sm{height:28px;padding:0 10px;font-size:13px}
+.ox-filter{display:flex;flex-wrap:wrap;gap:8px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.ox-filter input{flex:1 1 140px;min-width:0}
+.ox-set{max-width:160px}
+.ox-pad{padding:10px 16px}
+#ox-expr{width:100%;box-sizing:border-box;font-family:var(--mds-font-family-mono);font-size:12.5px;min-height:60px}
+#ox-expr-box{display:none;margin-top:8px}
+#ox-expr-note{display:none;margin-top:8px;overflow-wrap:anywhere}
 /* forms */
 .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:16px}
 .form-group{display:flex;flex-direction:column;gap:5px;min-width:0}
@@ -153,7 +162,7 @@ textarea{height:auto;padding:8px 10px;min-height:84px;resize:vertical;font-famil
 .exec-detail-scope,.exec-detail-params{display:block;font-size:12.5px;background:var(--bg);border:1px solid var(--line);padding:6px 8px;border-radius:var(--rad-ctl);white-space:pre-wrap;word-break:break-all}
 @media (max-width:900px){.pg{padding:16px}.exec-form,.exec-detail-grid{grid-template-columns:1fr}.exec-detail-sidebar{grid-column:1;grid-row:auto}}
 </style>
-</head><body>
+</head><body data-page="instructions">
 
   <!--yuzu:shell--><!--/yuzu:shell-->
 
@@ -212,6 +221,21 @@ textarea{height:auto;padding:8px 10px;min-height:84px;resize:vertical;font-famil
             <select id="exec-scope">
               <option value="__all__">All agents</option>
             </select>
+          </div>
+          <div class="form-group">
+            <label for="ox-target-mode">Target</label>
+            <select id="ox-target-mode">
+              <option value="picker">Agent or group</option>
+              <option value="expression">Scope expression</option>
+            </select>
+            <div id="ox-expr-box">
+              <textarea id="ox-expr" maxlength="8192" spellcheck="false" aria-label="Scope expression" placeholder="ostype == &quot;windows&quot; AND tag:env == &quot;prod&quot;"></textarea>
+              <div class="ox-row-btns">
+                <button type="button" class="btn btn-secondary btn-sm" data-ox="expr-validate">Validate</button>
+                <button type="button" class="btn btn-secondary btn-sm" data-ox="expr-preview">Preview</button>
+              </div>
+              <div id="ox-expr-note" class="note" role="status"></div>
+            </div>
           </div>
           <div id="exec-agent-list" class="agent-list"></div>
         </div>
@@ -464,6 +488,12 @@ function executeInstruction() {
   if (!selectedDef) return;
   var btn = document.getElementById('exec-btn');
   var status = document.getElementById('exec-status');
+  // The confirmation dialog lives in yuzu-operate-extras.js; without it this would be a
+  // one-click dispatch to the whole scope, so refuse.
+  if (!window.__yuzuExtrasReady) {
+    status.textContent = 'Page scripts did not load. Reload the page before dispatching.';
+    return;
+  }
   btn.disabled = true;
   status.textContent = 'Dispatching...';
 
@@ -915,6 +945,7 @@ extern const char* const kInstructionEditorHtml = R"HTM(
     <div id="yaml-mode" style="display:none">
         <form hx-post="/api/instructions/yaml" hx-target="#editor-alerts" hx-swap="innerHTML">
             <input type="hidden" name="id" value="{{DEF_ID}}">
+            <input type="hidden" name="updated_at" value="{{DEF_UPDATED_AT}}">
             <div class="form-group full">
                 <label>YAML Source (apiVersion: yuzu.io/v1alpha1)</label>
                 <div class="yaml-legend">
