@@ -504,6 +504,25 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     return false;
 }
 
+/// Same-site gate for a dashboard-called MUTATION. Cookie sessions are ambient credentials a
+/// cross-site page can ride, so a browser write must carry an Origin (or Referer) naming this
+/// site: unlike `origin_is_same_site`, whose empty-header case is "a curl/automation client",
+/// a header-less request authorised by a SESSION COOKIE is refused here, because browsers always
+/// send one on a write and a stripped header must not turn the control off. A request
+/// authenticated by an API/MCP/engine TOKEN is not riding a cookie, so it is not gated.
+/// `auth_source` is the resolved session's source ("local"/"oidc"/"saml" for cookie sessions);
+/// an unresolved one (empty) is treated as a cookie session. Returns true when the write must
+/// be refused.
+[[nodiscard]] inline bool browser_write_is_cross_site(
+    std::string_view auth_source, std::string_view host, std::string_view origin,
+    std::string_view referer, std::span<const std::string> trusted_origins = {}) {
+    if (auth_source == "api_token" || auth_source == "mcp_token" || auth_source == "engine_token")
+        return false;
+    if (origin.empty() && referer.empty())
+        return true;
+    return !origin_is_same_site(host, origin, referer, trusted_origins);
+}
+
 /// The MCP transport body-cap decision for the server's pre-routing handler
 /// (#2437) — extracted from `server.cpp`'s `set_pre_routing_handler` lambda
 /// for exactly the reason `is_login_exempt_path` below was: so the decision

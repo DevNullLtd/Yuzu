@@ -163,6 +163,9 @@ public:
         /// file keep using `perm_fn` above unchanged.
         FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
+        /// `--csrf-trusted-origin` allowlist (#2537) for the same-site gate on the dashboard's
+        /// `POST /api/instructions/{id}/execute`. Empty = same-host only.
+        std::vector<std::string> csrf_trusted_origins;
         EmitEventFn emit_fn;
         ScopeEstimateFn scope_fn;
         /// Kept for the legacy unversioned GET/mutator routes above (`GET

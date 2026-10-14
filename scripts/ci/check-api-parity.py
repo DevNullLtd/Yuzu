@@ -205,8 +205,24 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
 # which counts as untwinned by design, so the count rises 199 -> 200.
 #
-# Both of the two changes above landed on 199; merged together the count is 201
-# (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
+# Device containment fragments (es-1): get.fragments-hardware-quarantine is "twinned" to GET
+# /api/v1/quarantine (no MCP list tool exists; the gap is recorded on the row), and
+# get.fragments-hardware-ci-containment is "composed-of:get.fragments-hardware-quarantine"
+# (a single-device read of the same active-record set; REST has no per-device GET). One
+# composed-of row, so 200 -> 201, measured by the checker, not hand-picked.
+#
+# Stored data panel (es-1): get.fragments-hardware-ci-stored-data is an "exception:" row (the
+# erase it fronts is DELETE /api/v1/sle/agents/{id}, which has no ledger row to compose), so
+# 201 -> 202, measured by the checker, not hand-picked.
+#
+# The DEX Alerts and policy-fragments changes above landed on 199 and merged together to 201
+# (199 + 1 + 1). The two containment rows above landed on that, so merged with them the count
+# is 203 (201 + 1 composed-of + 1 exception), the value the checker reports on the merged tree.
+#
+# Hardware record properties panel (device data, merged from dev): GET /fragments/hardware/ci/properties
+# is "planned:#2146" (its data routes, /api/agents/{id}/properties*, are dashboard-only with no REST v1
+# or MCP twin), so it deepens an untwinned surface by one row. Merged with the containment rows above
+# the count is 204 (203 + 1), the value the checker reports on the merged tree.
 #
 # Home page (HM-1, measured on its own base at 200 = 199 + 1): +1 `composed-of:` row,
 # GET /fragments/home/summary (readout, needs attention) over the existing hardware roster,
@@ -216,12 +232,13 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # (/fragments/home/policies, /fragments/home/activity, /fragments/home/health) are UI-only
 # compositions over existing twinned or planned reads, so each is a composed-of row that
 # counts untwinned.
-# Both Home changes landed on the 201 above; merged together the count is 205 (201 + 1 + 3),
-# the value the checker reported on the merged tree.
+# Both Home changes landed on 201 on their own base. Merged with the dev changes above (204) the
+# four Home/Dashboard rows bring the count to 208 (204 + 4), the value the checker reports on the
+# merged tree.
 # Design delta 2026-10-14: the four rows above moved with their panels to the Dashboard and
 # are now /fragments/dashboard/{summary,policies,activity,health} (same composed-of status,
-# same count; a rename, not a new surface). Still 205.
-BASELINE_UNTWINNED = 205
+# same count; a rename, not a new surface), so the count stays 208.
+BASELINE_UNTWINNED = 208
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

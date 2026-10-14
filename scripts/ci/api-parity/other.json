@@ -573,6 +573,17 @@
     "status": "planned:#2146"
   },
   {
+    "method": "GET",
+    "path": "/fragments/instructions/templates",
+    "capability_id": "get.fragments-instructions-templates",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/definitions/{param}/response-templates"
+    },
+    "mcp_twin": "get_definition",
+    "status": "twinned"
+  },
+  {
     "method": "POST",
     "path": "/fragments/instructions/yaml-preview",
     "capability_id": "post.fragments-instructions-yaml-preview",
