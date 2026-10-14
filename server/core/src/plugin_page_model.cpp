@@ -10,10 +10,6 @@ std::string esc(const std::string& s) {
     return html_escape(s);
 }
 
-std::string panel_note(const std::string& cls, const std::string& text) {
-    return "<p class=\"" + cls + "\">" + esc(text) + "</p>";
-}
-
 std::string degraded_note(const char* what) {
     return std::string("<div class=\"failbox\" role=\"alert\"><b>") + what +
            " could not be read.</b> This is not an empty list. Reload to retry.</div>";
@@ -113,7 +109,7 @@ std::string render_kill_switch_panel(const KillSwitchPanel& p) {
          "</div></form>";
 
     if (!p.input_error.empty())
-        return h + "<div class=\"pb\">" + panel_note("feedback-error", p.input_error) + "</div>";
+        return h + "<div class=\"pb\">" + "<p class=\"feedback-error\">" + esc(p.input_error) + "</p>" + "</div>";
     if (p.plugin.empty())
         return h + "<div class=\"pb hint\">Enter a plugin to see its switch at the all-OS layer "
                    "and each OS layer. A plugin with no switch set runs.</div>";
