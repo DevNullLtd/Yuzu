@@ -17,7 +17,7 @@
 /// the command back (confirm dialog, history). Spliced into <body data-secret-params> so the
 /// script keeps no list of its own; test_operate_extras_ui.cpp pins it equal to
 /// kRedactedInstructionParamKeys (sensitive_instruction_params.hpp), the server's classification.
-#define YUZU_OX_SECRET_PARAMS "grant_secret,grant_id"
+#define YUZU_OX_SECRET_PARAMS "grant_secret,grant_id,client_secret"
 
 #define YUZU_OX_CSS                                                                              \
     R"OXC(.ox-panel{flex:none;max-height:46%;overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
