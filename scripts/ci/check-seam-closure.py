@@ -474,8 +474,9 @@ FAMILIES = {
     },
     # `workflow` (ADR-0031 WS-A4, the EIGHTH family through the seam) — the
     # multi-step-workflow READ surface (GET /api/v1/workflows[/{id}], GET
-    # /api/v1/workflow-executions/{id}, MCP list_workflows/get_workflow/
-    # get_workflow_execution). Header-only posture, same reason as
+    # /api/v1/workflow-executions[/{id}], MCP list_workflows/get_workflow/
+    # list_workflow_executions/get_workflow_execution). Header-only
+    # posture, same reason as
     # `dex`/`dex_perf`/`schedule`: the consumer TU (`workflow_routes.cpp`) is
     # multi-family (it also holds the legacy unversioned GET routes and
     # every mutator, plus `schedule`'s own legacy `/api/schedules` routes),
@@ -502,6 +503,10 @@ FAMILIES = {
             "server/core/src/workflow_types.hpp",
             "server/core/src/workflow_model.hpp",
             "server/core/src/workflow_model.cpp",
+            "server/core/src/workflow_execution_list_model.hpp",
+            "server/core/src/workflow_execution_list_model.cpp",
+            "server/core/src/list_keyset.hpp",
+            "server/core/src/list_keyset.cpp",
             "server/core/src/workflow_api.hpp",
             "server/core/src/workflow_api_local.hpp",
         ],

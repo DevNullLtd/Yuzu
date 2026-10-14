@@ -246,6 +246,48 @@ TEST_CASE("hardware row: DEX badge for a scored row; honest dash for the -1 sent
     CHECK(nth_td(first_row(render_row(unscored)), 5) == "<span class=\"hw-grey\">&mdash;</span>");
 }
 
+// Kills: swapping or dropping the DEX tone classes, or moving a threshold (>=90 ok, >=75 warn,
+// else bad). The score text alone survives all of those.
+TEST_CASE("hardware row: DEX badge tone — ok from 90 and warn from 75 and bad below",
+          "[hardware][ui]") {
+    const std::pair<int, const char*> cases[] = {
+        {95, "ok"}, {90, "ok"}, {82, "warn"}, {75, "warn"}, {74, "bad"}, {60, "bad"}};
+    for (const auto& [score, tone] : cases) {
+        InventoryDeviceRow row;
+        row.agent_id = "a1";
+        row.hostname = "WS-1";
+        row.dex_score = score;
+        CHECK(nth_td(first_row(render_row(row)), 5) ==
+              std::string("<span class=\"hw-pill ") + tone + "\">" + std::to_string(score) + "</span>");
+    }
+}
+
+// ── Status pill ────────────────────────────────────────────────────────────────
+
+// Kills: dropping or swapping the status pill tone, or collapsing the stale branch into offline.
+// Online wins over stale; offline (not stale) is the neutral pill with no tone class.
+TEST_CASE("hardware row: status pill — online ok and stale warn and offline neutral",
+          "[hardware][ui]") {
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    row.hostname = "WS-1";
+
+    row.online = true;
+    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"hw-pill ok\">online</span>");
+
+    row.online = true;
+    row.stale = true; // a live stream outranks a stale heartbeat
+    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"hw-pill ok\">online</span>");
+
+    row.online = false;
+    row.stale = true;
+    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"hw-pill warn\">stale</span>");
+
+    row.online = false;
+    row.stale = false;
+    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"hw-pill\">offline</span>");
+}
+
 // ── IP cell ────────────────────────────────────────────────────────────────────
 
 TEST_CASE("hardware row: IP cell — single IP, +N suffix for multiple, honest empty",
@@ -351,8 +393,8 @@ TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unkno
     HwCiAffordances aff;
 
     const auto html = render_hardware_lens_body("a1", detail, /*lens=*/"", /*now_secs=*/0, aff);
-    CHECK(html.find("Cores / threads: </span>8c/16t") != std::string::npos);
-    CHECK(html.find("Memory: </span>16.0 GB") != std::string::npos);
+    CHECK(html.find("Cores / threads</span>8c/16t") != std::string::npos);
+    CHECK(html.find("Memory</span>16.0 GB") != std::string::npos);
 
     DeviceCiRecord unk;
     unk.cpu_cores = "unknown";
@@ -363,9 +405,9 @@ TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unkno
     const auto unk_html = render_hardware_lens_body("a1", unk_detail, "", 0, aff);
     CHECK(unk_html.find("8c/16t") == std::string::npos);
     CHECK(unk_html.find(" GB") == std::string::npos);
-    CHECK(unk_html.find("Cores / threads: </span><span class=\"inv-grey\">&mdash;</span>") !=
+    CHECK(unk_html.find("Cores / threads</span><span class=\"inv-grey\">&mdash;</span>") !=
           std::string::npos);
-    CHECK(unk_html.find("Memory: </span><span class=\"inv-grey\">&mdash;</span>") !=
+    CHECK(unk_html.find("Memory</span><span class=\"inv-grey\">&mdash;</span>") !=
           std::string::npos);
 }
 
@@ -409,7 +451,7 @@ TEST_CASE("hardware CI record: store degrade, not-yet-synced and found render di
 TEST_CASE("hardware lens bar: id, fixed 7-tab order, active class, oob gated on the parameter",
           "[hardware][ui]") {
     const auto html = render_hardware_lens_bar("a1", "dex", /*oob=*/false);
-    REQUIRE(html.find("<div class=\"hw-lens\" id=\"hw-lens-bar\">") != std::string::npos);
+    REQUIRE(html.find("<div class=\"gp-subnav\" id=\"hw-lens-bar\">") != std::string::npos);
     CHECK(html.find("hx-swap-oob") == std::string::npos);
 
     // Fixed order + exact labels.
@@ -476,10 +518,10 @@ TEST_CASE("hardware lens body (overview): General block renders agent identity f
 
     const auto html = render_hardware_lens_body("agent-42", detail, /*lens=*/"", 0, aff);
     CHECK(html.find("<h4>General</h4>") != std::string::npos);
-    CHECK(html.find("Agent id: </span>agent-42") != std::string::npos);
-    CHECK(html.find("OS: </span>Linux") != std::string::npos); // os_label("linux")
-    CHECK(html.find("Agent version: </span>0.14.2") != std::string::npos);
-    CHECK(html.find("Architecture: </span>x86_64") != std::string::npos);
+    CHECK(html.find("Agent id</span>agent-42") != std::string::npos);
+    CHECK(html.find("OS</span>Linux") != std::string::npos); // os_label("linux")
+    CHECK(html.find("Agent version</span>0.14.2") != std::string::npos);
+    CHECK(html.find("Architecture</span>x86_64") != std::string::npos);
 }
 
 // ── #5531: failed roster read is never an empty fleet / "not found" ───────────
@@ -516,11 +558,33 @@ TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreada
     }
 }
 
+// Kills: dropping the CI header's online/offline text pill (status must never be colour alone), or
+// inverting its tone. The header has no stale state: anything not online reads "offline".
+TEST_CASE("hardware CI fragment: header status pill — online ok and otherwise neutral offline",
+          "[hardware][ui]") {
+    HwCiAffordances aff;
+    InventoryDeviceRow identity;
+    identity.hostname = "WS-1";
+    HardwareCiDetail d;
+
+    identity.online = true;
+    d.identity = identity;
+    const auto on = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+    CHECK(on.find("<span class=\"hw-pill ok\">online</span>") != std::string::npos);
+    CHECK(on.find("<span class=\"hw-pill\">offline</span>") == std::string::npos);
+
+    identity.online = false;
+    d.identity = identity;
+    const auto off = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+    CHECK(off.find("<span class=\"hw-pill\">offline</span>") != std::string::npos);
+    CHECK(off.find("<span class=\"hw-pill ok\">online</span>") == std::string::npos);
+}
+
 // Kills: rendering the KPI strip (all zeros) above the roster-unavailable banner. The marker is
-// the class-use `<div class="hw-kpis">`, not `hw-kpi`, which the inlined CSS rule also contains.
+// the class-use `<div class="gp-tiles">`.
 TEST_CASE("hardware list fragment: a degraded full-form list renders no KPI strip",
           "[hardware][ui]") {
-    const std::string marker = "<div class=\"hw-kpis\">";
+    const std::string marker = "<div class=\"gp-tiles\">";
     const auto degraded = render_hardware_list_fragment(HardwareListPage{}, false, true, false);
     CHECK(degraded.find("Hardware roster unavailable") != std::string::npos);
     CHECK(degraded.find(marker) == std::string::npos);

@@ -197,11 +197,11 @@ TEST_CASE("software page: freshness line, stale prefix, building and the later t
     REQUIRE_FALSE(has(h, "<table"));
 }
 
-TEST_CASE("software page: head, sub-nav and the ADR-0017 caveat", "[inventory][ui]") {
+TEST_CASE("software page: head and the ADR-0017 caveat", "[inventory][ui]") {
     const std::string h = full({}, page());
     REQUIRE(has(h, "<h1 class=\"inv-h1\">Software</h1>"));
     REQUIRE(has(h, "<a href=\"/hardware\">Hardware</a>"));
-    REQUIRE(has(h, "<div class=\"inv-subnav\" role=\"tablist\"><a class=\"on\" role=\"tab\""));
+    REQUIRE_FALSE(has(h, "inv-subnav")); // the lone Software tab is gone
     REQUIRE(has(h, "Scope (ADR-0017)"));
     REQUIRE_FALSE(has(h, "Devices tab"));
     REQUIRE_FALSE(has(h, "Find is also"));
@@ -236,8 +236,8 @@ TEST_CASE("software page: kind control, ecosystem and found-by chips", "[invento
     f.ecosystem = "brew";
     f.source = "pkg_inventory.packages";
     const std::string h = full(f, page());
-    REQUIRE(has(h, "<button type=\"button\" class=\"gp-chip\" data-g=\"kind\" data-v=\"\""));
-    REQUIRE(has(h, "class=\"gp-chip on\" data-g=\"kind\" data-v=\"pkg\" aria-pressed=\"true\" "
+    REQUIRE(has(h, "<button type=\"button\" class=\"inv-chip\" data-g=\"kind\" data-v=\"\""));
+    REQUIRE(has(h, "class=\"inv-chip\" data-g=\"kind\" data-v=\"pkg\" aria-pressed=\"true\" "
                    "title=\"macOS pkgutil and Homebrew packages\""));
     REQUIRE(has(h, "data-g=\"kind\" data-v=\"\" aria-pressed=\"false\""));
     REQUIRE(has(h, "title=\"OS packages (rpm, deb, apk, pacman)\""));
@@ -438,6 +438,24 @@ TEST_CASE("software page: modes return the right regions", "[inventory][ui]") {
     const std::string f = full({}, d);
     REQUIRE(has(f, "id=\"sw-kpis\""));
     REQUIRE(has(f, "id=\"sw-results\" data-hash=\"\""));
+}
+
+TEST_CASE("software page: panel wrappers stay balanced in every region", "[inventory][ui]") {
+    // The inv-panel wrappers are concatenated by hand across both results_region return paths.
+    auto balanced = [](const std::string& h) {
+        INFO(h);
+        REQUIRE(count_of(h, "<div ") + count_of(h, "<div>") == count_of(h, "</div>"));
+    };
+    auto d = page();
+    balanced(full({}, d));
+    balanced(render_software_page({}, d, SoftwarePageMode::Results));
+    d = page({});
+    d.totals = SoftwareCatalogTotals{0, 0};
+    balanced(full({}, d));
+    balanced(render_software_page({}, d, SoftwarePageMode::Results));
+    d = page();
+    d.rows.reset();
+    balanced(render_software_page({}, d, SoftwarePageMode::Results));
 }
 
 TEST_CASE("software page: degrade, empty, filtered-empty and caveat states", "[inventory][ui]") {

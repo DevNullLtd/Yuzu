@@ -1967,18 +1967,34 @@ TEST_CASE("#3972 stress: stop() raced against the loop-tail orphan reclaim never
 // ---------------------------------------------------------------------------
 // #3972: the bounded SYMMETRIC seq-ordered cross-lane launch hold.
 //
-// Every test here runs the real worker against a real GuardianSparkRuntime with H = 600 ms and
-// N = 2 (the production H is 1 s / N 64; tests override), and a sink that RECORDS the order and
-// time of every invocation. Sends are CV-gated per lane, so "this entry has not been invoked"
-// is an event, never a sleep. The direct tests (no start()) drive wrapped_send_for_test() with
-// hand-built entries: with no drain thread there is no probe either, which is what lets them
-// pin "running, not in_flight" and the seq == 0 fail-open deterministically.
+// Every test here runs the real worker against a real GuardianSparkRuntime with H = kHold
+// (600 ms) and N = 2 unless it names kRoomyHold / kMidHold / kUnreachedHold below (the
+// production H is 1 s / N 64; tests override), and a sink that RECORDS the order and time of
+// every invocation.
+// Sends are CV-gated per lane, so "this entry has not been invoked" is an event, never a sleep.
+// The direct tests (no start()) drive wrapped_send_for_test() with hand-built entries: with no
+// drain thread there is no probe either, which is what lets them pin "running, not in_flight"
+// and the seq == 0 fail-open deterministically.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 constexpr std::chrono::milliseconds kHold{600};
 constexpr std::size_t kAllowance = 2;
+// Holds for the tests whose setup must finish INSIDE the hold, on a wall clock: T2 (twenty 10 ms
+// sends), T3 (two 200 ms offer waits before the third denial), T4 (the second launch within the
+// carried-over allowance) and CH-4 (four denied passes before the swap). At kHold (600 ms) those
+// have 200-400 ms of slack, which a CI runner sharing a machine with another job does not
+// provide: a run there got through about 13 of T2's 20 sends before the hold expired (4-5x
+// slower than idle). The assertions that compare against the hold are written in terms of it, so
+// what each test pins is the same; only the headroom changes.
+//   kRoomyHold     - T3 and CH-4 wait the hold out, so it costs that much wall time per test.
+//   kMidHold       - T4 waits out TWO holds (c1, then c3), so about 7-8 s of wall time; 3 s still
+//                    leaves its c2 - c1 check 2.5 s (about 5x its idle ~0.5 s) of headroom.
+//   kUnreachedHold - T2 never reaches the hold (it asserts no release), so it costs nothing.
+constexpr std::chrono::milliseconds kRoomyHold{5000};
+constexpr std::chrono::milliseconds kMidHold{3000};
+constexpr std::chrono::milliseconds kUnreachedHold{30000};
 constexpr std::size_t kLifecycleIdx = 0;
 constexpr std::size_t kComplianceIdx = 1;
 constexpr std::size_t lane_idx(OutboxDomain d) { return d == OutboxDomain::Lifecycle ? 0 : 1; }
@@ -2246,14 +2262,21 @@ TEST_CASE("#3972 T2: a compliance entry waits for EVERY older lifecycle send (pe
     // The lifecycle backlog is larger than one drain_max_wall slice, so several passes run; the
     // verdict is denied each time its lane is offered. Between two lifecycle sends the lifecycle
     // executor is idle (nothing RUNNING) - only the pending term keeps the verdict back.
-    HoldRig f(20, kHold, kAllowance, /*drain_max_wall=*/60ms);
+    // The hold must NOT be what releases the verdict (the last CHECK asserts no release), so it
+    // is far longer than any plausible time for twenty 10 ms sends; the pending term alone
+    // orders them.
+    HoldRig f(20, kUnreachedHold, kAllowance, /*drain_max_wall=*/60ms);
     f.sink.delay[kLifecycleIdx] = 10ms;
     for (int i = 0; i < 20; ++i)
         f.lifecycle_only("lc" + std::to_string(i));
     f.drift("cmp");
     f.start();
-    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; }));
-    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Lifecycle) >= 21; }));
+    // Liveness deadlines only (the assertions below carry the ordering). They are explicit
+    // because the default 5 s is not enough on a heavily throttled runner.
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; },
+                       3 * kRoomyHold));
+    REQUIRE(
+        spin_until([&] { return f.sink.n_ended(OutboxDomain::Lifecycle) >= 21; }, 3 * kRoomyHold));
 
     const auto log = f.sink.snapshot();
     const auto verdict_seq = f.sink.nth_start(OutboxDomain::Compliance, 0)->seq;
@@ -2315,7 +2338,7 @@ TEST_CASE("#3972 T3: the hold clock is cumulative across changing blocker identi
     // offer wait and was seen RUNNING). A per-send timer would restart at every new blocker and
     // never reach H; the cumulative clock releases compliance H after the FIRST denial, while the
     // third send is still parked.
-    HoldRig f;
+    HoldRig f(20, kRoomyHold);
     f.sink.set_permits(kLifecycleIdx, 0);
     for (int i = 0; i < 3; ++i)
         f.lifecycle_only("lc" + std::to_string(i));
@@ -2338,13 +2361,18 @@ TEST_CASE("#3972 T3: the hold clock is cumulative across changing blocker identi
     const auto third_denied_at = std::chrono::steady_clock::now(); // >= the denial itself
     REQUIRE(f.worker->releases_for_test(OutboxDomain::Compliance) == 0);
 
-    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 1; }));
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 1; },
+                       3 * kRoomyHold));
     const auto released_at = f.sink.nth_start(OutboxDomain::Compliance, 0)->at;
-    CHECK(released_at - t0 >= kHold);                       // never before H of cumulative holding
-    // But not H from the THIRD: a per-send timer would release >= kHold after it. The slack is
-    // capped at kHold / 4 because kSpinScale is 6 under a sanitizer and an uncapped
-    // 100 ms * 6 zeroes the bound (ASan and TSan both failed the check that way).
-    CHECK(released_at - third_denied_at < kHold - std::min<std::chrono::milliseconds>(100ms * kSpinScale, kHold / 4));
+    CHECK(released_at - t0 >= kRoomyHold); // never before H of cumulative holding
+    // But not H from the THIRD: a per-send timer would release >= kRoomyHold after it. The slack
+    // is capped at kHold / 4 (150 ms), NOT at a fraction of the hold in use: the real gap between
+    // the first and the third denial is a fixed ~2 x 200 ms of offer waits, whatever H is, so a
+    // cap that grows with H (kRoomyHold / 4 = 1.25 s) would, at kSpinScale 6 under a sanitizer,
+    // push the bound below the expected release. (An uncapped 100 ms * 6 does the same, and
+    // ASan and TSan both failed the check that way before the cap existed.)
+    CHECK(released_at - third_denied_at <
+          kRoomyHold - std::min<std::chrono::milliseconds>(100ms * kSpinScale, kHold / 4));
     CHECK(f.sink.n_ended(OutboxDomain::Lifecycle) == 2);    // the third send is still parked
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
 }
@@ -2354,7 +2382,8 @@ TEST_CASE("#3972 T4: a release is an ALLOWANCE of N launches that persists acros
           "[spark][guardian][drain][order]") {
     // Lifecycle parked forever (the blocker). Three compliance verdicts whose sends take 300 ms
     // (> the 200 ms offer wait, so each spans pass boundaries). N = 2.
-    HoldRig f;
+    constexpr auto kWait = 3 * kMidHold; // liveness deadlines only, not timing assertions
+    HoldRig f(20, kMidHold);
     f.sink.set_permits(kLifecycleIdx, 0);
     f.sink.delay[kComplianceIdx] = 300ms;
     f.lifecycle_only("L");
@@ -2364,24 +2393,28 @@ TEST_CASE("#3972 T4: a release is an ALLOWANCE of N launches that persists acros
     const auto t0 = std::chrono::steady_clock::now();
     f.start();
 
-    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; }));
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; }, kWait));
     const auto c1 = f.sink.nth_start(OutboxDomain::Compliance, 0)->at;
-    CHECK(c1 - t0 >= kHold);
-    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 2; }));
+    CHECK(c1 - t0 >= kMidHold);
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 2; }, kWait));
     const auto c2 = f.sink.nth_start(OutboxDomain::Compliance, 1)->at;
-    // The allowance carried over: no second H. c2 starts about one 300 ms send plus a pass after
-    // c1; without the carry-over c2 would wait a further kHold after c1's send ends. A bound of
-    // the form kHold - x shrinks as kSpinScale grows, kHold + 200 ms does not.
-    CHECK(c2 - c1 < kHold + 200ms);
+    // The allowance carried over: no second H. c2 starts about one 300 ms send plus a pass
+    // (~0.5 s idle) after c1; without the carry-over c2 would wait a further H after c1's send
+    // ends, i.e. at least 300 ms + H after c1. A bound of exactly H separates the two by that
+    // fixed 300 ms send (the sink sleeps at least that long, so load cannot shrink it) and has
+    // H - 0.5 s of room on the passing side. A bound of the form H - x would shrink as
+    // kSpinScale grows; H does not.
+    CHECK(c2 - c1 < kMidHold);
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
 
-    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Compliance) >= 2; }));
+    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Compliance) >= 2; }, kWait));
     const auto c2_end = f.sink.nth_end(OutboxDomain::Compliance, 1)->at;
     const auto d0 = f.worker->denials_for_test(OutboxDomain::Compliance);
-    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) > d0; }));
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) > d0; },
+                       kWait));
     CHECK(f.sink.n_started(OutboxDomain::Compliance) == 2); // the third is held again
-    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 3; }));
-    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 2)->at - c2_end >= kHold);
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 3; }, kWait));
+    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 2)->at - c2_end >= kMidHold);
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 2);
 }
 
@@ -2621,9 +2654,10 @@ TEST_CASE("CH-4: the hold clock is per LANE and cumulative - a head swap inside 
     // WHEN the swap lands: a pass costs ~200 ms (the lifecycle offer waits out the parked send
     // before the compliance phase runs), so a swap at 0.9 H would be followed by no denial at all
     // before the release instant, and a clock that restarted on a new head could not be told
-    // apart. The swap is therefore anchored on the 4th denial (~0.65 H of the cumulative clock),
-    // which leaves at least one more denied pass on the NEW head before H runs out.
-    constexpr std::chrono::milliseconds H = 1000ms;
+    // apart. The swap is therefore anchored on the 4th denial (~0.12 H of the cumulative clock at
+    // H = 5 s, an idle machine; it needs about 3 passes, so the hold must outlast that on a loaded
+    // one), which leaves at least one more denied pass on the NEW head before H runs out.
+    constexpr std::chrono::milliseconds H = kRoomyHold;
     HoldRig f(20, H);
     f.sink.set_permits(kLifecycleIdx, 0); // the blocker: an OLDER lifecycle send parked forever
     f.lifecycle_only("L");
@@ -2643,10 +2677,12 @@ TEST_CASE("CH-4: the hold clock is per LANE and cumulative - a head swap inside 
     CHECK(released->rule == "b");
     CHECK(released->at - t0 >= H); // never before a full cumulative H
     // The remainder, not a fresh H: a clock restarted by the swap would release >= H after it.
-    // Expected gap: the rest of the episode plus at most one pass (~0.2 s each); 0.875 H leaves
-    // room either side of a fresh H (>= 1 H) and of that expectation. (A mutation that restarts
-    // the clock on a head change releases about 1.3 s after the swap, so it still fails.)
-    CHECK(released->at - t_swap < H * 7 / 8);
+    // Expected gap: the rest of the episode (H minus the ~0.6 s the swap waited for its 4th
+    // denial) plus at most one pass (~0.2 s), i.e. about H - 0.6 s to H - 0.4 s. A clock restarted
+    // by the swap starts counting at a denial AFTER the swap, so it releases at least H after it;
+    // H - 100 ms therefore separates the two with ~300 ms to spare on the passing side, and it
+    // is absolute because a fraction of H would eat that room as H grows.
+    CHECK(released->at - t_swap < H - 100ms);
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
 }
 

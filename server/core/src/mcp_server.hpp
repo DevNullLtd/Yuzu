@@ -739,12 +739,13 @@ public:
 
     /// ADR-0031 WS-A4 (eighth family): the SAME in-process workflow-read API
     /// seam the REST `GET /api/v1/workflows[/{id}]` and
-    /// `GET /api/v1/workflow-executions/{id}` handlers use — server.cpp
+    /// `GET /api/v1/workflow-executions[/{id}]` handlers use — server.cpp
     /// wires the IDENTICAL instance so `list_workflows`/`get_workflow`/
-    /// `get_workflow_execution` can never disagree with REST v1.
+    /// `get_workflow_execution`/`list_workflow_executions` can never
+    /// disagree with REST v1.
     /// A SETTER, not a `build_handler` parameter — mirrors `set_schedule_api`
     /// above: `build_handler`'s own `WorkflowEngine* workflow_engine`
-    /// parameter is now unused inside these three tool bodies (superseded by
+    /// parameter is now unused inside these tool bodies (superseded by
     /// this seam) but is kept, unremoved, for constructor-signature
     /// stability — a bounded, disclosed, deferred follow-up, not an
     /// oversight (matrix doc, `workflow` family row). Unset (default-

@@ -367,14 +367,13 @@ const char* const kDashboardIndexTemplate =
   </header>
 
   <!-- ── Console: instruction bar ───────────────────────────── -->
-  <!-- hx-on::before-request clears the chart deck the instant the
-       operator clicks Send so a stale chart from the previous
-       dispatch can't linger over the new query's results. The new
-       deck is delivered later via the OOB swap from
-       /fragments/results once execution has data to render. -->
+  <!-- The page script's htmx:beforeRequest listener on this form clears
+       the chart deck the instant the operator clicks Send so a stale
+       chart from the previous dispatch can't linger over the new
+       query's results. The new deck is delivered later via the OOB
+       swap from /fragments/results once execution has data to render. -->
   <form class="instr-bar" id="instr-form"
-        hx-post="/api/dashboard/execute" hx-swap="none"
-        hx-on::before-request="clearChartDeck()">
+        hx-post="/api/dashboard/execute" hx-swap="none">
     <div class="panel-hd">
       <h2>Console</h2>
       <span id="status-badge" class="badge-idle">IDLE</span>
@@ -684,8 +683,8 @@ const char* const kDashboardIndexTemplate =
 
     // Drop any chart-card ECharts instances and empty the deck. Called
     // both when the operator clicks Clear and at the start of every new
-    // dispatch (hx-on::before-request on #instr-form) so a stale chart
-    // from the previous query never overlays the new one.
+    // dispatch (the htmx:beforeRequest listener on #instr-form, below)
+    // so a stale chart from the previous query never overlays the new one.
     function clearChartDeck() {
       var host = document.getElementById('chart-deck-host');
       if (!host) return;
@@ -1204,8 +1203,8 @@ const char* const kDashboardIndexTemplate =
     /* ── CSP-safe HTMX bindings ─────────────────────────────
        The dashboard's strict CSP forbids 'unsafe-eval', so HTMX
        features that internally call new Function(...) — namely
-       hx-on:* attributes and hx-vals="js:..." — are blocked at
-       runtime. We re-create each broken handler here using
+       the inline event-handler attributes and hx-vals="js:..." —
+       are blocked at runtime. We re-create each broken handler here using
        addEventListener (covered by 'unsafe-inline') and the
        htmx:configRequest event (no eval). */
 
@@ -1223,11 +1222,14 @@ const char* const kDashboardIndexTemplate =
       }
     });
 
-    /* instr-form: close autocomplete before submit */
+    /* instr-form: close autocomplete and drop the previous chart deck before
+       submit. Clear the deck only for the form's own request (e.target): the
+       autocomplete input inside it fires bubbling beforeRequest events. */
     var instrForm = document.getElementById('instr-form');
     if (instrForm) {
-      instrForm.addEventListener('htmx:beforeRequest', function() {
+      instrForm.addEventListener('htmx:beforeRequest', function(e) {
         if (typeof closeAC === 'function') closeAC();
+        if (e.target === instrForm) clearChartDeck();
       });
     }
 
