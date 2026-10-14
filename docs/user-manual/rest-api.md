@@ -1414,7 +1414,7 @@ Reassign the named responsible owner of an active engine principal. Admin-forced
 
 Auditor-runnable, independent proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — not merely a claim about the write-path guard. Resolves each engine principal's actual role assignments and effective permissions against the live RBAC reference tables and reports any violation: a literal `admin`/`Administrator` role grant, any role flagged `is_system`, or a granted securable × operation set whose size reaches the full cross-product (functionally admin-equivalent even under a custom, non-system role name).
 
-**Permission:** `AuditLog:Read` — deliberately **not** `Security`, since this is a read-only evidentiary query, not part of the write-path bar it verifies; a read-only auditor role can run it without holding engine-principal write access.
+**Permission:** `AuditLog:Read` — deliberately **not** `Security`, since this is a read-only evidentiary query, not part of the write-path bar it verifies; a read-only auditor role can run it without holding engine-principal write access. With RBAC disabled the route is admin-only like every other audit read (#5771).
 
 **Response:**
 
@@ -3481,6 +3481,8 @@ Query the server audit trail. All state-changing operations are recorded with th
 
 > **Reads deny on store degrade (ADR-0040).** The audit trail is the SOC 2 evidence chain, so the audit query endpoints (`GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, and the legacy `GET /api/audit`) **return `503` when the underlying store or connection pool is unavailable — never an empty `200`.** A reviewer, SIEM, or CMDB integration can therefore never mistake an infrastructure blip for "no audit activity"; treat a `503` here as a transient, retryable evidence-availability gap, not as an empty result set. This is the read-side counterpart to the fail-hard write posture (`503` + `Sec-Audit-Failed` on the behavioural-PII routes).
 
+> **Who may read the trail.** Every audit read surface — `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, the legacy `GET /api/audit`, `GET /api/v1/engine-principals/audit/no-admin`, and the MCP `query_audit_log` / `audit_engine_no_admin` tools and `yuzu://audit/recent` resource — is gated on `AuditLog:Read`. **With RBAC disabled (the shipped default) only an `admin`-role session may read the trail** (#5771): `AuditLog:Read` is in the [authorization topology floor](rbac.md#the-authorization-topology-floor-2376), so any other authenticated session is refused with `403` and the denial is audited as `topology floor: non-admin role denied AuditLog:Read`. **With RBAC enabled** the permission is an ordinary grant: the seeded `Administrator`, `PlatformEngineer`, `Operator`, `ITServiceOwner` and `Viewer` roles hold it, and any custom role can be granted it. A holder reads every row; the audit surfaces are not confined to a management group.
+
 #### `GET /api/v1/audit`
 
 Query audit events.
@@ -3578,9 +3580,10 @@ order so a bounded `limit` is a sample across the window, not just the latest N.
 > **non-reproducible** (no seed) — re-running yields a different draw; the audited
 > `audit.auth_sample.exported` row is the chain-of-custody record of what was pulled.
 
-**Permission:** `AuditLog:Read` — note this is deliberately *not* admin-only, so
-a dedicated read-only auditor role can pull evidence without full admin
-(separation of duties).
+**Permission:** `AuditLog:Read` — with RBAC enabled this is deliberately *not*
+admin-only, so a dedicated read-only auditor role can pull evidence without
+full admin (separation of duties). With RBAC disabled it is admin-only (#5771;
+see the note at the top of this section).
 
 The export is itself audited as `audit.auth_sample.exported` (who pulled which
 window, and how many rows) so evidence access stays on the audit chain.
@@ -10215,6 +10218,9 @@ null>}` (field names `events`/`count`/`total`, not v1's `data`/`pagination`/
 taken after the page itself succeeds — it is `null`, not `0` or the page
 size, when that second read degrades; do not treat `null` as "unknown but
 probably zero".
+
+**Permission:** `AuditLog:Read` (admin-only while RBAC is disabled, #5771).
+This route's rows also carry the actor's `principal_role` and `source_ip`.
 
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
 `limit`/`offset` query parameter is not a valid integer, or `limit < 1` /

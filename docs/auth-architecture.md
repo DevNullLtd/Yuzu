@@ -2886,19 +2886,24 @@ MCP twins).
 2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
    EnginePrincipal:Read}` — plus, as of #4028, `{TlsConfig:Read,
    PluginSigning:Read, ServerConfig:Read, AnalyticsConfig:Read}` (see
-   "Settings read-twins" below), and as of #4031, `{Enrollment:Read,
-   OidcConfig:Read}` — require the `admin` session role regardless of the
-   RBAC on/off toggle, via `authz_topology_floor.hpp`'s
-   `topology_floor_applies()`. The three groups are different categories
-   that happen to share this one mechanism: the original three are
-   authorization-topology reads (the RBAC role graph, the engine-principal
+   "Settings read-twins" below), as of #4031, `{Enrollment:Read,
+   OidcConfig:Read}`, as of Wave 7 PR7.2, `{Forensics:Read}`, and as of
+   #5771, `{AuditLog:Read}` (see "The audit trail" below) — require the
+   `admin` session role regardless of the RBAC on/off toggle, via
+   `authz_topology_floor.hpp`'s `topology_floor_applies()`. The groups are
+   different categories that happen to share this one mechanism: the
+   original three are authorization-topology reads (the RBAC role graph, the engine-principal
    grant graph, the access-review export) that intentionally stay reachable
    by an admin-owned session on ANY transport, MCP tokens included, per the
    legacy-role-fallback note below; the #4028 four and #4031 two are
    server-administration reads that #520 additionally excludes from every
    MCP tier outright (`mcp_policy.hpp`'s `tier_allows()`), so an admin-owned
    MCP token cannot reach them even though it would otherwise satisfy this
-   same floor check. (`Directory` deliberately has no floor entry, since it
+   same floor check. `AuditLog:Read` is a further class — evidence-grade
+   data, neither topology nor a gate migration — and, like the original three
+   and unlike the #4028/#4031 reads, is NOT excluded from MCP tiers: an
+   admin-owned MCP token still reads it through `query_audit_log` where its
+   tier already allowed that. (`Directory` deliberately has no floor entry, since it
    was never `admin_fn_`-gated to begin with — `list_directory_users` and
    most of `get_directory_status`'s payload stay reachable at Viewer role
    and readonly MCP tier. **One field is the exception:**
@@ -2940,6 +2945,24 @@ MCP twins).
    `yuzu_auth_topology_floor_denied_total{permission}`, so an operator can
    alert on floored denials specifically rather than parsing audit-log
    text.
+
+**The audit trail (#5771).** `AuditLog:Read` was the one evidence store left
+open by default: with RBAC off, any signed-in session read the full trail
+through six surfaces — `GET /api/audit` (which also returns the actor's role
+and source IP), `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`,
+`GET /api/v1/engine-principals/audit/no-admin`, MCP `query_audit_log` /
+`audit_engine_no_admin`, and the `yuzu://audit/recent` resource. All six gate
+on the same `("AuditLog", "Read")` pair through `require_permission`, so the
+single floor entry covers them; there is no per-route change and no second
+list. Engine principals and service-scoped tokens were already refused with
+RBAC off and are unchanged. With RBAC on nothing changes: every seeded holder
+(`Administrator`, `PlatformEngineer`, `Operator`, `ITServiceOwner`, `Viewer`)
+and any custom role granted the pair is admitted, and — as before — a holder
+reads every row, because the audit surfaces are not yet management-group
+confined (ADR-0017 lists them as a later step). Deliberately NOT done here: a
+dedicated securable for the sensitive fields (source IP, actor role) so a
+`Reviewer`-style role could read audit evidence under RBAC, and field-level
+redaction by caller role — both are separate, separately-decidable follow-ons.
 
 **Deliberately NOT floored, on purpose:**
 
@@ -3452,7 +3475,8 @@ walkthrough.
   the three read routes are human-admin + RBAC gated but not step-up gated —
   list and get on `EnginePrincipal:Read` (moved off the over-broad
   `Security:Read` by #2376, see "The authorization topology floor" above), and
-  `audit/no-admin` on `AuditLog:Read`. Every route —
+  `audit/no-admin` on `AuditLog:Read` (floored under RBAC-off by #5771, so
+  the auditor route is admin-only on a default install). Every route —
   reads included — structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
   §9 belt): an engine principal can never read or mutate its own or another

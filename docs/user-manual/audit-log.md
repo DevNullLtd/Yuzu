@@ -365,6 +365,22 @@ The `/auto` deploy verbs share this pattern: `deployment.create` emits `resumed`
 
 ## REST API
 
+**Who may read the audit trail.** Reading it needs the `AuditLog:Read`
+permission, on every surface: the REST routes below, the dashboard viewer, and
+the MCP `query_audit_log` / `audit_engine_no_admin` tools and
+`yuzu://audit/recent` resource.
+
+- **RBAC disabled (the shipped default):** only an `admin`-role session may
+  read the trail (#5771). Any other authenticated session gets `403`, audited as
+  `topology floor: non-admin role denied AuditLog:Read`. Engine principals and
+  service-scoped tokens are refused as before.
+- **RBAC enabled:** `AuditLog:Read` is an ordinary grant. The seeded
+  `Administrator`, `PlatformEngineer`, `Operator`, `ITServiceOwner` and `Viewer`
+  roles hold it; a custom role can be granted it. A holder sees every row.
+
+See [RBAC](rbac.md#the-authorization-topology-floor-2376) for the floor and for
+how to grant a non-admin the read.
+
 ### GET /api/v1/audit
 
 Query audit events with filtering and pagination. Maximum page size is 1000.
@@ -483,7 +499,8 @@ curl -s -b cookies.txt \
 The Yuzu dashboard includes a built-in audit log viewer accessible from the
 navigation menu. The viewer renders audit events as an HTMX-powered table with
 live filtering by principal, action, and date range. No additional
-configuration is required.
+configuration is required. It is backed by `GET /api/audit`, so the same
+`AuditLog:Read` rule applies (admin-only while RBAC is disabled).
 
 ## Retention and cleanup
 
