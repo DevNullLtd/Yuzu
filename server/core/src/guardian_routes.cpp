@@ -2169,7 +2169,6 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                                                        bool can_delete) const {
     std::string name = guard_id, severity, os = "all", os_target_raw = "windows", yaml, spec_json;
     bool real_rule = false, enabled = true, enforcing = false;
-    int64_t version = 0;
     if (store_ && store_->is_open()) {
         // get_rule is now three-state (ADR-0038): found / genuinely absent / degraded.
         // Both "not found" and "degraded" fall through to the same "Guard not found"
@@ -2185,7 +2184,6 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             os = rr.os_target.empty() ? "all" : rr.os_target;
             yaml = rr.yaml_source;
             spec_json = rr.spec_json;
-            version = rr.version;
         }
     }
     if (!real_rule)
@@ -2367,8 +2365,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     if (can_write)
         h += "<button class=\"gp-btn\" data-gp-act=\"edit\"" + gp_data + " data-gp-severity=\"" +
              html_escape(severity) + "\" data-gp-enabled=\"" + (enabled ? "1" : "0") +
-             "\" data-gp-mode=\"" + mode + "\" data-gp-version=\"" + std::to_string(version) +
-             "\">Edit</button>";
+             "\" data-gp-mode=\"" + mode + "\">Edit</button>";
     if (can_delete)
         h += "<button class=\"gp-btn\" data-gp-act=\"delete\"" + gp_data + ">Delete</button>";
     h += "</div></div>";
