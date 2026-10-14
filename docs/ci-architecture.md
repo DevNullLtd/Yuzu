@@ -1679,7 +1679,7 @@ hash-mismatch procedure is in `docs/darwin-compat.md` ("Erlang gateway in macOS 
 Before #4841 it had no Erlang and Meson silently skipped the gateway.
 
 Every CI leg that runs tests (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan, and the dispatch-only
-`fork-dynamic-review.yml` Linux leg, which installs Erlang the same way as the Linux legs) now runs
+`fork-dynamic-review.yml` Linux leg, which installs Erlang via `erlef/setup-beam` like the other Linux legs) now runs
 `scripts/ci/assert-gateway-tests.py <builddir>` straight after configure (`meson setup`, or `scripts/setup.sh` in the fork review leg), so a missing `rebar3` (gateway tests not registered)
 fails the Configure step rather than skipping. It is deliberately a post-configure check, not the `-Drequire_gateway` project
 option: a non-default project option stored in these persistent, branch-shared build dirs makes every older branch's

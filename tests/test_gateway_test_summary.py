@@ -557,9 +557,9 @@ class AssertGatewayTests(unittest.TestCase):
         # installs Erlang with setup-beam must switch on trusted_execution. The
         # macOS leg no longer uses setup-beam: it downloads a hash-pinned OTP into
         # RUNNER_TEMP, which is per agent and per job. NOTE: this asserts the
-        # declared intent only. The actions runner applies its own RUNNER_* values
-        # after a step's env (actions/runner NodeScriptActionHandler), so a
-        # step-level RUNNER_TOOL_CACHE is not what setup-beam sees.
+        # declared YAML intent only; the actions runner applies its own RUNNER_*
+        # values after a step's env (actions/runner NodeScriptActionHandler), so the
+        # isolation it names is not established for the Linux leg.
         import yaml
         with open(os.path.join(ROOT, '.github', 'workflows', 'ci.yml'), encoding='utf-8') as f:
             doc = yaml.safe_load(f)
@@ -581,15 +581,19 @@ class AssertGatewayTests(unittest.TestCase):
         The step installs a prebuilt OTP + rebar3 into RUNNER_TEMP instead of
         erlef/setup-beam, whose rmRF + re-copy of the tool cache both BigMags agents
         share raced. What makes that substitute safe, and so what is pinned here: no
-        action, no tool cache, every download verified against a pinned SHA-256 BEFORE
-        anything else reads it (rebar3 has no upstream attestation, so its hash IS
-        its only integrity control). Matching is on comment-stripped lines, so a
-        commented-out verify does not count; whole-line comments only, which is the
-        only comment form the step uses.
+        action, no tool cache, every download goes through fetch() and is verified
+        against its own pinned SHA-256 BEFORE anything else reads it, and verify()
+        really compares a digest of its argument and exits on a mismatch (rebar3 has
+        no upstream attestation, so its hash IS its only integrity control).
+
+        LEXICAL ONLY: it matches comment-stripped whole lines (the only comment form
+        the step uses) and is not a shell parser; control flow that could skip a
+        verify is rejected outright instead of being analysed.
         """
         problems = []
-        if 'uses' in step:
-            problems.append('step must be a run: step, not an action')
+        for key in ('uses', 'if', 'continue-on-error', 'working-directory', 'shell'):
+            if key in step:
+                problems.append('step must not set %r' % key)
         env, run = step.get('env') or {}, str(step.get('run') or '')
         if not re.match(r'^\d+\.\d+', str(env.get('OTP_VERSION'))):
             problems.append('OTP_VERSION missing')
@@ -600,27 +604,46 @@ class AssertGatewayTests(unittest.TestCase):
         text = '\n'.join(code)
         if not any(re.fullmatch(r'\s*set -euo pipefail\s*', ln) for ln in code):
             problems.append('set -euo pipefail missing')
+        if re.search(r'set \+e|exit 0\b|\|\|\s*true|:\s*;\s*\}|\bfalse\s*&&|^\s*(?:if|case|while|for|until)\b',
+                     text, re.M):
+            problems.append('step has a control-flow bypass')
         if '$RUNNER_TEMP' not in text:
             problems.append('install root is not under $RUNNER_TEMP')
         if 'tool_cache' in text.lower() or 'tool_cache' in str(env).lower():
             problems.append('step touches the tool cache')
-        if 'openssl dgst -sha256' not in text or 'test "$got" = "$1"' not in text:
-            problems.append('verify() no longer compares a computed sha256')
+        if 'http://' in text:
+            problems.append('plain-http URL')
+        if sorted(re.findall(r'^\s*(verify|fetch)\s*\(\)', text, re.M)) != ['fetch', 'verify']:
+            problems.append('verify() and fetch() must each be defined exactly once')
+        if len(re.findall(r'\bcurl\b', text)) != 1:
+            problems.append('curl may only be run through fetch()')
+        first_fetch = re.search(r'^\s*fetch "', text, re.M)
+        vdef = text.find('verify() {')
+        body = text[vdef:first_fetch.start()] if (first_fetch and vdef >= 0) else ''
+        for needle in ('dgst -sha256 "$2"', 'test "$got" = "$1"'):
+            if needle not in body:
+                problems.append('verify() lost %r' % needle)
+        if body.count('test "$got" =') != 1:
+            problems.append('verify() must compare $got exactly once, against $1')
+        if not re.search(r'test "\$got" = "\$1" \|\| \{.*\bexit 1\b', body, re.S):
+            problems.append('verify() mismatch branch no longer exits 1')
         fetches = [(i, m.group(1)) for i, ln in enumerate(code)
                    for m in [re.fullmatch(r'\s*fetch "[^"]+" "([^"]+)" \d+\s*', ln)] if m]
         verifies = {m.group(2): (i, m.group(1)) for i, ln in enumerate(code)
                     for m in [re.fullmatch(r'\s*verify "\$(OTP_SHA256|REBAR3_SHA256)" "([^"]+)"\s*', ln)] if m}
         if sorted(v for _, v in verifies.values()) != ['OTP_SHA256', 'REBAR3_SHA256']:
             problems.append('each of OTP_SHA256 and REBAR3_SHA256 must be verified exactly once')
+        for dest, (_, var) in verifies.items():
+            if not dest.endswith({'OTP_SHA256': 'otp.tar.gz', 'REBAR3_SHA256': 'bin/rebar3'}[var]):
+                problems.append('%s is verified against the wrong pin (%s)' % (dest, var))
         if len(fetches) != 2:
             problems.append('expected exactly two fetch calls, found %d' % len(fetches))
         for fi, dest in fetches:
             if dest not in verifies:
                 problems.append('download %s is never verified' % dest)
                 continue
-            vi = verifies[dest][0]
             first_use = next((i for i in range(fi + 1, len(code)) if dest in code[i]), None)
-            if vi != first_use:
+            if verifies[dest][0] != first_use:
                 problems.append('%s is used before it is verified' % dest)
         return problems
 
@@ -646,33 +669,50 @@ class AssertGatewayTests(unittest.TestCase):
         self.assertIn(otp_v, run)
         self.assertIn(reb_v, run)
         mutations = {
-            'otp verify removed': lambda s: s['run'].replace(otp_v + '\n', ''),
-            'rebar3 verify removed': lambda s: s['run'].replace(reb_v + '\n', ''),
-            'otp verify commented out': lambda s: s['run'].replace(otp_v, '# ' + otp_v),
-            'rebar3 verify commented out': lambda s: s['run'].replace(reb_v, '# ' + reb_v),
-            'third download without verify': lambda s: s['run'].replace(
+            'otp verify removed': lambda r: r.replace(otp_v + '\n', ''),
+            'rebar3 verify removed': lambda r: r.replace(reb_v + '\n', ''),
+            'otp verify commented out': lambda r: r.replace(otp_v, '# ' + otp_v),
+            'rebar3 verify commented out': lambda r: r.replace(reb_v, '# ' + reb_v),
+            'verify pins swapped between files': lambda r: r.replace(
+                otp_v, 'verify "$REBAR3_SHA256" "$root/otp.tar.gz"').replace(
+                reb_v, 'verify "$OTP_SHA256" "$root/bin/rebar3"'),
+            'third download without verify': lambda r: r.replace(
                 reb_v + '\n', reb_v + '\nfetch "https://example.invalid/x" "$root/bin/x" 60\n'),
-            'rebar3 verify after use': lambda s: s['run'].replace(reb_v + '\n', '').replace(
+            'rebar3 verify after use': lambda r: r.replace(reb_v + '\n', '').replace(
                 'chmod 755 "$root/bin/rebar3"\n', 'chmod 755 "$root/bin/rebar3"\n' + reb_v + '\n'),
-            'install root moves to the tool cache': lambda s: s['run'].replace(
+            'install root moves to the tool cache': lambda r: r.replace(
                 'root="$RUNNER_TEMP/erlang"', 'root="$RUNNER_TOOL_CACHE/erlang"; : $RUNNER_TEMP'),
-            'verify no longer compares': lambda s: s['run'].replace('test "$got" = "$1"', 'true'),
-            'pipefail dropped': lambda s: s['run'].replace('set -euo pipefail', 'set -eu'),
+            'verify no longer compares': lambda r: r.replace('test "$got" = "$1"', 'true'),
+            'verify mismatch no longer exits': lambda r: r.replace(
+                'CDN/proxy error page was saved)"\n    exit 1',
+                'CDN/proxy error page was saved)"\n    :'),
+            'verify hashes a fixed file': lambda r: r.replace('dgst -sha256 "$2"', 'dgst -sha256 /etc/hosts'),
+            'verify redefined as a stub': lambda r: r.replace(
+                otp_v, 'verify() { :; }\n' + otp_v),
+            'second curl outside fetch': lambda r: r.replace(
+                otp_v, 'curl -fsSL -o "$root/extra" https://example.invalid/x\n' + otp_v),
+            'plain http url': lambda r: r.replace('https://github.com/erlang/rebar3', 'http://github.com/erlang/rebar3'),
+            'verify under a conditional': lambda r: r.replace(otp_v, 'if false; then ' + otp_v + '; fi'),
+            'exit 0 before the checks': lambda r: r.replace(otp_v, 'exit 0\n' + otp_v),
+            'errexit switched off': lambda r: r.replace('mkdir -p "$root/otp"', 'set +e\n          mkdir -p "$root/otp"'),
+            'pipefail dropped': lambda r: r.replace('set -euo pipefail', 'set -eu'),
         }
         for name, mutate in mutations.items():
             with self.subTest(mutation=name):
                 bad = copy.deepcopy(clean)
-                bad['run'] = mutate(bad)
+                bad['run'] = mutate(run)
                 self.assertNotEqual(bad['run'], run, 'mutation did not change the step')
                 self.assertTrue(self._macos_erlang_step_problems(bad), name)
-        with self.subTest(mutation='setup-beam action'):
-            bad = copy.deepcopy(clean)
-            bad['uses'] = 'ErLef/Setup-Beam@v1'
-            self.assertTrue(self._macos_erlang_step_problems(bad))
-        with self.subTest(mutation='hash pin emptied'):
-            bad = copy.deepcopy(clean)
-            bad['env']['REBAR3_SHA256'] = ''
-            self.assertTrue(self._macos_erlang_step_problems(bad))
+        for name, mutate in {
+            'setup-beam action (any case)': lambda s: s.__setitem__('uses', 'ErLef/Setup-Beam@v1'),
+            'continue-on-error': lambda s: s.__setitem__('continue-on-error', True),
+            'conditional step': lambda s: s.__setitem__('if', 'false'),
+            'hash pin emptied': lambda s: s['env'].__setitem__('REBAR3_SHA256', ''),
+        }.items():
+            with self.subTest(mutation=name):
+                bad = copy.deepcopy(clean)
+                mutate(bad)
+                self.assertTrue(self._macos_erlang_step_problems(bad), name)
 
 
 if __name__ == '__main__':

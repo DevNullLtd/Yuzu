@@ -47,7 +47,7 @@ def main(argv):
         print("::error::Meson did not register " + ", ".join(repr(n) for n in missing)
               + " -- rebar3 (Erlang/OTP 28) was not found at configure time, so the "
               "gateway would be silently skipped on this leg (#4841). Provision "
-              "Erlang on this runner (CI: see this leg's 'Install Erlang/OTP and rebar3' step in ci.yml).")
+              "Erlang on this runner (CI: see this leg's Erlang install step in ci.yml).")
         return 1
     print(f"assert-gateway-tests: {', '.join(REQUIRED)} registered.")
     return 0

@@ -2282,23 +2282,19 @@ jobs:
       # RUNNER_TOOL_CACHE did not isolate it: the failing logs showed the per-agent value
       # in the step env while the EEXIST path was under the shared tool cache. See
       # docs/darwin-compat.md, "Erlang gateway in macOS CI".
-      # Instead the pinned prebuilt OTP (the same bytes setup-beam fetched: it uses the
-      # OTP-<ver>-macos-arm64.tar.gz alias of otp-aarch64-apple-darwin.tar.gz, identical
-      # sha256) and the rebar3 escript go into RUNNER_TEMP (per agent) after a SHA-256
-      # check, and
-      # nothing touches runner.tool_cache (the "Do not read or write runner.tool_cache"
-      # rule above). The hash check catches a bad download or a re-published asset; it is
-      # not a defence against earlier steps of the same job, which run as the same user.
-      # The pins are EXACT here while the other legs float on 28 / 3.24, and Dependabot
-      # does not bump env values: to bump, edit all four env values together. OTP_SHA256
-      # is the sha256 of the otp_builds release asset (builds/aarch64-apple-darwin.csv in
-      # erlef/otp_builds) and its build provenance can be re-checked with
+      # Instead the pinned prebuilt OTP (the same bytes setup-beam fetched: its
+      # OTP-<ver>-macos-arm64.tar.gz alias has the same sha256) and the rebar3 escript go
+      # into RUNNER_TEMP (per agent) after a SHA-256 check; nothing touches
+      # runner.tool_cache (see the rule above). The check catches a bad download or a
+      # re-published asset, not a compromised step in the same job (same user).
+      # Pins are EXACT here (the other legs float on 28 / 3.24) and Dependabot does not
+      # bump env values: edit all four together. OTP_SHA256 is the sha256 of the otp_builds
+      # asset (builds/aarch64-apple-darwin.csv in erlef/otp_builds); re-check its provenance
       #   gh attestation verify otp-aarch64-apple-darwin.tar.gz --repo erlef/otp_builds \
       #     --bundle <the release's .sigstore file, saved with a .json name> \
       #     --signer-workflow erlef/otp_builds/.github/workflows/build.yaml
-      # rebar3 publishes no attestation: its hash pins the 3.24.0 bytes first seen on
-      # 2026-10-14. A "sha256 mismatch" failure means the bytes differ from the pin; do
-      # not edit the hash to make it pass, compare against the upstream release first.
+      # rebar3 has no attestation: its hash pins the 3.24.0 bytes first seen 2026-10-14.
+      # On a "sha256 mismatch", compare against the upstream release before touching a hash.
       - name: Install Erlang/OTP and rebar3
         timeout-minutes: 15
         env:
@@ -2308,6 +2304,13 @@ jobs:
           REBAR3_SHA256: d2d31cfb98904b8e4917300a75f870de12cb5167cd6214d1043e973a56668a54
         run: |
           set -euo pipefail
+          # Validate every input BEFORE the EXIT trap exists: on bash 3.2 an "unbound
+          # variable" abort exits 0 once an EXIT trap is installed, which would show this
+          # step green with no Erlang installed.
+          check_pin() { printf '%s' "$2" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::$1 is not a 64-hex sha256 pin"; exit 1; }; }
+          check_pin OTP_SHA256 "$OTP_SHA256"
+          check_pin REBAR3_SHA256 "$REBAR3_SHA256"
+          : "$OTP_VERSION" "$REBAR3_VERSION" "$GITHUB_PATH"
           root="$RUNNER_TEMP/erlang"
           rm -rf "$root"
           mkdir -p "$root/otp" "$root/bin"
@@ -2324,7 +2327,8 @@ jobs:
           # verify <sha256> <file>. /usr/bin/openssl (LibreSSL) rather than shasum, which is
           # a Perl script.
           verify() {
-            got="$(/usr/bin/openssl dgst -sha256 "$2" | awk '{print $NF}')"
+            got="$(/usr/bin/openssl dgst -sha256 "$2" | awk '{print $NF}')" ||
+              { echo "::error::could not hash ${2##*/}"; exit 1; }
             test "$got" = "$1" || {
               echo "::error::sha256 mismatch for ${2##*/}: expected $1, got $got (upstream re-published the asset, or a CDN/proxy error page was saved)"
               exit 1
