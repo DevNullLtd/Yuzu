@@ -56,33 +56,47 @@ TEST_CASE("scope attribute guard: premise, an unknown attribute under != or NOT 
 
 TEST_CASE("scope attribute guard: every catalogued attribute is accepted",
           "[scope][attribute_guard]") {
-    CHECK_FALSE(unknown_in(R"(ostype == "windows")"));
-    CHECK_FALSE(unknown_in(R"(hostname LIKE "WIN-%")"));
-    CHECK_FALSE(unknown_in(R"(arch == "x86_64")"));
-    CHECK_FALSE(unknown_in(R"(agent_version == "0.12.0")"));
-    CHECK_FALSE(unknown_in(R"(tag:department == "finance")"));
-    CHECK_FALSE(unknown_in(R"(props.owner == "jdoe")"));
+    const std::string expr1 = R"(ostype == "windows")";
+    CHECK_FALSE(unknown_in(expr1));
+    const std::string expr2 = R"(hostname LIKE "WIN-%")";
+    CHECK_FALSE(unknown_in(expr2));
+    const std::string expr3 = R"(arch == "x86_64")";
+    CHECK_FALSE(unknown_in(expr3));
+    const std::string expr4 = R"(agent_version == "0.12.0")";
+    CHECK_FALSE(unknown_in(expr4));
+    const std::string expr5 = R"(tag:department == "finance")";
+    CHECK_FALSE(unknown_in(expr5));
+    const std::string expr6 = R"(props.owner == "jdoe")";
+    CHECK_FALSE(unknown_in(expr6));
     CHECK_FALSE(unknown_in(R"(EXISTS from_result_set:rs_01H8X3ZQK7YB2)"));
-    CHECK_FALSE(unknown_in(R"((ostype == "linux" OR ostype == "darwin") AND NOT tag:env == "prod")"));
+    const std::string expr7 = R"((ostype == "linux" OR ostype == "darwin") AND NOT tag:env == "prod")";
+    CHECK_FALSE(unknown_in(expr7));
 }
 
 TEST_CASE("scope attribute guard: a typo or foreign name is reported, in every position",
           "[scope][attribute_guard]") {
     // The drawn design's own attribute name.
-    CHECK(unknown_in(R"(os == "windows")") == "os");
-    CHECK(unknown_in(R"(ostyp != "windows")") == "ostyp");
-    CHECK(unknown_in(R"(NOT os == "linux")") == "os");
-    CHECK(unknown_in(R"(ostype == "windows" AND (tag:a == "b" OR hostnam == "x"))") == "hostnam");
+    const std::string expr8 = R"(os == "windows")";
+    CHECK(unknown_in(expr8) == "os");
+    const std::string expr9 = R"(ostyp != "windows")";
+    CHECK(unknown_in(expr9) == "ostyp");
+    const std::string expr10 = R"(NOT os == "linux")";
+    CHECK(unknown_in(expr10) == "os");
+    const std::string expr11 = R"(ostype == "windows" AND (tag:a == "b" OR hostnam == "x"))";
+    CHECK(unknown_in(expr11) == "hostnam");
     // Case matters: the resolver compares exact names.
-    CHECK(unknown_in(R"(OSTYPE == "windows")") == "OSTYPE");
+    const std::string expr12 = R"(OSTYPE == "windows")";
+    CHECK(unknown_in(expr12) == "OSTYPE");
 }
 
 TEST_CASE("scope attribute guard: synthetic LEN and STARTSWITH forms are decoded",
           "[scope][attribute_guard]") {
     CHECK_FALSE(unknown_in(R"(LEN(hostname) > 5)"));
-    CHECK_FALSE(unknown_in(R"(STARTSWITH(hostname, "WIN-"))"));
+    const std::string expr13 = R"(STARTSWITH(hostname, "WIN-"))";
+    CHECK_FALSE(unknown_in(expr13));
     CHECK(unknown_in(R"(LEN(hostnam) > 5)") == "hostnam");
-    CHECK(unknown_in(R"(STARTSWITH(os, "w"))") == "os");
+    const std::string expr14 = R"(STARTSWITH(os, "w"))";
+    CHECK(unknown_in(expr14) == "os");
 }
 
 TEST_CASE("scope attribute guard: a prefix kind needs a non-empty suffix",

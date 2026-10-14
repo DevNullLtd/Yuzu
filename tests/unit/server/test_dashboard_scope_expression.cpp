@@ -184,7 +184,8 @@ TEST_CASE("scope_expression rule 5: a percent-encoded field NAME is still recogn
     // raw-byte scan alone would miss it and fall through to the fleet.
     auto res = h.post("instruction=version&scope%5Fexpression=" + enc(R"(ostype == "linux")"));
     REQUIRE(h.calls.size() == 1);
-    CHECK(h.calls[0].scope_expr == R"(ostype == "linux")");
+    const std::string expr1 = R"(ostype == "linux")";
+    CHECK(h.calls[0].scope_expr == expr1);
     CHECK(res->status == 200);
 }
 
