@@ -246,6 +246,14 @@ The gateway-upstream service now admits only a gateway whose certificate key (SP
 
 Check your own unit, env file, compose file or installer arguments before upgrading; the literal commands, the per-deployment table and the rollback steps are in [Upgrading](upgrading.md) ("Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization"), and the full reference is [Gateway upstream peer authorization](#gateway-upstream-peer-authorization) below. Pins are fixed at boot; changing or withdrawing one is a restart.
 
+### vNEXT - changing sign-in provider settings needs your own administrator role (breaking for elevation-only operators)
+
+**What changed.** `POST /api/settings/oidc` (Settings > OIDC) and `PUT /api/config/{key}` for the `oidc_*` keys refuse, with `403`, a session that is administrator only through a temporary elevation. The attempt is audited (`elevated_session_oidc_change_blocked`, `elevated_session_oidc_setting_blocked`). Other runtime-config keys are unaffected.
+
+**Who this affects.** Operators who rely on an elevated session to change the OIDC issuer, client, secret, redirect URI or administrator group, in particular deployments where every administrator is an elevation-eligible `user` account.
+
+**What to do.** Make the change from an account whose own role is `admin` (a local administrator, or a member of the identity provider's administrator group).
+
 ### vNEXT — the shipped Docker Compose files keep `/etc/yuzu/certs` on a volume (#5370; action needed before you recreate a 0.14.0 container)
 
 **Action required before upgrading from 0.14.0 on Docker Compose: copy `/etc/yuzu/certs` out of the running server container first ([Upgrading](upgrading.md) → "Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it").** Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the 0.14.0 README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` (which the README quickstart saves as `docker-compose.yml` since #5419) and `docker-compose.reference-gateway.yml` (their `certs` volume).

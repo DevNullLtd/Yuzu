@@ -4698,7 +4698,7 @@ keys with a stored override, so a key can appear in `config` without appearing i
 
 Update a single runtime configuration value. The key must be one of the allowed runtime-configurable keys.
 
-**Permission:** `Infrastructure:Write`
+**Permission:** `Infrastructure:Write`. Writing an `oidc_*` key also needs the caller's own administrator role (the local account role, or the role mapped from the identity provider): a session that is administrator only through a temporary elevation gets `403` and the audit row `config.update / denied / elevated_session_oidc_setting_blocked`. Every other key stays writable under `Infrastructure:Write`.
 
 **Allowed keys** (the full set; source of truth is `kAllowedKeys` in
 `server/core/src/runtime_config_store.cpp`):
@@ -4755,7 +4755,7 @@ most keys:
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
   appear to have no effect - because it has none. Manage auto-approve through its own rules API.
-- **OIDC keys (see note)** - persisted only, and **a restart does not apply them either.** The
+- **OIDC keys (see note)** - persisted only, and **a restart does not rebuild the provider from them.** `oidc_admin_group` is the exception to read carefully: the sign-in callback reads the administrator group from the live server config, which the startup pass overwrites with the stored value, so a stored `oidc_admin_group` does decide administrator membership after a restart. The
   `OidcProvider` is constructed early in server startup (`server.cpp:1894`) from CLI/environment
   configuration, whereas the stored runtime-config overrides are not read until much later in the
   same startup (`server.cpp:3466`); nothing rebuilds the provider afterwards. So a value written
@@ -9247,7 +9247,7 @@ outcome's granularity.
 
 **`POST /api/settings/oidc`** — Save OIDC / Entra ID SSO configuration.
 
-- **Permission:** Admin only
+- **Permission:** Admin only, on the caller's own account (the local account role, or the administrator role mapped from the identity provider). A session that is administrator only through a temporary elevation gets `403`; audit `oidc.configure / denied / elevated_session_oidc_change_blocked`.
 - **Request body (form-encoded):**
 
 | Field | Type | Required | Description |

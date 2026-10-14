@@ -692,6 +692,8 @@ Custom roles can be created programmatically via `RbacStore::create_role()` and 
 
 ### Fleet-Wide Role Assignment (Built-in Roles)
 
+Changing the sign-in provider settings (`POST /api/settings/oidc`, and `PUT /api/config/{key}` for the `oidc_*` keys) is refused to a session that is administrator only through a temporary elevation: the provider decides who becomes an administrator at the next SSO login, so the change needs the caller's own administrator role.
+
 An Administrator can grant or revoke one of the 6 non-`ITServiceOwner` built-in roles (`Administrator`, `PlatformEngineer`, `Operator`, `ApiTokenManager`, `Viewer`, `Reviewer`) to a human (`principal_type="user"`) user, fleet-wide, through a dedicated pair of routes — **not** the general RBAC-securable `perm_fn`/`require_permission` gate every other route in this document uses. Granting (and especially revoking) standing Administrator authority is a stronger security decision than an ordinary permission check, so the caller must hold a **durable** Administrator role themselves, re-read fresh from the store rather than trusted from a cached session role or a JIT (`POST /api/v1/elevate`) elevation — an elevated session does **not** satisfy this gate.
 
 ```bash
