@@ -38,10 +38,9 @@ std::string render_deployments_list(const std::vector<DeploymentRow>& rows,
                                     const std::vector<std::string>& target_labels);
 
 /// The read-only detail for one deployment: summary, exact counts from the run row,
-/// and the device grid. `truncated` = the grid shows fewer rows than `dep.total`.
+/// and the device grid (a note says so when it shows fewer rows than `dep.total`).
 std::string render_deployment_detail(const DeploymentRow& dep,
-                                     const std::vector<DeploymentDeviceRow>& devices,
-                                     bool truncated);
+                                     const std::vector<DeploymentDeviceRow>& devices);
 
 /// A store fault: never an empty table. `what` is fixed server text, not user input.
 std::string render_deployments_failbox(const std::string& what);

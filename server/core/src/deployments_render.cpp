@@ -68,8 +68,8 @@ std::string render_deployments_list(const std::vector<DeploymentRow>& rows,
 }
 
 std::string render_deployment_detail(const DeploymentRow& dep,
-                                     const std::vector<DeploymentDeviceRow>& devices,
-                                     bool truncated) {
+                                     const std::vector<DeploymentDeviceRow>& devices) {
+    const bool truncated = dep.total > static_cast<int>(devices.size());
     const auto st = deployment_state(dep.status, dep.failed, dep.skipped);
     std::string h = "<div class=\"panel\" data-deployment=\"" + esc(dep.deployment_id) + "\">";
     h += "<h3>" + esc(dep.name) + " " + pill(st) + "</h3><dl class=\"kvl\">";

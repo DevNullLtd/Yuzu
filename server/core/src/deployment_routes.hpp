@@ -105,7 +105,6 @@ struct DeploymentDetailRead {
     DeploymentRow deployment;
     std::vector<DeploymentDeviceRow> devices;
     int device_limit = kDeploymentDeviceDefault;
-    bool truncated = false;
 };
 
 /// The ONE detail reader REST, MCP and the fragment call. Owner-scoped to `viewer`

@@ -192,7 +192,6 @@ DeploymentDetailRead read_deployment_detail(DeploymentRunStore& store,
         return out; // kStoreFault
     out.deployment = **dep;
     out.devices = std::move(*devs);
-    out.truncated = out.deployment.total > static_cast<int>(out.devices.size());
     out.outcome = DeploymentDetailRead::Outcome::kOk;
     return out;
 }
@@ -830,7 +829,7 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
                             "text/html; charset=utf-8");
             return;
         }
-        res.set_content(render_deployment_detail(read.deployment, read.devices, read.truncated),
+        res.set_content(render_deployment_detail(read.deployment, read.devices),
                         "text/html; charset=utf-8");
     });
 }

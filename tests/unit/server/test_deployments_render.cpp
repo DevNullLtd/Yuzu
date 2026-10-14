@@ -135,7 +135,7 @@ TEST_CASE("render_deployment_detail: exact counts, no secrets, truncation note",
     dev.step = "failed";
     dev.exit_code = 1603;
     dev.error = std::string(500, 'x') + "<img src=x>";
-    const std::string h = render_deployment_detail(row("running"), {dev}, /*truncated=*/true);
+    const std::string h = render_deployment_detail(row("running"), {dev});
     CHECK(h.find("SECRET") == std::string::npos);
     CHECK(h.find("Set (not shown)") != std::string::npos);
     CHECK(h.find("&lt;b&gt;host&lt;/b&gt;") != std::string::npos);
@@ -146,7 +146,9 @@ TEST_CASE("render_deployment_detail: exact counts, no secrets, truncation note",
     // The error text is bounded: 500 'x' must not appear in full.
     CHECK(h.find(std::string(300, 'x')) == std::string::npos);
 
-    const std::string done = render_deployment_detail(row(), {}, false);
+    auto full_row = row();
+    full_row.total = 0;
+    const std::string done = render_deployment_detail(full_row, {});
     CHECK(done.find("only while a Deployments page is open") == std::string::npos);
     CHECK(done.find("data-truncated") == std::string::npos);
 }
