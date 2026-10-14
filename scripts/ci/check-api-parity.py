@@ -206,7 +206,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
 # is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
 # which counts as untwinned by design, so the count rises 199 -> 200.
-BASELINE_UNTWINNED = 201
+#
+# 2026-10-14 (Home panels, HM-2): +3. The three Home fragments (/fragments/home/policies,
+# /fragments/home/activity, /fragments/home/health) are UI-only compositions over existing
+# twinned or planned reads, so each is a composed-of row that counts untwinned. Measured with the checker at 204 (201 + 3).
+BASELINE_UNTWINNED = 204
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

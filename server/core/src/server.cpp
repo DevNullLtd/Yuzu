@@ -220,6 +220,7 @@
 #include "inventory_routes.hpp"
 #include "hardware_routes.hpp"
 #include "home_routes.hpp" // Home (/home): landing worklist over injected seams
+#include "home_panels_routes.hpp" // HM-2: Home policies + activity fragments
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
@@ -15473,6 +15474,7 @@ private:
                              .auth_fn = auth_fn,
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .fleet_read_fn = fleet_read_fn, // HM-2 /fragments/home/health
                              .cfg = &cfg_,
                              .metrics = &metrics_,
                              .registry = &registry_,
@@ -18291,6 +18293,60 @@ private:
                     return n;
                 },
             });
+
+        // HM-2: Home "Compliance by policy" and "Recent activity" fragments (the
+        // "Server health" panel registers from health_routes.cpp, where
+        // `health_handler` is in scope). Gates are the same closures
+        // HardwareRoutes receives; the audit panel is effective-admin-only and is
+        // NOT confined (see home_panels_routes.hpp).
+        {
+            HttplibRouteSink home_panels_sink{*web_server_};
+            yuzu::server::home_panels::Deps hp;
+            hp.auth_fn = auth_fn;
+            hp.deny_service_scoped_fn = deny_service_scoped_fn;
+            hp.fleet_read_fn = fleet_read_fn;
+            hp.perm_fn = perm_fn;
+            // ponytail: N+1 `compliance_summary` per policy (HZ-17) until HB-1's
+            // one-read `compliance_by_policy` lands on the seam; swap this body
+            // for that call and nothing else changes.
+            hp.policies_fn = [compliance_api]()
+                -> std::optional<yuzu::server::home_panels::PolicyPanel> {
+                // First 100 enabled policies (PolicyQuery's own page size): the N
+                // in "Lowest 5 of N" is capped there until the one-read swap.
+                PolicyQuery pq;
+                pq.enabled_only = true;
+                auto policies = compliance_api->list_policies(pq);
+                if (!policies)
+                    return std::nullopt;
+                std::vector<ComplianceSummary> sums;
+                sums.reserve(policies->size());
+                for (const auto& p : *policies) {
+                    if (!p.enabled)
+                        continue;
+                    auto sm = compliance_api->compliance_summary(p.id);
+                    if (!sm)
+                        return std::nullopt; // a degraded read is never "no results"
+                    sums.push_back(std::move(*sm));
+                }
+                return yuzu::server::home_panels::select_lowest_policies(*policies, sums);
+            };
+            hp.audit_fn = [this](int limit) -> std::optional<std::vector<AuditEvent>> {
+                if (!audit_store_)
+                    return std::nullopt;
+                AuditQuery q;
+                q.limit = limit;
+                return audit_store_->query(q);
+            };
+            hp.now_fn = [] {
+                return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                                     std::chrono::system_clock::now()
+                                                         .time_since_epoch())
+                                                     .count());
+            };
+            // No audit page exists at this tip (Access PR-3 adds nav key `audit`):
+            // an empty href omits the "Audit log" button.
+            yuzu::server::home_panels::register_home_panel_routes(home_panels_sink, std::move(hp));
+        }
 
         // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the
         // NEW SoftwareLicensing securable via the FAIL-CLOSED enforcement primitive
