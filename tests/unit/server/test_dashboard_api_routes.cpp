@@ -199,7 +199,8 @@ TEST_CASE("dashboard_api_routes: /api/me self-description per persona (#5779, #4
         }
         CHECK(j["can_access_settings"] == row.can_access);
         CHECK(r->get_header_value("Cache-Control") == "no-store, private");
-        // Reporting is a pure read of the session: no gate is consulted.
+        // perm_fn is never called (the audit-row absence is pinned by the PG
+        // decision-table case in test_auth_routes.cpp, which wires a real store).
         CHECK(h.last_perm_type.empty());
     }
 }

@@ -72,6 +72,20 @@ TEST_CASE("admin_gate_verdict: truth table", "[server][authz][admin_gate]") {
           AdminGate::McpTier);
     CHECK(admin_gate_verdict(make_session(auth::Role::admin, false, "", "finance")) ==
           AdminGate::ServiceScoped);
+    // Elevation never outranks a token confinement: an elevated user's MCP or
+    // service-scoped credential is still refused (the token checks run first).
+    CHECK(admin_gate_verdict(make_session(auth::Role::user, true, "operator")) ==
+          AdminGate::McpTier);
+    CHECK(admin_gate_verdict(make_session(auth::Role::user, true, "", "finance")) ==
+          AdminGate::ServiceScoped);
+    // A LAPSED elevation window is not admin: the effective role, not a stale
+    // wall-clock field, decides.
+    {
+        auto lapsed = make_session(auth::Role::user);
+        lapsed.steady_elevated_until = chr::steady_clock::now() - chr::seconds(1);
+        lapsed.elevated_until = chr::system_clock::now() - chr::seconds(1);
+        CHECK(admin_gate_verdict(lapsed) == AdminGate::NotAdmin);
+    }
     // Service scope is checked first, as require_admin always did.
     CHECK(admin_gate_verdict(make_session(auth::Role::admin, false, "operator", "finance")) ==
           AdminGate::ServiceScoped);

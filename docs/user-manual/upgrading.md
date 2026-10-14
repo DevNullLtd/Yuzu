@@ -35,8 +35,10 @@ shows the Settings entry only when `can_access_settings` is `true`. Users with a
 active just-in-time elevation now see the link; RBAC PlatformEngineer or
 `Administrator`-label holders who are not legacy admins no longer see a link that
 redirected away. During a rolling upgrade an older replica omits the new keys, so
-the Settings link stays hidden until every replica is upgraded. No configuration
-change is needed.
+the Settings link is hidden for every user, administrators included, whenever
+`/api/me` is answered by an older replica; open `/settings` directly by URL (it is
+unaffected) or wait for the upgrade to finish. Tabs opened before the upgrade keep
+the old shell until reloaded. No configuration change is needed.
 
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
