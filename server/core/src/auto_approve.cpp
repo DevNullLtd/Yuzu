@@ -6,8 +6,8 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
-#include <sstream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 

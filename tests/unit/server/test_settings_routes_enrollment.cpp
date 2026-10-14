@@ -476,3 +476,81 @@ TEST_CASE("settings auto-approve: toggle, delete and mode each audit exactly one
     REQUIRE(h.sink.Delete("/api/settings/auto-approve/7")->status == 200);
     CHECK(h.only("enrollment.auto_approve.rule_remove").result == "denied");
 }
+
+TEST_CASE("settings auto-approve: every rule type is accepted and stored as that type",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    const std::string ca(64, 'a');
+    REQUIRE(h.sink.Post("/api/settings/auto-approve",
+                        "type=trusted_ca&value=" + ca + "&label=ca", kForm)->status == 200);
+    REQUIRE(h.sink.Post("/api/settings/auto-approve",
+                        "type=cloud_provider&value=aws&label=cp", kForm)->status == 200);
+    REQUIRE(h.sink.Post("/api/settings/auto-approve",
+                        "type=hostname_glob&value=*.corp&label=hg", kForm)->status == 200);
+    const auto rules = h.auto_approve.list_rules();
+    REQUIRE(rules.size() == 3);
+    CHECK(rules[0].type == auth::AutoApproveRuleType::trusted_ca);
+    CHECK(rules[1].type == auth::AutoApproveRuleType::cloud_provider);
+    CHECK(rules[2].type == auth::AutoApproveRuleType::hostname_glob);
+}
+
+TEST_CASE("settings auto-approve: toggle, remove and mode audit rows carry the full contract",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    h.auto_approve.add_rule({auth::AutoApproveRuleType::hostname_glob, "*.corp", "corp", true});
+
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/0/toggle", "", kForm)->status == 200);
+    REQUIRE(h.audit_calls.size() == 1);
+    auto row = h.only("enrollment.auto_approve.rule_toggle");
+    CHECK(row.result == "success");
+    CHECK(row.target_type == "AutoApproveRule");
+    CHECK(row.target_id == "0");
+    CHECK(row.detail == "enabled=0 by=admin");
+
+    // Unknown index: denied, state untouched, exactly one row.
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/9/toggle", "", kForm)->status == 200);
+    REQUIRE(h.audit_calls.size() == 1);
+    row = h.only("enrollment.auto_approve.rule_toggle");
+    CHECK(row.result == "denied");
+    CHECK(row.target_id == "9");
+    CHECK(row.detail == "rule_not_found by=admin");
+    CHECK_FALSE(h.auto_approve.list_rules()[0].enabled);
+
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/mode", "mode=all", kForm)->status == 200);
+    REQUIRE(h.audit_calls.size() == 1);
+    row = h.only("enrollment.auto_approve.mode");
+    CHECK(row.result == "success");
+    CHECK(row.detail == "mode=all by=admin");
+
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Delete("/api/settings/auto-approve/0")->status == 200);
+    REQUIRE(h.audit_calls.size() == 1);
+    row = h.only("enrollment.auto_approve.rule_remove");
+    CHECK(row.result == "success");
+    CHECK(row.target_id == "0");
+    CHECK(row.detail == "value=*.corp label=corp by=admin");
+}
+
+TEST_CASE("settings auto-approve: an overlong numeric index is a denied no-op, not an exception",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    h.auto_approve.add_rule({auth::AutoApproveRuleType::hostname_glob, "*.corp", "corp", true});
+    const std::string huge(40, '9');
+
+    auto r = h.sink.Post("/api/settings/auto-approve/" + huge + "/toggle", "", kForm);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(h.only("enrollment.auto_approve.rule_toggle").result == "denied");
+
+    h.audit_calls.clear();
+    r = h.sink.Delete("/api/settings/auto-approve/" + huge);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    const auto row = h.only("enrollment.auto_approve.rule_remove");
+    CHECK(row.result == "denied");
+    CHECK(row.target_id == huge);
+    CHECK(h.auto_approve.list_rules().size() == 1);
+    CHECK(h.auto_approve.list_rules()[0].enabled);
+}

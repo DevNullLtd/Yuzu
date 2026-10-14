@@ -309,3 +309,25 @@ TEST_CASE("load: a rule line with an unknown type is dropped, not widened to hos
     // The dropped line must not have become a match-everything hostname_glob "*".
     CHECK(engine.evaluate(make_ctx("anything.example.com")).empty());
 }
+
+TEST_CASE("parse_auto_approve_rule_type: all four known names map to their enum",
+          "[auto_approve][hardening]") {
+    CHECK(parse_auto_approve_rule_type("trusted_ca") == AutoApproveRuleType::trusted_ca);
+    CHECK(parse_auto_approve_rule_type("hostname_glob") == AutoApproveRuleType::hostname_glob);
+    CHECK(parse_auto_approve_rule_type("ip_subnet") == AutoApproveRuleType::ip_subnet);
+    CHECK(parse_auto_approve_rule_type("cloud_provider") == AutoApproveRuleType::cloud_provider);
+}
+
+TEST_CASE("validate_auto_approve_rule: every control byte and DEL is rejected in value and label",
+          "[auto_approve][hardening]") {
+    using T = AutoApproveRuleType;
+    for (int c = 0; c < 0x20; ++c) {
+        const std::string bad = std::string("a") + static_cast<char>(c) + "b";
+        INFO("byte " << c);
+        CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, bad, "ok").empty());
+        CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, "ok", bad).empty());
+    }
+    const std::string del = std::string("a") + '\x7f' + "b";
+    CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, del, "ok").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, "ok", del).empty());
+}
