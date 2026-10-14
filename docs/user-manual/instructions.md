@@ -481,7 +481,7 @@ corrected `parameter_schema`:
 2. Edit its `parameter_schema` (a string holding the schema JSON). Unless the server runs with
    `--allow-unsigned-definitions`, the edited document must also be signed before import, or the import
    answers `400` as unsigned: add a hex `signature` and `publicKey` (an Ed25519 signature over the exact
-   bytes of `yaml_source`, 128 and 64 hex characters). A definition whose `yaml_source` is empty cannot be
+   bytes of `yaml_source`, 128 and 64 hex characters). The signature covers `yaml_source` only, so `plugin`, `action`, `type`, `approval_mode` and `concurrency_mode` are read from it and must agree with the envelope. A definition whose `yaml_source` is empty cannot be
    signed (import answers an error about a signature without `yaml_source`), so only the unsigned flag
    works for it.
 3. Rehearse the import, because step 5 cannot be rehearsed (an existing id answers `409`) and a refused

@@ -200,6 +200,9 @@ struct Deps {
     /// they degrade to a 200 HTML error instead, matching the original
     /// inline code's fragment-response convention).
     InstructionStore* store{nullptr};
+    /// `--csrf-trusted-origin` allowlist (#2537), for the same-site gate on cookie-authorised
+    /// writes. Empty = same-host only (fails closed behind a Host-rewriting proxy).
+    std::vector<std::string> csrf_trusted_origins;
 };
 
 /// Register all 13 Instruction Definitions + Instruction Sets API routes

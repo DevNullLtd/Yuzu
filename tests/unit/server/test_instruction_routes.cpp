@@ -114,6 +114,7 @@ struct Harness {
     // auth_allow/auth_username so tests can prove a route never gates on
     // it (see instruction_routes.hpp's header comment).
     std::string resolve_session_username{"alice"};
+    std::string resolve_session_auth_source{"local"}; ///< "api_token" = a token session (not gated)
 
     bool audit_succeeds{true};
     std::vector<AuditRow> audits;
@@ -155,6 +156,7 @@ struct Harness {
                 return std::nullopt;
             auth::Session s;
             s.username = resolve_session_username;
+            s.auth_source = resolve_session_auth_source;
             return s;
         };
         deps.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
@@ -168,6 +170,9 @@ struct Harness {
             emits.push_back({event_type, attrs, payload_data});
         };
         instruction::register_instruction_routes(sink, deps);
+        // A browser sends these on every same-origin write; the cross-site tests clear or
+        // override them.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     }
 };
 
@@ -1219,4 +1224,51 @@ TEST_CASE("instruction_routes: wiring -- server.cpp still calls "
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_instruction_routes(") != std::string::npos);
+}
+
+TEST_CASE("instruction_routes: a cookie-session write that is cross-site or carries no "
+          "Origin/Referer is refused (403, audited) and changes nothing; a token session is not "
+          "gated",
+          "[pg][server][routes][instruction_routes][csrf]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::unordered_map<std::string, std::string> cross_site[] = {
+        {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+        {{"Host", "yuzu.test"}, {"Referer", "https://evil.test/x"}},
+        {{"Host", "yuzu.test"}}, // a browser always sends one on a write
+    };
+    for (const auto& hdrs : cross_site) {
+        h.sink.default_headers = hdrs;
+        h.audits.clear();
+        auto set = h.sink.Post("/api/instruction-sets", json{{"name", "Evil"}}.dump());
+        REQUIRE(set);
+        CHECK(set->status == 403);
+        auto imp = h.sink.Post("/api/instructions/import", "{}");
+        REQUIRE(imp);
+        CHECK(imp->status == 403);
+        auto yaml = h.sink.Post("/api/instructions/yaml", "yaml_source=x",
+                                "application/x-www-form-urlencoded");
+        REQUIRE(yaml);
+        CHECK(yaml->status == 403);
+        auto del = h.sink.Delete("/api/instruction-sets/whatever");
+        REQUIRE(del);
+        CHECK(del->status == 403);
+        REQUIRE(h.audits.size() == 4);
+        for (const auto& a : h.audits)
+            CHECK(a.action == "csrf.denied"); // refused before any attempt row or change
+    }
+    const auto sets = w.store.list_sets();
+    REQUIRE(sets);
+    CHECK(sets->empty());
+
+    // An API/MCP token is not riding a cookie: no Origin is needed.
+    h.sink.default_headers.clear();
+    h.resolve_session_auth_source = "api_token";
+    auto token_write = h.sink.Post("/api/instruction-sets", json{{"name", "Via Token"}}.dump());
+    REQUIRE(token_write);
+    CHECK(token_write->status == 200);
 }

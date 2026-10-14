@@ -15592,6 +15592,7 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .store = instruction_store_.get(),
+                             .csrf_trusted_origins = cfg_.csrf_trusted_origins,
                          });
 
         // #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted
@@ -18780,6 +18781,7 @@ private:
         WorkflowRoutes::Deps wf_deps;
         wf_deps.auth_fn = auth_fn;
         wf_deps.perm_fn = perm_fn;
+        wf_deps.csrf_trusted_origins = cfg_.csrf_trusted_origins;
         wf_deps.probe_perm_fn = [perm_fn](const httplib::Request& req, const std::string& type,
                                           const std::string& op) -> bool {
             httplib::Response scratch;

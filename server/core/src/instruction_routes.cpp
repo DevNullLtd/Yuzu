@@ -27,6 +27,27 @@ extern const char* const kInstructionEditorDeniedHtml;
 
 namespace yuzu::server::instruction {
 
+namespace {
+/// Cookie-authorised writes need a same-site Origin/Referer (token callers are exempt); see
+/// `browser_write_is_cross_site`. Runs AFTER the permission gate so an unauthenticated or
+/// unauthorised caller still gets the 401/403 it always did. Refusals are audited.
+bool refuse_cross_site_write(const Deps& deps, const httplib::Request& req, httplib::Response& res) {
+    std::string source;
+    if (deps.resolve_session_fn)
+        if (auto sess = deps.resolve_session_fn(req))
+            source = sess->auth_source;
+    if (!browser_write_is_cross_site(source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"),
+                                     req.get_header_value("Referer"), deps.csrf_trusted_origins))
+        return false;
+    (void)deps.audit_fn(req, "csrf.denied", "denied", "Endpoint", "instruction",
+                        "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+    return true;
+}
+} // namespace
+
 void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     // -- Instruction Definitions API --------------------------------------
 
@@ -96,6 +117,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/instructions
     sink.Post("/api/instructions", [deps](const httplib::Request& req, httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Write"))
+            return;
+        if (refuse_cross_site_write(deps, req, res))
             return;
         if (!deps.store) {
             res.status = 503;
@@ -256,6 +279,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                                      httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Write"))
             return;
+        if (refuse_cross_site_write(deps, req, res))
+            return;
         if (!deps.store) {
             res.status = 503;
             res.set_content(
@@ -384,6 +409,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                                         httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Delete"))
             return;
+        if (refuse_cross_site_write(deps, req, res))
+            return;
         if (!deps.store) {
             res.status = 503;
             res.set_content(
@@ -461,6 +488,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post("/api/instructions/import", [deps](const httplib::Request& req,
                                                  httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Write"))
+            return;
+        if (refuse_cross_site_write(deps, req, res))
             return;
         if (!deps.store) {
             res.status = 503;
@@ -592,6 +621,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                               httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionSet", "Write"))
             return;
+        if (refuse_cross_site_write(deps, req, res))
+            return;
         if (!deps.store) {
             res.status = 503;
             res.set_content(
@@ -656,6 +687,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     sink.Delete(R"(/api/instruction-sets/([^/]+))", [deps](const httplib::Request& req,
                                                             httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionSet", "Delete"))
+            return;
+        if (refuse_cross_site_write(deps, req, res))
             return;
         if (!deps.store) {
             res.status = 503;
@@ -836,6 +869,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post("/api/instructions/yaml", [deps](const httplib::Request& req,
                                                httplib::Response& res) {
         if (!deps.perm_fn(req, res, "InstructionDefinition", "Write"))
+            return;
+        if (refuse_cross_site_write(deps, req, res))
             return;
         auto session = deps.auth_fn(req, res);
         if (!session)
