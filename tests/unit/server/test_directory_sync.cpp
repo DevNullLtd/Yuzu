@@ -33,6 +33,9 @@
  */
 
 #include "directory_sync.hpp"
+#include "discovery_routes.hpp"
+#include "integrations_sync_routes.hpp"
+#include "test_route_sink.hpp"
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -417,9 +420,13 @@ TEST_CASE("DirectorySync[pg]: checked reads succeed on an open store, never-sync
     CHECK(store->get_synced_groups_checked()->size() == 1);
     CHECK(store->get_synced_users_checked()->size() == 2);
     // `limit` caps the rows read (the Integrations users fragment asks for a page).
-    CHECK(store->get_synced_users_checked({}, 1)->size() == 1);
-    CHECK(store->get_synced_users_checked("g1", 5)->size() == 1);
-    CHECK(store->get_synced_users_checked("g1", 5)->front().groups.size() == 1);
+    auto one = store->get_synced_users_checked({}, 1);
+    REQUIRE(one.has_value());
+    CHECK(one->size() == 1);
+    auto g1 = store->get_synced_users_checked("g1", 5);
+    REQUIRE(g1.has_value());
+    REQUIRE(g1->size() == 1);
+    CHECK(g1->front().groups.size() == 1);
 
     // A failed sync's status row carries counts of a snapshot that was never
     // stored; the snapshot count must not follow it.
@@ -718,6 +725,7 @@ TEST_CASE("DirectorySync[pg]: a closed store degrades to empty/default, never cr
     CHECK(status.provider == "entra");
     CHECK(status.status == "idle");
     CHECK(store.get_group_role_mappings().empty());
+    CHECK(store.get_group_role_mappings_checked().error() == DirectoryReadError::store_unavailable);
 
     // The checked reads report the failure instead of the default value, so a
     // page can tell "could not read" from "never synced" / "no users".
@@ -735,4 +743,146 @@ TEST_CASE("DirectorySync[pg]: a closed store degrades to empty/default, never cr
     data.users.push_back(make_user("u1", "Alice"));
     auto apply_result = acc.apply_entra_sync(data);
     REQUIRE_FALSE(apply_result.has_value());
+}
+
+TEST_CASE("DirectorySync[pg]: a failed membership lookup fails the checked read, not the legacy one",
+          "[directory_sync][pg]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", "Alice"));
+    data.users.push_back(make_user("u2", "Bob"));
+    data.groups.push_back(make_group("g1", "Engineering"));
+    data.memberships["g1"] = {"u1"};
+    REQUIRE(acc.apply_entra_sync(data).has_value());
+
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "DROP TABLE directory_sync.directory_memberships",
+                                std::vector<std::string>{}).ok());
+    }
+    // Without the groups the users would read as members of nothing.
+    auto strict = store->get_synced_users_checked({}, 5);
+    REQUIRE_FALSE(strict.has_value());
+    CHECK(strict.error() == DirectoryReadError::query_failed);
+    // Callers that never asked for the strict contract keep the best-effort read.
+    auto loose = store->get_synced_users_checked({}, 5, /*require_groups=*/false);
+    REQUIRE(loose.has_value());
+    CHECK(loose->size() == 2);
+    CHECK(store->get_synced_users().size() == 2);
+
+    // The Integrations adapter passes the limit through and maps the failure.
+    auto deps = integrations::bind_stores(nullptr, nullptr, store.get(), nullptr);
+    auto page = deps.directory_users(1);
+    REQUIRE_FALSE(page.has_value());
+    CHECK(page.error() == integrations::ReadError::failed);
+}
+
+namespace {
+/// DiscoveryRoutes over a real DirectorySync with a capturing audit sink.
+struct DirectoryRouteHarness {
+    struct Row {
+        std::string action, result, target_id, detail;
+    };
+    std::vector<Row> audits;
+    DiscoveryRoutes routes;
+    yuzu::server::test::TestRouteSink sink; // declared after what its handlers capture
+
+    explicit DirectoryRouteHarness(DirectorySync* store) {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "dir-admin";
+            return s;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) { return true; };
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&,
+                               const std::string& target_id, const std::string& detail) {
+            audits.push_back({action, result, target_id, detail});
+        };
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, store, nullptr, nullptr, nullptr);
+    }
+    auto put_mappings(const std::string& body) {
+        return sink.Put("/api/directory/group-mappings", body, "application/json");
+    }
+};
+} // namespace
+
+TEST_CASE("DiscoveryRoutes[pg]: directory sync failures are audited with fixed non-secret details",
+          "[directory_sync][pg][routes]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+
+    auto bad = h.sink.Post("/api/directory/sync", "{", "application/json");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "directory.sync");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].detail == "invalid_json");
+
+    auto missing = h.sink.Post("/api/directory/sync",
+                               R"({"provider":"entra","tenant_id":"t","client_id":"c"})",
+                               "application/json");
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].target_id == "entra");
+    CHECK(h.audits[1].detail == "missing_credentials");
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: group mapping audit records what is stored, not what was asked",
+          "[directory_sync][pg][routes]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+
+    // Stored as asked: one success row naming the pair.
+    auto ok = h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":"Operator"}]})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "directory.group_mapping.update");
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail == "1 mappings updated: g1=Operator");
+
+    // A group named twice ends with its last entry: audited once, as stored.
+    h.audits.clear();
+    auto dup = h.put_mappings(R"({"mappings":[{"group_id":"g2","role_name":"bogus"},)"
+                              R"({"group_id":"g2","role_name":"Administrator"}]})");
+    REQUIRE(dup);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail == "1 mappings updated: g2=Administrator");
+
+    // A removal that took effect is a success.
+    h.audits.clear();
+    REQUIRE(h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":""}]})"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail == "1 mappings updated: g1=(removed)");
+
+    // Break the table: the writes are swallowed and the read-back fails too.
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DROP TABLE directory_sync.directory_group_role_mappings",
+                                std::vector<std::string>{}).ok());
+    }
+    h.audits.clear();
+    REQUIRE(h.put_mappings(R"({"mappings":[{"group_id":"g2","role_name":"Operator"}]})"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].detail == "1 mappings not confirmed by read-back: g2=Operator");
+
+    // A removal must not read as confirmed just because nothing could be read.
+    h.audits.clear();
+    REQUIRE(h.put_mappings(R"({"mappings":[{"group_id":"g2","role_name":""}]})"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].detail == "1 mappings not confirmed by read-back: g2=(removed)");
 }

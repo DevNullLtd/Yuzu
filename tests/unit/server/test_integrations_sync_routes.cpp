@@ -36,6 +36,7 @@ struct Harness {
     int users_reads{0};
     int users_limit{0};
     int delivery_reads{0};
+    int off_delivery_reads{0};
     bool perm{true};
     bool audit_throws{false};
     std::vector<std::string> perms; // "<securable>:<operation>" per securable check
@@ -90,7 +91,10 @@ struct Harness {
             return offload;
         };
         d.offload_get = [this](std::int64_t) { return offload_one; };
-        d.offload_deliveries = [this](std::int64_t, int) { return off_deliveries; };
+        d.offload_deliveries = [this](std::int64_t, int) {
+            ++off_delivery_reads;
+            return off_deliveries;
+        };
         d.directory_status = [this] { return status; };
         d.directory_user_count = [this] { return user_count; };
         d.directory_groups = [this] { return groups; };
@@ -320,6 +324,36 @@ TEST_CASE("sync routes: one failed history read stops the per-row reads",
     CHECK(unknown == 4);
 }
 
+TEST_CASE("sync routes: one failed offload history read stops the per-row reads",
+          "[integrations][routes]") {
+    Harness h;
+    std::vector<OffloadTarget> ts(4);
+    for (std::size_t i = 0; i < ts.size(); ++i)
+        ts[i].id = static_cast<std::int64_t>(i + 1);
+    h.offload = ts;
+    h.off_deliveries = std::nullopt;
+    auto res = h.get("/fragments/settings/offload-targets");
+    REQUIRE(res);
+    CHECK(h.off_delivery_reads == 1);
+    std::size_t unknown = 0;
+    for (std::size_t at = 0;
+         (at = res->body.find("Unknown (history could not be read)", at)) != std::string::npos; ++at)
+        ++unknown;
+    CHECK(unknown == 4);
+}
+
+TEST_CASE("sync routes: registration refuses deps that would leave a gate off",
+          "[integrations][routes]") {
+    test::TestRouteSink sink;
+    SyncDeps d;
+    CHECK_THROWS_AS(register_integrations_sync_routes(sink, d), std::invalid_argument);
+    d.admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
+    CHECK_THROWS_AS(register_integrations_sync_routes(sink, d), std::invalid_argument);
+    d.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    CHECK_THROWS_AS(register_integrations_sync_routes(sink, d), std::invalid_argument);
+}
+
 TEST_CASE("sync routes: users fragment survives a throwing audit sink and reads a bounded page",
           "[integrations][routes]") {
     Harness t;
@@ -335,6 +369,8 @@ TEST_CASE("sync routes: users fragment survives a throwing audit sink and reads 
     CHECK(t.users_reads == 0);
 
     // A failed persist also sets the shared Sec-Audit-Failed signal.
+    CHECK(t.get("/fragments/settings/directory-sync/users")->get_header_value("Sec-Audit-Failed") ==
+          "true");
     Harness f;
     f.audit_ok = false;
     CHECK(f.get("/fragments/settings/directory-sync/users")->get_header_value("Sec-Audit-Failed") ==
@@ -342,7 +378,7 @@ TEST_CASE("sync routes: users fragment survives a throwing audit sink and reads 
 
     Harness b;
     b.get("/fragments/settings/directory-sync/users");
-    CHECK(b.users_limit == 201); // shown cap + 1: enough to say "more exist"
+    CHECK(b.users_limit == static_cast<int>(kUsersShown) + 1); // enough to say "more exist"
 }
 
 TEST_CASE("sync routes: controller script is served no-store", "[integrations][routes]") {

@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -292,22 +294,28 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                 // Read back before auditing: the store's writers swallow a failed
                 // write, so a "success" row listing pairs that were never stored
-                // would be false evidence. Only confirmed pairs are audited as applied.
-                auto mappings = directory_sync->get_group_role_mappings();
-                const auto unconfirmed = integrations::unconfirmed_mapping_changes(applied, mappings);
+                // would be false evidence. A confirmed pair gets a success row, an
+                // unconfirmed one a failure row (both when a batch is mixed), and a
+                // failed read-back confirms nothing. A group named twice counts as
+                // its last entry, which is what the store ends with.
+                auto stored = directory_sync->get_group_role_mappings_checked();
+                const auto outcome = integrations::classify_mapping_changes(
+                    applied, stored ? std::optional<std::map<std::string, std::string>>(*stored)
+                                    : std::nullopt);
 
                 auto session = auth_fn(req, res);
                 if (session) {
-                    if (unconfirmed.empty())
+                    if (!outcome.confirmed.empty() || outcome.unconfirmed.empty())
                         audit_fn(req, "directory.group_mapping.update", "success",
                                  "Directory", "group-mappings",
-                                 integrations::mapping_audit_detail(applied));
-                    else
+                                 integrations::mapping_audit_detail(outcome.confirmed));
+                    if (!outcome.unconfirmed.empty())
                         audit_fn(req, "directory.group_mapping.update", "failure",
                                  "Directory", "group-mappings",
-                                 integrations::mapping_audit_detail(unconfirmed, 1000,
+                                 integrations::mapping_audit_detail(outcome.unconfirmed, 1000,
                                                                     "not confirmed by read-back"));
                 }
+                auto mappings = stored ? *stored : std::map<std::string, std::string>{};
 
                 nlohmann::json mappings_arr = nlohmann::json::array();
                 for (const auto& [gid, role] : mappings) {

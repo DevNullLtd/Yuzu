@@ -1294,11 +1294,16 @@ void DirectorySync::remove_group_role_mapping(const std::string& group_id) {
 }
 
 std::map<std::string, std::string> DirectorySync::get_group_role_mappings() const {
+    return get_group_role_mappings_checked().value_or(std::map<std::string, std::string>{});
+}
+
+std::expected<std::map<std::string, std::string>, DirectoryReadError>
+DirectorySync::get_group_role_mappings_checked() const {
     if (!open_)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
 
     pg::PgResult res = pg::exec_params(
         lease.get(), "SELECT group_id, role_name FROM directory_sync.directory_group_role_mappings",
@@ -1306,7 +1311,7 @@ std::map<std::string, std::string> DirectorySync::get_group_role_mappings() cons
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("DirectorySync::get_group_role_mappings: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return {};
+        return std::unexpected(DirectoryReadError::query_failed);
     }
 
     std::map<std::string, std::string> result;

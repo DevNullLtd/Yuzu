@@ -178,7 +178,15 @@ TEST_CASE("webhook create form: confirm names host and data classes, secret has 
     CHECK_THAT(tag, ContainsSubstring("autocomplete=\"new-password\""));
     CHECK(!contains(tag, "value="));
     CHECK_THAT(html, ContainsSubstring("it is not an approval step"));
-    CHECK_THAT(html, ContainsSubstring("recorded in the audit log; the analytics event stream carries only its scheme and host"));
+    {
+        // Both the confirm text and the hint say it, and neither says the old thing.
+        const std::string_view want = "recorded in the audit log; the analytics event stream";
+        std::size_t n = 0;
+        for (std::size_t at = 0; (at = html.find(want, at)) != std::string::npos; ++at)
+            ++n;
+        CHECK(n == 2);
+        CHECK(html.find("and in the analytics event stream") == std::string::npos);
+    }
 }
 
 TEST_CASE("webhook deliveries: failed read, empty, and rows", "[integrations][render]") {

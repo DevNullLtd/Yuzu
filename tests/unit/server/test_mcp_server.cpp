@@ -33365,6 +33365,10 @@ TEST_CASE("MCP B5: offload-target CRUD lifecycle over a LIVE store — "
     REQUIRE(ts.audit_log.size() >= 2);
     CHECK(ts.audit_log[ts.audit_log.size() - 2] == "offload_target.create|success");
     CHECK(ts.audit_log.back() == "mcp.create_offload_target|success");
+    // Same detail shape as the REST create row: where the data was sent is on record.
+    REQUIRE(ts.audit_details.size() >= 2);
+    CHECK(ts.audit_details[ts.audit_details.size() - 2] ==
+          "name=siem url=https://siem.example.com/ingest");
 
     auto list1 = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_offload_targets",)"

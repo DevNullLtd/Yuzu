@@ -53,20 +53,54 @@ TEST_CASE("mapping audit detail: pairs, removal marker, count", "[integrations][
 TEST_CASE("mapping read-back: only pairs the store shows are confirmed", "[integrations][audit]") {
     using integrations::MappingChange;
     const std::map<std::string, std::string> stored{{"g-1", "Operator"}, {"g-3", "Viewer"}};
-    const std::vector<MappingChange> asked{
-        {"g-1", "Operator"}, // stored as asked
-        {"g-2", "Operator"}, // write swallowed: not stored
-        {"g-3", ""},         // removal swallowed: still stored
-        {"g-4", ""},         // removal of an absent mapping is confirmed
-        {"g-1", "Admin"}};   // stored role differs from the requested one
-    const auto bad = integrations::unconfirmed_mapping_changes(asked, stored);
-    REQUIRE(bad.size() == 3);
-    CHECK(bad[0].group_id == "g-2");
-    CHECK(bad[1].group_id == "g-3");
-    CHECK(bad[2].role_name == "Admin");
-    CHECK(integrations::mapping_audit_detail(bad, 1000, "not confirmed by read-back") ==
-          "3 mappings not confirmed by read-back: g-2=Operator, g-3=(removed), g-1=Admin");
-    CHECK(integrations::unconfirmed_mapping_changes({}, stored).empty());
+    const auto out = integrations::classify_mapping_changes(
+        {{"g-1", "Operator"},  // stored as asked
+         {"g-2", "Operator"},  // write swallowed: not stored
+         {"g-3", ""},          // removal swallowed: still stored
+         {"g-4", ""}},         // removal of an absent mapping is confirmed
+        stored);
+    REQUIRE(out.confirmed.size() == 2);
+    CHECK(out.confirmed[0].group_id == "g-1");
+    CHECK(out.confirmed[1].group_id == "g-4");
+    REQUIRE(out.unconfirmed.size() == 2);
+    CHECK(out.unconfirmed[0].group_id == "g-2");
+    CHECK(out.unconfirmed[1].group_id == "g-3");
+    CHECK(integrations::mapping_audit_detail(out.unconfirmed, 1000, "not confirmed by read-back") ==
+          "2 mappings not confirmed by read-back: g-2=Operator, g-3=(removed)");
+}
+
+TEST_CASE("mapping read-back: a group named twice counts as its last entry", "[integrations][audit]") {
+    using integrations::MappingChange;
+    const auto last = integrations::last_wins_mapping_changes(
+        {{"g-1", "bogus"}, {"g-2", "Viewer"}, {"g-1", "Administrator"}, {"g-2", ""}});
+    REQUIRE(last.size() == 2);
+    CHECK(last[0].group_id == "g-1");
+    CHECK(last[0].role_name == "Administrator");
+    CHECK(last[1].group_id == "g-2");
+    CHECK(last[1].role_name.empty());
+
+    // The store ends with the last entry, so nothing is falsely unconfirmed.
+    const std::map<std::string, std::string> stored{{"g-1", "Administrator"}};
+    const auto out = integrations::classify_mapping_changes(
+        {{"g-1", "bogus"}, {"g-1", "Administrator"}, {"g-2", "x"}, {"g-2", ""}}, stored);
+    CHECK(out.unconfirmed.empty());
+    CHECK(out.confirmed.size() == 2);
+}
+
+TEST_CASE("mapping read-back: a failed read confirms nothing, removals included",
+          "[integrations][audit]") {
+    using integrations::MappingChange;
+    const auto out = integrations::classify_mapping_changes(
+        {{"g-1", "Operator"}, {"g-2", ""}}, std::nullopt);
+    CHECK(out.confirmed.empty());
+    REQUIRE(out.unconfirmed.size() == 2);
+    // An empty (readable) set is different: the removal is shown, the set is not.
+    const auto empty = integrations::classify_mapping_changes(
+        {{"g-1", "Operator"}, {"g-2", ""}}, std::map<std::string, std::string>{});
+    CHECK(empty.confirmed.size() == 1);
+    CHECK(empty.confirmed[0].group_id == "g-2");
+    CHECK(empty.unconfirmed.size() == 1);
+    CHECK(integrations::classify_mapping_changes({}, std::nullopt).confirmed.empty());
 }
 
 TEST_CASE("mapping audit detail: control bytes cannot split the row", "[integrations][audit]") {

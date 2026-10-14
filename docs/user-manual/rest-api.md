@@ -5404,7 +5404,7 @@ payload is transmitted in cleartext. Production deployments should use `https://
 store accepts `http://` for development convenience — same posture as Offload Targets below.
 
 **URL rules.** A URL with embedded credentials (`https://user:pass@host`) or with control bytes
-(CR, LF, NUL) in the URL or in `event_types` is refused with `400` and nothing is stored. The
+(any byte below 0x20, including tab, CR, LF and NUL, and DEL) in the URL or in `event_types` is refused with `400` and nothing is stored. The
 `webhook.created` analytics event carries the scheme and host only; the audit row keeps the full
 URL. The same hooks are managed from **Settings > Integrations**, which calls this route.
 
@@ -5533,7 +5533,7 @@ AD/Entra directory integration (Phase 7). Backed by `DirectorySync` (`directory_
 
 #### `POST /api/directory/sync`
 
-Trigger a directory sync. Requires `Directory:Write`. Also available from **Settings > Integrations > Directory sync**, which sends the tenant, client and secret for that one request and never stores them. A `400` (missing credentials) and a `500` (sync failed) are audited as `directory.sync` with result `failure`; the `500` row carries a fixed detail, not the upstream error text.
+Trigger a directory sync. Requires `Directory:Write`. Also available from **Settings > Integrations > Directory sync**, which sends the tenant, client and secret for that one request and never stores them. A `400` (unparseable body, `invalid_json`; or missing credentials, `missing_credentials`) and a `500` (sync failed, `sync_failed`) are audited as `directory.sync` with result `failure`, and a `409` as `denied`; every detail is a fixed token, never the upstream error text or a credential.
 
 **Request (`provider: "entra"`):**
 
@@ -5586,7 +5586,7 @@ Record group-to-role mappings (the RBAC role intended for a synced group's membe
 
 **Response (503):** `directory_sync` unavailable.
 
-**Audit:** `directory.group_mapping.update` records the pairs (`N mappings updated: <group_id>=<role>, <group_id>=(removed)`), bounded and with control bytes replaced. Mappings are recorded for reference; nothing reads them at sign-in. The write helpers swallow store failures and the route still answers `200`, so a client that needs certainty compares the echoed set with what it sent (the Integrations page does). The route reads the stored set back before auditing: the row is `result=success` only when every requested pair is stored, otherwise `result=failure` with `N mappings not confirmed by read-back: ...` listing the pairs that are not.
+**Audit:** `directory.group_mapping.update` records the pairs (`N mappings updated: <group_id>=<role>, <group_id>=(removed)`), bounded and with control bytes replaced. Mappings are recorded for reference; nothing reads them at sign-in. The write helpers swallow store failures and the route still answers `200`, so a client that needs certainty compares the echoed set with what it sent (the Integrations page does). The route reads the stored set back before auditing: stored pairs get a `result=success` row and pairs the store did not take get a `result=failure` row (`N mappings not confirmed by read-back: ...`); a failed read-back confirms nothing, removals included.
 
 #### `GET /api/v1/directory/users`
 

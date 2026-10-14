@@ -37,7 +37,7 @@ struct SyncDeps {
     /// `perm_fn`-style securable check (writes the 403 itself when it denies).
     /// Stacked AFTER `admin_fn` so a fragment is never wider than its JSON twin's
     /// securable: Infrastructure:Read for webhooks and offload targets,
-    /// Directory:Read for directory sync. Unset = no extra gate (tests).
+    /// Directory:Read for directory sync. Required: registration refuses a SyncDeps without it.
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string& securable, const std::string& operation)>;
     /// Bool-returning audit hook; `false` = the row was not persisted. The

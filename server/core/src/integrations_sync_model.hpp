@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -50,20 +51,48 @@ mapping_audit_detail(const std::vector<MappingChange>& changes, std::size_t cap 
     return out;
 }
 
-/// The requested changes the stored mapping set does not show. The store's
-/// mapping writers swallow a failed write (void return), so the route reads the
-/// set back and audits only what is actually there: a requested role must be
-/// the stored role, a removal must be absent.
+/// The requested changes after the store's own last-write-wins rule: one entry
+/// per group, in order of last occurrence (a body naming a group twice ends
+/// with the later entry stored, so the earlier one is not an outcome).
 [[nodiscard]] inline std::vector<MappingChange>
-unconfirmed_mapping_changes(const std::vector<MappingChange>& changes,
-                            const std::map<std::string, std::string>& stored) {
+last_wins_mapping_changes(const std::vector<MappingChange>& changes) {
     std::vector<MappingChange> out;
-    for (const auto& ch : changes) {
-        const auto it = stored.find(ch.group_id);
-        const bool ok = ch.role_name.empty() ? it == stored.end()
-                                              : it != stored.end() && it->second == ch.role_name;
-        if (!ok)
-            out.push_back(ch);
+    for (std::size_t i = 0; i < changes.size(); ++i) {
+        bool later = false;
+        for (std::size_t j = i + 1; j < changes.size(); ++j)
+            if (changes[j].group_id == changes[i].group_id) {
+                later = true;
+                break;
+            }
+        if (!later)
+            out.push_back(changes[i]);
+    }
+    return out;
+}
+
+/// Which requested changes the stored mapping set shows (`confirmed`) and which
+/// it does not (`unconfirmed`). The store's mapping writers swallow a failed
+/// write (void return), so the route reads the set back and audits what is
+/// actually there: a requested role must be the stored role, a removal must be
+/// absent. `stored` empty-optional means the read-back itself failed: nothing
+/// is confirmed, and an absent group must not read as a confirmed removal.
+struct MappingOutcome {
+    std::vector<MappingChange> confirmed;
+    std::vector<MappingChange> unconfirmed;
+};
+
+[[nodiscard]] inline MappingOutcome
+classify_mapping_changes(const std::vector<MappingChange>& changes,
+                         const std::optional<std::map<std::string, std::string>>& stored) {
+    MappingOutcome out;
+    for (const auto& ch : last_wins_mapping_changes(changes)) {
+        bool ok = false;
+        if (stored) {
+            const auto it = stored->find(ch.group_id);
+            ok = ch.role_name.empty() ? it == stored->end()
+                                      : it != stored->end() && it->second == ch.role_name;
+        }
+        (ok ? out.confirmed : out.unconfirmed).push_back(ch);
     }
     return out;
 }

@@ -50,7 +50,7 @@ template <class D> LastDelivery last_of(const std::optional<std::vector<D>>& d) 
                         const char* securable) {
     if (!d.admin_fn(req, res))
         return false;
-    return !d.perm_fn || d.perm_fn(req, res, securable, "Read");
+    return d.perm_fn(req, res, securable, "Read");
 }
 
 template <class T> std::expected<T, ReadError> unavailable() {
@@ -160,6 +160,11 @@ SyncDeps bind_stores(WebhookStore* wh, OffloadTargetStore* off, DirectorySync* d
 }
 
 void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
+    // A fragment without its admin gate, securable gate or users-view audit sink
+    // would be a silent hole: refuse to register rather than serve one.
+    if (!deps.admin_fn || !deps.perm_fn || !deps.audit_read)
+        throw std::invalid_argument(
+            "register_integrations_sync_routes: admin_fn, perm_fn and audit_read are required");
     // The SyncDeps are shared by every handler; one heap copy keeps lambdas small.
     auto d = std::make_shared<const SyncDeps>(std::move(deps));
 
@@ -303,7 +308,10 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
                  // REST v1 twin's fail-closed posture).
                  // The shared behavioural-audit funnel: it catches a throwing audit sink
                  // (withheld, not a 500) and sets Sec-Audit-Failed on a failed persist.
-                 if (!detail::emit_behavioral_audit(d->audit_read, req, res,
+                 // An unset sink must not read as "audit off" here: the list is PII,
+                 // so the route fails closed (production always binds one).
+                 if (!d->audit_read ||
+                     !detail::emit_behavioral_audit(d->audit_read, req, res,
                                                     "directory.users.view", "success", "Directory",
                                                     "", "integrations page directory users read")) {
                      send_html(res, render_audit_withheld_note());

@@ -268,6 +268,11 @@ public:
     /// Get all group-to-role mappings.
     std::map<std::string, std::string> get_group_role_mappings() const;
 
+    /// Checked variant: a failed read is an error, never an empty map, so a
+    /// caller verifying a write cannot mistake "could not read" for "removed".
+    [[nodiscard]] std::expected<std::map<std::string, std::string>, DirectoryReadError>
+    get_group_role_mappings_checked() const;
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
