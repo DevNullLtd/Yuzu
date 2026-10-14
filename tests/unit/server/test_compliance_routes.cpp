@@ -12,6 +12,7 @@
  */
 
 #include "authz_gates.hpp"
+#include "compliance_api.hpp"
 #include "compliance_api_local.hpp" // make_local_compliance_api — ADR-0031 WS-A4
 #include "compliance_routes.hpp"
 #include "pg/pg_pool.hpp"
@@ -23,6 +24,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <expected>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -40,6 +43,41 @@ namespace {
 struct AuditCall {
     std::string action, result, target_type, target_id, detail;
 };
+
+/// A wired seam that answers every read with success and nothing in it: the
+/// store is reachable and nothing is defined. Lets a test tell that state from
+/// "no seam at all" without Postgres, since what the route tests pin is the
+/// degrade decision, not the query.
+class EmptyComplianceApi final : public ComplianceApi {
+public:
+    std::expected<std::vector<PolicyFragment>, PolicyReadError>
+    list_fragments(const FragmentQuery&) const override {
+        return std::vector<PolicyFragment>{};
+    }
+    std::expected<std::vector<Policy>, PolicyReadError>
+    list_policies(const PolicyQuery&) const override {
+        return std::vector<Policy>{};
+    }
+    std::expected<std::optional<PolicyDetail>, PolicyReadError>
+    get_policy(const std::string&) const override {
+        return std::optional<PolicyDetail>{};
+    }
+    std::expected<FleetCompliance, PolicyReadError> fleet_compliance() const override {
+        return FleetCompliance{};
+    }
+    std::expected<ComplianceSummary, PolicyReadError>
+    compliance_summary(const std::string&) const override {
+        return ComplianceSummary{};
+    }
+    std::expected<std::vector<PolicyAgentStatus>, PolicyReadError>
+    policy_agent_statuses(const std::string&) const override {
+        return std::vector<PolicyAgentStatus>{};
+    }
+};
+
+ComplianceRoutes::ComplianceApiPtr empty_seam() {
+    return std::make_shared<EmptyComplianceApi>();
+}
 
 struct ComplianceHarness {
     // Declaration order matters (CLAUDE.md TestRouteSink convention): `sink`
@@ -93,7 +131,11 @@ struct ComplianceHarness {
     /// degrade path exactly.
     /// `wire_fleet_read = false` registers with NO fleet_read_fn (the
     /// misconfigured call site the detail fragment must 503 on).
-    explicit ComplianceHarness(PolicyStore* policy_store = nullptr, bool wire_fleet_read = true) {
+    /// `seam` wires a ComplianceApi directly (e.g. `empty_seam()`) when a test
+    /// needs a reachable store without Postgres; a non-null `policy_store`
+    /// replaces it.
+    explicit ComplianceHarness(PolicyStore* policy_store = nullptr, bool wire_fleet_read = true,
+                               ComplianceRoutes::ComplianceApiPtr seam = nullptr) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -136,7 +178,7 @@ struct ComplianceHarness {
             return {true, fleet_scope};
         };
 
-        ComplianceRoutes::ComplianceApiPtr api;
+        ComplianceRoutes::ComplianceApiPtr api = std::move(seam);
         if (policy_store)
             api = make_local_compliance_api(*policy_store);
 
@@ -234,18 +276,35 @@ TEST_CASE("/fragments/compliance/summary: a service-scoped token is denied",
 
 TEST_CASE("/fragments/compliance/summary: an ordinary session reaches the summary",
           "[compliance]") {
+    // A reachable store with nothing defined: the "No policies defined"
+    // empty-state branch, not a denial and not an unavailable note. Confirms
+    // the deny above didn't also block the legitimate path.
+    ComplianceHarness h{nullptr, true, empty_seam()};
+
+    auto res = h.sink.Get("/fragments/compliance/summary");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("No policies defined") != std::string::npos);
+    CHECK(res->body.find("temporarily unavailable") == std::string::npos);
+    for (const auto& c : h.audit_calls) {
+        CHECK(c.action != "compliance.fragment.access_denied");
+    }
+}
+
+TEST_CASE("/fragments/compliance/summary: a missing store seam is an unavailable note, not an "
+          "empty state",
+          "[compliance]") {
+    // No ComplianceApi wired: rendering "No policies defined" would read as a
+    // healthy fleet with nothing authored, the lie ADR-0056 forbids for a
+    // degraded read. The note carries no controls, so no permission echo either.
     ComplianceHarness h;
 
     auto res = h.sink.Get("/fragments/compliance/summary");
     REQUIRE(res);
     CHECK(res->status == 200);
-    // policy_store is nullptr in this harness — the "No policies defined"
-    // empty-state branch, not a denial. Confirms the deny above didn't also
-    // block the legitimate path.
-    CHECK(res->body.find("No policies defined") != std::string::npos);
-    for (const auto& c : h.audit_calls) {
-        CHECK(c.action != "compliance.fragment.access_denied");
-    }
+    CHECK(res->body.find("store not available") != std::string::npos);
+    CHECK(res->body.find("No policies defined") == std::string::npos);
+    CHECK(res->body.find("data-can-write") == std::string::npos);
 }
 
 TEST_CASE("compliance page: cell text rules are table-prefixed so they outrank the td default",
@@ -284,14 +343,15 @@ TEST_CASE("/fragments/compliance/{policy_id}: a service-scoped token is denied",
 
 TEST_CASE("/fragments/compliance/{policy_id}: an ordinary session reaches the detail",
           "[compliance]") {
-    ComplianceHarness h;
+    // A reachable store that has no rows for the policy: the "No compliance
+    // data yet" empty-state branch, not a denial and not a degrade.
+    ComplianceHarness h{nullptr, true, empty_seam()};
 
     auto res = h.sink.Get("/fragments/compliance/pol_1");
     REQUIRE(res);
     CHECK(res->status == 200);
-    // policy_store is nullptr — the "No compliance data yet" empty-state
-    // branch, not a denial.
     CHECK(res->body.find("No compliance data yet") != std::string::npos);
+    CHECK(res->body.find("temporarily unavailable") == std::string::npos);
     for (const auto& c : h.audit_calls) {
         CHECK(c.action != "compliance.fragment.access_denied");
     }
@@ -643,13 +703,17 @@ TEST_CASE("/fragments/compliance/{id}: an unwired fleet_read_fn is 503, never an
     CHECK(h.perm_calls.empty());
 }
 
-TEST_CASE("/fragments/compliance/{id}: nothing read, nothing audited (null store)",
+TEST_CASE("/fragments/compliance/{id}: null store is a degraded note, nothing read, nothing audited",
           "[compliance][security][authz]") {
     ComplianceHarness h;
 
     auto res = h.sink.Get("/fragments/compliance/pol_1");
     REQUIRE(res);
     CHECK(res->status == 200);
+    // The honest degrade, never the empty state that tells an operator to wait.
+    CHECK(res->body.find("temporarily unavailable") != std::string::npos);
+    CHECK(res->body.find("No compliance data yet") == std::string::npos);
+    // No rows were read, so no behavioural-PII access is audited.
     for (const auto& c : h.audit_calls)
         CHECK(c.action != "compliance.agent_statuses.view");
 }
@@ -892,7 +956,7 @@ TEST_CASE("compliance page: actions use one delegated [data-act] listener, no in
 TEST_CASE("/fragments/compliance/summary: probes Write, Execute and Delete once and echoes them",
           "[compliance][fragments]") {
     {
-        ComplianceHarness h;
+        ComplianceHarness h{nullptr, true, empty_seam()};
         auto res = h.sink.Get("/fragments/compliance/summary");
         REQUIRE(res);
         CHECK(res->status == 200);
@@ -908,7 +972,7 @@ TEST_CASE("/fragments/compliance/summary: probes Write, Execute and Delete once 
     {
         // A viewer with Read only: probes failing must leave the response
         // untouched (throwaway Response) and render no controls.
-        ComplianceHarness h;
+        ComplianceHarness h{nullptr, true, empty_seam()};
         h.perm_deny_op = "Write";
         auto res = h.sink.Get("/fragments/compliance/summary");
         REQUIRE(res);

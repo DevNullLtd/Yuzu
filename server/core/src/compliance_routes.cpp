@@ -65,6 +65,14 @@ std::string list_json(nlohmann::json data, int64_t total, int64_t start = 0,
 std::string ComplianceRoutes::render_compliance_summary_fragment(bool can_write, bool can_execute,
                                                                  bool can_delete) {
     namespace ch = compliance_html;
+    // No store seam is a wiring fault, not "no policies": rendering the empty
+    // state would read as a healthy fleet with nothing defined. Same degrade
+    // as the fragments list.
+    if (!api_) {
+        return ch::render_unavailable(
+            "Policy data temporarily unavailable (store not available) — try again shortly.");
+    }
+
     ch::SummaryView view;
     view.can_write = can_write;
     view.can_execute = can_execute;
@@ -76,36 +84,34 @@ std::string ComplianceRoutes::render_compliance_summary_fragment(bool can_write,
     // policies" — collapsing them would show a false "0 policies, nothing to
     // see" state when the real answer is "could not ask the store".
     bool degraded = false;
-    if (api_) {
-        auto all_policies = api_->list_policies(query);
-        if (!all_policies) {
-            degraded = true;
-        } else {
-            for (const auto& p : *all_policies) {
-                auto cs = api_->compliance_summary(p.id);
-                if (!cs) {
-                    degraded = true;
-                    continue;
-                }
-                // #4034 Rule 1: identity/scope/enabled and the status tally come
-                // from the SAME builders GET /api/v1/policies and
-                // GET /api/v1/compliance/{id} call — this fragment cannot drift
-                // from the REST/MCP field selection (docs/api-twin-recipe.md §1).
-                nlohmann::json row_j = policy_list_row_json(p);
-                nlohmann::json cs_j = compliance_summary_json(*cs);
-                ch::PolicyRow row;
-                row.id = row_j.at("id").get<std::string>();
-                row.name = row_j.at("name").get<std::string>();
-                row.scope = row_j.at("scope_expression").get<std::string>();
-                row.enabled = row_j.at("enabled").get<bool>();
-                row.compliant = cs_j.at("compliant").get<int64_t>();
-                row.non_compliant = cs_j.at("non_compliant").get<int64_t>();
-                row.unknown = cs_j.at("unknown").get<int64_t>();
-                row.fixing = cs_j.at("fixing").get<int64_t>();
-                row.error = cs_j.at("error").get<int64_t>();
-                row.total = cs_j.at("total").get<int64_t>();
-                view.policies.push_back(std::move(row));
+    auto all_policies = api_->list_policies(query);
+    if (!all_policies) {
+        degraded = true;
+    } else {
+        for (const auto& p : *all_policies) {
+            auto cs = api_->compliance_summary(p.id);
+            if (!cs) {
+                degraded = true;
+                continue;
             }
+            // #4034 Rule 1: identity/scope/enabled and the status tally come
+            // from the SAME builders GET /api/v1/policies and
+            // GET /api/v1/compliance/{id} call — this fragment cannot drift
+            // from the REST/MCP field selection (docs/api-twin-recipe.md §1).
+            nlohmann::json row_j = policy_list_row_json(p);
+            nlohmann::json cs_j = compliance_summary_json(*cs);
+            ch::PolicyRow row;
+            row.id = row_j.at("id").get<std::string>();
+            row.name = row_j.at("name").get<std::string>();
+            row.scope = row_j.at("scope_expression").get<std::string>();
+            row.enabled = row_j.at("enabled").get<bool>();
+            row.compliant = cs_j.at("compliant").get<int64_t>();
+            row.non_compliant = cs_j.at("non_compliant").get<int64_t>();
+            row.unknown = cs_j.at("unknown").get<int64_t>();
+            row.fixing = cs_j.at("fixing").get<int64_t>();
+            row.error = cs_j.at("error").get<int64_t>();
+            row.total = cs_j.at("total").get<int64_t>();
+            view.policies.push_back(std::move(row));
         }
     }
 
@@ -114,14 +120,12 @@ std::string ComplianceRoutes::render_compliance_summary_fragment(bool can_write,
             "Policy data temporarily unavailable (store degraded) — try again shortly.");
     }
 
-    if (api_) {
-        auto fc_res = api_->fleet_compliance();
-        if (!fc_res) {
-            return ch::render_unavailable("Fleet compliance temporarily unavailable (store "
-                                          "degraded) — try again shortly.");
-        }
-        view.fleet = *fc_res;
+    auto fc_res = api_->fleet_compliance();
+    if (!fc_res) {
+        return ch::render_unavailable("Fleet compliance temporarily unavailable (store "
+                                      "degraded) — try again shortly.");
     }
+    view.fleet = *fc_res;
     return ch::render_summary(view);
 }
 
@@ -136,76 +140,83 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(
     view.policy_name = policy_id;
     view.confined = scope.has_value();
 
-    if (api_) {
-        // The header is best-effort: a degraded read or a not-found keeps the
-        // id as the displayed name and omits the kv panel. Definition reads
-        // (name, scope expression, bound fragment) are a GLOBAL Policy:Read on
-        // the REST twins (perm_fn_); this route's fleet-read gate also admits
-        // a holder whose grant arrives only through a management group, so a
-        // confined caller gets the per-device rows and nothing else, exactly
-        // what GET /api/v1/compliance/{id} returns.
-        if (!view.confined) {
-            auto policy = api_->get_policy(policy_id);
-            if (policy && *policy) {
-                const auto& d = **policy;
-                view.have_policy = true;
-                view.policy_name = d.policy.name;
-                view.applies_to = d.policy.scope_expression;
-                view.remediation_available = d.remediation_available;
-                auto frags = api_->list_fragments(FragmentQuery{});
-                if (frags) {
-                    for (const auto& f : *frags) {
-                        if (f.id == d.policy.fragment_id) {
-                            view.check = f.check_compliance;
-                            break;
-                        }
+    if (!api_) {
+        // No store seam is a wiring fault, not a policy with no data yet: render
+        // the degraded note a failed read gets, never "No compliance data yet".
+        // rows_read stays unset, so no audit row is written for a view that
+        // read nothing.
+        view.degraded = true;
+        return ch::render_detail(view);
+    }
+
+    // The header is best-effort: a degraded read or a not-found keeps the
+    // id as the displayed name and omits the kv panel. Definition reads
+    // (name, scope expression, bound fragment) are a GLOBAL Policy:Read on
+    // the REST twins (perm_fn_); this route's fleet-read gate also admits
+    // a holder whose grant arrives only through a management group, so a
+    // confined caller gets the per-device rows and nothing else, exactly
+    // what GET /api/v1/compliance/{id} returns.
+    if (!view.confined) {
+        auto policy = api_->get_policy(policy_id);
+        if (policy && *policy) {
+            const auto& d = **policy;
+            view.have_policy = true;
+            view.policy_name = d.policy.name;
+            view.applies_to = d.policy.scope_expression;
+            view.remediation_available = d.remediation_available;
+            auto frags = api_->list_fragments(FragmentQuery{});
+            if (frags) {
+                for (const auto& f : *frags) {
+                    if (f.id == d.policy.fragment_id) {
+                        view.check = f.check_compliance;
+                        break;
                     }
                 }
             }
         }
+    }
 
-        auto statuses = api_->policy_agent_statuses(policy_id);
-        if (!statuses) {
-            view.degraded = true;
-        } else {
-            // #4034 Rule 1 + ADR-0017: the SAME confined tally REST's
-            // GET /api/v1/compliance/{id} and MCP's get_policy_agent_statuses
-            // use, narrowed to the caller's own scope.
-            auto confined = confined_policy_compliance(*statuses, scope, policy_id);
-            view.summary = confined.summary;
-            rows_read = confined.visible.size();
+    auto statuses = api_->policy_agent_statuses(policy_id);
+    if (!statuses) {
+        view.degraded = true;
+    } else {
+        // #4034 Rule 1 + ADR-0017: the SAME confined tally REST's
+        // GET /api/v1/compliance/{id} and MCP's get_policy_agent_statuses
+        // use, narrowed to the caller's own scope.
+        auto confined = confined_policy_compliance(*statuses, scope, policy_id);
+        view.summary = confined.summary;
+        rows_read = confined.visible.size();
 
-            // One registry read per render, not one per row.
-            std::unordered_map<std::string, std::pair<std::string, std::string>> by_agent;
-            try {
-                auto arr = nlohmann::json::parse(agents_json_fn_());
-                for (const auto& a : arr) {
-                    by_agent[a.value("agent_id", std::string{})] = {
-                        a.value("hostname", std::string{}), a.value("os", std::string{})};
-                }
-            } catch (...) {
-                // Hostname/OS are display-only; fall back to the agent id.
+        // One registry read per render, not one per row.
+        std::unordered_map<std::string, std::pair<std::string, std::string>> by_agent;
+        try {
+            auto arr = nlohmann::json::parse(agents_json_fn_());
+            for (const auto& a : arr) {
+                by_agent[a.value("agent_id", std::string{})] = {
+                    a.value("hostname", std::string{}), a.value("os", std::string{})};
             }
+        } catch (...) {
+            // Hostname/OS are display-only; fall back to the agent id.
+        }
 
-            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                                 std::chrono::system_clock::now().time_since_epoch())
-                                 .count();
-            for (const auto& s : confined.visible) {
-                nlohmann::json row_j = policy_agent_status_json(s);
-                ch::DetailAgent row;
-                row.agent_id = row_j.at("agent_id").get<std::string>();
-                row.status = row_j.at("status").get<std::string>();
-                row.detail = row_j.at("check_result").get<std::string>();
-                row.hostname = row.agent_id;
-                auto it = by_agent.find(row.agent_id);
-                if (it != by_agent.end()) {
-                    if (!it->second.first.empty())
-                        row.hostname = it->second.first;
-                    row.os = it->second.second;
-                }
-                row.last_check = ch::format_age(now, row_j.at("last_check_at").get<int64_t>());
-                view.agents.push_back(std::move(row));
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+        for (const auto& s : confined.visible) {
+            nlohmann::json row_j = policy_agent_status_json(s);
+            ch::DetailAgent row;
+            row.agent_id = row_j.at("agent_id").get<std::string>();
+            row.status = row_j.at("status").get<std::string>();
+            row.detail = row_j.at("check_result").get<std::string>();
+            row.hostname = row.agent_id;
+            auto it = by_agent.find(row.agent_id);
+            if (it != by_agent.end()) {
+                if (!it->second.first.empty())
+                    row.hostname = it->second.first;
+                row.os = it->second.second;
             }
+            row.last_check = ch::format_age(now, row_j.at("last_check_at").get<int64_t>());
+            view.agents.push_back(std::move(row));
         }
     }
     return ch::render_detail(view);
