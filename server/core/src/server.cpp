@@ -153,6 +153,7 @@
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
+#include "groups_routes.hpp" // Groups and enrolment page (Phase 2 UI): /groups + its script
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
 #include "instruction_routes.hpp" // #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
@@ -15224,6 +15225,11 @@ private:
             .viz_disabled = &viz_disabled_,
             .registry = &registry_,
         });
+
+        // Groups and enrolment page (Phase 2 UI): GET /groups and its script. The page's
+        // panels are the existing /fragments/settings/{tokens,pending,auto-approve}.
+        yuzu::server::groups::register_groups_routes(
+            inline_sink, yuzu::server::groups::Deps{.auth_fn = auth_fn});
 
         // #2542 follow-up: 7 dashboard/API routes with no single owning store
         // (/api/me, /api/agents, /api/audit, /api/export/json-to-csv,

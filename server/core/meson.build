@@ -181,6 +181,20 @@ yuzu_viz_host_js_embed = custom_target(
   ],
 )
 
+# Groups and enrolment page: client glue for /groups. Symbol: kYuzuGroupsJs (std::string).
+yuzu_groups_js_embed = custom_target(
+  'yuzu_groups_js_bundle',
+  input: 'static/yuzu-groups.js',
+  output: 'yuzu_groups_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuGroupsJs',
+  ],
+)
+
 cytoscape_js_embed = custom_target(
   'cytoscape_js_bundle',
   input: 'static/cytoscape.min.js',
@@ -375,7 +389,7 @@ yuzu_key_provider_dep = declare_dependency(
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
-   yuzu_viz_host_js_embed, cytoscape_js_embed,
+   yuzu_viz_host_js_embed, yuzu_groups_js_embed, cytoscape_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -401,6 +415,8 @@ yuzu_server_core_lib = static_library(
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
+    'src/groups_ui.cpp', # Groups and enrolment page: the page template
+    'src/groups_routes.cpp', # Groups and enrolment page: /groups + static glue
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',

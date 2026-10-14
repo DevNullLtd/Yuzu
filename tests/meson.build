@@ -1686,6 +1686,8 @@ if build_server
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_groups_page.cpp', # Groups and enrolment page: /groups gate, headers, template contract
+      'unit/server/test_groups_js.cpp', # Groups and enrolment page: string pins on yuzu-groups.js
       'unit/server/test_nav_shells.cpp',            # app shell: nav model, renderer, marker swap, per-page active item
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
