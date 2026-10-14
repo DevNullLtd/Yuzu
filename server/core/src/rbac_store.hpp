@@ -360,7 +360,24 @@ public:
     [[nodiscard]] bool rbac_enabled_view_degraded() const;
 
     // ── Roles CRUD ───────────────────────────────────────────────────────
+    /// LEGACY fail-soft: `list_roles_checked().value_or({})` — a store-not-open
+    /// / pool-acquire-timeout / query-error degrade renders as an empty
+    /// vector, INDISTINGUISHABLE from a store with no roles. Prefer
+    /// `list_roles_checked`. `GET /api/v1/rbac/roles` and
+    /// `GET /api/v1/rbac/roles/{role}/permissions` are on the checked read.
     std::vector<RbacRole> list_roles() const;
+
+    /// Authoritative variant of `list_roles` — same posture as
+    /// `get_role_permissions_checked`: `unexpected(msg)` is a closed store
+    /// (`kRbacErrStoreNotOpen`), a pool-acquire timeout
+    /// (`kRbacErrPoolAcquireTimeout`) or a query error ("query failed: ...");
+    /// a value (possibly empty) is a genuine, fully-read result. A pool
+    /// timeout or query error also bumps
+    /// `yuzu_server_rbac_read_degrade_total{reason}`, so `list_roles` — which
+    /// is this read with the error collapsed to an empty vector — makes its
+    /// remaining fail-soft callers visible there.
+    std::expected<std::vector<RbacRole>, std::string> list_roles_checked() const;
+
     std::optional<RbacRole> get_role(const std::string& name) const;
     std::expected<void, std::string> create_role(const RbacRole& role);
     std::expected<void, std::string> update_role(const std::string& name,
