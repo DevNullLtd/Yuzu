@@ -10,6 +10,7 @@
 ///   /fragments/access/roles/list        Roles panel; loud UserManagement:Read, 200 always
 ///   /fragments/access/roles/permissions Role permissions panel (?role=); same gate
 ///   /fragments/access/roles/assignments Role assignments panel; loud AccessReview:Read, audited
+///   /fragments/access/enforcement       RBAC enforcement panel; any signed-in session
 ///   /static/yuzu-access.js              the page's client glue
 ///
 /// No mutating route is added. The write controls call routes that already exist (the
@@ -21,6 +22,7 @@
 /// their REST twins (`GET /api/v1/rbac/roles`, `.../{role}/permissions`), which emit none
 /// either. A denial audits through the gate itself.
 
+#include "access_render.hpp"
 #include "rbac_store.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -67,6 +69,9 @@ struct Deps {
     /// `RbacStore::list_all_principal_roles_checked()`.
     using ListAssignmentsFn = std::function<std::expected<std::vector<PrincipalRole>, std::string>()>;
 
+    /// The cached enforcement view. `unexpected` = the RBAC store is not open.
+    using EnforcementStateFn = std::function<std::expected<EnforcementView, std::string>()>;
+
     // Designated initialisers must follow this order (GCC and MSVC reject a reordered one).
     AuthFn auth_fn;
     AdminFn admin_fn;
@@ -76,6 +81,7 @@ struct Deps {
     ListRolesFn list_roles_fn;
     RolePermissionsFn role_permissions_fn;
     ListAssignmentsFn list_assignments_fn;
+    EnforcementStateFn enforcement_state_fn;
 };
 
 /// Throws `std::invalid_argument` when any `Deps` member is unbound.

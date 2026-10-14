@@ -9902,6 +9902,14 @@ Render the Role assignments panel: every fleet-wide grant (type, principal, role
 - **Response (403):** The caller lacks `AccessReview:Read`, or the session is an engine session (the latter is audited as `engine_session_denied`).
 - **Headers:** `Cache-Control: no-store`.
 
+**`GET /fragments/access/enforcement`**
+
+Render the RBAC enforcement panel.
+
+- **Permission:** any signed-in session, the same as its twin `GET /api/v1/me`. Neither the account-role gate nor a permission gate is applied.
+- **Response (200):** HTML fragment: the setting (On or Off) with an **Enforce roles** switch for an administrator account hint, a read-only switch for everyone else, **Unconfirmed** when the store's view could not be confirmed (the cached flag is not drawn at all in that case), or a red "could not be read" box when the RBAC store is not open. Never "Off" for a failed read.
+- **Headers:** `Cache-Control: no-store`. No audit row (the twin writes none).
+
 **`GET /fragments/access/users/detail?username=<name>`**
 
 Render the Account panel for one active account.

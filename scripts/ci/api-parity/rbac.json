@@ -135,5 +135,16 @@
     },
     "mcp_twin": "list_rbac_role_assignments",
     "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/enforcement",
+    "capability_id": "get.fragments-access-enforcement",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/me"
+    },
+    "mcp_twin": null,
+    "status": "twinned"
   }
 ]

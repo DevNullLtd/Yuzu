@@ -88,6 +88,23 @@ TEST_CASE("access glue: assignments, derived cells and Your account call the exi
     CHECK_THAT(js, ContainsSubstring("full ? String(byRole.get(td.dataset.assignedFor) || 0) : 'Not shown'"));
 }
 
+TEST_CASE("access glue: enforcement, elevation and the permission check keep their guards",
+          "[access][js]") {
+    const std::string& js = yuzu::server::kYuzuAccessJs;
+    for (const char* token :
+         {"ACTS.enforce", "ACTS.elevate", "ACTS.stepdown", "ACTS.check",
+          "'/api/v1/rbac/enforcement'", "{ json: { enabled: want } }",
+          // The switch is put back at once; only a redraw from the server changes it.
+          "sw.checked = !want;", "reloadPanels()",
+          "'/api/v1/elevate'", "'/api/v1/elevate/revoke'", "justification", "duration_secs",
+          "new TextEncoder().encode(j).length > 1024", "Enter a reason.", "r.auditFailed", "r.data.expires_at",
+          "'/api/v1/rbac/check'", "securable_type", "typeof allowed === 'boolean'", "Enter an area and an operation.",
+          "the role store may not have answered: check again.", "data-slot=\"out\""}) {
+        INFO(token);
+        CHECK_THAT(js, ContainsSubstring(token));
+    }
+}
+
 TEST_CASE("access page: the template is inline-free, single-shell and under the MSVC literal cap",
           "[access][js]") {
     const std::string t = kAccessUsersTemplate;
@@ -123,6 +140,9 @@ TEST_CASE("access page: the template's sentences are byte-equal to the renderer'
     CHECK_THAT(t, ContainsSubstring("data-denied=\"" + std::string(kAssignmentsDenied) + "\""));
     CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kAssignmentsUnavailable) + "\""));
     CHECK_THAT(t, ContainsSubstring("data-src=\"/fragments/access/roles/assignments\""));
+    CHECK_THAT(t, ContainsSubstring("data-denied=\"" + std::string(kEnforcementDenied) + "\""));
+    CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kEnforcementUnavailable) + "\""));
+    CHECK_THAT(t, ContainsSubstring("data-src=\"/fragments/access/enforcement\""));
     // The marker the page route fills with the signed-in user's own panel, exactly once.
     CHECK(t.find(std::string(kAccountMarker)) != std::string::npos);
     CHECK(t.find(std::string(kAccountMarker)) == t.rfind(std::string(kAccountMarker)));
@@ -130,4 +150,25 @@ TEST_CASE("access page: the template's sentences are byte-equal to the renderer'
     CHECK_THAT(t, ContainsSubstring("data-src=\"/fragments/access/roles/list\""));
     // Both panels name their own refetch source for the Retry button.
     CHECK_THAT(t, ContainsSubstring("data-src=\"/fragments/access/users/list\""));
+}
+
+TEST_CASE("access page: elevation and check are static markup with the bounds the server enforces",
+          "[access][js]") {
+    const std::string t = kAccessUsersTemplate;
+    for (const char* token :
+         {"id=\"el-j\" maxlength=\"1024\"", "data-act=\"elevate\"", "data-act=\"stepdown\"",
+          "standing Administrator role", "id=\"ck-s\" type=\"text\" maxlength=\"128\"",
+          "id=\"ck-o\" type=\"text\" maxlength=\"64\"", "data-act=\"check\""}) {
+        INFO(token);
+        CHECK_THAT(t, ContainsSubstring(token));
+    }
+    // The disabled "another person" field has no name and no action: nothing can submit it.
+    const auto at = t.find("id=\"ck-w\"");
+    REQUIRE(at != std::string::npos);
+    const auto tag = t.substr(at, t.find('>', at) - at);
+    CHECK_THAT(tag, ContainsSubstring("disabled"));
+    CHECK_THAT(tag, !ContainsSubstring("name="));
+    CHECK_THAT(tag, !ContainsSubstring("data-act"));
+    // No per-row elevate anywhere: the handlers read fixed ids and so act on the caller only.
+    CHECK_THAT(yuzu::server::kYuzuAccessJs, ContainsSubstring("document.getElementById('el-j')"));
 }

@@ -1148,6 +1148,7 @@ SETTINGS_FRAGMENTS=(
     "/fragments/access/users/list"
     "/fragments/access/users/detail"
     "/fragments/access/roles/assignments"
+    "/fragments/access/enforcement"
     "/fragments/access/roles/list"
     "/fragments/access/roles/permissions?role=Viewer"
     "/fragments/settings/tokens"

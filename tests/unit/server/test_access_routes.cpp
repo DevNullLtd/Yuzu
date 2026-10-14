@@ -22,6 +22,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -95,6 +98,8 @@ struct Harness {
     bool audit_persists{true};
     std::vector<std::vector<std::string>> audits;
     int perms_calls{0};
+    int enforce_calls{0};
+    std::expected<access::EnforcementView, std::string> enforce_result{access::EnforcementView{true, false, false}};
     std::string perms_asked_role;
     std::expected<std::vector<Permission>, std::string> perms_result{std::vector<Permission>{
         perm("Tag", "Read"), perm("Tag", "Write")}};
@@ -147,6 +152,10 @@ struct Harness {
             ++roles_calls;
             return roles_result;
         };
+        d.enforcement_state_fn = [this]() {
+            ++enforce_calls;
+            return enforce_result;
+        };
         d.list_assignments_fn = [this]() {
             ++assigns_calls;
             return assigns_result;
@@ -175,6 +184,7 @@ TEST_CASE("access routes: registration fails fast when any dependency is unbound
         [](access::Deps& d) { d.list_roles_fn = nullptr; },
         [](access::Deps& d) { d.role_permissions_fn = nullptr; },
         [](access::Deps& d) { d.list_assignments_fn = nullptr; },
+        [](access::Deps& d) { d.enforcement_state_fn = nullptr; },
     };
     for (const auto& f : unbind) {
         Harness h;
@@ -603,4 +613,117 @@ TEST_CASE("access routes: no hint for an SSO, token, MCP or engine-class session
         CHECK_THAT(res->body, !ContainsSubstring("data-act=\"assign\""));
         CHECK_THAT(res->body, !ContainsSubstring("data-act=\"unassign\""));
     }
+}
+
+// ── RBAC enforcement ─────────────────────────────────────────────────────────
+
+TEST_CASE("access routes: enforcement needs a session and nothing else", "[access][routes]") {
+    Harness h;
+    h.wire();
+    auto res = h.sink.dispatch("GET", "/fragments/access/enforcement");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Content-Type") == "text/html; charset=utf-8");
+    CHECK(res->get_header_value("Cache-Control") == "no-store");
+    CHECK(h.enforce_calls == 1);
+    // Neither the account-role gate nor a permission gate: the twin (GET /api/v1/me) has neither.
+    CHECK(h.admin_calls == 0);
+    CHECK(h.perm_asked.empty());
+    CHECK(h.audits.empty());
+
+    // No session: the store is never read.
+    Harness n;
+    n.session_present = false;
+    n.wire();
+    res = n.sink.dispatch("GET", "/fragments/access/enforcement");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(n.enforce_calls == 0);
+}
+
+TEST_CASE("access routes: an unreadable RBAC store is a 200 red box with no store text", "[access][routes]") {
+    Harness h;
+    h.enforce_result = std::unexpected(std::string("rbac store not open: PGRES details"));
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/fragments/access/enforcement");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("role=\"alert\""));
+    CHECK_THAT(res->body, !ContainsSubstring("<input"));
+    CHECK_THAT(res->body, !ContainsSubstring("PGRES"));
+}
+
+TEST_CASE("access routes: the switch is live only for a local account admin on a cookie session",
+          "[access][routes]") {
+    struct Case {
+        auth::Role role;
+        const char* source;
+        const char* kind;
+        const char* tier;
+        bool live;
+    };
+    const Case cases[] = {
+        {auth::Role::admin, "local", "human", "", true},
+        {auth::Role::user, "local", "human", "", false},
+        {auth::Role::admin, "oidc", "human", "", false},
+        {auth::Role::admin, "local", "engine", "", false},
+        {auth::Role::admin, "local", "human", "operator", false},
+    };
+    for (const auto& c : cases) {
+        INFO(c.source << "/" << c.kind << "/" << c.tier);
+        Harness h;
+        h.session_role = c.role;
+        h.session_source = c.source;
+        h.session_kind = c.kind;
+        h.session_mcp_tier = c.tier;
+        h.wire();
+        const auto res = h.sink.dispatch("GET", "/fragments/access/enforcement");
+        REQUIRE(res);
+        CHECK((res->body.find("data-act=\"enforce\"") != std::string::npos) == c.live);
+    }
+}
+
+TEST_CASE("access routes: the wiring in server.cpp uses the checked reads and the display accessors only",
+          "[access][routes]") {
+    // Every case above stubs the gates and stores; pin what the real binding reads.
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    namespace fs = std::filesystem;
+    auto slurp = [](const fs::path& p) {
+        REQUIRE(fs::exists(p));
+        std::ifstream in(p, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string server = slurp(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    const auto at = server.find("register_access_routes(");
+    REQUIRE(at != std::string::npos);
+    const auto end = server.find("register_access_tokens_routes(", at);
+    REQUIRE(end != std::string::npos);
+    const std::string blk = server.substr(at, end - at);
+    // The loud account-role gate really is require_admin, not a permissive lambda.
+    CHECK_THAT(blk, ContainsSubstring("return require_admin(req, res);"));
+    CHECK_THAT(blk, ContainsSubstring("auth_db_->list_users()"));
+    CHECK_THAT(blk, ContainsSubstring(".perm_fn = perm_fn"));
+    CHECK_THAT(blk, ContainsSubstring("rbac_store_->list_roles_checked()"));
+    CHECK_THAT(blk, ContainsSubstring("rbac_store_->get_role_permissions_checked(role)"));
+    CHECK_THAT(blk, ContainsSubstring("rbac_store_->list_all_principal_roles_checked()"));
+    // Enforcement: the cached view first, then the staleness flag, in that order.
+    const auto en = blk.find("rbac_store_->is_rbac_enabled()");
+    REQUIRE(en != std::string::npos);
+    const auto dg = blk.find("rbac_store_->rbac_enabled_view_degraded()");
+    REQUIRE(dg != std::string::npos);
+    CHECK(en < dg);
+
+    // The routed A2/A1 row reserves these two predicates; neither renderer nor routes may call them.
+    for (const char* file : {"access_routes.cpp", "access_render.cpp", "access_routes.hpp", "access_render.hpp"}) {
+        INFO(file);
+        const std::string text = slurp(fs::path(YUZU_SERVER_SRC_DIR) / file);
+        CHECK_THAT(text, !ContainsSubstring("is_rbac_administrator("));
+        CHECK_THAT(text, !ContainsSubstring("rbac_enforcement_label("));
+        // The closed role list is reached through its accessor, never the array.
+        CHECK_THAT(text, !ContainsSubstring("kRbacAssignableRoles"));
+    }
+    CHECK_THAT(blk, !ContainsSubstring("rbac_enforcement_label("));
+    CHECK_THAT(blk, !ContainsSubstring("is_rbac_administrator("));
 }

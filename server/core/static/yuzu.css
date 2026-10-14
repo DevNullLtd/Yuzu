@@ -937,6 +937,8 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 #acc-alert:empty, #acc-msg:empty { display: none; }
 .panel table td.wrap { white-space: normal; overflow-wrap: anywhere; }
 .tw.scroll { max-height: 320px; overflow: auto; }
+.sw:disabled { opacity: .5; cursor: not-allowed; }
+[data-slot="out"]:empty { display: none; }
 .acts { display: grid; border-top: 1px solid var(--line); }
 .acts > div { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); }
 .acts > div:last-child { border-bottom: 0; }

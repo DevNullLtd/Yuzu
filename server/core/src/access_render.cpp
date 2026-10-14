@@ -369,6 +369,40 @@ std::string render_your_account(const std::string& username, const std::string& 
     return out;
 }
 
+// ---- RBAC enforcement ---------------------------------------------------------------------
+
+std::string render_enforcement(const std::variant<EnforcementView, Unavailable>& state) {
+    const auto* v = std::get_if<EnforcementView>(&state);
+    const std::string retry = "<button type=\"button\" class=\"btn sm\" data-act=\"reload\" "
+                              "data-target=\"acc-enforcement\">Retry</button>";
+    if (!v)
+        return "<div class=\"hd\"><h2>RBAC enforcement</h2></div><div class=\"pb\">" +
+               failbox("The enforcement setting could not be read.", kEnforcementUnavailable, retry) + "</div>";
+    const std::string out_slot = "<div class=\"pb\" data-slot=\"out\" role=\"status\" aria-live=\"polite\"></div>";
+    const std::string title = "<div class=\"hd\"><h2>RBAC enforcement</h2></div>";
+    if (v->degraded)
+        return title + "<div class=\"tog\"><div class=\"t\"><b>Enforce roles</b><span>Unconfirmed. The server could "
+               "not confirm the current setting and treats enforcement as On until it can.</span></div>"
+               "<span class=\"pill warn\">Unconfirmed</span></div><div class=\"pb\">" + retry + "</div>" + out_slot;
+
+    std::string text;
+    if (!v->may_toggle)
+        text = std::string(v->enabled ? "On." : "Off.") + " Only a durable Administrator can change this.";
+    else if (v->enabled)
+        text = "On: access follows each person's RBAC roles. Off: access follows the account role, so admins can "
+               "do everything and users can read most things and change nothing.";
+    else
+        text = "Off. Turning it on needs a fleet-wide Administrator grant for you and a current local admin "
+               "account, plus an MFA code.";
+    std::string sw = "<input class=\"sw\" type=\"checkbox\" role=\"switch\" aria-label=\"RBAC enforcement\"";
+    if (v->enabled)
+        sw += " checked";
+    sw += v->may_toggle ? " data-act=\"enforce\">"
+                        : " disabled title=\"Only a durable Administrator can change this.\">";
+    return title + "<div class=\"tog\"><div class=\"t\"><b>Enforce roles</b><span>" + esc(text) + "</span></div>" + sw +
+           "</div>" + out_slot;
+}
+
 std::string render_select_role() {
     return "<div class=\"hd\"><h2>Role permissions</h2></div><div class=\"empty\"><span>" +
            esc(kSelectRole) + "</span></div>";

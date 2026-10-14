@@ -143,3 +143,10 @@ TEST_CASE("access golden: your account", "[access][golden]") {
     check_golden("your-account__local", render_your_account("alice", "local"));
     check_golden("your-account__sso", render_your_account("oidc:https://idp.example/realm#7f3a", "oidc"));
 }
+
+TEST_CASE("access golden: enforcement", "[access][golden]") {
+    check_golden("enforcement__on-admin", render_enforcement(EnforcementView{true, false, true}));
+    check_golden("enforcement__off-readonly", render_enforcement(EnforcementView{false, false, false}));
+    check_golden("enforcement__degraded", render_enforcement(EnforcementView{true, true, true}));
+    check_golden("enforcement__unavailable", render_enforcement(Unavailable{}));
+}

@@ -71,6 +71,47 @@ extern const char* const kAccessUsersTemplate =
         <div class="empty"><span>Select a user from the list to see the account.</span></div>
       </section>
       <!--yuzu:account-->
+      <section class="panel" id="acc-elevation">
+        <div class="hd"><h2>Your elevation</h2></div>
+        <div class="form">
+          <div class="fld"><label for="el-j">Reason</label>
+            <textarea id="el-j" maxlength="1024" autocomplete="off" placeholder="Why do you need admin rights?"></textarea>
+            <span class="hint">Required, recorded in the audit log. Up to 1024 bytes.</span></div>
+          <div class="fld"><label for="el-d">Duration (seconds)</label>
+            <input class="in mono" id="el-d" type="text" inputmode="numeric" autocomplete="off" value="3600">
+            <span class="hint">Capped by the server (default 3600). A longer value is clamped.</span></div>
+        </div>
+        <div class="btns"><button type="button" class="btn primary" data-act="elevate">Elevate my session</button>
+          <button type="button" class="btn" data-act="stepdown">Step down</button></div>
+        <div class="pb" data-slot="out" role="status" aria-live="polite"></div>
+        <div class="pb"><p class="hint">This page cannot show whether your session is currently elevated. Step down is always safe.</p>
+          <p class="hint">While elevated you can use administrator features. Assigning roles and changing RBAC enforcement still need your own standing Administrator role.</p></div>
+      </section>
+      <section class="panel" id="acc-check">
+        <div class="hd"><h2>Check your own permission</h2></div>
+        <div class="form">
+          <div class="row2">
+            <div class="fld"><label for="ck-s">Area</label>
+              <input class="in mono" id="ck-s" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="UserManagement">
+              <span class="hint">The area of the platform, for example UserManagement or AuditLog.</span></div>
+            <div class="fld"><label for="ck-o">Operation</label>
+              <input class="in mono" id="ck-o" type="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="Read">
+              <span class="hint">The operation, for example Read or Write.</span></div>
+          </div>
+          <div class="fld"><label for="ck-w">Check for another person</label>
+            <input class="in" id="ck-w" type="text" disabled placeholder="Not available yet" title="The check only covers the signed-in account. Checking another person is not available yet."></div>
+        </div>
+        <div class="btns"><button type="button" class="btn primary" data-act="check">Check permission</button></div>
+        <div class="pb" data-slot="out" role="status" aria-live="polite"></div>
+        <div class="pb"><p class="hint">Checks your role grants only. While enforcement is off, access follows your account role instead, so Denied here does not by itself block you.</p></div>
+      </section>
+      <section class="panel" id="acc-enforcement" hx-get="/fragments/access/enforcement" hx-trigger="load" hx-swap="innerHTML"
+               data-src="/fragments/access/enforcement"
+               data-denied="The enforcement setting needs a signed-in session."
+               data-unavailable="The enforcement setting could not be read. This is not the same as it being off.">
+        <div class="hd"><h2>RBAC enforcement</h2></div>
+        <div class="pb"><p class="hint">Loading...</p></div>
+      </section>
     </div>
   </div>
 </main>

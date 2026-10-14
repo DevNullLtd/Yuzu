@@ -331,6 +331,141 @@
     });
   };
 
+  // ---- RBAC enforcement, your elevation, check your own permission ----
+  // These panels sit in the lower column, so their outcome goes in the panel's own
+  // [data-slot=out] region, not the page-top message line.
+
+  function sayIn(panelId, kind, text, more) {
+    var slot = document.querySelector('#' + panelId + ' [data-slot="out"]');
+    if (!slot) return;
+    slot.replaceChildren();
+    if (!text) return;
+    if (kind === 'bad') {
+      var box = el('div', 'failbox');
+      box.setAttribute('role', 'alert');
+      var msg = el('div', null, text);
+      if (more) { msg.appendChild(document.createElement('br')); msg.appendChild(el('span', 'guard', more)); }
+      box.appendChild(msg);
+      slot.appendChild(box);
+    } else {
+      slot.appendChild(el('p', 'hint', text));
+    }
+  }
+
+  // Re-read every panel that has a source. The state behind other panels may have changed
+  // (a turned-off enforcement or an elevation changes what their gates let through).
+  function reloadPanels() {
+    var waits = [];
+    document.querySelectorAll('section[data-src]').forEach(function (p) {
+      waits.push(Promise.resolve(htmx.ajax('GET', p.dataset.src, { target: '#' + p.id })).catch(function () {}));
+    });
+    return Promise.all(waits);
+  }
+
+  function remediation(r) {
+    return r.data && r.data.error && typeof r.data.error.remediation === 'string' ? r.data.error.remediation : '';
+  }
+
+  var ENFORCE_NOTE = 'You must hold a fleet-wide Administrator grant and a local admin account, or the server refuses ' +
+                     'so you cannot lock yourself out. You will be asked for an MFA code.';
+
+  ACTS.enforce = function (sw) {
+    var want = sw.checked;
+    sw.checked = !want; // the switch shows the server's state; a redraw is what changes it
+    return window.YuzuDialog.confirm(want ? {
+      title: 'Turn RBAC enforcement on?',
+      body: "From now on access follows each person's RBAC roles. Anyone without a role assignment loses access " +
+            'immediately, and a person with no management group role sees no devices.',
+      confirmLabel: 'Turn on enforcement', danger: true
+    } : {
+      title: 'Turn RBAC enforcement off?',
+      body: 'Access will follow the account role instead of RBAC roles. Admins can do everything; users can read ' +
+            'most things and change nothing.',
+      confirmLabel: 'Turn off enforcement', danger: true
+    }).then(function (ok) {
+      if (!ok) return;
+      sw.disabled = true;
+      return window.YuzuDialog.request('PUT', '/api/v1/rbac/enforcement', { json: { enabled: want } }).then(function (r) {
+        if (r.ok) {
+          var d = (r.data && r.data.data) || {};
+          var now = d.enabled ? 'on' : 'off';
+          var text = (d.changed ? 'Enforcement is now ' + now + '.' : 'Enforcement was already ' + now + '. Nothing changed.') +
+                     ' Other servers may take a few seconds to follow.' +
+                     (typeof d.post_transition_administrators === 'number'
+                       ? ' Administrators who keep access: ' + d.post_transition_administrators + '.' : '');
+          return reloadPanels().then(function () { sayIn('acc-enforcement', 'ok', text); });
+        }
+        if (unknown(r)) {
+          // The audit write can fail after the change took effect: the panel re-reads the real setting.
+          return reloadPanels().then(function () {
+            sayIn('acc-enforcement', 'bad', r.message || 'The request may not have applied.', 'The setting shown is the current one.');
+          });
+        }
+        sw.disabled = false;
+        sayIn('acc-enforcement', 'bad', r.message || ('The request was refused (HTTP ' + r.status + ').'),
+              remediation(r) || ENFORCE_NOTE);
+      });
+    });
+  };
+
+  ACTS.elevate = function (btn) {
+    var jEl = document.getElementById('el-j'), dEl = document.getElementById('el-d');
+    var j = jEl.value.trim(), d = dEl.value.trim();
+    if (!j) return sayIn('acc-elevation', 'bad', 'Enter a reason. It is recorded in the audit log.');
+    // The server truncates silently at 1024 bytes; say so before anything is sent.
+    if (new TextEncoder().encode(j).length > 1024) return sayIn('acc-elevation', 'bad', 'The reason is over 1024 bytes. Shorten it.');
+    if (d && !/^[0-9]{1,6}$/.test(d)) return sayIn('acc-elevation', 'bad', 'Duration is a whole number of seconds.');
+    var body = { justification: j };
+    if (d && d !== '0') body.duration_secs = parseInt(d, 10); // absent: the server's own cap
+    btn.disabled = true;
+    return window.YuzuDialog.request('POST', '/api/v1/elevate', { json: body }).then(function (r) {
+      btn.disabled = false;
+      if (r.ok) {
+        // expires_at is top level here (not under data.data); "invalid-time" is never printed as a date.
+        var at = r.data && typeof r.data.expires_at === 'string' ? r.data.expires_at : '';
+        var text = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(at)
+          ? 'Elevated until ' + at.slice(0, 10) + ' ' + at.slice(11, 16) + ' UTC.' : 'Elevated.';
+        jEl.value = '';
+        return reloadPanels().then(function () { sayIn('acc-elevation', 'ok', text); });
+      }
+      if (r.auditFailed)
+        return sayIn('acc-elevation', 'bad', 'The elevation could not be recorded and was not granted. If this page still ' +
+                     'shows administrator access, use Step down and tell your administrator.');
+      if (unknown(r))
+        return reloadPanels().then(function () {
+          sayIn('acc-elevation', 'bad', 'The elevation could not be confirmed. Use Step down to make sure your session is not elevated.');
+        });
+      sayIn('acc-elevation', 'bad', r.message || ('The request was refused (HTTP ' + r.status + ').'), remediation(r));
+    });
+  };
+
+  ACTS.stepdown = function () {
+    return window.YuzuDialog.request('POST', '/api/v1/elevate/revoke', {}).then(function (r) {
+      if (r.ok) return reloadPanels().then(function () { sayIn('acc-elevation', 'ok', 'Stepped down. Your session is no longer elevated.'); });
+      sayIn('acc-elevation', 'bad', unknown(r)
+        ? 'The step-down could not be confirmed. Try again; your session may still be elevated.'
+        : (r.message || ('The request was refused (HTTP ' + r.status + ').')));
+    });
+  };
+
+  ACTS.check = function () {
+    var s = document.getElementById('ck-s').value.trim(), o = document.getElementById('ck-o').value.trim();
+    if (!s || !o) return sayIn('acc-check', 'bad', 'Enter an area and an operation.');
+    return window.YuzuDialog.request('POST', '/api/v1/rbac/check', { json: { securable_type: s, operation: o } }).then(function (r) {
+      var allowed = r.data && r.data.data ? r.data.data.allowed : undefined;
+      if (r.ok && typeof allowed === 'boolean') {
+        var slot = document.querySelector('#acc-check [data-slot="out"]');
+        slot.replaceChildren(el('span', 'pill ' + (allowed ? 'ok' : 'bad'), allowed ? 'Allowed' : 'Denied'));
+        // A store fault also reads as Denied on the server, so the sentence says to check again.
+        slot.appendChild(el('span', 'hint', allowed ? ' Your roles grant ' + s + ':' + o + '.'
+          : ' Your role grants do not include ' + s + ':' + o + '. If you expected access, the role store may not have answered: check again.'));
+        return;
+      }
+      if (r.ok) return sayIn('acc-check', 'bad', 'The server answered in a form this page does not understand.');
+      sayIn('acc-check', 'bad', r.message || ('The request was refused (HTTP ' + r.status + ').'), remediation(r));
+    });
+  };
+
   ACTS.reload = function (btn) { reload(btn.dataset.target); };
 
   document.addEventListener('click', function (e) {

@@ -150,6 +150,24 @@ inline constexpr std::string_view kAccountMarker = "<!--yuzu:account-->";
 /// local account (the route refuses everyone else with 409).
 std::string render_your_account(const std::string& username, const std::string& auth_source);
 
+// ---- RBAC enforcement ---------------------------------------------------------------------
+
+/// What `GET /fragments/access/enforcement` shows. `enabled` is the store's cached view
+/// (`is_rbac_enabled()`), meant for display; `degraded` is `rbac_enabled_view_degraded()`.
+struct EnforcementView {
+    bool enabled = false;
+    bool degraded = false;   ///< the view could not be confirmed: drawn as "Unconfirmed", never as On/Off
+    bool may_toggle = false; ///< `may_attempt_rbac_admin(session)`: a hint, the server decides
+};
+
+inline constexpr std::string_view kEnforcementDenied = "The enforcement setting needs a signed-in session.";
+inline constexpr std::string_view kEnforcementUnavailable =
+    "The enforcement setting could not be read. This is not the same as it being off.";
+
+/// The whole RBAC enforcement panel interior. A degraded view overrides `enabled` entirely: a
+/// failed read is never drawn as a state.
+std::string render_enforcement(const std::variant<EnforcementView, Unavailable>& state);
+
 /// RFC 3986 percent-encoding of one query value: `A-Za-z0-9-._~` kept, every other byte as
 /// uppercase `%XX`. (A durable SSO principal is `oidc:<iss>#<sub>`; an unencoded `#` is a
 /// URL fragment separator and would silently truncate the request.)

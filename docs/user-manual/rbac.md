@@ -6,7 +6,7 @@ Yuzu implements granular role-based access control with deny-overrides-allow sem
 
 RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role) — **except** a small, fixed set of reads that the fallback still refuses to a non-admin; see "The authorization topology floor" below. When enabled, every API call and UI action gated on a real securable type is checked against the caller's assigned roles — but not every surface has one: result sets are ownership-scoped, not RBAC-gated, regardless of this toggle; see "Not RBAC-gated: per-operator result sets" below.
 
-Toggle RBAC via `PUT /api/v1/rbac/enforcement` (or the `set_rbac_enforcement` MCP tool) — **not** a Settings-page control and **not** a `[rbac] enabled = true` config-file key. Neither exists: nothing in `server/core/src/main.cpp` or any `Config` header reads a `[rbac]` section — see [#388](https://github.com/Tr3kkR/Yuzu/issues/388).
+Toggle RBAC via `PUT /api/v1/rbac/enforcement` (the **Enforce roles** switch on the Users and roles page makes this call; or the `set_rbac_enforcement` MCP tool) — **not** a Settings-page control and **not** a `[rbac] enabled = true` config-file key. Neither exists: nothing in `server/core/src/main.cpp` or any `Config` header reads a `[rbac]` section — see [#388](https://github.com/Tr3kkR/Yuzu/issues/388).
 
 ```bash
 curl -s -b cookies.txt -X PUT \
@@ -494,6 +494,26 @@ Settings uses, so the two stay equivalent.
   every API token you own). If the server reports that a token revoke or a session end did not
   persist, the page says so and waits for you to choose to continue instead of redirecting at once.
   "Sign out all other sessions" is shown as not available yet.
+- **Turning enforcement on or off.** The **RBAC enforcement** panel shows the current setting to
+  every signed-in user (the same value `GET /api/v1/me` reports) and gives an administrator
+  account an **Enforce roles** switch. The switch always shows what the server holds: clicking it
+  asks for confirmation, then for an MFA code, and then the panel is redrawn from the server, so a
+  cancelled confirmation or a refusal leaves it where it was. The server's refusals (you would
+  not remain an administrator, or the source regime does not recognise you) are shown with their
+  remediation text. When the server cannot confirm the setting the panel says **Unconfirmed**
+  instead of On or Off; it treats enforcement as on until it can. See "Enabling RBAC" for the
+  lockout guards.
+- **Checking your own permission.** **Check your own permission** asks the server whether your
+  role grants an area and operation (for example `UserManagement` and `Read`). It checks role
+  grants only; while enforcement is off access follows your account role, so Denied does not by
+  itself block you. A role store that does not answer also reads as Denied on the server, so the
+  page tells you to check again.
+- **Temporary elevation.** **Your elevation** raises your own session to administrator for a
+  limited time (reason required, recorded in the audit log, up to 1024 bytes; the duration is capped
+  by the server). It needs elevation eligibility and an enrolled second factor and always asks
+  for an MFA code; **Step down** ends it and is always safe. The page cannot show whether your
+  session is currently elevated. Elevation does not satisfy the standing-Administrator rule: assigning
+  roles and changing enforcement still need your own standing Administrator role.
 - **Unreadable store.** If the account store does not answer, the Users panel shows a red
   message with a Retry button. It never shows an empty list in that case, so a degraded store
   cannot be mistaken for "nobody is here".

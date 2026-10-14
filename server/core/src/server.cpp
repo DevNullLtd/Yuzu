@@ -15653,6 +15653,18 @@ private:
                         return std::unexpected(std::string("rbac store not open"));
                     return rbac_store_->list_all_principal_roles_checked();
                 },
+                // Display accessors only: the cached view FIRST (reading it refreshes it), then the
+                // staleness flag. The enforcement-label and administrator predicates are
+                // deliberately not used here (routed A2/A1 row, clauses 3 and 4).
+                .enforcement_state_fn =
+                    [this]() -> std::expected<yuzu::server::access::EnforcementView, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    yuzu::server::access::EnforcementView v;
+                    v.enabled = rbac_store_->is_rbac_enabled();
+                    v.degraded = rbac_store_->rbac_enabled_view_degraded();
+                    return v;
+                },
             });
 
         // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three

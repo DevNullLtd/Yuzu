@@ -56,7 +56,8 @@ void respond_fragment(httplib::Response& res, const std::string& body) {
 
 void register_access_routes(HttpRouteSink& sink, Deps deps) {
     if (!deps.auth_fn || !deps.admin_fn || !deps.perm_fn || !deps.audit_fn || !deps.list_users_fn ||
-        !deps.list_roles_fn || !deps.role_permissions_fn || !deps.list_assignments_fn)
+        !deps.list_roles_fn || !deps.role_permissions_fn || !deps.list_assignments_fn ||
+        !deps.enforcement_state_fn)
         throw std::invalid_argument("access::register_access_routes: every Deps member is required");
 
     sink.Get("/access/users", [deps](const httplib::Request& req, httplib::Response& res) {
@@ -225,6 +226,25 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
                      }
                  }
                  respond_fragment(res, render_assignments(view));
+             });
+
+    // Enforcement: the twin is GET /api/v1/me, which reports rbac_enabled to any signed-in
+    // session, so this is a session-only gate too. The switch is a hint (the server decides on
+    // every PUT); the state is read ONLY through the store's display accessors, never through
+    // the label or administrator predicates the routed A2/A1 row reserves.
+    sink.Get("/fragments/access/enforcement",
+             [deps](const httplib::Request& req, httplib::Response& res) {
+                 const auto session = deps.auth_fn(req, res);
+                 if (!session)
+                     return;
+                 auto state = deps.enforcement_state_fn();
+                 if (!state) {
+                     spdlog::warn("/fragments/access/enforcement: {}", state.error());
+                     respond_fragment(res, render_enforcement(Unavailable{}));
+                     return;
+                 }
+                 state->may_toggle = may_attempt_rbac_admin(*session);
+                 respond_fragment(res, render_enforcement(*state));
              });
 
     sink.Get("/static/yuzu-access.js", [](const httplib::Request&, httplib::Response& res) {

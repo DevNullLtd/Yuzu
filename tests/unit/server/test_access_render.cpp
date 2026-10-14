@@ -133,6 +133,10 @@ std::vector<std::string> every_output() {
         render_role_permissions(NotFound{}),
         render_role_permissions(Unavailable{}, "/fragments/access/roles/permissions?role=Operator"),
         render_select_role(),
+        render_enforcement(EnforcementView{true, false, true}),
+        render_enforcement(EnforcementView{false, false, false}),
+        render_enforcement(EnforcementView{true, true, true}),
+        render_enforcement(Unavailable{}),
         assign_html(view_of({grant("user", "bob", "Viewer"), grant("group", "ops", "Operator")})),
         assign_html(view_of({})),
         render_assignments(Unavailable{}),
@@ -671,4 +675,66 @@ TEST_CASE("access account: the username is escaped", "[access][render]") {
     const auto html = render_your_account("<b>\"x\"</b>", "local");
     CHECK_THAT(html, ContainsSubstring("&lt;b&gt;&quot;x&quot;&lt;/b&gt;"));
     CHECK_THAT(html, !ContainsSubstring("<b>"));
+}
+
+// ── RBAC enforcement ─────────────────────────────────────────────────────────
+
+TEST_CASE("access enforcement: the switch reflects the state and is live only for an administrator hint",
+          "[access][render]") {
+    const auto on = render_enforcement(EnforcementView{true, false, true});
+    CHECK_THAT(on, ContainsSubstring("role=\"switch\" aria-label=\"RBAC enforcement\" checked data-act=\"enforce\">"));
+    CHECK_THAT(on, ContainsSubstring("On: access follows each person&#39;s RBAC roles."));
+    CHECK_THAT(on, !ContainsSubstring("disabled"));
+
+    const auto off = render_enforcement(EnforcementView{false, false, true});
+    CHECK_THAT(off, ContainsSubstring("aria-label=\"RBAC enforcement\" data-act=\"enforce\">"));
+    CHECK_THAT(off, !ContainsSubstring("checked"));
+    CHECK_THAT(off, ContainsSubstring("Off. Turning it on needs a fleet-wide Administrator grant"));
+
+    for (const bool enabled : {true, false}) {
+        INFO(enabled);
+        const auto ro = render_enforcement(EnforcementView{enabled, false, false});
+        CHECK_THAT(ro, ContainsSubstring(" disabled title=\"Only a durable Administrator can change this.\">"));
+        CHECK_THAT(ro, !ContainsSubstring("data-act="));
+        CHECK_THAT(ro, ContainsSubstring(enabled ? "On. Only a durable Administrator can change this."
+                                                 : "Off. Only a durable Administrator can change this."));
+    }
+}
+
+TEST_CASE("access enforcement: a degraded view is Unconfirmed whatever the cached flag says",
+          "[access][render]") {
+    const auto a = render_enforcement(EnforcementView{true, true, true});
+    const auto b = render_enforcement(EnforcementView{false, true, true});
+    const auto c = render_enforcement(EnforcementView{false, true, false});
+    CHECK(a == b); // a failed read is never drawn as On or as Off
+    CHECK(a == c); // and a read-only caller sees the same thing
+    CHECK_THAT(a, ContainsSubstring("<span class=\"pill warn\">Unconfirmed</span>"));
+    CHECK_THAT(a, ContainsSubstring("data-act=\"reload\" data-target=\"acc-enforcement\""));
+    CHECK_THAT(a, !ContainsSubstring("<input"));
+    CHECK_THAT(a, !ContainsSubstring("On."));
+    CHECK_THAT(a, !ContainsSubstring("Off."));
+}
+
+TEST_CASE("access enforcement: an unreadable store is a red box, not Off", "[access][render]") {
+    const auto u = render_enforcement(Unavailable{});
+    CHECK_THAT(u, ContainsSubstring("role=\"alert\""));
+    CHECK_THAT(u, ContainsSubstring(std::string(kEnforcementUnavailable)));
+    CHECK_THAT(u, !ContainsSubstring("<input"));
+    CHECK_THAT(u, !ContainsSubstring("Enforce roles"));
+    CHECK_THAT(u, ContainsSubstring("data-target=\"acc-enforcement\""));
+}
+
+TEST_CASE("access enforcement: every live state ends with the status region the script writes into",
+          "[access][render]") {
+    for (const auto& html : {render_enforcement(EnforcementView{true, false, true}),
+                             render_enforcement(EnforcementView{false, false, false}),
+                             render_enforcement(EnforcementView{true, true, true})})
+        CHECK_THAT(html, ContainsSubstring("data-slot=\"out\" role=\"status\" aria-live=\"polite\"></div>"));
+}
+
+TEST_CASE("access render: no renderer or golden mentions elevation as a per-row control",
+          "[access][render]") {
+    // The elevation routes act on the CALLER's own session; a per-user Elevate would mislead.
+    for (const auto& html : every_output())
+        CHECK_THAT(html, !ContainsSubstring("elevat"));
 }
