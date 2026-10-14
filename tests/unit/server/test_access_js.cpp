@@ -34,13 +34,34 @@ TEST_CASE("access glue: the denied and unavailable mapping is keyed on the panel
     }
 }
 
-TEST_CASE("access glue: no HTML-string injection and no action wiring in the read-only page",
+TEST_CASE("access glue: no HTML-string injection, and every request goes through the dialog module",
           "[access][js]") {
     const std::string& js = yuzu::server::kYuzuAccessJs;
     for (const char* bad : {"innerHTML", "insertAdjacentHTML", "eval(", "new Function",
                             "document.write", "hx-on", "fetch(", "XMLHttpRequest"}) {
         INFO(bad);
         CHECK_THAT(js, !ContainsSubstring(bad));
+    }
+    // Step-up, the single replay and the audit/persist flags live in YuzuDialog.request.
+    CHECK_THAT(js, ContainsSubstring("window.YuzuDialog.request("));
+}
+
+TEST_CASE("access glue: the user actions call the existing routes with encoded, vetted segments",
+          "[access][js]") {
+    const std::string& js = yuzu::server::kYuzuAccessJs;
+    for (const char* token :
+         {"ACTS.add", "ACTS.remove", "ACTS.role", "ACTS.revoke", "ACTS.reload",
+          "'/api/settings/users'", "'/api/settings/users/' + s", "'/role'",
+          "'/api/v1/sessions?username=' + encodeURIComponent(name)",
+          "encodeURIComponent(s)",
+          // A dot segment is resolved away by the browser even when percent-encoded, so a
+          // value made only of dots is refused instead of encoded.
+          "/^\\.+$/.test(s)",
+          // The role is checked against the only two values the route accepts.
+          "role !== 'admin' && role !== 'user'",
+          "r.auditFailed", "r.warning", "unknown(r)"}) {
+        INFO(token);
+        CHECK_THAT(js, ContainsSubstring(token));
     }
 }
 
@@ -55,12 +76,13 @@ TEST_CASE("access page: the template is inline-free, single-shell and under the 
                  std::string(yuzu::server::shell::kShellEnd)) != std::string::npos);
     CHECK(std::strlen(kAccessUsersTemplate) < 15000);
 
-    // The scripts are exactly these two, both same-origin.
+    // The scripts are exactly these three, all same-origin; the dialog loads before the glue.
     std::vector<std::string> srcs;
     const std::regex script_src(R"re(<script src="([^"]+)")re");
     for (std::sregex_iterator it(t.begin(), t.end(), script_src), end; it != end; ++it)
         srcs.push_back((*it)[1].str());
-    CHECK(srcs == std::vector<std::string>{"/static/htmx.js", "/static/yuzu-access.js"});
+    CHECK(srcs == std::vector<std::string>{"/static/htmx.js", "/static/yuzu-dialog.js",
+                                           "/static/yuzu-access.js"});
 }
 
 TEST_CASE("access page: the template's sentences are byte-equal to the renderer's constants",

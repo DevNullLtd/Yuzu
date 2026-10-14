@@ -7,8 +7,9 @@
  *   - a store that did not answer is never drawn as an empty table (Unavailable != empty);
  *   - every user-controlled byte is escaped in text AND attributes, and `?username=` is
  *     percent-encoded (an `oidc:<iss>#<sub>` principal carries a `#`);
- *   - this read-only half offers no mutation control, and never touches credential bytes;
- *   - an SSO/SCIM row is never offered a local-account control.
+ *   - the write controls (add, remove, change role, revoke) appear only where the server would
+ *     accept them: never on the caller's own row, and never a local-account control on an SSO row;
+ *   - credential bytes are never touched.
  */
 
 #include "access_render.hpp"
@@ -168,15 +169,14 @@ TEST_CASE("access list: an unanswered store is a red box with Retry and no table
 
 // ── Account panel ───────────────────────────────────────────────────────────
 
-TEST_CASE("access detail: a local account shows its role in a disabled select", "[access][render]") {
+TEST_CASE("access detail: a local account shows its role in an enabled select", "[access][render]") {
     const auto html = detail_html(user("bob", auth::Role::admin));
     CHECK_THAT(html, ContainsSubstring("<h2 class=\"long\">bob</h2>"));
     CHECK_THAT(html, ContainsSubstring("<span class=\"sub\">Local account</span>"));
-    CHECK_THAT(html, ContainsSubstring("<select id=\"acc-role\" disabled>"));
+    CHECK_THAT(html, ContainsSubstring("<select id=\"acc-role\"><option"));
     CHECK_THAT(html, ContainsSubstring("<option value=\"admin\" selected>Admin</option>"));
     CHECK_THAT(html, ContainsSubstring("<option value=\"user\">User</option>"));
     CHECK(count_of(html, "<option") == 2);
-    CHECK_THAT(html, ContainsSubstring("cannot be changed from this page yet"));
     // The role the account actually holds is the selected one, for either value.
     CHECK_THAT(detail_html(user("bob", auth::Role::user)),
                ContainsSubstring("<option value=\"user\" selected>User</option>"));
@@ -185,7 +185,9 @@ TEST_CASE("access detail: a local account shows its role in a disabled select", 
 TEST_CASE("access detail: the caller's own account says why the role is fixed", "[access][render]") {
     const auto html = detail_html(user("alice", auth::Role::admin), /*is_self=*/true);
     CHECK_THAT(html, ContainsSubstring("You cannot change your own role."));
-    CHECK_THAT(html, ContainsSubstring("disabled"));
+    CHECK_THAT(html, ContainsSubstring("<select id=\"acc-role\" disabled title=\""));
+    // Nothing that would end or remove the session the caller is using.
+    CHECK_THAT(html, !ContainsSubstring("data-act="));
 }
 
 TEST_CASE("access detail: an SSO account is labelled and carries the SSO reason",
@@ -193,7 +195,49 @@ TEST_CASE("access detail: an SSO account is labelled and carries the SSO reason"
     const auto html = detail_html(user("oidc:https://x/y#sub", auth::Role::user, "oidc"));
     CHECK_THAT(html, ContainsSubstring("<span class=\"sub\">OIDC account</span>"));
     CHECK_THAT(html, ContainsSubstring("Not available for SSO or SCIM accounts here."));
-    CHECK_THAT(html, !ContainsSubstring("from this page yet"));
+    CHECK_THAT(html, ContainsSubstring("<select id=\"acc-role\" disabled title=\""));
+    // The sessions route takes a principal, so Revoke stays; the local-account routes refuse
+    // an SSO principal, so role change and Remove are not offered.
+    CHECK_THAT(html, ContainsSubstring("data-act=\"revoke\""));
+    CHECK_THAT(html, !ContainsSubstring("data-act=\"role\""));
+    CHECK_THAT(html, !ContainsSubstring("data-act=\"remove\""));
+}
+
+TEST_CASE("access detail: the write controls follow the account's source and identity",
+          "[access][render]") {
+    struct Case {
+        const char* source;
+        bool self;
+        bool role, revoke, remove;
+    };
+    // local/other, own/not own -> which of the three detail controls render.
+    const Case cases[] = {
+        {"local", false, true, true, true},   {"local", true, false, false, false},
+        {"oidc", false, false, true, false},  {"saml", false, false, true, false},
+        {"ad", false, false, true, false},    {"scim", false, false, true, false},
+        {"foo<x>", false, false, true, false},
+    };
+    for (const auto& c : cases) {
+        INFO(c.source << (c.self ? " (self)" : ""));
+        const auto html = detail_html(user("bob", auth::Role::user, c.source), c.self);
+        CHECK((html.find("data-act=\"role\"") != std::string::npos) == c.role);
+        CHECK((html.find("data-act=\"revoke\"") != std::string::npos) == c.revoke);
+        CHECK((html.find("data-act=\"remove\"") != std::string::npos) == c.remove);
+    }
+}
+
+TEST_CASE("access list: Add user is in the header; Remove only on a local row that is not the caller's",
+          "[access][render]") {
+    const auto html = list_html({user("alice", auth::Role::admin), user("bob"),
+                                 user("oidc:https://x/y#sub", auth::Role::user, "oidc")});
+    CHECK_THAT(html, ContainsSubstring("data-act=\"add\">Add user</button>"));
+    CHECK_THAT(row_of(html, "bob"), ContainsSubstring("data-act=\"remove\" data-username=\"bob\""));
+    CHECK_THAT(row_of(html, "alice"), !ContainsSubstring("data-act="));
+    // SSO: the local delete route would refuse the principal, so no Remove is drawn.
+    CHECK_THAT(row_of(html, "oidc:https://x/y#sub"), !ContainsSubstring("data-act="));
+    CHECK(count_of(html, "data-act=\"remove\"") == 1);
+    // An unavailable store offers no Add: the form could not show the list it changes.
+    CHECK_THAT(render_users_list(Unavailable{}), !ContainsSubstring("data-act=\"add\""));
 }
 
 TEST_CASE("access detail: not found, unavailable and unselected are three different panels",
@@ -221,14 +265,13 @@ TEST_CASE("access detail: not found, unavailable and unselected are three differ
 
 // ── Hygiene across every state ──────────────────────────────────────────────
 
-TEST_CASE("access render: this read-only half offers no mutation control", "[access][render]") {
-    static const std::regex mut(R"re(data-act="(add|remove|role|revoke)"|hx-(post|put|delete|patch)|Reset password|Unlock|elevat)re",
+TEST_CASE("access render: only buttons with data-act mutate; no htmx verb and nothing out of scope",
+          "[access][render]") {
+    // Mutations are script-driven through the dialog module: no hx-post/put/delete/patch.
+    static const std::regex bad(R"re(hx-(post|put|delete|patch)|Reset password|Unlock|elevat)re",
                                 std::regex::icase);
-    for (const auto& html : every_output()) {
-        CHECK_FALSE(std::regex_search(html, mut));
-        CHECK_THAT(html, !ContainsSubstring("Add user"));
-        CHECK_THAT(html, !ContainsSubstring("Remove"));
-    }
+    for (const auto& html : every_output())
+        CHECK_FALSE(std::regex_search(html, bad));
 }
 
 TEST_CASE("access render: no inline handlers, hx-on or javascript: URLs", "[access][render]") {
@@ -271,8 +314,8 @@ TEST_CASE("access render: hostile usernames and sources are escaped in text and 
     CHECK_THAT(with_nul, ContainsSubstring("username=a%00b\""));
     const auto big = list_html({user(std::string(10 * 1024, 'x'))});
     CHECK_THAT(big, ContainsSubstring("</table>"));
-    // Cell text, the data attribute and the Manage URL.
-    CHECK(count_of(big, std::string(10 * 1024, 'x')) == 3);
+    // Cell text, the row's data attribute, the Manage URL and the Remove button's data attribute.
+    CHECK(count_of(big, std::string(10 * 1024, 'x')) == 4);
 }
 
 TEST_CASE("access url_q: RFC 3986 unreserved kept, everything else uppercase %XX",

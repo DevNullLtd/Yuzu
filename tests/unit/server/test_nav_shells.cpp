@@ -86,7 +86,7 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
             labels.push_back(it.label);
     CHECK(labels == std::vector<std::string_view>{"Console", "Instructions", "Result sets",
                                                   "Compliance", "Guardian", "DEX", "TAR",
-                                                  "Hardware", "Software", "Fleet", "Users",
+                                                  "Hardware", "Software", "Fleet", "Users and roles",
                                                   "Tokens and principals", "Settings"});
 }
 

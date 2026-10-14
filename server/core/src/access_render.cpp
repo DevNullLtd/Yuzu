@@ -46,6 +46,14 @@ std::string role_pill(const auth::UserEntry& u) {
     return "<span class=\"pill tag\">" + esc(auth::role_to_string(u.role)) + "</span>";
 }
 
+// `<button type="button" class="btn link sm [danger]" data-act=ACT data-username=NAME>`.
+std::string action_button(std::string_view label, std::string_view act, const std::string& username,
+                          bool danger) {
+    return std::string("<button type=\"button\" class=\"btn link sm") + (danger ? " danger" : "") +
+           "\" data-act=\"" + std::string(act) + "\" data-username=\"" + esc(username) + "\">" +
+           esc(label) + "</button>";
+}
+
 std::string user_row(const auth::UserEntry& u, bool is_self) {
     std::string out = "<tr data-username=\"" + esc(u.username) + "\"><td class=\"long\"><b>" +
                       esc(u.username) + "</b></td><td>" + source_pill(u) + "</td><td>" +
@@ -56,6 +64,11 @@ std::string user_row(const auth::UserEntry& u, bool is_self) {
         out += "<button type=\"button\" class=\"btn link sm\" hx-get=\"" + std::string(kDetailUrl) +
                esc(url_q(u.username)) + "\" hx-target=\"#acc-detail\" hx-swap=\"innerHTML\">"
                "Manage</button>";
+        // Local accounts only: the delete route's strict username charset refuses an SSO
+        // principal. The username travels as an escaped data attribute and is percent-encoded
+        // by the script when it builds the request path.
+        if (is_local(u))
+            out += action_button("Remove", "remove", u.username, /*danger=*/true);
     }
     return out + "</div></td></tr>";
 }
@@ -72,23 +85,40 @@ std::string account_noun(const auth::UserEntry& u) {
 std::string detail_panel(const UserDetail& d) {
     const auto& u = d.user;
     const bool admin = u.role == auth::Role::admin;
+    // The role of an SSO/SCIM account is the IdP's business, and nobody changes their own.
+    const bool can_change = is_local(u) && !d.is_self;
     std::string out = "<div class=\"hd\"><h2 class=\"long\">" + esc(u.username) +
                       "</h2><span class=\"sub\">" + account_noun(u) + "</span></div>"
                       "<div class=\"form\"><div class=\"fld\">"
-                      "<label for=\"acc-role\">Account role</label>"
-                      "<select id=\"acc-role\" disabled><option value=\"user\"";
+                      "<label for=\"acc-role\">Account role</label><select id=\"acc-role\"";
+    // A control that is off says why on hover as well as in the hint below it.
+    const std::string off_reason = d.is_self ? "You cannot change your own role."
+                                             : "Not available for SSO or SCIM accounts here.";
+    out += can_change ? "><option value=\"user\""
+                      : " disabled title=\"" + esc(off_reason) + "\"><option value=\"user\"";
     out += admin ? ">User</option>" : " selected>User</option>";
     out += admin ? "<option value=\"admin\" selected>Admin</option></select>"
                  : "<option value=\"admin\">Admin</option></select>";
     out += hint("Only admin and user exist here.");
-    // Read-only page: the control is always disabled, and the reason is stated.
     if (d.is_self)
         out += hint("You cannot change your own role.");
     else if (!is_local(u))
         out += hint("Not available for SSO or SCIM accounts here.");
     else
-        out += hint("The account role cannot be changed from this page yet.");
-    return out + "</div></div>";
+        out += hint("Changing it signs the person out.");
+    out += "</div></div>";
+    if (can_change)
+        out += "<div class=\"btns\">" + action_button("Change role", "role", u.username, false) + "</div>";
+    if (d.is_self)
+        return out;
+    // Revoke works for any account (the sessions route takes SSO principals too); it is never
+    // offered on the caller's own row, where it would end the page they are using.
+    out += "<div class=\"acts\"><div>" + action_button("Revoke sessions", "revoke", u.username, true) +
+           hint("Signs them out of the dashboard. API tokens are not revoked.") + "</div>";
+    if (is_local(u))
+        out += "<div>" + action_button("Remove user", "remove", u.username, true) +
+               hint("Revokes their sessions and API tokens, then removes the account.") + "</div>";
+    return out + "</div>";
 }
 
 } // namespace
@@ -104,7 +134,9 @@ std::string render_users_list(const std::variant<UsersList, Unavailable>& state)
 
     const std::size_t total = list->users.size();
     std::string out = "<div class=\"hd\"><h2>Users</h2><span class=\"sub\">" +
-                      std::to_string(total) + (total == 1 ? " account" : " accounts") + "</span></div>";
+                      std::to_string(total) + (total == 1 ? " account" : " accounts") +
+                      "</span><div class=\"end\"><button type=\"button\" class=\"btn primary sm\" "
+                      "data-act=\"add\">Add user</button></div></div>";
     if (total > kUsersRenderCap)
         out += "<div class=\"pb\"><div class=\"note warn\">Showing the first " +
                std::to_string(kUsersRenderCap) + " of " + std::to_string(total) +

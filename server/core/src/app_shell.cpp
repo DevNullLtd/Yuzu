@@ -89,7 +89,7 @@ constexpr NavItem kEstate[] = {
 };
 constexpr NavItem kAccess[] = {
     {.key = "users",
-     .label = "Users",
+     .label = "Users and roles",
      .href = "/access/users",
      .icon = "M12 12a4 4 0 100-8 4 4 0 000 8z M4 21c0-4 3.6-7 8-7s8 3 8 7"},
     {.key = "tokens",

@@ -15,9 +15,10 @@ extern const char* const kAccessUsersTemplate =
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Yuzu - Users</title>
+  <title>Yuzu - Users and roles</title>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
+  <script src="/static/yuzu-dialog.js" defer></script>
   <script src="/static/yuzu-access.js" defer></script>
 </head>
 <body>
@@ -25,10 +26,12 @@ extern const char* const kAccessUsersTemplate =
 <main class="page">
   <header class="page-header">
     <div>
-      <h1>Users</h1>
-      <p class="subtitle">The accounts that can sign in to this server. This page is read-only; manage accounts in Settings.</p>
+      <h1>Users and roles</h1>
+      <p class="subtitle">Who can sign in, what each role allows, and temporary elevation.</p>
     </div>
   </header>
+  <div id="acc-alert" role="alert"></div>
+  <div id="acc-msg" role="status" class="hint"></div>
   <div class="split">
     <div class="grow">
       <section class="panel" id="acc-users" hx-get="/fragments/access/users/list" hx-trigger="load" hx-swap="innerHTML"

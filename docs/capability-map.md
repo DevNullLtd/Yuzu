@@ -882,7 +882,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.3 Granular RBAC :white_check_mark: `T2`
 
-`RBACStore` (777 LOC): principals, custom roles, 10 securable types (Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response), 5 operations (Read, Write, Execute, Delete, Approve). Deny-override, system roles, group-based assignments. Global enable/disable toggle. The dashboard's **Access → Users** page (`/access/users`) lists the server's accounts read-only; account and RBAC changes stay in Settings and the RBAC API.
+`RBACStore` (777 LOC): principals, custom roles, 10 securable types (Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response), 5 operations (Read, Write, Execute, Delete, Approve). Deny-override, system roles, group-based assignments. Global enable/disable toggle. The dashboard's **Access → Users and roles** page (`/access/users`) lists the server's accounts and lets an administrator add, remove, change the role of and revoke the sessions of an account.
 
 ### 18.4 Management-Group-Scoped Roles :white_check_mark: `T2`
 

@@ -127,7 +127,18 @@
         return res;
       }
       var challenge = typeof meta.challenge_url === 'string' ? meta.challenge_url : '/login/mfa/stepup';
-      // The OIDC challenge is a redirect flow, not a code prompt; send the user to sign in.
+      // The OIDC challenge is a redirect flow, not a code prompt: say so, then send the user
+      // to their identity provider. The route takes no return path, so the action is not replayed.
+      if (challenge === '/auth/oidc/start') {
+        return form({
+          title: 'Sign in again',
+          body: 'Sign in again at your identity provider. You will return to the dashboard, so repeat the action afterwards.',
+          submitLabel: 'Sign in again',
+          nested: true,
+          submit: function () { location.assign(challenge); return Promise.resolve(null); }
+        }).then(function () { return res; });
+      }
+      // Any other challenge is refused: the user is sent to sign in.
       if (challenge !== '/login/mfa/stepup') { location.assign('/login'); return res; }
       return form({
         title: 'Confirm it is you',
