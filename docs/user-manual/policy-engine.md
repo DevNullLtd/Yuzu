@@ -455,7 +455,9 @@ Both forms produce a 201 with `{"id": "<fragment-id>", "status": "created"}`.
 > per-policy detail uses the fleet-read gate as its only gate, lists only the devices in
 > the caller's scope, and writes a `compliance.agent_statuses.view` audit row per open. If
 > that row cannot be persisted the page still renders and the response carries
-> `Sec-Audit-Failed: true` (the REST twin refuses with 503 instead).
+> `Sec-Audit-Failed: true` (the REST twin refuses with 503 instead). A caller whose grant
+> arrives only through a management group sees the device rows and no policy definition
+> (name, scope, check), the same as `GET /api/v1/compliance/{id}`.
 
 | Route | Gate | Description |
 |---|---|---|
