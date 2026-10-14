@@ -155,6 +155,8 @@
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
+#include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
+#include "access_tokens_render.hpp"
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
 #include "instruction_routes.hpp" // #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
@@ -15408,6 +15410,73 @@ private:
                         return std::unexpected("AuthDB::list_users failed (error " +
                                                std::to_string(static_cast<int>(r.error())) + ")");
                     return std::move(*r);
+                },
+            });
+
+        // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three
+        // fragments and the page's static glue. Every read is a checked store read (a store
+        // fault reaches the page as "could not be read", never as an empty list). Stores are
+        // dereferenced inside the closures so a store that is absent (SQLite-only install)
+        // is a read failure, not a crash.
+        yuzu::server::access_tokens::register_access_tokens_routes(
+            inline_sink,
+            yuzu::server::access_tokens::Deps{
+                .auth_fn = auth_fn,
+                .admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
+                    return require_admin(req, res);
+                },
+                .perm_fn = perm_fn,
+                .audit_fn = audit_fn,
+                .rbac_enforced_fn = [this]() { return rbac_enforcement_in_effect(rbac_store_.get()); },
+                .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
+                .list_tokens_fn = [this](const std::string& filter)
+                    -> std::expected<std::vector<ApiToken>, std::string> {
+                    if (!api_token_store_ || !api_token_store_->is_open())
+                        return std::unexpected(std::string("api token store not open"));
+                    return api_token_store_->list_tokens(filter);
+                },
+                .list_principals_fn = [this]()
+                    -> std::expected<std::vector<EnginePrincipalRow>, std::string> {
+                    if (!engine_principal_store_ || !engine_principal_store_->is_open())
+                        return std::unexpected(std::string("engine principal store not open"));
+                    return engine_principal_store_->list_all_checked(true);
+                },
+                .all_roles_fn = [this]() -> std::expected<std::vector<PrincipalRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_all_principal_roles_checked();
+                },
+                .get_principal_fn = [this](const std::string& id)
+                    -> std::expected<std::optional<EnginePrincipalRow>, std::string> {
+                    if (!engine_principal_store_ || !engine_principal_store_->is_open())
+                        return std::unexpected(std::string("engine principal store not open"));
+                    return engine_principal_store_->get(id);
+                },
+                .active_credentials_fn = [this](const std::string& id)
+                    -> std::expected<std::vector<ApiToken>, std::string> {
+                    if (!api_token_store_ || !api_token_store_->is_open())
+                        return std::unexpected(std::string("api token store not open"));
+                    return api_token_store_->list_active_for_principal_checked(id);
+                },
+                .principal_roles_fn = [this](const std::string& id)
+                    -> std::expected<std::vector<PrincipalRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->get_principal_roles_checked("engine", id);
+                },
+                .revoke_detail_fn = [this](const std::string& id)
+                    -> std::expected<std::string, std::string> {
+                    if (!audit_store_)
+                        return std::unexpected(std::string("audit store not configured"));
+                    AuditQuery q;
+                    q.target_type = "EnginePrincipal";
+                    q.target_id = id;
+                    q.action = "engine_principal.revoke";
+                    q.limit = 200;  // newest first; the original committed revoke is picked below
+                    auto events = audit_store_->query(q);
+                    if (!events)
+                        return std::unexpected(std::string("audit store did not answer"));
+                    return yuzu::server::access_tokens::committed_revoke_detail(*events);
                 },
             });
 

@@ -1396,6 +1396,10 @@ if build_server
       'unit/server/test_access_routes.cpp', # Access pages: /access/users + fragments + static glue (gate order, degraded states)
       'unit/server/test_access_js.cpp', # Access pages: string pins on the template and yuzu-access.js
       'unit/server/test_access_golden.cpp', # Access pages: four rendered-fragment goldens
+      'unit/server/test_access_tokens_render.cpp', # Tokens and principals page: pure renderers
+      'unit/server/test_access_tokens_routes.cpp', # Tokens and principals page: routes, gates, audit, degraded states
+      'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
+      'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam

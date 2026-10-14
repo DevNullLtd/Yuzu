@@ -143,19 +143,19 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 | instructions | 27 | 14 | 13 |
 | compliance-policy | 20 | 6 | 14 |
 | settings | 15 | 0 | 15 |
-| rbac | 12 | 0 | 12 |
+| rbac | 13 | 0 | 13 |
 | auth-mfa | 7 | 0 | 7 |
-| engine-principals | 1 | 0 | 1 |
+| engine-principals | 3 | 0 | 3 |
 | access-reviews | 2 | 0 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 13 | 61 |
-| **Total** | **291** | **88** | **203** |
+| **Total** | **294** | **88** | **206** |
 
 Registered `/api/vN/*` routes: 247. OpenAPI `paths` entries: 246. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 187.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 203.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 206.
 
 <!-- END GENERATED -->
 

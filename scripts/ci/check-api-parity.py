@@ -213,7 +213,14 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # list), +2. A GET /api/v1/users twin is not built here; the Settings rows and these two
 # are retired together when that twin lands. On top of the 201 above this is 203, the value the
 # checker reported on the merged tree, not hand-picked.
-BASELINE_UNTWINNED = 203
+#
+# Tokens and principals page (PR TGN-1): re-surfaces the untwinned Settings token and principal
+# lists as three read-only fragments, GET /fragments/access/tokens/list, .../principals/list
+# and .../principals/detail (each planned:#2146: the REST token twin is self-scope only and the
+# principal twins sit behind EnginePrincipal:Read, where the page keeps the stricter admin gate),
+# +3. With the Users page above, the count on the merged tree is 206 (203 + 3): the value the
+# checker reported, not hand-picked.
+BASELINE_UNTWINNED = 206
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

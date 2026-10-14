@@ -1124,6 +1124,9 @@ SETTINGS_FRAGMENTS=(
     "/fragments/schedules?view=page"
     "/fragments/workflow-runs"
     "/fragments/workflow-runs/e2e-no-such-run"
+    "/fragments/access/tokens/list"
+    "/fragments/access/principals/list"
+    "/fragments/access/principals/detail"
 )
 
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do

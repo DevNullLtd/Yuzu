@@ -94,5 +94,13 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "composed-of:get.fragments-access-users-list"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/tokens/list",
+    "capability_id": "get.fragments-access-tokens-list",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
   }
 ]
