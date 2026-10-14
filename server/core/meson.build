@@ -196,6 +196,36 @@ yuzu_viz_host_js_embed = custom_target(
   ],
 )
 
+# Operate O1: the Executions / Approvals page controller (read-only). Symbol:
+# kYuzuOperateJs (std::string).
+yuzu_operate_js_embed = custom_target(
+  'yuzu_operate_js_bundle',
+  input: 'static/yuzu-operate.js',
+  output: 'yuzu_operate_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuOperateJs',
+  ],
+)
+
+# Shared modal dialog + request helper (window.YuzuDialog). Symbol: kYuzuDialogJs
+# (std::string). First consumer: the Operate action dialogs.
+yuzu_dialog_js_embed = custom_target(
+  'yuzu_dialog_js_bundle',
+  input: 'static/yuzu-dialog.js',
+  output: 'yuzu_dialog_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuDialogJs',
+  ],
+)
+
 cytoscape_js_embed = custom_target(
   'cytoscape_js_bundle',
   input: 'static/cytoscape.min.js',
@@ -390,7 +420,8 @@ yuzu_key_provider_dep = declare_dependency(
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
-   yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_integrations_js_embed,
+   yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_dialog_js_embed, yuzu_integrations_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -477,6 +508,10 @@ yuzu_server_core_lib = static_library(
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
+    'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
+    'src/approvals_ui.cpp',
+    'src/executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
+    'src/executions_ui.cpp',
     'src/rbac_store.cpp',
     'src/rbac_admin_authority_owner.cpp',
     'src/oidc_provider.cpp',

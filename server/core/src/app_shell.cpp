@@ -19,6 +19,10 @@ namespace {
 // ── Nav model ────────────────────────────────────────────────────────────
 // Icon paths are the design's 24x24 line icons (stroke, no fill).
 
+constexpr NavItem kInstructionsSub[] = {
+    {.key = "executions", .label = "Executions", .href = "/executions"},
+    {.key = "approvals", .label = "Approvals", .href = "/approvals", .badge = true},
+};
 constexpr NavItem kSoftwareSub[] = {
     {.key = "auto", .label = "Deployments", .href = "/auto"},
 };
@@ -37,7 +41,8 @@ constexpr NavItem kOperate[] = {
     {.key = "instructions",
      .label = "Instructions",
      .href = "/instructions",
-     .icon = "M6 3h9l4 4v14H6z M14 3v5h5 M9 13h7 M9 17h7"},
+     .icon = "M6 3h9l4 4v14H6z M14 3v5h5 M9 13h7 M9 17h7",
+     .children = kInstructionsSub},
     {.key = "result-sets",
      .label = "Result sets",
      .href = "/result-sets",
@@ -158,6 +163,8 @@ void append_nav_item(std::string& out, const NavItem& it, std::string_view activ
                 out += R"( class="on" aria-current="page")";
             out += '>';
             out += c.label;
+            if (c.badge)
+                out += R"(<span class="shell-badge" id="nav-approvals-badge" hidden><span id="nav-approvals-n"></span><span class="shell-sr"> pending</span></span>)";
             out += "</a>";
         }
         out += "</div>";
@@ -243,6 +250,9 @@ html body{padding-left:var(--shell-side-w)}
 .shell-out:hover{background:var(--surface2);border-color:var(--mut)}
 .toast-container{top:calc(var(--shell-top-h) + var(--sp-4))}
 .shell-side a:focus-visible,.shell-search:focus-visible,.shell-out:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+.shell-sub a .shell-badge{margin-left:auto;min-width:20px;height:18px;padding:0 6px;border-radius:3px;background:var(--warn);color:var(--on-primary);font-size:12px;font-weight:600;line-height:18px;text-align:center}
+.shell-badge[hidden]{display:none}
+.shell-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 @media (max-width:820px){
 html body{padding-left:0}
 .shell-side{position:static;flex:0 0 auto;width:auto;flex-direction:row;flex-wrap:wrap;align-items:center;gap:4px 8px;padding:8px 12px;overflow:visible;border-right:0;border-bottom:1px solid var(--line)}
@@ -251,6 +261,7 @@ html body{padding-left:0}
 .shell-gt,.shell-me,.shell-cv{display:none}
 .shell-top{padding:10px 16px}
 .shell-search{flex-basis:100%;margin-left:0}
+.toast-container{top:auto;bottom:var(--sp-4)}
 }
 </style>)CSS";
 
@@ -282,7 +293,6 @@ constexpr std::string_view kShellScript = R"JS(<script>
     el('nav-user').textContent=name;
     el('context-user').textContent=name;
     el('role-badge').textContent=role;
-    document.body.setAttribute('data-role',role);
     if(d.role!=='admin'&&role!=='Administrator'&&role!=='PlatformEngineer'){
       var sl=el('nav-settings-link');
       if(sl){sl.style.display='none';var g=sl.closest('.shell-grp');if(g)g.style.display='none';}
@@ -328,6 +338,26 @@ constexpr std::string_view kShellScript = R"JS(<script>
   document.addEventListener('visibilitychange',pollOnline);
   pollOnline();
   setInterval(pollOnline,30000);
+
+  var badge=el('nav-approvals-badge'),binflight=false,bstop=false;
+  function pollBadge(){
+    if(!badge||bstop||document.hidden||binflight)return;
+    binflight=true;
+    Promise.resolve().then(function(){
+      return fetch('/api/approvals/pending/count',{signal:AbortSignal.timeout(5000)});
+    }).then(function(r){
+      if(r.status===401||r.status===403){bstop=true;throw new Error('auth');}
+      if(!r.ok)throw new Error('http');
+      return r.json();
+    }).then(function(d){
+      var n=d&&d.count;
+      if(typeof n!=='number')throw new Error('payload');
+      el('nav-approvals-n').textContent=n>99?'99+':String(n);
+      badge.hidden=n<=0;
+    }).catch(function(){badge.hidden=true;}).then(function(){binflight=false;});
+  }
+  if(badge){document.addEventListener('visibilitychange',pollBadge);pollBadge();setInterval(pollBadge,30000);}
+  document.addEventListener('yuzu:approvals-changed',pollBadge);
 })();
 </script>)JS";
 
