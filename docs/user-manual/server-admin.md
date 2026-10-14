@@ -5230,7 +5230,7 @@ Each panel loads on its own. A refused browser session writes no denied-access a
 
 ### Audit and reviews page
 
-`/access/audit` (Access group in the navigation) shows the audit log, an authentication sample and the audit retention period. It is read-only. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty. See [Audit Log](audit-log.md#dashboard-viewer) for what each panel shows.
+`/access/audit` (Access group in the navigation) shows the audit log, an authentication sample, the audit retention period and the access reviews. The page itself changes nothing: the review controls call the existing `/api/v1/access-reviews` routes. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty. See [Audit Log](audit-log.md#dashboard-viewer) for what each panel shows.
 
 | Method | Route | Description |
 |---|---|---|
@@ -5238,6 +5238,9 @@ Each panel loads on its own. A refused browser session writes no denied-access a
 | `GET` | `/fragments/access/audit/log` | Audit log panel (HTMX). Gated on `AuditLog:Read`. Query: `range` (`1h`, `24h` or `7d`), `principal`, `action` (exact), `offset` (0 to 10000). Fixed 50-row pages; `limit` is never read. Writes no audit row. |
 | `GET` | `/fragments/access/audit/sample` | Authentication sample (HTMX). Gated on `AuditLog:Read`. Query: `limit` (1 to 1000). Requested only by the **Draw sample** button; writes an `audit.auth_sample.exported` row. |
 | `GET` | `/fragments/access/audit/retention` | Retention panel (HTMX). Gated on `ServerConfig:Read`. Requested only by the **Show retention** button. |
+| `GET` | `/fragments/access/reviews/campaigns` | Review campaign list (HTMX). Gated on `AccessReview:Read`. Writes `access_review.list`. |
+| `GET` | `/fragments/access/reviews/campaign` | One campaign's frozen grants and summary (HTMX). `?id=<campaign_id>`. Gated on `AccessReview:Read`. Writes `access_review.get`. |
+| `GET` | `/fragments/access/reviews/grants` | Current grant population (HTMX), requested only by **Show current grants**. Gated on `AccessReview:Read`. Writes `access_review.exported` with `format=view`. |
 
 A request the page cannot honour (an unknown range, an `offset` past 10000, a NUL byte in a filter, a bad sample size) is answered with status 200 and a short note, because htmx discards 4xx and 5xx bodies; nothing is read from the store.
 

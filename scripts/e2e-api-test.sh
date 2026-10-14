@@ -1178,6 +1178,8 @@ SETTINGS_FRAGMENTS=(
     "/fragments/access/principals/detail"
     "/fragments/access/audit/log"
     "/fragments/access/audit/retention"
+    "/fragments/access/reviews/campaigns"
+    "/fragments/access/reviews/campaign"
 )
 
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do

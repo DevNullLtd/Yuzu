@@ -4111,13 +4111,13 @@ Audited as `access_review.closed`.
 
 | Action | Description |
 |---|---|
-| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv> rows=<N> rbac_enforcement=<value>`. `result=success`. |
-| `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews`. `target_type=AccessReview`. `result=success`. |
+| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv\|view> rows=<N> rbac_enforcement=<value>` (`view` is the dashboard's Current grants panel, `GET /fragments/access/reviews/grants`). `result=success`. |
+| `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews` or the dashboard fragment `GET /fragments/access/reviews/campaigns`. `target_type=AccessReview`. `result=success`. |
 | `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N> rbac_enforcement=<value>` on success. `result` ∈ {`success`, `failure`}. |
 | `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`. `result` ∈ {`success`, `failure`}. |
 | `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
 | `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |
-| `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}`. `target_id=<campaign_id>`. `result=success`. |
+| `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}` or the dashboard fragment `GET /fragments/access/reviews/campaign`. `target_id=<campaign_id>`. `result=success`. |
 
 Every `access_review.*` verb above additionally records `result=denied`
 (`detail="engine_session_denied"`) when the caller's own session is
@@ -10019,6 +10019,30 @@ The dashboard view of `GET /api/v1/audit/auth-sample` with the window left open.
 The dashboard view of `GET /api/v1/settings/data-retention` (audit retention only).
 
 - **Permission:** `ServerConfig:Read`.
+
+**`GET /fragments/access/reviews/campaigns`**
+
+The campaign list. Same gate, store read and audit row as `GET /api/v1/access-reviews` (MCP `list_access_reviews`).
+
+- **Permission:** `AccessReview:Read` (admin-only while RBAC is disabled). The Open review and Close controls are drawn only for a caller who also holds `AccessReview:Attest`.
+- **Response (200):** HTML fragment: the table, "No review campaigns yet" when the store answered with none, or a red box with no table when it did not answer.
+- **Response (403):** The gate's own response; an engine-class session is refused exactly as the REST route refuses it (A4 body, `access_review.list` denied with detail `engine_session_denied`).
+- **Audit:** `access_review.list`, `count=<N>`.
+
+**`GET /fragments/access/reviews/campaign?id=<campaign_id>`**
+
+One campaign's frozen grants (undecided first, capped at 1000 rows with a banner) plus its summary card, swapped out of band. Same gate, read and audit row as `GET /api/v1/access-reviews/{id}` (MCP `get_access_review`).
+
+- **Query:** `id` — 1 to 64 of `A-Z a-z 0-9 _ -`. Empty returns the placeholder; any other value is a 200 "No campaign with that id" note and nothing is read or audited.
+- **Audit:** `access_review.get`, `target_id=<campaign_id>`. An unknown campaign and a store fault write none.
+
+**`GET /fragments/access/reviews/grants`**
+
+The live grant population, requested only by the **Show current grants** button. Same gate, read and audit row as `GET /api/v1/access-reviews/export` (MCP `export_access_review`).
+
+- **Audit:** `access_review.exported`, `detail=format=view rows=<N> rbac_enforcement=<value>`.
+
+The page makes every change (open, close, attest, flag) by calling the existing `POST /api/v1/access-reviews` routes; there is no dashboard-only write route. Flag records `flagged_revoke` evidence only and never revokes a grant.
 
 ### Commands
 

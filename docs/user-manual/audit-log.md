@@ -555,6 +555,19 @@ panel states how many candidates the sample was drawn from and whether the pool 
 the newest events. Each draw is itself recorded as `audit.auth_sample.exported`; if that row
 cannot be written the panel says so.
 
+**Access reviews.** The same page lists review campaigns, shows a campaign's frozen grants
+(undecided first) with its summary, and shows the current grant population on request. It needs
+`AccessReview:Read` (the Administrator and Reviewer roles; admin-only while RBAC is disabled), a
+different permission from the audit log: holding `AuditLog:Read` does not grant it. A caller who
+also holds `AccessReview:Attest` can open a review, attest or flag a grant (with an optional
+justification) and close a campaign; each is a call to the existing `/api/v1/access-reviews`
+routes. **Flag for revocation records evidence only; it never revokes the grant.** Closing is
+one-way and may leave grants undecided. `/access/audit?campaign=<id>` opens a campaign directly.
+Viewing writes the same rows as the REST reads: `access_review.list` for the list,
+`access_review.get` for a campaign and `access_review.exported` (`format=view`) for the current
+grants, so opening a campaign leaves a row in the trail. If the access review store does not
+answer, the panel is a red box, never "no reviews".
+
 **Retention.** Shows the configured retention period (`--audit-retention-days`, 365 days by
 default) and that cleanup runs hourly. It needs `ServerConfig:Read`, which is
 Administrator-only, so it is fetched on request rather than on every page view. It is read only.
