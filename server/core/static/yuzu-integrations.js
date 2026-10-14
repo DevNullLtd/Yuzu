@@ -44,6 +44,9 @@
   document.body.addEventListener('htmx:confirm', function (e) {
     var f = e.detail && e.detail.elt;
     if (!f || f.id !== 'mcp-form') return;
+    // A markup change that drops a radio group must not leave Save dead: fall through to
+    // the form's own hx-confirm instead of cancelling the request.
+    if (!f.elements.enabled || !f.elements.read_only) return;
     e.preventDefault();
     var enabled = f.elements.enabled.value === 'true';
     var readOnly = f.elements.read_only.value === 'true';

@@ -134,6 +134,13 @@ TEST_CASE("integrations script: delegated listeners, textContent only, no eval",
     CHECK_THAT(js, ContainsSubstring("addEventListener('htmx:confirm'"));
     CHECK_THAT(js, ContainsSubstring("f.id !== 'mcp-form'"));
     CHECK_THAT(js, ContainsSubstring("e.detail.issueRequest(true)"));
+    // The field guard must run before the event is cancelled, else a markup change leaves
+    // Save dead (the fallback hx-confirm never gets its turn).
+    const auto guard = js.find("!f.elements.enabled || !f.elements.read_only");
+    const auto cancel = js.find("e.preventDefault()");
+    REQUIRE(guard != std::string::npos);
+    REQUIRE(cancel != std::string::npos);
+    CHECK(guard < cancel);
     // It must not smuggle the raw-string delimiter embed_js.py refuses.
     CHECK_THAT(js, !ContainsSubstring(")ECHARTSEMBED\""));
 }
