@@ -267,6 +267,7 @@
 #include "offload_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
+#include "integrations_routes.hpp" // System "Integrations" page + its page script
 #include "viz_routes.hpp"
 #include "webhook_routes.hpp"
 #include "workflow_routes.hpp"
@@ -15930,6 +15931,19 @@ private:
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
+
+        // System "Integrations" page + its page script (integrations_routes.*). The panels it
+        // hosts are the existing /fragments/settings/{mcp,gateway} routes, registered by
+        // SettingsRoutes; this adds the page and nothing else.
+        HttplibRouteSink integrations_sink{*web_server_};
+        yuzu::server::integrations::register_integrations_routes(
+            integrations_sink,
+            yuzu::server::integrations::Deps{
+                .admin_fn =
+                    [this](const httplib::Request& req, httplib::Response& res) {
+                        return require_admin(req, res);
+                    },
+            });
 
         // #2542 PR-12: the legacy GET /events SSE stream, extracted onto
         // the HttpRouteSink seam (legacy_events_routes.cpp) — see that
