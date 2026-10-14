@@ -1117,7 +1117,10 @@ TEST_CASE("build_execution_page_sql: the confinement clause precedes ORDER BY an
                        " ORDER BY e.started_at DESC, e.id DESC LIMIT $5::bigint");
     // The visible set is ONE array bind however large it is (no per-agent placeholder cap), with
     // quote and backslash escaped for the array literal.
-    CHECK(b.params == std::vector<std::string>{"wf-1", "150", "run-9", R"({"a\"1","b\\2"})", "51"});
+    // Spelled as an ordinary literal outside the macro: MSVC's preprocessor mis-lexes a raw string
+    // that carries quotes and backslashes when it sits inside a macro argument (C2017).
+    const std::string visible_array = "{\"a\\\"1\",\"b\\\\2\"}";
+    CHECK(b.params == std::vector<std::string>{"wf-1", "150", "run-9", visible_array, "51"});
     const auto scope_at = b.sql.find("jsonb_array_elements");
     REQUIRE(scope_at != std::string::npos);
     CHECK(scope_at < b.sql.find("ORDER BY"));
