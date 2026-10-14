@@ -1398,8 +1398,9 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     head += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
     head += dex_subnav("overview", window_days);
     head += "<div class=\"gp-head\"><div>"
-            "<div class=\"gp-titleline\"><h1>Digital Employee Experience</h1></div>"
-            "<div class=\"gp-sub\">Fleet experience from device signals &mdash; the per-device "
+            "<div class=\"gp-titleline\"><h1>DEX</h1></div>"
+            "<div class=\"gp-sub\">Digital Employee Experience: how the fleet feels to the people "
+            "using it, from device signals &mdash; the per-device "
             "score distribution, the Device/App/Network breakdown, and the measured reliability "
             "rates below. The score is a <b>derived roll-up of measured facts</b>.</div></div></div>";
     head += "<div class=\"gp-filters\">" + chip("24h", "24h") + chip("7d", "7d") +

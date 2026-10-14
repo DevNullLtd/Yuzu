@@ -336,9 +336,10 @@ R"HTM(</head>
 
   <div class="tar-content">
     <div class="tar-ph">
-      <h1>TAR &mdash; Timeline Activity Record</h1>
+      <h1>TAR</h1>
       <p class="tar-subtitle">
-        Forensic + inventory data warehouse on each agent. Disable a
+        Timeline Activity Record: what ran, what it connected to, and what
+        changed, recorded on each device. Disable a
         collector to freeze its data for analysis; re-enable when finished.
       </p>
     </div>
