@@ -95,7 +95,13 @@ struct OtaAuditHarness {
         REQUIRE(pool->valid());
         registry = std::make_unique<UpdateRegistry>(*pool, update_dir.path);
         REQUIRE(registry->is_open());
+        register_on(routes, sink);
+    }
 
+    /// Registers the OTA routes on `r`/`s` with this harness's registry and audit capture.
+    /// The TestRouteSink path (ctor) hands the handler a matches vector directly; a second
+    /// registration on a real httplib::Server proves what the wire does to an encoded URL.
+    void register_on(SettingsRoutes& r, HttpRouteSink& route_sink) {
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -112,7 +118,7 @@ struct OtaAuditHarness {
             audited.push_back(AuditRow{action, result, ttype, tid, detail});
             return true;
         };
-        routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
+        r.register_routes(route_sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve,
                                /*api_token_store=*/nullptr,
                                /*mgmt_group_store=*/nullptr,
@@ -597,4 +603,56 @@ TEST_CASE("updates fragment: package URLs are percent-encoded", "[ota][settings_
     CHECK(b.find("hx-delete=\"" + enc + "\"") != std::string::npos);
     // The displayed version and the data attribute stay human-readable, escaped.
     CHECK(b.find("data-version=\"1.2#3?x%y z\"") != std::string::npos);
+}
+
+TEST_CASE("updates fragment: an encoded package URL reaches the handler decoded, over a real socket",
+          "[ota][settings_routes][pg]") {
+    // The fragment emits url_encode(version). The route tests above hand the handler a
+    // pre-split matches vector, which proves nothing about the wire. This drives the
+    // encoded URL exactly as htmx sends it (%23 %3F %25 %20) through a real httplib::Server
+    // and asserts the handler and the audit row see the original, decoded version.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    UpdatePackage pkg;
+    pkg.platform = "linux";
+    pkg.arch = "x86_64";
+    pkg.version = "1.2#3?x%y z";
+    pkg.sha256 = std::string(64, 'c');
+    pkg.filename = "yuzu-agent-odd";
+    pkg.rollout_pct = 10;
+    pkg.file_size = 1024;
+    REQUIRE(h.registry->upsert_package(pkg));
+
+    httplib::Server svr;
+    SettingsRoutes wire_routes;
+    HttplibRouteSink wire_sink{svr};
+    h.register_on(wire_routes, wire_sink);
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread t([&svr] { svr.listen_after_bind(); });
+    svr.wait_until_ready();
+
+    httplib::Client cli("127.0.0.1", port);
+    const std::string enc = "/api/settings/updates/linux/x86_64/1.2%233%3Fx%25y%20z";
+    auto roll = cli.Post(enc + "/rollout", "rollout_pct=55", "application/x-www-form-urlencoded");
+    REQUIRE(roll);
+    CHECK(roll->status == 200);
+    auto pkgs = h.registry->list_packages();
+    REQUIRE(pkgs.size() == 1);
+    CHECK(pkgs.front().version == "1.2#3?x%y z");
+    CHECK(pkgs.front().rollout_pct == 55);
+    REQUIRE_FALSE(h.audited.empty());
+    CHECK(h.audited.back().action == "ota.package.rollout_changed");
+    CHECK(h.audited.back().result == "success");
+    CHECK(h.audited.back().target_id == "linux/x86_64/1.2#3?x%y z");
+
+    auto del = cli.Delete(enc);
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    CHECK(h.registry->list_packages().empty());
+    CHECK(h.audited.back().action == "ota.package.deleted");
+    CHECK(h.audited.back().target_id == "linux/x86_64/1.2#3?x%y z");
+
+    svr.stop();
+    t.join();
 }
