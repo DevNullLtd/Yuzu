@@ -248,14 +248,6 @@ const char* const kCompliancePageTemplate =
       applyPerms();
       showDialogControls(e.target || document);
     });
-
-    /* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-    document.addEventListener('keydown', function(e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        window.location.href = '/?palette=1';
-      }
-    });
   </script>
 )HTM"
     R"HTM(  <script>
