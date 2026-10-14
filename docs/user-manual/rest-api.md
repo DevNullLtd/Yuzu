@@ -9776,7 +9776,7 @@ v0.12.0 to give role transitions their own audit chain (governance C1).
 
 The `role` field must be exactly `admin` or `user`.
 
-The caller's own durable account role must be `admin`: a session that is only admin through a temporary elevation (`POST /api/v1/elevate`) is refused with `403` and audit `user.role_change / denied / elevated_session_role_change_blocked`, because an account role is a standing grant and an elevation must not become one.
+The caller's own role must be `admin` (a local account's role, or the role an identity provider's group mapping gave a single sign-on session): a session that is only admin through a temporary elevation (`POST /api/v1/elevate`) is refused with `403` and audit `user.role_change / denied / elevated_session_role_change_blocked`, because an account role is a standing grant and an elevation must not become one.
 
 - **Response (200) success:** Role changed. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"Role updated","level":"success"}}`. Audit `user.role_change / success` with `detail=old_role=user,new_role=admin` (or vice versa). **All active sessions for the target user are invalidated atomically** — the user must re-authenticate.
 - **Response (200) no-op:** Same role requested as already assigned. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Role unchanged","level":"info"}}`. Audit `user.role_change / no_op` with `detail=same_role={admin\|user}`.
