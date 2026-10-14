@@ -2439,7 +2439,7 @@ What changes on upgrade if the flag is set to `admin-only` or `required`:
 **Before upgrading with the flag set, do ONE of:**
 
 1. **Recommended:** leave the flag at `optional`, upgrade, have all affected
-   users enroll (Settings → Multi-Factor Authentication), *then* set
+   users enroll (Settings → Security and sign-in → Two-factor sign-in), *then* set
    `admin-only`/`required` and restart. or
 2. Upgrade with the flag set and accept that affected un-enrolled users will
    be walked through enrollment on their next login.
@@ -2487,7 +2487,7 @@ closed (non-zero exit, refuses to serve)** otherwise:
    SP config on Linux/macOS with HTTPS) refuses to start (it would lock every
    operator out).
 2. (Recommended) Create a single break-glass local account and **enroll MFA on
-   it** (Settings → Multi-Factor Authentication). Point `--break-glass-user` at
+   it** (Settings → Security and sign-in → Two-factor sign-in). Point `--break-glass-user` at
    it. `sso-only` refuses to start if the named break-glass user doesn't exist or
    has no MFA enrolled — a break-glass account must carry a second factor.
 3. Restart with `--auth-mode=sso-only`. Local-password login is now rejected for
@@ -3299,7 +3299,7 @@ only in the old `auth.db` local-account tables is gone until re-established.
    `yuzu-server.cfg`.
 3. Re-create any other local operator accounts that are not SCIM-provisioned
    (Settings → Users), and have every user re-enrol MFA
-   (Settings → Multi-Factor Authentication).
+   (Settings → Security and sign-in → Two-factor sign-in).
 4. For SCIM-provisioned users, either wait for the next scheduled IdP sync or
    trigger one manually if your SCIM setup supports it; do not manually
    re-create SCIM-managed users (they will be re-provisioned).

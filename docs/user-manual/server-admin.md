@@ -2402,7 +2402,7 @@ assurance package if you answer data-egress questions.
 
 ### vNEXT — `POST /login` returns 202 for MFA-enrolled users (breaking)
 
-Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Multi-Factor Authentication. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
+Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Security and sign-in → Two-factor sign-in. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
 
 MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` now **enforce** — see the breaking note in `docs/user-manual/upgrading.md`), `--mfa-step-up-window-secs` (default `300`), `--mfa-login-pending-secs` (default `120`), and the break-glass `--mfa-reset <username>` (clears a locked-out user's MFA and exits, writing an `mfa.reset.breakglass` audit row — see `docs/ops-runbooks/auth-db-recovery.md`). Recovery code format changed from `XXXXX-XXXXX` (50 bits) to `XXXX-XXXX-XXXX-XXXX` (80 bits) — codes printed by earlier PR1 commits remain valid until consumed or regenerated. The break-glass procedure for a user who has lost both their authenticator and all recovery codes — and the recovery path for an operator locked out by an enforcement misconfiguration (SSO IdP not asserting `amr`, or a sole admin who could not enroll) — lives at `docs/ops-runbooks/auth-db-recovery.md`.
 
@@ -2936,7 +2936,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 
 | Section | Fragment Route | Description |
 |---|---|---|
-| TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
+| TLS Configuration | `/fragments/settings/tls` | Agent (gRPC) certificate, key and CA upload or paste, plus the in-memory mTLS display switch. Does not control dashboard HTTPS (see `/fragments/settings/https`, read-only). Shown on **Settings → Security and sign-in** as "Agent connections (mTLS)". |
 | User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The accounts are also listed, read-only, on the **Users** page (`/access/users`) in the Access section of the sidebar. |
 | Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
@@ -3049,7 +3049,7 @@ signer leaf's own **expiry** already matters: once its `not_after` passes,
 
 The Yuzu server has **two independent TLS surfaces**:
 
-1. **HTTPS** — the dashboard and REST API (port 8443 by default). Configured via `--https-cert` / `--https-key` (or runtime via the Settings page). Disabled with `--no-https`.
+1. **HTTPS** — the dashboard and REST API (port 8443 by default). Configured via `--https-cert` / `--https-key` (the Settings page only displays it). Disabled with `--no-https`.
 2. **gRPC TLS** — the agent listener (port 50051) and the management listener (port 50052). Configured via `--cert` / `--key` / `--ca-cert` (and optionally `--management-cert` / `--management-key` / `--management-ca-cert` for a separate management cert). Disabled entirely with `--no-tls`.
 
 The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
@@ -3110,10 +3110,10 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 
 ### Via Settings Page
 
-1. Navigate to **Settings > TLS Configuration**.
-2. Toggle **Enable HTTPS**.
-3. Upload PEM-encoded certificate and private key files using the **Upload PEM** button, or paste PEM content directly using the **Paste PEM** button.
-4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS, except GET/HEAD on the four health-probe paths (see Probing a TLS-enabled server).
+The **Settings → Security and sign-in** page has two certificate panels, and neither one turns HTTPS on:
+
+1. **Dashboard HTTPS** is read-only. It shows whether HTTPS is on, the port, the certificate and key paths and the HTTP redirect. The dashboard certificate and key come from `--https-cert` / `--https-key` and reload from disk when the files change. There is no HTTPS toggle and no dashboard-certificate upload.
+2. **Agent connections (mTLS)** uploads or pastes the three agent (gRPC) files: server certificate, private key and CA certificate. Each replace asks for confirmation, overwrites the file with no backup, and does not change the running listeners (gRPC certificate hot-reload is not supported). After a restart the server uses the uploaded file only if `--cert`, `--key` and `--ca-cert` name it; if they do and the material is wrong, the server will not start. The gateway command plane pins the server certificate, so changing it can stop command forwarding. The mTLS switch on this panel changes only the value this server reports; it is not saved.
 
 ### Certificate Requirements
 

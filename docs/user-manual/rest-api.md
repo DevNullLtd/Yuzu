@@ -9750,7 +9750,7 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 
 ### Settings — Multi-Factor Authentication (MFA / TOTP)
 
-These endpoints drive the **Settings → Multi-Factor Authentication** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
+These endpoints drive the **Settings → Security and sign-in → Two-factor sign-in** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
 
 **`GET /fragments/settings/mfa`** — Render the MFA card for the logged-in admin.
 
