@@ -165,6 +165,28 @@ std::string render_exec_list(const ExecListView& v) {
     return out;
 }
 
+std::string render_stats_strip(const StatsStripView& v) {
+    auto ro = [](const std::string& value, const char* label, const char* note) {
+        return "<div class=\"ro\"><div class=\"v\">" + value + "</div><div class=\"l\">" +
+               label + "</div><div class=\"d\">" + note + "</div></div>";
+    };
+    const auto dur_ms = static_cast<int64_t>(std::max(0.0, v.avg_duration_seconds) * 1000.0);
+    // The unit rides in <small>: "41.6 s" / "2m 5s" / "800 ms" share one tone-free shape.
+    std::string dur = fmt_duration(dur_ms);
+    if (const auto sp = dur.rfind(' '); sp != std::string::npos && dur_ms < 60000)
+        dur = dur.substr(0, sp) + "<small> " + dur.substr(sp + 1) + "</small>";
+    std::string out = "<section class=\"readout stats\" data-slot=\"stats\" "
+                      "aria-label=\"Fleet execution statistics\">";
+    out += ro(std::to_string(v.executions_today), "Executions today", "UTC day");
+    out += ro(std::to_string(v.total_executions), "Finished, all time",
+              "excludes running and pending");
+    out += ro(std::format("{:.1f}", v.success_rate_pct) + "<small>%</small>",
+              "Device success rate", "all time, per device not per execution");
+    out += ro(dur, "Average duration", "finished executions");
+    out += "</section>";
+    return out;
+}
+
 std::string render_exec_selected(const ExecSelectedView& v) {
     const ExecRow& e = v.row;
     const ExecState st = derive_state(e.status, e.agents_failure, e.agents_responded);

@@ -38,6 +38,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 <header class="page-header"><div><h1>Executions</h1>
 <p class="subtitle">Instruction dispatches and their per-device results.</p></div></header>
 <div class="note" id="exec-confined" hidden><b>Confined view.</b> You can see executions you dispatched and executions that reached devices in your scope. Counts cover your devices only; scope and parameters are redacted.</div>
+<div id="exec-stats"></div>
 <div class="ops-grid">
 <div class="ops-main">
 <section class="panel ops-listbox">

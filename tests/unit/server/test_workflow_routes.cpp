@@ -848,6 +848,13 @@ TEST_CASE("executions page list: the status filter returns exactly the matching 
     std::sort(want.begin(), want.end());
     CHECK(ids == want);
     CHECK(all->body.find("data-count=\"3\"") != std::string::npos);
+    // Unconfined page view: the fleet strip comes first, counting finished executions only.
+    CHECK(all->body.rfind("<section class=\"readout stats\"", 0) == 0);
+    CHECK(all->body.find("<div class=\"v\">2</div><div class=\"l\">Finished, all time") !=
+          std::string::npos);
+    auto plain = h.sink.Get("/fragments/executions");
+    REQUIRE(plain);
+    CHECK(plain->body.find("readout stats") == std::string::npos);
     CHECK(all->body.find("Page def") != std::string::npos);
     // The page view is NOT the drawer markup, and the drawer view is not the page markup.
     CHECK(all->body.find("onclick=") == std::string::npos);

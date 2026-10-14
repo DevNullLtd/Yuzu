@@ -68,6 +68,17 @@ struct ExecListView {
 /// The list fragment (see the contract above).
 [[nodiscard]] std::string render_exec_list(const ExecListView& v);
 
+struct StatsStripView {
+    int64_t executions_today{0};
+    int64_t total_executions{0};  ///< finished (not running or pending), all time
+    double success_rate_pct{0};   ///< per device, not per execution
+    double avg_duration_seconds{0};
+};
+
+/// The fleet statistics strip (`data-slot="stats"`). No tone classes: the page states the
+/// figures and never decides whether a rate is good.
+[[nodiscard]] std::string render_stats_strip(const StatsStripView& v);
+
 struct ExecSelectedView {
     ExecRow row;
     std::string scope_expression;  ///< already the redaction constant when confined

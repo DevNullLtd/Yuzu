@@ -265,6 +265,28 @@ TEST_CASE("executions_page_render: Cancel is offered only for a live row, can-ca
     }
 }
 
+TEST_CASE("executions_page_render: the stats strip prints the figures with no tone classes",
+          "[ui][executions][render]") {
+    const auto html = render_stats_strip({3, 120, 97.5, 12.4});
+    CHECK(has(html, "<section class=\"readout stats\" data-slot=\"stats\" "
+                    "aria-label=\"Fleet execution statistics\">"));
+    CHECK(has(html, "<div class=\"ro\"><div class=\"v\">3</div><div class=\"l\">Executions "
+                    "today</div><div class=\"d\">UTC day</div></div>"));
+    CHECK(has(html, "<div class=\"v\">120</div><div class=\"l\">Finished, all time</div>"));
+    CHECK(has(html, "<div class=\"v\">97.5<small>%</small></div><div class=\"l\">Device success "
+                    "rate</div>"));
+    CHECK(has(html, "<div class=\"v\">12.4<small> s</small></div><div class=\"l\">Average "
+                    "duration</div>"));
+    // Yuzu states figures; it never decides whether a rate is good.
+    for (double pct : {97.5, 85.0, 40.0}) {
+        const auto h = render_stats_strip({1, 1, pct, 1.0});
+        CHECK_FALSE(has(h, "class=\"ro ok\""));
+        CHECK_FALSE(has(h, "class=\"ro warn\""));
+        CHECK_FALSE(has(h, "class=\"ro bad\""));
+    }
+    CHECK(has(render_stats_strip({0, 0, 0, 0}), "<div class=\"v\">0.0<small>%</small></div>"));
+}
+
 // -- Device results slot (render_exec_devices) --------------------------------------------
 
 namespace {

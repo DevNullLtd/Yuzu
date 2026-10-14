@@ -452,7 +452,18 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 row.dispatched_at = e.dispatched_at;
                 view.rows.push_back(std::move(row));
             }
-            res.set_content(operate_pages::render_exec_list(view), "text/html; charset=utf-8");
+            // Fleet-wide figures never reach a confined view; a store failure omits the strip
+            // rather than printing zeros. The list route does not audit, so neither does this.
+            std::string strip;
+            if (!gate.scope && execution_tracker) {
+                if (auto fs = execution_tracker->get_fleet_summary_checked(0, false)) {
+                    strip = operate_pages::render_stats_strip(
+                        {fs->executions_today, fs->total_executions, fs->overall_success_rate,
+                         fs->avg_duration_seconds});
+                }
+            }
+            res.set_content(strip + operate_pages::render_exec_list(view),
+                            "text/html; charset=utf-8");
             return;
         }
         std::string html;

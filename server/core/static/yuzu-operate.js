@@ -344,6 +344,7 @@
     var panel = $('#exec-selected');
     var devices = $('#exec-devices');
     var chip = $('#exec-chip');
+    var statsHost = $('#exec-stats');
     var confinedNote = $('#exec-confined');
     var defSel = $('#f-def');
     var defHint = $('#f-def-hint');
@@ -690,6 +691,12 @@
           return;
         }
         host.innerHTML = res.html; // server-rendered and escaped
+        // The optional fleet strip rides in the list response; adopt it into its own host
+        // (absent for a confined view or a store failure: the host is emptied, never stale).
+        var strip = $('[data-slot="stats"]', host);
+        if (statsHost) {
+          if (strip) statsHost.replaceChildren(strip); else statsHost.replaceChildren();
+        }
         var list = $('.ops-list', host);
         // A 200 note (denied, degraded, invalid) has no list: clear the previous list's chrome.
         if (list) updateChrome(list); else { chip.hidden = true; confinedNote.hidden = true; }

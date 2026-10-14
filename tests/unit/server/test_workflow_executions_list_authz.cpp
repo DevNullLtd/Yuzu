@@ -503,9 +503,13 @@ TEST_CASE("fragments/executions page view real gate: serves exactly the default 
     CHECK(has(pg.body, "data-confined=\"1\""));
     CHECK_FALSE(has(pg.body, "SECRET-ALICE"));
     CHECK_FALSE(has(pg.body, "alice-agent"));
+    // Fleet-wide figures never reach a confined view, and never the default view.
+    CHECK_FALSE(has(pg.body, "readout stats"));
+    CHECK_FALSE(has(def.body, "readout stats"));
 
-    // Global principal: unfiltered, not flagged confined.
+    // Global principal: unfiltered, not flagged confined, with the fleet strip.
     auto gary = r.get(r.mint("gary"), false, page);
+    CHECK(has(gary.body, "<section class=\"readout stats\" data-slot=\"stats\""));
     CHECK(gary.ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_alice, r.x_bob_own}));
     CHECK(has(gary.body, "data-confined=\"0\""));
 
