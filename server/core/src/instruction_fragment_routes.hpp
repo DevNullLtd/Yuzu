@@ -95,8 +95,15 @@ struct Deps {
                            const std::string& message, const std::string& target_type,
                            const std::string& target_id)>;
 
+    /// Render-time capability probe: true when the caller holds
+    /// `securable:op`. Unwired means "cannot decide" -- the list fragment then
+    /// renders neither the approval column nor the sets panel.
+    using ProbePermFn =
+        std::function<bool(const httplib::Request&, const std::string&, const std::string&)>;
+
     AuthFn auth_fn;
     PermFn perm_fn;
+    ProbePermFn probe_perm_fn;
     DenyServiceScopedFn deny_service_scoped_fn;
     /// `ServerImpl::instruction_store_`. Null, or a genuine DB error on
     /// `query_definitions()`, both degrade the list fragment to "Not

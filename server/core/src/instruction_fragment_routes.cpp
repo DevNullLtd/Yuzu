@@ -1,6 +1,7 @@
 #include "instruction_fragment_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "instruction_extras_render.hpp"
 #include "instruction_store.hpp"
 #include "web_utils.hpp" // html_escape
 
@@ -144,14 +145,47 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
 
-            // ADR-0058: query_definitions now returns std::expected — a genuine DB
-            // error degrades to the same "Not available" fragment as a null store.
-            auto defs_result = deps.store->query_definitions();
-            if (!defs_result) {
-                res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
+            // Filters and page size. `limit+1` is requested so a full page can be told
+            // apart from a truncated one; the extra row is never rendered. Over-long
+            // filter text cannot match any real name/plugin/type and is refused
+            // rather than silently shortened (which would widen the match).
+            constexpr std::size_t kMaxFilterLen = 128;
+            InstructionQuery q;
+            q.name_filter = req.get_param_value("name");
+            q.plugin_filter = req.get_param_value("plugin");
+            q.type_filter = req.get_param_value("type");
+            const bool filtered =
+                !q.name_filter.empty() || !q.plugin_filter.empty() || !q.type_filter.empty();
+            if (q.name_filter.size() > kMaxFilterLen || q.plugin_filter.size() > kMaxFilterLen ||
+                q.type_filter.size() > kMaxFilterLen) {
+                res.set_content("<div class=\"empty-state\">Filter text is too long.</div>",
+                                "text/html; charset=utf-8");
                 return;
             }
-            const auto& defs = *defs_result;
+            const int limit = instruction_extras::clamp_library_limit(req.get_param_value("limit"));
+            q.limit = limit + 1;
+
+            // ADR-0058: query_definitions returns std::expected -- a genuine DB error
+            // is a degraded read, never an empty library.
+            auto defs_result = deps.store->query_definitions(q);
+            if (!defs_result) {
+                res.set_content(instruction_extras::render_library_degraded(),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            auto& defs = *defs_result;
+            const bool truncated = defs.size() > static_cast<std::size_t>(limit);
+            if (truncated)
+                defs.resize(static_cast<std::size_t>(limit));
+
+            // Capability probes, at most once each per render (never per row). An
+            // unwired probe means "cannot decide": neither extra is rendered, and the
+            // output is byte-identical to the pre-extras fragment.
+            const bool show_approval =
+                deps.probe_perm_fn && deps.probe_perm_fn(req, "InstructionDefinition", "Read");
+            const bool probe_sets = static_cast<bool>(deps.probe_perm_fn);
+            const bool show_sets =
+                probe_sets && deps.probe_perm_fn(req, "InstructionSet", "Read");
 
             // Check if user has PlatformEngineer or Administrator role
             // PlatformEngineer or Administrator can author definitions.
@@ -179,8 +213,10 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                 html += "</div>";
             } else {
                 html += "<div class=\"tw\"><table><thead><tr><th>Name</th><th>Plugin:Action</"
-                        "th><th>Type</th><th>Enabled</th><th>Set</th><th></th></tr></thead>"
-                        "<tbody>";
+                        "th><th>Type</th>";
+                if (show_approval)
+                    html += "<th>Needs approval</th>";
+                html += "<th>Enabled</th><th>Set</th><th></th></tr></thead><tbody>";
                 for (const auto& d : defs) {
                     bool is_legacy = d.id.starts_with("legacy.");
                     html += "<tr><td><strong>" + html_escape(d.name) + "</strong>";
@@ -193,8 +229,11 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             "</code></td>"
                             "<td><span class=\"status-badge status-idle\">" +
                             html_escape(d.type) +
-                            "</span></td>"
-                            "<td>" +
+                            "</span></td>";
+                    if (show_approval)
+                        html += std::string("<td>") +
+                                instruction_extras::approval_label(d.approval_mode) + "</td>";
+                    html += "<td>" +
                             std::string(d.enabled ? "Yes" : "No") +
                             "</td>"
                             "<td>" +
@@ -231,7 +270,39 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                 }
                 html += "</tbody></table></div>";
             }
+            html += instruction_extras::render_library_foot(limit, truncated);
             html += "</section>";
+
+            if (probe_sets) {
+                if (!show_sets) {
+                    html += instruction_extras::render_sets_denied();
+                } else if (auto sets = deps.store->list_sets(); !sets) {
+                    html += instruction_extras::render_sets_degraded();
+                } else {
+                    // Counts need every definition, not the filtered/truncated page.
+                    const std::vector<InstructionDefinition>* all = &defs;
+                    std::expected<std::vector<InstructionDefinition>, std::string> full;
+                    if (filtered || truncated) {
+                        InstructionQuery all_q;
+                        all_q.limit = 10000; // ponytail: store max; counts show "N+" beyond it
+                        full = deps.store->query_definitions(all_q);
+                        all = full ? &*full : nullptr;
+                    }
+                    if (!all) {
+                        html += instruction_extras::render_sets_degraded();
+                    } else {
+                        std::vector<instruction_extras::SetRow> rows;
+                        for (const auto& st : *sets) {
+                            std::size_t n = 0;
+                            for (const auto& d : *all)
+                                n += (d.instruction_set_id == st.id) ? 1 : 0;
+                            rows.push_back({st, n});
+                        }
+                        html += instruction_extras::render_instruction_sets_panel(
+                            rows, all->size() >= 10000);
+                    }
+                }
+            }
             res.set_content(html, "text/html; charset=utf-8");
         });
 

@@ -98,15 +98,14 @@
 ///     `audit_emitted` (the captured `deps.audit_fn` return) on every
 ///     branch — a #883 SOC 2 CC7.2 pattern unique to this route in this
 ///     module.
-///   - `POST /api/instruction-sets` (create): **NO audit call on ANY
-///     branch** (db-error, conflict, validation, OR success) — a
-///     pre-existing gap, documented as such in the original inline code and
-///     NOT fixed by this mechanical move (tracked separately, #3598).
+///   - `POST /api/instruction-sets` (create): every outcome audits
+///     `instruction_set.create` -- `"success"` (target_id = the new id), a DB
+///     error `"error"`, a duplicate-id conflict `"denied"` detail `conflict`,
+///     any other rejection `"denied"` detail `invalid`. A failed audit write
+///     sets `Sec-Audit-Failed: true`.
 ///   - `DELETE /api/instruction-sets/:id`: a DB error audits `"error"`; a
-///     not-found audits `"denied"`; **success is NOT audited** — asymmetric
-///     with `DELETE /api/instructions/:id` (which DOES audit success). Both
-///     preserved verbatim; this is not this extraction's place to unify
-///     them.
+///     not-found audits `"denied"`; success audits `"success"` (and a failed
+///     audit write sets `Sec-Audit-Failed: true`).
 ///   - `GET /fragments/instructions/editor`: never audited. A
 ///     `perm_fn` denial does NOT surface as an HTTP 403 — the handler
 ///     overrides it to `200` + `kInstructionEditorDeniedHtml` (an HTMX

@@ -15719,6 +15719,15 @@ private:
             inline_sink, yuzu::server::instruction_fragment::Deps{
                              .auth_fn = auth_fn,
                              .perm_fn = perm_fn,
+                             // Render-time probe: the loud gate against a throwaway
+                             // Response (idiom of scoped_probe_fn below). Each failed
+                             // probe writes one auth.permission_required denied row.
+                             .probe_perm_fn =
+                                 [perm_fn](const httplib::Request& req, const std::string& type,
+                                           const std::string& op) -> bool {
+                                     httplib::Response probe;
+                                     return perm_fn(req, probe, type, op);
+                                 },
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .store = instruction_store_.get(),
                          });

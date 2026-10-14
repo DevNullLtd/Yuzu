@@ -77,6 +77,12 @@ struct Harness {
     bool perm_allow{true};
     std::vector<std::pair<std::string, std::string>> perm_calls;
 
+    // Render-time probe (Deps::probe_perm_fn). Unwired by default so existing
+    // cases exercise the byte-identical "cannot decide" path.
+    bool probe_wired{false};
+    std::vector<std::string> probe_allow; // "Securable:Op" entries that pass
+    std::vector<std::string> probe_calls;
+
     yuzu::server::test::TestRouteSink sink;
 
     void wire() {
@@ -119,6 +125,16 @@ struct Harness {
             }
             return true;
         };
+        if (probe_wired) {
+            deps.probe_perm_fn = [this](const httplib::Request&, const std::string& type,
+                                        const std::string& op) {
+                probe_calls.push_back(type + ":" + op);
+                for (const auto& a : probe_allow)
+                    if (a == type + ":" + op)
+                        return true;
+                return false;
+            };
+        }
         instruction_fragment::register_instruction_fragment_routes(sink, deps);
     }
 };
@@ -347,6 +363,125 @@ TEST_CASE("instruction_fragment_routes: GET renders the definitions table, escap
           std::string::npos);
     CHECK(admin_res->body.find("hx-confirm=\"Delete definition 'Get Hostname'?\"") !=
           std::string::npos);
+}
+
+TEST_CASE("instruction_fragment_routes: filters, limit+1 truncation, approval column and sets "
+          "panel behind render-time probes",
+          "[pg][server][routes][instruction_fragment_routes][extras]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_frag_tpl);
+    PgWired w{db.dsn()};
+    auto set_id = w.store.create_set(InstructionSet{.name = "Triage Set"});
+    REQUIRE(set_id.has_value());
+    for (const char* n : {"Alpha one", "Alpha two", "Beta three"}) {
+        auto d = make_def(n);
+        d.approval_mode = (std::string(n) == "Beta three") ? "always" : "auto";
+        d.instruction_set_id = (std::string(n) == "Beta three") ? *set_id : "";
+        REQUIRE(w.store.create_definition(d).has_value());
+    }
+
+    SECTION("default call with no probe wired is the legacy table: no approval column, no sets "
+            "panel, no foot") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto res = h.sink.Get("/fragments/instructions");
+        REQUIRE(res);
+        CHECK(res->body.find("3</strong> definitions") != std::string::npos);
+        CHECK(res->body.find("Needs approval") == std::string::npos);
+        CHECK(res->body.find("instruction-sets") == std::string::npos);
+        CHECK(res->body.find("data-truncated") == std::string::npos);
+        CHECK(h.probe_calls.empty());
+    }
+
+    SECTION("limit=2 truncates with an honest foot and never renders the sentinel row") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto res = h.sink.Get("/fragments/instructions?limit=2");
+        REQUIRE(res);
+        CHECK(res->body.find("2</strong> definitions") != std::string::npos);
+        CHECK(res->body.find("Showing the first 2. Narrow the filter.") != std::string::npos);
+        CHECK(res->body.find("Alpha one") != std::string::npos);
+        CHECK(res->body.find("Alpha two") != std::string::npos);
+        CHECK(res->body.find("Beta three") == std::string::npos);
+    }
+
+    SECTION("limit equal to the row count is not truncated") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto res = h.sink.Get("/fragments/instructions?limit=3");
+        REQUIRE(res);
+        CHECK(res->body.find("data-truncated") == std::string::npos);
+        CHECK(res->body.find("Beta three") != std::string::npos);
+    }
+
+    SECTION("name and type filters narrow the list") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto res = h.sink.Get("/fragments/instructions?name=alpha");
+        REQUIRE(res);
+        CHECK(res->body.find("2</strong> definitions") != std::string::npos);
+        CHECK(res->body.find("Beta three") == std::string::npos);
+        auto none = h.sink.Get("/fragments/instructions?type=action");
+        REQUIRE(none);
+        CHECK(none->body.find("0</strong> definitions") != std::string::npos);
+    }
+
+    SECTION("an over-long filter is refused, not shortened") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto res = h.sink.Get("/fragments/instructions?name=" + std::string(129, 'a'));
+        REQUIRE(res);
+        CHECK(res->body.find("Filter text is too long.") != std::string::npos);
+    }
+
+    SECTION("both probes pass: approval column and sets panel with server-computed counts") {
+        Harness h;
+        h.store = &w.store;
+        h.probe_wired = true;
+        h.probe_allow = {"InstructionDefinition:Read", "InstructionSet:Read"};
+        h.wire();
+        auto res = h.sink.Get("/fragments/instructions");
+        REQUIRE(res);
+        CHECK(res->body.find("<th>Needs approval</th>") != std::string::npos);
+        CHECK(res->body.find("<td>Yes</td>") != std::string::npos);
+        CHECK(res->body.find("<td>No</td>") != std::string::npos);
+        CHECK(res->body.find("Triage Set") != std::string::npos);
+        CHECK(res->body.find("<td>1</td></tr>") != std::string::npos); // one member
+        // Probed once per capability per render, never per row.
+        REQUIRE(h.probe_calls.size() == 2);
+        CHECK(h.probe_calls[0] == "InstructionDefinition:Read");
+        CHECK(h.probe_calls[1] == "InstructionSet:Read");
+    }
+
+    SECTION("set counts come from the whole library, not the filtered page") {
+        Harness h;
+        h.store = &w.store;
+        h.probe_wired = true;
+        h.probe_allow = {"InstructionDefinition:Read", "InstructionSet:Read"};
+        h.wire();
+        auto res = h.sink.Get("/fragments/instructions?name=alpha");
+        REQUIRE(res);
+        CHECK(res->body.find("Beta three") == std::string::npos);
+        CHECK(res->body.find("Triage Set") != std::string::npos);
+        CHECK(res->body.find("<td>1</td></tr>") != std::string::npos);
+    }
+
+    SECTION("probes denied: no approval column, no set data, a denied note instead") {
+        Harness h;
+        h.store = &w.store;
+        h.probe_wired = true; // nothing allowed
+        h.wire();
+        auto res = h.sink.Get("/fragments/instructions");
+        REQUIRE(res);
+        CHECK(res->body.find("Needs approval") == std::string::npos);
+        CHECK(res->body.find("Triage Set") == std::string::npos);
+        CHECK(res->body.find("data-denied=\"true\"") != std::string::npos);
+        CHECK(res->body.find("Beta three") != std::string::npos); // the list itself is unchanged
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
