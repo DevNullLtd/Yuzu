@@ -1166,6 +1166,27 @@ else
     fail "GET /home missing the signed-in panel"
 fi
 
+# Landing page without a session: the sign-in form, never a redirect; a screen page goes to
+# /home?next=<key>; /login forwards to /home keeping only a valid key.
+http_get_noauth "$SERVER_URL/home"
+assert_eq "GET /home (no session) status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *'id="signin"'* && "$HTTP_BODY" != *'aria-label="Signed in"'* ]]; then
+    pass "GET /home with no session shows the sign-in form"
+else
+    fail "GET /home with no session is not the sign-in form"
+fi
+for pair in "/devices|/home?next=devices" "/compliance|/home?next=compliance" "/login?next=%2Fevil|/home" "/login?next=devices|/home?next=devices"; do
+    from="${pair%%|*}"; want="${pair##*|}"
+    got=$(curl -s -o /dev/null -w "%{http_code} %{redirect_url}" "$SERVER_URL$from" 2>/dev/null || echo "000 ")
+    TESTS=$((TESTS + 1))
+    if [[ "$got" == "302 $SERVER_URL$want" ]]; then
+        pass "GET $from (no session) -> 302 $want"
+    else
+        fail "GET $from (no session) answered '$got', want '302 $SERVER_URL$want'"
+    fi
+done
+
 # Dashboard: the admin session is unconfined, so the page and the summary fragment must
 # answer 200 with their own markup. The loose status list above would also accept a route
 # that was never registered.
