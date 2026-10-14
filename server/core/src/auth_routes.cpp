@@ -851,12 +851,10 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // Reaching here with a Degraded verdict means the allow-list alone would have admitted
         // the request; refuse it as the retryable outage it is.
         if (ceiling_degraded) {
-            if (quiet == Quiet::Yes)
-                return false; // unreachable today; skip its degrade counter + audit row
             respond_ceiling_degraded(req, res, "auth.permission_required",
                                      "service-scoped token blocked: RBAC read degraded "
                                      "resolving the ITServiceOwner ceiling",
-                                     ceiling);
+                                     ceiling, quiet);
             return false;
         }
         return true;

@@ -939,11 +939,12 @@ private:
     /// the permission) and answers 503 with `retry_after_ms` 5000 and no `.permission`.
     /// Called by `require_fleet_read` and `require_scoped_permission`, and by
     /// `require_permission` only as the dormant guard where its allow-list would admit
-    /// (extend, never fork); each caller still refuses the request itself.
+    /// (extend, never fork); each caller still refuses the request itself. `Quiet::Yes` writes
+    /// the same 503 response but no counter and no audit row.
     void respond_ceiling_degraded(const httplib::Request& req, httplib::Response& res,
                                   const std::string& audit_action,
                                   const std::string& audit_detail,
-                                  const authz::CeilingResult& ceiling);
+                                  const authz::CeilingResult& ceiling, Quiet quiet = Quiet::No);
 
     std::optional<std::vector<authz::PermPair>> service_scope_global_safe_override_for_test_;
 
