@@ -110,10 +110,9 @@ TEST_CASE("RBAC role reads: a store that is not open is a 503 behind the gate, n
           "empty 200 or a 404",
           "[rest][rbac][reads]") {
     // Deliberately NOT tagged [pg]: the pool is dead, no database fixture runs, so the case
-    // needs no Postgres and runs in the non-pg shards with or without a DSN.
-    yuzu::server::pg::PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope "
-                                              "connect_timeout=1",
-                                  .size = 1}};
+    // needs no Postgres and runs in the non-pg shards with or without a DSN. The conninfo is
+    // unparseable (no network attempt), the repo's usual way to build an unopened store.
+    yuzu::server::pg::PgPool bad{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
     RbacStore broken{bad};
     REQUIRE_FALSE(broken.is_open());
     RoleReadsHarness h{&broken};
