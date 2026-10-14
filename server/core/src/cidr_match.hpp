@@ -10,8 +10,8 @@
 /// keeping those out of the widely-included peer_ip.hpp.
 ///
 /// Distinct from auth/auto_approve.cpp's IPv4-only `match_ip_subnet`: that one
-/// is a private AutoApproveEngine method and throws (`std::stoi`) on a malformed
-/// prefix. These are free functions, IPv4+IPv6, and never throw — a future
+/// is a private AutoApproveEngine method that treats a malformed prefix as a
+/// non-match. These are free functions, IPv4+IPv6, and never throw — a future
 /// consolidation could fold auto_approve onto these.
 
 #include <string>
