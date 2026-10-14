@@ -663,7 +663,14 @@ bool AuthRoutes::service_scope_admits(std::string_view securable_type,
 
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
                                     const std::string& securable_type,
-                                    const std::string& operation) {
+                                    const std::string& operation, Quiet quiet) {
+    // Quiet::Yes (render-time probe): every denial audit row and denial counter in this body and
+    // in require_tier_policy is suppressed; the verdict, status and body are unchanged. A probe is
+    // a rendering hint, never a gate -- the action route re-gates loudly.
+    const auto emit = [&](auto&&... a) {
+        if (quiet == Quiet::No)
+            audit_log(req, std::forward<decltype(a)>(a)...);
+    };
     auto session = require_auth(req, res);
     if (!session)
         return false;
@@ -693,7 +700,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     if (session->principal_kind == "engine") {
         if (!rbac_store_ || !rbac_store_->is_open()) {
             // Cannot evaluate authority — fail closed, 503.
-            audit_log(req, "auth.permission_required", "denied", "", "",
+            emit("auth.permission_required", "denied", "", "",
                       "engine principal denied: RBAC store unavailable");
             res.status = 503;
             res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
@@ -704,7 +711,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         }
         if (!rbac_store_->is_rbac_enabled() ||
             !rbac_store_->check_permission(session->username, securable_type, operation)) {
-            audit_log(req, "auth.permission_required", "denied", "", "",
+            emit("auth.permission_required", "denied", "", "",
                       "engine principal denied " + securable_type + ":" + operation);
             res.status = 403;
             const std::string perm = securable_type + ":" + operation;
@@ -723,7 +730,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // the seeded-empty allow-list.
         if (!session->token_scope_service.empty() &&
             !service_scope_admits(securable_type, operation)) {
-            audit_log(req, "auth.permission_required", "denied", "", "",
+            emit("auth.permission_required", "denied", "", "",
                       "engine principal denied: corrupted scope_service on engine session "
                       "blocked by service-scope default-deny");
             res.status = 403;
@@ -749,7 +756,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // require_permission), so holding securable_type:operation WOULD admit
     // the caller -- naming it in a denial is accurate, not a false claim.
     if (!require_tier_policy(req, res, *session, securable_type, operation,
-                             /*actionable_permission=*/true))
+                             /*actionable_permission=*/true, quiet))
         return false;
 
     // Service-scoped tokens (PR 3 — the flip, #2298 durable fix): ITServiceOwner
@@ -774,7 +781,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // fail closed via `authz::service_ceiling_check` on that same handle
         // instead — deny-on-degrade either way, just a more accurate reason.
         if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_)) {
-            audit_log(req, "auth.permission_required", "denied", "", "",
+            emit("auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
             // No `.permission`: granting `perm` does not fix "RBAC disabled".
@@ -798,7 +805,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // the one exception that continues (see above); it can only leave this function as a
         // refusal through the allow-list check or the guard after it.
         if (!ceiling_degraded && ceiling.verdict != authz::CeilingVerdict::Admit) {
-            audit_log(req, "auth.permission_required", "denied", "", "",
+            emit("auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
             // Post-flip, an ITServiceOwner grant is necessary but no longer
@@ -816,11 +823,11 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             // (status, body and metrics unchanged), so without it an outage would be
             // indistinguishable from a healthy default-deny in the audit row. The text before
             // the marker is the healthy row's detail, byte for byte.
-            audit_log(req, "auth.permission_required", "denied", "", "",
+            emit("auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: default-deny (" + perm +
                           " not on the service-scope global-safe allow-list)" +
                           (ceiling_degraded ? "; ceiling read degraded" : ""));
-            if (auto* m = auth_mgr_.metrics_registry()) {
+            if (auto* m = quiet == Quiet::No ? auth_mgr_.metrics_registry() : nullptr) {
                 m->counter("yuzu_auth_service_scope_default_denied_total",
                            {{"permission", perm},
                             {"path_class", std::string(resolve_body_cap(req.method, req.path)
@@ -847,7 +854,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             respond_ceiling_degraded(req, res, "auth.permission_required",
                                      "service-scoped token blocked: RBAC read degraded "
                                      "resolving the ITServiceOwner ceiling",
-                                     ceiling);
+                                     ceiling, quiet);
             return false;
         }
         return true;
@@ -865,7 +872,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // gate and the filter can never disagree on a corrupt store.
     if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_)) {
         if (!rbac_store_->check_permission(session->username, securable_type, operation)) {
-            audit_log(req, "auth.permission_required", "denied", "", "",
+            emit("auth.permission_required", "denied", "", "",
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
             const std::string perm = securable_type + ":" + operation;
@@ -906,9 +913,9 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                      : std::string("non-admin role denied ")) +
             securable_type + ":" + operation +
             (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")");
-        audit_log(req, "auth.permission_required", "denied", "", "", reason);
+        emit("auth.permission_required", "denied", "", "", reason);
         if (floored) {
-            if (auto* m = auth_mgr_.metrics_registry()) {
+            if (auto* m = quiet == Quiet::No ? auth_mgr_.metrics_registry() : nullptr) {
                 m->counter("yuzu_auth_topology_floor_denied_total",
                            {{"permission", securable_type + ":" + operation}})
                     .increment();
@@ -928,12 +935,16 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
                                      const auth::Session& session,
                                      const std::string& securable_type,
                                      const std::string& operation,
-                                     bool actionable_permission) {
+                                     bool actionable_permission, Quiet quiet) {
+    const auto emit = [&](auto&&... a) {
+        if (quiet == Quiet::No)
+            audit_log(req, std::forward<decltype(a)>(a)...);
+    };
     if (session.mcp_tier.empty())
         return true; // Not an MCP token — nothing this belt enforces (#4309).
 
     if (!mcp::tier_allows(session.mcp_tier, securable_type, operation)) {
-        audit_log(req, "auth.permission_required", "denied", "", "",
+        emit("auth.permission_required", "denied", "", "",
                   "MCP token tier '" + session.mcp_tier + "' does not allow " + securable_type +
                       ":" + operation);
         res.status = 403;
@@ -973,7 +984,7 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
     // endpoint. Keep the denial for EVERY OTHER transport: a REST route hit
     // by an MCP token must not bypass the ticket flow (#520).
     if (req.path != "/mcp/v1/" && mcp::requires_approval(session.mcp_tier, securable_type, operation)) {
-        audit_log(req, "auth.approval_required", "denied", "", "",
+        emit("auth.approval_required", "denied", "", "",
                   "MCP token tier '" + session.mcp_tier + "' requires approval for " +
                       securable_type + ":" + operation + " on a non-MCP transport");
         res.status = 403;

@@ -48,7 +48,7 @@ authz::CeilingResult authz::service_ceiling_check(const RbacStore& store,
 void AuthRoutes::respond_ceiling_degraded(const httplib::Request& req, httplib::Response& res,
                                           const std::string& audit_action,
                                           const std::string& audit_detail,
-                                          const authz::CeilingResult& ceiling) {
+                                          const authz::CeilingResult& ceiling, Quiet quiet) {
     // The ONE emission for a Degraded ITServiceOwner ceiling read, shared by
     // require_fleet_read and require_scoped_permission (and require_permission's dormant
     // guard where its allow-list would admit): an outage is not a missing grant, so it is a
@@ -62,12 +62,14 @@ void AuthRoutes::respond_ceiling_degraded(const httplib::Request& req, httplib::
     // never an admit), with the counter label falling back to query_error.
     assert(ceiling.verdict == authz::CeilingVerdict::Degraded &&
            "respond_ceiling_degraded: caller must pass a Degraded ceiling verdict");
-    if (auto* m = auth_mgr_.metrics_registry()) {
-        m->counter("yuzu_server_rbac_read_degrade_total",
-                   {{"reason", ceiling.degrade_reason ? ceiling.degrade_reason : "query_error"}})
-            .increment();
+    if (quiet == Quiet::No) {
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_server_rbac_read_degrade_total",
+                       {{"reason", ceiling.degrade_reason ? ceiling.degrade_reason : "query_error"}})
+                .increment();
+        }
+        audit_log(req, audit_action, "denied", "", "", audit_detail);
     }
-    audit_log(req, audit_action, "denied", "", "", audit_detail);
     res.status = 503;
     res.set_content(detail::a4_denial(res, 503,
                                       "authorization store degraded, cannot verify the "
