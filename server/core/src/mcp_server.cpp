@@ -603,8 +603,8 @@ static const ToolDef kTools[] = {
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
-     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
-     R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}}},"required":["entries"]})j"},
+     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string","description":"Exact target id; requires target_type"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500},"offset":{"type":"integer","default":0,"minimum":0,"maximum":10000}}})",
+     R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}}},"required":["entries"]})j"},
 
     {"list_definitions",
      // #4029: full filter set (was plugin/type only) — mirrors GET /api/v1/instructions.
@@ -8470,11 +8470,68 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 AuditQuery aq;
-                aq.principal = param_str(args, "principal");
-                aq.action = param_str(args, "action");
-                aq.target_type = param_str(args, "target_type");
-                aq.since = param_int(args, "since");
-                aq.until = param_int(args, "until");
+                // Strict: a present wrong-typed value is refused, not dropped
+                // (a dropped filter would widen the evidence read silently).
+                auto principal_opt = param_string_strict(args, "principal");
+                auto action_opt = param_string_strict(args, "action");
+                auto target_type_opt = param_string_strict(args, "target_type");
+                auto target_id_opt = param_string_strict(args, "target_id");
+                auto offset_opt = param_int_strict(args, "offset", 0);
+                auto since_opt = param_int_strict(args, "since", 0);
+                auto until_opt = param_int_strict(args, "until", 0);
+                if (!principal_opt || !action_opt || !target_type_opt) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "principal/action/target_type must be JSON strings"),
+                                    "application/json");
+                    return;
+                }
+                // A NUL would truncate the bound value at the C-string boundary and widen the filter.
+                for (const auto* v : {&*principal_opt, &*action_opt, &*target_type_opt}) {
+                    if (v->find('\0') != std::string::npos) {
+                        res.set_content(error_response(id, kInvalidParams,
+                                                       "string filters must not contain NUL"),
+                                        "application/json");
+                        return;
+                    }
+                }
+                aq.principal = *principal_opt;
+                aq.action = *action_opt;
+                if (!since_opt || !until_opt || *since_opt < 0 || *until_opt < 0 ||
+                    (*since_opt > 0 && *until_opt > 0 && *since_opt > *until_opt)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "since/until must be non-negative integers with since <= until"),
+                        "application/json");
+                    return;
+                }
+                aq.target_type = *target_type_opt;
+                if (!target_id_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "target_id must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                if (!offset_opt || *offset_opt < 0 || *offset_opt > kAuditMaxOffset) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "offset must be an integer 0..10000"),
+                        "application/json");
+                    return;
+                }
+                if (target_id_opt->find('\0') != std::string::npos) {
+                    res.set_content(error_response(id, kInvalidParams, "target_id must not contain NUL"),
+                                    "application/json");
+                    return;
+                }
+                aq.target_id = *target_id_opt;
+                aq.offset = static_cast<int>(*offset_opt);
+                if (!aq.target_id.empty() && aq.target_type.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "target_id requires target_type"),
+                        "application/json");
+                    return;
+                }
+                aq.since = *since_opt;
+                aq.until = *until_opt;
                 // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the
                 // query_responses idiom (`:3660`). Upper alone left a
                 // negative or zero `limit` reaching `AuditStore::query`,

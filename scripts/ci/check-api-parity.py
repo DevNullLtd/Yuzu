@@ -207,7 +207,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # Both of the two changes above landed on 199; merged together the count is 201
 # (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
-BASELINE_UNTWINNED = 201
+#
+# Audit filter parity: get.api-audit flips "planned:#2146" -> "twinned" (GET /api/v1/audit +
+# MCP query_audit_log, now at filter/paging parity), 201 - 1 = 200, the value the checker
+# reports on the merged tree.
+BASELINE_UNTWINNED = 200
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

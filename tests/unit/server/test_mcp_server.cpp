@@ -17492,6 +17492,64 @@ TEST_CASE("MCP query_audit_log: limit is clamped to [1,500] (no false-empty)",
     CHECK(query_limit("50").size() == 3);
 }
 
+TEST_CASE("MCP query_audit_log: target_id and offset filter and page; wrong types are refused",
+          "[pg][mcp][integration][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    for (const char* tid : {"id-a", "id-b", "id-b"}) {
+        AuditEvent evt;
+        evt.principal = "mcp-parity-probe";
+        evt.action = "parity.probe";
+        evt.target_type = "parity_t";
+        evt.target_id = tid;
+        evt.result = "success";
+        evt.timestamp = 1000;
+        REQUIRE(store.log(evt));
+    }
+
+    McpTestServer ts;
+    ts.audit_store_for_test = &store;
+    ts.start("readonly");
+
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":75,)"
+                                       R"("params":{"name":"query_audit_log","arguments":)") +
+                           args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    auto rows = [&](const std::string& args) {
+        auto body = call(args);
+        REQUIRE(body.contains("result"));
+        return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    };
+    const std::string base = R"("principal":"mcp-parity-probe","target_type":"parity_t")";
+
+    CHECK(rows("{" + base + R"(,"target_id":"id-b"})").size() == 2);
+    CHECK(rows("{" + base + R"(,"limit":2,"offset":2})").size() == 1);
+    CHECK(rows("{" + base + R"(,"offset":3})").size() == 0);
+    // since/until are inclusive: all three rows sit at timestamp 1000.
+    CHECK(rows("{" + base + R"(,"since":1000,"until":1000})").size() == 3);
+    CHECK(rows("{" + base + R"(,"since":1001})").size() == 0);
+    CHECK(rows("{" + base + R"(,"until":999})").size() == 0);
+    // The inclusive maximum is accepted (empty page, not an error).
+    CHECK(rows("{" + base + R"(,"offset":10000})").size() == 0);
+
+    // Present-but-wrong-type and out-of-range are refused, not dropped.
+    for (const std::string bad :
+         {R"({"offset":"5"})", R"({"offset":-1})", R"({"offset":10001})", R"({"target_id":7})",
+          R"({"target_id":"id-a"})" /* no target_type */, R"({"target_type":7})", R"({"principal":42})", R"({"action":false})",
+          R"({"target_type":"a\u0000b"})", R"({"principal":"a\u0000b"})", R"({"action":"a\u0000b"})",
+          R"({"target_type":"T","target_id":"a\u0000b"})", R"({"since":"1"})", R"({"until":-1})", R"({"since":9,"until":3})"}) {
+        INFO(bad);
+        auto body = call(bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == -32602);
+    }
+}
+
 TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution_id loop",
           "[pg][mcp][integration][response][fanout][execute]") {
     // End-to-end: dispatch via execute_instruction (real ExecutionTracker mints

@@ -1055,7 +1055,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "List instruction definitions", "tags": ["Instructions"], "responses": {"200": {"description": "List of instruction definitions"}}}
     },
     "/audit": {
-      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1 (a client error, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
+      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}, {"name": "target_type", "in": "query", "schema": {"type": "string"}}, {"name": "target_id", "in": "query", "description": "Requires target_type", "schema": {"type": "string"}}, {"name": "since", "in": "query", "description": "Inclusive epoch seconds; 0 = unbounded", "schema": {"type": "integer", "minimum": 0}}, {"name": "until", "in": "query", "description": "Inclusive epoch seconds; 0 = unbounded", "schema": {"type": "integer", "minimum": 0}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 10000}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1, malformed since/until/offset, since > until, or target_id without target_type (client errors, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
     },
     "/audit/auth-sample": {
       "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
@@ -8115,6 +8115,53 @@ void RestApiV1::register_routes(
                  }
                  q.principal = req.get_param_value("principal");
                  q.action = req.get_param_value("action");
+                 q.target_type = req.get_param_value("target_type");
+                 q.target_id = req.get_param_value("target_id");
+                 auto bad_request = [&res](const char* msg) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, msg), "application/json");
+                 };
+                 // A NUL (%00) would truncate the bound value at the C-string boundary and
+                 // silently widen the filter.
+                 if (q.principal.find('\0') != std::string::npos ||
+                     q.action.find('\0') != std::string::npos ||
+                     q.target_type.find('\0') != std::string::npos ||
+                     q.target_id.find('\0') != std::string::npos) {
+                     bad_request("string filters must not contain NUL");
+                     return;
+                 }
+                 // since/until: epoch seconds, whole value one non-negative integer;
+                 // absent or 0 = that side unbounded; both bounds inclusive.
+                 for (const auto& [name, dst] :
+                      {std::pair<const char*, int64_t*>{"since", &q.since},
+                       std::pair<const char*, int64_t*>{"until", &q.until}}) {
+                     const auto s = req.get_param_value(name);
+                     if (s.empty())
+                         continue;
+                     const auto v = parse_query_int<int64_t>(s);
+                     if (!v || *v < 0) {
+                         bad_request("since/until must be non-negative epoch seconds");
+                         return;
+                     }
+                     *dst = *v;
+                 }
+                 if (q.since > 0 && q.until > 0 && q.since > q.until) {
+                     bad_request("since must be <= until");
+                     return;
+                 }
+                 if (const auto off = req.get_param_value("offset"); !off.empty()) {
+                     const auto v = parse_query_int<int>(off);
+                     if (!v || *v < 0 || *v > kAuditMaxOffset) {
+                         bad_request("offset must be 0..10000");
+                         return;
+                     }
+                     q.offset = *v;
+                 }
+                 // The index leads with target_type, so a bare target_id is a scan.
+                 if (!q.target_id.empty() && q.target_type.empty()) {
+                     bad_request("target_id requires target_type");
+                     return;
+                 }
 
                  // ADR-0040: degrade-distinguishable read — nullopt on a
                  // store/pool failure. Surface 503, never a false-empty 200 (an
@@ -8130,6 +8177,7 @@ void RestApiV1::register_routes(
                  for (size_t i = 0; i < events->size(); ++i) {
                      const auto& e = (*events)[i];
                      arr.add(JObj()
+                                 .add("id", e.id)
                                  .add("timestamp", e.timestamp)
                                  .add("principal", e.principal)
                                  .add("action", e.action)
@@ -8138,7 +8186,9 @@ void RestApiV1::register_routes(
                                  .add("target_id", e.target_id)
                                  .add("detail", e.detail));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size())),
+                 // total = rows on this page; a page shorter than `limit` is the last.
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size()),
+                                           q.offset, q.limit),
                                  "application/json");
              });
 

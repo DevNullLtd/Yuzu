@@ -134,6 +134,11 @@ struct AuditQuery {
 // auditor (#4 / SOC 2 CC7.2 evidence honesty).
 inline constexpr std::size_t kAuditSampleScanCap = 10000;
 
+/// Largest `offset` any audit read surface accepts (REST v1, legacy REST, MCP).
+/// An offset above it is a 400, never a silent clamp: a client must not receive a
+/// different page than it asked for. Auditors narrow with `since`/`until`.
+inline constexpr int kAuditMaxOffset = 10000;
+
 // ── Retention clock guard (#2360) ──────────────────────────────────────────
 //
 // Retention deletes rows whose TTL has passed, with "has passed" decided by the

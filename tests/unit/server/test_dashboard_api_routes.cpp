@@ -31,6 +31,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
@@ -641,6 +642,49 @@ TEST_CASE("dashboard_api_routes: /api/audit rejects limit < 1 with 400 against a
     auto r = h.sink.Get("/api/audit?limit=0");
     REQUIRE(r);
     CHECK(r->status == 400);
+}
+
+TEST_CASE("dashboard_api_routes: /api/audit bounds limit and offset like its v1/MCP twins",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    AuditEvent e;
+    e.principal = "alice";
+    e.action = "auth.login";
+    e.result = "success";
+    REQUIRE(audit.log(e));
+    {
+        // One statement seeds 1000 more rows (1001 total) so the cap is observable.
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        PGresult* ins = PQexec(
+            lease.get(),
+            "INSERT INTO audit_store.audit_events (timestamp, principal, principal_role, action, "
+            "result) SELECT g, 'bulk', 'admin', 'bulk.seed', 'success' FROM generate_series(1, "
+            "1000) g");
+        REQUIRE(PQresultStatus(ins) == PGRES_COMMAND_OK);
+        PQclear(ins);
+    }
+
+    Harness h;
+    h.audit_store = &audit;
+    h.wire();
+
+    // An oversized limit is clamped to 1000 before the store: 1001 rows exist,
+    // exactly 1000 come back - not an unbounded fetch and not an error.
+    auto r = h.sink.Get("/api/audit?limit=2147483647");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(json::parse(r->body)["events"].size() == 1000);
+    // offset is capped at kAuditMaxOffset; the cap itself is valid.
+    r = h.sink.Get("/api/audit?offset=10001");
+    REQUIRE(r);
+    CHECK(r->status == 400);
+    r = h.sink.Get("/api/audit?offset=10000");
+    REQUIRE(r);
+    CHECK(r->status == 200);
 }
 
 TEST_CASE("dashboard_api_routes: /api/analytics/status reports real pending/total counts",

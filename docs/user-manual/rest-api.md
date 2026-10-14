@@ -3512,8 +3512,13 @@ Query audit events.
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `limit` | integer | No | Max events to return (default 100, max 1000) |
+| `offset` | integer | No | Rows to skip, `0`..`10000` (default 0) |
 | `principal` | string | No | Filter by acting user |
 | `action` | string | No | Filter by action name |
+| `target_type` | string | No | Filter by target type (exact match) |
+| `target_id` | string | No | Filter by target id (exact match); requires `target_type` |
+| `since` | integer | No | Inclusive lower bound, epoch seconds; `0` or absent is unbounded |
+| `until` | integer | No | Inclusive upper bound, epoch seconds; `0` or absent is unbounded |
 
 **Response:**
 
@@ -3521,6 +3526,7 @@ Query audit events.
 {
   "data": [
     {
+      "id": 4101,
       "timestamp": 1710849600,
       "principal": "admin",
       "action": "management_group.create",
@@ -3530,6 +3536,7 @@ Query audit events.
       "detail": "EU Production Servers"
     },
     {
+      "id": 4102,
       "timestamp": 1710849700,
       "principal": "admin",
       "action": "tag.set",
@@ -3539,6 +3546,7 @@ Query audit events.
       "detail": "production"
     },
     {
+      "id": 4103,
       "timestamp": 1710849800,
       "principal": "jane.ops",
       "action": "quarantine.enable",
@@ -3548,30 +3556,36 @@ Query audit events.
       "detail": "Suspicious network activity detected"
     }
   ],
-  "pagination": { "total": 3, "start": 0, "page_size": 50 },
+  "pagination": { "total": 3, "start": 0, "page_size": 100 },
   "meta": { "api_version": "v1" }
 }
 ```
 
-**`total` and `page_size` are not what they look like.** `total` is the
-number of rows in this response's `data` array, not the number of rows that
-matched — the route has no `offset` support, so a response at exactly
-`limit` (max 1000) rows can be silently truncated, indistinguishable from a
-complete answer. `page_size` is always `50`, regardless of the `limit` you
-passed (tracked: [#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If
-you hit the cap, narrow with `principal=`/`action=`, or fall back to the
-legacy `GET /api/audit` endpoint, which also accepts `offset`. `since`/`until`
-alone only bounds the time window — it does not by itself guarantee
-completeness inside that window if more rows matched than one call returns.
-The reliable recipe is both together: freeze a bounded window with
-`since`/`until` first, then page through it with `offset`.
+**Paging.** `total` is the number of rows in this response's `data` array,
+not the number of rows that matched; `start` echoes `offset` and `page_size`
+echoes `limit`. A page shorter than `limit` is the last page. Rows are
+ordered newest first, and rows with an identical timestamp break by `id`
+(newest first). On an unchanging result set `offset` paging neither repeats nor
+skips rows; the log is live, though, so a new event (or a retention delete)
+between two page fetches shifts later pages. Pin the window with a fixed
+`until` in the past and use `id` to de-duplicate across pages. `offset` is
+capped at 10000 and is never clamped: a larger value is a `400`. To read past
+that depth, set `until` to the oldest `timestamp` already seen (it is
+inclusive), restart at `offset=0`, and de-duplicate on `id`.
+
+Rows carry `id`, `timestamp`, `principal`, `action`, `result`, `target_type`,
+`target_id` and `detail`. `principal_role` and `source_ip` are returned only
+by the legacy `GET /api/audit`; the MCP `query_audit_log` tool returns the
+same row set as this route.
 
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
-less than 1 (a negative or zero limit; caught explicitly rather than reaching
-PostgreSQL as an invalid `LIMIT`); `503` — the audit store is unavailable or
-the query degraded (ADR-0040 deny-on-degrade — see the note above this
-section; never a false-empty `200`). A non-numeric `limit` (e.g. `abc`) is
-NOT a 400 here — it is silently caught and the request proceeds with the
+less than 1, `since`/`until` is not a non-negative integer, `since` is
+greater than `until`, `offset` is not an integer in `0..10000`, or
+`target_id` is given without `target_type` (the index leads with
+`target_type`, so a bare `target_id` would scan the table); `503` — the
+audit store is unavailable or the query degraded (ADR-0040 deny-on-degrade —
+see the note above this section; never a false-empty `200`). A non-numeric
+`limit` (e.g. `abc`) is NOT a 400 here — the request proceeds with the
 default `limit` (100); the sibling `auth-sample` route below is stricter and
 400s on the same input.
 
@@ -10297,18 +10311,20 @@ Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a lo
 Query audit events. Legacy route — **not** merely `GET /api/v1/audit` without
 the v1 envelope; the response shape and accepted parameters both genuinely
 differ. Accepts `principal`, `action`, `target_type`, `target_id`, `since`,
-`until`, `limit`, and `offset` (more than the v1 route's `limit`/`principal`/
-`action`). Response is `{"events": [...], "count": N, "total": <number-or-
+`until`, `limit`, and `offset` (the same filters as the v1 route). Response is `{"events": [...], "count": N, "total": <number-or-
 null>}` (field names `events`/`count`/`total`, not v1's `data`/`pagination`/
-`meta`), and each event row additionally carries `id`, `principal_role`, and
+`meta`), and each event row additionally carries `principal_role` and
 `source_ip`, which v1's row shape omits. `total` is a best-effort second read
 taken after the page itself succeeds — it is `null`, not `0` or the page
 size, when that second read degrades; do not treat `null` as "unknown but
 probably zero".
 
+`limit` is capped at 1000 (a larger value is clamped, as on v1) and `offset`
+at 10000.
+
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
-`limit`/`offset` query parameter is not a valid integer, or `limit < 1` /
-`offset < 0`; `503` — the audit store is closed, or the page-rows query
+`limit`/`offset` query parameter is not a valid integer, `limit < 1`, or
+`offset` outside `0..10000`; `503` — the audit store is closed, or the page-rows query
 degraded (ADR-0040 deny-on-degrade; never a false-empty `200`).
 
 ---
