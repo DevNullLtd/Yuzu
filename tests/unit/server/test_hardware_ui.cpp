@@ -531,6 +531,24 @@ TEST_CASE("hardware lens body (overview): General block renders agent identity f
     CHECK(html.find("Architecture</span>x86_64") != std::string::npos);
 }
 
+// Kills: dropping the stored_data_placeholder() call from the Overview lens (the feature's
+// only entry point) or rendering it on a non-Overview lens.
+TEST_CASE("hardware lens body: Stored data placeholder is on Overview only, click-triggered",
+          "[hardware][ui][estate]") {
+    InventoryDeviceRow identity;
+    identity.os = "linux";
+    HardwareCiDetail detail;
+    detail.identity = identity;
+    HwCiAffordances aff;
+
+    const auto overview = render_hardware_lens_body("agent-42", detail, "", 0, aff);
+    CHECK(overview.find("hx-get=\"/fragments/hardware/ci/stored-data?id=agent-42\"") !=
+          std::string::npos);
+    CHECK(overview.find("hx-trigger=\"click\"") != std::string::npos);
+    CHECK(render_hardware_lens_body("agent-42", detail, "tags", 0, aff).find("hw-stored-data") ==
+          std::string::npos);
+}
+
 // ── #5531: failed roster read is never an empty fleet / "not found" ───────────
 
 // Kills: collapsing the CI fragment's not-found arms without the identity_degraded split.
