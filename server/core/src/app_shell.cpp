@@ -274,7 +274,6 @@ constexpr std::string_view kBellCss = R"CSS(<style>
 .shell-pop>summary:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
 .shell-pop>summary svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 .shell-cnt{font-size:12px;font-weight:600;background:var(--warn);color:var(--bg);border-radius:3px;padding:0 5px}
-.shell-cnt[hidden]{display:none}
 .shell-pop-p{position:absolute;right:0;top:calc(100% + 6px);width:380px;max-width:calc(100vw - 32px);background:var(--raise);border:1px solid var(--line2);border-radius:var(--rad-over);box-shadow:var(--shadow);z-index:60;overflow:hidden}
 .shell-pop-h{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line);font-weight:600}
 .shell-pop-s{color:var(--mut);font-size:12.5px;font-weight:400}
@@ -286,9 +285,7 @@ constexpr std::string_view kBellCss = R"CSS(<style>
 .shell-pop-r{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
 .shell-pop-c{margin:8px 0 0;color:var(--ink2);font-size:12.5px}
 .shell-pop-note,.shell-pop-empty{margin:0;padding:11px 14px;border-bottom:1px solid var(--line);color:var(--mut);font-size:13px}
-.shell-pop-note[hidden],.shell-pop-f[hidden]{display:none}
-.shell-pop-f{display:block;padding:11px 14px;font-weight:500;color:var(--primary);text-decoration:none}
-.shell-pop-f:hover{text-decoration:underline}
+.shell-pop-note[hidden]{display:none}
 @media (max-width:820px){
 .shell-pop{position:static}
 .shell-pop-p{left:16px;right:16px;width:auto;max-width:none}
