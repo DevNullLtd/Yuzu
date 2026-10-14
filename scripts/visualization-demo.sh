@@ -59,6 +59,7 @@ print(json.dumps({
 
 IMPORT=$(curl -s -b "$UAT/cookies.txt" \
     -X POST "$BASE/api/instructions/import" \
+    -H "Origin: $BASE" \
     -H "Content-Type: application/json" \
     -d "$DEF_BODY")
 
@@ -78,6 +79,7 @@ echo "────────────────────────�
 
 DISPATCH=$(curl -s -b "$UAT/cookies.txt" \
     -X POST "$BASE/api/instructions/$DEF_ID/execute" \
+    -H "Origin: $BASE" \
     -H "Content-Type: application/json" \
     -d '{"scope":"__all__"}')
 
