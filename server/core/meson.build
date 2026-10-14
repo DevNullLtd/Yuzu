@@ -181,6 +181,20 @@ yuzu_viz_host_js_embed = custom_target(
   ],
 )
 
+# Access pages (Phase 2): client glue for /access/*. Symbol: kYuzuAccessJs (std::string).
+yuzu_access_js_embed = custom_target(
+  'yuzu_access_js_bundle',
+  input: 'static/yuzu-access.js',
+  output: 'yuzu_access_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuAccessJs',
+  ],
+)
+
 cytoscape_js_embed = custom_target(
   'cytoscape_js_bundle',
   input: 'static/cytoscape.min.js',
@@ -375,7 +389,7 @@ yuzu_key_provider_dep = declare_dependency(
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
-   yuzu_viz_host_js_embed, cytoscape_js_embed,
+   yuzu_viz_host_js_embed, yuzu_access_js_embed, cytoscape_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -402,6 +416,8 @@ yuzu_server_core_lib = static_library(
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
     'src/access_render.cpp', # Access pages (Phase 2): pure HTML renderers for /access/users
+    'src/access_ui.cpp', # Access pages: the Users page template
+    'src/access_routes.cpp', # Access pages: /access/users + its two fragments + static glue
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
