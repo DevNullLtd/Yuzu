@@ -33,8 +33,8 @@ extern const std::string
 extern const std::string
     kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
 extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
-extern const std::string kYuzuDialogJs;  // server/core/src/yuzu_dialog_js_bundle.cpp (shared dialog)
 extern const std::string kYuzuOperateJs; // server/core/src/yuzu_operate_js_bundle.cpp (Operate O1)
+extern const std::string kYuzuDialogJs;  // server/core/src/yuzu_dialog_js_bundle.cpp (shared dialog)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
 // server/core/vendor/ibm-plex/*.woff2 (SIL OFL)
 extern const std::string_view kIbmPlexSans400Woff2;
@@ -134,17 +134,18 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuVizHostJs, "application/javascript; charset=utf-8");
     });
-    // Shared modal dialog + request helper, loaded before the page controller that uses it.
-    sink.Get("/static/yuzu-dialog.js", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.set_content(yuzu::server::kYuzuDialogJs, "application/javascript; charset=utf-8");
-    });
     // Operate O1: the Executions / Approvals page controller. It is coupled to the fragment
     // markup the same release serves, so it is never cached (a 24 h cache would skew a page
     // against its fragment after an upgrade).
     sink.Get("/static/yuzu-operate.js", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuOperateJs, "application/javascript; charset=utf-8");
+    });
+    // Shared modal dialog + request helper, loaded before the page controller that uses it.
+    // Same no-cache treatment as yuzu-operate.js: page markup and module move together.
+    sink.Get("/static/yuzu-dialog.js", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(yuzu::server::kYuzuDialogJs, "application/javascript; charset=utf-8");
     });
     sink.Get("/static/cytoscape.min.js", [](const httplib::Request&,
                                             httplib::Response& res) {

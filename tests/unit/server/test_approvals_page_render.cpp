@@ -130,7 +130,8 @@ TEST_CASE("approvals_page_render: the container reports state count and pending"
         const auto html = render_approvals_page(make_view(
             {make_row("1", "pending"), make_row("2", "approved"), make_row("3", "pending")}));
         CHECK(html.find("<div class=\"ops-list\" data-state=\"ok\" data-count=\"3\" "
-                        "data-pending=\"2\" data-truncated=\"0\">") == 0);
+                        "data-pending=\"2\" data-truncated=\"0\" data-can-decide=\"0\">") == 0);
+        CHECK(html.find("data-can-decide=\"1\"") == std::string::npos);
         CHECK(count_of(html, "<tr class=\"row\"") == 3);
     }
     SECTION("truncated pending list is a lower bound") {

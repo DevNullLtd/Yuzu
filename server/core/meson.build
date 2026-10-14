@@ -405,8 +405,8 @@ yuzu_key_provider_dep = declare_dependency(
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
-   yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_dialog_js_embed,
-   yuzu_operate_js_embed,
+   yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_dialog_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',

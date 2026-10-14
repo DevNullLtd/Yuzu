@@ -6,9 +6,13 @@
  */
 
 #include "execution_tracker.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <string>
@@ -500,4 +504,42 @@ TEST_CASE("ExecutionStatistics: definition stats skips pending/running execution
     auto stats = tracker.get_definition_statistics();
     REQUIRE(stats.size() == 1);
     CHECK(stats[0].total_executions == 1); // only the succeeded one
+}
+
+// ============================================================================
+// get_fleet_summary_checked: a store failure is not a genuine zero
+// ============================================================================
+
+static void drop_table(yuzu::test::ExecutionTrackerPg& rig, const char* sql) {
+    auto lease = rig.pool().acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("ExecutionStatistics: checked fleet summary reads an empty store as zeros",
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg rig;
+    auto s = rig->get_fleet_summary_checked();
+    REQUIRE(s.has_value());
+    CHECK(s->total_executions == 0);
+}
+
+TEST_CASE("ExecutionStatistics: checked fleet summary fails when the active-agent statement fails",
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg rig;
+    drop_table(rig, "DROP TABLE execution_tracker.agent_exec_status");
+    CHECK_FALSE(rig->get_fleet_summary_checked(0, true).has_value());
+    // The strip variant never touches that table.
+    CHECK(rig->get_fleet_summary_checked(0, false).has_value());
+    // The unchanged wrapper contract: failure reads as zeros.
+    CHECK(rig->get_fleet_summary().total_executions == 0);
+}
+
+TEST_CASE("ExecutionStatistics: checked fleet summary fails when the executions table is gone",
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg rig;
+    drop_table(rig, "DROP TABLE execution_tracker.executions CASCADE");
+    CHECK_FALSE(rig->get_fleet_summary_checked(0, false).has_value());
+    CHECK(rig->get_fleet_summary().total_executions == 0);
 }

@@ -28,8 +28,8 @@
 ///   GET /static/three-orbit-controls.js     -
 ///   GET /static/yuzu-viz.js                 -
 ///   GET /static/yuzu-viz-host.js            -
-///   GET /static/yuzu-dialog.js              -                      (shared modal dialog + request helper)
 ///   GET /static/yuzu-operate.js             -                      (Operate pages' controller)
+///   GET /static/yuzu-dialog.js              -                      (shared modal dialog + request helper)
 ///   GET /static/cytoscape.min.js            -
 ///   GET /static/fonts/ibm-plex-sans-latin-400-normal.woff2   -
 ///   GET /static/fonts/ibm-plex-sans-latin-500-normal.woff2   -
