@@ -24,6 +24,13 @@ bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+std::size_t count_sub(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
+        ++n;
+    return n;
+}
+
 constexpr std::int64_t kNow = 1'760'000'000;
 
 SummaryView all_ok() {
@@ -180,7 +187,7 @@ TEST_CASE("devices cell: empty fleet and each failure state read differently", "
 
 // Kills: the response losing its out-of-band target. htmx swaps the first section in
 // place (the page's hx-swap=outerHTML) and routes the second by id via hx-swap-oob.
-TEST_CASE("summary: the readout swaps in place and Needs attention is the one OOB target",
+TEST_CASE("summary: the readout swaps in place; Needs attention and Estate state are the OOB targets",
           "[home][render]") {
     const std::string html = render_summary(all_ok());
     const auto ro = html.find("<section id=\"dash-readout\"");
@@ -189,7 +196,10 @@ TEST_CASE("summary: the readout swaps in place and Needs attention is the one OO
     REQUIRE(att != std::string::npos);
     CHECK(ro < att);
     CHECK(html.find("hx-swap-oob=\"outerHTML\"") > att);
-    CHECK(html.find("hx-swap-oob") == html.rfind("hx-swap-oob"));
+    const auto est = html.find("<section id=\"dash-estate\"");
+    REQUIRE(est != std::string::npos);
+    CHECK(att < est);
+    CHECK(count_sub(html, "hx-swap-oob") == 2);
 }
 
 TEST_CASE("attention: rows for every contributing figure, with resolved links", "[home][render]") {
@@ -281,4 +291,33 @@ TEST_CASE("summary never carries a device name, agent id or hostname field", "[h
     CHECK_FALSE(has(html, "onclick="));
     CHECK_FALSE(has(html, "innerHTML"));
     CHECK_FALSE(has(html, "hx-on"));
+}
+
+// ── estate state ───────────────────────────────────────────────────────────
+
+// Kills: an Estate state panel that invents a figure, prints a degraded read as 0, or drops
+// the lower-bound label the readout carries.
+TEST_CASE("estate: rows are the readout's own partition, and every non-Ok state is a note",
+          "[home][render]") {
+    const std::string html = render_estate(all_ok());
+    CHECK(has(html, "<section id=\"dash-estate\" class=\"panel\" hx-swap-oob=\"outerHTML\">"));
+    CHECK(has(html, "<span>Seen in the last 30 days</span><b>437</b>"));
+    CHECK(has(html, "<span>Online</span><b>412</b>"));
+    CHECK(has(html, "<span>Not seen for 2 days or more</span><b>25</b>"));
+    CHECK(has(html, "<span>Offline, seen within 2 days</span><b>0</b>"));
+
+    SummaryView lb = all_ok();
+    lb.devices.value.at_least = true;
+    CHECK(has(render_estate(lb), "<b>at least 412</b>"));
+
+    SummaryView down = all_ok();
+    down.devices = Fact<EstateCounts>::with(FactState::Unavailable);
+    const std::string d = render_estate(down);
+    CHECK(has(d, "This is not zero."));
+    CHECK_FALSE(has(d, "<b>0</b>"));
+    CHECK_FALSE(has(d, "kvl"));
+
+    SummaryView none = all_ok();
+    none.devices = Fact<EstateCounts>::make_ok(EstateCounts{});
+    CHECK(has(render_estate(none), "No devices have reported in the last 30 days."));
 }

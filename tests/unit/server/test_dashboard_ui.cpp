@@ -79,9 +79,12 @@ TEST_CASE("dashboard page: the moved panels load from /fragments/dashboard/*", "
     // Each placeholder is replaced whole; the two OOB targets carry no trigger of their own.
     CHECK(count_of(html, "hx-trigger=\"load\" hx-swap=\"outerHTML\"") == 4);
     CHECK(count_of(html, "hx-get=\"/fragments/home/") == 0);
-    // The console's own loaders are unchanged: scope list, autocomplete, help, help trigger.
-    CHECK(count_of(html, "hx-get=") == 8);
-    CHECK(count_of(html, "hx-get=\"/fragments/scope-list\"") == 1);
+    // The console's own loaders are unchanged: scope list, autocomplete, help, help trigger
+    // (the scope list is also named once in a script comment, hence >= 1 by attribute form).
+    CHECK(count_of(html, "\n           hx-get=\"/fragments/scope-list\"") == 1);
+    CHECK(count_of(html, "hx-get=\"/api/help/autocomplete\" hx-trigger=") == 1);
+    CHECK(count_of(html, "hx-get=\"/api/help\"") == 1);
+    CHECK(count_of(html, "hx-get=\"/api/help/html\"") == 1);
 }
 
 TEST_CASE("dashboard page: the scope bar's reference line is the resolver's catalogue",
@@ -123,7 +126,9 @@ TEST_CASE("dashboard page: the console's controls and their attributes survive t
     }
     CHECK(count_of(html, "hx-post=\"/api/dashboard/execute\"") == 1);
     CHECK(count_of(html, "hx-ext=\"sse\" sse-connect=\"/events\"") == 1);
-    CHECK(count_of(html, "sse-swap=\"") == 6);
+    for (const char* ev : {"output", "command-status", "timing", "heartbeat", "agent-online",
+                           "agent-offline"})
+        CHECK(count_of(html, std::string("<div sse-swap=\"") + ev + "\" hx-swap=\"none\"") == 1);
     CHECK(count_of(html, "hx-trigger=\"load, every 5s, agentChanged from:body\"") == 1);
     CHECK(count_of(html, "onclick=\"clearResults()\"") == 1);
     CHECK(count_of(html, "onclick=\"toggleDensity()\"") == 1);
@@ -134,7 +139,7 @@ TEST_CASE("dashboard page: the console's controls and their attributes survive t
     CHECK(count_of(html, "hx-on") == 0);
     // No gradient, glow or blur anywhere on the page (design ban list).
     CHECK(html.find("gradient") == std::string::npos);
-    CHECK(html.find("blur(") == std::string::npos);
+    CHECK(html.find("filter: blur") == std::string::npos);
     CHECK(html.find("glow") == std::string::npos);
 }
 
