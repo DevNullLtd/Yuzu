@@ -18306,29 +18306,21 @@ private:
             hp.deny_service_scoped_fn = deny_service_scoped_fn;
             hp.fleet_read_fn = fleet_read_fn;
             hp.perm_fn = perm_fn;
-            // ponytail: N+1 `compliance_summary` per policy (HZ-17) until HB-1's
-            // one-read `compliance_by_policy` lands on the seam; swap this body
-            // for that call and nothing else changes.
+            // One cached read of every policy's counts; NOT confined, and only
+            // called when the gate returned `scope == nullopt`.
             hp.policies_fn = [compliance_api]()
                 -> std::optional<yuzu::server::home_panels::PolicyPanel> {
-                // First 100 enabled policies (PolicyQuery's own page size): the N
-                // in "Lowest 5 of N" is capped there until the one-read swap.
+                // First 100 enabled policies (PolicyQuery's own page size): the N in
+                // "Lowest 5 of N" stops counting there.
                 PolicyQuery pq;
                 pq.enabled_only = true;
                 auto policies = compliance_api->list_policies(pq);
                 if (!policies)
                     return std::nullopt;
-                std::vector<ComplianceSummary> sums;
-                sums.reserve(policies->size());
-                for (const auto& p : *policies) {
-                    if (!p.enabled)
-                        continue;
-                    auto sm = compliance_api->compliance_summary(p.id);
-                    if (!sm)
-                        return std::nullopt; // a degraded read is never "no results"
-                    sums.push_back(std::move(*sm));
-                }
-                return yuzu::server::home_panels::select_lowest_policies(*policies, sums);
+                auto sums = compliance_api->compliance_by_policy();
+                if (!sums)
+                    return std::nullopt; // a degraded read is never "no results"
+                return yuzu::server::home_panels::select_lowest_policies(*policies, *sums);
             };
             hp.audit_fn = [this](int limit) -> std::optional<std::vector<AuditEvent>> {
                 if (!audit_store_)
