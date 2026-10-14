@@ -230,9 +230,16 @@ TEST_CASE("discovered devices: a subnet of exactly the max length is accepted",
     REQUIRE(frag);
     CHECK(frag->status == 200);
     CHECK(h.seen_subnet == edge);
+    // The REST twin refuses an over-long filter with a real 400; the fragment answers 200 with a
+    // failure box, because htmx drops the body of any non-2xx response.
+    auto rest_over = h.sink.Get("/api/v1/network/discovered-devices?subnet=" + edge + "1");
+    REQUIRE(rest_over);
+    CHECK(rest_over->status == 400);
     auto over = h.sink.Get("/fragments/network/discovered?subnet=" + edge + "1");
     REQUIRE(over);
-    CHECK(over->status == 400);
+    CHECK(over->status == 200);
+    CHECK(over->body.find("failbox") != std::string::npos);
+    CHECK(over->body.find("<table") == std::string::npos);
 }
 
 TEST_CASE("discovered devices REST: gates run before the read",
@@ -303,10 +310,19 @@ TEST_CASE("discovered devices REST: no reader wired is a 503",
         },
         [](const httplib::Request&, const std::string&, const std::string&, const std::string&,
            const std::string&, const std::string&) { return true; });
-    for (const char* path : {"/api/v1/network/discovered-devices", "/fragments/network/discovered"}) {
-        auto res = sink.Get(path);
+    // An unwired read seam: the REST twin is a real 503; the fragment is a swappable 200 with a
+    // failure box (htmx drops non-2xx bodies). Neither shows a table.
+    {
+        auto res = sink.Get("/api/v1/network/discovered-devices");
         REQUIRE(res);
         CHECK(res->status == 503);
+        CHECK(res->body.find("<table") == std::string::npos);
+    }
+    {
+        auto res = sink.Get("/fragments/network/discovered");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("failbox") != std::string::npos);
         CHECK(res->body.find("<table") == std::string::npos);
     }
 }
@@ -334,8 +350,9 @@ TEST_CASE("discovered devices fragment: store fault shows a failbox, not an empt
     h.result = std::unexpected("discovery read degraded");
     auto res = h.sink.Get("/fragments/network/discovered");
     REQUIRE(res);
-    CHECK(res->status == 503);
+    CHECK(res->status == 200); // swappable by htmx; the REST twin answers 503 for the same fault
     CHECK(res->body.find("failbox") != std::string::npos);
+    CHECK(res->body.find("role=\"alert\"") != std::string::npos);
     CHECK(res->body.find("<table") == std::string::npos);
 }
 
@@ -366,6 +383,7 @@ TEST_CASE("discovered devices fragment: shares the REST gates",
     Harness i;
     auto bad = i.sink.Get("/fragments/network/discovered?limit=0");
     REQUIRE(bad);
-    CHECK(bad->status == 400);
+    CHECK(bad->status == 200); // a failure box htmx can swap; the REST twin answers 400
+    CHECK(bad->body.find("failbox") != std::string::npos);
     CHECK(i.reads == 0);
 }

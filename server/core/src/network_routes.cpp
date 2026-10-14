@@ -269,9 +269,12 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         constexpr const char* kHtml = "text/html; charset=utf-8";
         const auto limit = parse_discovered_limit(req.get_param_value("limit"));
         const auto subnet = req.get_param_value("subnet");
+        // Both failure answers below are 200 with a failure box: htmx drops the body of any
+        // non-2xx response, so a 400/503 would leave the panel blank. The REST twin keeps the
+        // real status codes.
         if (!limit || subnet.size() > kDiscoveredSubnetMaxLen) {
-            res.status = 400;
-            res.set_content("<div class=\"failbox\">That filter is not valid.</div>", kHtml);
+            res.set_content("<div class=\"failbox\" role=\"alert\">That filter is not valid.</div>",
+                            kHtml);
             return;
         }
         std::expected<DiscoveredDevicesPage, std::string> page =
@@ -279,7 +282,6 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         if (discovered_)
             page = discovered_(subnet, *limit);
         if (!page) {
-            res.status = 503;
             res.set_content(render_discovered_devices_unavailable(), kHtml);
             return;
         }

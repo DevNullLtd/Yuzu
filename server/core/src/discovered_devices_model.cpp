@@ -76,8 +76,8 @@ std::string render_discovered_devices_fragment(const DiscoveredDevicesPage& page
 }
 
 std::string render_discovered_devices_unavailable() {
-    return "<div class=\"failbox\">Discovered hosts could not be read just now. Try again in a "
-           "moment.</div>";
+    return "<div class=\"failbox\" role=\"alert\">Discovered hosts could not be read just now. "
+           "Try again in a moment.</div>";
 }
 
 } // namespace yuzu::server
