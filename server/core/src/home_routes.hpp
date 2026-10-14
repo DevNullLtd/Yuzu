@@ -48,6 +48,12 @@ inline constexpr std::size_t kRosterReadCap = 100000;
 /// uncached by design and costs seconds at fleet scale, so Home owns the cache.
 inline constexpr std::int64_t kEstateCacheTtlSecs = 60;
 
+/// After a failed estate read, the next viewers get "could not read" for this long
+/// instead of each re-running the read. Without it N viewers queued behind a failing
+/// read retry it serially (N x the 2 s lease wait, or N x the 30 s statement timeout),
+/// each holding an HTTP worker. The failure is never shown as a figure.
+inline constexpr std::int64_t kEstateFailBackoffSecs = 5;
+
 struct Deps {
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
@@ -68,8 +74,10 @@ struct Deps {
     /// Fleet-wide SQL estate counts (HB-1 seam), partitioned. `nullopt` = degraded.
     /// Optional: when empty the roster path serves every caller. NOT CONFINED: only
     /// ever called for a caller whose gate returned `scope == nullopt`. HomeRoutes
-    /// caches a successful answer for `kEstateCacheTtlSecs` on `now_fn`; a failure is
-    /// never cached.
+    /// caches a successful answer for `kEstateCacheTtlSecs` on `now_fn` and backs off
+    /// `kEstateFailBackoffSecs` after a failure (served as Unavailable, never as a
+    /// figure). The cache is per process: each replica reads and caches on its own, so
+    /// replicas can show figures up to a minute apart.
     using FleetEstateFn = std::function<std::optional<EstateCounts>(std::int64_t now_ms)>;
     /// `ComplianceApi::fleet_compliance()` reduced to the figure. `nullopt` = degraded.
     using ComplianceFn = std::function<std::optional<ComplianceFigure>()>;
@@ -109,13 +117,17 @@ private:
     [[nodiscard]] SummaryView build_summary(const httplib::Request& req) const;
     /// TOP-caller estate read through the TTL cache. Single flight: the lock is held
     /// across the read so concurrent viewers wait for one scan instead of each
-    /// running their own; a failed read leaves the cache untouched.
-    [[nodiscard]] std::optional<EstateCounts> cached_estate(std::int64_t now_epoch) const;
+    /// running their own, and the clock is sampled under it so a waiter judges the
+    /// entry (and a failure) by when it got in, not when it arrived. A failed read is
+    /// never stored as a figure; it only starts the short backoff. Without `now_fn`
+    /// nothing could expire, so the seam is called through uncached.
+    [[nodiscard]] std::optional<EstateCounts> cached_estate() const;
 
     Deps deps_;
     mutable std::mutex estate_mu_;
     mutable std::optional<EstateCounts> estate_cache_;
     mutable std::int64_t estate_cached_at_{0};
+    mutable std::optional<std::int64_t> estate_failed_at_;
 };
 
 } // namespace yuzu::server::home
