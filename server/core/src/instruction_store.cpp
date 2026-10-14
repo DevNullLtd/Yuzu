@@ -22,11 +22,13 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <format>
 #include <random>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -86,6 +88,45 @@ std::string generate_id() {
 // yaml_source's own NUL rejection (validate_definition_scope, below) makes this a defense-in-
 // depth belt-and-braces for every OTHER free-text column, not the primary guard for yaml_source
 // itself.
+// The signature on an instruction-import envelope covers `yaml_source` ONLY; every other
+// top-level field is unsigned. The columns that decide WHAT RUNS and WHETHER IT NEEDS APPROVAL
+// are therefore taken from the verified YAML, and an envelope value that disagrees is refused:
+// otherwise a validly signed export could be re-labelled (plugin, action, approval_mode: auto)
+// and still import. Returns an error message, or nullopt after overwriting those envelope keys
+// with the YAML-derived values. Values are never echoed (they are attacker-controlled).
+std::optional<std::string> bind_signed_dispatch_columns(nlohmann::json& envelope,
+                                                       const std::string& yaml_source) {
+    const auto f = instruction_yaml::parse_definition_yaml(yaml_source);
+    if (f.plugin.empty() || f.action.empty())
+        return "signed yaml_source must declare the plugin and action it runs "
+               "(spec.execution.plugin / spec.execution.action)";
+    const std::pair<const char*, std::string> columns[] = {
+        {"plugin", f.plugin},
+        {"action", f.action}, // lowercased by the parser
+        {"type", f.type.empty() ? "question" : f.type},
+        {"approval_mode", f.approval.empty() ? "auto" : f.approval},
+        {"concurrency_mode", f.concurrency.empty() ? "per-device" : f.concurrency},
+    };
+    for (const auto& [key, yaml_value] : columns) {
+        if (envelope.contains(key) && !envelope[key].is_null()) {
+            if (!envelope[key].is_string())
+                return std::string("instruction-import field '") + key +
+                       "' must be a string when present";
+            auto given = envelope[key].get<std::string>();
+            if (std::string_view(key) == "action")
+                std::transform(given.begin(), given.end(), given.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            if (!given.empty() && given != yaml_value)
+                return std::string("instruction-import field '") + key +
+                       "' does not match the signed yaml_source - the signature covers only "
+                       "yaml_source, so dispatch and approval fields must come from it";
+        }
+        envelope[key] = yaml_value;
+    }
+    return std::nullopt;
+}
+
 // Escape LIKE metacharacters so a caller's filter text is matched literally (`50%` finds
 // names containing "50%", `a_b` does not also match "axb"). Paired with ESCAPE '\'.
 std::string escape_like(std::string_view s) {
@@ -989,6 +1030,8 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
                     "have been tampered with");
             }
             spdlog::info("InstructionStore::import_definition_json: signature verified");
+            if (auto err = bind_signed_dispatch_columns(parsed, yaml_source))
+                return std::unexpected(*err);
         } else if (sig_state == FieldState::Present || pub_state == FieldState::Present) {
             // Exactly one field present — incomplete signing metadata, reject.
             return std::unexpected(
