@@ -5,15 +5,19 @@
  * body as the loud call, and must write no denial audit row and move no
  * denial counter. The default (`Quiet::No`) stays loud.
  *
- * Not covered here: the RBAC-store-degraded column of the equivalence table
- * (the engine-principal 503 arm needs an engine credential minted through
- * the engine-principal store); the ceiling-degraded arm is covered below.
+ * The engine-principal arm (including its 503 "authorization store
+ * unavailable" refusal, reached by wiring AuthRoutes with no RBAC store) and
+ * the ceiling-degraded arm are covered below. Not covered: an RBAC store that
+ * is wired but whose handle has died mid-run (is_open() false) for a HUMAN
+ * session; it takes the same `rbac_enforcement_in_effect` branch the
+ * RBAC-on column already exercises.
  */
 
 #include "auth_routes.hpp"
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "engine_principal_store.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -128,10 +132,10 @@ struct Verdict {
     nlohmann::json body; // correlation_id removed: it is minted per response
 };
 
-Verdict ask(QuietRig& r, const httplib::Request& req, const std::string& type,
+Verdict ask(AuthRoutes& ar, const httplib::Request& req, const std::string& type,
             const std::string& op, Quiet q) {
     httplib::Response res;
-    const bool ok = r.ar->require_permission(req, res, type, op, q);
+    const bool ok = ar.require_permission(req, res, type, op, q);
     Verdict v{ok, res.status, nlohmann::json::object()};
     if (!res.body.empty()) {
         v.body = nlohmann::json::parse(res.body);
@@ -153,13 +157,15 @@ constexpr Pair kPairs[] = {{"Infrastructure", "Read"},
 
 // Runs every pair for one request: quiet first (must not write), then loud
 // (must agree, and must write exactly one row when it denies).
-void check_equivalent(QuietRig& r, const httplib::Request& req, const std::string& label) {
+void check_equivalent(QuietRig& r, const httplib::Request& req, const std::string& label,
+                      AuthRoutes* ar_override = nullptr) {
+    AuthRoutes& ar = ar_override ? *ar_override : *r.ar;
     for (const auto& p : kPairs) {
         INFO(label << " " << p.type << ":" << p.op);
         const auto before = r.denial_rows();
-        const auto q = ask(r, req, p.type, p.op, Quiet::Yes);
+        const auto q = ask(ar, req, p.type, p.op, Quiet::Yes);
         CHECK(r.denial_rows() == before); // quiet wrote nothing
-        const auto l = ask(r, req, p.type, p.op, Quiet::No);
+        const auto l = ask(ar, req, p.type, p.op, Quiet::No);
         CHECK(q.ok == l.ok);
         CHECK(q.status == l.status);
         CHECK(q.body == l.body);
@@ -198,9 +204,9 @@ TEST_CASE("Quiet probe: loud and quiet agree for MCP-tier tokens",
     // The approval-gated pair on a REST path is its own audit action.
     auto req = r.token_request("", "supervised");
     const auto before = r.rows("auth.approval_required");
-    CHECK_FALSE(ask(r, req, "Execution", "Execute", Quiet::Yes).ok);
+    CHECK_FALSE(ask(*r.ar, req, "Execution", "Execute", Quiet::Yes).ok);
     CHECK(r.rows("auth.approval_required") == before);
-    CHECK_FALSE(ask(r, req, "Execution", "Execute", Quiet::No).ok);
+    CHECK_FALSE(ask(*r.ar, req, "Execution", "Execute", Quiet::No).ok);
     CHECK(r.rows("auth.approval_required") == before + 1);
 }
 
@@ -210,9 +216,9 @@ TEST_CASE("Quiet probe: a quiet call consumes nothing -- the loud call still den
     QuietRig r{db.dsn()};
     auto req = r.token_request("", "supervised");
     for (int i = 0; i < 3; ++i)
-        CHECK_FALSE(ask(r, req, "Execution", "Execute", Quiet::Yes).ok);
+        CHECK_FALSE(ask(*r.ar, req, "Execution", "Execute", Quiet::Yes).ok);
     CHECK(r.denial_rows() == 0);
-    CHECK_FALSE(ask(r, req, "Execution", "Execute", Quiet::No).ok);
+    CHECK_FALSE(ask(*r.ar, req, "Execution", "Execute", Quiet::No).ok);
     CHECK(r.rows("auth.approval_required") == 1);
 }
 
@@ -223,9 +229,9 @@ TEST_CASE("Quiet probe: denial counters move only for loud calls",
 
     SECTION("topology floor") {
         auto req = r.cookie_request("frank", auth::Role::user);
-        CHECK_FALSE(ask(r, req, "AccessReview", "Read", Quiet::Yes).ok);
+        CHECK_FALSE(ask(*r.ar, req, "AccessReview", "Read", Quiet::Yes).ok);
         CHECK(r.floor_counter("AccessReview:Read") == 0.0);
-        CHECK_FALSE(ask(r, req, "AccessReview", "Read", Quiet::No).ok);
+        CHECK_FALSE(ask(*r.ar, req, "AccessReview", "Read", Quiet::No).ok);
         CHECK(r.floor_counter("AccessReview:Read") == 1.0);
     }
 
@@ -233,10 +239,10 @@ TEST_CASE("Quiet probe: denial counters move only for loud calls",
         r.rbac.set_rbac_enabled(true);
         REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Response", "Read", "allow"}).has_value());
         auto req = r.token_request("printers", "");
-        CHECK_FALSE(ask(r, req, "Response", "Read", Quiet::Yes).ok);
+        CHECK_FALSE(ask(*r.ar, req, "Response", "Read", Quiet::Yes).ok);
         CHECK(r.default_deny_counter("Response:Read") == 0.0);
         CHECK(r.rows("auth.permission_required") == 0);
-        CHECK_FALSE(ask(r, req, "Response", "Read", Quiet::No).ok);
+        CHECK_FALSE(ask(*r.ar, req, "Response", "Read", Quiet::No).ok);
         CHECK(r.default_deny_counter("Response:Read") == 1.0);
         CHECK(r.rows("auth.permission_required") == 1);
     }
@@ -258,13 +264,75 @@ TEST_CASE("Quiet probe: a degraded ceiling read under a populated allow-list is 
     r.ar->set_service_scope_global_safe_override_for_test(
         std::vector<authz::PermPair>{{"Response", "Read"}});
 
-    CHECK_FALSE(ask(r, req, "Response", "Read", Quiet::Yes).ok);
+    const auto quiet = ask(*r.ar, req, "Response", "Read", Quiet::Yes);
+    CHECK_FALSE(quiet.ok);
+    CHECK(quiet.status == 503); // the refusal is the same retryable outage, just unrecorded
     CHECK(r.rows("auth.permission_required") == 0);
     CHECK(r.metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
               .value() == 0.0);
 
-    const auto loud = ask(r, req, "Response", "Read", Quiet::No);
+    const auto loud = ask(*r.ar, req, "Response", "Read", Quiet::No);
     CHECK_FALSE(loud.ok);
     CHECK(loud.status == 503);
+    CHECK(quiet.body == loud.body);
     CHECK(r.rows("auth.permission_required") == 1);
+    CHECK(r.metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("Quiet probe: loud and quiet agree for an engine principal (granted, ungranted, RBAC "
+          "off, RBAC store unavailable)",
+          "[pg][authz][quiet][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quiet_tpl);
+    QuietRig r{db.dsn()};
+    PgPool engine_pool{{.conninfo = db.dsn(), .size = 2}};
+    EnginePrincipalStore engine_store{engine_pool};
+    REQUIRE(engine_store.is_open());
+    REQUIRE(engine_store
+                .create("Quiet Engine", "alice", "quiet probe coverage", "internal", "admin",
+                        "engine:quiet-test")
+                .has_value());
+    r.api_tokens->set_engine_referent_check(
+        [&](const std::string& id) { return engine_store.get_for_auth(id).status; });
+    r.ar->set_engine_principal_store(&engine_store);
+
+    const auto exp = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count() + 3600;
+    auto raw = r.api_tokens->create_token("quiet-engine", "engine:quiet-test", exp, "", "readonly",
+                                          "engine");
+    REQUIRE(raw.has_value());
+    httplib::Request req;
+    req.headers.emplace("Authorization", "Bearer " + *raw);
+    req.path = "/api/v1/probe";
+
+    SECTION("RBAC off: denied (engine never reaches the legacy fallback)") {
+        check_equivalent(r, req, "engine/rbac-off");
+    }
+    SECTION("RBAC on, ungranted") {
+        r.rbac.set_rbac_enabled(true);
+        check_equivalent(r, req, "engine/ungranted");
+    }
+    SECTION("RBAC on, granted") {
+        // A custom role: the seeded Administrator role cannot be assigned to an engine.
+        REQUIRE(r.rbac.create_role({.name = "QuietEngineRole", .description = "d"}).has_value());
+        REQUIRE(r.rbac.set_permission({"QuietEngineRole", "Infrastructure", "Read", "allow"})
+                    .has_value());
+        REQUIRE(r.rbac.assign_role({"engine", "engine:quiet-test", "QuietEngineRole"}).has_value());
+        r.rbac.set_rbac_enabled(true);
+        check_equivalent(r, req, "engine/granted");
+        httplib::Response res;
+        CHECK(r.ar->require_permission(req, res, "Infrastructure", "Read", Quiet::Yes));
+    }
+    SECTION("RBAC store unavailable: 503 on both paths") {
+        std::shared_mutex mu;
+        std::unique_ptr<oidc::OidcProvider> no_oidc;
+        AuthRoutes bare(r.cfg, r.auth_mgr, /*rbac_store=*/nullptr, r.api_tokens.get(), &r.audit,
+                        nullptr, &r.tags, nullptr, mu, no_oidc);
+        bare.set_engine_principal_store(&engine_store);
+        const auto q = ask(bare, req, "Infrastructure", "Read", Quiet::Yes);
+        CHECK_FALSE(q.ok);
+        CHECK(q.status == 503);
+        check_equivalent(r, req, "engine/store-unavailable", &bare);
+    }
 }
