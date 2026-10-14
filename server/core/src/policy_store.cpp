@@ -363,6 +363,33 @@ PolicyStore::PolicyStore(pg::PgPool& pool) : pool_(pool) {
     spdlog::info("PolicyStore: opened on Postgres (schema {})", kStoreName);
 }
 
+namespace {
+/// Explicit ids (`metadata.id` in the YAML) end up in page links and `/api/policies/<id>`
+/// paths. Bound them to the same charset instruction definition ids use
+/// (`InstructionStore`: letters, digits, '.', '_', '-', max 128) and refuse a dot-only
+/// id, which browsers collapse as a path segment. Store-generated ids are hex and
+/// always pass. Applies to NEW records only: an id that predates this check is
+/// rendered safely (percent-encoded, no actions when dot-only), never rejected.
+std::optional<std::string> explicit_id_error(const std::string& id, const char* what) {
+    if (id.empty())
+        return std::nullopt;
+    if (id.size() > 128)
+        return std::string(what) + " id too long (max 128 characters)";
+    bool all_dots = true;
+    for (const char c : id) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok)
+            return std::string(what) + " id may only contain letters, digits, '.', '_', and '-'";
+        if (c != '.')
+            all_dots = false;
+    }
+    if (all_dots)
+        return std::string(what) + " id must not consist only of dots";
+    return std::nullopt;
+}
+} // namespace
+
 std::string PolicyStore::generate_id() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     std::uniform_int_distribution<uint64_t> dist;
@@ -411,6 +438,8 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
             "docs/user-manual/policy-engine.md"));
 
     auto id_val = extract_yaml_value(yaml_source, "id");
+    if (auto err = explicit_id_error(id_val, "fragment"))
+        return std::unexpected(*err);
     auto id = id_val.empty() ? generate_id() : id_val;
     auto name = extract_yaml_value(yaml_source, "displayName");
     if (name.empty())
@@ -612,6 +641,8 @@ PolicyStore::create_policy(const std::string& yaml_source) {
             "docs/user-manual/policy-engine.md"));
 
     auto id_val = extract_yaml_value(yaml_source, "id");
+    if (auto err = explicit_id_error(id_val, "policy"))
+        return std::unexpected(*err);
     auto id = id_val.empty() ? generate_id() : id_val;
     auto name = extract_yaml_value(yaml_source, "displayName");
     if (name.empty())
