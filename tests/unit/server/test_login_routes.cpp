@@ -39,8 +39,7 @@ struct Harness {
 
     Harness() {
         cfg.https_enabled = false;
-        REQUIRE(auth_mgr.upsert_user("dave.rae", "davepassword1", auth::Role::admin));
-        REQUIRE(auth_mgr.upsert_user("alice", "alicepassword1", auth::Role::user));
+        // No user rows: the cases mint sessions directly, so no password hash is computed.
     }
 
     void wire() {
@@ -73,8 +72,8 @@ TEST_CASE("GET /home signed out: the sign-in form, no session needed, never cach
     CHECK(has(r->body, "id=\"signin\" aria-label=\"Sign in\" data-next=\"\">"));
     CHECK_FALSE(has(r->body, "aria-label=\"Signed in\""));
     CHECK_FALSE(has(r->body, "signin-notice"));
-    // The slim bar carries the server name and, to a signed-out visitor, no version.
-    CHECK(has(r->body, "<span class=\"srv\">"));
+    // A signed-out visitor sees neither the server name nor the version.
+    CHECK(has(r->body, "<span class=\"srv\"></span>"));
     CHECK_FALSE(has(r->body, "version "));
     CHECK_FALSE(has(r->body, "&middot;"));
     // No single sign-on without a provider; no two-factor note under the default enforcement.
@@ -185,6 +184,9 @@ TEST_CASE("GET /login forwards to the landing page, keeping only a validated nex
         {"/login?error=sso_failed", "/home?error=sso_failed"},
         {"/login?error=saml", "/home?error=saml"},
         {"/login?error=%3Cscript%3E", "/home"},
+        {"/login?error=SSO_FAILED", "/home"},
+        {"/login?next=devices&next=/evil", "/home?next=devices"},
+        {"/login?next=devices%20", "/home"},
         {"/login?next=tar&error=sso_invalid", "/home?next=tar&error=sso_invalid"},
     };
     for (const auto& [path, location] : expected) {

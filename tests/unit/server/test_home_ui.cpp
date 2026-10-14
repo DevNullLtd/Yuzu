@@ -140,10 +140,11 @@ TEST_CASE("landing: no shell, no header-bar controls, no bell, no fragment loads
     }
 }
 
-TEST_CASE("landing: the slim bar shows the version only to a signed-in user", "[home][ui]") {
-    // Signed out the page is public: server name only, the version string appears nowhere.
+TEST_CASE("landing: the slim bar shows the server name and version only to a signed-in user", "[home][ui]") {
+    // Signed out the page is public: neither the server name nor the version appears.
     const auto out = home_ui::render_landing(signed_out());
-    CHECK_THAT(out, ContainsSubstring("<span class=\"srv\">yuzu-01</span>"));
+    CHECK_THAT(out, ContainsSubstring("<span class=\"srv\"></span>"));
+    CHECK(count_of(out, "yuzu-01") == 0);
     CHECK(count_of(out, "0.14.1") == 0);
     CHECK(count_of(out, "version ") == 0);
     // Signed in: name and version.
@@ -297,11 +298,11 @@ TEST_CASE("sign_in_location: a screen request carries its key, a sub-page its pa
 TEST_CASE("landing: the family tokens and the landing block are in yuzu.css, with no gradient, glow or blur",
           "[home][ui][css]") {
     const std::string& css = kYuzuCss;
-    CHECK_THAT(css, ContainsSubstring("--fam-operate: #4c9aff;"));
-    CHECK_THAT(css, ContainsSubstring("--fam-posture: #2dd4bf;"));
-    CHECK_THAT(css, ContainsSubstring("--fam-estate:  #a78bfa;"));
-    CHECK_THAT(css, ContainsSubstring("--fam-access:  #f5c542;"));
-    CHECK_THAT(css, ContainsSubstring("--fam-system:  #9aa2ae;"));
+    CHECK_THAT(css, ContainsSubstring("--fam-operate: var(--c1);"));
+    CHECK_THAT(css, ContainsSubstring("--fam-posture: var(--c2);"));
+    CHECK_THAT(css, ContainsSubstring("--fam-estate:  var(--c5);"));
+    CHECK_THAT(css, ContainsSubstring("--fam-access:  var(--c3);"));
+    CHECK_THAT(css, ContainsSubstring("--fam-system:  var(--mds-color-theme-text-tertiary);"));
     const auto start = css.find("/* Home landing (delta 2026-10-14)");
     REQUIRE(start != std::string::npos);
     const std::string block = css.substr(start);

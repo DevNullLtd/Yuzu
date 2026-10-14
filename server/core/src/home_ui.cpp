@@ -138,13 +138,12 @@ void append_tiles(std::string& out) {
     out += "</div></section>";
 }
 
-void append_sign_in(std::string& out, const LandingView& v, const std::string& host) {
+void append_sign_in(std::string& out, const LandingView& v) {
     out += R"(<section class="panel login" id="signin" aria-label="Sign in" data-next=")";
     if (v.next)
         out += v.next->key;
-    out += R"("><div class="hd"><h2>Sign in</h2><div class="end"><span class="sub mono">)";
-    out += host;
-    out += R"HTM(</span></div></div><form id="login-form" class="form" onsubmit="doLogin(event)">)HTM";
+    // No server name here: the page is reachable without a session (see render_landing).
+    out += R"HTM("><div class="hd"><h2>Sign in</h2></div><form id="login-form" class="form" onsubmit="doLogin(event)">)HTM";
     if (v.next) {
         out += R"(<div class="note" id="signin-notice">Sign in to open <b>)";
         out += v.next->name;
@@ -231,10 +230,11 @@ std::string render_landing(const LandingView& v) {
     out.reserve(24000);
     out += kHead;
     out += R"(<span class="srv">)";
-    // The page is reachable without a session, so the running version (what an
-    // attacker looks up CVEs against) is shown to a signed-in user only.
-    out += host;
+    // The page is reachable without a session, so the server name and the running
+    // version (what an attacker looks up CVEs against) are shown to a signed-in
+    // user only: a signed-out visitor sees the brand, the form and the tiles.
     if (v.who) {
+        out += host;
         if (!host.empty())
             out += " &middot; ";
         out += "version ";
@@ -248,7 +248,7 @@ std::string render_landing(const LandingView& v) {
     if (v.who)
         append_signed_in(out, v, host);
     else
-        append_sign_in(out, v, host);
+        append_sign_in(out, v);
     out += "</div></section>";
     append_tiles(out);
     out += "</div>\n";
