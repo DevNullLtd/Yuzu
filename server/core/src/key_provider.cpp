@@ -314,9 +314,18 @@ bool FileKeyProvider::store_named_file(std::string_view file_name, std::string_v
                       std::string(file_name), bytes.size());
         return false;
     }
+#ifdef _WIN32
+    // Windows has no --cert-group sharing, and this directory already carries
+    // the owner-only DACL from the CA/KEK custody that writes into it at boot,
+    // so applying it again is the existing posture, not a new narrowing.
+    constexpr bool kTightenExistingDir = true;
+#else
+    // A pre-existing directory may be deliberately 0750 + group (--cert-group).
+    constexpr bool kTightenExistingDir = false;
+#endif
     return write_file_atomic(file_name, base_dir_ / std::string(file_name),
                              {reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()},
-                             /*tighten_existing_dir=*/false);
+                             kTightenExistingDir);
 }
 
 bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path& dest,

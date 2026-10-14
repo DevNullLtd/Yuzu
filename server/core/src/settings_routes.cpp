@@ -4020,7 +4020,7 @@ void SettingsRoutes::register_routes(
 
         auto cert_dir = auth::default_cert_dir();
         std::error_code ec;
-        cert_upload::create_cert_dir(cert_dir, ec);
+        std::filesystem::create_directories(cert_dir, ec);
         if (ec) {
             res.status = 500;
             res.set_header("HX-Retarget", "#plugin-signing-section");

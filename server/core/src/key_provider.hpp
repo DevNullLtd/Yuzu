@@ -187,8 +187,10 @@ public:
     /// temp -> fsync -> rename path as store_key, so the bytes are never visible
     /// at a looser mode and a pre-existing symlink/file at the destination is
     /// replaced, never followed. Unlike store_key it does NOT re-tighten an
-    /// existing base directory (an operator cert directory may be deliberately
-    /// group-traversable via --cert-group); a directory this call creates is 0700.
+    /// existing base directory on POSIX (an operator cert directory may be
+    /// deliberately group-traversable via --cert-group); a directory this call
+    /// creates is 0700. On Windows the owner-only DACL is applied as store_key
+    /// does (no group sharing there; the dir already carries it from CA/KEK custody).
     /// `file_name` must be a bare safe component (same charset as a key_id).
     [[nodiscard]] bool store_named_file(std::string_view file_name, std::string_view bytes);
 
@@ -210,8 +212,8 @@ private:
     /// Atomic durable write: temp file (0600 from creation, O_EXCL) → fsync
     /// → rename. Shared by store_key and generate_kek.
     /// `tighten_existing_dir` = false leaves an already-present base dir's POSIX
-    /// mode alone (a dir this call creates is always 0700); the Windows
-    /// owner-only DACL on the dir is applied either way.
+    /// mode alone (a dir this call creates is always 0700). The Windows
+    /// owner-only DACL on the dir is applied either way (callers there pass true).
     [[nodiscard]] bool write_file_atomic(std::string_view key_id, const std::filesystem::path& dest,
                                          std::span<const std::uint8_t> bytes,
                                          bool tighten_existing_dir = true);
