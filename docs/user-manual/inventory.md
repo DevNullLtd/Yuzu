@@ -515,8 +515,17 @@ place, **Hardware** and **Software**, each its own page:
     `inventory.device.software`), now with its own filter box and, for the first time,
     rendered **Signature** and **Ecosystem** columns. Carries the same **Sync now**
     affordance, scoped to the `installed_software` source.
-  - **Tags** — inline add/remove via the existing tag routes, shown only when a
-    `Tag:Write` probe passes for the device.
+  - **Tags and properties** — inline add/remove via the existing tag routes. Add is
+    shown when a `Tag:Write` probe passes for the device; Remove needs its own
+    `Tag:Delete` probe (a different permission), taken only when this lens is open. The
+    lens also hosts **Custom properties** (the device's `props.<key>` values, read from
+    `GET /api/agents/{id}/properties`, gated on scoped `Infrastructure:Read`; edit
+    controls need `Infrastructure:Write`) and **Property schemas** (fleet-wide, read from
+    `GET /api/property-schemas`, so a management-group-confined operator sees a note
+    naming the missing fleet-wide `Infrastructure:Read` grant instead). Both load in one
+    fragment, `GET /fragments/hardware/ci/properties?id=`; a degraded store reads
+    "could not be read", never "No properties set." Property values are written to the
+    audit log (`custom_property.set`) and take part in scope expressions.
   - **DEX**, **Guardian**, **Live** — not reimplemented: these mount the *same*
     `/fragments/device/*` fragments the (now-redirected) device page used, each gated on
     scoped `GuaranteedState:Read` as before. **Live** additionally carries the ten

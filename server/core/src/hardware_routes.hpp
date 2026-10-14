@@ -63,7 +63,10 @@ struct HwSyncAffordance {
 };
 struct HwCiAffordances {
     HwSyncAffordance sync;
-    bool can_write_tags{false}; // Tag:Write probe passed → Add/remove tag controls render
+    bool can_write_tags{false}; // Tag:Write probe passed → Add tag control renders
+    // Tag:Delete is a different permission from Tag:Write; probed only when the Tags
+    // lens is the active one (so a record view on another lens pays no extra probe).
+    bool can_delete_tags{false};
     // Round-3 merge: the DEX/Guardian/Live lenses reuse device_routes.cpp's existing
     // fragments verbatim, which gate on scoped GuaranteedState:Read — a STRICTER
     // check than the Inventory:Read the CI record itself already passed. htmx does
@@ -108,7 +111,7 @@ std::string render_hardware_software_lens(const std::string& agent_id,
 
 std::string render_hardware_tags_lens(const std::string& agent_id,
                                       const std::optional<std::vector<DeviceTag>>& tags,
-                                      bool can_write);
+                                      bool can_write, bool can_delete = false);
 
 std::string render_hardware_not_found(const std::string& agent_id);
 

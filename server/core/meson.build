@@ -544,6 +544,8 @@ yuzu_server_core_lib = static_library(
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
     'src/custom_properties_routes.cpp',
+    'src/device_data_render.cpp',
+    'src/device_data_routes.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/instruction_param_schema.cpp',

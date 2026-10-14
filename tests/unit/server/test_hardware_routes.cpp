@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <expected>
 #include <optional>
@@ -60,6 +61,8 @@ struct HwHarness {
     authz::VisibleSet scope;            // FleetReadGate scope; nullopt = unfiltered, set = confine to these ids
     bool allow_execute = true;          // scoped Execution:Execute probe (sync affordance/actions)
     bool allow_tag_write = true;        // scoped Tag:Write probe (tag controls)
+    bool allow_tag_delete = true;       // scoped Tag:Delete probe (Remove control; Tags lens only)
+    std::vector<std::string> probes;    // "Type:Op" for every scoped probe, in call order
 
     std::vector<InventoryDeviceRow> roster_rows;
     bool roster_ci_degraded = false;
@@ -125,6 +128,9 @@ struct HwHarness {
         HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&) { return ci_detail; };
         HardwareRoutes::ScopedProbeFn probe = [this](const httplib::Request&, const std::string& type,
                                                      const std::string& op, const std::string&) {
+            probes.push_back(type + ":" + op);
+            if (type == "Tag" && op == "Delete")
+                return allow_tag_delete;
             if (type == "GuaranteedState" && op == "Read")
                 return allow_guaranteed_state;
             if (type == "Execution" && op == "Execute")
@@ -1146,4 +1152,50 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readabl
         REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.device.ci|success");
     }
+}
+
+// Remove needs Tag:Delete, which is not Tag:Write: a Write-only viewer is offered Add and no
+// Remove (a control that can only 403). Kills: the Remove column keyed off can_write again.
+TEST_CASE("route: Tags lens offers Remove only behind a Tag:Delete probe and hosts the "
+          "properties fragment",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("agent-1", "TAG-HOST", "windows", true);
+    h.ci_detail.tags = std::vector<DeviceTag>{{"agent-1", "owner", "ops", "api", 0}};
+
+    auto full = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags");
+    REQUIRE(full);
+    CHECK(contains(full->body, "hwTagSet(this)"));
+    CHECK(contains(full->body, "hwTagDelete(this)"));
+    CHECK(contains(full->body, "/fragments/hardware/ci/properties?id=agent-1"));
+    CHECK(contains(full->body, ">Tags and properties<"));
+
+    h.allow_tag_delete = false;
+    auto write_only = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags&lens_only=1");
+    REQUIRE(write_only);
+    CHECK(contains(write_only->body, "hwTagSet(this)"));
+    CHECK_FALSE(contains(write_only->body, "hwTagDelete(this)"));
+
+    h.allow_tag_write = false;
+    h.allow_tag_delete = true;
+    auto delete_only = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags&lens_only=1");
+    REQUIRE(delete_only);
+    CHECK_FALSE(contains(delete_only->body, "hwTagSet(this)"));
+    CHECK(contains(delete_only->body, "hwTagDelete(this)"));
+}
+
+// A record view on another lens must not pay a denied-probe audit row for a control it
+// never renders. Kills: moving the Tag:Delete probe into affordances_for (every lens).
+TEST_CASE("route: the Tag:Delete probe is taken only when the Tags lens is the active one",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("agent-1", "TAG-HOST", "windows", true);
+    h.ci_detail.tags = std::vector<DeviceTag>{};
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1"));
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=software"));
+    CHECK(std::count(h.probes.begin(), h.probes.end(), "Tag:Delete") == 0);
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags"));
+    CHECK(std::count(h.probes.begin(), h.probes.end(), "Tag:Delete") == 1);
 }

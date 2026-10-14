@@ -282,7 +282,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         const HardwareCiDetail detail = deps_.ci_detail_fn(id);
-        const HwCiAffordances aff = affordances_for(req, id, detail);
+        HwCiAffordances aff = affordances_for(req, id, detail);
+        if (lens == "tags")
+            aff.can_delete_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Delete", id);
 
         std::string verb = "inventory.device.ci";
         std::string state = !detail.ci.has_value() ? "store degraded"

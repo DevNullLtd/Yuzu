@@ -533,7 +533,7 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
         h += render_hardware_software_lens(agent_id, detail.software, detail.software_truncated, online,
                                            aff.sync);
     } else if (lens == "tags") {
-        h += render_hardware_tags_lens(agent_id, detail.tags, aff.can_write_tags);
+        h += render_hardware_tags_lens(agent_id, detail.tags, aff.can_write_tags, aff.can_delete_tags);
     } else if (lens == "actions") {
         // The route swaps this placeholder for the real actions lens on load —
         // rendering the lens itself needs actions_fn/classify_fn/schema_fn, which
@@ -716,7 +716,7 @@ std::string render_hardware_lens_bar(const std::string& agent_id, const std::str
                     std::string(oob ? " hx-swap-oob=\"true\"" : "") + ">";
     h += device_lens_tab("overview", "Overview", agent_id, active);
     h += device_lens_tab("software", "Installed software", agent_id, active);
-    h += device_lens_tab("tags", "Tags", agent_id, active);
+    h += device_lens_tab("tags", "Tags and properties", agent_id, active);
     h += device_lens_tab("dex", "DEX", agent_id, active);
     h += device_lens_tab("guardian", "Guardian", agent_id, active);
     h += device_lens_tab("live", "Live", agent_id, active);
@@ -800,10 +800,17 @@ std::string render_hardware_software_lens(const std::string& agent_id,
 
 std::string render_hardware_tags_lens(const std::string& agent_id,
                                       const std::optional<std::vector<DeviceTag>>& tags,
-                                      bool can_write) {
+                                      bool can_write, bool can_delete) {
+    // The custom-properties and property-schema panels load into this host on open
+    // (their own fragment carries the Infrastructure probes, so a record view that
+    // never opens this lens never pays them).
+    const std::string properties_host =
+        "<div hx-get=\"/fragments/hardware/ci/properties?id=" + url_encode(agent_id) +
+        "\" hx-trigger=\"load\" hx-swap=\"innerHTML\" style=\"margin-top:22px\"><span "
+        "class=\"gp-mute\">Loading properties&hellip;</span></div>";
     if (!tags)
         return "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read. "
-               "Retry shortly.</div>";
+               "Retry shortly.</div>" + properties_host;
     std::string h = "<div class=\"hw-panel\">";
     if (can_write) {
         // Posts JSON to the EXISTING /api/tags/set (scoped Tag:Write, audited tag.set)
@@ -817,20 +824,22 @@ std::string render_hardware_tags_lens(const std::string& agent_id,
     }
     if (tags->empty()) {
         h += "<div class=\"hw-empty\">No tags set on this device.</div></div>";
-        return h;
+        return h + properties_host;
     }
+    // Remove needs Tag:Delete, a different permission from the Tag:Write that
+    // gates Add — a Write-only viewer must not be offered a control that 403s.
     h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr><th>Key</th><th>Value</th><th>Source</th>" +
-         std::string(can_write ? "<th></th>" : "") + "</tr></thead><tbody>";
+         std::string(can_delete ? "<th></th>" : "") + "</tr></thead><tbody>";
     for (const auto& t : *tags) {
         h += "<tr><td class=\"hw-name\">" + esc(t.key) + "</td><td class=\"hw-mono\">" + esc(t.value) +
              "</td><td class=\"hw-mono\">" + esc(t.source) + "</td>";
-        if (can_write)
+        if (can_delete)
             h += "<td><a class=\"gp-btn danger\" data-agent=\"" + esc(agent_id) + "\" data-key=\"" + esc(t.key) +
                  "\" onclick=\"hwTagDelete(this)\">remove</a></td>";
         h += "</tr>";
     }
     h += "</tbody></table></div></div>";
-    return h;
+    return h + properties_host;
 }
 
 } // namespace yuzu::server

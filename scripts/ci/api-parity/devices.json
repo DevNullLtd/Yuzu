@@ -110,6 +110,14 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/hardware/ci/properties",
+    "capability_id": "get.fragments-hardware-ci-properties",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/hardware/ci/result",
     "capability_id": "get.fragments-hardware-ci-result",
     "rest_v1_twin": null,

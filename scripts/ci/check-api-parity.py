@@ -202,7 +202,12 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
 # is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
 # which counts as untwinned by design, so the count rises 199 -> 200.
-BASELINE_UNTWINNED = 200
+#
+# 201 (200 + 1): GET /fragments/hardware/ci/properties, the Hardware record's custom-properties and
+# property-schema panels. Its data routes (/api/agents/{id}/properties*, /api/property-schemas)
+# are dashboard-only with no REST v1 or MCP twin (rows above, planned:#2146), so the fragment has
+# none to name either; it deepens an untwinned surface rather than adding a new capability.
+BASELINE_UNTWINNED = 201
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
