@@ -221,6 +221,7 @@
 #include "inventory_routes.hpp"
 #include "hardware_routes.hpp"
 #include "home_routes.hpp" // Home (/home): landing worklist over injected seams
+#include "home_ui.hpp"     // sign_in_location: where a signed-out page request goes
 #include "home_panels_routes.hpp" // HM-2: Home policies + activity fragments
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
@@ -14885,7 +14886,9 @@ private:
                         R"({"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}})",
                         "application/json");
                 } else {
-                    res.set_redirect("/login");
+                    // The landing page, carrying the requested screen as a
+                    // validated key so it can say "Sign in to open <area>."
+                    res.set_redirect(home_ui::sign_in_location(req.path));
                 }
                 return httplib::Server::HandlerResponse::Handled;
             }

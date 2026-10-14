@@ -727,7 +727,11 @@ template <typename Req>
 /// must stay in effect for every path this allows through unauthenticated.
 /// Returns true iff `path` should skip session/bearer resolution entirely.
 inline bool is_login_exempt_path(std::string_view path) {
-    return path == "/login" || path == "/login/mfa" || path == "/login/mfa/enroll" ||
+    // `/home` is the landing and sign-in page: it must render for a visitor with
+    // no session (it IS where the chokepoint below sends them), and it shows the
+    // signed-in panel itself when a session exists.
+    return path == "/home" || path == "/login" || path == "/login/mfa" ||
+           path == "/login/mfa/enroll" ||
            path == "/health" || path == "/api/health" || path == "/auth/oidc/start" ||
            path == "/auth/callback" ||
            // #2057: /api/v1/openapi.json used to be listed here as
