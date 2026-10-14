@@ -3367,7 +3367,7 @@ The password is hashed with PBKDF2 before storage. Plaintext passwords are never
 > **Breaking change in v0.12.0** — the `role` field is **ignored** on
 > create. New users are always created as `user`. To grant admin, call
 > `POST /api/settings/users/{username}/role` (the Users table has no
-> role button today — see "Changing a User's Role" below). This is a
+> role button; use **Access → Users and roles → Change role** or see "Changing a User's Role" below). This is a
 > deliberate split (security finding C1): collapsing role assignment
 > into the create endpoint allowed a 4xx-on-create + audit-as-success
 > pattern that operators couldn't audit cleanly. Each role transition
@@ -3376,7 +3376,7 @@ The password is hashed with PBKDF2 before storage. Plaintext passwords are never
 
 ### Changing a User's Role
 
-The Settings → User Management table does **not** render a role button;
+The Settings → User Management table does **not** render a role button (the **Access → Users and roles** page does);
 change a role with the Settings endpoint from an admin session (it is
 MFA step-up gated):
 
@@ -3502,7 +3502,7 @@ their credentials live at the identity provider (#5342).
   `--auth-mode=sso-only` only the armed break-glass account can change
   its own password. This button is on the admin-only User Management
   page, so non-admin users change their password with
-  `POST /api/v1/users/me/password` for now (#5353).
+  `POST /api/v1/users/me/password`, or **Access → Users and roles → Your account → Change password**.
 - **Any other local row → Reset password.** Enter the new password
   twice. Every dashboard session of that user is signed out and any
   lockout on the account is cleared (the toast says so when there was

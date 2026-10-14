@@ -786,6 +786,27 @@ TEST_CASE("is_valid_principal: rejects an over-255-byte principal", "[settings][
 // (3) audit the attempt as denied with detail="weak_password", (4) leave
 // the user NOT persisted.
 
+TEST_CASE("SettingsRoutes POST /api/settings/users: a dot-only username is refused",
+          "[settings][users]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+    for (const char* name : {".", "..", "..."}) {
+        INFO(name);
+        auto res = h.Post("/api/settings/users",
+                          std::string("username=") + name + "&password=a-long-enough-password",
+                          "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK_FALSE(h.has_user(name));
+    }
+    // A name that merely contains a dot is fine.
+    auto ok = h.Post("/api/settings/users", "username=a.b&password=a-long-enough-password",
+                     "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
 TEST_CASE("SettingsRoutes POST /api/settings/users: short password rejected with toast",
           "[settings][users][weak-password]") {
     SettingsRoutesHarness h;

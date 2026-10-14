@@ -4830,8 +4830,10 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        // H1 FIX: Validate username format (alphanumeric + ._- only, no ':')
-        if (!is_valid_username(username)) {
+        // H1 FIX: Validate username format (alphanumeric + ._- only, no ':'). A name made only
+        // of dots is refused too: a browser resolves "." and ".." out of a request path, so such
+        // an account could never be addressed (removed, or have its role changed) by URL.
+        if (!is_valid_username(username) || username.find_first_not_of('.') == std::string::npos) {
             res.status = 400;
             res.set_header(
                 "HX-Trigger",

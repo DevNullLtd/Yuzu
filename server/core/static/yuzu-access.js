@@ -122,8 +122,9 @@
       ],
       note: 'New accounts start as User. Set the account role afterwards.',
       submitLabel: 'Add user',
+      validate: function (v) { return /^\.+$/.test(v.username.trim()) ? 'A name made only of dots cannot be used.' : null; },
       // The POST runs inside the dialog, so a refusal (duplicate name, weak password) keeps
-      // it open and nobody retypes the password.
+      // it open with the username kept; the dialog clears the password field, so it is retyped.
       submit: function (v) {
         return window.YuzuDialog.request('POST', '/api/settings/users',
           { form: { username: v.username.trim(), password: v.password } }).then(function (r) {
@@ -199,7 +200,10 @@
       ],
       submitLabel: 'Assign role',
       // The role is a path segment: only a value the server offered, and only as a vetted segment.
-      validate: function (v) { return roles.indexOf(v.role) >= 0 && seg(v.role) ? null : 'Choose one of the listed roles.'; },
+      validate: function (v) {
+        if (/^\.+$/.test(v.principal_id.trim())) return 'A name made only of dots cannot be used.';
+        return roles.indexOf(v.role) >= 0 && seg(v.role) ? null : 'Choose one of the listed roles.';
+      },
       submit: function (v) {
         var id = v.principal_id.trim();
         return window.YuzuDialog.request('POST', '/api/v1/rbac/roles/' + seg(v.role) + '/assignments',

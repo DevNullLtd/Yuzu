@@ -454,10 +454,13 @@ Settings uses, so the two stay equivalent.
 - **Confirmation and MFA.** Each of these asks to confirm in the page. Remove, Change role and
   Revoke sessions also need a recent second-factor check: when yours is stale the page asks for
   an authenticator or recovery code and then repeats the action once. A single sign-on session
-  is told to sign in again at its identity provider and to repeat the action afterwards.
-- **What is never offered.** Your own row has no Remove, no role change and no Revoke (the
-  server refuses them too). A single sign-on or SCIM account has only Revoke sessions, because
-  the local account routes refuse its name. The page never guesses whether an account is the last
+  signed in through OpenID Connect is told to sign in again at its identity provider and to repeat
+  the action afterwards; a SAML session sees the server's refusal.
+- **What is never offered.** Your own row has no Remove or role change (the
+  server refuses both) and no Revoke sessions (it would end the page you are using; use Sign out
+  everywhere). A single sign-on or SCIM account has only Revoke sessions: the page hides the other
+  controls as a hint (the server refuses single sign-on principal names outright, but a SCIM
+  account has a plain name that the local account routes accept). The page never guesses whether an account is the last
   administrator: the server's refusal is shown as it came.
 - **When the outcome is unknown.** After a server error or a dropped connection the page says the
   change may or may not have been applied and reloads both panels, so what is shown is what the
@@ -511,10 +514,12 @@ Settings uses, so the two stay equivalent.
   page tells you to check again.
 - **Temporary elevation.** **Your elevation** raises your own session to administrator for a
   limited time (reason required, recorded in the audit log, up to 1024 bytes; the duration is capped
-  by the server). It needs elevation eligibility and an enrolled second factor and always asks
-  for an MFA code; **Step down** ends it and is always safe. The page cannot show whether your
+  by the server). It needs elevation eligibility and an enrolled second factor and asks
+  for an MFA code (an OpenID Connect session is sent to its identity provider instead); **Step down** ends it and is always safe. The page cannot show whether your
   session is currently elevated. Elevation does not satisfy the standing-Administrator rule: assigning
-  roles and changing enforcement still need your own standing Administrator role.
+  roles and changing enforcement still need your own standing Administrator role, and
+  changing an account role (Change role) needs your own account role to be admin: the server refuses it
+  for a session that is only admin through an elevation.
 - **Unreadable store.** If the account store does not answer, the Users panel shows a red
   message with a Retry button. It never shows an empty list in that case, so a degraded store
   cannot be mistaken for "nobody is here".
