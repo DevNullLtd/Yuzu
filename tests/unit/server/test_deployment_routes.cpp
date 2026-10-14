@@ -492,6 +492,7 @@ struct ReadRig {
     std::string user = "alice";
     std::string token_service; // non-empty => service-scoped session
     bool authed = true;
+    bool auth_writes_401 = true; // false: auth_fn_ returns no session without touching res
     bool perm_allow = true;
     std::vector<std::pair<std::string, std::string>> perms;
 
@@ -505,9 +506,11 @@ struct ReadRig {
                    httplib::Response& res) -> std::optional<auth::Session> {
                 if (!authed) {
                     // The real auth_fn writes its own 401 (A4 envelope) before returning nullopt.
-                    res.status = 401;
-                    res.set_content(R"({"error":{"code":401,"message":"from auth_fn"}})",
-                                    "application/json");
+                    if (auth_writes_401) {
+                        res.status = 401;
+                        res.set_content(R"({"error":{"code":401,"message":"from auth_fn"}})",
+                                        "application/json");
+                    }
                     return std::nullopt;
                 }
                 auth::Session s;
@@ -618,6 +621,24 @@ TEST_CASE("deployment routes: GET /api/v1/deployments is owner-scoped, newest fi
     CHECK(ok->status == 200);
 }
 
+TEST_CASE("deployment routes: an auth seam that answers nothing still gets an A4 401",
+          "[deployment][routes][rest][security]") {
+    ReadRig rig;
+    rig.authed = false;
+    rig.auth_writes_401 = false; // auth_fn_ returns no session and leaves the response untouched
+    rig.wire(nullptr, nullptr);
+    for (const std::string path :
+         {std::string("/api/v1/deployments"), "/api/v1/deployments/" + hex_id(1)}) {
+        INFO(path);
+        auto r = rig.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        const auto body = nlohmann::json::parse(r->body);
+        CHECK(body["error"]["code"] == 401);
+        CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    }
+}
+
 TEST_CASE("deployment routes: deployments list/detail gate matrix (401, service-scoped, RBAC)",
           "[pg][deployment][routes][rest][security]") {
     YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
@@ -704,6 +725,10 @@ TEST_CASE("deployment routes: GET /api/v1/deployments/{id} is owner-scoped, boun
     CHECK(res->body.find("repo.lan") == std::string::npos);
 
     // device limit: bounded read, exact counts, truncated flag.
+    // The detail route rejects trailing junk in limit the same way the list does.
+    auto junk = rig.sink.Get("/api/v1/deployments/" + hex_id(10) + "?limit=20junk");
+    REQUIRE(junk);
+    CHECK(junk->status == 400);
     auto cut = rig.sink.Get("/api/v1/deployments/" + hex_id(10) + "?limit=2");
     REQUIRE(cut);
     auto cj = nlohmann::json::parse(cut->body);

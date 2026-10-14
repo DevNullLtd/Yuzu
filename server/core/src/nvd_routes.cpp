@@ -87,9 +87,7 @@ void register_nvd_routes(HttpRouteSink& sink, Deps deps) {
             (void)detail::try_persist_audit(deps.audit_fn, req, "nvd.sync.request", "disabled",
                                             "NvdSync", "nvd", "");
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"NVD sync not enabled"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "NVD sync not enabled"), "application/json");
             return;
         }
         // A privileged outbound action: the request is recorded BEFORE it is made, and an

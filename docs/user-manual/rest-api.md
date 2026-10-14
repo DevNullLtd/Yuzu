@@ -8019,9 +8019,7 @@ row. It does not read the shelved `/software-deployments` store below. MCP twin:
 
 `pagination.truncated` is `true` when you own more deployments than `limit` returned. There is no
 total and no paging cursor: raise `limit` (maximum 100) to see more, and note that a deployment
-older than your newest 100 is not reachable through this endpoint. The `total` field this endpoint
-returned before 2026-10-14 was the number of rows in the page, not a count of your deployments, and
-has been removed.
+older than your newest 100 is not reachable through this endpoint.
 
 `status` is `running` or `complete`; the live engine has no staged, cancelled or rolled-back state.
 `state.label` carries the failed or skipped count of a finished deployment ("Complete, 2 failed").

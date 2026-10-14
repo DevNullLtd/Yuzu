@@ -209,6 +209,9 @@ TEST_CASE("nvd_routes: /api/nvd/sync 503s when nvd_sync is unset", "[server][rou
     auto r = h.sink.Post("/api/nvd/sync", "");
     REQUIRE(r);
     CHECK(r->status == 503);
+    const auto body = json::parse(r->body);
+    CHECK(body["error"]["message"] == "NVD sync not enabled");
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
 }
 
 TEST_CASE("nvd_routes: /api/nvd/sync requests a sync and answers sync_started when wired",

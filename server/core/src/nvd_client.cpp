@@ -1,5 +1,7 @@
 #include "nvd_client.hpp"
 
+#include "settings_model.hpp" // sanitize_url_userinfo
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -61,8 +63,14 @@ std::string url_encode(const std::string& value) {
 
 } // namespace
 
-NvdProxyEndpoint parse_nvd_proxy_url(std::string_view url) {
+NvdProxyEndpoint parse_nvd_proxy_url(std::string_view raw) {
     NvdProxyEndpoint ep;
+    // Userinfo first, through the shared sanitiser: it ends userinfo at the LAST '@' anywhere and
+    // over-strips on ambiguity, because a boundary-first parse cannot tell a password such as
+    // "admin:1234/ss@host" from a host:port (the reasoning is in settings_model.hpp). A proxy URL
+    // with a path containing '@' therefore loses its host, which no real proxy URL has.
+    const std::string sanitized = settings_model::sanitize_url_userinfo(raw);
+    std::string_view url = sanitized;
     // Scheme: only http:// and https:// are recognised; a proxy URL with no scheme is
     // "host:port".
     if (url.starts_with("http://"))
@@ -72,10 +80,6 @@ NvdProxyEndpoint parse_nvd_proxy_url(std::string_view url) {
     // The authority ends at the first path, query or fragment delimiter.
     if (const auto end = url.find_first_of("/?#"); end != std::string_view::npos)
         url = url.substr(0, end);
-    // Userinfo is everything up to the LAST '@' in the authority, so a password may itself
-    // contain '@'. It is discarded, not parsed.
-    if (const auto at = url.rfind('@'); at != std::string_view::npos)
-        url.remove_prefix(at + 1);
 
     std::string_view host = url;
     std::string_view port_text;
@@ -102,7 +106,8 @@ NvdProxyEndpoint parse_nvd_proxy_url(std::string_view url) {
         const auto [p, ec] = std::from_chars(first, last, port);
         if (ec == std::errc{} && p == last && port >= 1 && port <= 65535)
             ep.port = port;
-        // else keep the 8080 default, as the previous parse did for a bad port
+        // else keep the 8080 default for a port that is not a plain number in 1..65535 (the
+        // previous parse also did for a non-numeric port, but read "80x" as 80)
     }
     return ep;
 }
@@ -114,8 +119,14 @@ NvdClient::NvdClient(std::string api_key, std::string proxy_url, std::string bas
         const auto ep = parse_nvd_proxy_url(proxy_url);
         proxy_host_ = ep.host;
         proxy_port_ = ep.port;
-        // Host and port only: the parse has already dropped any userinfo.
-        spdlog::info("NVD client using proxy {}:{}", proxy_host_, proxy_port_);
+        if (proxy_host_.empty()) {
+            // An ambiguous URL (for example '?' or '#' ahead of the userinfo '@') is dropped
+            // whole rather than guessed at. Say so, without echoing any of it.
+            spdlog::warn("NVD proxy URL has no usable host; requests will not use a proxy");
+        } else {
+            // Host and port only: the parse has already dropped any userinfo.
+            spdlog::info("NVD client using proxy {}:{}", proxy_host_, proxy_port_);
+        }
     }
 }
 

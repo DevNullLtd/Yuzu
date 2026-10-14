@@ -2067,8 +2067,9 @@ static const ToolDef kTools[] = {
      "and MACs are agent-reported free text. A host is not necessarily unmanaged: discovery does "
      "not yet match hosts to enrolled agents, so no managed flag is returned. Each row names a "
      "host fleet-wide, so every call is audit-logged (network.discovered.view); a service-scoped "
-     "API token is denied. Mirrors GET /api/v1/network/discovered-devices. Requires "
-     "Infrastructure:Read.",
+     "API token is denied, and an operator confined to a management group is refused (the read "
+     "does not yet narrow by the discovering agent). Mirrors GET "
+     "/api/v1/network/discovered-devices. Requires Infrastructure:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("subnet":{"type":"string","maxLength":64,"description":"Only hosts found on this exact subnet string"},)j"
      R"j("limit":{"type":"integer","minimum":1,"maximum":500,"default":500})j"
@@ -21519,6 +21520,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto deployment_id = param_str(args, "deployment_id");
                 if (deployment_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "deployment_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // The published schema bounds the id; enforce it, so an oversized value is
+                // refused here instead of reaching the store as a query parameter.
+                if (deployment_id.size() > kDeploymentIdMaxLen) {
+                    res.set_content(a4_error(kInvalidParams,
+                                             "deployment_id is longer than 64 characters"),
                                     "application/json");
                     return;
                 }

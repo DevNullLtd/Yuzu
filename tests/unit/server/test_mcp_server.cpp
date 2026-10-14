@@ -20556,6 +20556,14 @@ TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders,
     CHECK(nlohmann::json::parse(theirs->body)["error"]["message"] ==
           nlohmann::json::parse(absent->body)["error"]["message"]);
 
+    // An id over the published 64-character bound is refused, not passed to the store.
+    auto longid = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"get_deployment",)") +
+        R"("arguments":{"deployment_id":")" + std::string(65, 'a') + R"("}}})");
+    REQUIRE(longid);
+    CHECK(nlohmann::json::parse(longid->body)["error"]["code"] ==
+          yuzu::server::mcp::kInvalidParams);
+
     auto noid = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"get_deployment",)"
         R"("arguments":{}}})");

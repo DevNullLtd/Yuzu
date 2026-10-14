@@ -16,6 +16,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
 #include <atomic>
@@ -25,6 +27,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2154,7 +2157,14 @@ TEST_CASE("parse_nvd_proxy_url: userinfo never reaches the host or the port",
         {"http://svc:hunter2@[::1]:3128", "::1", 3128},             // IPv6 literal
         {"http://svc:hunter2@[2001:db8::5]", "2001:db8::5", 8080},  // IPv6, no port
         {"[::1]:3128", "::1", 3128},                                // IPv6, no scheme or userinfo
-        {"http://svc:hunter2@proxy.lan:3128/p@th", "proxy.lan", 3128}, // '@' in a path
+        // Over-stripping on ambiguity, like the settings-panel sanitiser: a path '@' cannot be told
+        // from the end of a password, so everything up to the last '@' is treated as userinfo.
+        {"http://svc:hunter2@proxy.lan:3128/p@th", "th", 8080},
+        {"admin:1234/ss@proxy.lan:3128", "proxy.lan", 3128},     // '/' in a password, digit-led
+        // '?' or '#' ahead of the userinfo '@' is the sanitiser's documented ambiguous case: it
+        // drops everything from the authority on, so there is no host (and no leak).
+        {"http://svc:p?ss@proxy.lan:3128", "", 8080},
+        {"http://svc:p#ss@proxy.lan:3128", "", 8080},
     };
     for (const auto& c : cases) {
         INFO("url: " << c.url);
@@ -2164,6 +2174,38 @@ TEST_CASE("parse_nvd_proxy_url: userinfo never reaches the host or the port",
         // The credential text appears nowhere in the parsed endpoint.
         CHECK(ep.host.find("hunter2") == std::string::npos);
         CHECK(ep.host.find("svc") == std::string::npos);
+        CHECK(ep.host.find("admin") == std::string::npos);
+        CHECK(ep.host.find("1234") == std::string::npos); // a digit-led password prefix
         CHECK(ep.host.find('@') == std::string::npos);
     }
+}
+
+namespace {
+// Swaps spdlog's default logger for one that records into a string, and restores it on scope exit.
+struct ScopedLogCapture {
+    std::ostringstream text;
+    std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+    ScopedLogCapture() {
+        auto sink = std::make_shared<spdlog::sinks::ostream_sink_mt>(text);
+        auto logger = std::make_shared<spdlog::logger>("nvd_proxy_capture", sink);
+        logger->set_level(spdlog::level::info);
+        spdlog::set_default_logger(logger);
+    }
+    ~ScopedLogCapture() {
+        spdlog::default_logger()->flush();
+        spdlog::set_default_logger(previous);
+    }
+};
+} // namespace
+
+TEST_CASE("NvdClient: the startup line names the proxy host and port and no credentials",
+          "[nvd][proxy][security]") {
+    ScopedLogCapture capture;
+    { NvdClient client{"", "http://svc:hunter2@proxy.lan:3128"}; }
+    spdlog::default_logger()->flush();
+    const auto line = capture.text.str();
+    CHECK(line.find("proxy.lan:3128") != std::string::npos);
+    CHECK(line.find("svc") == std::string::npos);
+    CHECK(line.find("hunter2") == std::string::npos);
+    CHECK(line.find('@') == std::string::npos);
 }

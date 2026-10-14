@@ -77,6 +77,8 @@ nlohmann::json deploy_preview_json(const std::string& run_id, const std::string&
 /// `list_deployments` (mirrors `/api/v1/preflight/runs`: 1..100).
 inline constexpr int kDeploymentListDefault = 20;
 inline constexpr int kDeploymentListMax = 100;
+// Deployment ids are 16 hex characters; MCP get_deployment publishes and enforces this bound.
+inline constexpr std::size_t kDeploymentIdMaxLen = 64;
 /// Detail device-grid page: default / ceiling for `GET /api/v1/deployments/{id}`
 /// and MCP `get_deployment`. The run row carries the exact totals regardless.
 inline constexpr int kDeploymentDeviceDefault = 500;
