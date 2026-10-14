@@ -101,6 +101,53 @@ The Instruction Management page provides two authoring modes:
 
 Both modes are served as HTMX fragments.
 
+**Saving keeps what the YAML does not carry.** The editor's Save writes only the
+fields the YAML expresses (name, plugin, action, description, and the optional
+`type`, `version`, `concurrency` and `approval`). Everything else stored on the
+definition -- its instruction set, enabled flag, TTLs, result schema,
+visualization, response templates, platforms, minimum agent version, required
+plugins and readable payload -- is kept. When the YAML omits `type`, `version`,
+`concurrency` or `approval`, the stored value is kept as well; a value that
+differs from the stored one is an intentional edit and is written, and a change
+of `approval` is recorded in the audit detail as `approval_mode: <old> -> <new>`.
+
+**Library list.** The Definitions tab lists up to 100 definitions by default.
+`GET /fragments/instructions` takes `name`, `plugin`, `type` and `limit` (maximum
+500); a cut list says "Showing the first N. Narrow the filter." The "Needs
+approval" column and the instruction sets panel appear for callers who hold
+`InstructionDefinition:Read` and `InstructionSet:Read` respectively.
+
+**Page controls follow permissions.** New, Edit, Import, Delete and the set
+controls appear for callers who hold `InstructionDefinition:Write`,
+`InstructionDefinition:Delete`, `InstructionSet:Write` and `InstructionSet:Delete`
+respectively, not for a role. Each capability is probed once per page render, and
+a denied probe is audited as a denial, so loading the page as a caller who lacks
+a capability writes one denial row for it.
+
+**Sets.** The sets panel lists each set with the number of definitions in it.
+New set asks for a name and description. Delete set states that its definitions
+stay and become unassigned. Each library row has a set select that assigns the
+definition to a set or clears it.
+
+**Response templates.** Templates on a library row loads that definition's
+templates: the built-in default (never editable) first, then the authored ones.
+New, Edit and Delete open dialogs that call
+`/api/v1/definitions/{id}/response-templates`. Filters are written one per line as
+`column | op | value`.
+
+**Import and export.** Import definition takes the JSON document that Export
+produces (Ed25519-signed or not); unsigned documents can be refused by policy and
+a duplicate id is refused. When the audit record could not be written the page
+says so. Export saves the definition as `<id>.json`.
+
+**Dispatch.** Selecting a definition on the Executions tab reads its parameters
+from `GET /api/v1/instructions/{id}`; `grant_secret` and `grant_id` are write-only
+password inputs. The Target select offers a scope expression with Validate
+(syntax only) and Preview (needs `Infrastructure:Read`). Dispatch always
+confirms, naming the instruction, `plugin:action`, type and target; a definition
+whose approval mode is not `auto` says it will be submitted for approval and not
+run, and an expression that was not previewed needs `DISPATCH` typed to send.
+
 ---
 
 ## 3. InstructionDefinition Reference
@@ -434,7 +481,7 @@ corrected `parameter_schema`:
 2. Edit its `parameter_schema` (a string holding the schema JSON). Unless the server runs with
    `--allow-unsigned-definitions`, the edited document must also be signed before import, or the import
    answers `400` as unsigned: add a hex `signature` and `publicKey` (an Ed25519 signature over the exact
-   bytes of `yaml_source`, 128 and 64 hex characters). A definition whose `yaml_source` is empty cannot be
+   bytes of `yaml_source`, 128 and 64 hex characters). The signature covers `yaml_source` only, so `plugin`, `action`, `type`, `approval_mode` and `concurrency_mode` are read from it and must agree with the envelope. A definition whose `yaml_source` is empty cannot be
    signed (import answers an error about a signature without `yaml_source`), so only the unsigned flag
    works for it.
 3. Rehearse the import, because step 5 cannot be rehearsed (an existing id answers `409`) and a refused
@@ -1401,9 +1448,11 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 
 **Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
 
-**Workflows page.** `/workflows` is a read-only page in the sidebar under Instructions: the workflow definitions (name, description, step count; selecting one lists its steps with each step's failure policy) and the recurring schedules. Schedules run a single instruction on the cadence the scheduler really applies (once, every N minutes, daily, weekly or monthly; time of day, weekday and day of month are stored but not used) and are not linked to workflows. A schedule you did not create shows only whether it targets all devices or a subset. Creating, running and deleting workflows and schedules are not on this page yet.
+**Workflows page.** `/workflows` is a page in the sidebar under Instructions (its workflow actions are described below): the workflow definitions (name, description, step count; selecting one lists its steps with each step's failure policy) and the recurring schedules. Schedules run a single instruction on the cadence the scheduler really applies (once, every N minutes, daily, weekly or monthly; time of day, weekday and day of month are stored but not used) and are not linked to workflows. A schedule you did not create shows only whether it targets all devices or a subset.
 
 The definitions table also shows each workflow's Last run and Result (the newest run you may see: "Not run" when there is none, "None visible" when runs exist only on devices outside your scope, "Unknown" when the list of newest runs was cut off before it reached that workflow). Selecting a workflow loads its latest run in the **Latest run** panel (status, start, duration, device count and one row per step) and the **Recent runs** disclosure lists its ten newest runs; selecting one loads it. A step shown as *Dispatched* means the command was sent: it says nothing about the result on a device, and for a caller confined to a device scope it reads *Dispatched (run-wide)* because the send covered the run's whole target list. A skipped step says why only for the three reasons the engine writes (condition not met, previous step failed, workflow aborted); a failed step shows its error text when the engine stored one, otherwise "No detail.". A run is visible to you only if at least one of its target devices is in your scope; a run you may not see and a run that does not exist look the same.
+
+**Workflow actions.** **New workflow** (shown when you hold `Workflow:Write`) opens a dialog for the workflow's YAML; the server's message is shown if the YAML is refused, and nothing runs until you run it. Each row's **Run now** (needs `Workflow:Execute`) opens a device checklist built from the connected devices you may see (filter box, the first 200 matches shown, at most 500 selected); without permission to list devices it falls back to a box of device ids, one per line. Each step is sent to every selected device in order; a step whose instruction needs approval is refused, and device results are not collected on this page. The server runs the whole workflow before it answers, so the page waits 8 seconds, then says the run may keep running on the server, disables that workflow's Run now and checks its newest run every 5 seconds for up to 10 minutes. Check Recent runs before running it again. **Delete** in the Steps panel (needs `Workflow:Delete`) retires the workflow after a confirmation; run history is kept and there is no undelete in the console. A control you may not use is shown disabled with the permission it needs. Instruction names appear on step rows only if you also hold `InstructionDefinition:Read`; otherwise the step's label or instruction id is shown. **Schedule actions.** Each schedule row has **Enable**/**Disable** and **Delete**, enabled only on schedules you created (a schedule with no recorded creator is nobody's, so both stay disabled). **Enable** needs `Schedule:Write` and `Execution:Execute` and asks for confirmation because the schedule then runs without anyone present; **Disable** needs `Schedule:Write` and is one click; **Delete** needs `Schedule:Delete` and confirms first. After a change the list is re-read and the stored state shown. **New schedule** (needs `Schedule:Write` and `Execution:Execute`; the instruction list needs `InstructionDefinition:Read`) takes a name, an enabled instruction, a cadence (once runs at the next scheduler tick, about now; the scheduler ignores time of day), targets, whether each run needs approval and parameters as JSON. Leaving targets empty needs an explicit acknowledgement that it reaches every device. A final summary shows the instruction's approval mode before the schedule is created enabled; a run can still be refused when it fires. Not verified by running a workflow against a live fleet: that the server keeps running a workflow after the page stops waiting.
 
 Who sees what: Administrator, Operator, PlatformEngineer, Viewer and ITServiceOwner hold `Workflow:Read` and see all definitions; runs follow the fleet-read scope of the account. A caller scoped only to management groups is refused the definitions and schedules panels (the existing global-grant rule) but sees runs that include a device in scope. ITServiceOwner can create, enable and delete its own schedules elsewhere but has no Run, New workflow or Delete workflow control, and a service-scoped token is refused the schedules panel outright.
 

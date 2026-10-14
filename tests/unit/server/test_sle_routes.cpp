@@ -93,6 +93,7 @@ struct SleHarness {
     std::vector<std::string> denied_perms;
     bool degrade_agent = false;
     bool audit_should_fail = false;
+    std::string audit_fail_result; // fail only rows whose result equals this (e.g. "success")
 
     std::vector<AgentLicenseRow> agent_rows;
     DecommissionResult decommission_result{}; // returned by the injected cascade
@@ -138,6 +139,8 @@ struct SleHarness {
                             const std::string& tt, const std::string& tid, const std::string&) {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
+            if (!audit_fail_result.empty() && r == audit_fail_result)
+                return false;
             return !audit_should_fail;
         };
         routes.register_routes(sink, scoped, agents_fn, decommission, audit);
@@ -392,6 +395,40 @@ TEST_CASE("sle erase: all-Deleted → 200 decommissioned, attempt+success audite
     CHECK(j["failed"] == 0);
     CHECK(h.audited("sle.agent.decommission|attempt"));
     CHECK(h.audited("sle.agent.decommission|success"));
+}
+
+// Kills: the outcome row's persist failure being invisible (a (void)try_persist_audit that
+// never sets the header), which left the page client's warning branch dead.
+TEST_CASE("sle erase: a lost OUTCOME audit row sets Sec-Audit-Failed on the 200 and on the partial 500",
+          "[sle_routes]") {
+    {
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.decommission_result = ok_result();
+        h.audit_fail_result = "success"; // the attempt row persisted; the outcome row did not
+        auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    {
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.decommission_result = partial_result();
+        h.audit_fail_result = "partial";
+        auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    {   // no failure → no header
+        SleHarness h;
+        h.allow_scoped_all = true;
+        h.decommission_result = ok_result();
+        auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    }
 }
 
 TEST_CASE("sle erase: a non-throwing Failed store → 500 partial, never a false success",

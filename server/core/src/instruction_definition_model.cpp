@@ -1,5 +1,7 @@
 #include "instruction_definition_model.hpp"
 
+#include "sensitive_instruction_params.hpp"
+
 namespace yuzu::server {
 
 nlohmann::json instruction_definition_row_json(const InstructionDefinition& d) {
@@ -27,11 +29,18 @@ nlohmann::json instruction_definition_detail_json(const InstructionDefinition& d
     j["parameter_schema"] = d.parameter_schema;
     j["result_schema"] = d.result_schema;
     j["yaml_source"] = d.yaml_source;
+    // Parameter names a client must treat as write-only (password input, never echoed or
+    // stored in history): the one shared list, so a dispatch form cannot keep its own copy.
+    auto secrets = nlohmann::json::array();
+    for (auto key : kRedactedInstructionParamKeys)
+        secrets.push_back(std::string(key));
+    j["secret_params"] = std::move(secrets);
     return j;
 }
 
 nlohmann::json instruction_definition_export_json(const InstructionDefinition& d) {
     nlohmann::json j = instruction_definition_detail_json(d);
+    j.erase("secret_params"); // a client hint, not part of the exported definition
     j["concurrency_mode"] = d.concurrency_mode;
     j["platforms"] = d.platforms;
     j["min_agent_version"] = d.min_agent_version;

@@ -205,9 +205,25 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
 # which counts as untwinned by design, so the count rises 199 -> 200.
 #
-# Both of the two changes above landed on 199; merged together the count is 201
-# (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
-BASELINE_UNTWINNED = 201
+# Device containment fragments (es-1): get.fragments-hardware-quarantine is "twinned" to GET
+# /api/v1/quarantine (no MCP list tool exists; the gap is recorded on the row), and
+# get.fragments-hardware-ci-containment is "composed-of:get.fragments-hardware-quarantine"
+# (a single-device read of the same active-record set; REST has no per-device GET). One
+# composed-of row, so 200 -> 201, measured by the checker, not hand-picked.
+#
+# Stored data panel (es-1): get.fragments-hardware-ci-stored-data is an "exception:" row (the
+# erase it fronts is DELETE /api/v1/sle/agents/{id}, which has no ledger row to compose), so
+# 201 -> 202, measured by the checker, not hand-picked.
+#
+# The DEX Alerts and policy-fragments changes above landed on 199 and merged together to 201
+# (199 + 1 + 1). The two containment rows above landed on that, so merged with them the count
+# is 203 (201 + 1 composed-of + 1 exception), the value the checker reports on the merged tree.
+#
+# Hardware record properties panel (device data, merged from dev): GET /fragments/hardware/ci/properties
+# is "planned:#2146" (its data routes, /api/agents/{id}/properties*, are dashboard-only with no REST v1
+# or MCP twin), so it deepens an untwinned surface by one row. Merged with the containment rows above
+# the count is 204 (203 + 1), the value the checker reports on the merged tree.
+BASELINE_UNTWINNED = 204
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

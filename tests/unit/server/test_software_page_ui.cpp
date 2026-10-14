@@ -197,12 +197,14 @@ TEST_CASE("software page: freshness line, stale prefix, building and the later t
     REQUIRE_FALSE(has(h, "<table"));
 }
 
-TEST_CASE("software page: head and the ADR-0017 caveat", "[inventory][ui]") {
+TEST_CASE("software page: head, and no standing ADR-0017 scope banner", "[inventory][ui]") {
     const std::string h = full({}, page());
     REQUIRE(has(h, "<h1 class=\"inv-h1\">Software</h1>"));
     REQUIRE(has(h, "<a href=\"/hardware\">Hardware</a>"));
     REQUIRE_FALSE(has(h, "inv-subnav")); // the lone Software tab is gone
-    REQUIRE(has(h, "Scope (ADR-0017)"));
+    // The scope note was a permanent banner above the table; confined callers still get their own
+    // notice (the kpis region), and the gate itself is unchanged.
+    REQUIRE_FALSE(has(h, "Scope (ADR-0017)"));
     REQUIRE_FALSE(has(h, "Devices tab"));
     REQUIRE_FALSE(has(h, "Find is also"));
 }
@@ -761,4 +763,17 @@ TEST_CASE("software page: shell script is CSP-safe and wires the page's behaviou
     for (const char* never : {"hx-on", "new Function", "eval("})
         REQUIRE_FALSE(has(s, never));
     REQUIRE(s.rfind("<script>", 0) == 0);
+}
+
+// The Inventory sources panel loads once with the full page and only there: the Results and
+// Rows swaps must not re-request it. Kills: moving the host into results_region.
+TEST_CASE("software page: Inventory sources host loads with the full page only",
+          "[inventory][ui]") {
+    const auto d = page();
+    const std::string html = full({}, d);
+    REQUIRE(has(html, "hx-get=\"/fragments/inventory/sources\" hx-trigger=\"load\""));
+    REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Results),
+                      "/fragments/inventory/sources"));
+    REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Rows),
+                      "/fragments/inventory/sources"));
 }

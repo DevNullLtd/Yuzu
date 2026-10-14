@@ -231,9 +231,43 @@ numbers match.
   narrows the trend to one version at a time (the same `version` parameter the
   `GET /api/v1/dex/perf/app` / `/perf/group` / `/perf/tag` endpoints already
   accept); "all
-  versions" is the default. Per-version crash/hang counts are not shown on
-  this panel yet: `GET /api/v1/dex/perf/app` carries the join, the panel does
-  not render it — use the per-application crash/hang drill above for those.
+  versions" is the default.
+  On the **whole-fleet** scope a second table, **Crashes and hangs by
+  version**, sits under the performance table; it renders the same
+  `versions[]` join that `GET /api/v1/dex/perf/app` and the `get_dex_app_perf`
+  MCP tool return. Its columns are **Crashes**, **Hangs** and **Affected
+  devices** (fleet-wide counts at any device count; `0` means no events were
+  reported), **Exposed devices**, **Failure rate** and **Rate vs previous
+  version**. Read it with these rules:
+  - **Every rate sits beside its population.** The failure rate is exposed
+    events per exposed device over the window, shown per 1,000 exposed devices
+    with its 95 percent interval and the exposed-device count it came from. A
+    `reliable` marker means 20 or more events; "under 20 events" flags a small
+    count and the interval stays on screen either way. It is not a rate per day
+    of use, so read it beside the "seen on N days" line under each version.
+  - **Exposed devices are sampled devices, not a census.** Only a device's top
+    resource-consuming applications each day are sampled, so a device running
+    the version can be missing from the count. An **unknown** exposure (no
+    sample rows for the version) is shown as "unknown", never as 0, and shows no
+    rate; a known `0` shows "no exposed devices". A row with affected devices
+    and an unknown exposure is failures recorded under a version that has no
+    samples.
+  - **The ratio against the previous version** needs a known, positive
+    exposure on both versions. When the previous version had no exposed events
+    the page says "no upper bound" and prints only the interval's lower end. A
+    missing ratio states why (no older version listed, exposure missing on one
+    side, or no exposed events on either).
+  - **The window and the cap are stated:** "last N days" (the failure window,
+    29 at the default 30-day observation retention) and, when more than 20
+    versions exist, "Showing the 20 newest versions". A version with no
+    performance rows is not listed, so a missing row is not the absence of
+    failures.
+  - **A non-zero `stat_failures`** is shown as a fault banner (an unexpected
+    condition), and a **degraded read** shows a failed-read note with a retry
+    link while the performance table above stays; it is never a table of zeros.
+  - Nothing is labelled good or bad: there are no status colours on the
+    figures. A management-group or device-model scope does not show this table,
+    because crashes and hangs are recorded fleet-wide.
   On the **fleet-wide** view (no management-group or device-model scope), each version row
   has a **&#9656; devices** affordance that expands in place to list the
   devices behind that number — `agent_id`, last-seen day, and that day's CPU /
