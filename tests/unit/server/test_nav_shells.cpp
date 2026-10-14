@@ -35,6 +35,7 @@ extern const char* const kComplianceHtml;
 extern const char* const kGuardianHtml;
 extern const char* const kGuardianDetailPageHtml;
 extern const char* const kSettingsHtml;
+extern const char* const kGroupsHtml;
 
 using Catch::Matchers::ContainsSubstring;
 using namespace yuzu::server::shell;
@@ -77,7 +78,8 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
             labels.push_back(it.label);
     CHECK(labels == std::vector<std::string_view>{"Dashboard", "Instructions", "Result sets",
                                                   "Compliance", "Guardian", "DEX", "TAR",
-                                                  "Hardware", "Software", "Fleet", "Settings"});
+                                                  "Groups and enrolment", "Hardware", "Software",
+                                                  "Fleet", "Settings"});
 }
 
 TEST_CASE("app shell: keys and hrefs are unique and every top-level entry has an icon",
@@ -354,6 +356,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"guardian detail (shared shell default)", kGuardianDetailPageHtml, {"/guardian"}},
         {"tar", kTarPageHtml, {"/tar"}},
         {"settings", kSettingsHtml, {"/settings"}},
+        {"groups and enrolment", kGroupsHtml, {"/groups"}},
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},
