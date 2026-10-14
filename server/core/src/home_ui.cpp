@@ -7,8 +7,6 @@
 #include "app_shell.hpp" // nav_groups(): a shell sub-page maps to its parent screen
 #include "web_utils.hpp" // html_escape
 
-#include <yuzu/version.hpp> // kVersionString, for the baked page
-
 #include <string>
 #include <string_view>
 
@@ -258,11 +256,3 @@ std::string render_landing(const LandingView& v) {
 }
 
 } // namespace yuzu::server::home_ui
-
-// NOLINTBEGIN(cert-err58-cpp)
-namespace {
-const std::string kHomeHtmlStr =
-    yuzu::server::home_ui::render_landing({.version = yuzu::kVersionString});
-} // namespace
-const char* const kHomeHtml = kHomeHtmlStr.c_str();
-// NOLINTEND(cert-err58-cpp)

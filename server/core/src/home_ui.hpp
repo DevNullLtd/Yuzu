@@ -88,9 +88,3 @@ std::string_view sign_in_fields();
 std::string_view sign_in_steps();
 std::string_view sign_in_script();
 } // namespace yuzu::server::login_ui
-
-/// The signed-out page with no notice, no server name and no SSO button, baked
-/// once. Kept for the superseded `GET /home` handler in home_routes.cpp (which
-/// the auth routes' registration now shadows) and for the page pins; the live
-/// route renders through `render_landing`.
-extern const char* const kHomeHtml;

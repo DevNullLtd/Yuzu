@@ -114,8 +114,7 @@ TEST_CASE("landing: fifteen tiles in five families with the design's exact names
 
 TEST_CASE("landing: no shell, no header-bar controls, no bell, no fragment loads, no data",
           "[home][ui]") {
-    for (const auto& html : {home_ui::render_landing(signed_out()), home_ui::render_landing(signed_in()),
-                             std::string(kHomeHtml)}) {
+    for (const auto& html : {home_ui::render_landing(signed_out()), home_ui::render_landing(signed_in())}) {
         CHECK(count_of(html, "<!--yuzu:shell-->") == 0);
         CHECK(count_of(html, "<aside") == 0);
         CHECK(count_of(html, "<nav") == 0);
@@ -144,9 +143,10 @@ TEST_CASE("landing: no shell, no header-bar controls, no bell, no fragment loads
 TEST_CASE("landing: slim bar shows the server name and version it was given", "[home][ui]") {
     const auto html = home_ui::render_landing(signed_out());
     CHECK_THAT(html, ContainsSubstring("<span class=\"srv\">yuzu-01 &middot; version 0.14.1</span>"));
-    // The baked page has no server name: version only, nothing invented.
-    CHECK_THAT(std::string(kHomeHtml), ContainsSubstring("<span class=\"srv\">version "));
-    CHECK(count_of(kHomeHtml, "&middot;") == 0);
+    // With no server name: version only, nothing invented.
+    const auto bare = home_ui::render_landing({.version = "0.14.1"});
+    CHECK_THAT(bare, ContainsSubstring("<span class=\"srv\">version 0.14.1</span>"));
+    CHECK(count_of(bare, "&middot;") == 0);
 }
 
 TEST_CASE("landing signed out: the real sign-in form, labelled fields, no SSO or two-factor note by default",
@@ -318,7 +318,7 @@ TEST_CASE("landing: every page piece is under the MSVC literal cap and the page 
     CHECK(login_ui::sign_in_fields().size() < 16000);
     CHECK(login_ui::sign_in_steps().size() < 16000);
     CHECK(login_ui::sign_in_script().size() < 16000);
-    const std::string html(kHomeHtml);
+    const std::string html = home_ui::render_landing(signed_out());
     CHECK(count_of(html, "<style") == 0);
     CHECK(count_of(html, "<link rel=\"stylesheet\" href=\"/static/yuzu.css\">") == 1);
 }

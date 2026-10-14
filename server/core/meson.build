@@ -491,7 +491,7 @@ yuzu_server_core_lib = static_library(
     'src/help_ui.cpp',
     'src/home_ui.cpp',     # Home page (/home): baked page + scoped CSS
     'src/home_render.cpp', # Home: pure value structs + renderers
-    'src/home_routes.cpp', # Home: GET /home + /fragments/home/summary over injected seams
+    'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
