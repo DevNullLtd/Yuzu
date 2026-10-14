@@ -158,6 +158,10 @@ std::string hw_style() {
   .hw-mono{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--mut)}
   .hw-lab{color:var(--mut);font-size:13px}
   .hw-grey,.inv-grey{color:var(--faint)}
+  .hw-pill{display:inline-flex;align-items:center;padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500;white-space:nowrap}
+  .hw-pill.ok{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+  .hw-pill.warn{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
+  .hw-pill.bad{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
   .hw-tag{display:inline-flex;align-items:center;margin-right:4px;padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500}
   a.hw-tag.link{cursor:pointer}
   a.hw-tag.link:hover{color:var(--ink)}
