@@ -34,6 +34,7 @@ struct NavItem {
     std::string_view icon;  ///< SVG path data for a 24x24 viewBox; empty for sub-items
     std::span<const NavItem> children = {};
     bool admin_only = false; ///< rendered `id="nav-settings-link"`; the shell script hides it from non-admins
+    bool badge = false;      ///< sub-item only: carries the pending-count badge the shell script fills
 };
 
 struct NavGroup {
