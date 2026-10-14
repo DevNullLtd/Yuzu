@@ -3910,7 +3910,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 .increment();
         }
 
-        res.set_redirect("/");
+        // Sign-in stays on Home (the signed-in panel offers "Open Dashboard"): the
+        // landing page is where every sign-in ends, password or federated.
+        res.set_redirect("/home");
     });
 
     // -- SAML 2.0 SSO endpoints ------------------------------------------------
@@ -4553,7 +4555,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             return true;
         };
-        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/"};
+        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/home"};
         res.set_redirect(target);
     });
 
