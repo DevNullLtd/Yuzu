@@ -37,6 +37,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <regex>
 #include <string>
 #include <string_view>
 
@@ -1140,6 +1141,19 @@ TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and 
     // hover's filter.
     const std::string armed = block(".btn-confirming.btn-confirming:hover:not(:disabled) {");
     CHECK_THAT(armed, ContainsSubstring("filter: none"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuCss has no unscoped .scope rule", "[static-js][yuzu-css]") {
+    // The DEX trends OS cards (dex_routes.cpp) carry a bare `.scope` element and
+    // style it themselves (`.gp-oscard .scope`, guardian_page_ui.cpp). A bare
+    // `.scope` selector in the shared sheet reaches that element on every page
+    // that loads it: the old `@media (max-width: 1440px) { .scope { width: 220px
+    // !important } }` pinned the card line to 220 px below 1440 px. The dashboard
+    // panel is `.scope-panel`; `.scope-*` classes are different tokens and stay.
+    // A selector starts after the sheet start, `{`, `}`, `,` or a comment end; `.scope` followed
+    // by `-` or a word character is another class and does not match.
+    const std::regex bare_scope(R"((^|[{},/])\s*\.scope(?![-\w]))");
+    CHECK_FALSE(std::regex_search(yuzu::server::kYuzuCss, bare_scope));
 }
 
 TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs", "[static-js][yuzu-css]") {
