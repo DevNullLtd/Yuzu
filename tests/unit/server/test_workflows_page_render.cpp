@@ -350,3 +350,44 @@ TEST_CASE("workflows render: an instruction name is shown only when the route su
     CHECK(has(html, "3. Collect logs"));
     CHECK_FALSE(has(html, kPlant));
 }
+
+TEST_CASE("schedules render: controls follow the hints and the row's owner",
+          "[ui][workflows][render]") {
+    ScheduleListView v;
+    auto off = sched("s-off", true);
+    off.enabled = false;
+    v.rows = {sched("s-on", true), off, sched("s-other", false)};
+    v.can_write = true;
+    v.can_enable = true;
+    v.can_delete = true;
+    auto html = render_schedules_page(v);
+    CHECK(has(html, "data-can-write=\"1\" data-can-enable=\"1\" data-can-delete=\"1\""));
+    CHECK(has(html, "data-schedule-id=\"s-on\" data-owner=\"1\" data-enabled=\"1\""));
+    CHECK(has(html, "data-schedule-id=\"s-off\" data-owner=\"1\" data-enabled=\"0\""));
+    CHECK(has(html, ">Disable</button>"));
+    CHECK(has(html, ">Enable</button>"));
+    // A non-owner row (and an orphan, which is never the owner) is disabled with the reason.
+    CHECK(has(html, "data-act=\"sc-toggle\" disabled title=\"Only the schedule's creator can "
+                    "change it\">Disable"));
+    CHECK(has(html, "data-act=\"sc-delete\" disabled title=\"Only the schedule's creator can "
+                    "change it\""));
+
+    // Enable needs Execution:Execute as well; Disable does not.
+    v.rows = {off, sched("s-on", true)};
+    v.can_enable = false;
+    html = render_schedules_page(v);
+    CHECK(has(html, "disabled title=\"Requires Schedule:Write and Execution:Execute\">Enable"));
+    CHECK_FALSE(has(html, "data-act=\"sc-toggle\" disabled title=\"Requires Schedule:Write\""));
+    v.can_write = false;
+    v.can_delete = false;
+    html = render_schedules_page(v);
+    CHECK(has(html, "disabled title=\"Requires Schedule:Write\">Disable"));
+    CHECK(has(html, "data-act=\"sc-delete\" disabled title=\"Requires Schedule:Delete\""));
+
+    // An empty list still carries the hints (New schedule is offered from them).
+    v.rows.clear();
+    v.can_write = true;
+    v.can_enable = true;
+    CHECK(has(render_schedules_page(v), "data-state=\"empty\""));
+    CHECK(has(render_schedules_page(v), "data-can-write=\"1\" data-can-enable=\"1\""));
+}

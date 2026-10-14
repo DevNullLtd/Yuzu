@@ -109,6 +109,10 @@ struct ScheduleRowView {
 struct ScheduleListView {
     std::vector<ScheduleRowView> rows;
     bool truncated{false}; ///< the store's list cap dropped schedules
+    // Render hints probed once per render (never a gate; each write route checks its own grant).
+    bool can_write{false};  ///< Schedule:Write (Disable, New schedule)
+    bool can_enable{false}; ///< Execution:Execute (Enable and New schedule arm a schedule)
+    bool can_delete{false}; ///< Schedule:Delete
 };
 
 /// "Once", "Every N minutes", "Daily (every 24 hours)", "Weekly (every 7 days)",

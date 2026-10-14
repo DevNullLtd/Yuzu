@@ -767,6 +767,7 @@
     var recentBody = $('#wf-recent-body');
     var newBtn = $('#wf-new');
     var delBtn = $('#wf-del');
+    var scNewBtn = $('#sc-new');
     if (!wfHost || !scHost || !stepsTitle || !stepsBody || !runsStore || !runBody ||
         !recentDet || !recentBody) return;
 
@@ -958,6 +959,7 @@
         }
         scHost.innerHTML = res.html; // server-rendered and escaped
         renderLocalTimes(scHost);
+        applyScheduleActions();
       });
     }
 
@@ -1314,6 +1316,242 @@
         if (recentDet.open && selectedId === id) loadRecent();
       }, function () { /* another dialog is open: nothing to do */ });
     }
+
+
+    // ---- schedule actions (WF-3b) ----
+    // data-can-* on the schedules list are render hints; the routes stay the gate and are
+    // owner-scoped (a non-owner request answers 200 and changes nothing), so every outcome is
+    // confirmed by re-reading the stored state rather than trusting the 200.
+    function scCan(name) {
+      var list = $('.ops-list', scHost);
+      return !!list && list.getAttribute('data-can-' + name) === '1';
+    }
+
+    function applyScheduleActions() {
+      if (!scNewBtn) return;
+      scNewBtn.hidden = !$('.ops-list', scHost);
+      setReason(scNewBtn, scCan('write') && scCan('enable'),
+        'Requires Schedule:Write and Execution:Execute');
+    }
+
+    function scheduleRow(id) {
+      var found = null;
+      $$('tr.row', scHost).forEach(function (r) {
+        if (r.getAttribute('data-schedule-id') === id) found = r;
+      });
+      return found;
+    }
+
+    function scheduleFacts(row) {
+      var cells = row.children;
+      var nm = $('.nm', row);
+      var subs = $$('.sub', row);
+      return {
+        name: nm ? nm.textContent : '',
+        instruction: subs.length ? subs[0].textContent : '',
+        target: subs.length > 1 ? subs[1].textContent : '',
+        cadence: cells.length > 1 ? cells[1].textContent : ''
+      };
+    }
+
+    function setScheduleEnabled(id, want) {
+      return YuzuDialog.request('POST', '/api/schedules/' + encodeURIComponent(id) + '/enable',
+        { json: { enabled: want } }).then(function (r) {
+        if (!r.ok) {
+          showToast(r.status === 403 ? 'You do not have permission to change this schedule.'
+            : errText(r, 'Could not change the schedule (HTTP ' + r.status + ').'), 'error');
+          return;
+        }
+        return loadSchedules().then(function () {
+          var row = scheduleRow(id);
+          var now = row ? row.getAttribute('data-enabled') === '1' : null;
+          if (now === want) showToast(want ? 'Schedule enabled' : 'Schedule disabled', 'success');
+          else showToast('The schedule was not changed. Only its creator can enable or disable it.', 'warning');
+        });
+      });
+    }
+
+    function toggleSchedule(row) {
+      if (!window.YuzuDialog) return;
+      var id = row.getAttribute('data-schedule-id') || '';
+      var want = row.getAttribute('data-enabled') !== '1';
+      if (!want) { setScheduleEnabled(id, false); return; }
+      var f = scheduleFacts(row);
+      YuzuDialog.form({
+        title: 'Enable schedule',
+        body: ['Enabling "' + f.name + '" arms it: it runs instruction ' + f.instruction +
+                 ' on ' + f.target + ', ' + f.cadence + ', and runs without anyone present.',
+               'It can still be refused when it fires (for example by approval rules).'],
+        fields: [],
+        submitLabel: 'Enable schedule',
+        submit: function () {
+          return YuzuDialog.request('POST', '/api/schedules/' + encodeURIComponent(id) + '/enable',
+            { json: { enabled: true } }).then(function (r) {
+            if (r.ok) return null;
+            if (r.status === 403) return 'You do not have permission to enable schedules.';
+            return errText(r, 'Could not enable the schedule (HTTP ' + r.status + ').');
+          });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        return loadSchedules().then(function () {
+          var again = scheduleRow(id);
+          if (again && again.getAttribute('data-enabled') === '1') showToast('Schedule enabled', 'success');
+          else showToast('The schedule was not changed. Only its creator can enable or disable it.', 'warning');
+        });
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    function deleteSchedule(row) {
+      if (!window.YuzuDialog) return;
+      var id = row.getAttribute('data-schedule-id') || '';
+      var f = scheduleFacts(row);
+      YuzuDialog.form({
+        title: 'Delete schedule',
+        body: ['Deletes "' + f.name + '". It stops running and cannot be restored.'],
+        danger: true,
+        fields: [],
+        cancelLabel: 'Go back',
+        submitLabel: 'Delete schedule',
+        submit: function () {
+          return YuzuDialog.request('DELETE', '/api/schedules/' + encodeURIComponent(id))
+            .then(function (r) {
+              if (r.ok && r.data && r.data.deleted === false)
+                return 'Not deleted: only the schedule\'s creator can delete it, or it no longer exists.';
+              if (r.ok) return null;
+              if (r.status === 403) return 'You do not have permission to delete schedules.';
+              return errText(r, 'Could not delete the schedule (HTTP ' + r.status + ').');
+            });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast('Schedule deleted', 'success');
+        loadSchedules();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    var CADENCES = [
+      { value: 'once', label: 'Once (at the next scheduler tick)' },
+      { value: 'interval', label: 'Every N minutes' },
+      { value: 'daily', label: 'Daily (every 24 hours)' },
+      { value: 'weekly', label: 'Weekly (every 7 days)' },
+      { value: 'monthly', label: 'Monthly (every 30 days)' }
+    ];
+    var YES_NO = [{ value: 'no', label: 'No' }, { value: 'yes', label: 'Yes' }];
+
+    function newSchedule() {
+      if (!window.YuzuDialog) return;
+      YuzuDialog.request('GET', '/api/instructions?enabled_only=1&limit=500').then(function (r) {
+        var defs = r.ok && r.data && Array.isArray(r.data.definitions) ? r.data.definitions : null;
+        if (!defs) {
+          showToast(r.status === 403
+            ? 'Choosing an instruction needs the InstructionDefinition:Read permission.'
+            : errText(r, 'Could not load instructions (HTTP ' + r.status + ').'), 'error');
+          return;
+        }
+        if (!defs.length) { showToast('There are no enabled instructions to schedule.', 'warning'); return; }
+        var byId = {};
+        var options = defs.map(function (d) {
+          byId[d.id] = d;
+          return { value: d.id, label: d.name + (d.plugin ? ' (' + d.plugin + ')' : '') };
+        });
+        return YuzuDialog.form({
+          title: 'New schedule',
+          body: 'Runs one instruction on a repeat, without anyone present. You confirm the details next.',
+          fields: [
+            { name: 'name', label: 'Name', type: 'text', maxlength: 200, required: true },
+            { name: 'definition_id', label: 'Instruction', type: 'select', options: options },
+            { name: 'frequency_type', label: 'Cadence', type: 'select', options: CADENCES,
+              hint: 'The scheduler applies the cadence only; it ignores time of day.' },
+            { name: 'interval_minutes', label: 'Interval minutes', type: 'text', value: '60',
+              inputmode: 'numeric', hint: 'Used by "Every N minutes" only.' },
+            { name: 'scope_expression', label: 'Targets (scope expression)', type: 'text',
+              maxlength: 2000, hint: 'Leave empty to target every device.' },
+            { name: 'all_ack', label: 'Targets are empty: run on All devices?', type: 'select',
+              options: YES_NO, hint: 'Choose Yes to acknowledge that an empty scope reaches every device.' },
+            { name: 'requires_approval', label: 'Require approval for each run', type: 'select',
+              options: YES_NO },
+            { name: 'parameters', label: 'Parameters (JSON object)', type: 'textarea', rows: 4,
+              value: '{}', maxlength: 20000 }
+          ],
+          submitLabel: 'Review',
+          validate: function (v) {
+            if (v.frequency_type === 'interval') {
+              var n = Number(v.interval_minutes);
+              if (!/^\d+$/.test(v.interval_minutes.trim()) || n < 1 || n > 525600)
+                return 'Interval minutes must be a whole number from 1 to 525600.';
+            }
+            if (!v.scope_expression.trim() && v.all_ack !== 'yes')
+              return 'No targets entered. Choose Yes under "run on All devices" to confirm every device.';
+            var p = null;
+            try { p = JSON.parse(v.parameters.trim() || '{}'); } catch (e) { p = null; }
+            if (!p || typeof p !== 'object' || Array.isArray(p)) return 'Parameters must be a JSON object.';
+            return null;
+          }
+        }).then(function (v) {
+          if (v === null) return;
+          return confirmSchedule(v, byId[v.definition_id]);
+        });
+      }).then(null, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    // The mandatory last step: a plain-language summary, including the instruction's approval
+    // mode (read from the definition), because the schedule starts enabled and fires unattended.
+    function confirmSchedule(v, def) {
+      return YuzuDialog.request('GET', '/api/v1/instructions/' + encodeURIComponent(v.definition_id))
+        .then(function (r) {
+          var d = r.ok && r.data && r.data.data ? r.data.data : null;
+          var mode = d && typeof d.approval_mode === 'string' && d.approval_mode ? d.approval_mode : 'unknown';
+          var scope = v.scope_expression.trim();
+          var cadence = v.frequency_type === 'interval'
+            ? 'every ' + v.interval_minutes.trim() + ' minutes'
+            : (v.frequency_type === 'once' ? 'once, at the next scheduler tick (about now)' : v.frequency_type);
+          var lines = [
+            'Schedule "' + v.name.trim() + '" runs ' + (def ? def.name : v.definition_id) + ' ' + cadence + '.',
+            'Targets: ' + (scope ? scope : 'ALL DEVICES') + '.',
+            'Instruction approval mode: ' + mode + '. Require approval for each run: ' +
+              (v.requires_approval === 'yes' ? 'yes' : 'no') + '.',
+            'It starts enabled and runs without anyone present. A run can still be refused when it ' +
+              'fires (for example by approval rules, or because the instruction needs one-time credentials).'
+          ];
+          return YuzuDialog.form({
+            title: 'Create this schedule?',
+            body: lines,
+            fields: [],
+            cancelLabel: 'Go back',
+            submitLabel: 'Create schedule',
+            submit: function () {
+              var body = {
+                name: v.name.trim(), definition_id: v.definition_id,
+                frequency_type: v.frequency_type, scope_expression: scope,
+                requires_approval: v.requires_approval === 'yes',
+                parameters: JSON.parse(v.parameters.trim() || '{}')
+              };
+              if (v.frequency_type === 'interval') body.interval_minutes = Number(v.interval_minutes.trim());
+              return YuzuDialog.request('POST', '/api/schedules', { json: body }).then(function (res) {
+                if (res.ok) return null;
+                if (res.status === 403) return 'You do not have permission to create schedules.';
+                return errText(res, 'Could not create the schedule (HTTP ' + res.status + ').');
+              });
+            }
+          });
+        }).then(function (done) {
+          if (done === null || done === undefined) return;
+          showToast('Schedule created', 'success');
+          loadSchedules();
+        });
+    }
+
+    if (scNewBtn) scNewBtn.addEventListener('click', function () { if (!scNewBtn.disabled) newSchedule(); });
+    scHost.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-act]') : null;
+      if (!b || !scHost.contains(b) || b.disabled) return;
+      var row = b.closest('tr.row');
+      if (!row) return;
+      var act = b.getAttribute('data-act');
+      if (act === 'sc-toggle') toggleSchedule(row);
+      else if (act === 'sc-delete') deleteSchedule(row);
+    });
 
     newBtn.addEventListener('click', function () { if (!newBtn.disabled) newWorkflow(); });
     delBtn.addEventListener('click', function () { if (!delBtn.disabled) deleteWorkflow(); });

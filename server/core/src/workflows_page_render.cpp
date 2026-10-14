@@ -323,12 +323,40 @@ std::string cadence_text(std::string_view frequency_type, int interval_minutes) 
     return std::string(frequency_type);
 }
 
+namespace {
+// Owner-scoped writes: the routes change only a schedule the caller created, and answer 200
+// when they changed nothing, so a row that is not the caller's is disabled with the reason
+// (an empty created_by is nobody's: both controls stay disabled for it).
+std::string schedule_actions(const ScheduleRowView& s, const ScheduleListView& v) {
+    const char* not_owner = " disabled title=\"Only the schedule's creator can change it\"";
+    const bool arm_ok = s.enabled ? v.can_write : (v.can_write && v.can_enable);
+    std::string toggle_attr;
+    if (!s.owner)
+        toggle_attr = not_owner;
+    else if (!arm_ok)
+        toggle_attr = s.enabled ? " disabled title=\"Requires Schedule:Write\""
+                                : " disabled title=\"Requires Schedule:Write and Execution:Execute\"";
+    std::string del_attr;
+    if (!s.owner)
+        del_attr = not_owner;
+    else if (!v.can_delete)
+        del_attr = " disabled title=\"Requires Schedule:Delete\"";
+    return std::string("<td class=\"act\"><button type=\"button\" class=\"btn btn-sm\" "
+                       "data-act=\"sc-toggle\"") +
+           toggle_attr + ">" + (s.enabled ? "Disable" : "Enable") +
+           "</button> <button type=\"button\" class=\"btn btn-danger btn-sm\" "
+           "data-act=\"sc-delete\"" + del_attr + ">Delete</button></td>";
+}
+} // namespace
+
 std::string render_schedules_page(const ScheduleListView& v) {
     std::string out;
     out.reserve(256 + v.rows.size() * 700);
     out += std::string("<div class=\"ops-list\" data-state=\"") + (v.rows.empty() ? "empty" : "ok") +
            "\" data-count=\"" + std::to_string(v.rows.size()) + "\" data-truncated=\"" +
-           (v.truncated ? "1" : "0") + "\">";
+           (v.truncated ? "1" : "0") + "\" data-can-write=\"" + (v.can_write ? "1" : "0") +
+           "\" data-can-enable=\"" + (v.can_enable ? "1" : "0") + "\" data-can-delete=\"" +
+           (v.can_delete ? "1" : "0") + "\">";
     if (v.truncated)
         out += "<div class=\"note warn\">" + esc(kSchedulesPartialNote) + "</div>";
     if (v.rows.empty()) {
@@ -336,7 +364,8 @@ std::string render_schedules_page(const ScheduleListView& v) {
         return out;
     }
     out += "<div class=\"tw\"><table class=\"sc\"><thead><tr><th>Schedule</th><th>Runs</th>"
-           "<th>Next run</th><th>Last run</th><th>Count</th><th>Enabled</th></tr></thead><tbody>";
+           "<th>Next run</th><th>Last run</th><th>Count</th><th>Enabled</th><th></th></tr></thead>"
+           "<tbody>";
     for (const auto& s : v.rows) {
         // What a non-owner may learn is the boolean `targeted` and the frequency TYPE: the
         // expression, the interval, the approval flag and the parameters are in no current
@@ -353,7 +382,8 @@ std::string render_schedules_page(const ScheduleListView& v) {
             extra += " &middot; " + plural(s.parameter_count, "parameter", "parameters");
 
         out += "<tr class=\"row\" data-schedule-id=\"" + esc(s.id) + "\" data-owner=\"" +
-               (s.owner ? "1" : "0") + "\"><td><span class=\"nm\" title=\"" + esc(s.name) + "\">" +
+               (s.owner ? "1" : "0") + "\" data-enabled=\"" + (s.enabled ? "1" : "0") +
+               "\"><td><span class=\"nm\" title=\"" + esc(s.name) + "\">" +
                esc(s.name) + "</span><span class=\"sub\"><span class=\"mono\">" +
                esc(s.definition_id) + "</span></span><span class=\"sub\">" + target + extra +
                "</span></td><td>" +
@@ -361,7 +391,8 @@ std::string render_schedules_page(const ScheduleListView& v) {
         out += time_cell(s.next_execution_at);
         out += time_cell(s.last_executed_at);
         out += "<td>" + std::to_string(s.execution_count) + "</td><td>" +
-               (s.enabled ? pill("ok", "Enabled") : pill("idle", "Disabled")) + "</td></tr>";
+               (s.enabled ? pill("ok", "Enabled") : pill("idle", "Disabled")) + "</td>" +
+               schedule_actions(s, v) + "</tr>";
     }
     out += "</tbody></table></div></div>";
     return out;

@@ -673,3 +673,23 @@ TEST_CASE("/fragments/workflows: a refused or degraded read probes nothing",
     (void)degraded.get("/fragments/workflows");
     CHECK(degraded.probes.empty());
 }
+
+TEST_CASE("/fragments/schedules?view=page: capability hints are probed once per render, never a gate",
+          "[workflow][workflows][page][schedules][authz]") {
+    Fx fx;
+    fx.schedules = ScheduleListResult{{sched("s1", "Mine")}, false};
+    auto none = fx.get("/fragments/schedules?view=page");
+    CHECK(has(none->body, "data-can-write=\"0\" data-can-enable=\"0\" data-can-delete=\"0\""));
+    CHECK(has(none->body, "data-act=\"sc-toggle\" disabled title=\"Requires Schedule:Write\""));
+    CHECK(fx.probes == std::vector<std::string>{"Schedule:Write", "Execution:Execute",
+                                                "Schedule:Delete"});
+    CHECK(fx.perm_calls == 1); // the route's own gate is unchanged
+
+    fx.probe_grants = {"Schedule:Write", "Execution:Execute"};
+    auto arm = fx.get("/fragments/schedules?view=page");
+    CHECK(has(arm->body, "data-can-write=\"1\" data-can-enable=\"1\" data-can-delete=\"0\""));
+    CHECK(has(arm->body, "data-act=\"sc-delete\" disabled title=\"Requires Schedule:Delete\""));
+    fx.probe_grants = {"Schedule:Delete"};
+    auto del = fx.get("/fragments/schedules?view=page");
+    CHECK(has(del->body, "data-can-write=\"0\" data-can-enable=\"0\" data-can-delete=\"1\""));
+}

@@ -1591,7 +1591,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     };
 
     // GET /fragments/schedules -- schedule list HTMX fragment
-    sink.Get("/fragments/schedules", [auth_fn, perm_fn, schedule_api,
+    sink.Get("/fragments/schedules", [auth_fn, perm_fn, probe_perm_fn, schedule_api,
                                       deny_service_scoped_schedule_list](
                                          const httplib::Request& req, httplib::Response& res) {
         // `view=page` (Operate Workflows page) serves the same rows through
@@ -1675,6 +1675,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             operate_pages::ScheduleListView view;
             view.truncated = result->truncated;
+            // Render hints, probed once per render and never a gate (an unwired probe offers
+            // no control). Each refused grant writes one auth.permission_required audit row.
+            auto probe = [&](const char* type, const char* op) {
+                return probe_perm_fn && probe_perm_fn(req, type, op);
+            };
+            view.can_write = probe("Schedule", "Write");
+            view.can_enable = probe("Execution", "Execute");
+            view.can_delete = probe("Schedule", "Delete");
             view.rows.reserve(scheds.size());
             for (const auto& sc : scheds) {
                 operate_pages::ScheduleRowView row;

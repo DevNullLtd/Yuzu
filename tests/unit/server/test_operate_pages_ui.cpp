@@ -396,6 +396,7 @@ TEST_CASE("operate pages: Workflows copy is exact and the action hooks are in th
     // the probed hints; Run now is a per-row button rendered with the definitions fragment.
     CHECK(has(body, "id=\"wf-new\" hidden>New workflow</button>"));
     CHECK(has(body, "id=\"wf-del\" hidden>Delete</button>"));
+    CHECK(has(body, "id=\"sc-new\" hidden>New schedule</button>"));
     CHECK_FALSE(has(body, "Run now"));
     // The dialog module loads before the controller.
     const auto dlg = body.find("/static/yuzu-dialog.js");
@@ -441,4 +442,27 @@ TEST_CASE("operate pages: the Workflows action controller keeps its guards",
     // Every control is a render hint: the server routes stay the gate.
     CHECK(has(js, "'data-can-' + name"));
     CHECK_FALSE(has(js, "setInterval("));
+}
+
+TEST_CASE("operate pages: the schedule action controller keeps its guards",
+          "[ui][operate][pages]") {
+    const auto& js = yuzu::server::kYuzuOperateJs;
+    // Enable arms a schedule that runs unattended: a confirm that says so, Disable is one click.
+    CHECK(has(js, "if (!want) { setScheduleEnabled(id, false); return; }"));
+    CHECK(has(js, "and runs without anyone present."));
+    // The routes answer 200 when the owner scope changed nothing: the stored state is re-read.
+    CHECK(has(js, "row.getAttribute('data-enabled') === '1'"));
+    CHECK(has(js, "The schedule was not changed. Only its creator can enable or disable it."));
+    CHECK(has(js, "r.data.deleted === false"));
+    // New schedule: empty targets need the explicit All devices acknowledgement, the instruction
+    // list needs its own grant, and a mandatory summary (with approval mode) comes last.
+    CHECK(has(js, "if (!v.scope_expression.trim() && v.all_ack !== 'yes')"));
+    CHECK(has(js, "'/api/instructions?enabled_only=1&limit=500'"));
+    CHECK(has(js, "Choosing an instruction needs the InstructionDefinition:Read permission."));
+    CHECK(has(js, "'Instruction approval mode: ' + mode"));
+    CHECK(has(js, "at the next scheduler tick (about now)"));
+    CHECK(has(js, "can still be refused when it '"));
+    CHECK(has(js, "one-time credentials"));
+    CHECK(has(js, "title: 'Create this schedule?'"));
+    CHECK(has(js, "'/api/schedules', { json: body }"));
 }

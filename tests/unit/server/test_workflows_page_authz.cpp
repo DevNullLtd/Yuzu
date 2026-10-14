@@ -15,6 +15,8 @@
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "schedule_api_local.hpp"
+#include "schedule_engine.hpp"
 #include "tag_store.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_route_sink.hpp"
@@ -64,14 +66,17 @@ struct Rig {
     WorkflowEngine engine;
     TagStore tags;
     InstructionStore instr;
+    ScheduleEngine sched_engine;
     pg::PgPool audit_pool;
     AuditStore audit_store;
     std::unique_ptr<AuthRoutes> auth;
     std::shared_ptr<WorkflowApi> api;
+    std::shared_ptr<ScheduleApi> sched_api;
     std::string dsn, wf;
 
     explicit Rig(const std::string& dsn_in)
         : rig{dsn_in}, engine{rig.pool}, tags{rig.pool}, instr{rig.pool},
+          sched_engine{rig.pool},
           audit_pool{{.conninfo = dsn_in, .size = 2}}, audit_store{audit_pool}, dsn{dsn_in} {
         REQUIRE(engine.is_open());
         REQUIRE(tags.is_open());
@@ -98,7 +103,22 @@ struct Rig {
             REQUIRE(rig.rbac.set_permission({"WorkflowEditorPage", "Workflow", op, "allow"})
                         .has_value());
         REQUIRE(rig.rbac.assign_role({"user", "olly", "WorkflowEditorPage"}).has_value());
-        for (const char* u : {"gary", "dave", "erin", "ivy", "olly"})
+        // sam: full schedule operator (Read/Write/Delete + Execution:Execute).
+        // ron: Schedule:Read only; Workflow:Read for the page itself.
+        REQUIRE(rig.rbac.create_role({"ScheduleOperatorPage", "", false, 0}).has_value());
+        for (const auto& pr : {std::pair<const char*, const char*>{"Workflow", "Read"},
+                               {"Schedule", "Read"}, {"Schedule", "Write"}, {"Schedule", "Delete"},
+                               {"Execution", "Execute"}})
+            REQUIRE(rig.rbac.set_permission({"ScheduleOperatorPage", pr.first, pr.second, "allow"})
+                        .has_value());
+        REQUIRE(rig.rbac.assign_role({"user", "sam", "ScheduleOperatorPage"}).has_value());
+        REQUIRE(rig.rbac.create_role({"ScheduleReaderPage", "", false, 0}).has_value());
+        for (const auto& pr : {std::pair<const char*, const char*>{"Workflow", "Read"},
+                               {"Schedule", "Read"}})
+            REQUIRE(rig.rbac.set_permission({"ScheduleReaderPage", pr.first, pr.second, "allow"})
+                        .has_value());
+        REQUIRE(rig.rbac.assign_role({"user", "ron", "ScheduleReaderPage"}).has_value());
+        for (const char* u : {"gary", "dave", "erin", "ivy", "olly", "sam", "ron"})
             REQUIRE(rig.auth_mgr.upsert_user(u, "correct-horse-battery-staple", auth::Role::user));
         REQUIRE(tags.set_tag("bob-agent", "service", "printers").has_value());
         REQUIRE(tags.set_tag("alice-agent", "service", "scanners").has_value());
@@ -106,6 +126,8 @@ struct Rig {
                                             &audit_store, &rig.mgmt, &tags, nullptr, rig.oidc_mu,
                                             rig.oidc_provider);
         api = make_local_workflow_api(engine);
+        REQUIRE(sched_engine.is_open());
+        sched_api = make_local_schedule_api(sched_engine);
         wf = *engine.create_workflow(wf_yaml("page-wf"));
         run("r-bob", 100, R"(["bob-agent"])");
         run("r-mixed", 200, R"(["bob-agent","alice-agent-secret"])");
@@ -152,6 +174,10 @@ struct Rig {
                 return {};
             return {true, result->visible_for_query()};
         };
+        d.auth_fn = [this](const httplib::Request& req,
+                           httplib::Response& res) -> std::optional<auth::Session> {
+            return auth->require_auth(req, res);
+        };
         d.perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                            const std::string& t, const std::string& o) {
             return auth->require_permission(req, res, t, o);
@@ -176,6 +202,7 @@ struct Rig {
         };
         d.instruction_store = &instr;
         d.workflow_api = api;
+        d.schedule_api = sched_api;
         routes.register_routes(sink, std::move(d));
         std::unordered_map<std::string, std::string> hdrs;
         if (!token.empty())
@@ -363,4 +390,54 @@ TEST_CASE("workflows page real gate: capability hints follow the grants and name
     auto blind = r.get(r.mint("erin"), "/fragments/workflow-runs/r-named");
     CHECK(has(blind->body, *iid));
     CHECK_FALSE(has(blind->body, "Restart the spooler"));
+}
+
+TEST_CASE("workflows page real gate: schedule controls follow the grants and the schedule's creator",
+          "[pg][workflow][workflows][page][authz][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, wf_page_tpl);
+    Rig r{db.dsn()};
+    InstructionDefinition def;
+    def.name = "Restart the spooler";
+    def.type = "action";
+    def.plugin = "services";
+    def.action = "restart";
+    def.version = "1.0";
+    auto iid = r.instr.create_definition(def);
+    REQUIRE(iid.has_value());
+    auto make = [&](const std::string& name, const std::string& owner) {
+        InstructionSchedule s;
+        s.name = name;
+        s.definition_id = *iid;
+        s.frequency_type = "daily";
+        s.created_by = owner;
+        auto id = r.sched_engine.create_schedule(s);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    const auto mine = make("sam-sched", "sam");
+    const auto theirs = make("other-sched", "someone-else");
+
+    // sam holds every grant: his own row is enabled, the other creator's is disabled with the
+    // reason, and the page-level hints are all 1.
+    auto sam = r.get(r.mint("sam"), "/fragments/schedules?view=page");
+    CHECK(sam->status == 200);
+    CHECK(has(sam->body, "data-can-write=\"1\" data-can-enable=\"1\" data-can-delete=\"1\""));
+    const auto mine_at = sam->body.find("data-schedule-id=\"" + mine + "\"");
+    const auto theirs_at = sam->body.find("data-schedule-id=\"" + theirs + "\"");
+    REQUIRE(mine_at != std::string::npos);
+    REQUIRE(theirs_at != std::string::npos);
+    const auto first = std::min(mine_at, theirs_at);
+    const auto second = std::max(mine_at, theirs_at);
+    const auto row1 = sam->body.substr(first, second - first);
+    const auto row2 = sam->body.substr(second);
+    const auto& my_row = mine_at < theirs_at ? row1 : row2;
+    const auto& their_row = mine_at < theirs_at ? row2 : row1;
+    CHECK_FALSE(has(my_row, " disabled"));
+    CHECK(has(their_row, "data-act=\"sc-toggle\" disabled title=\"Only the schedule's creator "
+                         "can change it\""));
+    CHECK(has(their_row, "data-act=\"sc-delete\" disabled"));
+
+    // ron may read schedules and nothing else: every hint is 0.
+    auto ron = r.get(r.mint("ron"), "/fragments/schedules?view=page");
+    CHECK(has(ron->body, "data-can-write=\"0\" data-can-enable=\"0\" data-can-delete=\"0\""));
 }

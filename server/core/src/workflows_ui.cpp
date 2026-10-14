@@ -9,8 +9,9 @@
 // run (`/fragments/workflow-runs/{id}`) and its ten most recent runs on demand.
 // Workflow actions (WF-3a): Run now, New workflow and Delete workflow go through the shared
 // dialog module (/static/yuzu-dialog.js). The controls are offered from data-can-* hints the
-// definitions fragment probes once per render; the write routes stay the gate. The schedule
-// controls are not on this page yet (the Instructions page's Schedules tab keeps its Delete).
+// definitions fragment probes once per render; the write routes stay the gate. Schedule
+// actions (WF-3b): Enable, Disable, Delete and New schedule use the same module; the owner-scoped
+// routes change only the caller's own schedules, so other rows' controls are disabled.
 //
 // Product UI: HTMX loaded only for the shell's Sign out (`hx-post`), CSP-clean (no hx-on,
 // no inline handlers, htmx eval disabled), tokens from /static/yuzu.css, page-local CSS in
@@ -50,7 +51,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 <div id="wf-runs-store" hidden></div>
 </section>
 <section class="panel ops-listbox ops-sc">
-<div class="hd"><h2>Schedules</h2></div>
+<div class="hd"><h2>Schedules</h2><button type="button" class="btn btn-primary btn-sm end" id="sc-new" hidden>New schedule</button></div>
 <div id="sc-list"><div class="empty-state">Loading…</div></div>
 </section>
 </div>
