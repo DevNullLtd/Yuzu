@@ -1,4 +1,4 @@
-# M.6 (pkg_inventory Linux store_packages and managers) Resource Ledger (governance Gate 1)
+# pkg_inventory Linux store_packages and managers: Resource Ledger (governance Gate 1)
 
 The production-code ledger for the Linux `pkg_inventory` legs. Files `agents/plugins/pkg_inventory/src/pkg_inventory_linux_parsers.hpp`, `pkg_inventory_legs.hpp`, `pkg_inventory_parsers.hpp`, `pkg_inventory_linux.cpp`, `pkg_inventory_plugin.cpp`, `agents/core/src/sync_source_installed_software.{hpp,cpp}`, and the server vocabulary headers (`software_catalog_rules.hpp`, `cpe_normalize.hpp`, `software_inventory_store.hpp`).
 
