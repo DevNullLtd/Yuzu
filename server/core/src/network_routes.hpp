@@ -18,6 +18,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "discovered_devices_model.hpp" // DiscoveredDevicesReadFn: the discovery read seam
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "network_perf_model.hpp"
 
@@ -81,22 +82,33 @@ public:
     using NetworkApiPtr = std::shared_ptr<const NetworkApi>;
 
     /// Register the /network routes. The page shell is auth-only static chrome;
-    /// the data-bearing fragments gate on GuaranteedState:Read.
+    /// the data-bearing fragments gate on GuaranteedState:Read. `discovered`
+    /// backs the discovered-devices twin (`GET
+    /// /api/v1/network/discovered-devices` and `GET
+    /// /fragments/network/discovered`, both `Infrastructure:Read`); empty, both
+    /// answer 503 "unavailable" rather than an empty list.
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                         NetworkApiPtr api = nullptr);
+                         NetworkApiPtr api = nullptr, DiscoveredDevicesReadFn discovered = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam
     /// so the handlers are unit-testable in-process via TestRouteSink (no
     /// httplib acceptor; the #438 TSan trap). The httplib::Server& overload
     /// wraps + delegates.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                         NetworkApiPtr api = nullptr);
+                         NetworkApiPtr api = nullptr, DiscoveredDevicesReadFn discovered = {});
 
 private:
+    /// Fleet-wide identity-linked read: a service-scoped token is refused with
+    /// a 403 and an audited `network.discovered.view|denied` row. Returns true
+    /// when the response was written (caller stops); false lets it proceed.
+    bool deny_service_scoped_discovered_(const httplib::Request& req, httplib::Response& res,
+                                         const char* surface, const auth::Session& session);
+
     AuthFn auth_fn_;
     PermFn perm_fn_;
     AuditFn audit_fn_;
     NetworkApiPtr api_;
+    DiscoveredDevicesReadFn discovered_;
 };
 
 } // namespace yuzu::server

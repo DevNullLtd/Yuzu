@@ -97,7 +97,8 @@ constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_c
                                          "get_dex_group_app_perf",   "get_dex_tag_app_perf",
                                          "compare_app_perf_versions",
                                          "get_dex_device_app_perf"};
-constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices"};
+constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices",
+                                        "list_discovered_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
                                            "get_bundle_result"};
 constexpr std::string_view kRemediation[] = {"quarantine_device"};

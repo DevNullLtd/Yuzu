@@ -8,6 +8,7 @@
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
 #include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
 #include "mcp_jsonrpc.hpp"
+#include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
@@ -2055,6 +2056,30 @@ static const ToolDef kTools[] = {
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"platform":{"type":"string"},"cohort":{"type":"string"},"rtt_ms":{"type":"number"},"retrans_pct":{"type":"number"},"throughput_bps":{"type":"number"},"net_degraded":{"type":"boolean"},"under_pressure":{"type":"boolean"},"app_unstable":{"type":"boolean"},"fleet_pctile":{"type":"integer"}},"required":["agent_id","platform","cohort","net_degraded","under_pressure","app_unstable"]}}},"required":["devices"]})j"},
+
+    // Network discovery read twin (Estate E-2). Same shared builders as
+    // GET /api/v1/network/discovered-devices and /fragments/network/discovered
+    // (discovered_devices_model.hpp), so the three cannot drift.
+    {"list_discovered_devices",
+     "List hosts found by network discovery scans, newest last-seen first, with the total and "
+     "distinct-subnet counts over the filter and a truncated flag (at most 500 rows). Rows are "
+     "address, MAC, hostname, subnet, the agent that found them and first/last seen; hostnames "
+     "and MACs are agent-reported free text. A host is not necessarily unmanaged: discovery does "
+     "not yet match hosts to enrolled agents, so no managed flag is returned. Each row names a "
+     "host fleet-wide, so every call is audit-logged (network.discovered.view); a service-scoped "
+     "API token is denied. Mirrors GET /api/v1/network/discovered-devices. Requires "
+     "Infrastructure:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("subnet":{"type":"string","maxLength":64,"description":"Only hosts found on this exact subnet string"},)j"
+     R"j("limit":{"type":"integer","minimum":1,"maximum":500,"default":500})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("id":{"type":"integer"},"ip_address":{"type":"string"},"mac_address":{"type":"string"},"hostname":{"type":"string"},)j"
+     R"j("subnet":{"type":"string"},"discovered_by":{"type":"string"},"discovered_at":{"type":"integer"},"last_seen":{"type":"integer"})j"
+     R"j(},"required":["id","ip_address","last_seen"]}},)j"
+     R"j("summary":{"type":"object","properties":{"total":{"type":"integer"},"subnets":{"type":"integer"}},"required":["total","subnets"]},)j"
+     R"j("truncated":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present and false only when the access-audit row failed to persist"})j"
+     R"j(},"required":["data","summary","truncated"]})j"},
 
     // Phase 2 write tool
     {"execute_instruction",
@@ -4279,6 +4304,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // REST twins, and `denied` (not `confined`) for the same owner-scope reason.
     {"list_deployments", {"SoftwareDeployment", "Read"}},
     {"get_deployment", {"SoftwareDeployment", "Read"}},
+    // Network discovery read twin: 2-element (default `denied`) form, like the
+    // two rows above — fleet-wide host list with no per-agent confinement
+    // mechanism, so a service-scoped token is denied at the C8 chokepoint.
+    {"list_discovered_devices", {"Infrastructure", "Read"}},
 
     // #2146 Batch B3 — fleet visualization + execution/fleet statistics read
     // twins. Default (2-element) form: none of these routes reason about
@@ -5011,6 +5040,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_deployment_preview", {ToolEffect::ReadOnly, true, "Get deployment preview"}},
     {"list_deployments", {ToolEffect::ReadOnly, true, "List deployments"}},
     {"get_deployment", {ToolEffect::ReadOnly, true, "Get deployment"}},
+    {"list_discovered_devices", {ToolEffect::ReadOnly, true, "List discovered devices"}},
     // #2146 Batch B3 — plain reads, repeat calls return the same shape for
     // unchanged server state (get_fleet_topology's fresh=true param busts a
     // shared cache but is still safe/repeatable -- it never mutates
@@ -21491,6 +21521,71 @@ McpServer::HandlerFn McpServer::build_handler(
                 nlohmann::json payload = {
                     {"data", deployment_detail_json(read.deployment, read.devices,
                                                     read.device_limit)}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // Network discovery read twin (Estate E-2). Mirrors GET
+            // /api/v1/network/discovered-devices: the SAME read seam and
+            // discovered_devices_json builder, so the JSON cannot drift. The
+            // C8 gate above default-denies a service-scoped caller for this
+            // tool's 2-element kToolSecurityRows entry.
+            if (tool_name == "list_discovered_devices") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!discovered_devices_reader_) {
+                    // Wired once at construction: permanent, so no retry hint.
+                    res.set_content(a4_error(kInternalError, "discovery store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                // Strict: a present non-string `subnet` must be refused, not read
+                // as "" (which the SQL treats as every subnet -- a dropped filter).
+                const auto subnet_opt = param_string_strict(args, "subnet");
+                if (!subnet_opt) {
+                    res.set_content(a4_error(kInvalidParams, "invalid subnet"),
+                                    "application/json");
+                    return;
+                }
+                const auto& subnet = *subnet_opt;
+                std::optional<int> limit = kDiscoveredDevicesMaxLimit;
+                if (args.contains("limit")) {
+                    limit = args["limit"].is_number_integer()
+                                ? clamp_discovered_limit(args["limit"].get<long long>())
+                                : std::nullopt;
+                }
+                if (!limit || subnet.size() > kDiscoveredSubnetMaxLen) {
+                    res.set_content(a4_error(kInvalidParams, limit ? "invalid subnet"
+                                                                   : "invalid limit"),
+                                    "application/json");
+                    return;
+                }
+                auto page = discovered_devices_reader_(subnet, *limit);
+                if (!page) {
+                    res.set_content(a4_error(kInternalError, "discovery read degraded",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // Behavioural-PII access audit, same verb as the REST twin.
+                // MCP convention is set-and-proceed: a failed persist is
+                // reported as audit_persisted:false, not a refusal.
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "network.discovered.view", "success", "Infrastructure", "",
+                    "fleet-wide discovered-devices list via MCP list_discovered_devices");
+                nlohmann::json payload = discovered_devices_json(*page);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),

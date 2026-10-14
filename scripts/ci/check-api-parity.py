@@ -213,7 +213,13 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # count unchanged). The new GET /fragments/auto/nvd status card is ledgered "exception"
 # (grandfathered NVD surface, no get_nvd_status MCP): +1. Merged on top of the 201 above, the
 # checker reported 202 on the merged tree.
-BASELINE_UNTWINNED = 202
+#
+# Network discovery read twin (Estate E-2): the unbounded legacy GET /api/discovery/results
+# row flips "planned:#2146" -> "twinned" (GET /api/v1/network/discovered-devices + MCP
+# list_discovered_devices); the new GET /fragments/network/discovered row is born "twinned"
+# (count unchanged): -1 on its own. Combined with the +1 above the checker reported 201 on the
+# merged tree, not a hand-added delta.
+BASELINE_UNTWINNED = 201
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
