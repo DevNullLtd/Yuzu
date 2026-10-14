@@ -1758,8 +1758,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // does not imply. Reads one past the 100 shown so truncation is known, not guessed.
     // list_workflows loads every row's yaml_source and steps (one query per row under one
     // lease), so the page limit stays at 101 and the YAML is never rendered.
-    sink.Get("/fragments/workflows", [perm_fn, workflow_api](const httplib::Request& req,
-                                                             httplib::Response& res) {
+    sink.Get("/fragments/workflows", [perm_fn, probe_perm_fn, instruction_store, workflow_api](
+                                         const httplib::Request& req, httplib::Response& res) {
         // htmx drops 4xx/5xx bodies: every refusal and degrade is a 200 note, and nothing from
         // the gate's own body (reason, role or permission names) reaches the fragment.
         auto note = [&res](const char* attr, std::string_view text) {
@@ -1787,6 +1787,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const auto shown = std::min<std::size_t>(result->size(),
                                                  static_cast<std::size_t>(view.page_cap));
         view.truncated = result->size() > shown;
+        // Render hints, probed once per render and never a gate (every write route keeps its
+        // own perm_fn). An unwired probe cannot decide, so no control is offered. The probe
+        // writes one auth.permission_required audit row per refused grant (disclosed).
+        auto probe = [&](const char* type, const char* op) {
+            return probe_perm_fn && probe_perm_fn(req, type, op);
+        };
+        view.can_run = probe("Workflow", "Execute");
+        view.can_write = probe("Workflow", "Write");
+        view.can_delete = probe("Workflow", "Delete");
+        // Instruction names are a second securable: Workflow:Read does not imply
+        // InstructionDefinition:Read, so the lookup runs only behind its own probe.
+        const bool may_name = shown > 0 && probe("InstructionDefinition", "Read");
+        operate_pages::NameLookupMemo names(
+            may_name ? operate_pages::instruction_name_resolver(instruction_store)
+                     : operate_pages::NameLookupMemo::Resolver{});
         view.rows.reserve(shown);
         for (std::size_t i = 0; i < shown; ++i) {
             const auto& w = (*result)[i];
@@ -1799,6 +1814,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 operate_pages::WorkflowStepView sv;
                 sv.index = st.index;
                 sv.instruction_id = st.instruction_id;
+                if (may_name) {
+                    // label() answers the id itself when unresolved: that is no name.
+                    auto n = names.label(st.instruction_id);
+                    if (n != st.instruction_id)
+                        sv.instruction_name = std::move(n);
+                }
                 sv.label = st.label;
                 sv.condition = st.condition;
                 sv.foreach_source = st.foreach_source;
@@ -1893,8 +1914,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // route is no existence oracle. Step titles come from the workflow's own definition (label,
     // else the step's instruction id); no instruction-name lookup, as the definitions fragment.
     sink.Get(R"(/fragments/workflow-runs/([^/]+))",
-             [fleet_read_fn, audit_fn, workflow_api, run_note](const httplib::Request& req,
-                                                               httplib::Response& res) {
+             [fleet_read_fn, audit_fn, probe_perm_fn, instruction_store, workflow_api,
+              run_note](const httplib::Request& req, httplib::Response& res) {
         if (!fleet_read_fn) {
             run_note(res, "degraded", operate_pages::kRunsDegradedNote);
             return;
@@ -1961,12 +1982,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 if (!st.label.empty())
                     labels[st.index] = st.label;
         }
+        // The instruction's name is a second securable (InstructionDefinition:Read): looked up
+        // only behind its own probe, else the instruction id stays the fallback title.
+        const bool may_name = !exec.step_results.empty() && probe_perm_fn &&
+                              probe_perm_fn(req, "InstructionDefinition", "Read");
+        operate_pages::NameLookupMemo names(
+            may_name ? operate_pages::instruction_name_resolver(instruction_store)
+                     : operate_pages::NameLookupMemo::Resolver{});
         view.steps.reserve(exec.step_results.size());
         for (const auto& sr : exec.step_results) {
             operate_pages::RunStepView sv;
             sv.index = sr.step_index;
             auto it = labels.find(sr.step_index);
-            sv.title = it != labels.end() ? it->second : sr.instruction_id;
+            sv.title = it != labels.end() ? it->second : names.label(sr.instruction_id);
             sv.status = sr.status;
             sv.started_at = sr.started_at;
             sv.completed_at = sr.completed_at;

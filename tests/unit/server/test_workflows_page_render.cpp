@@ -305,3 +305,48 @@ TEST_CASE("runs render: step detail comes from known shapes only",
     CHECK(c.find("Dispatched (run-wide)") != std::string::npos);
     CHECK(c.find("Devices in your scope") != std::string::npos);
 }
+
+TEST_CASE("workflows render: the action hints and Run now reflect the probed capabilities",
+          "[ui][workflows][render]") {
+    WorkflowListView v;
+    v.rows.push_back(wf("w-1", "Patch"));
+    auto off = render_workflows_list(v);
+    CHECK(has(off, "data-can-run=\"0\" data-can-write=\"0\" data-can-delete=\"0\""));
+    CHECK(has(off, "data-act=\"run\" disabled title=\"Requires Workflow:Execute\""));
+    v.can_run = true;
+    v.can_write = true;
+    v.can_delete = true;
+    auto on = render_workflows_list(v);
+    CHECK(has(on, "data-can-run=\"1\" data-can-write=\"1\" data-can-delete=\"1\""));
+    CHECK_FALSE(has(on, "data-act=\"run\" disabled"));
+    CHECK(has(on, ">Run now</button>"));
+    // The hints also ride on an empty list, so New workflow can be offered there.
+    WorkflowListView e;
+    e.can_write = true;
+    CHECK(has(render_workflows_list(e), "data-can-write=\"1\""));
+}
+
+TEST_CASE("workflows render: an instruction name is shown only when the route supplied one",
+          "[ui][workflows][render]") {
+    WorkflowListView v;
+    auto w = wf("w-1", "Patch");
+    auto s = step(0, "inst-9");
+    w.steps.push_back(s);
+    s.index = 1;
+    s.label = "Stop the spooler";
+    s.instruction_name = std::string("Restart ") + kPlant;
+    w.steps.push_back(s);
+    s.index = 2;
+    s.label = "";
+    s.instruction_name = "Collect logs";
+    w.steps.push_back(s);
+    v.rows.push_back(w);
+    const auto html = render_workflows_list(v);
+    // No name: the id is the title. Label plus name: the label titles, the name leads the
+    // subtitle (escaped). Name without a label: the name titles.
+    CHECK(has(html, "1. inst-9"));
+    CHECK(has(html, "2. Stop the spooler"));
+    CHECK(has(html, "Restart &lt;img src=x onerror=1&gt; &middot; <span class=\"mono\">inst-9"));
+    CHECK(has(html, "3. Collect logs"));
+    CHECK_FALSE(has(html, kPlant));
+}

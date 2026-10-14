@@ -38,7 +38,10 @@ std::string time_cell(int64_t secs, std::string_view data_c = {}) {
 }
 
 std::string step_subtitle(const WorkflowStepView& s) {
-    std::string t = "<span class=\"mono\">" + esc(s.instruction_id) + "</span>";
+    std::string t;
+    if (!s.label.empty() && !s.instruction_name.empty())
+        t += esc(s.instruction_name) + " &middot; ";
+    t += "<span class=\"mono\">" + esc(s.instruction_id) + "</span>";
     if (!s.condition.empty())
         t += " &middot; if " + esc(truncate_utf8(s.condition, kConditionChars));
     if (s.retry_count > 0)
@@ -57,10 +60,12 @@ void append_steps(std::string& out, const WorkflowRowView& w) {
     }
     out += "<ol class=\"ops-steps\">";
     for (const auto& s : w.steps) {
-        // The label is the author's own text; the instruction id is the fallback. No
-        // instruction-name lookup: that read needs InstructionDefinition:Read, which this
-        // page's Workflow:Read gate does not imply.
-        const std::string& title = s.label.empty() ? s.instruction_id : s.label;
+        // The label is the author's own text; the instruction's name (only when the route
+        // proved InstructionDefinition:Read, which Workflow:Read does not imply) and then its
+        // id are the fallbacks.
+        const std::string& title = !s.label.empty()            ? s.label
+                                   : !s.instruction_name.empty() ? s.instruction_name
+                                                                 : s.instruction_id;
         const StepPolicy p = step_policy(s.on_failure);
         out += "<li><div class=\"st\"><b class=\"nm\" title=\"" + esc(title) + "\">" +
                std::to_string(s.index + 1) + ". " + esc(title) + "</b><span class=\"sub\">" +
@@ -86,14 +91,16 @@ std::string render_workflows_list(const WorkflowListView& v) {
     out.reserve(256 + v.rows.size() * 900);
     out += std::string("<div class=\"ops-list\" data-state=\"") + (v.rows.empty() ? "empty" : "ok") +
            "\" data-count=\"" + std::to_string(v.rows.size()) + "\" data-truncated=\"" +
-           (v.truncated ? "1" : "0") + "\">";
+           (v.truncated ? "1" : "0") + "\" data-can-run=\"" + (v.can_run ? "1" : "0") +
+           "\" data-can-write=\"" + (v.can_write ? "1" : "0") + "\" data-can-delete=\"" +
+           (v.can_delete ? "1" : "0") + "\">";
     if (v.rows.empty()) {
         out += "<div class=\"empty-state\">" + esc(kWorkflowsEmptyNote) + "<br>" +
                esc(kWorkflowsEmptyHint) + "</div></div>";
         return out;
     }
     out += "<div class=\"tw\"><table class=\"wf\"><thead><tr><th>Workflow</th><th>Steps</th>"
-           "<th>Last run</th><th>Result</th></tr></thead><tbody>";
+           "<th>Last run</th><th>Result</th><th></th></tr></thead><tbody>";
     for (const auto& w : v.rows) {
         out += "<tr class=\"row\" tabindex=\"0\" aria-selected=\"false\" data-workflow-id=\"" +
                esc(w.id) + "\" data-workflow-name=\"" + esc(w.name) + "\"><td><span class=\"nm\" "
@@ -103,7 +110,10 @@ std::string render_workflows_list(const WorkflowListView& v) {
                    esc(truncate_utf8(w.description, kDescriptionChars)) + "</span>";
         // Filled from the runs fragment by the controller (data-c cells are swapped in place).
         out += "</td><td>" + std::to_string(w.steps.size()) +
-               "</td><td class=\"tm\" data-c=\"started\">-</td><td data-c=\"status\">-</td></tr>";
+               "</td><td class=\"tm\" data-c=\"started\">-</td><td data-c=\"status\">-</td>"
+               "<td class=\"act\"><button type=\"button\" class=\"btn btn-sm\" data-act=\"run\"" +
+               std::string(v.can_run ? "" : " disabled title=\"Requires Workflow:Execute\"") +
+               ">Run now</button></td></tr>";
     }
     out += "</tbody></table></div><div class=\"ops-steps-store\" hidden>";
     for (const auto& w : v.rows)

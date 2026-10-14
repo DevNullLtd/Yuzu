@@ -765,6 +765,8 @@
     var runBody = $('#wf-run-body');
     var recentDet = $('#wf-recent-det');
     var recentBody = $('#wf-recent-body');
+    var newBtn = $('#wf-new');
+    var delBtn = $('#wf-del');
     if (!wfHost || !scHost || !stepsTitle || !stepsBody || !runsStore || !runBody ||
         !recentDet || !recentBody) return;
 
@@ -777,6 +779,7 @@
     var selectedId = '';
     var runsDone = false;  // a runs answer (list or note) has arrived
     var panelFor = '';     // the workflow whose Latest run panel has been requested
+    var polling = {};      // workflow id -> true while its run is watched (Run is disabled)
 
     function stepsEmpty(text) {
       stepsTitle.textContent = 'Steps';
@@ -915,6 +918,7 @@
       if (!id) return;
       dseq++; // a detail still in flight belongs to the workflow just left
       showSteps(id);
+      applyActions();
       writeQs(function (p) { p.set('wf', id); });
       panelFor = '';
       showLatest();
@@ -931,6 +935,7 @@
           setNote(wfHost, failureCopy(res.status, 'workflows'));
           selectedId = '';
           stepsEmpty('Select a workflow to see its steps.');
+          applyActions();
           return;
         }
         wfHost.innerHTML = res.html; // server-rendered and escaped
@@ -939,6 +944,7 @@
         if (selectedId && !showSteps(selectedId))
           stepsEmpty('That workflow is no longer listed.');
         applyLatest();
+        applyActions();
       });
     }
 
@@ -955,12 +961,376 @@
       });
     }
 
+    // ---- actions (WF-3a) ----
+    // The data-can-* hints on the definitions list decide which controls are offered. They
+    // are render hints from a probe, never a gate: every write route checks its own grant.
+    var RUN_POLL_MS = 5000;
+    var RUN_POLL_MAX_MS = 600000;   // stop watching a run after 10 minutes
+    var RUN_POST_TIMEOUT_MS = 8000; // the server holds the request for the whole run
+    var AGENT_SHOW_MAX = 200;       // devices drawn in the checklist
+    var AGENT_SELECT_MAX = 500;     // devices one run may name
+    var AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+    var TERMINAL = { completed: 1, failed: 1, cancelled: 1 };
+
+    function can(name) {
+      var list = $('.ops-list', wfHost);
+      return !!list && list.getAttribute('data-can-' + name) === '1';
+    }
+
+    function setReason(btn, allowed, reason) {
+      btn.disabled = !allowed;
+      if (allowed) btn.removeAttribute('title');
+      else btn.setAttribute('title', reason);
+    }
+
+    // Re-applied after every definitions render and after a selection or a poll changes.
+    function applyActions() {
+      var listed = !!$('.ops-list', wfHost);
+      newBtn.hidden = !listed;
+      setReason(newBtn, can('write'), 'Requires Workflow:Write');
+      delBtn.hidden = !(listed && selectedId);
+      setReason(delBtn, can('delete'), 'Requires Workflow:Delete');
+      $$('tr.row', wfHost).forEach(function (row) {
+        var b = $('button[data-act="run"]', row);
+        if (!b) return;
+        var watched = !!polling[row.getAttribute('data-workflow-id')];
+        // Disabled while its run is watched: the server accepts duplicate executes, and the
+        // earlier one may still be running although the request timed out.
+        setReason(b, can('run') && !watched, watched
+          ? 'A run of this workflow may still be in progress.' : 'Requires Workflow:Execute');
+      });
+    }
+
+    function errText(r, fallback) {
+      if (r.status === 401) return 'Your session has expired. Sign in again.';
+      return r.message || fallback;
+    }
+
+    function newWorkflow() {
+      if (!window.YuzuDialog) return;
+      YuzuDialog.form({
+        title: 'New workflow',
+        body: 'Paste the workflow definition as YAML. Nothing runs until you use Run now.',
+        fields: [{ name: 'yaml', label: 'Workflow YAML', type: 'textarea', rows: 14,
+                   maxlength: 200000, required: true,
+                   hint: 'Steps name instructions by id, in the order they run.' }],
+        submitLabel: 'Create workflow',
+        submit: function (v) {
+          return YuzuDialog.request('POST', '/api/workflows', { json: { yaml_source: v.yaml } })
+            .then(function (r) {
+              if (r.ok) return null;
+              if (r.status === 403) return 'You do not have permission to create workflows.';
+              return errText(r, 'Could not create the workflow (HTTP ' + r.status + ').');
+            });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast('Workflow created', 'success');
+        loadWorkflows();
+        loadRuns();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    function deleteWorkflow() {
+      if (!window.YuzuDialog || !selectedId) return;
+      var id = selectedId;
+      var block = stepsFor(id);
+      var name = (block && block.getAttribute('data-name')) || id;
+      YuzuDialog.form({
+        title: 'Delete workflow',
+        body: ['Deletes "' + name + '". Run history is kept. There is no undelete in the console.'],
+        danger: true,
+        fields: [],
+        cancelLabel: 'Go back',
+        submitLabel: 'Delete workflow',
+        submit: function () {
+          return YuzuDialog.request('DELETE', '/api/workflows/' + encodeURIComponent(id))
+            .then(function (r) {
+              if (r.ok && r.data && r.data.deleted === false)
+                return 'That workflow was already deleted or does not exist.';
+              if (r.ok) return null;
+              if (r.status === 403) return 'You do not have permission to delete workflows.';
+              return errText(r, 'Could not delete the workflow (HTTP ' + r.status + ').');
+            });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast('Workflow deleted', 'success');
+        if (selectedId === id) {
+          selectedId = '';
+          writeQs(function (p) { p.delete('wf'); });
+          stepsEmpty('Select a workflow to see its steps.');
+          applyActions();
+        }
+        loadWorkflows();
+        loadRuns();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    // Watches the newest run of a workflow after the Run request timed out: the server keeps
+    // working, so poll the runs fragment every 5 s until a run newer than the one that was
+    // newest before the request reaches a terminal status, or 10 minutes pass.
+    function watchRun(id, baselineRunId) {
+      if (polling[id]) return;
+      polling[id] = true;
+      applyActions();
+      var started = Date.now();
+      function finish(msg) {
+        delete polling[id];
+        applyActions();
+        if (msg) showToast(msg, 'info');
+        loadRuns();
+        if (recentDet.open && selectedId === id) loadRecent();
+      }
+      function tick() {
+        if (Date.now() - started > RUN_POLL_MAX_MS) {
+          finish('Stopped watching the run. Check Recent runs before running it again.');
+          return;
+        }
+        fetchFragment('/fragments/workflow-runs?limit=1&workflow_id=' + encodeURIComponent(id))
+          .then(function (res) {
+            var row = null;
+            if (res.status === 200)
+              row = new DOMParser().parseFromString(res.html, 'text/html').querySelector('tr.row');
+            if (row && row.getAttribute('data-run-id') !== baselineRunId &&
+                TERMINAL[row.getAttribute('data-status')]) {
+              finish('The run finished.');
+              return;
+            }
+            setTimeout(tick, RUN_POLL_MS);
+          });
+      }
+      setTimeout(tick, RUN_POLL_MS);
+    }
+
+    function newestRunId(wid) {
+      var found = '';
+      $$('tr.row', runsStore).forEach(function (r) {
+        if (!found && r.getAttribute('data-workflow-id') === wid)
+          found = r.getAttribute('data-run-id') || '';
+      });
+      return found;
+    }
+
+    function agentList(data) {
+      var arr = Array.isArray(data) ? data : (data && Array.isArray(data.agents) ? data.agents : null);
+      if (!arr) return null;
+      return arr.filter(function (a) { return a && typeof a.agent_id === 'string' && a.agent_id; })
+        .map(function (a) {
+          return { id: a.agent_id, host: typeof a.hostname === 'string' ? a.hostname : '',
+                   os: typeof a.os === 'string' ? a.os : '' };
+        });
+    }
+
+    // The device chooser inside the Run dialog. Returns {node, ids()}; its content arrives
+    // from GET /api/agents (a bare array; an object with .agents is also accepted). Without
+    // Infrastructure:Read (or when the list cannot be read) it falls back to a textarea of
+    // device ids, which the server confines to the caller's scope anyway.
+    function deviceChooser() {
+      var root = doc.createElement('div');
+      var chosen = {};      // agent id -> true
+      var chosenCount = 0;
+      var agents = null;    // null until loaded; [] when none are connected
+      var shownList = [];   // the devices currently drawn (at most AGENT_SHOW_MAX)
+      var area = null;      // the textarea of the fallback
+
+      var note = doc.createElement('p');
+      note.className = 'hint';
+      note.textContent = 'Loading devices…';
+      root.appendChild(note);
+
+      function countText() { note.textContent = chosenCount + ' of ' + AGENT_SELECT_MAX + ' maximum selected.'; }
+
+      function drawList(host, filter) {
+        host.replaceChildren();
+        shownList = [];
+        var q = filter.trim().toLowerCase();
+        var shown = 0;
+        var matched = 0;
+        agents.forEach(function (a) {
+          if (q && (a.host + ' ' + a.id + ' ' + a.os).toLowerCase().indexOf(q) < 0) return;
+          matched++;
+          if (shown >= AGENT_SHOW_MAX) return;
+          shown++;
+          shownList.push(a);
+          var lab = doc.createElement('label');
+          lab.className = 'dev';
+          var cb = doc.createElement('input');
+          cb.type = 'checkbox';
+          cb.checked = !!chosen[a.id];
+          cb.addEventListener('change', function () {
+            if (cb.checked && chosenCount >= AGENT_SELECT_MAX) { cb.checked = false; return; }
+            if (cb.checked) { chosen[a.id] = true; chosenCount++; }
+            else if (chosen[a.id]) { delete chosen[a.id]; chosenCount--; }
+            countText();
+          });
+          var t = doc.createElement('span');
+          t.textContent = (a.host || a.id) + (a.os ? ' · ' + a.os : '');
+          lab.appendChild(cb);
+          lab.appendChild(t);
+          host.appendChild(lab);
+        });
+        if (matched > shown) {
+          var more = doc.createElement('p');
+          more.className = 'hint';
+          more.textContent = 'Showing the first ' + shown + ' of ' + matched +
+            ' matching devices. Narrow the filter to see the rest.';
+          host.appendChild(more);
+        }
+        if (!matched) {
+          var none = doc.createElement('p');
+          none.className = 'hint';
+          none.textContent = agents.length ? 'No device matches the filter.' : 'No devices are connected.';
+          host.appendChild(none);
+        }
+      }
+
+      function showChecklist() {
+        var filt = doc.createElement('input');
+        filt.type = 'text';
+        filt.placeholder = 'Filter devices';
+        filt.setAttribute('aria-label', 'Filter devices');
+        var host = doc.createElement('div');
+        host.className = 'devs';
+        var all = doc.createElement('button');
+        all.type = 'button';
+        all.className = 'btn btn-sm';
+        all.textContent = 'Select shown';
+        all.addEventListener('click', function () {
+          shownList.forEach(function (a) {
+            if (!chosen[a.id] && chosenCount < AGENT_SELECT_MAX) { chosen[a.id] = true; chosenCount++; }
+          });
+          drawList(host, filt.value);
+          countText();
+        });
+        filt.addEventListener('input', function () { drawList(host, filt.value); });
+        root.appendChild(filt);
+        root.appendChild(all);
+        root.appendChild(host);
+        drawList(host, '');
+        countText();
+      }
+
+      function showFallback(why) {
+        note.textContent = why + ' Enter device ids, one per line (letters, digits, . _ -).';
+        area = doc.createElement('textarea');
+        area.rows = 6;
+        area.setAttribute('aria-label', 'Device ids');
+        root.appendChild(area);
+      }
+
+      var init = { credentials: 'same-origin', cache: 'no-store' };
+      var sig = timeoutSignal(FETCH_TIMEOUT_MS);
+      if (sig) init.signal = sig;
+      fetch('/api/agents', init).then(function (r) {
+        if (r.status === 403) { showFallback('You cannot list devices.'); return null; }
+        if (r.status !== 200) { showFallback('The device list could not be loaded.'); return null; }
+        return r.json().then(function (d) {
+          agents = agentList(d);
+          if (agents === null) { showFallback('The device list could not be read.'); return; }
+          showChecklist();
+        });
+      }).catch(function () { showFallback('The device list could not be loaded.'); });
+
+      return {
+        node: root,
+        // The chosen ids, or an error string when the input is not usable.
+        read: function () {
+          if (area) {
+            var seen = {};
+            var out = [];
+            var lines = area.value.split('\n');
+            for (var i = 0; i < lines.length; i++) {
+              var t = lines[i].trim();
+              if (!t) continue;
+              if (!AGENT_ID_RE.test(t)) return 'Not a valid device id: ' + t.slice(0, 40);
+              if (!seen[t]) { seen[t] = true; out.push(t); }
+            }
+            if (out.length > AGENT_SELECT_MAX) return 'Name at most ' + AGENT_SELECT_MAX + ' devices.';
+            return out;
+          }
+          return Object.keys(chosen);
+        }
+      };
+    }
+
+    function runWorkflow(id) {
+      if (!window.YuzuDialog || polling[id] || !can('run')) return;
+      var block = stepsFor(id);
+      var name = (block && block.getAttribute('data-name')) || id;
+      var body = doc.createElement('div');
+      var intro = doc.createElement('p');
+      intro.textContent = 'Runs "' + name + '". Each step is sent to every selected device, in ' +
+        'order. Steps whose instruction needs approval are refused. Device results are not ' +
+        'collected here.';
+      body.appendChild(intro);
+      var chooser = deviceChooser();
+      body.appendChild(chooser.node);
+      var baseline = newestRunId(id);
+      var outcome = '';   // 'ok' (202) or 'timeout' (the request did not finish in time)
+      YuzuDialog.form({
+        title: 'Run workflow',
+        body: body,
+        fields: [],
+        submitLabel: 'Run on selected devices',
+        validate: function () {
+          var ids = chooser.read();
+          if (typeof ids === 'string') return ids;
+          return ids.length ? null : 'Choose at least one device.';
+        },
+        submit: function () {
+          var ids = chooser.read();
+          if (typeof ids === 'string' || !ids.length) return Promise.resolve('Choose at least one device.');
+          var init = { method: 'POST', credentials: 'same-origin', cache: 'no-store',
+                       headers: { 'Content-Type': 'application/json' },
+                       body: JSON.stringify({ agent_ids: ids }) };
+          var sig = timeoutSignal(RUN_POST_TIMEOUT_MS);
+          if (sig) init.signal = sig;
+          return fetch('/api/workflows/' + encodeURIComponent(id) + '/execute', init).then(function (r) {
+            return r.text().then(function (t) {
+              var data = null;
+              try { data = JSON.parse(t); } catch (e) { /* not JSON */ }
+              if (r.ok) { outcome = 'ok'; return null; }
+              if (r.status === 401) return 'Your session has expired. Sign in again.';
+              var msg = data && data.error && typeof data.error.message === 'string' ? data.error.message : '';
+              if (r.status === 403) return msg || 'You do not have permission to run this workflow.';
+              return msg || 'Could not start the run (HTTP ' + r.status + ').';
+            });
+          }, function () {
+            // Timeout or a dropped connection: the server may still be running it.
+            outcome = 'timeout';
+            return null;
+          });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        if (outcome === 'timeout') {
+          showToast('The run may keep running on the server. Check Recent runs before running it again.', 'warning');
+          watchRun(id, baseline);
+          return;
+        }
+        showToast('Workflow run started', 'success');
+        loadRuns();
+        if (recentDet.open && selectedId === id) loadRecent();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    newBtn.addEventListener('click', function () { if (!newBtn.disabled) newWorkflow(); });
+    delBtn.addEventListener('click', function () { if (!delBtn.disabled) deleteWorkflow(); });
+    wfHost.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-act="run"]') : null;
+      if (!b || !wfHost.contains(b) || b.disabled) return;
+      var brow = b.closest('tr.row');
+      if (brow) runWorkflow(brow.getAttribute('data-workflow-id') || '');
+    });
+
     wfHost.addEventListener('click', function (e) {
       var row = e.target.closest ? e.target.closest('tr.row') : null;
       if (row && wfHost.contains(row)) select(row);
     });
     wfHost.addEventListener('keydown', function (e) {
       if (e.key !== 'Enter' && e.key !== ' ') return;
+      if (e.target && e.target.tagName === 'BUTTON') return; // let the button's own click run
       var row = e.target.closest ? e.target.closest('tr.row') : null;
       if (!row || !wfHost.contains(row)) return;
       e.preventDefault();
@@ -995,7 +1365,7 @@
     loadRuns();
     loadWorkflows().then(function () {
       if (!wantId) return;
-      if (showSteps(wantId)) showLatest();
+      if (showSteps(wantId)) { applyActions(); showLatest(); }
       else stepsEmpty('That workflow is not listed, or you may not see it.');
     });
   }

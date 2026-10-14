@@ -12,6 +12,7 @@
  */
 
 #include "audit_store.hpp"
+#include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "tag_store.hpp"
@@ -30,6 +31,7 @@
 #include <regex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -42,7 +44,9 @@ yuzu::test::PgTestTemplate wf_page_tpl{"wf_page_authz", [](const std::string& ds
     WorkflowEngine engine{pool};
     TagStore tags{pool};
     AuditStore audit{pool};
-    if (!rbac.is_open() || !engine.is_open() || !tags.is_open() || !audit.is_open())
+    InstructionStore instr{pool};
+    if (!rbac.is_open() || !engine.is_open() || !tags.is_open() || !audit.is_open() ||
+        !instr.is_open())
         throw std::runtime_error("wf_page_authz template: a store failed to migrate");
 }};
 
@@ -59,6 +63,7 @@ struct Rig {
     yuzu::test::ResponseExecutionAuthzPgRig rig;
     WorkflowEngine engine;
     TagStore tags;
+    InstructionStore instr;
     pg::PgPool audit_pool;
     AuditStore audit_store;
     std::unique_ptr<AuthRoutes> auth;
@@ -66,10 +71,11 @@ struct Rig {
     std::string dsn, wf;
 
     explicit Rig(const std::string& dsn_in)
-        : rig{dsn_in}, engine{rig.pool}, tags{rig.pool},
+        : rig{dsn_in}, engine{rig.pool}, tags{rig.pool}, instr{rig.pool},
           audit_pool{{.conninfo = dsn_in, .size = 2}}, audit_store{audit_pool}, dsn{dsn_in} {
         REQUIRE(engine.is_open());
         REQUIRE(tags.is_open());
+        REQUIRE(instr.is_open());
         REQUIRE(audit_store.is_open());
         // gary: GLOBAL Workflow:Read. bob: Workflow:Read only through his management group.
         // erin: GLOBAL Workflow:Read and nothing else (no InstructionDefinition:Read).
@@ -79,7 +85,20 @@ struct Rig {
         REQUIRE(rig.rbac.assign_role({"user", "gary", "WorkflowReaderPage"}).has_value());
         REQUIRE(rig.rbac.assign_role({"user", "erin", "WorkflowReaderPage"}).has_value());
         REQUIRE(rig.mgmt.assign_role({rig.bob_group, "user", "bob", "WorkflowReaderPage"}).has_value());
-        for (const char* u : {"gary", "dave", "erin"})
+        // ivy: Workflow:Read + Execute and InstructionDefinition:Read (may see names, may run).
+        // olly: Workflow Read/Write/Delete and no Execute and no InstructionDefinition:Read.
+        REQUIRE(rig.rbac.create_role({"WorkflowRunnerPage", "", false, 0}).has_value());
+        for (const auto& pr : {std::pair<const char*, const char*>{"Workflow", "Read"},
+                               {"Workflow", "Execute"}, {"InstructionDefinition", "Read"}})
+            REQUIRE(rig.rbac.set_permission({"WorkflowRunnerPage", pr.first, pr.second, "allow"})
+                        .has_value());
+        REQUIRE(rig.rbac.assign_role({"user", "ivy", "WorkflowRunnerPage"}).has_value());
+        REQUIRE(rig.rbac.create_role({"WorkflowEditorPage", "", false, 0}).has_value());
+        for (const char* op : {"Read", "Write", "Delete"})
+            REQUIRE(rig.rbac.set_permission({"WorkflowEditorPage", "Workflow", op, "allow"})
+                        .has_value());
+        REQUIRE(rig.rbac.assign_role({"user", "olly", "WorkflowEditorPage"}).has_value());
+        for (const char* u : {"gary", "dave", "erin", "ivy", "olly"})
             REQUIRE(rig.auth_mgr.upsert_user(u, "correct-horse-battery-staple", auth::Role::user));
         REQUIRE(tags.set_tag("bob-agent", "service", "printers").has_value());
         REQUIRE(tags.set_tag("alice-agent", "service", "scanners").has_value());
@@ -150,6 +169,12 @@ struct Rig {
             (void)req;
             (void)audit_store.log(e);
         };
+        d.probe_perm_fn = [this](const httplib::Request& req, const std::string& t,
+                                 const std::string& o) {
+            httplib::Response scratch;
+            return auth->require_permission(req, scratch, t, o);
+        };
+        d.instruction_store = &instr;
         d.workflow_api = api;
         routes.register_routes(sink, std::move(d));
         std::unordered_map<std::string, std::string> hdrs;
@@ -290,4 +315,52 @@ TEST_CASE("workflows page real gate: with RBAC off an authenticated caller is un
     auto refused = r.get(svc, "/fragments/workflow-runs");
     CHECK(refused->status == 200);
     CHECK(has(refused->body, "data-denied=\"true\""));
+}
+
+TEST_CASE("workflows page real gate: capability hints follow the grants and names follow "
+          "InstructionDefinition:Read",
+          "[pg][workflow][workflows][page][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, wf_page_tpl);
+    Rig r{db.dsn()};
+    InstructionDefinition def;
+    def.name = "Restart the spooler";
+    def.type = "action";
+    def.plugin = "services";
+    def.action = "restart";
+    def.version = "1.0";
+    auto iid = r.instr.create_definition(def);
+    REQUIRE(iid.has_value());
+    REQUIRE(r.engine
+                .create_workflow("kind: Workflow\nmetadata:\n  displayName: named-wf\nspec:\n"
+                                 "  steps:\n    - instruction: " + *iid + "\n")
+                .has_value());
+
+    // erin: Workflow:Read only. Every hint is 0, and the instruction name is nowhere in the
+    // bytes: Workflow:Read does not imply InstructionDefinition:Read.
+    auto erin = r.get(r.mint("erin"), "/fragments/workflows");
+    CHECK(erin->status == 200);
+    CHECK(has(erin->body, "data-can-run=\"0\" data-can-write=\"0\" data-can-delete=\"0\""));
+    CHECK(has(erin->body, *iid));
+    CHECK_FALSE(has(erin->body, "Restart the spooler"));
+    CHECK(has(erin->body, "Requires Workflow:Execute"));
+
+    // ivy: Execute and the instruction grant: Run is offered and the name is shown.
+    auto ivy = r.get(r.mint("ivy"), "/fragments/workflows");
+    CHECK(has(ivy->body, "data-can-run=\"1\" data-can-write=\"0\" data-can-delete=\"0\""));
+    CHECK(has(ivy->body, "Restart the spooler"));
+
+    // olly: Write and Delete but not Execute and not the instruction grant.
+    auto olly = r.get(r.mint("olly"), "/fragments/workflows");
+    CHECK(has(olly->body, "data-can-run=\"0\" data-can-write=\"1\" data-can-delete=\"1\""));
+    CHECK_FALSE(has(olly->body, "Restart the spooler"));
+
+    // The run detail follows the same rule for the step title.
+    r.run("r-named", 400, R"(["bob-agent"])");
+    r.exec_sql("UPDATE workflow_engine.workflow_step_results SET instruction_id = $1 "
+               "WHERE execution_id = 'r-named'", {*iid});
+    auto seen = r.get(r.mint("ivy"), "/fragments/workflow-runs/r-named");
+    CHECK(has(seen->body, "Restart the spooler"));
+    auto blind = r.get(r.mint("erin"), "/fragments/workflow-runs/r-named");
+    CHECK(has(blind->body, *iid));
+    CHECK_FALSE(has(blind->body, "Restart the spooler"));
 }

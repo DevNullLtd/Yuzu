@@ -7,9 +7,10 @@
 // definitions fragment into the side panel, patches each row's Last run / Result cells from
 // `/fragments/workflow-runs?latest_per_workflow=true`, and loads the selected workflow's newest
 // run (`/fragments/workflow-runs/{id}`) and its ten most recent runs on demand.
-// Read-only: Run now, New workflow, Delete and the
-// schedule controls are not on this page yet (the Instructions page's Schedules tab keeps its
-// Delete).
+// Workflow actions (WF-3a): Run now, New workflow and Delete workflow go through the shared
+// dialog module (/static/yuzu-dialog.js). The controls are offered from data-can-* hints the
+// definitions fragment probes once per render; the write routes stay the gate. The schedule
+// controls are not on this page yet (the Instructions page's Schedules tab keeps its Delete).
 //
 // Product UI: HTMX loaded only for the shell's Sign out (`hx-post`), CSP-clean (no hx-on,
 // no inline handlers, htmx eval disabled), tokens from /static/yuzu.css, page-local CSS in
@@ -44,7 +45,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 <div class="ops-grid">
 <div class="ops-main">
 <section class="panel ops-listbox">
-<div class="hd"><h2>Workflows</h2></div>
+<div class="hd"><h2>Workflows</h2><button type="button" class="btn btn-primary btn-sm end" id="wf-new" hidden>New workflow</button></div>
 <div id="wf-list"><div class="empty-state">Loading…</div></div>
 <div id="wf-runs-store" hidden></div>
 </section>
@@ -55,7 +56,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 </div>
 <aside class="ops-side">
 <section class="panel ops-sel" id="wf-steps">
-<div class="hd"><h2 id="wf-steps-title">Steps</h2></div>
+<div class="hd"><h2 id="wf-steps-title">Steps</h2><button type="button" class="btn btn-danger btn-sm end" id="wf-del" hidden>Delete</button></div>
 <div id="wf-steps-body"><div class="empty-state">Select a workflow to see its steps.</div></div>
 </section>
 <section class="panel ops-sel" id="wf-run">
@@ -71,6 +72,8 @@ constexpr std::string_view kBody = R"HTM(</style>
 </aside>
 </div>
 </main>
+<div class="toast-container" id="toasts" aria-live="polite"></div>
+<script src="/static/yuzu-dialog.js" defer></script>
 <script src="/static/yuzu-operate.js" defer></script>
 </body></html>
 )HTM";
