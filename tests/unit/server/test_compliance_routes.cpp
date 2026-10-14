@@ -676,6 +676,11 @@ TEST_CASE("/fragments/compliance/{id}: confined to the caller's scope, audited w
     CHECK(res->body.find("agent-in") != std::string::npos);
     CHECK(res->body.find("agent-out") == std::string::npos);
     CHECK(res->body.find("Rows cover devices in your scope") != std::string::npos);
+    // Definition reads are a global Policy:Read on the REST twins; a confined
+    // caller gets the per-device rows only (name, scope expression, check).
+    CHECK(res->body.find("Confined Policy") == std::string::npos);
+    CHECK(res->body.find("Applies to") == std::string::npos);
+    CHECK(res->body.find("data-act=\"remediate\"") == std::string::npos);
 
     const AuditCall* seen = nullptr;
     for (const auto& c : h.audit_calls)
@@ -709,6 +714,10 @@ TEST_CASE("/fragments/compliance/{id}: an audit-persist failure flags the header
     CHECK(res->status == 200); // dashboard posture: proceed, flag
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(res->body.find("agent-1") != std::string::npos);
+    // Unconfined caller: the definition header is present (counterpart of the
+    // confined case, which must not show it).
+    CHECK(res->body.find("Audit Flag Policy") != std::string::npos);
+    CHECK(res->body.find("Applies to") != std::string::npos);
 }
 
 // ═════════════════════════════════════════════════════════════════════════

@@ -138,20 +138,27 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(
 
     if (api_) {
         // The header is best-effort: a degraded read or a not-found keeps the
-        // id as the displayed name and omits the kv panel.
-        auto policy = api_->get_policy(policy_id);
-        if (policy && *policy) {
-            const auto& d = **policy;
-            view.have_policy = true;
-            view.policy_name = d.policy.name;
-            view.applies_to = d.policy.scope_expression;
-            view.remediation_available = d.remediation_available;
-            auto frags = api_->list_fragments(FragmentQuery{});
-            if (frags) {
-                for (const auto& f : *frags) {
-                    if (f.id == d.policy.fragment_id) {
-                        view.check = f.check_compliance;
-                        break;
+        // id as the displayed name and omits the kv panel. Definition reads
+        // (name, scope expression, bound fragment) are a GLOBAL Policy:Read on
+        // the REST twins (perm_fn_); this route's fleet-read gate also admits
+        // a holder whose grant arrives only through a management group, so a
+        // confined caller gets the per-device rows and nothing else, exactly
+        // what GET /api/v1/compliance/{id} returns.
+        if (!view.confined) {
+            auto policy = api_->get_policy(policy_id);
+            if (policy && *policy) {
+                const auto& d = **policy;
+                view.have_policy = true;
+                view.policy_name = d.policy.name;
+                view.applies_to = d.policy.scope_expression;
+                view.remediation_available = d.remediation_available;
+                auto frags = api_->list_fragments(FragmentQuery{});
+                if (frags) {
+                    for (const auto& f : *frags) {
+                        if (f.id == d.policy.fragment_id) {
+                            view.check = f.check_compliance;
+                            break;
+                        }
                     }
                 }
             }
