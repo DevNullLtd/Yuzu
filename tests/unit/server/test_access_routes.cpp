@@ -22,9 +22,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
-#include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -248,22 +245,4 @@ TEST_CASE("access routes: the static glue is served uncached", "[access][routes]
     CHECK(res->get_header_value("Content-Type") == "application/javascript; charset=utf-8");
     CHECK(res->get_header_value("Cache-Control") == "no-cache, no-store, must-revalidate");
     CHECK_THAT(res->body, ContainsSubstring("htmx:responseError"));
-}
-
-TEST_CASE("access routes: server.cpp binds the real require_admin gate", "[access][routes]") {
-    // Every case above stubs the gate, so a permissive lambda in server.cpp would pass them
-    // all. Scan the registration site instead (precedent: test_body_cap_route_inventory.cpp).
-    const std::filesystem::path src = std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp";
-    std::ifstream in(src, std::ios::binary);
-    REQUIRE(in.good());
-    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    const auto at = text.find("register_access_routes(");
-    REQUIRE(at != std::string::npos);
-    const auto admin = text.find(".admin_fn", at);
-    REQUIRE(admin != std::string::npos);
-    const auto next = text.find(".perm_fn", admin);
-    REQUIRE(next != std::string::npos);
-    const std::string binding = text.substr(admin, next - admin);
-    CHECK_THAT(binding, ContainsSubstring("require_admin(req, res)"));
-    CHECK_THAT(binding, !ContainsSubstring("return true"));
 }

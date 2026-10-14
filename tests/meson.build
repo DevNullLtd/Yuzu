@@ -3371,6 +3371,15 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   timeout: 30,
 )
 
+# Access Users page: pins the production wiring in server.cpp (the real require_admin gate and the
+# AuthDB::list_users() account source), which every route test stubs. Source-text only, so Python.
+test('access users production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_wiring_lexical.py')],
+  suite: 'server',
+  timeout: 30,
+)
+
 # #5678: static lexical gate pinning that BOTH disconnect paths (direct Subscribe in
 # agent_service_impl.cpp, gateway DISCONNECTED in gateway_service_impl.cpp) mirror a departure into
 # durable presence only through mirror_departure_to_presence() with the real gate; the direct path
