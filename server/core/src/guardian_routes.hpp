@@ -49,7 +49,10 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
-    using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
+    /// Returns whether the audit row was persisted (production wires `audit_log`'s
+    /// bool). A mutation that must fail closed on audit failure (ADR-0033 §9) reads it
+    /// through `detail::emit_behavioral_audit` and refuses to apply the change.
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
     using EmitEventFn = std::function<void(const std::string& event_type,
@@ -70,7 +73,8 @@ public:
     using PushFn = std::function<int(const std::string& scope, bool full_sync)>;
 
     /// Boot-time CSRF allowlist (cfg.csrf_trusted_origins) for the same-site gate
-    /// on the Guard update/delete fragments; empty = same-host only (fail closed).
+    /// on every cookie-authorized Guardian mutation (Guard create/enable/update/delete
+    /// and every Baseline mutation); empty = same-host only (fail closed).
     void set_csrf_trusted_origins(std::vector<std::string> origins) {
         csrf_trusted_origins_ = std::move(origins);
     }
