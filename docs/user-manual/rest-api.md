@@ -4736,13 +4736,13 @@ most keys:
   the agent's own `--plugin-require-signature` flag paired with an operator-distributed
   `--plugin-trust-bundle`. Setting this key records the operator's intent and changes what Settings
   displays; **it does not harden anything by itself**.
-- **persisted only, applied at next boot or next DEX-alerts Settings save** - `dex_alert_routing`,
+- **persisted only, applied at next boot or next save on the DEX → Alerts tab** - `dex_alert_routing`,
   `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`,
   `dex_cohort_export_key`. The live consumers (`DexAlertRouter`, the blast-radius detector, the
   cohort-gauge export key) are **cached in memory** and refreshed only by `apply_dex_alert_config()`,
-  which runs at server startup and from the Settings -> DEX alerts save handler - never from this
+  which runs at server startup and from the DEX -> Alerts tab save handlers - never from this
   endpoint. A `PUT` through this API is inert on the running server until one of those two happens.
-  To change DEX alerting and have it apply at once, use Settings -> DEX alerts.
+  To change DEX alerting and have it apply at once, use the DEX -> Alerts tab.
 - **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
@@ -5382,8 +5382,8 @@ Create a new webhook subscription.
 | `agent.registered` | An agent enrolls or re-enrolls | `agent_id`, `hostname`, `os`, `arch`, `agent_version` |
 | `command.completed` / `execution.completed` | An instruction finishes across its targets | command/execution identifiers |
 | `policy.violation` | A policy evaluation finds a non-compliant device | policy + device identifiers |
-| `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable under Settings → DEX alerts (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
-| `dex.signal` | A device reports a DEX signal type the operator routed to alerts (Settings → DEX alerts; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
+| `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable on the DEX → Alerts tab (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
+| `dex.signal` | A device reports a DEX signal type the operator routed to alerts (DEX → Alerts tab; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
 
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — a server restart, a network blip, or a gateway bounce that strands and reconnects a fleet produces one delivery per reconnecting agent, not one per genuinely new device. A target wired to a low-tolerance channel (e.g. a Slack alert intended for "new device joined the fleet") should filter or debounce on the receiving end if reconnect noise matters; the dashboard's own "Agent Enrolled" notification does not have this problem (it fires once, on first enrollment only).
 
