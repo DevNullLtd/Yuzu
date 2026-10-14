@@ -214,7 +214,7 @@ TEST_CASE("operate pages: the Executions template carries every hook the control
     CHECK(has(js, "if (res.status !== 200) { panelNote(detailCopy(res.status)); return; }"));
     // No auto-select: the detail read (one audit row) happens on a click, Enter/Space or
     // an explicit ?id= only.
-    CHECK(count_of(js, "showDetail(") == 4); // definition, click path, deep link, live refresh
+    CHECK(count_of(js, "showDetail(") == 5); // definition, click, deep link, live refresh, post-cancel
     CHECK(has(js, "if (wantId) showDetail(wantId);"));
     // No polling. Live updates: exactly one EventSource, on the page's own detail stream,
     // started only from a fresh detail response that says running|pending.
