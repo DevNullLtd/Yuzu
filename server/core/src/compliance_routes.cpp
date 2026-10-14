@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -191,7 +192,10 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
     return html;
 }
 
-std::string ComplianceRoutes::render_compliance_detail_fragment(const std::string& policy_id) {
+std::string ComplianceRoutes::render_compliance_detail_fragment(
+    const std::string& policy_id, const authz::VisibleSet& scope,
+    std::optional<std::size_t>& rows_read) {
+    rows_read.reset();
     // Look up the policy via the seam. Low-stakes (page-title fallback
     // only) — a degraded read or not-found just keeps the id as the
     // displayed name; not worth a distinct error state here.
@@ -214,13 +218,11 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
 
     std::vector<AgentRow> agents;
     bool degraded = false;
-    // #4034 Rule 1: same confined_policy_compliance tally REST's
-    // GET /api/v1/compliance/{id} and MCP's get_policy_agent_statuses use to
-    // count agents by status (scope=nullopt/TOP — this fragment has no
-    // confinement gate of its own to derive a narrower scope from; the
-    // fragment's separate lack-of-RBAC-gate gap is #4042's job, not this
-    // one's). Default-constructed (all-zero) until the block below runs, so
-    // it stays valid across the degraded/empty early-returns further down.
+    // #4034 Rule 1 + ADR-0017 (#4042): the SAME confined_policy_compliance
+    // tally REST's GET /api/v1/compliance/{id} and MCP's
+    // get_policy_agent_statuses use, narrowed to the caller's admitted scope.
+    // Default-constructed (all-zero) until the block below runs, so it stays
+    // valid across the degraded/empty early-returns further down.
     ConfinedPolicyCompliance confined;
     confined.summary.policy_id = policy_id;
     if (api_) {
@@ -229,7 +231,9 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
             degraded = true;
             statuses = std::vector<PolicyAgentStatus>{};
         }
-        confined = confined_policy_compliance(*statuses, /*scope=*/std::nullopt, policy_id);
+        confined = confined_policy_compliance(*statuses, scope, policy_id);
+        if (!degraded)
+            rows_read = confined.visible.size();
         for (const auto& s : confined.visible) {
             nlohmann::json row_j = policy_agent_status_json(s);
             AgentRow row;
@@ -434,24 +438,50 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                      });
 
     // -- Compliance HTMX fragment: fleet summary --------------------------
+    // #4042: service-scoped deny first (blanket), then the same Policy:Read
+    // grant GET /api/v1/compliance asks for. perm_fn_ is a GLOBAL grant
+    // check, so a holder whose Policy:Read comes only through a management
+    // group is refused here (403) and never reaches the confined detail.
     sink.Get("/fragments/compliance/summary",
                      [this](const httplib::Request& req, httplib::Response& res) {
                          if (deny_service_scoped_(req, res)) return;
-                         auto session = auth_fn_(req, res);
-                         if (!session) return;
+                         if (!perm_fn_(req, res, "Policy", "Read")) return;
                          res.set_content(render_compliance_summary_fragment(),
                                          "text/html; charset=utf-8");
                      });
 
     // -- Compliance HTMX fragment: per-policy agent detail ----------------
+    // #4042: the REST v1 twin's contract. fleet_read_fn_ is the SOLE gate
+    // (never stacked with perm_fn_), rows are confined to the caller's
+    // scope, and the per-agent read writes compliance.agent_statuses.view.
+    // Audit posture follows the dashboard convention (set-and-proceed, flag
+    // via Sec-Audit-Failed); the REST twin fails closed instead.
     sink.Get(R"(/fragments/compliance/(\w[\w\-]*))",
                      [this](const httplib::Request& req, httplib::Response& res) {
                          if (deny_service_scoped_(req, res)) return;
-                         auto session = auth_fn_(req, res);
-                         if (!session) return;
+                         if (!fleet_read_fn_) {
+                             // Unwired is misconfiguration: 503, never a
+                             // fall-through to an ungated render.
+                             spdlog::error("GET /fragments/compliance/{{id}}: fleet_read_fn_ "
+                                           "unwired — misconfigured call site; failing closed");
+                             res.status = 503;
+                             res.set_content(detail::a4_error(res, "service unavailable"),
+                                             "application/json");
+                             return;
+                         }
+                         auto gate = fleet_read_fn_(req, res, "Policy", "Read");
+                         if (!gate.admitted) return;
                          auto policy_id = req.matches[1].str();
-                         res.set_content(render_compliance_detail_fragment(policy_id),
-                                         "text/html; charset=utf-8");
+                         std::optional<std::size_t> rows_read;
+                         auto html =
+                             render_compliance_detail_fragment(policy_id, gate.scope, rows_read);
+                         if (rows_read) {
+                             (void)detail::emit_behavioral_audit(
+                                 audit_fn_, req, res, "compliance.agent_statuses.view", "success",
+                                 "Policy", policy_id,
+                                 "agents=" + std::to_string(*rows_read) + " surface=dashboard");
+                         }
+                         res.set_content(html, "text/html; charset=utf-8");
                      });
 
     // -- Policy Engine API (Phase 5, READ side) -------------------------------

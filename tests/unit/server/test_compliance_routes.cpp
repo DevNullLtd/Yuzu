@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -66,6 +67,14 @@ struct ComplianceHarness {
     bool fleet_admitted{true};
     std::optional<std::unordered_set<std::string>> fleet_scope; // nullopt = TOP/unfiltered
 
+    /// #4042 — `perm_fn` outcome the test controls, plus the (securable,
+    /// operation) pairs it was asked for, so a test can pin WHICH grant a
+    /// fragment requires and that a denial stops the render.
+    bool perm_admitted{true};
+    std::vector<std::pair<std::string, std::string>> perm_calls;
+    /// Number of times the fleet-read gate was consulted.
+    int fleet_read_calls{0};
+
     /// #4034 follow-up — `policy_store` defaults to nullptr (every
     /// pre-existing test above and the null-store 503 tests below rely on
     /// that), but a test can pass a REAL, live-Postgres-backed PolicyStore
@@ -76,7 +85,9 @@ struct ComplianceHarness {
     /// wrapped in `make_local_compliance_api` before registration; a null
     /// store leaves the seam nullptr, matching the pre-seam null-store
     /// degrade path exactly.
-    explicit ComplianceHarness(PolicyStore* policy_store = nullptr) {
+    /// `wire_fleet_read = false` registers with NO fleet_read_fn (the
+    /// misconfigured call site the detail fragment must 503 on).
+    explicit ComplianceHarness(PolicyStore* policy_store = nullptr, bool wire_fleet_read = true) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -85,8 +96,17 @@ struct ComplianceHarness {
             s.token_scope_service = mock_token_scope_service;
             return s;
         };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool { return true; };
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                              const std::string& securable, const std::string& op) -> bool {
+            perm_calls.emplace_back(securable, op);
+            if (!perm_admitted) {
+                res.status = 403;
+                res.set_content(R"({"error":{"message":"permission denied"}})",
+                                "application/json");
+                return false;
+            }
+            return true;
+        };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -97,6 +117,7 @@ struct ComplianceHarness {
         ComplianceRoutes::FleetReadFn fleet_read_fn =
             [this](const httplib::Request&, httplib::Response& res, const std::string&,
                   const std::string&) -> authz::FleetReadGate {
+            ++fleet_read_calls;
             if (!fleet_admitted) {
                 res.status = 403;
                 res.set_content(R"({"error":{"message":"permission denied"}})",
@@ -110,6 +131,8 @@ struct ComplianceHarness {
         if (policy_store)
             api = make_local_compliance_api(*policy_store);
 
+        if (!wire_fleet_read)
+            fleet_read_fn = {};
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, api, agents_json_fn,
                                std::move(fleet_read_fn));
     }
@@ -552,4 +575,128 @@ TEST_CASE("GET /api/v1/compliance/{id}: audit succeeds -> 200 with the per-agent
         if (c.action == "compliance.agent_statuses.view" && c.result == "success")
             saw_success = true;
     CHECK(saw_success);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// #4042 — the two dashboard fragments carry their REST twins' gate.
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("/fragments/compliance/summary: requires Policy:Read, a denial stops the render",
+          "[compliance][security][authz]") {
+    ComplianceHarness h;
+    h.perm_admitted = false;
+
+    auto res = h.sink.Get("/fragments/compliance/summary");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("No policies defined") == std::string::npos);
+    REQUIRE(h.perm_calls.size() == 1);
+    CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Policy", "Read"});
+}
+
+TEST_CASE("/fragments/compliance/summary: a service-scoped token is denied before the grant check",
+          "[compliance][security][authz]") {
+    ComplianceHarness h;
+    h.mock_token_scope_service = "printers";
+
+    auto res = h.sink.Get("/fragments/compliance/summary");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // The blanket deny owns the response: the grant gate was never asked.
+    CHECK(h.perm_calls.empty());
+}
+
+TEST_CASE("/fragments/compliance/{id}: the fleet-read gate is the sole gate, a denial stops the render",
+          "[compliance][security][authz]") {
+    ComplianceHarness h;
+    h.fleet_admitted = false;
+
+    auto res = h.sink.Get("/fragments/compliance/pol_1");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.fleet_read_calls == 1);
+    // Never stacked with perm_fn_ (routed-concerns RBAC row).
+    CHECK(h.perm_calls.empty());
+    CHECK(res->body.find("No compliance data") == std::string::npos);
+    for (const auto& c : h.audit_calls)
+        CHECK(c.action != "compliance.agent_statuses.view");
+}
+
+TEST_CASE("/fragments/compliance/{id}: an unwired fleet_read_fn is 503, never an ungated render",
+          "[compliance][security][authz]") {
+    ComplianceHarness h{nullptr, /*wire_fleet_read=*/false};
+
+    auto res = h.sink.Get("/fragments/compliance/pol_1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("No compliance data") == std::string::npos);
+    // perm_fn_ would have admitted: the route must not fall back to it.
+    CHECK(h.perm_calls.empty());
+}
+
+TEST_CASE("/fragments/compliance/{id}: nothing read, nothing audited (null store)",
+          "[compliance][security][authz]") {
+    ComplianceHarness h;
+
+    auto res = h.sink.Get("/fragments/compliance/pol_1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    for (const auto& c : h.audit_calls)
+        CHECK(c.action != "compliance.agent_statuses.view");
+}
+
+TEST_CASE("/fragments/compliance/{id}: confined to the caller's scope, audited with the row count",
+          "[compliance][rest][pg][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value(), "Confined Policy"));
+    REQUIRE(pol.has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-in", "compliant").has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-out", "non_compliant").has_value());
+
+    ComplianceHarness h{&store};
+    h.fleet_scope = std::unordered_set<std::string>{"agent-in"};
+
+    auto res = h.sink.Get("/fragments/compliance/" + pol.value());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("agent-in") != std::string::npos);
+    CHECK(res->body.find("agent-out") == std::string::npos);
+
+    const AuditCall* seen = nullptr;
+    for (const auto& c : h.audit_calls)
+        if (c.action == "compliance.agent_statuses.view")
+            seen = &c;
+    REQUIRE(seen != nullptr);
+    CHECK(seen->result == "success");
+    CHECK(seen->target_type == "Policy");
+    CHECK(seen->target_id == pol.value());
+    CHECK(seen->detail.find("agents=1") != std::string::npos);
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+}
+
+TEST_CASE("/fragments/compliance/{id}: an audit-persist failure flags the header and still renders",
+          "[compliance][rest][pg][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value(), "Audit Flag Policy"));
+    REQUIRE(pol.has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "compliant").has_value());
+
+    ComplianceHarness h{&store};
+    h.audit_ok = false;
+
+    auto res = h.sink.Get("/fragments/compliance/" + pol.value());
+    REQUIRE(res);
+    CHECK(res->status == 200); // dashboard posture: proceed, flag
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("agent-1") != std::string::npos);
 }

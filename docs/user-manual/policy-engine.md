@@ -434,14 +434,18 @@ Both forms produce a 201 with `{"id": "<fragment-id>", "status": "created"}`.
 
 ### HTMX Fragments
 
-> These dashboard fragments are **not** `Policy:*`-gated — they resolve a session and
-> nothing more (`compliance_routes.cpp`). That is a known gap, tracked as #4042; the
-> per-route permissions above apply to the `/api/` surface only.
+> These fragments carry the same gate as their REST v1 twins. After a
+> service-scoped-token deny, the summary requires `Policy:Read` (a global grant: a holder
+> whose grant arrives only through a management group is refused with 403). The
+> per-policy detail uses the fleet-read gate as its only gate, lists only the devices in
+> the caller's scope, and writes a `compliance.agent_statuses.view` audit row per open. If
+> that row cannot be persisted the page still renders and the response carries
+> `Sec-Audit-Failed: true` (the REST twin refuses with 503 instead).
 
-| Route | Description |
-|---|---|
-| `/fragments/compliance/summary` | Compliance dashboard summary fragment |
-| `/fragments/compliance/{policy_id}` | Per-policy compliance detail fragment |
+| Route | Gate | Description |
+|---|---|---|
+| `/fragments/compliance/summary` | `Policy:Read` | Compliance dashboard summary fragment |
+| `/fragments/compliance/{policy_id}` | fleet-read `Policy:Read`, confined, audited | Per-policy compliance detail fragment |
 
 ---
 

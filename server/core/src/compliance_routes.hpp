@@ -19,6 +19,7 @@
 
 #include <httplib.h>
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -98,12 +99,17 @@ private:
     // -- Fragment renderers (called by route handlers) -------------------------
 
     std::string render_compliance_summary_fragment();
-    std::string render_compliance_detail_fragment(const std::string& policy_id);
+    /// `scope` is the caller's admitted visible set (nullopt = whole fleet).
+    /// `rows_read` is set to the number of agent rows read when the store
+    /// answered (the caller audits that read) and left empty otherwise.
+    std::string render_compliance_detail_fragment(const std::string& policy_id,
+                                                  const authz::VisibleSet& scope,
+                                                  std::optional<std::size_t>& rows_read);
 
-    // guardian-confinement-2298 PR3 §3e: both compliance fragments below are
-    // auth_fn_-only (no perm_fn_ at all) and render per-agent compliance rows
-    // fleet-wide plus policy scope expressions — no per-target parameter to
-    // scope against. Same shape/ordering/throw-safety contract as
+    // guardian-confinement-2298 PR3 §3e: blanket service-scoped-token deny for
+    // the two compliance fragments, ahead of their grant gates (#4042:
+    // summary = perm_fn_(Policy,Read); detail = fleet_read_fn_(Policy,Read),
+    // confined and audited). Same shape/ordering/throw-safety contract as
     // GuardianRoutes::deny_service_scoped_ (JSON A4 body even though the
     // caller is an HTMX fragment route — that's the established precedent
     // for this route class, not a fragment-specific shape).
