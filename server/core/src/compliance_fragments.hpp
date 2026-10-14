@@ -159,7 +159,7 @@ inline std::string render_summary(const SummaryView& v) {
     }
     for (const auto& p : v.policies) {
         const int pct = p.total > 0 ? static_cast<int>(p.compliant * 100 / p.total) : 0;
-        // An empty or dot-only id cannot be placed in a link (browsers collapse
+        // An empty, `.` or `..` id cannot be placed in a link (browsers collapse
         // dot segments, and the id feeds /api/policies/<id> paths in the page
         // script), so such a row is shown without any action.
         const bool addressable = path_segment_ok(p.id);

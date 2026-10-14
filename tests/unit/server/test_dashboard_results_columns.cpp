@@ -102,6 +102,13 @@ struct DashboardResultsColumnsTestAccess {
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, text_query, definition_id);
     }
+    std::string render_filtered(const std::string& command_id, const std::string& plugin,
+                                const std::vector<FacetFilter>& filters,
+                                const std::string& definition_id = {}) {
+        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+                                     /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50, filters,
+                                     /*text_query=*/"", definition_id);
+    }
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
                                    const std::string& username = {}) {
         return routes.render_filter_bar(command_id, plugin, /*definition_id=*/{},
@@ -850,6 +857,68 @@ TEST_CASE("render_results: request-reflected values are query-encoded in the sor
             CHECK(std::count(u.begin(), u.end(), '#') == 0);
             CHECK(std::count(u.begin(), u.end(), '&') == 7);
         }
+    }
+}
+
+
+TEST_CASE("render_results: the Create Group link carries each filter value as one encoded value",
+          "[pg][server][dashboard][render_results][url_path_segment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string hostile = "a&b=c#d/../e";
+    StoredResponse r;
+    r.instruction_id = "cmd-fg-1";
+    r.agent_id = "agent-1";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.plugin = "registry";
+    r.output = hostile;
+    rs.store(r);
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(nullptr, &rs);
+    const std::string html =
+        acc.render_filtered("cmd-fg-1", "registry", {FacetFilter{.col_idx = 0, .value = hostile}});
+    const auto urls = yuzu::test::url_attr_values(html);
+
+    const std::string want = "/fragments/create-group-form?command_id=cmd-fg-1&plugin=registry"
+                             "&f_output=" +
+                             yuzu::server::url_query_value(hostile);
+    CHECK(yuzu::test::has_url(urls, want));
+    for (const auto& u : urls) {
+        CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+        if (u.rfind("/fragments/create-group-form", 0) == 0)
+            CHECK(std::count(u.begin(), u.end(), '&') == 2);
+    }
+}
+
+TEST_CASE("render_results: the chart URL encodes the command id and is omitted for a dot-only one",
+          "[pg][server][dashboard][render_results][url_path_segment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    auto def = make_list_profiles_definition();
+    def.visualization_spec = R"([{"type":"bar","processor":"count_by"}])";
+    auto created = is.create_definition(def);
+    REQUIRE(created.has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+
+    {
+        const auto html = acc.render_filtered("cmd 1/x", "registry", {}, *created);
+        const auto urls = yuzu::test::url_attr_values(html);
+        CHECK(yuzu::test::has_url(urls, "/api/v1/executions/cmd%201%2Fx/visualization?definition_id=" +
+                                            yuzu::server::url_query_value(*created) + "&index=0"));
+    }
+    for (const std::string id : {std::string(".."), std::string("."), std::string("%2e%2e")}) {
+        const auto html = acc.render_filtered(id, "registry", {}, *created);
+        CHECK(html.find("yuzu-chart-card") == std::string::npos);
     }
 }
 

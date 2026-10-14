@@ -413,8 +413,6 @@ TEST_CASE("settings enrollment: bulk approve/deny with the store down are 503 + 
     CHECK(h.only("enrollment.bulk_deny").result == "failure");
 }
 
-// A token still in date is Active, and its pill must never wear the green OK colour (role-ok),
-// which would assert health for a credential an operator is meant to watch.
 // ── Pending-agent row URLs: the agent-supplied id is ONE encoded path segment ──
 
 namespace {
@@ -437,6 +435,10 @@ TEST_CASE("settings pending: a hostile agent id reaches Approve/Deny only as one
         auto page = h.sink.Get("/fragments/settings/pending");
         REQUIRE(page);
         const auto urls = yuzu::test::url_attr_values(page->body);
+
+        // The Deny control says Deny and confirms Deny; it is the only confirm on the row.
+        CHECK(page->body.find("hx-confirm=\"Deny agent enrollment?\"") != std::string::npos);
+        CHECK(page->body.find("Forget") == std::string::npos);
 
         const std::string base = "/api/settings/pending-agents/" + url_path_segment(id);
         REQUIRE(yuzu::test::has_url(urls, base + "/approve"));
@@ -498,6 +500,8 @@ TEST_CASE("settings pending: an empty-looking dot-only agent id gets no row acti
     }
 }
 
+// A token still in date is Active, and its pill must never wear the green OK colour (role-ok),
+// which would assert health for a credential an operator is meant to watch.
 TEST_CASE("settings enrollment: the Active token pill is not the green OK pill",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;

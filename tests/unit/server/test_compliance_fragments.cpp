@@ -5,6 +5,7 @@
  */
 
 #include "compliance_fragments.hpp"
+#include "url_attr_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -285,7 +286,6 @@ TEST_CASE("policy fragments: Delete is disabled while a policy uses the fragment
 
 // ── URL path-segment encoding (policy id in hx-get / data-id) ──────────────
 
-#include "url_attr_scan.hpp"
 
 namespace {
 ch::PolicyRow row_with_id(const std::string& id) {

@@ -2579,7 +2579,7 @@ std::string DashboardRoutes::render_results(
     }
     html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML">)";
     // command_id is request-supplied and becomes a path segment below: no chart
-    // URL for an empty or dot-only value (browsers collapse dot segments).
+    // URL for an empty, `.` or `..` value (browsers collapse dot segments).
     if (chart_count > 0 && path_segment_ok(command_id)) {
         html += R"(<div class="yuzu-chart-deck">)";
         for (int i = 0; i < chart_count; ++i) {

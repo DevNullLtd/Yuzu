@@ -1915,7 +1915,7 @@ std::string SettingsRoutes::render_pending_fragment() {
                     "<td>";
 
             if (a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id)) {
-                // The id is empty or only dots: a browser collapses a dot-only
+                // The id is empty, `.` or `..`: a browser collapses a dot-only
                 // path segment, so no per-row URL can be built for it. Offer no
                 // row action (the bulk buttons below still cover the queue).
                 html += "<span class=\"muted\">identifier not supported for row actions</span>";
@@ -2326,7 +2326,7 @@ std::string SettingsRoutes::render_updates_fragment() {
 
             // platform/arch/version are operator-uploaded path segments: encode
             // each, and offer no rollout/delete URL when one is empty or only
-            // dots (a browser collapses a dot segment).
+            // `.`/`..` (a browser collapses a dot segment).
             const bool pkg_actionable = path_segment_ok(pkg.platform) &&
                                         path_segment_ok(pkg.arch) && path_segment_ok(pkg.version);
             std::string rollout_cell;
@@ -6061,7 +6061,7 @@ void SettingsRoutes::register_routes(
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
-    // A pending-agent id that is empty or only dots can never be addressed by a
+    // A pending-agent id that is empty, `.` or `..` can never be addressed by a
     // browser-built URL (dot segments collapse), so an API call carrying one is
     // refused outright rather than matched against the store.
     auto refuse_unaddressable_agent_id = [this](const httplib::Request& req,

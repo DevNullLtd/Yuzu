@@ -2528,7 +2528,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                  html_escape(lower(d.host)) + "\"><td class=\"" + std::string(d.online ? "" : "gp-mute") +
                  "\">" +
                  // agent_id is agent-supplied: one encoded path segment, and no link
-                 // at all for an empty or dot-only id (browsers collapse those).
+                 // at all for an empty, `.` or `..` id (browsers collapse those).
                  (path_segment_ok(d.agent_id)
                       ? "<a href=\"/viz/host/" + url_path_segment(d.agent_id) +
                             "\" title=\"Open host detail\">" + html_escape(d.host) + "</a>"
