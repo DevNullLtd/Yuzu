@@ -1111,6 +1111,11 @@ struct McpTestServer {
     /// pre-existing test on the "store unavailable" path.
     yuzu::server::PreflightRunStore* preflight_run_store_for_test{nullptr};
 
+    /// Network discovery read twin (list_discovered_devices) — optionally
+    /// inject the read seam so the tool runs against fixtures, no Postgres.
+    /// Empty keeps every other test on the "discovery store unavailable" path.
+    yuzu::server::DiscoveredDevicesReadFn discovered_devices_reader_for_test{};
+
     /// #2146 Batch B2 — optionally wire a real ResultSetStore so the 12
     /// result-set MCP tools can be exercised end-to-end against live
     /// Postgres state, same setter-idiom pattern as
@@ -1627,6 +1632,8 @@ private:
         // the two above — wire before the handlers are built.
         if (preflight_run_store_for_test)
             mcp.set_preflight_run_store(preflight_run_store_for_test);
+        if (discovered_devices_reader_for_test)
+            mcp.set_discovered_devices_reader(discovered_devices_reader_for_test);
         // #2146 Batch B2: result_set_store ALSO rides a setter, same pattern
         // as preflight_run_store immediately above — wire before the
         // handlers are built.
@@ -34163,4 +34170,143 @@ TEST_CASE("MCP B5: software-deployment mutations are tier-denied below supervise
         R"("params":{"name":"list_software_deployments","arguments":{}}})");
     REQUIRE(list_res);
     CHECK(list_res->status == 403);
+}
+
+// ── Network discovery read twin: list_discovered_devices ───────────────────
+// Fixture reader, no Postgres: the tool and the REST/fragment twins all sit on
+// the same DiscoveredDevicesReadFn seam and discovered_devices_json builder.
+
+namespace {
+
+yuzu::server::DiscoveredDevicesPage discovered_fixture_page() {
+    yuzu::server::DiscoveredDevicesPage page;
+    yuzu::server::DiscoveredDevice d;
+    d.id = 7;
+    d.ip_address = "10.0.0.5";
+    d.mac_address = "aa:bb:cc:dd:ee:ff";
+    d.hostname = "printer-1";
+    d.subnet = "10.0.0.0/24";
+    d.discovered_by = "agent-a";
+    d.discovered_at = 1000;
+    d.last_seen = 2000;
+    d.managed = true; // must never surface: nothing maintains the flag
+    d.agent_id = "stale-agent";
+    page.devices.push_back(d);
+    page.summary = {.total = 9, .subnets = 2};
+    page.truncated = true;
+    return page;
+}
+
+constexpr const char* kListDiscoveredCall =
+    R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_discovered_devices","arguments":)";
+
+} // namespace
+
+TEST_CASE("MCP list_discovered_devices: returns the shared builder shape, audited, "
+          "passing subnet and a clamped limit to the seam",
+          "[mcp][integration][network][discovery]") {
+    McpTestServer ts;
+    std::string seen_subnet;
+    int seen_limit = -1;
+    ts.discovered_devices_reader_for_test =
+        [&](const std::string& subnet, int limit)
+        -> std::expected<yuzu::server::DiscoveredDevicesPage, std::string> {
+        seen_subnet = subnet;
+        seen_limit = limit;
+        return discovered_fixture_page();
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(std::string(kListDiscoveredCall) +
+                       R"({"subnet":"10.0.0.0/24","limit":9999}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(seen_subnet == "10.0.0.0/24");
+    CHECK(seen_limit == 500);
+    auto payload =
+        nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload == yuzu::server::discovered_devices_json(discovered_fixture_page()));
+    REQUIRE(payload["data"].size() == 1);
+    CHECK_FALSE(payload["data"][0].contains("managed"));
+    CHECK_FALSE(payload["data"][0].contains("agent_id"));
+    CHECK(payload["truncated"] == true);
+    CHECK(payload["summary"]["total"] == 9);
+    CHECK_FALSE(payload.contains("audit_persisted"));
+    bool saw_domain = false, saw_generic = false;
+    for (const auto& a : ts.audit_log) {
+        saw_domain = saw_domain || a == "network.discovered.view|success";
+        saw_generic = saw_generic || a == "mcp.list_discovered_devices|success";
+    }
+    CHECK(saw_domain);
+    CHECK(saw_generic);
+}
+
+TEST_CASE("MCP list_discovered_devices: a service-scoped token is denied before the seam",
+          "[mcp][integration][network][discovery][security]") {
+    McpTestServer ts;
+    bool reached = false;
+    ts.discovered_devices_reader_for_test =
+        [&](const std::string&, int) -> std::expected<yuzu::server::DiscoveredDevicesPage, std::string> {
+        reached = true;
+        return discovered_fixture_page();
+    };
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(std::string(kListDiscoveredCall) + "{}}}");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(reached);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "network.discovered.view|success");
+}
+
+TEST_CASE("MCP list_discovered_devices: a store fault is a retryable error, never an empty list",
+          "[mcp][integration][network][discovery]") {
+    McpTestServer ts;
+    ts.discovered_devices_reader_for_test =
+        [](const std::string&, int) -> std::expected<yuzu::server::DiscoveredDevicesPage, std::string> {
+        return std::unexpected("discovery read degraded");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(std::string(kListDiscoveredCall) + "{}}}");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "network.discovered.view|success");
+}
+
+TEST_CASE("MCP list_discovered_devices: invalid arguments are refused and an unwired seam is "
+          "reported as unavailable",
+          "[mcp][integration][network][discovery]") {
+    {
+        McpTestServer ts;
+        bool reached = false;
+        ts.discovered_devices_reader_for_test =
+            [&](const std::string&, int) -> std::expected<yuzu::server::DiscoveredDevicesPage, std::string> {
+            reached = true;
+            return discovered_fixture_page();
+        };
+        ts.start("readonly");
+        for (const char* args : {R"({"limit":0}}})", R"({"limit":-3}}})", R"({"limit":"5"}}})",
+                                 R"({"limit":2.5}}})"}) {
+            auto res = ts.call(std::string(kListDiscoveredCall) + args);
+            REQUIRE(res);
+            CHECK(nlohmann::json::parse(res->body).contains("error"));
+        }
+        CHECK_FALSE(reached);
+    }
+    {
+        McpTestServer ts; // no reader wired
+        ts.start("readonly");
+        auto res = ts.call(std::string(kListDiscoveredCall) + "{}}}");
+        REQUIRE(res);
+        CHECK(nlohmann::json::parse(res->body).contains("error"));
+    }
 }
