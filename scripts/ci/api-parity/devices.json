@@ -129,6 +129,14 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/home/summary",
+    "capability_id": "get.fragments-home-summary",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.fragments-hardware-list,get.api-approvals-pending-count,get.fragments-executions,get.api-compliance"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/settings/management-groups",
     "capability_id": "get.fragments-settings-management-groups",
     "rest_v1_twin": {

@@ -5082,6 +5082,17 @@ The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin r
 | `dex.device.perf.query` | An operator loads a device performance sparkline panel (DEX device drill-down). Execute-gated; detail records the target agent and command id. |
 | `dex.device.procperf.query` | An operator loads a device's per-application panel (usage-class telemetry — deliberately a separate verb from the machine-health `dex.device.perf.query` so usage reads stay separately countable). Execute-gated; detail records the target agent and command id. |
 
+### Home
+
+`GET /home` is the landing worklist: a four-cell readout (devices online, policy checks passing, failed executions in the last 24 hours, approvals waiting), the estate state donut with a by-platform bar, and a Needs attention list. It is reached from the Yuzu logo; it has no sidebar entry, and `/` stays the Dashboard console. Home never polls: each view reads once, and the Refresh link reloads it.
+
+Every figure is a typed read of an existing source and keeps its own gate. A figure that cannot be shown says why (no access, limited to a group of devices, could not be read) and is never rendered as 0. "Nothing needs attention" appears only when every contributing figure was read successfully. The enrolment row is shown to administrators only.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/home` | The Home page (signed-in session; otherwise redirects to `/login`). |
+| `GET` | `/fragments/home/summary` | The readout, Estate state and Needs attention panels (HTMX). Per-figure gates: `Inventory:Read`, `Policy:Read`, `Execution:Read`, `Approval:Read`. Always answers `200`; a refusal becomes a panel note. A service-scoped token is refused first (audit action `home.fragment.access_denied`). Accounts limited to a group of devices see device figures narrowed to their group and a "limited" note for fleet-wide compliance and failed executions. |
+
 ---
 
 ## Agent OTA pull bounds
