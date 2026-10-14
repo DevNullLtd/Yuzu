@@ -2952,10 +2952,10 @@ MCP twins).
 
 **The audit trail (#5771).** `AuditLog:Read` was the one evidence store left
 open by default: with RBAC off, any signed-in session read the full trail
-through six surfaces — `GET /api/audit` (which also returns the actor's role
+through seven surfaces — `GET /api/audit` (which also returns the actor's role
 and source IP), `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`,
 `GET /api/v1/engine-principals/audit/no-admin`, MCP `query_audit_log` /
-`audit_engine_no_admin`, and the `yuzu://audit/recent` resource. All six gate
+`audit_engine_no_admin`, and the `yuzu://audit/recent` resource. All seven gate
 on the same `("AuditLog", "Read")` pair through `require_permission`, so the
 single floor entry covers them; there is no per-route change and no second
 list. Engine principals and service-scoped tokens were already refused with

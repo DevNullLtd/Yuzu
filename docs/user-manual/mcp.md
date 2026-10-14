@@ -667,7 +667,8 @@ for the tool to execute.
 > op (approver must not be the submitter).
 >
 > The three **read** tools (`list_engine_principals`, `get_engine_principal`,
-> `audit_engine_no_admin`) are plain `Read`-class RBAC checks and, like every
+> `audit_engine_no_admin`) are plain `Read`-class RBAC checks (`audit_engine_no_admin` gates on `AuditLog:Read`,
+> admin-only while RBAC is disabled) and, like every
 > other read-only MCP tool, are available on **every** tier including
 > `readonly` — they are **not** restricted to `supervised` and are **not**
 > approval-gated.

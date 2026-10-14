@@ -11396,7 +11396,7 @@ The first three gate `GuaranteedState:Read` and are not audited (cohort posture)
 |---|---|
 | `yuzu://server/health` | Server health status |
 | `yuzu://compliance/fleet` | Fleet-wide compliance data |
-| `yuzu://audit/recent` | Recent audit events |
+| `yuzu://audit/recent` | Recent audit events (`AuditLog:Read`; admin-only while RBAC is disabled) |
 
 **Prompts:**
 

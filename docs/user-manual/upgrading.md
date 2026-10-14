@@ -40,6 +40,24 @@ the Settings link is hidden for every user, administrators included, whenever
 unaffected) or wait for the upgrade to finish. Tabs opened before the upgrade keep
 the old shell until reloaded. No configuration change is needed.
 
+## Behaviour change: the audit log is admin-only while RBAC is off, and audit reads are bounded (#5771)
+
+**Audit trail access.** With role-based access control switched off (the shipped
+default), only administrators can now read the audit log. A non-admin signed-in
+user or API token gets `403` on `GET /api/audit`, `GET /api/v1/audit`,
+`GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`,
+the MCP tools `query_audit_log` and `audit_engine_no_admin`, and the
+`yuzu://audit/recent` resource. Previously any signed-in user could read it.
+To give a non-admin the trail, enable RBAC and assign a role that holds
+`AuditLog:Read`. Admins and RBAC-enabled `AuditLog:Read` holders are unchanged.
+
+**Bounded audit reads.** `GET /api/audit` now clamps `limit` to 1000 and returns
+`400` for an `offset` above 10000, matching `GET /api/v1/audit` and the MCP tool.
+Callers that paged deeper or asked for more than 1000 rows should narrow the
+window with `since`/`until`. MCP `query_audit_log` now rejects a wrong-typed or
+negative filter with an invalid-params error (`-32602`) instead of silently
+ignoring it.
+
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
 **What changed.** Deleting (deactivating) an account and demoting a local `admin` account now go through
