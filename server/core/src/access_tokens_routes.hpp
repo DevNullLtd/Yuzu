@@ -80,6 +80,8 @@ struct Deps {
     /// Revoked principals: the `engine_principal.revoke` audit detail ("" = none recorded).
     /// Only called when the caller holds AuditLog:Read.
     std::function<std::expected<RevokeDetail, std::string>(const std::string&)> revoke_detail_fn;
+    /// Names of the roles an engine principal may hold: non-system roles only.
+    Read<std::vector<std::string>> custom_roles_fn;
 };
 
 /// Throws `std::invalid_argument` when any `Deps` member is unbound.

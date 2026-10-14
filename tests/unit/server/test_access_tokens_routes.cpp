@@ -89,6 +89,7 @@ struct Harness {
     std::expected<std::vector<PrincipalRole>, std::string> roles{std::vector<PrincipalRole>{}};
     std::expected<access_tokens::RevokeDetail, std::string> revoke_detail{access_tokens::RevokeDetail{}};
     bool rbac{false};  // RBAC view shown to the page (write controls follow it)
+    std::expected<std::vector<std::string>, std::string> custom_roles{std::vector<std::string>{}};
     yuzu::server::test::TestRouteSink sink;
 
     Harness() {
@@ -143,6 +144,7 @@ struct Harness {
             ++revoke_calls;
             return revoke_detail;
         };
+        d.custom_roles_fn = [this]() { return custom_roles; };
         return d;
     }
     void wire() { access_tokens::register_access_tokens_routes(sink, deps()); }
@@ -162,6 +164,7 @@ TEST_CASE("tokens routes: registration fails fast when any dependency is unbound
         [](auto& d) { d.active_credentials_fn = nullptr; },
         [](auto& d) { d.principal_roles_fn = nullptr; },
         [](auto& d) { d.revoke_detail_fn = nullptr; },
+        [](auto& d) { d.custom_roles_fn = nullptr; },
     };
     for (const auto& f : unbind) {
         Harness h;
@@ -700,6 +703,56 @@ TEST_CASE("tokens routes: every fragment is never cached and varies on the cooki
     }
 }
 
+TEST_CASE("principals routes: capability is a Security:Write probe only when RBAC is enforced",
+          "[access-tokens][routes][writes]") {
+    {
+        Harness h;  // RBAC off: the admin gate already proved the role - no extra probe
+        h.wire();
+        const auto list = h.sink.dispatch("GET", "/fragments/access/principals/list");
+        const auto det = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+        REQUIRE(list);
+        REQUIRE(det);
+        CHECK_THAT(list->body, ContainsSubstring("data-tk=\"principal-new\""));
+        CHECK_THAT(det->body, ContainsSubstring("data-tk=\"principal-mint\""));
+        CHECK(h.perm_calls.empty());
+    }
+    {
+        Harness h;
+        h.rbac = true;
+        h.perm_deny.insert("Security:Write");
+        h.wire();
+        const auto list = h.sink.dispatch("GET", "/fragments/access/principals/list");
+        const auto det = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+        REQUIRE(list);
+        REQUIRE(det);
+        CHECK_THAT(list->body, !ContainsSubstring("principal-new"));
+        CHECK_THAT(det->body, !ContainsSubstring("principal-mint"));
+        CHECK_THAT(det->body, ContainsSubstring("Changing principals needs the Security:Write permission."));
+        // One probe per fragment render, nothing per row.
+        CHECK(h.perm_calls.size() == 2);
+        CHECK(list->status == 200);
+        CHECK(det->status == 200);
+    }
+}
+
+TEST_CASE("principals routes: Assign offers custom roles only; an unreadable role list disables it",
+          "[access-tokens][routes][writes]") {
+    Harness h;
+    h.custom_roles = std::vector<std::string>{"Auditor"};
+    h.wire();
+    auto res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("<option value=\"Auditor\">Auditor</option>"));
+
+    Harness bad;
+    bad.custom_roles = std::unexpected(std::string("rbac exploded"));
+    bad.wire();
+    res = bad.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("disabled title=\"No custom roles exist."));
+    CHECK_THAT(res->body, !ContainsSubstring("exploded"));
+}
+
 TEST_CASE("tokens routes: the write glue is served uncached as JavaScript", "[access-tokens][routes][writes]") {
     Harness h;
     h.wire();
@@ -709,4 +762,19 @@ TEST_CASE("tokens routes: the write glue is served uncached as JavaScript", "[ac
     CHECK(res->get_header_value("Content-Type") == "application/javascript; charset=utf-8");
     CHECK_THAT(res->get_header_value("Cache-Control"), ContainsSubstring("no-store"));
     CHECK_THAT(res->body, ContainsSubstring("reveal-stored"));
+}
+
+TEST_CASE("tokens routes: server.cpp binds the real custom-role closure for the write controls",
+          "[access-tokens][routes][writes]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    namespace fs = std::filesystem;
+    std::ifstream in(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp", std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto at = text.find("register_access_tokens_routes(");
+    REQUIRE(at != std::string::npos);
+    const auto end = text.find("#2542 PR-5: wraps AuthRoutes::deny_service_scoped_session", at);
+    REQUIRE(end != std::string::npos);
+    CHECK_THAT(text.substr(at, end - at), ContainsSubstring("if (!r.is_system)"));
 }

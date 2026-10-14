@@ -106,8 +106,10 @@ struct Attr {
 };
 
 std::string act(const char* tk, const std::vector<Attr>& attrs, const char* label, bool danger = false,
-                const char* disabled_reason = nullptr) {
-    std::string out = std::string("<button type=\"button\" class=\"btn link") + (danger ? " danger" : "") +
+                const char* disabled_reason = nullptr, bool solid = false) {
+    std::string out = std::string("<button type=\"button\" class=\"") +
+                      (solid ? (danger ? "btn btn-sm btn-danger" : "btn btn-sm")
+                             : (danger ? "btn link danger" : "btn link")) +
                       "\" data-tk=\"" + tk + "\"";
     for (const auto& a : attrs)
         out += std::string(" ") + a.name + "=\"" + html_escape(a.value) + "\"";
@@ -131,6 +133,14 @@ std::string need_note(bool rbac_enforced, const char* what, const char* perm) {
 }
 
 bool any_action(const TokenCaps& c) { return c.rotate || c.revoke; }
+
+// "New principal" (or the sentence saying what it needs). Rows carry no actions: every
+// principal action lives in the detail panel, where the credential facts they depend on are read.
+std::string principals_toolbar(const PrincipalsView& v) {
+    if (v.can_write)
+        return "<div class=\"pb\">" + primary_btn("principal-new", "New principal") + "</div>";
+    return "<div class=\"pb\">" + need_note(v.rbac_enforced, "Creating principals", "Security:Write") + "</div>";
+}
 
 // Rotation grace window: a second rotate by the same operator inside it returns the same
 // successor secret (ApiTokenStore::kRotationGraceSecs). The server stays authoritative.
@@ -181,6 +191,47 @@ std::string token_actions(const ApiToken& t, const std::vector<ApiToken>& all, c
     return out;
 }
 
+// Principal actions, drawn in the detail panel from the credential facts it just read.
+std::string principal_actions(const PrincipalDetail& d) {
+    const auto& p = d.row;
+    if (p.lifecycle_state != "active" || !valid_principal_id(p.principal_id))
+        return {};
+    if (!d.can_write)
+        return "<div class=\"pb\">" + need_note(d.rbac_enforced, "Changing principals", "Security:Write") + "</div>";
+    const std::vector<Attr> id{{"data-principal-id", p.principal_id}};
+    const auto solid = [&](const char* tk, const char* label, bool danger = false) {
+        return act(tk, id, label, danger, nullptr, true);
+    };
+    std::string out = "<div class=\"btns\">";
+    if (const auto* creds = std::get_if<std::vector<ApiToken>>(&d.credentials)) {
+        const ApiToken* succ = nullptr;
+        for (const auto& c : *creds)
+            if (!c.supersedes_token_id.empty()) {
+                succ = &c;
+                break;
+            }
+        if (creds->empty()) {
+            out += solid("principal-mint", "Mint credential");
+        } else if (succ && safe_token_id(succ->token_id)) {
+            out += act("principal-confirm", {{"data-principal-id", p.principal_id}, {"data-token-id", succ->token_id}},
+                       "Confirm credential", false, nullptr, true);
+            // Lost the response to the rotate? Within the grace window the same call returns the
+            // same secret; after it the only way out is to revoke the successor and rotate again.
+            if (creds->size() == 2 && d.now - succ->created_at < kRotationGraceSecs)
+                out += solid("principal-rotate", "Rotate credential");
+        } else if (creds->size() == 1) {
+            out += solid("principal-rotate", "Rotate credential");
+        }
+    } else {
+        for (const auto& [tk, label] : {std::pair{"principal-mint", "Mint credential"},
+                                        std::pair{"principal-rotate", "Rotate credential"}})
+            out += act(tk, id, label, false, "Credentials could not be read.", true);
+    }
+    out += solid("principal-transfer", "Transfer owner");
+    out += solid("principal-revoke", "Revoke principal", true);
+    return out + "</div>";
+}
+
 const std::string kRetryTokens = "data-tk=\"reload\" data-target=\"tokens-body\"";
 const std::string kRetryPrincipals = "data-tk=\"reload\" data-target=\"principals-body\"";
 
@@ -219,6 +270,12 @@ bool safe_token_id(std::string_view id) {
     if (!alnum(id.front()))
         return false;  // also rules out "." and ".."
     return std::ranges::all_of(id, [&](char c) { return alnum(c) || c == '.' || c == '_' || c == '-'; });
+}
+
+std::string principal_slug(std::string_view principal_id) {
+    if (!valid_principal_id(principal_id))
+        return {};
+    return std::string(principal_id.substr(7));  // after "engine:"
 }
 
 bool valid_principal_id(std::string_view id) {
@@ -301,12 +358,14 @@ std::string render_principals_list(const std::variant<PrincipalsView, Unavailabl
                       std::to_string(std::min(view->rows.size(), kRenderCap)) + "\" data-check=\"" +
                       (view->can_run_check ? "1" : "0") + "\">";
     if (view->rows.empty())
-        return out + empty_box("No engine principals.",
-                               "Engine principals are named identities for automation and agentic workers.") +
+        return out + principals_toolbar(*view) +
+               empty_box("No engine principals.",
+                         "Engine principals are named identities for automation and agentic workers.") +
                "</div>";
 
     const auto* grants = std::get_if<std::vector<PrincipalRole>>(&view->roles);
     const std::size_t shown = std::min(view->rows.size(), kRenderCap);
+    out += principals_toolbar(*view);
     out += "<div class=\"tw\"><table><thead><tr><th>Principal</th><th>Owner</th><th>Roles</th>"
            "<th>State</th></tr></thead><tbody>";
     for (std::size_t i = 0; i < shown; ++i) {
@@ -386,7 +445,7 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
         }
         out += kv("Revocation detail", detail);
     }
-    out += "</div>";
+    out += "</div>" + principal_actions(d);
 
     // Credentials: active rows only, as the store's checked read defines them.
     if (const auto* creds = std::get_if<std::vector<ApiToken>>(&d.credentials)) {
@@ -409,14 +468,47 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
     out += "</section>";
 
     // Roles: Unavailable is never "No roles".
-    out += "<section class=\"panel\"><div class=\"hd\"><h2>Roles</h2></div>";
+    const bool can_edit_roles = d.can_write && valid_principal_id(p.principal_id);
+    const std::string slug = principal_slug(p.principal_id);
+    out += "<section class=\"panel\"><div class=\"hd\"><h2>Roles</h2>";
+    if (can_edit_roles && active) {
+        out += "<div class=\"end\">";
+        if (d.custom_roles.empty()) {
+            out += act("role-assign", {{"data-slug", slug}, {"data-principal-id", p.principal_id}}, "Assign role", false,
+                       "No custom roles exist. Engine principals can only hold custom roles; built-in roles are refused.",
+                       true);
+        } else {
+            out += act("role-assign", {{"data-slug", slug}, {"data-principal-id", p.principal_id}}, "Assign role", false,
+                       nullptr, true);
+        }
+        out += "</div>";
+    }
+    out += "</div>";
+    if (can_edit_roles && active && !d.custom_roles.empty()) {
+        out += "<select id=\"role-options\" hidden>";
+        for (const auto& r : d.custom_roles)
+            out += "<option value=\"" + esc(r) + "\">" + esc(r) + "</option>";
+        out += "</select>";
+    } else if (can_edit_roles && active) {
+        out += "<div class=\"pb\"><p class=\"hint\">No custom roles exist. Engine principals can only hold custom roles; "
+               "built-in roles are refused.</p></div>";
+    }
     if (const auto* roles = std::get_if<std::vector<PrincipalRole>>(&d.roles)) {
         if (roles->empty()) {
             out += empty_box("No roles.", "An engine principal has no authority until a role is assigned.");
         } else {
-            out += "<div class=\"tw\"><table><thead><tr><th>Role</th></tr></thead><tbody>";
+            out += "<div class=\"tw\"><table><thead><tr><th>Role</th>" +
+                   std::string(can_edit_roles ? "<th><span class=\"sr\">Actions</span></th>" : "") + "</tr></thead><tbody>";
             for (const auto& r : *roles)
-                out += "<tr><td>" + esc(r.role_name) + "</td></tr>";
+                out += "<tr><td>" + esc(r.role_name) + "</td>" +
+                       (can_edit_roles ? "<td class=\"acts\">" +
+                                             act("role-remove",
+                                                 {{"data-slug", slug}, {"data-role", r.role_name},
+                                                  {"data-principal-id", p.principal_id}},
+                                                 "Remove", true) +
+                                             "</td>"
+                                       : std::string{}) +
+                       "</tr>";
             out += "</tbody></table></div>";
         }
     } else {

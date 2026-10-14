@@ -15787,6 +15787,15 @@ private:
                         return std::unexpected(std::string("audit store did not answer"));
                     return yuzu::server::access_tokens::revoke_detail_from(std::move(*events));
                 },
+                .custom_roles_fn = [this]() -> std::expected<std::vector<std::string>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    std::vector<std::string> names;
+                    for (const auto& r : rbac_store_->list_roles())
+                        if (!r.is_system)
+                            names.push_back(r.name);
+                    return names;
+                },
             });
 
         // Hardware record, "Tags and properties" lens: the read-only HTML twin of the

@@ -73,6 +73,8 @@ struct PageFlags {
 /// Ids that may reach a request path. Each matches (or is narrower than) the charset of the
 /// route that receives it; anything else renders without action controls.
 [[nodiscard]] bool safe_token_id(std::string_view id);  ///< `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`
+/// The bare slug of a valid engine principal id ("" when the id is not valid).
+[[nodiscard]] std::string principal_slug(std::string_view principal_id);
 
 /// True only for a cookie session whose effective role is admin. Any bearer (API, MCP,
 /// engine) or service-scoped session gets its own tokens only, as the REST twin does.
@@ -120,6 +122,8 @@ struct PrincipalsView {
     /// The caller holds AuditLog:Read, which the no-administrator check (a REST call the page
     /// script makes) needs; `data-check` tells the script whether to make it.
     bool can_run_check{false};
+    bool can_write{false};  ///< Security:Write: "New principal" is drawn only when true
+    bool rbac_enforced{false};
 };
 
 [[nodiscard]] std::string render_principals_list(const std::variant<PrincipalsView, Unavailable>& v);
@@ -134,6 +138,11 @@ struct PrincipalDetail {
     /// The revoke-history window was full: the detail shown is the oldest success within it.
     bool revoke_truncated{false};
     std::int64_t now{0};
+    bool can_write{false};  ///< Security:Write: every principal action is drawn only when true
+    bool rbac_enforced{false};
+    /// Names of the roles an engine principal may hold (non-system roles only). Empty = none
+    /// exist (or the role list could not be read): Assign is drawn disabled with the reason.
+    std::vector<std::string> custom_roles;
 };
 
 [[nodiscard]] std::string render_principal_detail(

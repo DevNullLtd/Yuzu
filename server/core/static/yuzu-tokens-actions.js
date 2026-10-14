@@ -23,12 +23,16 @@
 
   var API = '/api/v1/';
   var TOKENS = '/fragments/access/tokens/list';
+  var PRINCIPALS = '/fragments/access/principals/list';
+  var DETAIL = '/fragments/access/principals/detail';
   var DAY = 86400;
   // The server caps an MCP token at 90 days from its own clock; 2160 h plus page-measured
   // elapsed time can tip a few seconds over, so the form stops one hour short.
   var MCP_MAX_HOURS = 2159;
   var MAX_HOURS = 876000;
   var TOKEN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+  var PRINCIPAL = /^engine:[a-z0-9._-]{1,128}$/;
+  var SLUG = /^[a-z0-9._-]{1,128}$/;
   var AUDIT_FAILED = 'The change was made, but its audit record could not be saved.';
 
   var secretShown = false;
@@ -63,6 +67,11 @@
     var on = document.querySelector('#tokens-body .seg .on');
     load(TOKENS + '?state=' + (on && on.dataset.state === 'all' ? 'all' : 'active'), 'tokens-body');
   }
+  function reloadPrincipals() { load(PRINCIPALS, 'principals-body'); }
+  function reloadDetail(id) {
+    if (PRINCIPAL.test(id)) load(DETAIL + '?id=' + seg(id), 'side-principal');
+  }
+
   // ---- one-time reveal strip --------------------------------------------------------------
   function reveal(title, secret, hint) {
     var box = byId('reveal');
@@ -188,6 +197,11 @@
     if (!TOKEN_ID.test(id || '')) { flash('This row cannot be changed from this page.'); return null; }
     return API + 'tokens/' + seg(id) + (tail || '');
   }
+  function principalPath(id, tail) {
+    if (!PRINCIPAL.test(id || '')) { flash('This principal cannot be changed from this page.'); return null; }
+    return API + 'engine-principals/' + seg(id) + (tail || '');
+  }
+
   // ---- API tokens -------------------------------------------------------------------------
   function tokenNew() {
     if (blockedBySecret()) return;
@@ -281,10 +295,180 @@
     });
   }
 
+  // ---- engine principals ------------------------------------------------------------------
+  function principalNew() {
+    mutate({
+      title: 'New engine principal',
+      fields: [
+        { name: 'slug', label: 'Slug', type: 'text', maxlength: 128, required: true,
+          hint: 'Lower-case letters, digits, dot, underscore and hyphen.' },
+        { name: 'display_name', label: 'Display name', type: 'text', maxlength: 256, required: true },
+        { name: 'owner_username', label: 'Owner (username)', type: 'text', maxlength: 256, required: true },
+        { name: 'classification', label: 'Classification', type: 'select', options: [
+          { value: 'internal', label: 'Internal' }, { value: 'external', label: 'External' }] },
+        { name: 'justification', label: 'Justification', type: 'textarea', maxlength: 1024, required: true }
+      ],
+      submitLabel: 'Create',
+      validate: function (v) { return SLUG.test(v.slug.trim()) ? null : 'The slug may use a-z, 0-9, dot, underscore and hyphen, up to 128 characters.'; },
+      method: 'POST', path: API + 'engine-principals',
+      json: function (v) {
+        return { slug: v.slug.trim(), display_name: v.display_name.trim(), owner_username: v.owner_username.trim(),
+                 justification: v.justification.trim(), classification: v.classification };
+      }
+    }).then(function (r) {
+      if (!r) return;
+      flash('Engine principal created.');
+      reloadPrincipals();
+    });
+  }
+
+  // A failed mint, rotate or confirm may still have changed the credentials (a 503 after the write
+  // withholds the secret): refresh the detail so the buttons match what exists, never auto-retry.
+  function refreshOnFail(id) { return function (r) { if (r.status >= 500) reloadDetail(id); }; }
+
+  function principalMint(d) {
+    if (blockedBySecret()) return;
+    var path = principalPath(d.principalId, '/credentials');
+    if (!path) return;
+    mutate({
+      title: 'Mint credential',
+      note: 'The secret is shown once. Engine credentials are read-only MCP tokens that expire within 90 days.',
+      fields: [{ name: 'days', label: 'Lifetime (days)', type: 'text', inputmode: 'numeric', value: '90', required: true }],
+      submitLabel: 'Mint',
+      validate: function (v) { return isNaN(wholeNumber(v.days, 1, 90)) ? 'Lifetime must be 1 to 90 days.' : null; },
+      method: 'POST', path: path, onFail: refreshOnFail(d.principalId),
+      json: function (v) { return { ttl_days: parseInt(v.days, 10) }; }
+    }).then(function (r) {
+      if (!r) return;
+      showOrExplain('Engine credential minted', takeToken(r), '',
+        'The credential was minted but the response did not include it. Rotate it to get a new one.');
+      reloadPrincipals();
+      reloadDetail(d.principalId);
+    });
+  }
+
+  function principalRotate(d) {
+    if (blockedBySecret()) return;
+    var path = principalPath(d.principalId, '/credentials/rotate');
+    if (!path) return;
+    mutate({
+      title: 'Rotate credential',
+      body: 'Rotate the credential for "' + d.principalId + '"? Both credentials stay valid for the overlap window.',
+      fields: [overlapField()],
+      submitLabel: 'Rotate',
+      method: 'POST', path: path, onFail: refreshOnFail(d.principalId),
+      json: function (v) { return { overlap_secs: parseInt(v.overlap, 10) }; }
+    }).then(function (r) {
+      if (!r) return;
+      showOrExplain('Replacement engine credential', takeToken(r),
+        'Lost it? Rotate again within 2 minutes to get the same secret. After that, revoke the new credential and rotate again.',
+        'The replacement was minted but the response did not include it. Rotate again within 2 minutes.');
+      reloadDetail(d.principalId);
+    });
+  }
+
+  function principalConfirm(d) {
+    var path = principalPath(d.principalId, '/credentials/confirm');
+    if (!path || !TOKEN_ID.test(d.tokenId || '')) return;
+    mutate({
+      title: 'Confirm credential',
+      body: 'Paste the new secret to prove you received it. Confirming retires the previous credential.',
+      fields: [{ name: 'secret', label: 'New secret', type: 'password', autocomplete: 'off', required: true }],
+      submitLabel: 'Confirm credential', danger: true,
+      method: 'POST', path: path, onFail: refreshOnFail(d.principalId),
+      json: function (v) { return { token_id: d.tokenId, secret: v.secret.trim() }; }
+    }).then(function (r) {
+      if (!r) return;
+      flash('Credential confirmed. The previous credential is retired.');
+      reloadDetail(d.principalId);
+    });
+  }
+
+  function principalTransfer(d) {
+    var path = principalPath(d.principalId, '/transfer-owner');
+    if (!path) return;
+    mutate({
+      title: 'Transfer owner',
+      note: 'Takes effect immediately. The current owner is not asked.',
+      fields: [{ name: 'owner', label: 'New owner (username)', type: 'text', maxlength: 256, required: true }],
+      submitLabel: 'Transfer',
+      method: 'POST', path: path,
+      json: function (v) { return { new_owner: v.owner.trim() }; }
+    }).then(function (r) {
+      if (!r) return;
+      flash('Owner changed.');
+      reloadPrincipals();
+      reloadDetail(d.principalId);
+    });
+  }
+
+  function principalRevoke(d) {
+    var path = principalPath(d.principalId);
+    if (!path) return;
+    mutate({
+      title: 'Revoke principal', danger: true, submitLabel: 'Revoke',
+      body: 'Revoke engine principal "' + d.principalId +
+            '"? This is TERMINAL - never un-revocable; recovery mints a successor.',
+      fields: [{ name: 'successor', label: 'Successor principal id (optional)', type: 'text', maxlength: 160 }],
+      validate: function (v) {
+        var s = v.successor.trim();
+        return s === '' || PRINCIPAL.test(s) ? null : 'A successor id looks like engine:name.';
+      },
+      method: 'DELETE', path: path,
+      json: function (v) {
+        var s = v.successor.trim();
+        return s ? { superseded_by: s } : undefined;
+      }
+    }).then(function (r) {
+      if (!r) return;
+      flash('Principal revoked.');
+      reloadPrincipals();
+      reloadDetail(d.principalId);
+    });
+  }
+
+  // ---- roles ------------------------------------------------------------------------------
+  function roleAssign(d) {
+    var sel = byId('role-options');
+    if (!SLUG.test(d.slug || '') || !sel || !sel.options.length) return;
+    var options = Array.prototype.map.call(sel.options, function (o) { return { value: o.value, label: o.textContent }; });
+    mutate({
+      title: 'Assign role',
+      note: 'Takes effect immediately. Engine principals can only hold custom roles.',
+      fields: [{ name: 'role', label: 'Role', type: 'select', options: options }],
+      submitLabel: 'Assign',
+      method: 'POST', path: API + 'engine-principals/' + seg(d.slug) + '/roles',
+      json: function (v) { return { role: v.role }; }
+    }).then(function (r) {
+      if (!r) return;
+      flash('Role assigned.');
+      reloadPrincipals();
+      reloadDetail(d.principalId);
+    });
+  }
+
+  function roleRemove(d) {
+    if (!SLUG.test(d.slug || '') || !d.role) return;
+    mutate({
+      title: 'Remove role', danger: true, submitLabel: 'Remove',
+      body: 'Remove role "' + d.role + '" from "' + d.principalId + '"?',
+      method: 'DELETE', path: API + 'engine-principals/' + seg(d.slug) + '/roles/' + seg(d.role)
+    }).then(function (r) {
+      if (!r) return;
+      flash('Role removed.');
+      reloadPrincipals();
+      reloadDetail(d.principalId);
+    });
+  }
+
   // ---- dispatch ---------------------------------------------------------------------------
   var ACTIONS = {
     'token-new': tokenNew, 'token-rotate': tokenRotate, 'token-confirm': tokenConfirm,
-    'token-revoke': tokenRevoke
+    'token-revoke': tokenRevoke,
+    'principal-new': principalNew, 'principal-mint': principalMint, 'principal-rotate': principalRotate,
+    'principal-confirm': principalConfirm, 'principal-transfer': principalTransfer,
+    'principal-revoke': principalRevoke,
+    'role-assign': roleAssign, 'role-remove': roleRemove
   };
 
   document.addEventListener('click', function (e) {

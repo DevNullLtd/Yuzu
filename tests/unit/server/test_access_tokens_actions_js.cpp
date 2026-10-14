@@ -83,17 +83,19 @@ TEST_CASE("actions glue: a revealed secret has no timer, one owner, and one way 
 
 TEST_CASE("actions glue: every secret-minting action refuses while an unstored secret is showing",
           "[access-tokens][js][writes][secret]") {
-    // token-new and token-rotate: two, no more, no fewer.
-    CHECK(count_of(js(), "if (blockedBySecret()) return;") == 2);
+    // token-new, token-rotate, principal-mint, principal-rotate: four, no more, no fewer.
+    CHECK(count_of(js(), "if (blockedBySecret()) return;") == 4);
     CHECK_THAT(js(), ContainsSubstring("before creating another."));
     // Confirm secrets are write-only password fields: never prefilled, never spell-checked (dialog).
-    CHECK(count_of(js(), "type: 'password', autocomplete: 'off'") == 1);
+    CHECK(count_of(js(), "type: 'password', autocomplete: 'off'") == 2);
     CHECK_THAT(js(), !ContainsSubstring("type: 'password', autocomplete: 'off', value"));
 }
 
 TEST_CASE("actions glue: every route is the documented REST v1 route and the dashboard twins are not used",
           "[access-tokens][js][writes][routes]") {
-    for (const char* lit : {"'tokens'", "'tokens/'", "'/rotate'", "'/confirm'"}) {
+    for (const char* lit : {"'tokens'", "'tokens/'", "'/rotate'", "'/confirm'", "'engine-principals'",
+                            "'engine-principals/'", "'/credentials'", "'/credentials/rotate'",
+                            "'/credentials/confirm'", "'/transfer-owner'", "'/roles'", "'/roles/'"}) {
         INFO(lit);
         CHECK_THAT(js(), ContainsSubstring(lit));
     }
@@ -101,14 +103,17 @@ TEST_CASE("actions glue: every route is the documented REST v1 route and the das
     // The dashboard twins lack a step-up; this page must never call them.
     CHECK_THAT(js(), !ContainsSubstring("/api/settings/"));
     // Methods: one per route family, as documented.
-    CHECK(count_of(js(), "method: 'POST'") == 3);   // token new, rotate, confirm
-    CHECK(count_of(js(), "method: 'DELETE'") == 1);  // token revoke
+    // POST: token new/rotate/confirm (3); principal new/mint/rotate/confirm/transfer (5); role assign.
+    CHECK(count_of(js(), "method: 'POST'") == 9);
+    CHECK(count_of(js(), "method: 'DELETE'") == 3);  // token, principal, role
 }
 
 TEST_CASE("actions glue: every id reaches a path only after a charset check and percent-encoding",
           "[access-tokens][js][writes][urlsafety]") {
     // The charsets mirror the routes' own.
     CHECK_THAT(js(), ContainsSubstring("var TOKEN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;"));
+    CHECK_THAT(js(), ContainsSubstring("var PRINCIPAL = /^engine:[a-z0-9._-]{1,128}$/;"));
+    CHECK_THAT(js(), ContainsSubstring("var SLUG = /^[a-z0-9._-]{1,128}$/;"));
     CHECK_THAT(js(), ContainsSubstring("function seg(v) { return encodeURIComponent(v); }"));
     // Every line that builds a request path may add only literals, seg(...) and the literal tail.
     std::size_t path_lines = 0;
@@ -125,9 +130,13 @@ TEST_CASE("actions glue: every id reaches a path only after a charset check and 
         // What is left may be `API`, `+`, `,` and punctuation - never another identifier.
         CHECK_FALSE(std::regex_search(line.substr(std::string("API + ").size()), std::regex(R"([A-Za-z_]{2,})")));
     }
-    CHECK(path_lines >= 2);
+    CHECK(path_lines >= 6);
     // The page helpers refuse an id outside its charset before building anything.
     CHECK_THAT(js(), ContainsSubstring("if (!TOKEN_ID.test(id || ''))"));
+    CHECK_THAT(js(), ContainsSubstring("if (!PRINCIPAL.test(id || ''))"));
+    CHECK_THAT(js(), ContainsSubstring("!SLUG.test(d.slug || '')"));
+    // A reload URL takes a re-checked principal id, encoded.
+    CHECK_THAT(js(), ContainsSubstring("if (PRINCIPAL.test(id)) load(DETAIL + '?id=' + seg(id), 'side-principal');"));
 }
 
 TEST_CASE("actions glue: every mutation is a dialog form with a submit hook, so a refusal keeps the dialog",
@@ -136,6 +145,9 @@ TEST_CASE("actions glue: every mutation is a dialog form with a submit hook, so 
     CHECK_THAT(js(), !ContainsSubstring("D.confirm("));
     CHECK(count_of(js(), "D.request(") == 1);
     CHECK_THAT(js(), ContainsSubstring("return why(r);"));
+    // A 5xx on a credential write may have changed state: the detail is reloaded, never retried.
+    CHECK_THAT(js(), ContainsSubstring("function refreshOnFail(id) { return function (r) { if (r.status >= 500) reloadDetail(id); }; }"));
+    CHECK(count_of(js(), "onFail: refreshOnFail(d.principalId)") == 3);
     // A dropped audit row on a successful change is surfaced, persistently.
     CHECK_THAT(js(), ContainsSubstring("if (r.auditFailed) auditBanner();"));
 }
@@ -143,9 +155,11 @@ TEST_CASE("actions glue: every mutation is a dialog form with a submit hook, so 
 TEST_CASE("actions glue: copy and limits match the matrix", "[access-tokens][js][writes]") {
     // Settings' confirm sentences, verbatim.
     CHECK_THAT(js(), ContainsSubstring("Applications using this token will lose access."));
-    // MCP tokens: one hour short of 90 days; default overlap 7 days.
+    CHECK_THAT(js(), ContainsSubstring("This is TERMINAL - never un-revocable; recovery mints a successor."));
+    // MCP tokens: one hour short of 90 days; default overlap 7 days; ttl days 1..90.
     CHECK_THAT(js(), ContainsSubstring("var MCP_MAX_HOURS = 2159;"));
     CHECK_THAT(js(), ContainsSubstring("value: String(7 * DAY)"));
+    CHECK_THAT(js(), ContainsSubstring("wholeNumber(v.days, 1, 90)"));
     // The recovery sentence names the 2-minute window and the way out after it.
     CHECK_THAT(js(), ContainsSubstring("Rotate again within 2 minutes to get the same secret."));
     CHECK_THAT(js(), ContainsSubstring("After that, revoke the new"));

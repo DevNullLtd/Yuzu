@@ -74,6 +74,7 @@ struct Rig {
     std::unique_ptr<AuthRoutes> ar;
     int principal_reads{0};
     int user_reads{0};
+    std::optional<EnginePrincipalRow> principal_row;  ///< what the detail read answers; none = not found
     yuzu::server::test::TestRouteSink sink;  // LAST: handlers capture `this`
 
     explicit Rig(const std::string& dsn)
@@ -114,7 +115,7 @@ struct Rig {
         d.get_principal_fn = [this](const std::string&)
             -> std::expected<std::optional<EnginePrincipalRow>, std::string> {
             ++principal_reads;
-            return std::optional<EnginePrincipalRow>{};
+            return principal_row;
         };
         d.active_credentials_fn = [](const std::string&) -> std::expected<std::vector<ApiToken>, std::string> {
             return std::vector<ApiToken>{};
@@ -124,6 +125,13 @@ struct Rig {
         };
         d.revoke_detail_fn = [](const std::string&) -> std::expected<access_tokens::RevokeDetail, std::string> {
             return access_tokens::RevokeDetail{};
+        };
+        d.custom_roles_fn = [this]() -> std::expected<std::vector<std::string>, std::string> {
+            std::vector<std::string> names;
+            for (const auto& role : rbac.list_roles())
+                if (!role.is_system)
+                    names.push_back(role.name);
+            return names;
         };
         access_tokens::register_access_tokens_routes(sink, std::move(d));
 
@@ -440,4 +448,36 @@ TEST_CASE("tokens page authz: RBAC on, Viewer sees the list with no write contro
     CHECK(has(res->body, "Creating tokens needs the ApiToken:Write permission."));
     // The capability probes are quiet for a cookie session: a refused permission leaves no row.
     CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("tokens page authz: RBAC on, an account administrator without Security:Write sees the principal with no write control",
+          "[pg][access-tokens][authz][writes][principals]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    EnginePrincipalRow p;
+    p.principal_id = "engine:bot";
+    p.display_name = "bot";
+    p.owner_username = "alice";
+    p.lifecycle_state = "active";
+    r.principal_row = p;
+
+    // RBAC off: the account role is the whole gate, so the administrator may change it.
+    const auto cookie = r.auth_mgr.create_local_session_for_test("root", auth::Role::admin, true);
+    auto res = r.get_cookie(kDetail, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-tk=\"principal-mint\""));
+    CHECK(has(res->body, "data-tk=\"principal-revoke\""));
+    CHECK(r.denied_rows() == 0);
+
+    // RBAC on: require_admin still admits the account role, but the write grant is what the
+    // controls follow. This administrator holds no Security:Write grant, so none is drawn.
+    r.rbac.set_rbac_enabled(true);
+    res = r.get_cookie(kDetail, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(has(res->body, "principal-mint"));
+    CHECK_FALSE(has(res->body, "principal-revoke"));
+    CHECK(has(res->body, "Changing principals needs the Security:Write permission."));
+    CHECK(r.denied_rows() == 1);  // the one refused probe
 }

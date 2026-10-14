@@ -11,7 +11,9 @@
  *     hostile id ("./bulk-approve?", "../x") can never be spliced into a path;
  *   - rotate and confirm are owner-only and human-only; engine credentials offer Revoke only;
  *   - the 120 s recovery window offers Rotate on a predecessor and never outside it;
- *   - every stored string in a button attribute is escaped.
+ *   - every stored string in a button attribute is escaped;
+ *   - Assign role is disabled with the reason when no custom role exists, and built-in roles
+ *     are never offered.
  */
 
 #include "access_tokens_render.hpp"
@@ -61,6 +63,34 @@ std::size_t count(const std::string& hay, const std::string& needle) {
     for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
         ++n;
     return n;
+}
+
+EnginePrincipalRow principal(std::string slug, std::string state = "active") {
+    EnginePrincipalRow p;
+    p.principal_id = "engine:" + slug;
+    p.display_name = slug;
+    p.owner_username = "alice";
+    p.classification = "internal";
+    p.lifecycle_state = std::move(state);
+    return p;
+}
+
+PrincipalDetail detail(std::vector<ApiToken> creds, bool can_write = true) {
+    PrincipalDetail d;
+    d.row = principal("bot");
+    d.credentials = std::move(creds);
+    d.roles = std::vector<PrincipalRole>{};
+    d.revoke_detail = std::string{};
+    d.now = kNow;
+    d.can_write = can_write;
+    return d;
+}
+
+ApiToken cred(std::string id, std::int64_t created) {
+    ApiToken c = tok(std::move(id), "engine:bot");
+    c.principal_kind = "engine";
+    c.created_at = created;
+    return c;
 }
 
 } // namespace
@@ -196,4 +226,116 @@ TEST_CASE("tokens write render: stored strings in button attributes are escaped"
     CHECK_THAT(html, ContainsSubstring("&lt;img src=x onerror=1&gt;&quot;&#39;&amp;"));
     // The name rides in a data attribute that the page script reads with dataset + textContent.
     CHECK_THAT(html, ContainsSubstring("data-predecessor=\"&lt;img"));
+}
+
+// ---- engine principals --------------------------------------------------------------------
+
+TEST_CASE("principals write render: New principal only with the capability, else the reason",
+          "[access-tokens][render][writes]") {
+    PrincipalsView v;
+    v.rows = {principal("bot")};
+    v.roles = std::vector<PrincipalRole>{};
+    CHECK_THAT(render_principals_list(v), !ContainsSubstring("principal-new"));
+    CHECK_THAT(render_principals_list(v), ContainsSubstring("Creating principals needs the Administrator account role."));
+    v.rbac_enforced = true;
+    CHECK_THAT(render_principals_list(v), ContainsSubstring("Creating principals needs the Security:Write permission."));
+    v.can_write = true;
+    CHECK_THAT(render_principals_list(v), ContainsSubstring("data-tk=\"principal-new\""));
+    v.rows.clear();
+    CHECK_THAT(render_principals_list(v), ContainsSubstring("data-tk=\"principal-new\""));
+    // Rows carry no action: every principal action lives in the detail panel.
+    v.rows = {principal("bot")};
+    CHECK_THAT(render_principals_list(v), !ContainsSubstring("principal-revoke"));
+}
+
+TEST_CASE("principals write render: the detail draws the credential actions the facts allow",
+          "[access-tokens][render][writes]") {
+    auto has = [](const std::string& html, const char* tk) {
+        return html.find(std::string("data-tk=\"") + tk + "\"") != std::string::npos;
+    };
+    // Zero active credentials: Mint only.
+    auto none = render_principal_detail(detail({}), "engine:bot");
+    CHECK(has(none, "principal-mint"));
+    CHECK_FALSE(has(none, "principal-rotate"));
+    CHECK(has(none, "principal-transfer"));
+    CHECK(has(none, "principal-revoke"));
+    // One credential: Rotate, never Mint.
+    auto one = render_principal_detail(detail({cred("c1", kNow - 9999)}), "engine:bot");
+    CHECK(has(one, "principal-rotate"));
+    CHECK_FALSE(has(one, "principal-mint"));
+    CHECK_FALSE(has(one, "principal-confirm"));
+    // Pair, successor older than 120 s: Confirm only.
+    auto s_old = cred("c2", kNow - 500);
+    s_old.supersedes_token_id = "c1";
+    auto two = render_principal_detail(detail({cred("c1", kNow - 9999), s_old}), "engine:bot");
+    CHECK(has(two, "principal-confirm"));
+    CHECK_THAT(two, ContainsSubstring("data-token-id=\"c2\""));
+    CHECK_FALSE(has(two, "principal-rotate"));
+    // Pair, successor inside the grace window: Confirm and the recovery Rotate.
+    auto s_new = cred("c2", kNow - 30);
+    s_new.supersedes_token_id = "c1";
+    auto fresh = render_principal_detail(detail({cred("c1", kNow - 9999), s_new}), "engine:bot");
+    CHECK(has(fresh, "principal-confirm"));
+    CHECK(has(fresh, "principal-rotate"));
+    // Credentials unreadable: Mint and Rotate are disabled with the reason, not drawn live.
+    PrincipalDetail d = detail({});
+    d.credentials = Unavailable{};
+    auto unread = render_principal_detail(d, "engine:bot");
+    CHECK_THAT(unread, ContainsSubstring("disabled title=\"Credentials could not be read.\""));
+    CHECK(has(unread, "principal-transfer"));
+}
+
+TEST_CASE("principals write render: without the capability no action is drawn and the reason is stated",
+          "[access-tokens][render][writes]") {
+    PrincipalDetail d = detail({}, false);
+    d.rbac_enforced = true;
+    d.roles = std::vector<PrincipalRole>{{"engine", "engine:bot", "Reader"}};
+    const auto html = render_principal_detail(d, "engine:bot");
+    for (const char* tk : {"principal-mint", "principal-rotate", "principal-confirm", "principal-transfer",
+                           "principal-revoke", "role-assign", "role-remove"})
+        CHECK_THAT(html, !ContainsSubstring(std::string("data-tk=\"") + tk));
+    CHECK_THAT(html, ContainsSubstring("Changing principals needs the Security:Write permission."));
+    // A revoked principal is terminal: no principal action even with the capability.
+    PrincipalDetail r = detail({});
+    r.row = principal("bot", "revoked");
+    CHECK_THAT(render_principal_detail(r, "engine:bot"), !ContainsSubstring("principal-revoke"));
+    CHECK_THAT(render_principal_detail(r, "engine:bot"), !ContainsSubstring("role-assign"));
+}
+
+TEST_CASE("principals write render: roles - Assign lists custom roles only and is disabled with the reason when none",
+          "[access-tokens][render][writes]") {
+    PrincipalDetail d = detail({});
+    d.roles = std::vector<PrincipalRole>{{"engine", "engine:bot", "Auditor"}};
+    // None exist: disabled with the reason; no option list at all.
+    auto none = render_principal_detail(d, "engine:bot");
+    CHECK_THAT(none, ContainsSubstring("data-tk=\"role-assign\""));
+    CHECK_THAT(none, ContainsSubstring("disabled title=\"No custom roles exist."));
+    CHECK_THAT(none, !ContainsSubstring("role-options"));
+    // Some exist: they, and only they, are options; names are escaped.
+    d.custom_roles = {"Auditor-2", kXss};
+    auto some = render_principal_detail(d, "engine:bot");
+    CHECK_THAT(some, ContainsSubstring("<select id=\"role-options\" hidden>"));
+    CHECK_THAT(some, ContainsSubstring("<option value=\"Auditor-2\">Auditor-2</option>"));
+    CHECK_THAT(some, !ContainsSubstring("<img"));
+    CHECK_THAT(some, !ContainsSubstring("Administrator</option>"));
+    // Remove rides the bare slug, never the full id, and the role as data.
+    CHECK_THAT(some, ContainsSubstring("data-tk=\"role-remove\" data-slug=\"bot\" data-role=\"Auditor\""));
+}
+
+TEST_CASE("principals write render: a hostile principal id draws no action and no role control",
+          "[access-tokens][render][writes][urlsafety]") {
+    for (const char* bad : {"engine:../x", "engine:a/b", "engine:A", "engine:", "x", "engine:a b"}) {
+        INFO(bad);
+        PrincipalDetail d = detail({});
+        d.row.principal_id = bad;
+        d.custom_roles = {"r"};
+        d.roles = std::vector<PrincipalRole>{{"engine", bad, "r"}};
+        const auto html = render_principal_detail(d, bad);
+        CHECK_THAT(html, !ContainsSubstring("data-tk=\"principal-"));
+        CHECK_THAT(html, !ContainsSubstring("data-tk=\"role-"));
+        CHECK_THAT(html, !ContainsSubstring("data-slug="));
+    }
+    CHECK(principal_slug("engine:bot") == "bot");
+    CHECK(principal_slug("engine:../x").empty());
+    CHECK(principal_slug("bot").empty());
 }

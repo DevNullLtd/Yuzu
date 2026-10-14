@@ -98,7 +98,7 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
     if (!deps.auth_fn || !deps.perm_fn || !deps.audit_fn || !deps.rbac_enforced_fn ||
         !deps.now_fn || !deps.list_tokens_fn || !deps.list_principals_fn || !deps.all_roles_fn ||
         !deps.get_principal_fn || !deps.active_credentials_fn || !deps.principal_roles_fn ||
-        !deps.revoke_detail_fn)
+        !deps.revoke_detail_fn || !deps.custom_roles_fn)
         throw std::invalid_argument(
             "access_tokens::register_access_tokens_routes: every Deps member is required");
 
@@ -157,6 +157,8 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  }
                  PrincipalsView view;
                  view.can_run_check = may_read(deps, req, "AuditLog");
+                 view.rbac_enforced = deps.rbac_enforced_fn();
+                 view.can_write = !view.rbac_enforced || allowed(deps, req, "Security", "Write");
                  view.rows = std::move(*rows);
                  // The store returns oldest first; the cap banner promises the newest.
                  std::ranges::reverse(view.rows);
@@ -202,6 +204,14 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  PrincipalDetail d;
                  d.row = std::move(**row);
                  d.now = deps.now_fn();
+                 d.rbac_enforced = deps.rbac_enforced_fn();
+                 d.can_write = !d.rbac_enforced || allowed(deps, req, "Security", "Write");
+                 // An unreadable role list is "no custom roles": Assign stays disabled, which is
+                 // the safe side. Built-in (system) roles are never offered.
+                 if (auto cr = deps.custom_roles_fn(); cr)
+                     d.custom_roles = std::move(*cr);
+                 else
+                     spdlog::warn("/fragments/access/principals/detail custom roles: {}", cr.error());
                  if (auto c = deps.active_credentials_fn(id); c)
                      d.credentials = std::move(*c);
                  else
