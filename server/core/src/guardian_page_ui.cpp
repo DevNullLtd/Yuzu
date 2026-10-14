@@ -47,6 +47,7 @@ const char* const kGuardianDetailPageTemplate =
     .gp-actions { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
 
     .gp-sech { font-size: 14px; font-weight: 600; color: var(--ink); margin: 22px 0 8px; }
+    .gp-sech .gp-mute { font-weight: 400; }
     .gp-note { font-size: 12.5px; color: var(--mut); margin-top: 8px; }
     .gp-note b { color: var(--ink); font-weight: 600; }
 
@@ -76,6 +77,7 @@ const char* const kGuardianDetailPageTemplate =
     /* compliance hero */
     .gp-hero { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; padding: 16px 18px;
                background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel); }
+    .gp-hero-bar { flex: 1; min-width: 320px; }
     .gp-pct { font-size: 26px; font-weight: 500; letter-spacing: -.02em; line-height: 1.15; color: var(--ink); }
     .gp-pct small { display: block; font-size: 13px; color: var(--mut); font-weight: 400; letter-spacing: 0; }
     .gp-bar { display: flex; gap: 2px; height: 18px; border-radius: 3px; overflow: hidden; background: var(--bg); }
@@ -86,7 +88,7 @@ const char* const kGuardianDetailPageTemplate =
                    margin-right: 6px; vertical-align: middle; }
     .gp-legend b { color: var(--ink); font-weight: 600; margin-left: 4px; }
 
-    /* readout row (was a strip of stat tiles): one bordered region, 1px rules between figures */
+    /* readout row: one bordered region, 1px rules between figures */
     .gp-tiles { display: flex; flex-wrap: wrap; gap: 1px; margin-top: 16px; overflow: hidden;
                 background: var(--line); border: 1px solid var(--line); border-radius: var(--rad-panel); }
     .gp-tile { flex: 1 1 170px; min-width: 0; padding: 14px 18px; background: var(--surface); }
@@ -430,8 +432,9 @@ const char* const kGuardianDetailPageTemplate =
   </script>
 )HTM"
     // Chunk 3: the Hardware CI record's generic action runner. Split into its own
-    // literal because chunk 2 above sits at ~14.5 KiB and MSVC caps a single
-    // string literal at 16 KiB (C2026) -- see the sibling warning in
+    // literal because chunk 2 above sits at ~14 KB (measure with a full-range
+    // rawcheck: tools/rawcheck.py scans only uncommitted diffs) and MSVC caps a
+    // single string literal at 16,380 bytes (C2026) -- see the sibling warning in
     // instruction_ui.cpp. Keep prose OUT of this literal; explain here instead.
     //
     // hwRunAction(btn): reads the enclosing <form>'s data-plugin/data-action/
