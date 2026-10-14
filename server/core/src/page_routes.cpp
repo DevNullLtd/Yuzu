@@ -14,6 +14,7 @@ extern const char* const kDashboardIndexHtml;
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kApprovalsPageHtml; // server/core/src/approvals_ui.cpp (Operate O1)
+extern const char* const kExecutionsPageHtml; // server/core/src/executions_ui.cpp (Operate O1)
 extern const char* const kTarPageHtml;
 extern const char* const kVizFleetPageHtml; // server/core/src/viz_page_ui.cpp (PR 5)
 extern const char* const kVizHostPageHtml;  // server/core/src/viz_host_page_ui.cpp (PR 9-pre)
@@ -400,6 +401,16 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         res.set_content(kApprovalsPageHtml, "text/html; charset=utf-8");
+    });
+
+    // -- Executions page (Operate O1; the first child of Instructions in the shell) ---------
+    sink.Get("/executions", [deps](const httplib::Request& req, httplib::Response& res) {
+        auto session = deps.auth_fn(req, res);
+        if (!session) {
+            res.set_redirect("/login");
+            return;
+        }
+        res.set_content(kExecutionsPageHtml, "text/html; charset=utf-8");
     });
 }
 

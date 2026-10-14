@@ -29,6 +29,7 @@ extern const char* const kDashboardIndexHtml;
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kApprovalsPageHtml;
+extern const char* const kExecutionsPageHtml;
 extern const char* const kTarPageHtml;
 extern const char* const kVizFleetPageHtml;
 extern const char* const kVizHostPageHtml;
@@ -109,7 +110,7 @@ TEST_CASE("app shell: only Instructions Software and Fleet have sub-items; Setti
             CHECK((it.key == "settings") == it.admin_only);
         }
     CHECK(with_children ==
-          std::vector<std::string>{"instructions>approvals", "software>auto", "fleet>network"});
+          std::vector<std::string>{"instructions>executions", "software>auto", "fleet>network"});
 
     const auto groups = nav_groups();
     REQUIRE(groups.back().title == "System");
@@ -129,6 +130,8 @@ TEST_CASE("app shell: breadcrumb is group / page, and a sub-item skips its paren
           std::vector<std::string>{"Estate", "Deployments"});
     CHECK(breadcrumb_trail({.active_key = "approvals"}) ==
           std::vector<std::string>{"Operate", "Approvals"});
+    CHECK(breadcrumb_trail({.active_key = "executions"}) ==
+          std::vector<std::string>{"Operate", "Executions"});
 }
 
 TEST_CASE("app shell: a title extends the trail, a repeated label does not", "[nav][shell]") {
@@ -191,7 +194,11 @@ TEST_CASE("app shell: sub-items show only for the active family and light their 
     // Instructions' child (Operate pages): visible on the Instructions family only.
     const auto on_instructions = render_shell({.active_key = "instructions"});
     CHECK(count_of(on_instructions, "class=\"shell-sub\"") == 1);
+    CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/executions\">Executions</a>"));
     CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/approvals\">Approvals</a>"));
+    const auto on_executions = render_shell({.active_key = "executions"});
+    CHECK(highlighted_hrefs(on_executions) ==
+          std::vector<std::string>{"/instructions", "/executions"});
     const auto on_approvals = render_shell({.active_key = "approvals"});
     CHECK_THAT(on_approvals,
                ContainsSubstring("<a href=\"/approvals\" class=\"on\" aria-current=\"page\">"));
@@ -367,6 +374,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"dashboard", kDashboardIndexHtml, {"/"}},
         {"instructions", kInstructionPageHtml, {"/instructions"}},
         {"approvals", kApprovalsPageHtml, {"/instructions", "/approvals"}},
+        {"executions", kExecutionsPageHtml, {"/instructions", "/executions"}},
         {"result sets", yuzu::server::kResultSetsPageHtml, {"/result-sets"}},
         {"compliance", kComplianceHtml, {"/compliance"}},
         {"guardian", kGuardianHtml, {"/guardian"}},

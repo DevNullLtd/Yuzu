@@ -1,6 +1,6 @@
 /**
  * test_operate_pages_ui.cpp — static pins for the Operate pages' templates, shared CSS and
- * embedded controller (Approvals today; Executions joins in the same loops).
+ * embedded controller (Approvals and Executions).
  *
  * Pure string checks, no server and no store. What they guard is the part a rendering
  * unit test cannot see: CSP hygiene (no inline handlers, no dynamic-code sinks, eval
@@ -20,6 +20,7 @@
 #include <vector>
 
 extern const char* const kApprovalsPageHtml;
+extern const char* const kExecutionsPageHtml;
 namespace yuzu::server {
 extern const std::string kYuzuOperateJs;
 } // namespace yuzu::server
@@ -43,7 +44,7 @@ struct Page {
 };
 
 std::vector<Page> pages() {
-    return {{"approvals", kApprovalsPageHtml}};
+    return {{"approvals", kApprovalsPageHtml}, {"executions", kExecutionsPageHtml}};
 }
 
 } // namespace
@@ -90,9 +91,12 @@ TEST_CASE("operate pages: the embedded controller is CSP-clean and bounded",
     for (const char* sink : {"eval(", "new Function(", "document.write", "javascript:",
                              "insertAdjacentHTML", "outerHTML", "setTimeout(\"", "setInterval(\""})
         CHECK_FALSE(has(js, sink));
-    // The one innerHTML sink is the server-rendered list host; nothing else assigns markup.
-    CHECK(count_of(js, ".innerHTML") == 1);
-    CHECK(has(js, "host.innerHTML = res.html;"));
+    // The only innerHTML sinks are the three server-rendered fragment hosts (the Approvals
+    // list, the Executions list and the Selected execution panel); nothing else assigns
+    // markup. Each is written from a 200 body only.
+    CHECK(count_of(js, ".innerHTML") == 3);
+    CHECK(count_of(js, "host.innerHTML = res.html;") == 2);
+    CHECK(count_of(js, "panel.innerHTML = res.html;") == 1);
     CHECK(has(js, "if (res.status !== 200) {"));
     // Bounded fetch, built inside try/catch so an old browser degrades to no timeout.
     CHECK(has(js, "var FETCH_TIMEOUT_MS = 15000;"));
@@ -101,6 +105,10 @@ TEST_CASE("operate pages: the embedded controller is CSP-clean and bounded",
     // A late response never overwrites a newer one.
     CHECK(has(js, "var mine = ++seq;"));
     CHECK(has(js, "if (mine !== seq) return;"));
+    CHECK(has(js, "var mine = ++lseq;"));
+    CHECK(has(js, "if (mine !== lseq) return;"));
+    CHECK(has(js, "var mine = ++dseq;"));
+    CHECK(has(js, "if (mine !== dseq) return;"));
     // Every non-200 list answer maps to fixed copy; the body is never shown.
     CHECK(has(js, "'Could not load. Check your connection and retry.'"));
     CHECK(has(js, "'Your session has expired. Sign in again.'"));
@@ -159,4 +167,55 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK_FALSE(has(body, ">Reject<"));
     CHECK_FALSE(has(body, "<button"));
     CHECK_FALSE(has(body, "<dialog"));
+}
+
+TEST_CASE("operate pages: the Executions template carries every hook the controller binds",
+          "[ui][operate][pages]") {
+    const std::string html(kExecutionsPageHtml);
+    const auto& js = yuzu::server::kYuzuOperateJs;
+
+    for (const char* id : {"id=\"exec-list\"", "id=\"exec-selected\"", "id=\"exec-chip\"",
+                           "id=\"exec-confined\"", "id=\"f-def\"", "id=\"f-def-hint\""})
+        CHECK(has(html, id));
+    // Status filter: All is the checked, empty-valued default; the five states follow.
+    CHECK(has(html, "<input type=\"radio\" name=\"est\" value=\"\" checked>All"));
+    for (const char* v : {"running", "succeeded", "completed", "cancelled", "pending"})
+        CHECK(has(html, std::string("name=\"est\" value=\"") + v + "\""));
+    CHECK(has(html, "<option value=\"\">All instructions</option>"));
+    // The controller asks exactly the fragment contract's URLs.
+    CHECK(has(js, "'/fragments/executions?view=page'"));
+    CHECK(has(js, "'/detail?view=page'"));
+    CHECK(has(js, "'/api/instructions?limit=500'"));
+    CHECK(has(js, "timeoutSignal(10000)"));
+    // Every non-200 detail answer maps to fixed copy (the body is never shown).
+    CHECK(has(js, "'This execution was not found, or part of it is outside your scope.'"));
+    CHECK(has(js, "'You do not have permission to view this execution.'"));
+    CHECK(has(js, "'Execution tracker degraded, retry shortly.'"));
+    CHECK(has(js, "if (res.status !== 200) { panelNote(detailCopy(res.status)); return; }"));
+    // No auto-select: the detail read (one audit row) happens on a click, Enter/Space or
+    // an explicit ?id= only.
+    CHECK(count_of(js, "showDetail(") == 3);
+    CHECK(has(js, "if (wantId) showDetail(wantId);"));
+    // No polling and no live stream in the read-only pages.
+    CHECK_FALSE(has(js, "setInterval("));
+    CHECK_FALSE(has(js, "EventSource"));
+}
+
+TEST_CASE("operate pages: Executions copy is exact and read-only", "[ui][operate][pages]") {
+    const std::string html(kExecutionsPageHtml);
+    CHECK(has(html, "<title>Yuzu — Executions</title>"));
+    CHECK(has(html, "<h1>Executions</h1>"));
+    CHECK(has(html, "Instruction dispatches and their per-device results."));
+    CHECK(has(html, "Select an execution to see its scope, parameters and responses."));
+    CHECK(has(html, "<b>Confined view.</b> You can see executions you dispatched and "
+                    "executions that reached devices in your scope. Counts cover your devices "
+                    "only; scope and parameters are redacted."));
+    CHECK(has(html, "Instruction list unavailable; filter by status only."));
+    const auto body_at = html.find("<!--/yuzu:shell-->");
+    REQUIRE(body_at != std::string::npos);
+    const auto body = html.substr(body_at);
+    CHECK_FALSE(has(body, "<button"));
+    CHECK_FALSE(has(body, "<dialog"));
+    CHECK_FALSE(has(body, ">Cancel execution"));
+    CHECK_FALSE(has(body, ">Re-run"));
 }

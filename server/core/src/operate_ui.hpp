@@ -51,6 +51,14 @@ code{font-family:var(--mds-font-family-mono);font-size:12.5px}
 td .scope{max-width:150px}
 td .by{max-width:140px}
 .ops-foot{padding:10px 16px;border-top:1px solid var(--line)}
+.ops-sel [data-slot]>.hd{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
+.ops-sel [data-slot]>.hd h2{font-size:14px;font-weight:600}
+.pv{display:block;max-width:132px;overflow:hidden;text-overflow:ellipsis;font-family:var(--mds-font-family-mono);font-size:12px;color:var(--bad)}
+.empty-more{padding:0 16px 24px;text-align:center}
+.prog{display:flex;flex-direction:column;gap:6px;padding:12px 16px 0}
+.lnk{color:var(--primary);text-decoration:none}
+.lnk:hover{color:var(--primary-h);text-decoration:underline}
+.ops-sel [data-slot]>.btns{padding-top:16px}
 .ops-sel .kvl small{display:block;font-size:11.5px;font-weight:400;color:var(--faint);text-align:right;overflow-wrap:anywhere}
 .ops-sel .kvl b .clip{max-width:230px}
 .ops-sel .kvl>div.stack{flex-direction:column;gap:6px}

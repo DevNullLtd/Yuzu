@@ -8,7 +8,8 @@
  * Rules this file keeps (pinned by test_operate_pages_ui.cpp):
  *   - no dynamic-code or raw-markup sinks of any kind (the test pins the exact list);
  *   - innerHTML is assigned ONLY from a 200 fragment the server rendered (and escaped), to
- *     the one list host (#ap-list); a non-200 body is never written anywhere;
+ *     the three fragment hosts (#ap-list, #exec-list, #exec-selected); a non-200 body is
+ *     never written anywhere;
  *   - every fetch has a bounded timeout, and a late response never overwrites a newer one
  *     (request token).
  */
@@ -67,6 +68,27 @@
       var q = p.toString();
       history.replaceState(null, '', location.pathname + (q ? '?' + q : '') + location.hash);
     } catch (e) { /* the page works without a shareable URL */ }
+  }
+
+  // Local wall-clock text for an epoch in ms: HH:MM:SS, prefixed "D Mon " when not today.
+  var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  function fmtLocal(ms) {
+    var d = new Date(Number(ms));
+    if (isNaN(d.getTime())) return '';
+    function p2(n) { return (n < 10 ? '0' : '') + n; }
+    var t = p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+    var now = new Date();
+    var today = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() &&
+      d.getDate() === now.getDate();
+    return today ? t : d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + t;
+  }
+  // The server renders UTC text (no-JS fallback) and the ISO instant in the title; the
+  // epoch in data-epoch-ms is the source for the local text.
+  function renderLocalTimes(root) {
+    $$('[data-epoch-ms]', root).forEach(function (el) {
+      var t = fmtLocal(el.getAttribute('data-epoch-ms'));
+      if (t) el.textContent = t;
+    });
   }
 
   function approvalsController() {
@@ -234,7 +256,191 @@
     load();
   }
 
-  var controllers = { approvals: approvalsController };
+  function executionsController() {
+    var host = $('#exec-list');
+    var panel = $('#exec-selected');
+    var chip = $('#exec-chip');
+    var confinedNote = $('#exec-confined');
+    var defSel = $('#f-def');
+    var defHint = $('#f-def-hint');
+    if (!host || !panel || !defSel) return;
+
+    var STATUSES = ['', 'running', 'succeeded', 'completed', 'cancelled', 'pending'];
+    var lseq = 0;          // request tokens: only the newest list / detail response is applied
+    var dseq = 0;
+    var loadedAt = 0;
+    var selectedId = '';
+
+    function currentStatus() {
+      var r = $('input[name="est"]:checked');
+      return r ? r.value : '';
+    }
+
+    // Keeps the select showing the filter that is really applied: an id from the URL that
+    // is not among the loaded options (outside the first 500, or the load failed) gets a
+    // synthetic option rather than silently reading as "All instructions".
+    function ensureOption(id) {
+      if (!id) return;
+      var found = false;
+      $$('option', defSel).forEach(function (o) { if (o.value === id) found = true; });
+      if (found) return;
+      var o = doc.createElement('option');
+      o.value = id;
+      o.textContent = id;
+      defSel.appendChild(o);
+    }
+
+    function loadOptions(wanted) {
+      var init = { credentials: 'same-origin', cache: 'no-store' };
+      var sig = timeoutSignal(10000);
+      if (sig) init.signal = sig;
+      return fetch('/api/instructions?limit=500', init).then(function (r) {
+        if (!r.ok) throw new Error('http');
+        return r.json();
+      }).then(function (body) {
+        var defs = (body && Array.isArray(body.definitions)) ? body.definitions : [];
+        defs = defs.filter(function (d) { return d && typeof d.id === 'string' && d.id; });
+        defs.sort(function (a, b) {
+          return String(a.name || a.id).localeCompare(String(b.name || b.id));
+        });
+        defs.forEach(function (d) {
+          var o = null;
+          $$('option', defSel).forEach(function (x) { if (x.value === d.id) o = x; });
+          if (!o) { o = doc.createElement('option'); o.value = d.id; defSel.appendChild(o); }
+          o.textContent = d.name || d.id; // names a synthetic deep-link option in place
+        });
+      }).catch(function () {
+        defHint.hidden = false;
+      }).then(function () {
+        ensureOption(wanted);
+        defSel.value = wanted || '';
+      });
+    }
+
+    function panelNote(text) {
+      var hd = doc.createElement('div');
+      hd.className = 'hd';
+      var h = doc.createElement('h2');
+      h.textContent = 'Selected execution';
+      hd.appendChild(h);
+      var n = doc.createElement('div');
+      n.className = 'empty-state';
+      n.textContent = text;
+      panel.replaceChildren(hd, n);
+    }
+
+    function markSelected() {
+      $$('tr.row', host).forEach(function (r) {
+        var on = !!selectedId && r.dataset.executionId === selectedId;
+        r.classList.toggle('sel', on);
+        r.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+
+    function detailCopy(status) {
+      if (status === 404) return 'This execution was not found, or part of it is outside your scope.';
+      if (status === 403) return 'You do not have permission to view this execution.';
+      if (status === 401) return 'Your session has expired. Sign in again.';
+      if (status === 503) return 'Execution tracker degraded, retry shortly.';
+      if (status === 0) return 'Could not load. Check your connection and retry.';
+      return 'Could not load this execution (HTTP ' + status + ').';
+    }
+
+    // One audited detail read per call. Never run on load without an explicit ?id=.
+    function showDetail(id) {
+      var mine = ++dseq;
+      selectedId = id;
+      markSelected();
+      writeQs(function (p) { p.set('id', id); });
+      return fetchFragment('/fragments/executions/' + encodeURIComponent(id) +
+                           '/detail?view=page').then(function (res) {
+        if (mine !== dseq) return;
+        if (res.status !== 200) { panelNote(detailCopy(res.status)); return; }
+        panel.innerHTML = res.html; // server-rendered and escaped
+        renderLocalTimes(panel);
+      });
+    }
+
+    function updateChrome(list) {
+      var count = Number(list.getAttribute('data-count')) || 0;
+      confinedNote.hidden = list.getAttribute('data-confined') !== '1';
+      if (count > 0) {
+        $('b', chip).textContent = String(count);
+        chip.hidden = false;
+      } else {
+        chip.hidden = true;
+      }
+    }
+
+    function loadList() {
+      var mine = ++lseq;
+      var params = [];
+      if (currentStatus()) params.push('status=' + encodeURIComponent(currentStatus()));
+      if (defSel.value) params.push('definition_id=' + encodeURIComponent(defSel.value));
+      var url = '/fragments/executions?view=page' + (params.length ? '&' + params.join('&') : '');
+      return fetchFragment(url).then(function (res) {
+        if (mine !== lseq) return;
+        loadedAt = Date.now();
+        if (res.status !== 200) {
+          setNote(host, failureCopy(res.status, 'executions'));
+          chip.hidden = true;
+          return;
+        }
+        host.innerHTML = res.html; // server-rendered and escaped
+        var list = $('.ops-list', host);
+        if (list) updateChrome(list);
+        renderLocalTimes(host);
+        markSelected(); // re-apply the selection without a refetch
+      });
+    }
+
+    function selectRow(row) {
+      var id = row.dataset.executionId;
+      if (id) showDetail(id);
+    }
+
+    host.addEventListener('click', function (e) {
+      var row = e.target.closest ? e.target.closest('tr.row') : null;
+      if (row && host.contains(row)) selectRow(row);
+    });
+    host.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      var row = e.target.closest ? e.target.closest('tr.row') : null;
+      if (!row || !host.contains(row)) return;
+      e.preventDefault();
+      selectRow(row);
+    });
+    function onFilter() {
+      writeQs(function (p) {
+        if (currentStatus()) p.set('status', currentStatus()); else p.delete('status');
+        if (defSel.value) p.set('definition_id', defSel.value); else p.delete('definition_id');
+      });
+      loadList();
+    }
+    $$('input[name="est"]').forEach(function (r) { r.addEventListener('change', onFilter); });
+    defSel.addEventListener('change', onFilter);
+    doc.addEventListener('visibilitychange', function () {
+      if (!doc.hidden && loadedAt && Date.now() - loadedAt > RELOAD_AFTER_MS) loadList();
+    });
+
+    // Deep link: /executions?definition_id=<id>&status=<s>&id=<execution>. The id is read
+    // once; there is no auto-select otherwise (each selection is one audited read).
+    var qs = readQs();
+    var wantStatus = qs ? (qs.get('status') || '') : '';
+    var wantDef = qs ? (qs.get('definition_id') || '') : '';
+    var wantId = qs ? (qs.get('id') || '') : '';
+    var radio = $('input[name="est"][value="' + (STATUSES.indexOf(wantStatus) >= 0 ? wantStatus : '') + '"]');
+    if (radio) radio.checked = true;
+    ensureOption(wantDef);
+    defSel.value = wantDef;
+    loadOptions(wantDef);
+    loadList().then(function () {
+      // A row that is not in the (capped, filtered) list is still fetched directly.
+      if (wantId) showDetail(wantId);
+    });
+  }
+
+  var controllers = { approvals: approvalsController, executions: executionsController };
   var page = doc.body ? doc.body.getAttribute('data-page') : '';
   if (controllers[page]) controllers[page]();
 })();

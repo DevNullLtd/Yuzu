@@ -18,7 +18,7 @@
 /// per-request logic, so a null registry now 503s even a request that would
 /// not have touched the registry (e.g. an empty `?q=`).
 ///
-/// Routes (31) — gate in parens, `-` = no gate:
+/// Routes (32) — gate in parens, `-` = no gate:
 ///   GET /static/yuzu.css                    -
 ///   GET /static/icons.svg                   -
 ///   GET /static/htmx.js                     -
@@ -50,6 +50,7 @@
 ///   GET /viz/host/:agent_id                 (auth_fn + viz kill switch)
 ///   GET /instructions                       (auth_fn)
 ///   GET /approvals                          (auth_fn)
+///   GET /executions                         (auth_fn)
 ///
 /// ORDERING: `/viz/fleet` is registered before `/viz/host/([^/]+)` — see the
 /// comment carried over onto that registration in page_routes.cpp. Today's
@@ -101,7 +102,7 @@ struct Deps {
     const yuzu::server::detail::AgentRegistry* registry{nullptr};
 };
 
-/// Register all 31 page-shell / static-asset routes against `sink`.
+/// Register all 32 page-shell / static-asset routes against `sink`.
 void register_page_routes(HttpRouteSink& sink, Deps deps);
 
 } // namespace page

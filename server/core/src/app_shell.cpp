@@ -20,6 +20,7 @@ namespace {
 // Icon paths are the design's 24x24 line icons (stroke, no fill).
 
 constexpr NavItem kInstructionsSub[] = {
+    {.key = "executions", .label = "Executions", .href = "/executions"},
     {.key = "approvals", .label = "Approvals", .href = "/approvals"},
 };
 constexpr NavItem kSoftwareSub[] = {
