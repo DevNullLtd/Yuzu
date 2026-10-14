@@ -22,11 +22,13 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <format>
 #include <random>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -86,6 +88,58 @@ std::string generate_id() {
 // yaml_source's own NUL rejection (validate_definition_scope, below) makes this a defense-in-
 // depth belt-and-braces for every OTHER free-text column, not the primary guard for yaml_source
 // itself.
+// The signature on an instruction-import envelope covers `yaml_source` ONLY; every other
+// top-level field is unsigned. The columns that decide WHAT RUNS and WHETHER IT NEEDS APPROVAL
+// are therefore taken from the verified YAML, and an envelope value that disagrees is refused:
+// otherwise a validly signed export could be re-labelled (plugin, action, approval_mode: auto)
+// and still import. Returns an error message, or nullopt after overwriting those envelope keys
+// with the YAML-derived values. Values are never echoed (they are attacker-controlled).
+std::optional<std::string> bind_signed_dispatch_columns(nlohmann::json& envelope,
+                                                       const std::string& yaml_source) {
+    const auto f = instruction_yaml::parse_definition_yaml(yaml_source);
+    if (f.plugin.empty() || f.action.empty())
+        return "signed yaml_source must declare the plugin and action it runs "
+               "(spec.execution.plugin / spec.execution.action)";
+    const std::pair<const char*, std::string> columns[] = {
+        {"plugin", f.plugin},
+        {"action", f.action}, // lowercased by the parser
+        {"type", f.type.empty() ? "question" : f.type},
+        {"approval_mode", f.approval.empty() ? "auto" : f.approval},
+        {"concurrency_mode", f.concurrency.empty() ? "per-device" : f.concurrency},
+    };
+    for (const auto& [key, yaml_value] : columns) {
+        if (envelope.contains(key) && !envelope[key].is_null()) {
+            if (!envelope[key].is_string())
+                return std::string("instruction-import field '") + key +
+                       "' must be a string when present";
+            auto given = envelope[key].get<std::string>();
+            if (std::string_view(key) == "action")
+                std::transform(given.begin(), given.end(), given.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            if (!given.empty() && given != yaml_value)
+                return std::string("instruction-import field '") + key +
+                       "' does not match the signed yaml_source - the signature covers only "
+                       "yaml_source, so dispatch and approval fields must come from it";
+        }
+        envelope[key] = yaml_value;
+    }
+    return std::nullopt;
+}
+
+// Escape LIKE metacharacters so a caller's filter text is matched literally (`50%` finds
+// names containing "50%", `a_b` does not also match "axb"). Paired with ESCAPE '\'.
+std::string escape_like(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '\\' || c == '%' || c == '_')
+            out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
 std::string sanitize_pg_text(std::string_view s) {
     std::string out = sanitize_utf8_strict(s);
     std::size_t pos = 0;
@@ -388,6 +442,36 @@ InstructionStore::InstructionStore(pg::PgPool& pool) : pool_(pool) {
 // Definitions — reads
 // ---------------------------------------------------------------------------
 
+std::expected<std::unordered_map<std::string, std::size_t>, std::string>
+InstructionStore::count_definitions_per_set() const {
+    if (!open_) {
+        note_read_degrade(metrics_, kReasonStoreNotOpen);
+        return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        note_read_degrade(metrics_, kReasonPoolTimeout);
+        return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
+                               "pool acquire timeout");
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT instruction_set_id, count(*)::bigint FROM "
+        "instruction_store.instruction_definitions WHERE instruction_set_id <> '' "
+        "GROUP BY instruction_set_id",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        note_read_degrade(metrics_, kReasonQueryError);
+        return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
+                               PQerrorMessage(lease.get()));
+    }
+    std::unordered_map<std::string, std::size_t> out;
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out[PQgetvalue(res.get(), i, 0)] =
+            static_cast<std::size_t>(std::strtoull(PQgetvalue(res.get(), i, 1), nullptr, 10));
+    return out;
+}
+
 std::expected<std::vector<InstructionDefinition>, std::string>
 InstructionStore::query_definitions(const InstructionQuery& q) const {
     if (!open_) {
@@ -414,7 +498,10 @@ InstructionStore::query_definitions(const InstructionQuery& q) const {
         // default; plain Postgres LIKE is case-sensitive. Using ILIKE here restores the
         // pre-migration behaviour instead of silently returning zero rows for a query
         // that differs from an existing name only by case.
-        add_clause("name ILIKE", "%" + q.name_filter + "%");
+        {
+            sql += " AND name ILIKE $" + std::to_string(++n) + " ESCAPE '\\'";
+            binds.push_back("%" + escape_like(q.name_filter) + "%");
+        }
     if (!q.plugin_filter.empty())
         add_clause("plugin =", q.plugin_filter);
     if (!q.type_filter.empty())
@@ -655,7 +742,9 @@ InstructionStore::create_definition(const InstructionDefinition& def) {
 // Definitions — update + delete
 // ---------------------------------------------------------------------------
 
-std::expected<void, std::string> InstructionStore::update_definition(const InstructionDefinition& def) {
+std::expected<void, std::string>
+InstructionStore::update_definition(const InstructionDefinition& def,
+                                    std::optional<std::int64_t> expected_updated_at) {
     if (!open_) {
         note_write_degrade(metrics_, "update_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
@@ -687,7 +776,7 @@ std::expected<void, std::string> InstructionStore::update_definition(const Instr
         return std::unexpected("invalid approval_mode: " + def.approval_mode +
                                " (must be auto, role-gated, or always)");
 
-    const char* sql = R"(
+    std::string sql = R"(
         UPDATE instruction_store.instruction_definitions SET
             name=$1, version=$2, type=$3, plugin=$4, action=$5, description=$6,
             enabled=$7::boolean, instruction_set_id=$8, gather_ttl_seconds=$9::int,
@@ -697,8 +786,10 @@ std::expected<void, std::string> InstructionStore::update_definition(const Instr
             result_schema=$14, approval_mode=$15,
             concurrency_mode=$16, platforms=$17, min_agent_version=$18, required_plugins=$19,
             readable_payload=$20, visualization_spec=$21, response_templates_spec=$22
-        WHERE id=$23 RETURNING id
-    )";
+        WHERE id=$23)";
+    if (expected_updated_at)
+        sql += " AND updated_at=$24::bigint";
+    sql += " RETURNING id";
     // An EMPTY def.parameter_schema means "keep the stored column" (the SQL above): the YAML
     // editor builds its definition from YAML, which carries no parameters, so writing '{}'
     // would wipe a stored schema. Any non-empty value, including `{}`, is written.
@@ -733,6 +824,8 @@ std::expected<void, std::string> InstructionStore::update_definition(const Instr
                                    vs,
                                    rts,
                                    def.id};
+    if (expected_updated_at)
+        binds.push_back(std::to_string(*expected_updated_at));
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease) {
@@ -740,14 +833,25 @@ std::expected<void, std::string> InstructionStore::update_definition(const Instr
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
                                "pool acquire timeout");
     }
-    pg::PgResult res = pg::exec_params(lease.get(), sql, binds);
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
     if (res.status() != PGRES_TUPLES_OK) {
         note_write_degrade(metrics_, "update_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
                                PQerrorMessage(lease.get()));
     }
-    if (PQntuples(res.get()) == 0)
+    if (PQntuples(res.get()) == 0) {
+        if (expected_updated_at) {
+            // Zero rows is either "gone" or "changed since the caller read it"; tell them apart
+            // on the same lease so the route can answer 409 rather than 404.
+            pg::PgResult exists = pg::exec_params(
+                lease.get(), "SELECT 1 FROM instruction_store.instruction_definitions WHERE id=$1",
+                std::vector<std::string>{def.id});
+            if (exists.status() == PGRES_TUPLES_OK && PQntuples(exists.get()) > 0)
+                return std::unexpected(std::string(kConflictPrefix) + " instruction definition '" +
+                                       def.id + "' was modified since it was loaded");
+        }
         return std::unexpected("not_found: definition not found: " + def.id);
+    }
     return {};
 }
 
@@ -926,6 +1030,8 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
                     "have been tampered with");
             }
             spdlog::info("InstructionStore::import_definition_json: signature verified");
+            if (auto err = bind_signed_dispatch_columns(parsed, yaml_source))
+                return std::unexpected(*err);
         } else if (sig_state == FieldState::Present || pub_state == FieldState::Present) {
             // Exactly one field present — incomplete signing metadata, reject.
             return std::unexpected(
@@ -1228,6 +1334,14 @@ std::expected<std::string, std::string> InstructionStore::insert_set_row(const I
 std::expected<std::string, std::string> InstructionStore::create_set(const InstructionSet& s) {
     if (s.name.empty())
         return std::unexpected("name is required");
+    // The same bounds the Instructions page dialog applies; enforced here so the API cannot
+    // store what the page would refuse.
+    if (s.name.size() > kMaxInstructionSetNameLen)
+        return std::unexpected("name is too long (max " +
+                               std::to_string(kMaxInstructionSetNameLen) + " characters)");
+    if (s.description.size() > kMaxInstructionSetDescriptionLen)
+        return std::unexpected("description is too long (max " +
+                               std::to_string(kMaxInstructionSetDescriptionLen) + " characters)");
     return insert_set_row(s, /*is_seed=*/false);
 }
 

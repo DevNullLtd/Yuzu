@@ -3303,7 +3303,10 @@ distinguishes them, since only one is covered by the existing metric:
   practically reachable. Watch the `yuzu_server_quarantine_read_degrade_total{reason}`
   counter — a non-zero rate means the quarantine view is degraded, **not** that no
   devices are quarantined.
-- **`"authorization check unavailable — try again"`** (new) — the per-record
+- **`"authorization check unavailable — try again"`** (superseded: `GET /api/v1/quarantine`
+  now makes one `Security:Read` list-gate decision per request instead of a per-record
+  loop, so this second message no longer occurs; an unavailable authorization store now
+  answers with the gate's own 503) — the per-record
   admit-then-filter loop that scopes the list to the caller's management groups hit
   an anomalous outcome (neither an explicit allow nor an explicit 403 deny) partway
   through, most commonly a transient engine-principal-store outage landing between
