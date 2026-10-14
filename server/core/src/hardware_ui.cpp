@@ -340,7 +340,7 @@ std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bo
     // would need 50 scoped probes); yuzu-estate.js stops the row's own click handler from
     // overriding its target.
     const std::string quarantine_cell =
-        std::string(quarantined ? "<span class=\"pill bad\">Quarantined</span> " : "") +
+        std::string(quarantined ? "<span class=\"hw-pill bad\">Quarantined</span> " : "") +
         "<a class=\"hw-lab\" data-act=\"row-containment\" href=\"/hardware/ci?id=" + url_encode(d.agent_id) +
         "&amp;lens=containment\">" + (quarantined ? "Containment" : "Quarantine") + "</a>";
     const std::string cpu_ram = [&] {
