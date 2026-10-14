@@ -1706,6 +1706,9 @@ if build_server
       'unit/server/test_workflows_page_render.cpp', # Operate WF-A: the Workflows page's pure definitions/schedules renderers
       'unit/server/test_workflows_page_routes.cpp', # Operate WF-A: the Workflows page fragments (fake gates, no PG)
       'unit/server/test_workflows_page_authz.cpp',  # Operate WF-A: the Workflows page fragments over the real gates ([pg])
+      'unit/server/test_dashboard_scope_expression.cpp', # operate-extras E-1: scope_expression on /api/dashboard/execute
+      'unit/server/test_scope_attribute_guard.cpp', # operate-extras E-1: attribute allow-check for expression-targeted Send
+      'unit/server/test_operate_extras_ui.cpp',     # operate extras: ox- CSS chunk, Dashboard helper markup, controller script pins
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
