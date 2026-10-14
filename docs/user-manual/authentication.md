@@ -1081,7 +1081,7 @@ and `.../confirm` for the full error matrix.
 
 To reduce **standing** privilege (SOC 2 CC6.3/CC6.6), an operator can hold a non-admin role day-to-day and **activate** admin **just-in-time** for a short, justified window — so a compromised everyday session is not a standing admin session. Two steps:
 
-**1. An admin grants eligibility** (one-time, per operator):
+**1. An admin grants eligibility** (one-time, per operator). The granting administrator must hold the administrator role on their own account; a session that is administrator only through an elevation can revoke eligibility but not grant it:
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \

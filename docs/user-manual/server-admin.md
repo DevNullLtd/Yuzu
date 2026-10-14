@@ -235,6 +235,14 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT - changing an account's role or granting elevation eligibility needs your own administrator role (breaking for elevation-only operators)
+
+**What changed.** `POST /api/settings/users/{username}/role` and the grant form (`eligible=true`) of `POST /api/v1/users/{username}/elevation-eligibility` refuse, with `403`, a session that is administrator only through a temporary elevation. The attempt is audited (`elevated_session_role_change_blocked`, `elevated_session_eligibility_grant_blocked`).
+
+**Who this affects.** Operators who rely on an elevated session to change roles or grant eligibility, in particular deployments where every administrator is an elevation-eligible `user` account.
+
+**What to do.** Make the change from an account whose own role is `admin` (a local administrator, or a member of the identity provider's administrator group). Revoking eligibility is still allowed during an elevation.
+
 ### vNEXT - `--gateway-upstream` refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs)
 
 The gateway-upstream service now admits only a gateway whose certificate key (SPKI SHA-256) is pinned, carries `serverAuth` and is inside its validity window, and the server **exits at boot, before binding a port,** when `--gateway-upstream` is set and that cannot be arranged. Who is affected and what to do:
