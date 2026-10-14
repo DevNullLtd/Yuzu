@@ -2984,8 +2984,8 @@ ADR-0041, currently at v3).
 (`Quiet::No` by default). `Quiet::Yes` returns the identical verdict, status and body but
 suppresses the denial side effects: the `auth.permission_required` / `auth.approval_required`
 audit rows and the `yuzu_auth_topology_floor_denied_total` and
-`yuzu_auth_service_scope_default_denied_total` counters. The ceiling-degraded 503 path returns
-`false` without its degrade counter or audit row.
+`yuzu_auth_service_scope_default_denied_total` counters. The ceiling-degraded 503 path still
+answers the same 503 body but skips its degrade counter and audit row.
 
 Not suppressed: the one-off `role.elevation.expired` lifecycle row minted when the request
 reaps an expired elevation, and `RbacStore`'s own store-read telemetry (latency histogram,
