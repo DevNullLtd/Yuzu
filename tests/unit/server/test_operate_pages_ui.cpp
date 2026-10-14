@@ -93,12 +93,14 @@ TEST_CASE("operate pages: the embedded controller is CSP-clean and bounded",
     for (const char* sink : {"eval(", "new Function(", "document.write", "javascript:",
                              "insertAdjacentHTML", "outerHTML", "setTimeout(\"", "setInterval(\""})
         CHECK_FALSE(has(js, sink));
-    // The only innerHTML sinks are the three server-rendered fragment hosts (the Approvals
-    // list, the Executions list and the Selected execution panel); nothing else assigns
-    // markup. Each is written from a 200 body only.
-    CHECK(count_of(js, ".innerHTML") == 3);
+    // The only innerHTML sinks are the two server-rendered list hosts (the Approvals list
+    // and the Executions list); the Selected and Device results panels take parsed
+    // [data-slot] nodes through DOMParser + replaceChildren, so a new panel does not add a
+    // markup sink. Each is written from a 200 body only.
+    CHECK(count_of(js, ".innerHTML") == 2);
     CHECK(count_of(js, "host.innerHTML = res.html;") == 2);
-    CHECK(count_of(js, "panel.innerHTML = res.html;") == 1);
+    CHECK(has(js, "new DOMParser().parseFromString(html, 'text/html')"));
+    CHECK(has(js, "applySlots(res.html);"));
     CHECK(has(js, "if (res.status !== 200) {"));
     // Bounded fetch, built inside try/catch so an old browser degrades to no timeout.
     CHECK(has(js, "var FETCH_TIMEOUT_MS = 15000;"));
@@ -178,7 +180,8 @@ TEST_CASE("operate pages: the Executions template carries every hook the control
     const std::string html(kExecutionsPageHtml);
     const auto& js = yuzu::server::kYuzuOperateJs;
 
-    for (const char* id : {"id=\"exec-list\"", "id=\"exec-selected\"", "id=\"exec-chip\"",
+    for (const char* id : {"id=\"exec-list\"", "id=\"exec-selected\"", "id=\"exec-devices\"",
+                           "id=\"exec-chip\"",
                            "id=\"exec-confined\"", "id=\"f-def\"", "id=\"f-def-hint\""})
         CHECK(has(html, id));
     // Status filter: All is the checked, empty-valued default; the five states follow.

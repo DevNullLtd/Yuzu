@@ -69,6 +69,36 @@ td .by{max-width:140px}
 .held{margin:0 16px 16px;padding:10px 12px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:12.5px;display:flex;flex-direction:column;gap:4px}
 .ops-sel>.btns+.held{margin-top:0}
 .ops-sel>.kvl+.held{margin-top:16px}
+.ops-dev [data-slot]>.hd{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
+.ops-dev .hd h2{font-size:14px;font-weight:600}
+.ops-dev .hd .sub{display:inline;max-width:none}
+.ops-dev .hd .end{margin-left:auto}
+.readout.kpi{border-width:0 0 1px;border-radius:0}
+.readout.kpi .ro{padding:12px 16px;flex-basis:110px}
+.readout.kpi .v{font-size:22px}
+.agrid-wrap{padding:14px 16px 4px}
+.agent-grid{display:grid;grid-template-columns:repeat(auto-fill,12px);gap:2px;max-height:200px;overflow-y:auto}
+.agent-cell{width:12px;height:12px;border-radius:2px;cursor:pointer}
+.agent-cell--bucket{width:auto;height:18px;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--bg);padding:0 6px;border-radius:3px}
+.agent-cell--succeeded{background:var(--ok)}
+.agent-cell--failed{background:var(--bad)}
+.agent-cell--running{background:var(--info)}
+.agent-cell--pending{background:var(--mut);opacity:.4}
+.ops-dev .tw{margin-top:10px}
+table.pa th,table.pa td{padding:7px 12px;font-size:13px}
+table.pa td.er{min-width:150px;max-width:240px;white-space:normal;overflow-wrap:anywhere;font-family:var(--mds-font-family-mono);font-size:12px;color:var(--bad)}
+table.pa td code{font-size:12px;color:var(--ink2)}
+table.pa td code.clip{max-width:262px}
+.dbar{display:inline-block;height:6px;border-radius:2px;vertical-align:middle;min-width:3px}
+.dbar--succeeded{background:var(--ok)}
+.dbar--failed{background:var(--bad)}
+.dbar--running{background:var(--info)}
+.dbar--pending{background:var(--mut);opacity:.4}
+.dtx{font-size:12px;color:var(--mut);margin-left:8px}
+details.resp{border-top:1px solid var(--line);padding:10px 16px}
+details.resp summary{cursor:pointer;font-size:13px;color:var(--mut)}
+.resp-output pre{margin:6px 0;padding:8px;background:var(--bg);border:1px solid var(--line);border-radius:var(--rad-ctl);max-height:200px;overflow:auto;white-space:pre-wrap;font-family:var(--mds-font-family-mono);font-size:12.5px}
+.ops-cap-note{padding:8px 16px}
 @media (max-width:820px){
 .pg{padding:16px}
 .nm,.sub{max-width:200px}

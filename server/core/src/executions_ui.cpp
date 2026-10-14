@@ -56,6 +56,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 </div></div>
 <div id="exec-list"><div class="empty-state">Loading…</div></div>
 </section>
+<section class="panel ops-dev" id="exec-devices" hidden></section>
 </div>
 <aside class="ops-side">
 <section class="panel ops-sel" id="exec-selected">

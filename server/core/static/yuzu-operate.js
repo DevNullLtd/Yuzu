@@ -8,8 +8,9 @@
  * Rules this file keeps (pinned by test_operate_pages_ui.cpp):
  *   - no dynamic-code or raw-markup sinks of any kind (the test pins the exact list);
  *   - innerHTML is assigned ONLY from a 200 fragment the server rendered (and escaped), to
- *     the three fragment hosts (#ap-list, #exec-list, #exec-selected); a non-200 body is
- *     never written anywhere;
+ *     the two list hosts (#ap-list, #exec-list); the selected and devices panels receive
+ *     parsed [data-slot] nodes (DOMParser + replaceChildren); a non-200 body is never
+ *     written anywhere;
  *   - every fetch has a bounded timeout, and a late response never overwrites a newer one
  *     (request token).
  */
@@ -259,11 +260,12 @@
   function executionsController() {
     var host = $('#exec-list');
     var panel = $('#exec-selected');
+    var devices = $('#exec-devices');
     var chip = $('#exec-chip');
     var confinedNote = $('#exec-confined');
     var defSel = $('#f-def');
     var defHint = $('#f-def-hint');
-    if (!host || !panel || !defSel) return;
+    if (!host || !panel || !devices || !defSel) return;
 
     var STATUSES = ['', 'running', 'succeeded', 'completed', 'cancelled', 'pending'];
     var lseq = 0;          // request tokens: only the newest list / detail response is applied
@@ -327,6 +329,27 @@
       n.className = 'empty-state';
       n.textContent = text;
       panel.replaceChildren(hd, n);
+      devices.hidden = true;
+      devices.replaceChildren();
+    }
+
+    // Moves each top-level [data-slot] of a page-view response into the host that carries
+    // its name. The response is parsed into an inert document (nothing in it runs) and the
+    // slot nodes are adopted whole, so no markup is ever assigned as a string here.
+    var SLOT_HOSTS = { selected: panel, devices: devices };
+    function applySlots(html) {
+      var parsed = new DOMParser().parseFromString(html, 'text/html');
+      var seen = {};
+      $$('[data-slot]', parsed.body).forEach(function (slot) {
+        var name = slot.getAttribute('data-slot');
+        var target = SLOT_HOSTS[name];
+        if (!target || seen[name]) return;
+        seen[name] = true;
+        target.replaceChildren(slot);
+        target.hidden = false;
+        renderLocalTimes(target);
+      });
+      if (!seen.devices) { devices.hidden = true; devices.replaceChildren(); }
     }
 
     function markSelected() {
@@ -356,8 +379,7 @@
                            '/detail?view=page').then(function (res) {
         if (mine !== dseq) return;
         if (res.status !== 200) { panelNote(detailCopy(res.status)); return; }
-        panel.innerHTML = res.html; // server-rendered and escaped
-        renderLocalTimes(panel);
+        applySlots(res.html); // server-rendered and escaped
       });
     }
 
