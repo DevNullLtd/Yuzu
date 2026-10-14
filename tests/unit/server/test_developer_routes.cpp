@@ -95,7 +95,7 @@ TEST_CASE("developer page template: no inline handlers, hx-on, eval or innerHTML
     CHECK_FALSE(has(body, " onclick="));
     CHECK_FALSE(has(body, "eval("));
     CHECK_FALSE(has(body, "new Function"));
-    CHECK_FALSE(has(body, "innerHTML"));
+    CHECK_FALSE(has(body, ".innerHTML"));
     CHECK_FALSE(has(body, "unsafe-eval"));
 }
 

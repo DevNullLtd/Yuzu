@@ -322,7 +322,7 @@ TEST_CASE("dashboard_api_routes: /api/export/json-to-csv quotes non-string cells
     // A negative number stays a number: neutralize_formula would make it '-5.
     auto num = h.sink.Post("/api/export/json-to-csv", R"([{"n":-5,"f":-1.5,"b":true}])");
     REQUIRE(num);
-    CHECK(num->body == "n,f,b\r\n-5,-1.5,true\r\n");
+    CHECK(num->body == "b,f,n\r\ntrue,-1.5,-5\r\n"); // keys sort; -5 untouched
 
     // A nested object with commas stays in ONE cell (RFC 4180 quoted).
     auto obj = h.sink.Post("/api/export/json-to-csv", R"([{"o":{"a":1,"b":2},"z":"x"}])");

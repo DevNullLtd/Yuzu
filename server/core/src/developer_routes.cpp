@@ -65,7 +65,7 @@ void register_developer_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  std::size_t n = 0;
                  const auto& doc = routes_doc();
-                 if (doc.is_object() && doc.contains("count") && doc["count"].is_number_unsigned())
+                 if (doc.is_object() && doc.contains("count") && doc["count"].is_number_integer())
                      n = doc["count"].get<std::size_t>();
                  send_html(res, render_api_panel(n));
              });

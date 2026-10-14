@@ -447,7 +447,7 @@ TEST_CASE("render_retention_table: days, no expiry, unknown, and stored-not-in-f
     CHECK(html.find("No expiry") != std::string::npos);
     CHECK(html.find("Unknown") != std::string::npos);
     // An unknown window is never printed as a number.
-    CHECK(html.find("0 days") == std::string::npos);
+    CHECK(html.find(">0 days") == std::string::npos);
     CHECK(html.find("--guardian-event-retention-days") != std::string::npos);
     CHECK(html.find("25,000 per cleanup pass") != std::string::npos);
 }

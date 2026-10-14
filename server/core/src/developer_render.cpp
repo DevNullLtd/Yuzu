@@ -121,7 +121,7 @@ std::string render_api_panel(std::size_t operation_count) {
 std::string render_routes_table(const json& doc, std::string_view q_raw) {
     const auto routes = doc.is_object() ? doc.find("routes") : doc.end();
     const std::size_t total =
-        doc.is_object() && doc.contains("count") && doc["count"].is_number_unsigned()
+        doc.is_object() && doc.contains("count") && doc["count"].is_number_integer()
             ? doc["count"].get<std::size_t>()
             : 0;
     if (!doc.is_object() || routes == doc.end() || !routes->is_array() || total == 0)
