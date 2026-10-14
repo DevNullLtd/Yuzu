@@ -243,6 +243,8 @@ The Guard page (`/guardian/guard/<id>`) shows **Edit** and **Delete** buttons to
 
 Both actions need a fresh MFA step-up for a signed-in user with MFA enrolled (the dialog asks for the authenticator or recovery code and replays the request), are refused for a service-scoped API token, and are refused when the request is not same-site (audited as a denied row with detail `csrf_denied`). Their routes are `POST /fragments/guardian/guard/<id>/update` and `/delete`, twinned to the REST `PUT` / `DELETE /api/v1/guaranteed-state/rules/<id>` and the MCP `update_guardian_rule` / `delete_guardian_rule`.
 
+The dashboard edit, delete and Enable/Disable write the audit row **before** the change and fail closed: if the row cannot be written the request is refused (`503` with `Sec-Audit-Failed: true` for edit and delete; the toggle re-renders the list with a banner and the same header) and nothing changes. A change that is then rejected by the store (a name conflict, for example) adds a `result=failure` row for the same verb after the `success` row, so one request can leave a `success` and a `failure` row; read the pair together. The REST and MCP twins still audit after the change (tracked in #5797).
+
 ## Baselines — how Guards reach agents
 
 A **Baseline** is a named collection of Guards and is the **only deployable unit**. Authoring a Guard (REST or the dashboard form) creates it *unscoped and inert* — it enforces nothing until it is a member of a **deployed** Baseline. This mirrors a GPO / Intune configuration profile / Jamf profile: you assemble controls into a baseline and deploy the baseline.

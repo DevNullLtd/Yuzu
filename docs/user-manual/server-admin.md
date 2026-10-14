@@ -1383,8 +1383,9 @@ value through. Direct access, and proxies configured to preserve `Host`, are una
 need no change.
 
 **The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
-— CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, and the
-gated settings POSTs. The dashboard renders fine and reads work; only the destructive actions
+— CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
+gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
+Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When

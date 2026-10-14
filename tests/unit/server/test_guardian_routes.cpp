@@ -176,6 +176,7 @@ struct Harness {
     // the seam returns false); `audit_throws` models a sink that throws.
     bool audit_ok{true};
     bool audit_throws{false};
+    int audit_attempts{0}; // every call, persisted or not
     std::vector<PushCall> pushes;
     // Every perm_fn call, so a test can prove a polled fragment makes exactly
     // its own one gate check and no extra capability probes (S2).
@@ -242,6 +243,7 @@ struct Harness {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) -> bool {
+            ++audit_attempts;
             if (audit_throws)
                 throw std::runtime_error("audit sink down");
             if (!audit_ok)
@@ -2078,6 +2080,9 @@ TEST_CASE("guard update and delete fail closed when the audit row cannot be writ
     CHECK(d->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(d->body.find("deleted") == std::string::npos);
     CHECK(*h.store->get_rule("g1")); // still there
+    // Both routes tried to write the row (so the refusal is the fail-closed branch,
+    // not a request that never reached the audit step), and neither row persisted.
+    CHECK(h.audit_attempts == 2);
     CHECK(h.audit_count("guaranteed_state.rule.update", "success") == 0);
     CHECK(h.audit_count("guaranteed_state.rule.delete", "success") == 0);
 }
@@ -2096,8 +2101,35 @@ TEST_CASE("guard update and delete fail closed when the audit sink throws",
     REQUIRE(d);
     CHECK(u->status == 503);
     CHECK(d->status == 503);
+    CHECK(u->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(d->get_header_value("Sec-Audit-Failed") == "true");
     CHECK((**h.store->get_rule("g1")).name == "GuardOne");
     CHECK(*h.store->get_rule("g1"));
+}
+
+TEST_CASE("guard Enable/Disable toggle fails closed when the audit row cannot be written",
+          "[pg][guardian_routes][guard][audit]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    REQUIRE((**h.store->get_rule("g1")).enabled);
+    h.audit_ok = false;
+    auto r = h.sink.dispatch("POST", "/fragments/guardian/guard/g1/enabled?value=0", "",
+                             "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    // The fragment convention is 200 + a banner (htmx drops 4xx bodies); the header
+    // and the untouched Guard are the fail-closed evidence.
+    CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(r->body.find("audit record could not be written") != std::string::npos);
+    CHECK((**h.store->get_rule("g1")).enabled);
+    CHECK(h.audit_attempts == 1);
+    CHECK(h.audit_count("guaranteed_state.rule.update", "success") == 0);
+
+    h.audit_ok = true;
+    auto ok = h.sink.dispatch("POST", "/fragments/guardian/guard/g1/enabled?value=0", "",
+                              "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK_FALSE((**h.store->get_rule("g1")).enabled);
+    CHECK(h.audit_count("guaranteed_state.rule.update", "success") == 1);
 }
 
 TEST_CASE("every cookie-authorized Guardian mutation refuses a cross-origin post",

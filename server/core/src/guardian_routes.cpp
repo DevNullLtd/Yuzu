@@ -1093,8 +1093,20 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
         return fail("No such Guard: " + rule_id);
 
     (*rule)->enabled = enabled;
-    if (auto r = store_->update_rule(**rule); !r)
+    // ADR-0033 §9: no audit row, no mutation. Disabling an enforcing Guard is the most
+    // security-relevant change here, so it must not be the unaudited route around the
+    // fail-closed edit dialog. `fail` carries the Sec-Audit-Failed header already set.
+    const std::string audit_detail = std::string(enabled ? "enabled=true" : "enabled=false") +
+                                     " (state-only; applies on next deploy/reconcile)";
+    if (!detail::emit_behavioral_audit(audit_fn_, req, res, "guaranteed_state.rule.update",
+                                       "success", "GuaranteedState", rule_id, audit_detail))
+        return fail("The audit record could not be written, so the change was not applied. "
+                    "Try again.");
+    if (auto r = store_->update_rule(**rule); !r) {
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guaranteed_state.rule.update",
+                                            "failure", "GuaranteedState", rule_id, r.error());
         return fail("Update failed: " + r.error());
+    }
 
     // STATE-ONLY (no push). A Guard's enabled flag is global state, not an
     // individual deploy — Guards are not deployable on their own; only Baselines
@@ -1102,11 +1114,9 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
     // effect on the next Baseline deploy or heartbeat reconcile, both of which
     // re-push the union of *deployed* Baselines' enabled members. (Mode is set at
     // creation and immutable — a different posture is a different Guard — so there
-    // is no mode change here.) Audited under its own rule.update verb so "who
-    // enabled / disabled this guard" stays queryable.
-    audit_fn_(req, "guaranteed_state.rule.update", "success", "GuaranteedState", rule_id,
-              std::string(enabled ? "enabled=true" : "enabled=false") +
-                  " (state-only; applies on next deploy/reconcile)");
+    // is no mode change here.) Audited under its own rule.update verb (written
+    // above, before the store write) so "who enabled / disabled this guard" stays
+    // queryable.
     res.set_content(render_guards_fragment(), "text/html; charset=utf-8");
 }
 
@@ -1140,8 +1150,10 @@ namespace {
 /// `Sec-Audit-Failed: true`, set by emit_behavioral_audit).
 void audit_unavailable(httplib::Response& res) {
     res.status = 503;
-    res.set_content(detail::a4_error(res, "audit record could not be written; the change was not "
-                                          "applied"),
+    res.set_content(detail::a4_error(res,
+                                     "audit record could not be written; the change was not "
+                                     "applied",
+                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
                     "application/json");
 }
 } // namespace
@@ -1235,8 +1247,8 @@ void GuardianRoutes::update_guard_action(const httplib::Request& req, httplib::R
         res.status = conflict ? 409 : 400;
         res.set_content(detail::a4_error(res, std::string(strip_conflict_prefix(r.error()))),
                         "application/json");
-        (void)detail::try_persist_audit(audit_fn_, req, kVerb, "failure", "GuaranteedState",
-                                        rule_id, r.error());
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, kVerb, "failure", "GuaranteedState",
+                                            rule_id, r.error());
         return;
     }
     // Last write wins: no concurrency check (#4303), same as the REST PUT.
@@ -1281,8 +1293,8 @@ void GuardianRoutes::delete_guard_action(const httplib::Request& req, httplib::R
     if (auto r = store_->delete_rule(rule_id); !r) {
         res.status = 404;
         res.set_content(detail::a4_error(res, r.error()), "application/json");
-        (void)detail::try_persist_audit(audit_fn_, req, kVerb, "failure", "GuaranteedState",
-                                        rule_id, r.error());
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, kVerb, "failure", "GuaranteedState",
+                                            rule_id, r.error());
         return;
     }
     // Does NOT unarm agents already enforcing it (#4304): they keep enforcing until
@@ -2735,11 +2747,11 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // silently corrupt a SIEM/works-council query filtering that verb by
     // target_type=Agent. `target_type="GuaranteedState"` matches every other
     // rule/guard-scoped verb in this file (guaranteed_state.rule.*,
-    // guaranteed_state.baseline.*). GuardianRoutes::AuditFn is void (no
-    // persist-failure signal, unlike RestApiV1::AuditFn), so both calls below
-    // are direct fire-and-forget — the same set-and-proceed idiom every other
-    // audit_fn_ call site in this file already uses; a transient audit hiccup
-    // must not blank this operator's lens, and a denial is not a leak.
+    // guaranteed_state.baseline.*). GuardianRoutes::AuditFn returns a persist bool,
+    // but both calls below deliberately ignore it (set-and-proceed, the idiom of
+    // this file's read fragments): a transient audit hiccup must not blank this
+    // operator's lens, and a denial is not a leak. Mutations differ: they fail
+    // closed (update/delete/enable) per ADR-0033 §9.
     sink.Get(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/page)",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (deny_service_scoped_(req, res)) return;

@@ -135,7 +135,11 @@ public:
             // Inject test-supplied headers. Done AFTER Content-Type so a
             // test that explicitly overrides Content-Type via the map
             // wins (rare, but a valid scenario).
+            // httplib keeps header duplicates (an unordered_multimap) and a read returns
+            // the first one, whose order differs between standard libraries: erase the
+            // existing value so the per-call header wins everywhere.
             for (const auto& [name, value] : extra_headers) {
+                req.headers.erase(name);
                 req.set_header(name, value);
             }
 
