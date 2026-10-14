@@ -1386,6 +1386,23 @@ TEST_CASE("ca_routes: wrapper errors carry a toast trigger and re-render the sha
     CHECK_FALSE(missing->get_header_value("HX-Trigger").empty());
 }
 
+TEST_CASE("ca_routes: a successful revoke in view=pki re-renders the pki shape without a toast",
+          "[ca_routes][pki][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.wire();
+    auto ok = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=DEAD&view=pki", "",
+                              "application/x-www-form-urlencoded",
+                              {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}});
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->get_header_value("HX-Trigger").empty());
+    CHECK(ok->body.find("grid2") != std::string::npos);
+    CHECK(ok->body.find(">Revoked</span>") != std::string::npos);
+    CHECK(h.store->is_revoked("DEAD"));
+}
+
 TEST_CASE("ca_routes: the cross-origin refusal keeps its bare body and never re-renders",
           "[ca_routes][pki][security][pg]") {
     // Re-rendering the inventory here would hand a cross-site probe a view of it before the
