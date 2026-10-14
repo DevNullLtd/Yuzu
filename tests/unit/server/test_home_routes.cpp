@@ -380,11 +380,9 @@ TEST_CASE("resolve_links falls back to today's pages and follows the nav when a 
           "[home][route]") {
     const auto links = resolve_links(shell::nav_groups());
     // Targets must always be an absolute path or a fragment of one.
-    for (const auto* l : {&links.approvals, &links.executions, &links.devices, &links.enrolment,
-                          &links.compliance})
+    for (const auto* l : {&links.approvals, &links.executions, &links.devices, &links.enrolment})
         CHECK(l->starts_with("/"));
     CHECK(links.devices == "/hardware");
-    CHECK(links.compliance == "/compliance");
 }
 
 // ── pure roster tally ─────────────────────────────────────────────────────

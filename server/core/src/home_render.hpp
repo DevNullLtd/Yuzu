@@ -76,7 +76,6 @@ struct Links {
     std::string executions{"/instructions"};
     std::string devices{"/hardware"};
     std::string enrolment{"/settings#pending-section"};
-    std::string compliance{"/compliance"};
 };
 
 struct SummaryView {

@@ -16,7 +16,6 @@ namespace {
 // A refused or degraded gate, resolved against a scratch response.
 struct GateResult {
     FactState state{FactState::Unavailable};
-    bool scope_engaged{false};
     authz::VisibleSet scope;
     std::string need;
 };
@@ -40,7 +39,6 @@ GateResult fleet_gate(const Deps& d, const httplib::Request& req, std::string_vi
         return r;
     }
     r.state = FactState::Ok;
-    r.scope_engaged = g.scope.has_value();
     r.scope = std::move(g.scope);
     return r;
 }
@@ -98,7 +96,6 @@ Links resolve_links(std::span<const shell::NavGroup> groups) {
         l.executions = std::string(it->href) + "?status=failed";
     l.devices = href_or(groups, "hardware", l.devices);
     l.enrolment = href_or(groups, "groups", l.enrolment);
-    l.compliance = href_or(groups, "compliance", l.compliance);
     return l;
 }
 
@@ -128,7 +125,7 @@ SummaryView HomeRoutes::build_summary(const httplib::Request& req,
         const GateResult g = fleet_gate(deps_, req, "Inventory", "Read");
         if (g.state != FactState::Ok) {
             v.devices = from_gate<EstateCounts>(g);
-        } else if (!g.scope_engaged && deps_.fleet_estate_fn) {
+        } else if (!g.scope.has_value() && deps_.fleet_estate_fn) {
             auto c = deps_.fleet_estate_fn(v.now_epoch * 1000);
             v.devices = c ? Fact<EstateCounts>::make_ok(*c)
                           : Fact<EstateCounts>::with(FactState::Unavailable);
@@ -158,7 +155,7 @@ SummaryView HomeRoutes::build_summary(const httplib::Request& req,
         const GateResult g = fleet_gate(deps_, req, "Policy", "Read");
         if (g.state != FactState::Ok) {
             v.compliance = from_gate<ComplianceFigure>(g);
-        } else if (g.scope_engaged) {
+        } else if (g.scope.has_value()) {
             v.compliance = Fact<ComplianceFigure>::with(FactState::Limited);
         } else if (!deps_.compliance_fn) {
             v.compliance = Fact<ComplianceFigure>::with(FactState::Unwired);
@@ -174,7 +171,7 @@ SummaryView HomeRoutes::build_summary(const httplib::Request& req,
         const GateResult g = fleet_gate(deps_, req, "Execution", "Read");
         if (g.state != FactState::Ok) {
             v.failed = from_gate<FailedFigure>(g);
-        } else if (g.scope_engaged) {
+        } else if (g.scope.has_value()) {
             v.failed = Fact<FailedFigure>::with(FactState::Limited);
         } else if (!deps_.failed_fn) {
             v.failed = Fact<FailedFigure>::with(FactState::Unwired);
