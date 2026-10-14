@@ -1431,3 +1431,66 @@ TEST_CASE("ca_routes: import wrapper in view=pki re-renders the pki shape and to
     CHECK(ok->body.find("grid2") != std::string::npos);
     CHECK(ok->get_header_value("HX-Trigger").empty());
 }
+
+TEST_CASE("ca_routes: /ca/issued meta and the MCP-shared figures carry the CRL fields",
+          "[ca_routes][pki][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+
+    // No CRL yet: every figure present and null, stale true (no list covers anything).
+    auto none = h.sink.Get("/api/v1/ca/issued");
+    REQUIRE(none);
+    auto m = json::parse(none->body)["meta"];
+    for (const char* k : {"crl_version", "crl_published_at", "crl_next_update", "crl_revoked_count"}) {
+        INFO(k);
+        REQUIRE(m.contains(k));
+        CHECK(m[k].is_null());
+    }
+    REQUIRE(m.contains("crl_stale"));
+
+    CrlVersionRecord crl;
+    crl.version = 3;
+    crl.der = {0x30, 0x03, 0x01, 0x02, 0x03};
+    crl.this_update = 1000;
+    crl.next_update = 2000;
+    crl.published_at = 1000;
+    crl.revoked_count = 0;
+    REQUIRE(h.store->record_crl_for_test(crl));
+    auto some = h.sink.Get("/api/v1/ca/issued");
+    REQUIRE(some);
+    auto m2 = json::parse(some->body)["meta"];
+    CHECK(m2["crl_version"] == 3);
+    CHECK(m2["crl_published_at"] == 1000);
+    CHECK(m2["crl_next_update"] == 2000);
+    CHECK(m2["crl_revoked_count"] == 0);
+    CHECK(m2["crl_stale"] == false);
+
+    // The shared builder is what the MCP twin merges: same keys, same values.
+    const auto figs = crl_figures_json(*h.store);
+    CHECK(figs["crl_version"] == 3);
+    CHECK(figs["crl_stale"] == false);
+}
+
+TEST_CASE("ca_routes: a pre-count CRL row reports a null revoked count, not 0",
+          "[ca_routes][pki][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    CrlVersionRecord crl;
+    crl.version = 1;
+    crl.der = {0x30, 0x03, 0x01, 0x02, 0x03};
+    crl.this_update = 1'800'000'000;
+    crl.next_update = 1'800'086'400;
+    crl.published_at = 1'800'000'000;
+    // revoked_count left nullopt: a list published before counts were recorded.
+    REQUIRE(h.store->record_crl_for_test(crl));
+    h.wire();
+
+    auto r = h.sink.Get("/api/v1/ca/issued");
+    REQUIRE(r);
+    CHECK(json::parse(r->body)["meta"]["crl_revoked_count"].is_null());
+    auto page = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(page);
+    CHECK(page->body.find("Not recorded") != std::string::npos);
+    CHECK(page->body.find("Not confirmed current") != std::string::npos);
+}

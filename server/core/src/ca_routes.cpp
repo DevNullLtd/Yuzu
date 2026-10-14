@@ -30,6 +30,24 @@ std::string derive_cert_audit_target_type(CaStore& ca_store, const std::string& 
     return target_type;
 }
 
+nlohmann::json crl_figures_json(CaStore& ca_store) {
+    nlohmann::json j = {{"crl_version", nullptr},
+                        {"crl_published_at", nullptr},
+                        {"crl_next_update", nullptr},
+                        {"crl_revoked_count", nullptr},
+                        {"crl_stale", nullptr}};
+    if (auto crl = ca_store.latest_crl()) {
+        j["crl_version"] = crl->version;
+        j["crl_published_at"] = crl->published_at;
+        j["crl_next_update"] = crl->next_update;
+        if (crl->revoked_count)
+            j["crl_revoked_count"] = *crl->revoked_count;
+    }
+    if (auto stale = ca_store.has_unpublished_revocations())
+        j["crl_stale"] = *stale;
+    return j;
+}
+
 namespace {
 
 using detail::error_json_a4;
@@ -546,6 +564,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                                        {"has_more", has_more}};
                 if (has_more)
                     meta["next_offset"] = offset + limit;
+                meta.update(crl_figures_json(*ca_store));
                 nlohmann::json out = {{"items", std::move(items)},
                                       {"count", records.size()},
                                       {"meta", std::move(meta)}};
