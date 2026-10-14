@@ -1,13 +1,14 @@
 #pragma once
 
 /// @file home_panels_render.hpp
-/// PURE renderers for the three Home panels that HM-2 adds: Compliance by
-/// policy ("lowest 5"), Recent activity, Server health. Value structs in, HTML
-/// string out: no store, no clock, no request. Every dynamic string goes
-/// through `html_escape`. The route layer (`home_panels_routes`, and the one
-/// health registration in `health_routes.cpp`) owns gating and reads.
+/// PURE renderers for the three Dashboard panels HM-2 added (on Home at first,
+/// moved to the Dashboard in the 2026-10-14 design delta): Compliance by policy
+/// ("lowest 5"), Recent events (the audit read), Server health. Value structs
+/// in, HTML string out: no store, no clock, no request. Every dynamic string
+/// goes through `html_escape`. The route layer (`home_panels_routes`, and the
+/// one health registration in `health_routes.cpp`) owns gating and reads.
 ///
-/// Each renderer returns a complete `<section class="panel" id="home-...">`
+/// Each renderer returns a complete `<section class="panel" id="dash-...">`
 /// so the fragment can replace the page's placeholder with `hx-swap=outerHTML`.
 /// A failed or refused read is a distinct sentence, never an empty value and
 /// never a zero (P17).
@@ -61,7 +62,11 @@ inline constexpr std::size_t kActivityRows = 8;
 
 [[nodiscard]] std::string render_policies_panel(const Fact<PolicyPanel>& f, std::int64_t as_of_secs);
 
-// ── Recent activity ──────────────────────────────────────────────────────
+// ── Recent events ────────────────────────────────────────────────────────
+// Rendered as the Dashboard's five-column "Recent events" table (time, who,
+// action, target, severity). The Severity column is the audit row's `result`
+// (success / failure / denied / other), coloured by that value and nothing
+// else: no severity is invented beyond what the row carries.
 
 struct ActivityRow {
     std::int64_t timestamp{0};

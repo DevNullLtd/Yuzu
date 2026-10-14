@@ -1,9 +1,12 @@
 #pragma once
 
 /// @file home_routes.hpp
-/// `GET /home` and `GET /fragments/home/summary`. Presentation over seams: every
-/// figure comes through an injected closure (ADR-0031 style), so the routes are
-/// unit-testable through `TestRouteSink` with no store, clock or Postgres.
+/// `GET /fragments/dashboard/summary` (the Dashboard readout, Needs attention and
+/// Estate state panels). Presentation over seams: every figure comes through an
+/// injected closure (ADR-0031 style), so the route is unit-testable through
+/// `TestRouteSink` with no store, clock or Postgres. The file name and the `home`
+/// namespace are historical: the fragment began on the Home page (HM-1) and moved
+/// to the Dashboard in the 2026-10-14 design delta.
 ///
 /// AUTH, per figure, each against a scratch `httplib::Response` so a refusal never
 /// reaches the page (htmx drops 4xx/5xx bodies, so every fragment answers 200 with a
@@ -15,7 +18,8 @@
 ///   enrolment    `fleet_read_fn("Enrollment","Read")`, the pending-agents REST twin's gate;
 ///                scope ignored; a refusal omits the row (no note)
 /// `deny_service_scoped_fn` runs first on every fragment (audit verb
-/// `home.fragment.access_denied`). Home never polls and writes no audit row on success.
+/// `dashboard.fragment.access_denied`). The fragment never polls and writes no audit
+/// row on success.
 
 #include <yuzu/server/auth.hpp>
 
@@ -45,7 +49,7 @@ inline constexpr std::size_t kFailedReadCap = 100;
 inline constexpr std::size_t kRosterReadCap = 100000;
 
 /// How long a successful TOP-caller estate read is reused. `fleet_state_counts` is
-/// uncached by design and costs seconds at fleet scale, so Home owns the cache.
+/// uncached by design and costs seconds at fleet scale, so this route owns the cache.
 inline constexpr std::int64_t kEstateCacheTtlSecs = 60;
 
 /// After a failed estate read, the next viewers get "could not read" for this long
@@ -73,7 +77,7 @@ struct Deps {
     using RosterFn = std::function<InventoryDevicesResult()>;
     /// Fleet-wide SQL estate counts (HB-1 seam), partitioned. `nullopt` = degraded.
     /// Optional: when empty the roster path serves every caller. NOT CONFINED: only
-    /// ever called for a caller whose gate returned `scope == nullopt`. HomeRoutes
+    /// ever called for a caller whose gate returned `scope == nullopt`. The route
     /// caches a successful answer for `kEstateCacheTtlSecs` on `now_fn` and backs off
     /// `kEstateFailBackoffSecs` after a failure (served as Unavailable, never as a
     /// figure). The cache is per process: each replica reads and caches on its own, so
@@ -102,13 +106,13 @@ struct Deps {
 };
 
 /// Resolve button targets through the nav by key, with today's page as the
-/// fallback, so Home merges before or after the pages that own those links.
+/// fallback, so the panels merge before or after the pages that own those links.
 [[nodiscard]] Links resolve_links(std::span<const yuzu::server::shell::NavGroup> groups);
 
 /// State tally over a scoped roster slice: the three segments partition the total.
 [[nodiscard]] EstateCounts tally_roster(const std::vector<InventoryDeviceRow>& rows);
 
-class HomeRoutes {
+class DashboardSummaryRoutes {
 public:
     void register_routes(httplib::Server& svr, Deps deps);
     void register_routes(HttpRouteSink& sink, Deps deps);

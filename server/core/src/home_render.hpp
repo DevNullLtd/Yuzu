@@ -1,9 +1,12 @@
 #pragma once
 
 /// @file home_render.hpp
-/// Home (`/home`) value types and PURE renderers. Nothing here reads a store, a
+/// Dashboard summary (`/fragments/dashboard/summary`: readout, Needs attention,
+/// Estate state) value types and PURE renderers. Nothing here reads a store, a
 /// clock or a request: the route resolves every figure into these values and the
 /// renderers turn them into HTML. Every dynamic string goes through `html_escape`.
+/// (The `home` namespace and file name are historical: these panels began on the
+/// Home page and moved to the Dashboard in the 2026-10-14 design delta.)
 ///
 /// Honesty contract (P17): each figure is a `Fact<T>` whose state is one of Ok /
 /// Denied / Limited / Unavailable / Unwired. A figure that could not be read is
@@ -122,11 +125,14 @@ struct FailedRow {
 
 // ── Renderers ──────────────────────────────────────────────────────────────
 
-/// The readout (four cells) as the main swap target `<section id="home-readout">`.
+/// The readout (four cells) as the main swap target `<section id="dash-readout">`.
 [[nodiscard]] std::string render_readout(const SummaryView& v);
-/// Needs attention panel, `<section id="home-attention" hx-swap-oob="outerHTML">`.
+/// Needs attention panel, `<section id="dash-attention" hx-swap-oob="outerHTML">`.
 [[nodiscard]] std::string render_attention(const SummaryView& v);
-/// The whole `/fragments/home/summary` body: readout + the OOB attention panel.
+/// Estate state panel, `<section id="dash-estate" hx-swap-oob="outerHTML">`: the
+/// readout's device partition (online / offline / not seen of total) as plain rows.
+[[nodiscard]] std::string render_estate(const SummaryView& v);
+/// The whole `/fragments/dashboard/summary` body: readout + the two OOB panels.
 [[nodiscard]] std::string render_summary(const SummaryView& v);
 
 } // namespace yuzu::server::home

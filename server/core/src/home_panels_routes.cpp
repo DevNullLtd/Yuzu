@@ -10,12 +10,12 @@ namespace yuzu::server::home_panels {
 namespace {
 
 void serve(httplib::Response& res, const std::string& html) {
-    res.status = 200; // every Home fragment answers 200 so htmx swaps the note
+    res.status = 200; // every Dashboard panel fragment answers 200 so htmx swaps the note
     res.set_header("Cache-Control", "no-store");
     res.set_content(html, "text/html; charset=utf-8");
 }
 
-constexpr const char* kDenyVerb = "home.fragment.access_denied";
+constexpr const char* kDenyVerb = "dashboard.fragment.access_denied";
 
 /// Service-scoped tokens are refused first. The gate writes into a scratch
 /// response; a refusal renders as a Denied note, never the gate's body.
@@ -38,15 +38,15 @@ std::optional<PolicyPanel> read_policy_panel(const ComplianceApi& api) {
     return select_lowest_policies(*policies, *sums);
 }
 
-void register_home_panel_routes(HttpRouteSink& sink, Deps deps) {
+void register_dashboard_panel_routes(HttpRouteSink& sink, Deps deps) {
     if (!deps.auth_fn || !deps.deny_service_scoped_fn || !deps.fleet_read_fn || !deps.perm_fn ||
         !deps.policies_fn || !deps.audit_fn || !deps.now_fn)
-        throw std::invalid_argument("home_panels::register_home_panel_routes: unbound closure");
+        throw std::invalid_argument("home_panels::register_dashboard_panel_routes: unbound closure");
 
-    sink.Get("/fragments/home/policies", [deps](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/dashboard/policies", [deps](const httplib::Request& req, httplib::Response& res) {
         const auto now = deps.now_fn();
         if (service_scoped_refused(deps, req,
-                                   "service-scoped tokens may not read the Home policies panel")) {
+                                   "service-scoped tokens may not read the Dashboard policies panel")) {
             serve(res, render_policies_panel(Fact<PolicyPanel>::with(FactState::Denied, "Policy:Read"),
                                              now));
             return;
@@ -70,14 +70,14 @@ void register_home_panel_routes(HttpRouteSink& sink, Deps deps) {
                                          now));
     });
 
-    sink.Get("/fragments/home/activity", [deps](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/dashboard/activity", [deps](const httplib::Request& req, httplib::Response& res) {
         using Rows = std::vector<ActivityRow>;
         const auto now = deps.now_fn();
         auto out = [&](const Fact<Rows>& f) {
             serve(res, render_activity_panel(f, now, deps.audit_href));
         };
         if (service_scoped_refused(deps, req,
-                                   "service-scoped tokens may not read the Home activity panel")) {
+                                   "service-scoped tokens may not read the Dashboard events panel")) {
             out(Fact<Rows>::with(FactState::Denied, "AuditLog:Read"));
             return;
         }

@@ -218,6 +218,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # counts untwinned.
 # Both Home changes landed on the 201 above; merged together the count is 205 (201 + 1 + 3),
 # the value the checker reported on the merged tree.
+# Design delta 2026-10-14: the four rows above moved with their panels to the Dashboard and
+# are now /fragments/dashboard/{summary,policies,activity,health} (same composed-of status,
+# same count; a rename, not a new surface). Still 205.
 BASELINE_UNTWINNED = 205
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────

@@ -16,9 +16,9 @@ constexpr std::size_t kTargetChars = 48;
 constexpr std::size_t kFailingStoreNames = 5;
 
 std::string header(const char* title, const std::string& sub, std::int64_t as_of) {
-    std::string h = "<div class=\"hd\"><h3>";
+    std::string h = "<div class=\"hd\"><h2>";
     h += title;
-    h += "</h3>";
+    h += "</h2>";
     if (!sub.empty()) h += "<span class=\"sub\">" + html_escape(sub) + "</span>";
     h += "<span class=\"end mut\">As of " + hhmm_utc(as_of) + " UTC</span></div>";
     return h;
@@ -40,7 +40,7 @@ std::string state_note(FactState s, const std::string& securable, const char* wh
     switch (s) {
     case FactState::Denied:
         if (securable == kAdminOnlyNeed)
-            return note("Recent activity is shown to administrators only.");
+            return note("Recent events are shown to administrators only.");
         return note("You do not have access to this panel. It needs " + securable + ".");
     case FactState::Limited:
         return note("Fleet totals are not shown to accounts limited to a group of devices.");
@@ -117,11 +117,11 @@ PolicyPanel select_lowest_policies(const std::vector<Policy>& policies,
 
 std::string render_policies_panel(const Fact<PolicyPanel>& f, std::int64_t as_of_secs) {
     if (f.state != FactState::Ok)
-        return section("home-policies", header("Compliance by policy", {}, as_of_secs),
+        return section("dash-policies", header("Compliance by policy", {}, as_of_secs),
                        state_note(f.state, f.need, "policy compliance"));
     const auto& p = f.value;
     if (p.enabled_total == 0)
-        return section("home-policies", header("Compliance by policy", {}, as_of_secs),
+        return section("dash-policies", header("Compliance by policy", {}, as_of_secs),
                        note("No policies are defined."));
     std::string rows;
     for (const auto& b : p.lowest) {
@@ -140,7 +140,7 @@ std::string render_policies_panel(const Fact<PolicyPanel>& f, std::int64_t as_of
     }
     const std::string sub = "Lowest " + std::to_string(p.lowest.size()) + " of " +
                             std::to_string(p.enabled_total) + " policies";
-    return section("home-policies", header("Compliance by policy", sub, as_of_secs), rows);
+    return section("dash-policies", header("Compliance by policy", sub, as_of_secs), rows);
 }
 
 // ── Activity ─────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ std::vector<ActivityRow> to_activity_rows(const std::vector<AuditEvent>& events)
 
 std::string render_activity_panel(const Fact<std::vector<ActivityRow>>& f, std::int64_t as_of_secs,
                                   const std::string& audit_href) {
-    std::string head = header("Recent activity", {}, as_of_secs);
+    std::string head = header("Recent events", {}, as_of_secs);
     if (!audit_href.empty()) { // empty = no audit page, button omitted
         // The "Audit log" button sits in the header's trailing group.
         const std::string btn = "<a class=\"btn sm\" href=\"" + html_escape(audit_href) +
@@ -172,11 +172,11 @@ std::string render_activity_panel(const Fact<std::vector<ActivityRow>>& f, std::
         head.insert(pos, btn);
     }
     if (f.state != FactState::Ok)
-        return section("home-activity", head, state_note(f.state, f.need, "recent activity"));
+        return section("dash-events", head, state_note(f.state, f.need, "recent events"));
     if (f.value.empty())
-        return section("home-activity", head, note("No activity recorded yet."));
+        return section("dash-events", head, note("No events recorded yet."));
     std::string t = "<table class=\"tw\"><thead><tr><th>Time</th><th>Who</th><th>Action</th>"
-                    "<th>Target</th><th>Result</th></tr></thead><tbody>";
+                    "<th>Target</th><th>Severity</th></tr></thead><tbody>";
     for (const auto& r : f.value) {
         const char* pill = r.result == "success"  ? "ok"
                            : r.result == "failure" ? "bad"
@@ -191,7 +191,7 @@ std::string render_activity_panel(const Fact<std::vector<ActivityRow>>& f, std::
              "</span></td></tr>";
     }
     t += "</tbody></table>";
-    return section("home-activity", head, t);
+    return section("dash-events", head, t);
 }
 
 // ── Health ───────────────────────────────────────────────────────────────
@@ -243,8 +243,8 @@ std::string render_health_panel(const Fact<HealthPanel>& f, std::int64_t as_of_s
     const std::string head = header("Server health", {}, as_of_secs);
     if (f.state != FactState::Ok) {
         if (f.state == FactState::Unavailable)
-            return section("home-health", head, note("Server health could not be read.", true));
-        return section("home-health", head, state_note(f.state, f.need, "server health"));
+            return section("dash-health", head, note("Server health could not be read.", true));
+        return section("dash-health", head, state_note(f.state, f.need, "server health"));
     }
     const auto& h = f.value;
     auto row = [](const std::string& k, const std::string& v) {
@@ -270,7 +270,7 @@ std::string render_health_panel(const Fact<HealthPanel>& f, std::int64_t as_of_s
     b += row("Agents connected to this server", std::to_string(h.agents_online));
     if (!h.version.empty()) b += row("Version", "<span class=\"mono\">" + html_escape(h.version) + "</span>");
     b += "</div>";
-    return section("home-health", head, b);
+    return section("dash-health", head, b);
 }
 
 } // namespace yuzu::server::home_panels

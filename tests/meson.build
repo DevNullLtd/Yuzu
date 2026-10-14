@@ -1412,8 +1412,8 @@ if build_server
       'unit/server/test_execution_tracker.cpp',
       'unit/server/test_execution_routes.cpp', # #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
       'unit/server/test_health_routes.cpp', # #2542 PR-10: the 6-route Health/Infra cluster, extracted onto the HttpRouteSink seam
-      'unit/server/test_home_panels_render.cpp', # HM-2: pure Home panel renderers
-      'unit/server/test_home_panels_routes.cpp', # HM-2: Home policies + activity fragments
+      'unit/server/test_home_panels_render.cpp', # HM-2: pure Dashboard panel renderers
+      'unit/server/test_home_panels_routes.cpp', # HM-2: Dashboard policies + events fragments
       'unit/server/test_leader_elector.cpp',
       'unit/server/test_leader_gate.cpp',
       'unit/server/test_coord_dsn.cpp',
@@ -1535,8 +1535,9 @@ if build_server
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
-      'unit/server/test_home_render.cpp',         # Home: pure renderers, partitions, states
-      'unit/server/test_home_routes.cpp',         # Home: gates, scope, degrade, caller matrix
+      'unit/server/test_home_render.cpp',         # Dashboard summary: pure renderers, partitions, states
+      'unit/server/test_home_routes.cpp',         # Dashboard summary: gates, scope, degrade, caller matrix
+      'unit/server/test_dashboard_ui.cpp',        # Dashboard page: row order, moved placeholders, controls, part pins
       'unit/server/test_home_ui.cpp',             # Home: page pins
       'unit/server/test_inventory_routes.cpp',
       'unit/server/test_software_page_ui.cpp',

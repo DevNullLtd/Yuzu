@@ -1,5 +1,5 @@
 /// @file test_home_panels_render.cpp
-/// Pure renderers for the HM-2 Home panels (policies, activity, health).
+/// Pure renderers for the HM-2 Dashboard panels (policies, events, health).
 /// Fixtures are constructed from the handler value shapes, not captured.
 
 #include "home_panels_render.hpp"
@@ -168,7 +168,7 @@ TEST_CASE("home_panels: activity result pill classes and escaping", "[server][ho
 
 TEST_CASE("home_panels: activity states", "[server][home]") {
     using R = Fact<std::vector<ActivityRow>>;
-    CHECK(has(render_activity_panel(R::make_ok({}), kNow, ""), "No activity recorded yet."));
+    CHECK(has(render_activity_panel(R::make_ok({}), kNow, ""), "No events recorded yet."));
     CHECK(has(render_activity_panel(R::with(FactState::Denied, kAdminOnlyNeed), kNow, ""),
               "administrators only"));
     CHECK(has(render_activity_panel(R::with(FactState::Denied, "AuditLog:Read"), kNow, ""),

@@ -1,13 +1,16 @@
 #pragma once
 
 /// @file home_panels_routes.hpp
-/// HM-2 fragments for the Home page: `GET /fragments/home/policies` and
-/// `GET /fragments/home/activity`. (`GET /fragments/home/health` is registered
-/// from `health_routes.cpp`, because it must capture the `health_handler`
-/// lambda; it uses the same pure renderers.)
+/// HM-2 fragments for the Dashboard: `GET /fragments/dashboard/policies` and
+/// `GET /fragments/dashboard/activity` (the Recent events table).
+/// (`GET /fragments/dashboard/health` is registered from `health_routes.cpp`,
+/// because it must capture the `health_handler` lambda; it uses the same pure
+/// renderers.) The file name and the `home_panels` namespace are historical:
+/// the panels began on the Home page and moved to the Dashboard in the
+/// 2026-10-14 design delta.
 ///
 /// GATING, per fragment, in this order:
-///   1. `deny_service_scoped_fn` (audit verb `home.fragment.access_denied`).
+///   1. `deny_service_scoped_fn` (audit verb `dashboard.fragment.access_denied`).
 ///   2. `auth_fn`.
 ///   3. the figure's own gate, run against a SCRATCH response: a refusal is a
 ///      200 panel note and the gate's body never reaches the page (htmx drops
@@ -80,7 +83,7 @@ struct Deps {
 
 /// Registers exactly 2 routes. Throws `std::invalid_argument` if a required
 /// closure is unbound (a wiring bug caught at boot).
-void register_home_panel_routes(HttpRouteSink& sink, Deps deps);
+void register_dashboard_panel_routes(HttpRouteSink& sink, Deps deps);
 
 } // namespace home_panels
 } // namespace yuzu::server

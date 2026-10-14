@@ -206,7 +206,7 @@ struct Deps {
                            const std::string& action, const std::string& message,
                            const std::string& target_type, const std::string& target_id)>;
 
-    /// Home health panel only (`/fragments/home/health`): the admit-then-filter
+    /// Dashboard health panel only (`/fragments/dashboard/health`): the admit-then-filter
     /// gate for the "Executions running" row. Optional: unbound -> the row is
     /// omitted (never shown unfiltered).
     using FleetReadFn =
@@ -217,7 +217,7 @@ struct Deps {
     AuthFn auth_fn;                          // /fragments/health/summary
     ResolveSessionFn resolve_session_fn;      // /health, /api/health
     DenyServiceScopedFn deny_service_scoped_fn; // /fragments/health/summary
-    FleetReadFn fleet_read_fn;                  // /fragments/home/health (optional)
+    FleetReadFn fleet_read_fn;                  // /fragments/dashboard/health (optional)
 
     // ---- REQUIRED (registration throws std::invalid_argument if null) ----
     Config* cfg{nullptr};
