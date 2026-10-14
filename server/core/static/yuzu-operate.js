@@ -765,6 +765,9 @@
     var runBody = $('#wf-run-body');
     var recentDet = $('#wf-recent-det');
     var recentBody = $('#wf-recent-body');
+    var newBtn = $('#wf-new');
+    var delBtn = $('#wf-del');
+    var scNewBtn = $('#sc-new');
     if (!wfHost || !scHost || !stepsTitle || !stepsBody || !runsStore || !runBody ||
         !recentDet || !recentBody) return;
 
@@ -777,6 +780,7 @@
     var selectedId = '';
     var runsDone = false;  // a runs answer (list or note) has arrived
     var panelFor = '';     // the workflow whose Latest run panel has been requested
+    var polling = {};      // workflow id -> true while its run is watched (Run is disabled)
 
     function stepsEmpty(text) {
       stepsTitle.textContent = 'Steps';
@@ -915,6 +919,7 @@
       if (!id) return;
       dseq++; // a detail still in flight belongs to the workflow just left
       showSteps(id);
+      applyActions();
       writeQs(function (p) { p.set('wf', id); });
       panelFor = '';
       showLatest();
@@ -931,6 +936,7 @@
           setNote(wfHost, failureCopy(res.status, 'workflows'));
           selectedId = '';
           stepsEmpty('Select a workflow to see its steps.');
+          applyActions();
           return;
         }
         wfHost.innerHTML = res.html; // server-rendered and escaped
@@ -939,6 +945,7 @@
         if (selectedId && !showSteps(selectedId))
           stepsEmpty('That workflow is no longer listed.');
         applyLatest();
+        applyActions();
       });
     }
 
@@ -952,8 +959,608 @@
         }
         scHost.innerHTML = res.html; // server-rendered and escaped
         renderLocalTimes(scHost);
+        applyScheduleActions();
       });
     }
+
+    // ---- actions (WF-3a) ----
+    // The data-can-* hints on the definitions list decide which controls are offered. They
+    // are render hints from a probe, never a gate: every write route checks its own grant.
+    var RUN_POLL_MS = 5000;
+    var RUN_POLL_MAX_MS = 600000;   // stop watching a run after 10 minutes
+    var RUN_POST_TIMEOUT_MS = 8000; // the server holds the request for the whole run
+    var AGENT_SHOW_MAX = 200;       // devices drawn in the checklist
+    var AGENT_SELECT_MAX = 500;     // devices one run may name
+    var AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+    var TERMINAL = { completed: 1, failed: 1, cancelled: 1 };
+
+    function can(name) {
+      var list = $('.ops-list', wfHost);
+      return !!list && list.getAttribute('data-can-' + name) === '1';
+    }
+
+    function setReason(btn, allowed, reason) {
+      btn.disabled = !allowed;
+      if (allowed) btn.removeAttribute('title');
+      else btn.setAttribute('title', reason);
+    }
+
+    // Re-applied after every definitions render and after a selection or a poll changes.
+    function applyActions() {
+      var listed = !!$('.ops-list', wfHost);
+      newBtn.hidden = !listed;
+      setReason(newBtn, can('write'), 'Requires Workflow:Write');
+      delBtn.hidden = !(listed && selectedId);
+      setReason(delBtn, can('delete'), 'Requires Workflow:Delete');
+      $$('tr.row', wfHost).forEach(function (row) {
+        var b = $('button[data-act="run"]', row);
+        if (!b) return;
+        var watched = !!polling[row.getAttribute('data-workflow-id')];
+        // Disabled while its run is watched: the server accepts duplicate executes, and the
+        // earlier one may still be running although the request timed out.
+        setReason(b, can('run') && !watched, watched
+          ? 'A run of this workflow may still be in progress.' : 'Requires Workflow:Execute');
+      });
+    }
+
+    function errText(r, fallback) {
+      if (r.status === 401) return 'Your session has expired. Sign in again.';
+      return r.message || fallback;
+    }
+
+    function newWorkflow() {
+      if (!window.YuzuDialog) return;
+      YuzuDialog.form({
+        title: 'New workflow',
+        body: 'Paste the workflow definition as YAML. Nothing runs until you use Run now.',
+        fields: [{ name: 'yaml', label: 'Workflow YAML', type: 'textarea', rows: 14,
+                   maxlength: 200000, required: true,
+                   hint: 'Steps name instructions by id, in the order they run.' }],
+        submitLabel: 'Create workflow',
+        submit: function (v) {
+          return YuzuDialog.request('POST', '/api/workflows', { json: { yaml_source: v.yaml } })
+            .then(function (r) {
+              if (r.ok) return null;
+              if (r.status === 403) return 'You do not have permission to create workflows.';
+              return errText(r, 'Could not create the workflow (HTTP ' + r.status + ').');
+            });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast('Workflow created', 'success');
+        loadWorkflows();
+        loadRuns();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    function deleteWorkflow() {
+      if (!window.YuzuDialog || !selectedId) return;
+      var id = selectedId;
+      var block = stepsFor(id);
+      var name = (block && block.getAttribute('data-name')) || id;
+      YuzuDialog.form({
+        title: 'Delete workflow',
+        body: ['Deletes "' + name + '". Run history is kept. There is no undelete in the console.'],
+        danger: true,
+        fields: [],
+        cancelLabel: 'Go back',
+        submitLabel: 'Delete workflow',
+        submit: function () {
+          return YuzuDialog.request('DELETE', '/api/workflows/' + encodeURIComponent(id))
+            .then(function (r) {
+              if (r.ok && r.data && r.data.deleted === false)
+                return 'That workflow was already deleted or does not exist.';
+              if (r.ok) return null;
+              if (r.status === 403) return 'You do not have permission to delete workflows.';
+              return errText(r, 'Could not delete the workflow (HTTP ' + r.status + ').');
+            });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast('Workflow deleted', 'success');
+        if (selectedId === id) {
+          selectedId = '';
+          writeQs(function (p) { p.delete('wf'); });
+          stepsEmpty('Select a workflow to see its steps.');
+          applyActions();
+        }
+        loadWorkflows();
+        loadRuns();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    // Watches the newest run of a workflow after the Run request timed out: the server keeps
+    // working, so poll the runs fragment every 5 s until a run newer than the one that was
+    // newest before the request reaches a terminal status, or 10 minutes pass.
+    function watchRun(id, baselineRunId) {
+      if (polling[id]) return;
+      polling[id] = true;
+      applyActions();
+      var started = Date.now();
+      function finish(msg) {
+        delete polling[id];
+        applyActions();
+        if (msg) showToast(msg, 'info');
+        loadRuns();
+        if (recentDet.open && selectedId === id) loadRecent();
+      }
+      function tick() {
+        if (Date.now() - started > RUN_POLL_MAX_MS) {
+          finish('Stopped watching the run. Check Recent runs before running it again.');
+          return;
+        }
+        fetchFragment('/fragments/workflow-runs?limit=1&workflow_id=' + encodeURIComponent(id))
+          .then(function (res) {
+            var row = null;
+            if (res.status === 200)
+              row = new DOMParser().parseFromString(res.html, 'text/html').querySelector('tr.row');
+            if (row && row.getAttribute('data-run-id') !== baselineRunId &&
+                TERMINAL[row.getAttribute('data-status')]) {
+              finish('The run finished.');
+              return;
+            }
+            setTimeout(tick, RUN_POLL_MS);
+          });
+      }
+      setTimeout(tick, RUN_POLL_MS);
+    }
+
+    function newestRunId(wid) {
+      var found = '';
+      $$('tr.row', runsStore).forEach(function (r) {
+        if (!found && r.getAttribute('data-workflow-id') === wid)
+          found = r.getAttribute('data-run-id') || '';
+      });
+      return found;
+    }
+
+    function agentList(data) {
+      var arr = Array.isArray(data) ? data : (data && Array.isArray(data.agents) ? data.agents : null);
+      if (!arr) return null;
+      return arr.filter(function (a) { return a && typeof a.agent_id === 'string' && a.agent_id; })
+        .map(function (a) {
+          return { id: a.agent_id, host: typeof a.hostname === 'string' ? a.hostname : '',
+                   os: typeof a.os === 'string' ? a.os : '' };
+        });
+    }
+
+    // The device chooser inside the Run dialog. Returns {node, ids()}; its content arrives
+    // from GET /api/agents (a bare array; an object with .agents is also accepted). Without
+    // Infrastructure:Read (or when the list cannot be read) it falls back to a textarea of
+    // device ids, which the server confines to the caller's scope anyway.
+    function deviceChooser() {
+      var root = doc.createElement('div');
+      var chosen = {};      // agent id -> true
+      var chosenCount = 0;
+      var agents = null;    // null until loaded; [] when none are connected
+      var shownList = [];   // the devices currently drawn (at most AGENT_SHOW_MAX)
+      var area = null;      // the textarea of the fallback
+
+      var note = doc.createElement('p');
+      note.className = 'hint';
+      note.textContent = 'Loading devices…';
+      root.appendChild(note);
+
+      function countText() { note.textContent = chosenCount + ' of ' + AGENT_SELECT_MAX + ' maximum selected.'; }
+
+      function drawList(host, filter) {
+        host.replaceChildren();
+        shownList = [];
+        var q = filter.trim().toLowerCase();
+        var shown = 0;
+        var matched = 0;
+        agents.forEach(function (a) {
+          if (q && (a.host + ' ' + a.id + ' ' + a.os).toLowerCase().indexOf(q) < 0) return;
+          matched++;
+          if (shown >= AGENT_SHOW_MAX) return;
+          shown++;
+          shownList.push(a);
+          var lab = doc.createElement('label');
+          lab.className = 'dev';
+          var cb = doc.createElement('input');
+          cb.type = 'checkbox';
+          cb.checked = !!chosen[a.id];
+          cb.addEventListener('change', function () {
+            if (cb.checked && chosenCount >= AGENT_SELECT_MAX) { cb.checked = false; return; }
+            if (cb.checked) { chosen[a.id] = true; chosenCount++; }
+            else if (chosen[a.id]) { delete chosen[a.id]; chosenCount--; }
+            countText();
+          });
+          var t = doc.createElement('span');
+          t.textContent = (a.host || a.id) + (a.os ? ' · ' + a.os : '');
+          lab.appendChild(cb);
+          lab.appendChild(t);
+          host.appendChild(lab);
+        });
+        if (matched > shown) {
+          var more = doc.createElement('p');
+          more.className = 'hint';
+          more.textContent = 'Showing the first ' + shown + ' of ' + matched +
+            ' matching devices. Narrow the filter to see the rest.';
+          host.appendChild(more);
+        }
+        if (!matched) {
+          var none = doc.createElement('p');
+          none.className = 'hint';
+          none.textContent = agents.length ? 'No device matches the filter.' : 'No devices are connected.';
+          host.appendChild(none);
+        }
+      }
+
+      function showChecklist() {
+        var filt = doc.createElement('input');
+        filt.type = 'text';
+        filt.placeholder = 'Filter devices';
+        filt.setAttribute('aria-label', 'Filter devices');
+        var host = doc.createElement('div');
+        host.className = 'devs';
+        var all = doc.createElement('button');
+        all.type = 'button';
+        all.className = 'btn btn-sm';
+        all.textContent = 'Select shown';
+        all.addEventListener('click', function () {
+          shownList.forEach(function (a) {
+            if (!chosen[a.id] && chosenCount < AGENT_SELECT_MAX) { chosen[a.id] = true; chosenCount++; }
+          });
+          drawList(host, filt.value);
+          countText();
+        });
+        filt.addEventListener('input', function () { drawList(host, filt.value); });
+        root.appendChild(filt);
+        root.appendChild(all);
+        root.appendChild(host);
+        drawList(host, '');
+        countText();
+      }
+
+      function showFallback(why) {
+        note.textContent = why + ' Enter device ids, one per line (letters, digits, . _ -).';
+        area = doc.createElement('textarea');
+        area.rows = 6;
+        area.setAttribute('aria-label', 'Device ids');
+        root.appendChild(area);
+      }
+
+      var init = { credentials: 'same-origin', cache: 'no-store' };
+      var sig = timeoutSignal(FETCH_TIMEOUT_MS);
+      if (sig) init.signal = sig;
+      fetch('/api/agents', init).then(function (r) {
+        if (r.status === 403) { showFallback('You cannot list devices.'); return null; }
+        if (r.status !== 200) { showFallback('The device list could not be loaded.'); return null; }
+        return r.json().then(function (d) {
+          agents = agentList(d);
+          if (agents === null) { showFallback('The device list could not be read.'); return; }
+          showChecklist();
+        });
+      }).catch(function () { showFallback('The device list could not be loaded.'); });
+
+      return {
+        node: root,
+        // The chosen ids, or an error string when the input is not usable.
+        read: function () {
+          if (area) {
+            var seen = {};
+            var out = [];
+            var lines = area.value.split('\n');
+            for (var i = 0; i < lines.length; i++) {
+              var t = lines[i].trim();
+              if (!t) continue;
+              if (!AGENT_ID_RE.test(t)) return 'Not a valid device id: ' + t.slice(0, 40);
+              if (!seen[t]) { seen[t] = true; out.push(t); }
+            }
+            if (out.length > AGENT_SELECT_MAX) return 'Name at most ' + AGENT_SELECT_MAX + ' devices.';
+            return out;
+          }
+          return Object.keys(chosen);
+        }
+      };
+    }
+
+    function runWorkflow(id) {
+      if (!window.YuzuDialog || polling[id] || !can('run')) return;
+      var block = stepsFor(id);
+      var name = (block && block.getAttribute('data-name')) || id;
+      var body = doc.createElement('div');
+      var intro = doc.createElement('p');
+      intro.textContent = 'Runs "' + name + '". Each step is sent to every selected device, in ' +
+        'order. Steps whose instruction needs approval are refused. Device results are not ' +
+        'collected here.';
+      body.appendChild(intro);
+      var chooser = deviceChooser();
+      body.appendChild(chooser.node);
+      var baseline = newestRunId(id);
+      var outcome = '';   // 'ok' (202) or 'timeout' (the request did not finish in time)
+      YuzuDialog.form({
+        title: 'Run workflow',
+        body: body,
+        fields: [],
+        submitLabel: 'Run on selected devices',
+        validate: function () {
+          var ids = chooser.read();
+          if (typeof ids === 'string') return ids;
+          return ids.length ? null : 'Choose at least one device.';
+        },
+        submit: function () {
+          var ids = chooser.read();
+          if (typeof ids === 'string' || !ids.length) return Promise.resolve('Choose at least one device.');
+          var init = { method: 'POST', credentials: 'same-origin', cache: 'no-store',
+                       headers: { 'Content-Type': 'application/json' },
+                       body: JSON.stringify({ agent_ids: ids }) };
+          var sig = timeoutSignal(RUN_POST_TIMEOUT_MS);
+          if (sig) init.signal = sig;
+          return fetch('/api/workflows/' + encodeURIComponent(id) + '/execute', init).then(function (r) {
+            return r.text().then(function (t) {
+              var data = null;
+              try { data = JSON.parse(t); } catch (e) { /* not JSON */ }
+              if (r.ok) { outcome = 'ok'; return null; }
+              if (r.status === 401) return 'Your session has expired. Sign in again.';
+              var msg = data && data.error && typeof data.error.message === 'string' ? data.error.message : '';
+              if (r.status === 403) return msg || 'You do not have permission to run this workflow.';
+              return msg || 'Could not start the run (HTTP ' + r.status + ').';
+            });
+          }, function () {
+            // Timeout or a dropped connection: the server may still be running it.
+            outcome = 'timeout';
+            return null;
+          });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        if (outcome === 'timeout') {
+          showToast('The run may keep running on the server. Check Recent runs before running it again.', 'warning');
+          watchRun(id, baseline);
+          return;
+        }
+        showToast('Workflow run started', 'success');
+        loadRuns();
+        if (recentDet.open && selectedId === id) loadRecent();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+
+    // ---- schedule actions (WF-3b) ----
+    // data-can-* on the schedules list are render hints; the routes stay the gate and are
+    // owner-scoped (a non-owner request answers 200 and changes nothing), so every outcome is
+    // confirmed by re-reading the stored state rather than trusting the 200.
+    function scCan(name) {
+      var list = $('.ops-list', scHost);
+      return !!list && list.getAttribute('data-can-' + name) === '1';
+    }
+
+    function applyScheduleActions() {
+      if (!scNewBtn) return;
+      scNewBtn.hidden = !$('.ops-list', scHost);
+      setReason(scNewBtn, scCan('write') && scCan('enable'),
+        'Requires Schedule:Write and Execution:Execute');
+    }
+
+    function scheduleRow(id) {
+      var found = null;
+      $$('tr.row', scHost).forEach(function (r) {
+        if (r.getAttribute('data-schedule-id') === id) found = r;
+      });
+      return found;
+    }
+
+    function scheduleFacts(row) {
+      var cells = row.children;
+      var nm = $('.nm', row);
+      var subs = $$('.sub', row);
+      return {
+        name: nm ? nm.textContent : '',
+        instruction: subs.length ? subs[0].textContent : '',
+        target: subs.length > 1 ? subs[1].textContent : '',
+        cadence: cells.length > 1 ? cells[1].textContent : ''
+      };
+    }
+
+    function setScheduleEnabled(id, want) {
+      return YuzuDialog.request('POST', '/api/schedules/' + encodeURIComponent(id) + '/enable',
+        { json: { enabled: want } }).then(function (r) {
+        if (!r.ok) {
+          showToast(r.status === 403 ? 'You do not have permission to change this schedule.'
+            : errText(r, 'Could not change the schedule (HTTP ' + r.status + ').'), 'error');
+          return;
+        }
+        return loadSchedules().then(function () {
+          var row = scheduleRow(id);
+          var now = row ? row.getAttribute('data-enabled') === '1' : null;
+          if (now === want) showToast(want ? 'Schedule enabled' : 'Schedule disabled', 'success');
+          else showToast('The schedule was not changed. Only its creator can enable or disable it.', 'warning');
+        });
+      });
+    }
+
+    function toggleSchedule(row) {
+      if (!window.YuzuDialog) return;
+      var id = row.getAttribute('data-schedule-id') || '';
+      var want = row.getAttribute('data-enabled') !== '1';
+      if (!want) { setScheduleEnabled(id, false); return; }
+      var f = scheduleFacts(row);
+      YuzuDialog.form({
+        title: 'Enable schedule',
+        body: ['Enabling "' + f.name + '" arms it: it runs instruction ' + f.instruction +
+                 ' on ' + f.target + ', ' + f.cadence + ', and runs without anyone present.',
+               'It can still be refused when it fires (for example by approval rules).'],
+        fields: [],
+        submitLabel: 'Enable schedule',
+        submit: function () {
+          return YuzuDialog.request('POST', '/api/schedules/' + encodeURIComponent(id) + '/enable',
+            { json: { enabled: true } }).then(function (r) {
+            if (r.ok) return null;
+            if (r.status === 403) return 'You do not have permission to enable schedules.';
+            return errText(r, 'Could not enable the schedule (HTTP ' + r.status + ').');
+          });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        return loadSchedules().then(function () {
+          var again = scheduleRow(id);
+          if (again && again.getAttribute('data-enabled') === '1') showToast('Schedule enabled', 'success');
+          else showToast('The schedule was not changed. Only its creator can enable or disable it.', 'warning');
+        });
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    function deleteSchedule(row) {
+      if (!window.YuzuDialog) return;
+      var id = row.getAttribute('data-schedule-id') || '';
+      var f = scheduleFacts(row);
+      YuzuDialog.form({
+        title: 'Delete schedule',
+        body: ['Deletes "' + f.name + '". It stops running and cannot be restored.'],
+        danger: true,
+        fields: [],
+        cancelLabel: 'Go back',
+        submitLabel: 'Delete schedule',
+        submit: function () {
+          return YuzuDialog.request('DELETE', '/api/schedules/' + encodeURIComponent(id))
+            .then(function (r) {
+              if (r.ok && r.data && r.data.deleted === false)
+                return 'Not deleted: only the schedule\'s creator can delete it, or it no longer exists.';
+              if (r.ok) return null;
+              if (r.status === 403) return 'You do not have permission to delete schedules.';
+              return errText(r, 'Could not delete the schedule (HTTP ' + r.status + ').');
+            });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast('Schedule deleted', 'success');
+        loadSchedules();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    var CADENCES = [
+      { value: 'once', label: 'Once (at the next scheduler tick)' },
+      { value: 'interval', label: 'Every N minutes' },
+      { value: 'daily', label: 'Daily (every 24 hours)' },
+      { value: 'weekly', label: 'Weekly (every 7 days)' },
+      { value: 'monthly', label: 'Monthly (every 30 days)' }
+    ];
+    var YES_NO = [{ value: 'no', label: 'No' }, { value: 'yes', label: 'Yes' }];
+
+    function newSchedule() {
+      if (!window.YuzuDialog) return;
+      YuzuDialog.request('GET', '/api/instructions?enabled_only=1&limit=500').then(function (r) {
+        var defs = r.ok && r.data && Array.isArray(r.data.definitions) ? r.data.definitions : null;
+        if (!defs) {
+          showToast(r.status === 403
+            ? 'Choosing an instruction needs the InstructionDefinition:Read permission.'
+            : errText(r, 'Could not load instructions (HTTP ' + r.status + ').'), 'error');
+          return;
+        }
+        if (!defs.length) { showToast('There are no enabled instructions to schedule.', 'warning'); return; }
+        var byId = {};
+        var options = defs.map(function (d) {
+          byId[d.id] = d;
+          return { value: d.id, label: d.name + (d.plugin ? ' (' + d.plugin + ')' : '') };
+        });
+        return YuzuDialog.form({
+          title: 'New schedule',
+          body: 'Runs one instruction on a repeat, without anyone present. You confirm the details next.',
+          fields: [
+            { name: 'name', label: 'Name', type: 'text', maxlength: 200, required: true },
+            { name: 'definition_id', label: 'Instruction', type: 'select', options: options },
+            { name: 'frequency_type', label: 'Cadence', type: 'select', options: CADENCES,
+              hint: 'The scheduler applies the cadence only; it ignores time of day.' },
+            { name: 'interval_minutes', label: 'Interval minutes', type: 'text', value: '60',
+              inputmode: 'numeric', hint: 'Used by "Every N minutes" only.' },
+            { name: 'scope_expression', label: 'Targets (scope expression)', type: 'text',
+              maxlength: 2000, hint: 'Leave empty to target every device.' },
+            { name: 'all_ack', label: 'Targets are empty: run on All devices?', type: 'select',
+              options: YES_NO, hint: 'Choose Yes to acknowledge that an empty scope reaches every device.' },
+            { name: 'requires_approval', label: 'Require approval for each run', type: 'select',
+              options: YES_NO },
+            { name: 'parameters', label: 'Parameters (JSON object)', type: 'textarea', rows: 4,
+              value: '{}', maxlength: 20000 }
+          ],
+          submitLabel: 'Review',
+          validate: function (v) {
+            if (v.frequency_type === 'interval') {
+              var n = Number(v.interval_minutes);
+              if (!/^\d+$/.test(v.interval_minutes.trim()) || n < 1 || n > 525600)
+                return 'Interval minutes must be a whole number from 1 to 525600.';
+            }
+            if (!v.scope_expression.trim() && v.all_ack !== 'yes')
+              return 'No targets entered. Choose Yes under "run on All devices" to confirm every device.';
+            var p = null;
+            try { p = JSON.parse(v.parameters.trim() || '{}'); } catch (e) { p = null; }
+            if (!p || typeof p !== 'object' || Array.isArray(p)) return 'Parameters must be a JSON object.';
+            return null;
+          }
+        }).then(function (v) {
+          if (v === null) return;
+          return confirmSchedule(v, byId[v.definition_id]);
+        });
+      }).then(null, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    // The mandatory last step: a plain-language summary, including the instruction's approval
+    // mode (read from the definition), because the schedule starts enabled and fires unattended.
+    function confirmSchedule(v, def) {
+      return YuzuDialog.request('GET', '/api/v1/instructions/' + encodeURIComponent(v.definition_id))
+        .then(function (r) {
+          var d = r.ok && r.data && r.data.data ? r.data.data : null;
+          var mode = d && typeof d.approval_mode === 'string' && d.approval_mode ? d.approval_mode : 'unknown';
+          var scope = v.scope_expression.trim();
+          var cadence = v.frequency_type === 'interval'
+            ? 'every ' + v.interval_minutes.trim() + ' minutes'
+            : (v.frequency_type === 'once' ? 'once, at the next scheduler tick (about now)' : v.frequency_type);
+          var lines = [
+            'Schedule "' + v.name.trim() + '" runs ' + (def ? def.name : v.definition_id) + ' ' + cadence + '.',
+            'Targets: ' + (scope ? scope : 'ALL DEVICES') + '.',
+            'Instruction approval mode: ' + mode + '. Require approval for each run: ' +
+              (v.requires_approval === 'yes' ? 'yes' : 'no') + '.',
+            'It starts enabled and runs without anyone present. A run can still be refused when it ' +
+              'fires (for example by approval rules, or because the instruction needs one-time credentials).'
+          ];
+          return YuzuDialog.form({
+            title: 'Create this schedule?',
+            body: lines,
+            fields: [],
+            cancelLabel: 'Go back',
+            submitLabel: 'Create schedule',
+            submit: function () {
+              var body = {
+                name: v.name.trim(), definition_id: v.definition_id,
+                frequency_type: v.frequency_type, scope_expression: scope,
+                requires_approval: v.requires_approval === 'yes',
+                parameters: JSON.parse(v.parameters.trim() || '{}')
+              };
+              if (v.frequency_type === 'interval') body.interval_minutes = Number(v.interval_minutes.trim());
+              return YuzuDialog.request('POST', '/api/schedules', { json: body }).then(function (res) {
+                if (res.ok) return null;
+                if (res.status === 403) return 'You do not have permission to create schedules.';
+                return errText(res, 'Could not create the schedule (HTTP ' + res.status + ').');
+              });
+            }
+          });
+        }).then(function (done) {
+          if (done === null || done === undefined) return;
+          showToast('Schedule created', 'success');
+          loadSchedules();
+        });
+    }
+
+    if (scNewBtn) scNewBtn.addEventListener('click', function () { if (!scNewBtn.disabled) newSchedule(); });
+    scHost.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-act]') : null;
+      if (!b || !scHost.contains(b) || b.disabled) return;
+      var row = b.closest('tr.row');
+      if (!row) return;
+      var act = b.getAttribute('data-act');
+      if (act === 'sc-toggle') toggleSchedule(row);
+      else if (act === 'sc-delete') deleteSchedule(row);
+    });
+
+    newBtn.addEventListener('click', function () { if (!newBtn.disabled) newWorkflow(); });
+    delBtn.addEventListener('click', function () { if (!delBtn.disabled) deleteWorkflow(); });
+    wfHost.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-act="run"]') : null;
+      if (!b || !wfHost.contains(b) || b.disabled) return;
+      var brow = b.closest('tr.row');
+      if (brow) runWorkflow(brow.getAttribute('data-workflow-id') || '');
+    });
 
     wfHost.addEventListener('click', function (e) {
       var row = e.target.closest ? e.target.closest('tr.row') : null;
@@ -961,6 +1568,7 @@
     });
     wfHost.addEventListener('keydown', function (e) {
       if (e.key !== 'Enter' && e.key !== ' ') return;
+      if (e.target && e.target.tagName === 'BUTTON') return; // let the button's own click run
       var row = e.target.closest ? e.target.closest('tr.row') : null;
       if (!row || !wfHost.contains(row)) return;
       e.preventDefault();
@@ -995,7 +1603,7 @@
     loadRuns();
     loadWorkflows().then(function () {
       if (!wantId) return;
-      if (showSteps(wantId)) showLatest();
+      if (showSteps(wantId)) { applyActions(); showLatest(); }
       else stepsEmpty('That workflow is not listed, or you may not see it.');
     });
   }

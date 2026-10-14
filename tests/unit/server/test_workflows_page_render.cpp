@@ -305,3 +305,89 @@ TEST_CASE("runs render: step detail comes from known shapes only",
     CHECK(c.find("Dispatched (run-wide)") != std::string::npos);
     CHECK(c.find("Devices in your scope") != std::string::npos);
 }
+
+TEST_CASE("workflows render: the action hints and Run now reflect the probed capabilities",
+          "[ui][workflows][render]") {
+    WorkflowListView v;
+    v.rows.push_back(wf("w-1", "Patch"));
+    auto off = render_workflows_list(v);
+    CHECK(has(off, "data-can-run=\"0\" data-can-write=\"0\" data-can-delete=\"0\""));
+    CHECK(has(off, "data-act=\"run\" disabled title=\"Requires Workflow:Execute\""));
+    v.can_run = true;
+    v.can_write = true;
+    v.can_delete = true;
+    auto on = render_workflows_list(v);
+    CHECK(has(on, "data-can-run=\"1\" data-can-write=\"1\" data-can-delete=\"1\""));
+    CHECK_FALSE(has(on, "data-act=\"run\" disabled"));
+    CHECK(has(on, ">Run now</button>"));
+    // The hints also ride on an empty list, so New workflow can be offered there.
+    WorkflowListView e;
+    e.can_write = true;
+    CHECK(has(render_workflows_list(e), "data-can-write=\"1\""));
+}
+
+TEST_CASE("workflows render: an instruction name is shown only when the route supplied one",
+          "[ui][workflows][render]") {
+    WorkflowListView v;
+    auto w = wf("w-1", "Patch");
+    auto s = step(0, "inst-9");
+    w.steps.push_back(s);
+    s.index = 1;
+    s.label = "Stop the spooler";
+    s.instruction_name = std::string("Restart ") + kPlant;
+    w.steps.push_back(s);
+    s.index = 2;
+    s.label = "";
+    s.instruction_name = "Collect logs";
+    w.steps.push_back(s);
+    v.rows.push_back(w);
+    const auto html = render_workflows_list(v);
+    // No name: the id is the title. Label plus name: the label titles, the name leads the
+    // subtitle (escaped). Name without a label: the name titles.
+    CHECK(has(html, "1. inst-9"));
+    CHECK(has(html, "2. Stop the spooler"));
+    CHECK(has(html, "Restart &lt;img src=x onerror=1&gt; &middot; <span class=\"mono\">inst-9"));
+    CHECK(has(html, "3. Collect logs"));
+    CHECK_FALSE(has(html, kPlant));
+}
+
+TEST_CASE("schedules render: controls follow the hints and the row's owner",
+          "[ui][workflows][render]") {
+    ScheduleListView v;
+    auto off = sched("s-off", true);
+    off.enabled = false;
+    v.rows = {sched("s-on", true), off, sched("s-other", false)};
+    v.can_write = true;
+    v.can_enable = true;
+    v.can_delete = true;
+    auto html = render_schedules_page(v);
+    CHECK(has(html, "data-can-write=\"1\" data-can-enable=\"1\" data-can-delete=\"1\""));
+    CHECK(has(html, "data-schedule-id=\"s-on\" data-owner=\"1\" data-enabled=\"1\""));
+    CHECK(has(html, "data-schedule-id=\"s-off\" data-owner=\"1\" data-enabled=\"0\""));
+    CHECK(has(html, ">Disable</button>"));
+    CHECK(has(html, ">Enable</button>"));
+    // A non-owner row (and an orphan, which is never the owner) is disabled with the reason.
+    CHECK(has(html, "data-act=\"sc-toggle\" disabled title=\"Only the schedule's creator can "
+                    "change it\">Disable"));
+    CHECK(has(html, "data-act=\"sc-delete\" disabled title=\"Only the schedule's creator can "
+                    "change it\""));
+
+    // Enable needs Execution:Execute as well; Disable does not.
+    v.rows = {off, sched("s-on", true)};
+    v.can_enable = false;
+    html = render_schedules_page(v);
+    CHECK(has(html, "disabled title=\"Requires Schedule:Write and Execution:Execute\">Enable"));
+    CHECK_FALSE(has(html, "data-act=\"sc-toggle\" disabled title=\"Requires Schedule:Write\""));
+    v.can_write = false;
+    v.can_delete = false;
+    html = render_schedules_page(v);
+    CHECK(has(html, "disabled title=\"Requires Schedule:Write\">Disable"));
+    CHECK(has(html, "data-act=\"sc-delete\" disabled title=\"Requires Schedule:Delete\""));
+
+    // An empty list still carries the hints (New schedule is offered from them).
+    v.rows.clear();
+    v.can_write = true;
+    v.can_enable = true;
+    CHECK(has(render_schedules_page(v), "data-state=\"empty\""));
+    CHECK(has(render_schedules_page(v), "data-can-write=\"1\" data-can-enable=\"1\""));
+}

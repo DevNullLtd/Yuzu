@@ -13,6 +13,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -40,6 +41,9 @@ struct Fx {
     std::string username{"alice"};
     std::string token_scope_service;
     std::vector<std::string> audit_actions;
+    // The render-hint probe (never a gate): every "Type:Op" asked, and the ones it grants.
+    std::vector<std::string> probes;
+    std::unordered_set<std::string> probe_grants;
 
     int list_calls{0};
     WorkflowQuery seen_query;
@@ -80,6 +84,11 @@ struct Fx {
                 return false;
             }
             return true;
+        };
+        d.probe_perm_fn = [this](const httplib::Request&, const std::string& t,
+                                 const std::string& op) {
+            probes.push_back(t + ":" + op);
+            return probe_grants.count(t + ":" + op) > 0;
         };
         d.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                                  const std::string&) -> authz::FleetReadGate {
@@ -609,4 +618,78 @@ TEST_CASE("/fragments/workflow-runs/{id}: stored text is escaped and an unknown 
     CHECK_FALSE(has(res->body, "<img"));
     CHECK_FALSE(has(res->body, "<b>new"));
     CHECK(has(res->body, "No detail."));
+}
+
+TEST_CASE("/fragments/workflows: each action hint is its own probe and defaults to off",
+          "[workflow][workflows][page][authz]") {
+    Fx fx;
+    fx.workflows = std::vector<Workflow>{workflow("wf-1", "Patch Tuesday")};
+    // Nothing granted: every hint is 0 and Run now is disabled with its reason.
+    auto none = fx.get("/fragments/workflows");
+    CHECK(has(none->body,
+              "data-can-run=\"0\" data-can-write=\"0\" data-can-delete=\"0\""));
+    CHECK(has(none->body, "data-act=\"run\" disabled title=\"Requires Workflow:Execute\""));
+    // Probed once per render: Execute, Write, Delete, then the instruction-name grant.
+    CHECK(fx.probes == std::vector<std::string>{"Workflow:Execute", "Workflow:Write",
+                                                "Workflow:Delete",
+                                                "InstructionDefinition:Read"});
+    // The route's own gate is unchanged by the probes.
+    CHECK(fx.perm_calls == 1);
+
+    // One grant at a time lights exactly one hint.
+    fx.probe_grants = {"Workflow:Write"};
+    auto w = fx.get("/fragments/workflows");
+    CHECK(has(w->body, "data-can-run=\"0\" data-can-write=\"1\" data-can-delete=\"0\""));
+    fx.probe_grants = {"Workflow:Execute"};
+    auto x = fx.get("/fragments/workflows");
+    CHECK(has(x->body, "data-can-run=\"1\" data-can-write=\"0\" data-can-delete=\"0\""));
+    CHECK_FALSE(has(x->body, "data-act=\"run\" disabled"));
+    fx.probe_grants = {"Workflow:Delete"};
+    auto d = fx.get("/fragments/workflows");
+    CHECK(has(d->body, "data-can-run=\"0\" data-can-write=\"0\" data-can-delete=\"1\""));
+}
+
+TEST_CASE("/fragments/workflows: an empty list still carries the New workflow hint",
+          "[workflow][workflows][page]") {
+    Fx fx;
+    fx.probe_grants = {"Workflow:Write"};
+    auto res = fx.get("/fragments/workflows");
+    CHECK(has(res->body, "data-state=\"empty\""));
+    CHECK(has(res->body, "data-can-write=\"1\""));
+    // No rows: the instruction-name probe is not spent.
+    CHECK(std::find(fx.probes.begin(), fx.probes.end(), "InstructionDefinition:Read") ==
+          fx.probes.end());
+}
+
+TEST_CASE("/fragments/workflows: a refused or degraded read probes nothing",
+          "[workflow][workflows][page][authz]") {
+    Fx refused;
+    refused.perm_grant = false;
+    (void)refused.get("/fragments/workflows");
+    CHECK(refused.probes.empty());
+
+    Fx degraded;
+    degraded.workflows = std::unexpected(std::string{"boom"});
+    (void)degraded.get("/fragments/workflows");
+    CHECK(degraded.probes.empty());
+}
+
+TEST_CASE("/fragments/schedules?view=page: capability hints are probed once per render, never a gate",
+          "[workflow][workflows][page][schedules][authz]") {
+    Fx fx;
+    fx.schedules = ScheduleListResult{{sched("s1", "Mine")}, false};
+    auto none = fx.get("/fragments/schedules?view=page");
+    CHECK(has(none->body, "data-can-write=\"0\" data-can-enable=\"0\" data-can-delete=\"0\""));
+    CHECK(has(none->body, "data-act=\"sc-toggle\" disabled title=\"Requires Schedule:Write\""));
+    CHECK(fx.probes == std::vector<std::string>{"Schedule:Write", "Execution:Execute",
+                                                "Schedule:Delete"});
+    CHECK(fx.perm_calls == 1); // the route's own gate is unchanged
+
+    fx.probe_grants = {"Schedule:Write", "Execution:Execute"};
+    auto arm = fx.get("/fragments/schedules?view=page");
+    CHECK(has(arm->body, "data-can-write=\"1\" data-can-enable=\"1\" data-can-delete=\"0\""));
+    CHECK(has(arm->body, "data-act=\"sc-delete\" disabled title=\"Requires Schedule:Delete\""));
+    fx.probe_grants = {"Schedule:Delete"};
+    auto del = fx.get("/fragments/schedules?view=page");
+    CHECK(has(del->body, "data-can-write=\"0\" data-can-enable=\"0\" data-can-delete=\"1\""));
 }
