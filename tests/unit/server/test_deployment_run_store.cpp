@@ -347,6 +347,14 @@ TEST_CASE("DeploymentRunStore checked readers: a miss is not a fault, a fault is
         auto two = store.get_devices_checked("cA", 2);
         REQUIRE(two);
         CHECK(two->size() == 2);
+        // Equal hostnames order by agent_id, so a capped page is stable.
+        REQUIRE(store.create_deployment(make_dep("cT", "alice", t),
+                                        {{"z2", "same-host", "windows"}, {"a9", "same-host", "windows"}}));
+        auto tied = store.get_devices_checked("cT");
+        REQUIRE(tied);
+        REQUIRE(tied->size() == 2);
+        CHECK((*tied)[0].agent_id == "a9");
+        CHECK((*tied)[1].agent_id == "z2");
         auto absent = store.get_devices_checked("nope");
         REQUIRE(absent);
         CHECK(absent->empty());

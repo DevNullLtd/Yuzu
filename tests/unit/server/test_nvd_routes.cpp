@@ -388,6 +388,7 @@ TEST_CASE("nvd_routes: the status fragment states the off state plainly",
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK(r->body.find("NVD sync is off on this server.") != std::string::npos);
+    CHECK(r->get_header_value("Cache-Control") == "no-store");
 }
 
 TEST_CASE("render_nvd_status: counts, never-synced, in-progress, and an escaped bounded error",

@@ -587,6 +587,8 @@ TEST_CASE("deployment routes: GET /api/v1/deployments is owner-scoped, newest fi
     auto huge = rig.sink.Get("/api/v1/deployments?limit=99999");
     REQUIRE(huge);
     CHECK(huge->status == 200);
+    CHECK(nlohmann::json::parse(huge->body)["pagination"]["page_size"] == 100); // ceiling
+    CHECK(body["pagination"]["page_size"] == 20);                                // default
     auto bad = rig.sink.Get("/api/v1/deployments?limit=abc");
     REQUIRE(bad);
     CHECK(bad->status == 400);
@@ -667,6 +669,10 @@ TEST_CASE("deployment routes: GET /api/v1/deployments/{id} is owner-scoped, boun
     CHECK(body["data"]["total"] == 3);
     CHECK(body["data"]["devices"].size() == 3);
     CHECK(body["data"]["truncated"] == false);
+    CHECK(body["data"]["device_limit"] == 500); // default
+    auto big = rig.sink.Get("/api/v1/deployments/" + hex_id(10) + "?limit=99999");
+    REQUIRE(big);
+    CHECK(nlohmann::json::parse(big->body)["data"]["device_limit"] == 5000); // ceiling
     CHECK(body["data"]["devices"][0]["hostname"] == "host-a1"); // ordered by hostname
     CHECK(res->body.find("repo.lan") == std::string::npos);
 
@@ -783,6 +789,7 @@ TEST_CASE("deployment routes: list fragment resolves the target label owner-scop
     CHECK(l->body.find("Run no longer kept") != std::string::npos);
     CHECK(l->body.find(hex_id(32)) == std::string::npos); // bob's deployment is not listed
     CHECK(l->body.find("repo.lan") == std::string::npos);
+    CHECK(l->get_header_value("Cache-Control") == "no-store");
 
     auto mine = rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(30));
     auto theirs = rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(32));
@@ -791,6 +798,7 @@ TEST_CASE("deployment routes: list fragment resolves the target label owner-scop
     REQUIRE(theirs);
     REQUIRE(absent);
     CHECK(mine->body.find("host-a1") != std::string::npos);
+    CHECK(mine->get_header_value("Cache-Control") == "no-store");
     CHECK(theirs->body == absent->body); // byte-identical: no existence oracle
     CHECK(theirs->body.find("aged out of retention") != std::string::npos);
     CHECK(rig.dispatches == 0);
