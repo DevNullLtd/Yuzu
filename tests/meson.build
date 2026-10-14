@@ -1548,6 +1548,7 @@ if build_server
       # relative path.
       '../agents/plugins/tar/src/tar_schema_registry.cpp',
       'unit/server/test_dex_app_perf_model.cpp',
+      'unit/server/test_dex_app_perf_failures.cpp', # pure per-version crash/hang join + shared versions[] serializer - no store, no PG
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_dex_stability_score.cpp', # pure application/version stability score (dex_stability_score.hpp) - no store, no PG
