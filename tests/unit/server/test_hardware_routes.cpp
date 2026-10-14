@@ -18,6 +18,7 @@
 
 #include <cstdio>
 #include <expected>
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -80,14 +81,18 @@ struct HwHarness {
     int sync_dispatch_calls = 0;
 
     // Quarantine pill (es-1): `quarantine_rows` unset = the list closure is left unwired.
-    // `security_read_status[id]` = the status the throwaway Response carries when the
-    // per-record Security:Read probe for `id` fails (403 = scope denial, anything else =
-    // an anomalous degrade); absent = pass.
+    // The pill uses ONE Security:Read list-gate decision per render (never a per-record probe).
     std::optional<std::vector<QuarantineRecord>> quarantine_rows;
     bool quarantine_list_wired = false;
     bool quarantine_read_degraded = false;
-    std::unordered_map<std::string, int> security_read_status;
-    std::vector<std::string> security_read_probes; // ids probed, in order
+    std::vector<std::string> security_read_probes; // per-device probes (must stay empty for pills)
+    // The Security:Read LIST gate the pills use (one call per render). `security_gate_status`:
+    // 0 = admit (scope below), 403 = scope refusal, other = anomalous (401/503).
+    int security_gate_status = 0;
+    int security_gate_calls = 0;
+    authz::VisibleSet security_scope; // nullopt = TOP
+    int quarantine_list_calls = 0;
+    std::vector<std::string> last_quarantine_ids; // ids pushed into the last store read
 
     std::vector<std::string> audits;        // "action|result"
     std::vector<std::string> audit_full;    // "action|result|target_type|target_id"
@@ -112,11 +117,7 @@ struct HwHarness {
                                   const std::string& type, const std::string& op,
                                   const std::string& id) {
             if (type == "Security" && op == "Read") {
-                security_read_probes.push_back(id);
-                if (auto it = security_read_status.find(id); it != security_read_status.end()) {
-                    res.status = it->second;
-                    return false;
-                }
+                security_read_probes.push_back(id); // the pills must never reach this
                 return true;
             }
             if (!allow_scoped_perm)
@@ -124,9 +125,19 @@ struct HwHarness {
             return allow_scoped_perm;
         };
         HardwareRoutes::FleetReadFn fleet_read =
-            [this](const httplib::Request&, httplib::Response& res, const std::string&,
+            [this](const httplib::Request&, httplib::Response& res, const std::string& type,
                   const std::string&) -> authz::FleetReadGate {
             authz::FleetReadGate g;
+            if (type == "Security") { // the Quarantined pill's list gate (ADR-0017)
+                ++security_gate_calls;
+                if (security_gate_status != 0) {
+                    res.status = security_gate_status;
+                    return g;
+                }
+                g.admitted = true;
+                g.scope = security_scope;
+                return g;
+            }
             if (!allow_fleet_read) {
                 res.status = 403;
                 return g; // admitted=false, scope=deny_all() (unused — response already written)
@@ -184,10 +195,21 @@ struct HwHarness {
         deps.scoped_probe_fn = probe;
         deps.dex_score_fn = dex_fn;
         if (quarantine_list_wired) {
-            deps.quarantine_list_fn = [this]() -> std::optional<std::vector<QuarantineRecord>> {
+            deps.quarantine_list_fn = [this](const std::vector<std::string>* ids, std::size_t limit)
+                -> std::optional<std::vector<QuarantineRecord>> {
+                ++quarantine_list_calls;
+                last_quarantine_ids = ids ? *ids : std::vector<std::string>{};
                 if (quarantine_read_degraded)
                     return std::nullopt;
-                return quarantine_rows.value_or(std::vector<QuarantineRecord>{});
+                std::vector<QuarantineRecord> out;
+                for (const auto& r : quarantine_rows.value_or(std::vector<QuarantineRecord>{})) {
+                    if (ids && std::find(ids->begin(), ids->end(), r.agent_id) == ids->end())
+                        continue;
+                    out.push_back(r);
+                    if (limit != 0 && out.size() >= limit)
+                        break;
+                }
+                return out;
             };
         }
         deps.sync_dispatch_fn = unwire_sync_dispatch ? HardwareRoutes::SyncDispatchFn{} : sync_fn;
@@ -1191,7 +1213,7 @@ QuarantineRecord q_rec(const std::string& id) {
 
 // Kills: probing every active record instead of the intersection with the page's rows
 // (an unbounded audit-noise / DoS loop), and the pill landing on the wrong row.
-TEST_CASE("route: list pill — probes only quarantined ids that are on the page; pill on those rows",
+TEST_CASE("route: list pill — one Security:Read gate decision; only on-page ids reach the store; pill on those rows",
           "[hardware][route][quarantine]") {
     HwHarness h(false, false, /*quarantine_list_wired=*/true);
     h.roster_rows = {make_row("a-on-page", "PAGE-HOST", "linux", true),
@@ -1201,7 +1223,11 @@ TEST_CASE("route: list pill — probes only quarantined ids that are on the page
     auto res = h.sink.Get("/fragments/hardware/list");
     REQUIRE(res);
     REQUIRE(res->status == 200);
-    CHECK(h.security_read_probes == std::vector<std::string>{"a-on-page"});
+    // ONE list-gate decision, no per-device probe, and the store was asked only for page ids.
+    CHECK(h.security_gate_calls == 1);
+    CHECK(h.security_read_probes.empty());
+    CHECK(h.quarantine_list_calls == 1);
+    CHECK(h.last_quarantine_ids.size() == 2);
     // exactly one Quarantined pill, and it is in a-on-page's row
     const auto first = res->body.find("hw-pill bad\">Quarantined");
     REQUIRE(first != std::string::npos);
@@ -1217,19 +1243,36 @@ TEST_CASE("route: list pill — probes only quarantined ids that are on the page
     CHECK_FALSE(contains(res->body, "Quarantine state unavailable"));
 }
 
-// Kills: a non-403 probe outcome being treated as "not visible" (silently filtered), which
-// would render a degraded authz check as "not quarantined".
-TEST_CASE("route: list pill — a non-403 probe outcome or a degraded read raises the banner, no pill",
+// Kills: a confined caller's scope not narrowing what the store is asked for.
+TEST_CASE("route: list pill — the caller's scope narrows the pills and the store query",
+          "[hardware][route][quarantine]") {
+    HwHarness h(false, false, true);
+    h.roster_rows = {make_row("mine", "MINE-HOST", "linux", true),
+                     make_row("theirs", "THEIRS-HOST", "linux", true)};
+    h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("mine"), q_rec("theirs")};
+    h.security_scope = authz::VisibleSet{std::unordered_set<std::string>{"mine"}};
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    CHECK(h.last_quarantine_ids == std::vector<std::string>{"mine"});
+    const auto pill = res->body.find("hw-pill bad\">Quarantined");
+    REQUIRE(pill != std::string::npos);
+    CHECK(res->body.find("hw-pill bad\">Quarantined", pill + 1) == std::string::npos);
+    CHECK(h.security_read_probes.empty());
+}
+
+// Kills: an unavailable gate or store being rendered as "not quarantined".
+TEST_CASE("route: list pill — an unavailable gate or a degraded read raises the banner, no pill",
           "[hardware][route][quarantine]") {
     {
         HwHarness h(false, false, true);
         h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
         h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("a")};
-        h.security_read_status["a"] = 503;
+        h.security_gate_status = 503;
         auto res = h.sink.Get("/fragments/hardware/list");
         REQUIRE(res);
         CHECK(contains(res->body, "Quarantine state unavailable"));
         CHECK_FALSE(contains(res->body, "hw-pill bad\">Quarantined"));
+        CHECK(h.quarantine_list_calls == 0);
     }
     {
         HwHarness h(false, false, true);
@@ -1241,17 +1284,18 @@ TEST_CASE("route: list pill — a non-403 probe outcome or a degraded read raise
     }
 }
 
-// Kills: a 403 (scope denial) being rendered as a pill or as the degraded banner.
-TEST_CASE("route: list pill — an explicit 403 hides the record without a banner",
+// Kills: a 403 (scope refusal) being rendered as a pill or as the degraded banner.
+TEST_CASE("route: list pill — an explicit 403 from the gate hides pills without a banner",
           "[hardware][route][quarantine]") {
     HwHarness h(false, false, true);
     h.roster_rows = {make_row("a", "A-HOST", "linux", true)};
     h.quarantine_rows = std::vector<QuarantineRecord>{q_rec("a")};
-    h.security_read_status["a"] = 403;
+    h.security_gate_status = 403;
     auto res = h.sink.Get("/fragments/hardware/list");
     REQUIRE(res);
     CHECK_FALSE(contains(res->body, "hw-pill bad\">Quarantined"));
     CHECK_FALSE(contains(res->body, "Quarantine state unavailable"));
+    CHECK(h.quarantine_list_calls == 0);
 }
 
 TEST_CASE("route: list — full render carries the Quarantined panel placeholder, results_only does not",

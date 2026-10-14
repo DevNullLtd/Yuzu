@@ -1805,28 +1805,25 @@ Quarantine isolates a device from receiving commands or participating in normal 
 
 #### `GET /api/v1/quarantine`
 
-List currently quarantined devices visible to the caller — admit-then-filter:
-a device outside the caller's management-group scope is omitted from the
-list entirely, not merely hidden from write access.
+List currently quarantined devices visible to the caller — admit-then-filter
+(ADR-0017): the route makes **one** `Security:Read` list-gate decision per
+request and applies the resulting scope in the store query, so a device
+outside the caller's management-group scope is omitted from the list
+entirely, not merely hidden from write access, and an out-of-scope record
+costs neither a per-record permission check nor an audit row.
 
-**Permission:** `Security:Read`, scoped per-device
+**Permission:** `Security:Read`, resolved once through the fleet-read list gate
 
 > **Fail-closed on a degraded read (ADR-0047).** A store/pool/query failure
 > returns `503` (`"quarantine list unavailable — try again"`), never a
 > silently-empty list — a device could still be actively contained while the
-> caller would otherwise see "nothing quarantined". A **second, distinct**
-> `503` cause exists for the per-record admit-then-filter scope check itself:
-> if it hits an anomalous outcome partway through the list (neither an
-> explicit allow nor an explicit deny — most commonly a transient
-> engine-principal-store outage), the whole list fails closed with
-> `"authorization check unavailable — try again"` rather than silently
-> omitting the affected record(s). Only the first cause increments
+> caller would otherwise see "nothing quarantined". Each failure increments
 > `yuzu_server_quarantine_read_degrade_total` — see
-> `docs/user-manual/upgrading.md` and `docs/user-manual/metrics.md` for the
-> full distinction. For a service-scoped API token whose `ITServiceOwner`
-> ceiling cannot be read, the per-record `Security:Read` probe answers `503`,
-> so the whole list fails with `503` rather than silently omitting the
-> record.
+> `docs/user-manual/upgrading.md` and `docs/user-manual/metrics.md`. If the
+> list gate itself cannot decide (an unavailable authorization store, or a
+> service-scoped API token whose `ITServiceOwner` ceiling cannot be read) it
+> answers with its own `401`/`403`/`503` and the store is not read. An
+> unwired gate answers `500`, never an unfiltered list.
 
 **Response:**
 
@@ -1867,6 +1864,13 @@ list entirely, not merely hidden from write access.
 Quarantine a device.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
+
+> **Audit-before-change (ADR-0033 §9).** After authorisation and validation the
+> route writes a `quarantine.enable` row with `result=attempt` **before** it
+> changes the record. If that row cannot be written the request is refused
+> with `503` (`Sec-Audit-Failed: true`) and containment is unchanged. The change
+> is then recorded as `success` or `failure`; a lost outcome row is flagged with
+> the same header on the response.
 
 > **Supervised MCP tokens are approval-gated here too.** A bearer token minted
 > with `mcp_tier: "supervised"` gets `403` on this route (and on the `DELETE`
@@ -2052,6 +2056,10 @@ Quarantine a device.
 Release a device from quarantine.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
+
+Like `POST`, the release writes a `quarantine.disable` row with `result=attempt`
+before the change and answers `503` (`Sec-Audit-Failed: true`) without releasing
+the device if that row cannot be written.
 
 **Response:**
 

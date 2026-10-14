@@ -18210,10 +18210,11 @@ private:
                              // list render; the snapshot the dispatch gate keeps is a 20 s
                              // cache and is deliberately not reused for an operator display).
                              .quarantine_list_fn =
-                                 [this]() -> std::optional<std::vector<QuarantineRecord>> {
+                                 [this](const std::vector<std::string>* ids, std::size_t limit)
+                                     -> std::optional<std::vector<QuarantineRecord>> {
                                      if (!quarantine_store_ || !quarantine_store_->is_open())
                                          return std::nullopt;
-                                     return quarantine_store_->list_quarantined();
+                                     return quarantine_store_->list_quarantined_in(ids, limit);
                                  },
                          });
 
@@ -18227,10 +18228,12 @@ private:
                 DeviceContainmentRoutes::Deps{
                     .auth_fn = auth_fn,
                     .scoped_perm_fn = scoped_perm_fn,
-                    .list_fn = [this]() -> std::optional<std::vector<QuarantineRecord>> {
+                    .fleet_read_fn = fleet_read_fn,
+                    .list_fn = [this](const std::vector<std::string>* ids, std::size_t limit)
+                        -> std::optional<std::vector<QuarantineRecord>> {
                         if (!quarantine_store_ || !quarantine_store_->is_open())
                             return std::nullopt;
-                        return quarantine_store_->list_quarantined();
+                        return quarantine_store_->list_quarantined_in(ids, limit);
                     },
                     .status_fn = [this](const std::string& id)
                         -> std::expected<std::optional<QuarantineRecord>, std::string> {

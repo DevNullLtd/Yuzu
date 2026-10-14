@@ -56,15 +56,22 @@ void DeviceContainmentRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         QuarantinePanelView view;
         view.cap = kPanelCap;
         view.now_secs = now_secs();
+        // ADR-0017: ONE list-gate decision for the whole view, then its scope goes into the
+        // store query. An unwired gate refuses (never an unfiltered list); a refusal writes
+        // its own 401/403/503 (require_fleet_read audits it once).
+        if (!deps_.fleet_read_fn) {
+            view.read = QuarantinePanelView::Read::ProbeDegraded;
+            send_html(res, render_quarantine_panel(view));
+            return;
+        }
+        const authz::FleetReadGate gate = deps_.fleet_read_fn(req, res, "Security", "Read");
+        if (!gate.admitted)
+            return; // response already written by fleet_read_fn
         QuarantineVisibleOptions opt;
         opt.max_visible = kPanelCap;
-        const QuarantineVisible vis =
-            quarantine_visible_records(req, deps_.list_fn, deps_.scoped_perm_fn, opt);
+        const QuarantineVisible vis = quarantine_visible_records(gate.scope, deps_.list_fn, opt);
         if (vis.status == QuarantineReadStatus::StoreDegraded) {
             view.read = QuarantinePanelView::Read::StoreDegraded;
-        } else if (vis.status != QuarantineReadStatus::Ok) {
-            // ProbeDegraded or ScopeUnwired: the caller's authority could not be derived.
-            view.read = QuarantinePanelView::Read::ProbeDegraded;
         } else {
             view.more = vis.more;
             std::unordered_map<std::string, std::string> names;

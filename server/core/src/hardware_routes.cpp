@@ -249,24 +249,34 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             for (auto& row : page.rows)
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
 
-        // Quarantined pill: ONE authoritative active-set read per render, intersected with
-        // the page's rows BEFORE any per-record probe, so the probe count is bounded by the
-        // page size and not by the number of quarantines. A degraded read or probe sets the
+        // Quarantined pill: ONE Security:Read list-gate decision per render (ADR-0017), its
+        // scope intersected with the page's rows and pushed into ONE store read, so the cost
+        // is bounded by the page size and not by the number of quarantines. The gate answers
+        // into a throwaway Response (the list itself is the response): a refusal means "this
+        // caller may not see pills" and draws none; an unavailable gate or store sets the
         // banner flag and no pill (absence is then not evidence).
         if (deps_.quarantine_list_fn && !page.rows.empty()) {
-            std::unordered_set<std::string> page_ids;
-            page_ids.reserve(page.rows.size());
-            for (const auto& row : page.rows)
-                page_ids.insert(row.agent_id);
-            QuarantineVisibleOptions opt;
-            opt.only_ids = &page_ids;
-            const auto vis = quarantine_visible_records(req, deps_.quarantine_list_fn,
-                                                        deps_.scoped_perm_fn, opt);
-            if (vis.status == QuarantineReadStatus::Ok) {
-                for (const auto& r : vis.records)
-                    page.quarantined_ids.insert(r.agent_id);
-            } else {
-                page.quarantine_degraded = true;
+            httplib::Response gate_res;
+            const authz::FleetReadGate qgate =
+                deps_.fleet_read_fn ? deps_.fleet_read_fn(req, gate_res, "Security", "Read")
+                                    : authz::FleetReadGate{};
+            if (qgate.admitted) {
+                std::unordered_set<std::string> page_ids;
+                page_ids.reserve(page.rows.size());
+                for (const auto& row : page.rows)
+                    page_ids.insert(row.agent_id);
+                QuarantineVisibleOptions opt;
+                opt.only_ids = &page_ids;
+                const auto vis =
+                    quarantine_visible_records(qgate.scope, deps_.quarantine_list_fn, opt);
+                if (vis.status == QuarantineReadStatus::Ok) {
+                    for (const auto& r : vis.records)
+                        page.quarantined_ids.insert(r.agent_id);
+                } else {
+                    page.quarantine_degraded = true;
+                }
+            } else if (!deps_.fleet_read_fn || gate_res.status != 403) {
+                page.quarantine_degraded = true; // gate unwired/401/503: not a scope refusal
             }
         }
 

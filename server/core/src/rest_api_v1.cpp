@@ -5910,14 +5910,15 @@ void RestApiV1::register_routes(
 
     sink.Get(
         "/api/v1/quarantine",
-        [auth_fn, scoped_perm_fn, quarantine_store](const httplib::Request& req,
-                                                     httplib::Response& res) {
-            // gov-fix(consistency-auditor): admit-then-filter, matching POST/DELETE
-            // (CDX-P1-02) rather than the flat global gate this route shipped with —
-            // a management-group-confined operator who can act on a device via
-            // POST/DELETE must also be able to SEE it here, and must not see
-            // quarantine records for devices outside their scope. Fail CLOSED (500)
-            // if scoped_perm_fn is unwired, never fall back to an unfiltered list.
+        [auth_fn, fleet_read_fn, quarantine_store](const httplib::Request& req,
+                                                    httplib::Response& res) {
+            // ADR-0017 (World A): a list of per-agent data goes through the admit-then-filter
+            // list chokepoint (`fleet_read_fn` = `require_fleet_read`) — ONE Security:Read
+            // decision per request, its scope pushed into the store query, so a management-
+            // group-confined operator sees only their own records and an out-of-scope record
+            // costs neither a probe nor an audit row. Fail CLOSED (500) if the gate is
+            // unwired, never fall back to an unfiltered list. POST/DELETE keep the per-
+            // device `scoped_perm_fn` (one device, one decision).
             if (!auth_fn(req, res))
                 return;
             if (!quarantine_store || !quarantine_store->is_open()) {
@@ -5925,33 +5926,29 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
-            if (!scoped_perm_fn) {
+            if (!fleet_read_fn) {
                 res.status = 500;
                 res.set_content(detail::a4_error(res, "scope gate not configured"),
                                 "application/json");
                 return;
             }
+            const authz::FleetReadGate gate = fleet_read_fn(req, res, "Security", "Read");
+            if (!gate.admitted)
+                return; // response already written by fleet_read_fn
 
-            // AUTHORITATIVE read + per-record admit-then-filter, shared with the dashboard
-            // fragments (quarantine_visible.hpp — one copy of the rules): a nullopt store read
-            // is a degraded read, NEVER an empty list; an explicit 403 filters the record;
-            // ANY other probe outcome fails the WHOLE list closed (503). The per-record
-            // rationale (gov-fix security-guardian / unhappy-path Gate 4: a degraded authz
-            // check must not render as "not quarantined") lives in the header's banner.
+            // AUTHORITATIVE scoped read, shared with the dashboard fragments
+            // (quarantine_visible.hpp — one copy of the rules): a nullopt store read is a
+            // degraded read, NEVER an empty list (a degraded read must not render as
+            // "not quarantined").
             const auto visible_set = quarantine_visible_records(
-                req, [quarantine_store] { return quarantine_store->list_quarantined(); },
-                scoped_perm_fn);
+                gate.scope,
+                [quarantine_store](const std::vector<std::string>* ids, std::size_t limit) {
+                    return quarantine_store->list_quarantined_in(ids, limit);
+                });
             if (visible_set.status == QuarantineReadStatus::StoreDegraded) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "quarantine list unavailable — try again"),
                                 "application/json");
-                return;
-            }
-            if (visible_set.status == QuarantineReadStatus::ProbeDegraded) {
-                res.status = 503;
-                res.set_content(
-                    detail::a4_error(res, "authorization check unavailable — try again"),
-                    "application/json");
                 return;
             }
             JArr arr;
@@ -6058,6 +6055,22 @@ void RestApiV1::register_routes(
         auto session = auth_fn(req, res);
         std::string by = session ? session->username : "system";
 
+        // ADR-0033 §9: a mutating capability fails closed on audit failure (no audit row,
+        // no mutation). The attempt row is written AFTER authorisation and validation and
+        // BEFORE the store write, so containment is never changed without a record; the
+        // outcome row below says whether it applied (`success` keeps meaning "applied").
+        if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "attempt",
+                                           "Security", agent_id, reason)) {
+            res.status = 503;
+            res.set_content(
+                detail::a4_error(res,
+                                 "audit subsystem unavailable; refusing to change containment "
+                                 "without durable evidence",
+                                 {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                "application/json");
+            return;
+        }
+
         auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
         if (!result) {
             const bool db_error = is_quarantine_db_error(result.error());
@@ -6075,10 +6088,14 @@ void RestApiV1::register_routes(
             // already audits this branch (mcp_audit("failure", ...)) — REST
             // was silently skipping it, the only quarantine failure path with
             // no audit row.
-            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id, result.error());
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "failure",
+                                                "Security", agent_id, result.error());
             return;
         }
-        audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
+        // The change is made; a lost outcome row is signalled by Sec-Audit-Failed, and the
+        // attempt row already records who asked.
+        (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "success",
+                                            "Security", agent_id, reason);
         res.status = 201;
         res.set_content(ok_json(JObj().add("quarantined", true).str()), "application/json");
     });
@@ -6121,6 +6138,19 @@ void RestApiV1::register_routes(
             if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
                 return;
 
+            // ADR-0033 §9: attempt row before the store write, fail closed (see POST above).
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "attempt",
+                                               "Security", agent_id, "")) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "audit subsystem unavailable; refusing to change containment "
+                                     "without durable evidence",
+                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                    "application/json");
+                return;
+            }
+
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
                 const bool db_error = is_quarantine_db_error(result.error());
@@ -6131,11 +6161,12 @@ void RestApiV1::register_routes(
                                                  db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
                                                            : detail::A4ErrorOpts{}),
                                 "application/json");
-                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
-                         result.error());
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable",
+                                                    "failure", "Security", agent_id, result.error());
                 return;
             }
-            audit_fn(req, "quarantine.disable", "success", "Security", agent_id, "");
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "success",
+                                                "Security", agent_id, "");
             res.set_content(ok_json(JObj().add("released", true).str()), "application/json");
         });
 

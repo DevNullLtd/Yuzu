@@ -11,6 +11,7 @@
  */
 
 #include "quarantine_store.hpp"
+#include "authz_gates.hpp"
 #include "rest_api_v1.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -85,8 +86,18 @@ struct QuarantineRouteHarness {
     // auth_fn above. Checked before scope_allow_for/scope_allow.
     std::unordered_map<std::string, int> scope_degrade_for;
     std::vector<AuditCall> audit_calls;
+    // Audit seam control: `audit_fail_result` makes a row whose RESULT equals it report a
+    // persist failure (the row is then NOT recorded); "" = every row persists.
+    std::string audit_fail_result;
+    // The GET list's ADR-0017 gate (fleet_read_fn = require_fleet_read): ONE decision per
+    // request. `gate_status` 0 = admit with `list_scope` (nullopt = TOP); else the status the
+    // gate writes (401/403/503). `wire_fleet` false registers it unwired (the 500 case).
+    int gate_status{0};
+    authz::VisibleSet list_scope;
+    int gate_calls{0};
+    std::string gate_type_op;
 
-    explicit QuarantineRouteHarness(pg::PgPool& pool, bool wire_scope = true)
+    explicit QuarantineRouteHarness(pg::PgPool& pool, bool wire_scope = true, bool wire_fleet = true)
         : quarantine_store(pool) {
         REQUIRE(quarantine_store.is_open());
 
@@ -110,6 +121,8 @@ struct QuarantineRouteHarness {
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
+            if (!audit_fail_result.empty() && result == audit_fail_result)
+                return false;
             audit_calls.push_back({action, result, target_type, target_id, detail});
             return true;
         };
@@ -134,6 +147,20 @@ struct QuarantineRouteHarness {
             };
         }
 
+        RestApiV1::FleetReadFn fleet_fn{};
+        if (wire_fleet) {
+            fleet_fn = [this](const httplib::Request&, httplib::Response& res, const std::string& t,
+                              const std::string& op) -> authz::FleetReadGate {
+                ++gate_calls;
+                gate_type_op = t + ":" + op;
+                if (gate_status != 0) {
+                    res.status = gate_status;
+                    return {};
+                }
+                return {true, list_scope};
+            };
+        }
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr, &quarantine_store,
@@ -149,7 +176,12 @@ struct QuarantineRouteHarness {
                             /*result_set_store=*/nullptr, /*command_dispatch_fn=*/{},
                             /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
                             /*network_api=*/{}, /*lockout_clear_fn=*/{},
-                            /*baseline_store=*/nullptr, scoped_fn);
+                            /*baseline_store=*/nullptr, scoped_fn,
+                            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
+                            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+                            /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
+                            /*stream_budget=*/nullptr, /*exec_visible_fn=*/{},
+                            /*list_read_fn=*/{}, fleet_fn);
     }
 
     auto post(const std::string& body) {
@@ -191,6 +223,75 @@ TEST_CASE("REST POST /api/v1/quarantine requires authentication before any store
     CHECK(res->status == 401);
     CHECK_FALSE(h.scope_fn_called);
     CHECK_FALSE(h.is_quarantined("agent-B")); // no write
+}
+
+// ADR-0033 §9: no audit row, no mutation. Kills: the store write moving back before the
+// attempt row, or the result of the attempt row being ignored.
+TEST_CASE("REST POST/DELETE /api/v1/quarantine fail closed when the attempt audit row cannot be "
+          "written (503, Sec-Audit-Failed, containment unchanged)",
+          "[rest][quarantine][audit][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.audit_fail_result = "attempt";
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(h.is_quarantined("agent-B")); // no row, no mutation
+
+    // DELETE: a device that IS quarantined stays quarantined.
+    REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "r", ""));
+    auto del = h.del("agent-B");
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(del->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.is_quarantined("agent-B")); // still contained
+}
+
+TEST_CASE("REST POST/DELETE /api/v1/quarantine write an attempt row first, then the outcome",
+          "[rest][quarantine][audit][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    REQUIRE(h.audit_calls.size() == 2);
+    CHECK(h.audit_calls[0].action == "quarantine.enable");
+    CHECK(h.audit_calls[0].result == "attempt");
+    CHECK(h.audit_calls[1].result == "success");
+    // A rejected change leaves attempt + failure, never a "success" that did not happen.
+    h.audit_calls.clear();
+    auto dup = h.post(kBody);
+    REQUIRE(dup);
+    CHECK(dup->status == 400);
+    REQUIRE(h.audit_calls.size() == 2);
+    CHECK(h.audit_calls[0].result == "attempt");
+    CHECK(h.audit_calls[1].result == "failure");
+    // Release: attempt then success.
+    h.audit_calls.clear();
+    auto del = h.del("agent-B");
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    REQUIRE(h.audit_calls.size() == 2);
+    CHECK(h.audit_calls[0].action == "quarantine.disable");
+    CHECK(h.audit_calls[0].result == "attempt");
+    CHECK(h.audit_calls[1].result == "success");
+}
+
+// A lost OUTCOME row after the change was made is signalled, not hidden.
+TEST_CASE("REST POST /api/v1/quarantine flags a lost outcome row with Sec-Audit-Failed",
+          "[rest][quarantine][audit][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    h.audit_fail_result = "success";
+    auto res = h.post(kBody);
+    REQUIRE(res);
+    CHECK(res->status == 201); // the attempt row recorded who asked; the change applied
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.is_quarantined("agent-B"));
 }
 
 TEST_CASE("REST POST /api/v1/quarantine is denied per-target by the scoped gate (403, no write) "
@@ -332,89 +433,73 @@ TEST_CASE("REST POST/DELETE /api/v1/quarantine audit the unwired-scope-gate 500 
     }
 }
 
-TEST_CASE("REST GET /api/v1/quarantine admits-then-filters per record (gov-fix/consistency-"
-          "auditor)",
+TEST_CASE("REST GET /api/v1/quarantine resolves ONE list-gate decision and pushes its scope into "
+          "the store query (ADR-0017)",
           "[rest][quarantine][authz][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
     pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
-    SECTION("an out-of-scope record is dropped from the list, an in-scope record is kept") {
+    SECTION("an out-of-scope record is dropped, an in-scope record is kept, with no per-record "
+            "probe") {
         QuarantineRouteHarness h(qpool);
         REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
         REQUIRE(h.quarantine_store.quarantine_device("agent-hidden", "seed", "r2", ""));
-        h.scope_allow_for["agent-visible"] = true;
-        h.scope_allow_for["agent-hidden"] = false;
+        h.list_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-visible"}};
         auto res = h.get();
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK(res->body.find("agent-visible") != std::string::npos);
         CHECK(res->body.find("agent-hidden") == std::string::npos);
+        CHECK(h.gate_calls == 1);
+        CHECK(h.gate_type_op == "Security:Read");
+        CHECK_FALSE(h.scope_fn_called); // the per-device probe is for POST/DELETE only
     }
-    SECTION("unwired scope gate fails closed (500), not an unfiltered list") {
-        QuarantineRouteHarness h(qpool, /*wire_scope=*/false);
+    SECTION("an unrestricted (TOP) scope lists every active record") {
+        QuarantineRouteHarness h(qpool);
+        REQUIRE(h.quarantine_store.quarantine_device("agent-1", "seed", "r1", ""));
+        REQUIRE(h.quarantine_store.quarantine_device("agent-2", "seed", "r2", ""));
+        auto res = h.get();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("agent-1") != std::string::npos);
+        CHECK(res->body.find("agent-2") != std::string::npos);
+    }
+    SECTION("an empty (deny-all) scope lists nothing") {
+        QuarantineRouteHarness h(qpool);
+        REQUIRE(h.quarantine_store.quarantine_device("agent-1", "seed", "r1", ""));
+        h.list_scope = authz::VisibleSet{std::unordered_set<std::string>{}};
+        auto res = h.get();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("agent-1") == std::string::npos);
+    }
+    SECTION("unwired list gate fails closed (500), not an unfiltered list") {
+        QuarantineRouteHarness h(qpool, /*wire_scope=*/true, /*wire_fleet=*/false);
         REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
         auto res = h.get();
         REQUIRE(res);
         CHECK(res->status == 500);
         CHECK(res->body.find("agent-visible") == std::string::npos);
     }
-    // gov Gate 2 (security-guardian): a per-record scope-gate DEGRADE
-    // (require_scoped_permission genuinely returns false with status==503 on
-    // an RBAC/tag-store outage, distinct from a 403 denial) must fail the
-    // WHOLE list closed, not be silently filtered like a denial -- that
-    // would render a degraded per-record authz check as "not quarantined"
-    // for that record, the same fail-open class the store-layer nullopt
-    // check exists to close, one layer up.
-    SECTION("a per-record scope-gate DEGRADE (503) fails the whole list closed, never a "
-            "silently-filtered partial list") {
-        QuarantineRouteHarness h(qpool);
-        // gov-fix(quality-engineer): seed the DEGRADED agent FIRST (lower id)
-        // and the visible one SECOND (higher id) -- list_quarantined orders
-        // `quarantined_at DESC, id DESC`, so the visible record is probed
-        // and added to the response array BEFORE the degrade is hit. This
-        // exercises the actual discard-a-partially-built-list path; the
-        // reverse seed order would let the degrade fire on the FIRST record
-        // probed, never proving a non-empty `arr` gets thrown away too.
-        REQUIRE(h.quarantine_store.quarantine_device("agent-degraded", "seed", "r2", ""));
-        REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
-        h.scope_allow_for["agent-visible"] = true;
-        h.scope_degrade_for["agent-degraded"] = 503;
-        auto res = h.get();
-        REQUIRE(res);
-        CHECK(res->status == 503);
-        // Neither record is rendered -- not a partial list that silently
-        // dropped only the degraded one.
-        CHECK(res->body.find("agent-visible") == std::string::npos);
-        CHECK(res->body.find("agent-degraded") == std::string::npos);
+    // A refused or degraded gate writes its own status; the store is never read for it.
+    SECTION("a refused or unavailable gate answers with its own status and lists nothing") {
+        for (int status : {401, 403, 503}) {
+            CAPTURE(status);
+            QuarantineRouteHarness h(qpool);
+            REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
+            h.gate_status = status;
+            auto res = h.get();
+            REQUIRE(res);
+            CHECK(res->status == status);
+            CHECK(res->body.find("agent-visible") == std::string::npos);
+        }
     }
-    // gov Gate 4 (unhappy-path, UP-1): the ORIGINAL Gate 2 fix only checked
-    // for probe.status==503, missing that require_scoped_permission's
-    // INTERNAL require_auth re-check can ALSO fail with 401 mid-request on
-    // an engine-principal store outage (EngineLookupStatus::
-    // StoreUnreachable collapses to the same nullopt/401 as a genuinely
-    // absent session) -- even though the caller already authenticated once,
-    // successfully, via the outer auth_fn. A 401 must fail the list closed
-    // exactly like a 503, never be silently filtered as if it were a 403
-    // denial.
-    SECTION("a per-record scope-gate DEGRADE surfacing as 401 (not just 503) also fails the "
-            "whole list closed") {
-        QuarantineRouteHarness h(qpool);
-        REQUIRE(h.quarantine_store.quarantine_device("agent-degraded", "seed", "r2", ""));
-        REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
-        h.scope_allow_for["agent-visible"] = true;
-        h.scope_degrade_for["agent-degraded"] = 401;
-        auto res = h.get();
-        REQUIRE(res);
-        CHECK(res->status == 503);
-        CHECK(res->body.find("agent-visible") == std::string::npos);
-        CHECK(res->body.find("agent-degraded") == std::string::npos);
-    }
-    SECTION("no session is refused before any store work") {
+    SECTION("no session is refused before any gate or store work") {
         QuarantineRouteHarness h(qpool);
         h.session_user = "";
         auto res = h.get();
         REQUIRE(res);
         CHECK(res->status == 401);
-        CHECK_FALSE(h.scope_fn_called);
+        CHECK(h.gate_calls == 0);
     }
 }
 
