@@ -18308,19 +18308,8 @@ private:
             hp.perm_fn = perm_fn;
             // One cached read of every policy's counts; NOT confined, and only
             // called when the gate returned `scope == nullopt`.
-            hp.policies_fn = [compliance_api]()
-                -> std::optional<yuzu::server::home_panels::PolicyPanel> {
-                // First 100 enabled policies (PolicyQuery's own page size): the N in
-                // "Lowest 5 of N" stops counting there.
-                PolicyQuery pq;
-                pq.enabled_only = true;
-                auto policies = compliance_api->list_policies(pq);
-                if (!policies)
-                    return std::nullopt;
-                auto sums = compliance_api->compliance_by_policy();
-                if (!sums)
-                    return std::nullopt; // a degraded read is never "no results"
-                return yuzu::server::home_panels::select_lowest_policies(*policies, *sums);
+            hp.policies_fn = [compliance_api]() {
+                return yuzu::server::home_panels::read_policy_panel(*compliance_api);
             };
             hp.audit_fn = [this](int limit) -> std::optional<std::vector<AuditEvent>> {
                 if (!audit_store_)

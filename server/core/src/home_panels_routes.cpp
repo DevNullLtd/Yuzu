@@ -26,6 +26,18 @@ bool service_scoped_refused(const Deps& d, const httplib::Request& req, const ch
 
 } // namespace
 
+std::optional<PolicyPanel> read_policy_panel(const ComplianceApi& api) {
+    PolicyQuery pq;
+    pq.enabled_only = true;
+    auto policies = api.list_policies(pq);
+    if (!policies)
+        return std::nullopt;
+    auto sums = api.compliance_by_policy();
+    if (!sums)
+        return std::nullopt;
+    return select_lowest_policies(*policies, *sums);
+}
+
 void register_home_panel_routes(HttpRouteSink& sink, Deps deps) {
     if (!deps.auth_fn || !deps.deny_service_scoped_fn || !deps.fleet_read_fn || !deps.perm_fn ||
         !deps.policies_fn || !deps.audit_fn || !deps.now_fn)

@@ -296,3 +296,91 @@ TEST_CASE("home_panels_routes: activity degraded and service-scoped states", "[s
         CHECK(h.audit_calls == 0);
     }
 }
+
+// ── read_policy_panel: the production policies_fn body ────────────────────
+
+namespace {
+
+struct CountingComplianceApi final : ComplianceApi {
+    mutable int list_policies_calls{0};
+    mutable int by_policy_calls{0};
+    mutable int summary_calls{0};
+    mutable bool enabled_only_seen{false};
+    bool policies_ok{true};
+    bool by_policy_ok{true};
+
+    std::expected<std::vector<PolicyFragment>, PolicyReadError>
+    list_fragments(const FragmentQuery&) const override {
+        return std::vector<PolicyFragment>{};
+    }
+    std::expected<std::vector<Policy>, PolicyReadError>
+    list_policies(const PolicyQuery& q) const override {
+        ++list_policies_calls;
+        enabled_only_seen = q.enabled_only;
+        if (!policies_ok)
+            return std::unexpected(PolicyReadError::kDegraded);
+        Policy a;
+        a.id = "a";
+        a.name = "Alpha";
+        a.enabled = true;
+        Policy b = a;
+        b.id = "b";
+        b.name = "Beta";
+        return std::vector<Policy>{a, b};
+    }
+    std::expected<std::optional<PolicyDetail>, PolicyReadError>
+    get_policy(const std::string&) const override {
+        return std::optional<PolicyDetail>{};
+    }
+    std::expected<FleetCompliance, PolicyReadError> fleet_compliance() const override {
+        return FleetCompliance{};
+    }
+    std::expected<ComplianceSummary, PolicyReadError>
+    compliance_summary(const std::string&) const override {
+        ++summary_calls;
+        return ComplianceSummary{};
+    }
+    std::expected<std::vector<PolicyAgentStatus>, PolicyReadError>
+    policy_agent_statuses(const std::string&) const override {
+        return std::vector<PolicyAgentStatus>{};
+    }
+    std::expected<std::vector<ComplianceSummary>, PolicyReadError>
+    compliance_by_policy() const override {
+        ++by_policy_calls;
+        if (!by_policy_ok)
+            return std::unexpected(PolicyReadError::kDegraded);
+        ComplianceSummary s;
+        s.policy_id = "b";
+        s.compliant = 1;
+        s.total = 4;
+        return std::vector<ComplianceSummary>{s};
+    }
+};
+
+} // namespace
+
+TEST_CASE("read_policy_panel: one list, one batched read, zero per-policy reads",
+          "[home][route][policies]") {
+    // Kills: a revert to the per-policy compliance_summary loop, and a disabled-policy leak.
+    CountingComplianceApi api;
+    auto p = home_panels::read_policy_panel(api);
+    REQUIRE(p.has_value());
+    CHECK(api.list_policies_calls == 1);
+    CHECK(api.enabled_only_seen);
+    CHECK(api.by_policy_calls == 1);
+    CHECK(api.summary_calls == 0);
+    REQUIRE(p->lowest.size() == 2);
+    CHECK(p->lowest[0].name == "Beta"); // has results, ranked before the no-result policy
+    CHECK(p->lowest[1].total == 0);
+}
+
+TEST_CASE("read_policy_panel: a degraded read is nullopt, never an empty panel",
+          "[home][route][policies]") {
+    CountingComplianceApi a;
+    a.policies_ok = false;
+    CHECK_FALSE(home_panels::read_policy_panel(a).has_value());
+    CHECK(a.by_policy_calls == 0);
+    CountingComplianceApi b;
+    b.by_policy_ok = false;
+    CHECK_FALSE(home_panels::read_policy_panel(b).has_value());
+}

@@ -716,6 +716,9 @@ TEST_CASE("health_routes: /fragments/home/health denies a service-scoped token f
     CHECK(h.last_deny_action == "home.fragment.access_denied");
     CHECK_FALSE(h.auth_fn_called); // deny runs BEFORE auth_fn
     CHECK(r->body.find("service-scoped tokens") == std::string::npos); // gate text never reaches the page
+    CHECK(r->body.find("id=\"home-health\"") != std::string::npos);
+    CHECK(r->body.find("You do not have access to this panel.") != std::string::npos);
+    CHECK(r->body.find("Agents connected to this server") == std::string::npos);
     CHECK(r->get_header_value("Cache-Control") == "no-store");
 }
 
@@ -782,4 +785,28 @@ TEST_CASE("health_routes: /fragments/home/health never renders system, tls or pe
     REQUIRE(r);
     for (const char* banned : {"cpu_percent", "rss", "tls", "pending", "command_queue_depth"})
         CHECK(r->body.find(banned) == std::string::npos);
+}
+
+TEST_CASE("health_routes: /fragments/home/health agrees with /api/health on healthy versus degraded",
+          "[server][routes][health_routes][home]") {
+    // Kills: a panel that re-derives "healthy" instead of reusing the health document's decision.
+    PgReachabilityProbe ok_probe(fixed_ping(PgReachabilityProbe::PingResult::Kind::Ok));
+    ok_probe.probe_once();
+    PgReachabilityProbe bad_probe(fixed_ping(PgReachabilityProbe::PingResult::Kind::Failed));
+    bad_probe.probe_once();
+    bad_probe.probe_once();
+    for (PgReachabilityProbe* probe : {static_cast<PgReachabilityProbe*>(nullptr), &ok_probe, &bad_probe}) {
+        Harness h;
+        h.pg_probe = probe;
+        h.wire();
+        auto doc = h.sink.dispatch("GET", "/api/health");
+        auto panel = h.sink.dispatch("GET", "/fragments/home/health");
+        REQUIRE(doc);
+        REQUIRE(panel);
+        const std::string status = json::parse(doc->body)["status"].get<std::string>();
+        const bool healthy_pill = panel->body.find(">Healthy<") != std::string::npos;
+        const bool degraded_pill = panel->body.find(">Degraded<") != std::string::npos;
+        CHECK(healthy_pill == (status == "healthy"));
+        CHECK(degraded_pill == (status != "healthy"));
+    }
 }

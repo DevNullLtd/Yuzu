@@ -85,6 +85,9 @@ TEST_CASE("home_panels: equal percentages tie-break by name then id", "[server][
                                       {sum("1", 1, 2), sum("2", 2, 4), sum("3", 5, 10)});
     REQUIRE(out.lowest.size() == 3);
     CHECK(out.lowest[0].name == "Aaa");
+    // The two "Same" rows are told apart by id: "1" (1 of 2) before "2" (2 of 4).
+    CHECK(out.lowest[1].compliant == 1);
+    CHECK(out.lowest[2].compliant == 2);
 }
 
 TEST_CASE("home_panels: policies panel states are distinct sentences", "[server][home]") {

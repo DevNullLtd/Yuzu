@@ -22,6 +22,7 @@
 /// and `principal_role` are never rendered.
 
 #include "authz_gates.hpp"
+#include "compliance_api.hpp"
 #include "home_panels_render.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -70,6 +71,12 @@ struct Deps {
     /// Nav-resolved "Audit log" target; empty = no audit page, button omitted.
     std::string audit_href;
 };
+
+/// The production `Deps::policies_fn` body: the enabled policies (first 100, the
+/// store's page size) joined with ONE `compliance_by_policy()` read. nullopt when
+/// either read is degraded, so a failed read is never shown as "no results".
+/// NOT confined: callers hold the fleet-read gate AND `scope == nullopt`.
+[[nodiscard]] std::optional<PolicyPanel> read_policy_panel(const ComplianceApi& api);
 
 /// Registers exactly 2 routes. Throws `std::invalid_argument` if a required
 /// closure is unbound (a wiring bug caught at boot).
