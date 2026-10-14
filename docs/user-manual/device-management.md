@@ -524,8 +524,8 @@ Unless noted, these endpoints accept form-encoded parameters and return HTML fra
 | `POST` | `/api/settings/enrollment-tokens` | Generate an enrollment token (form-encoded) | HTMX |
 | `POST` | `/api/settings/enrollment-tokens/batch` | Generate tokens in batch (JSON in, JSON out) | JSON |
 | `DELETE` | `/api/settings/enrollment-tokens/{token_id}` | Revoke a token | HTMX |
-| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`) | HTMX |
-| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`) | HTMX |
+| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`); `400` and nothing saved for an unknown type, empty value, `:` or control character in value or label, malformed `ip_subnet` (IPv4 with optional `/0-32`) or `trusted_ca` that is not 64 hex characters | HTMX |
+| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`); other values return `400` | HTMX |
 | `POST` | `/api/settings/auto-approve/{index}/toggle` | Enable/disable a rule | HTMX |
 | `DELETE` | `/api/settings/auto-approve/{index}` | Delete a rule | HTMX |
 | `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart) | HTMX |
