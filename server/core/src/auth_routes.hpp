@@ -253,6 +253,18 @@ public:
     bool require_permission(const httplib::Request& req, httplib::Response& res,
                             const std::string& securable_type, const std::string& operation);
 
+    /// Whether the caller holds `securable_type:operation`, for deciding what to DRAW. It runs
+    /// `require_permission`'s own decision path (elevation, engine principals, MCP tier,
+    /// service scope, RBAC, legacy role), so the answer cannot drift from the gate's, but it
+    /// writes no response and no `auth.permission_required` denial row: nobody attempted
+    /// anything, and a page that refreshes every few seconds would otherwise fill the audit
+    /// log with denials. NEVER a gate: an action must still pass `require_permission` (or a
+    /// scoped variant) on the request that performs it. (#5792 asks for this on the shared
+    /// auth seam; callers that still probe with the loud gate are listed there and in #5830.)
+    [[nodiscard]] bool has_permission(const httplib::Request& req,
+                                      const std::string& securable_type,
+                                      const std::string& operation);
+
     /// The MCP tier/approval belt (#5047) — extracted verbatim from
     /// `require_permission`'s `mcp_tier` branch so a route that has its OWN
     /// primary authorization gate (e.g. the result-set write routes' owner

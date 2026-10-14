@@ -93,11 +93,10 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     .tar-content button:hover:not(:disabled) { background: var(--surface2); border-color: var(--mut); }
     .tar-content button:disabled { opacity: .5; cursor: default; }
     .tar-content button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-    .tar-sql-controls button, .tar-content .apply-push {
+    .tar-content .apply-push {
       color: var(--on-primary); background: var(--primary); border-color: var(--primary); font-weight: 600;
     }
-    .tar-sql-controls button { height: var(--ctl); padding: 0 14px; font-size: 14px; }
-    .tar-sql-controls button:hover:not(:disabled), .tar-content .apply-push:hover:not(:disabled) {
+    .tar-content .apply-push:hover:not(:disabled) {
       background: var(--primary-h); border-color: var(--primary-h);
     }
     .tar-content td .btn-secondary, .tar-content td .btn-danger {
@@ -109,36 +108,19 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     }
 
     /* Form fields */
-    .scope-chip-row, .picker-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-    .scope-chip-row { margin-bottom: 12px; }
-    .scope-chip-label, .picker-row label, .filter-label, .tt-filter-label {
+    .picker-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .picker-row label, .filter-label, .tt-filter-label {
       font-size: 13px; font-weight: 500; color: var(--ink2);
     }
-    .scope-chip-select, .tar-sql-name, .tar-tree-filter, .tar-tree-custom input[type="datetime-local"],
-    .tar-sql-textarea {
+    .tar-tree-filter, .tar-tree-custom input[type="datetime-local"] {
       color: var(--ink); background: var(--bg); border: 1px solid var(--line2);
       border-radius: var(--rad-ctl);
-    }
-    .scope-chip-select, .tar-sql-name, .tar-tree-filter, .tar-tree-custom input[type="datetime-local"] {
       height: var(--ctl); padding: 0 10px; min-width: 0; font: inherit; font-size: 14px;
     }
-    .scope-chip-select { max-width: 24rem; }
-    .scope-chip-meta, .src-note { font-size: 12.5px; color: var(--mut); }
+    .src-note { font-size: 12.5px; color: var(--mut); }
     .tar-content input[type="checkbox"] { accent-color: var(--primary); }
-    .tar-sql-textarea {
-      width: 100%; min-height: 84px; padding: 8px 10px; resize: vertical;
-      font-family: var(--mds-font-family-mono); font-size: 12.5px;
-    }
-    .tar-sql-textarea::placeholder, .tar-tree-filter::placeholder, .tar-sql-name::placeholder { color: var(--faint); }
-    .tar-sql-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
-    .tar-sql-name { flex: 1 1 16rem; min-width: 12rem; }
-    .tar-sql-empty { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink2); }
-    .tar-sql-result { margin-top: 12px; font-size: 13.5px; color: var(--mut); }
-    .tar-sql-result a { color: var(--primary); }
-    .tar-sql-result code {
-      color: var(--ink2); background: var(--surface2); padding: 1px 6px; border-radius: 3px;
-    }
-    .tar-sql-result.error { color: var(--bad); }
+    .tar-tree-filter::placeholder { color: var(--faint); }
+    .tar-sql-moved a { color: var(--primary); }
 
     /* ── Process tree viewer (Phase 15.H) ───────────────────────────────── */
     .tar-tree-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -408,37 +390,15 @@ R"HTM(    <!-- ── Capture sources (ADR-0015) ──────────�
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
 R"HTM(
-    <!-- ── Ad-hoc TAR SQL frame (Phase 15.D — scope walking) ────────── -->
+    <!-- Ad-hoc TAR SQL moved to Result sets > From TAR query (it carries the same parent
+         scope, SQL, name and include-empty fields, behind a confirm that shows the SQL). -->
     <div class="tar-frame" id="frame-tar-sql">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Ad-hoc TAR SQL</h2>
-        <div class="tar-frame-actions">
-          <button class="btn-secondary" id="tar-sql-refresh-scopes"
-                  title="Reload your result sets">Refresh scopes</button>
-        </div>
       </div>
-      <div class="tar-frame-body tar-pad">
-        <!-- Scope chip (design §8.3): pick the candidate scope this query
-             narrows. Submitting creates a NEW result set parented at the
-             selected set. Standard scopes (__all__) carry no parent. -->
-        <div class="scope-chip-row">
-          <label class="scope-chip-label" for="tar-sql-scope">Scope</label>
-          <select id="tar-sql-scope" class="scope-chip-select">
-            <option value="__all__">__all__ — entire fleet</option>
-          </select>
-          <span class="scope-chip-meta" id="tar-sql-scope-meta"></span>
-        </div>
-        <textarea id="tar-sql-text" class="tar-sql-textarea" rows="4" spellcheck="false"
-                  placeholder="SELECT DISTINCT pid FROM process_live WHERE name = 'chrome.exe'"></textarea>
-        <div class="tar-sql-controls">
-          <input type="text" id="tar-sql-name" class="tar-sql-name"
-                 placeholder="Name (optional) e.g. windows-chrome-suspects" maxlength="120">
-          <label class="tar-sql-empty">
-            <input type="checkbox" id="tar-sql-include-empty"> include responders with 0 rows
-          </label>
-          <button id="tar-sql-run">Run &amp; create result set</button>
-        </div>
-        <div class="tar-sql-result" id="tar-sql-result"></div>
+      <div class="tar-frame-body tar-pad tar-sql-moved">
+        Ad-hoc TAR queries now start from <a href="/result-sets">Result sets</a>: choose
+        <strong>From TAR query</strong> to run a SELECT on a scope and keep the devices that answer.
       </div>
     </div>
 
@@ -541,125 +501,6 @@ document.body.addEventListener('htmx:afterSettle', function(e) {
   }
 });
 
-// ── Scope-walking SQL frame (Phase 15.D) ─────────────────────────────────
-// Drives the scope chip + ad-hoc TAR SQL against the REST result-set API.
-// Selecting a scope picks the candidate set; running the query dispatches
-// tar.sql to that scope and creates a NEW result set parented at it, then
-// polls until the async maintenance thread materialises membership.
-(function() {
-  var scopeSel  = document.getElementById('tar-sql-scope');
-  var scopeMeta = document.getElementById('tar-sql-scope-meta');
-  var sqlText   = document.getElementById('tar-sql-text');
-  var nameInput = document.getElementById('tar-sql-name');
-  var emptyChk  = document.getElementById('tar-sql-include-empty');
-  var runBtn    = document.getElementById('tar-sql-run');
-  var resultBox = document.getElementById('tar-sql-result');
-  var refreshBtn= document.getElementById('tar-sql-refresh-scopes');
-  if (!scopeSel || !runBtn) return;
-
-  // id -> {name, device_count, status} for the meta line.
-  var scopeIndex = {};
-
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
-      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c];
-    });
-  }
-
-  function renderMeta() {
-    var v = scopeSel.value;
-    if (v === '__all__') { scopeMeta.textContent = 'entire fleet — no parent'; return; }
-    var s = scopeIndex[v];
-    if (!s) { scopeMeta.textContent = ''; return; }
-    var bits = [s.device_count + ' devices'];
-    if (s.status && s.status !== 'materialized') bits.push(s.status);
-    scopeMeta.textContent = bits.join(' · ');
-  }
-
-  function loadScopes() {
-    fetch('/api/v1/result-sets?limit=200').then(function(r){return r.json();}).then(function(j){
-      var sets = (j.data && j.data.result_sets) || [];
-      var keep = scopeSel.value;
-      scopeIndex = {};
-      while (scopeSel.options.length > 1) scopeSel.remove(1);
-      sets.forEach(function(s){
-        scopeIndex[s.id] = s;
-        var label = (s.name ? s.name : s.id) + ' — ' + s.device_count + ' devices'
-                  + (s.status && s.status !== 'materialized' ? ' (' + s.status + ')' : '');
-        var opt = document.createElement('option');
-        opt.value = s.id; opt.textContent = label;
-        scopeSel.appendChild(opt);
-      });
-      if (keep && (keep === '__all__' || scopeIndex[keep])) scopeSel.value = keep;
-      renderMeta();
-    }).catch(function(){ /* leave __all__ only */ });
-  }
-
-  // Poll a freshly-created pending set until membership materialises.
-  function pollSet(id, name, tries) {
-    fetch('/api/v1/result-sets/' + encodeURIComponent(id)).then(function(r){return r.json();})
-      .then(function(j){
-        var s = j.data || {};
-        if (s.status === 'pending' && tries > 0) {
-          setTimeout(function(){ pollSet(id, name, tries - 1); }, 2000);
-          return;
-        }
-        if (s.status === 'failed') {
-          resultBox.className = 'tar-sql-result error';
-          resultBox.innerHTML = 'Result set <code>' + esc(id) + '</code> failed to materialise.';
-        } else if (s.status === 'pending') {
-          resultBox.className = 'tar-sql-result';
-          resultBox.innerHTML = 'Result set <code>' + esc(id) + '</code> still pending — '
-            + '<a href="/result-sets">view in Result Sets</a>.';
-        } else {
-          resultBox.className = 'tar-sql-result';
-          resultBox.innerHTML = 'Created <code>' + esc(name || id) + '</code> — <strong>'
-            + esc(s.device_count) + '</strong> device(s). '
-            + 'Copy scope token <code>from_result_set:' + esc(id) + '</code> · '
-            + '<a href="/result-sets">open</a>';
-          loadScopes();
-        }
-        runBtn.disabled = false;
-      }).catch(function(){ runBtn.disabled = false; });
-  }
-
-  function run() {
-    var sql = sqlText.value.trim();
-    if (!sql) { showToast('Enter a SQL query', 'warning'); return; }
-    var body = { sql: sql, include_empty: !!emptyChk.checked };
-    var nm = nameInput.value.trim();
-    if (nm) body.name = nm;
-    if (scopeSel.value && scopeSel.value !== '__all__') body.parent_id = scopeSel.value;
-    runBtn.disabled = true;
-    resultBox.className = 'tar-sql-result';
-    resultBox.textContent = 'Dispatching to agents…';
-    fetch('/api/v1/result-sets/from-tar-query', {
-      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
-    }).then(function(r){ return r.json().then(function(j){ return {status:r.status, body:j}; }); })
-      .then(function(res){
-        if (res.status === 202 && res.body.data) {
-          var s = res.body.data;
-          resultBox.innerHTML = 'Dispatched (execution <code>' + esc(s.source_execution_id)
-            + '</code>) — awaiting responses…';
-          pollSet(s.id, s.name, 150);
-        } else {
-          var msg = (res.body.error && (res.body.error.message || res.body.error)) || 'request failed';
-          resultBox.className = 'tar-sql-result error';
-          resultBox.textContent = msg;
-          runBtn.disabled = false;
-        }
-      }).catch(function(){
-        resultBox.className = 'tar-sql-result error';
-        resultBox.textContent = 'network error';
-        runBtn.disabled = false;
-      });
-  }
-
-  scopeSel.addEventListener('change', renderMeta);
-  runBtn.addEventListener('click', run);
-  if (refreshBtn) refreshBtn.addEventListener('click', loadScopes);
-  loadScopes();
-})();
 </script>
 </body></html>
 )HTM";
