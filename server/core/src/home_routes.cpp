@@ -113,8 +113,7 @@ EstateCounts tally_roster(const std::vector<InventoryDeviceRow>& rows) {
     return c;
 }
 
-SummaryView HomeRoutes::build_summary(const httplib::Request& req,
-                                      const auth::Session& session) const {
+SummaryView HomeRoutes::build_summary(const httplib::Request& req) const {
     SummaryView v;
     v.now_epoch = deps_.now_fn ? deps_.now_fn() : 0;
     v.links = resolve_links(shell::nav_groups());
@@ -201,10 +200,15 @@ SummaryView HomeRoutes::build_summary(const httplib::Request& req,
         }
     }
 
-    // Enrolment: effective admin only. The store scan never runs for anyone else.
-    v.show_enrolment = auth::effective_role(session) == auth::Role::admin;
+    // Enrolment: the REST twin's gate (Enrollment:Read, floored so RBAC-off stays
+    // admin-only). A refused caller gets no row and no note, and the store scan
+    // never runs for them; the twin ignores scope (pending agents are not devices).
+    const GateResult eg = fleet_gate(deps_, req, "Enrollment", "Read");
+    v.show_enrolment = eg.state != FactState::Denied;
     if (v.show_enrolment) {
-        if (!deps_.enrolment_fn) {
+        if (eg.state != FactState::Ok) {
+            v.enrolment = from_gate<std::int64_t>(eg);
+        } else if (!deps_.enrolment_fn) {
             v.enrolment = Fact<std::int64_t>::with(FactState::Unwired);
         } else {
             auto n = deps_.enrolment_fn();
@@ -240,10 +244,9 @@ void HomeRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                          "service-scoped tokens may not read the Home summary", "",
                                          ""))
             return;
-        auto session = deps_.auth_fn(req, res);
-        if (!session)
+        if (!deps_.auth_fn(req, res))
             return;
-        send_html(res, render_summary(build_summary(req, *session)));
+        send_html(res, render_summary(build_summary(req)));
     });
 }
 

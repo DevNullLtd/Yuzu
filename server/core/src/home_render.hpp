@@ -87,7 +87,7 @@ struct SummaryView {
     Fact<FailedFigure> failed;
     Fact<ApprovalFigure> approvals;
     Fact<std::int64_t> enrolment; ///< only meaningful when `show_enrolment`
-    bool show_enrolment{false};   ///< effective admin only (UX visibility, not authorization)
+    bool show_enrolment{false};   ///< Enrollment:Read admitted; a refused caller gets no row
     Links links;
 };
 

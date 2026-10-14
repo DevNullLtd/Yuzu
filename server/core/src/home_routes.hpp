@@ -12,7 +12,8 @@
 ///   compliance   `fleet_read_fn("Policy","Read")`      scope engaged -> Limited
 ///   failed exec  `fleet_read_fn("Execution","Read")`   scope engaged -> Limited
 ///   approvals    `perm_fn("Approval","Read")`
-///   enrolment    effective admin only (UX visibility, not authorization)
+///   enrolment    `fleet_read_fn("Enrollment","Read")`, the pending-agents REST twin's gate;
+///                scope ignored; a refusal omits the row (no note)
 /// `deny_service_scoped_fn` runs first on every fragment (audit verb
 /// `home.fragment.access_denied`). Home never polls and writes no audit row on success.
 
@@ -98,8 +99,7 @@ public:
     void register_routes(HttpRouteSink& sink, Deps deps);
 
 private:
-    [[nodiscard]] SummaryView build_summary(const httplib::Request& req,
-                                            const auth::Session& session) const;
+    [[nodiscard]] SummaryView build_summary(const httplib::Request& req) const;
 
     Deps deps_;
 };

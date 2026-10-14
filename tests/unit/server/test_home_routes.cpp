@@ -47,7 +47,8 @@ struct HomeHarness {
     bool service_scoped = false;
 
     // Gates.
-    bool allow_inventory = true, allow_policy = true, allow_execution = true, allow_approval = true;
+    bool allow_inventory = true, allow_policy = true, allow_execution = true, allow_approval = true,
+         allow_enrollment = true;
     int gate_status = 403; // status the refused gate writes
     authz::VisibleSet scope;       // nullopt = TOP
     std::vector<std::pair<std::string, std::string>> gate_calls;
@@ -94,7 +95,8 @@ struct HomeHarness {
             gate_calls.emplace_back(sec, op);
             authz::FleetReadGate g;
             const bool ok = (sec == "Inventory" && allow_inventory) ||
-                            (sec == "Policy" && allow_policy) || (sec == "Execution" && allow_execution);
+                            (sec == "Policy" && allow_policy) || (sec == "Execution" && allow_execution) ||
+                            (sec == "Enrollment" && allow_enrollment);
             if (!ok) {
                 res.status = gate_status;
                 res.set_content("SECRET-GATE-BODY", "text/plain");
@@ -206,7 +208,8 @@ TEST_CASE("summary: no-store, html, one gate call per figure with the exact secu
     CHECK(h.gated("Policy", "Read"));
     CHECK(h.gated("Execution", "Read"));
     CHECK(h.gated("Approval", "Read"));
-    CHECK(h.gate_calls.size() == 4);
+    CHECK(h.gated("Enrollment", "Read"));
+    CHECK(h.gate_calls.size() == 5);
 }
 
 // ── denial ────────────────────────────────────────────────────────────────
@@ -412,23 +415,35 @@ TEST_CASE("summary: approvals print the exact count; oldest only when known", "[
 
 // ── enrolment ─────────────────────────────────────────────────────────────
 
-// Kills: running the pending-agent scan for a caller who will never see the row.
-TEST_CASE("summary: the enrolment scan runs only for an effective admin", "[home][route]") {
+// Kills: gating the row on the legacy role instead of Enrollment:Read (the REST twin's
+// gate), and running the pending-agent scan for a caller who will never see the row.
+TEST_CASE("summary: the enrolment scan runs only for an Enrollment:Read caller", "[home][route]") {
     HomeHarness h;
-    h.role = auth::Role::user;
+    h.role = auth::Role::admin; // the legacy role alone must not open the row
+    h.allow_enrollment = false;
     h.enrolment = 4;
     auto out = h.sink.Get("/fragments/home/summary");
     REQUIRE(out);
+    CHECK(h.gated("Enrollment", "Read"));
     CHECK(h.enrolment_calls == 0);
     CHECK_FALSE(has(out->body, "awaiting enrolment"));
+    CHECK_FALSE(has(out->body, "Pending enrolments"));
 
     HomeHarness a;
-    a.role = auth::Role::admin;
+    a.role = auth::Role::user; // and a non-admin role with the grant sees it
     a.enrolment = 4;
-    auto admin = a.sink.Get("/fragments/home/summary");
-    REQUIRE(admin);
+    auto granted = a.sink.Get("/fragments/home/summary");
+    REQUIRE(granted);
     CHECK(a.enrolment_calls == 1);
-    CHECK(has(admin->body, "4 agents are awaiting enrolment"));
+    CHECK(has(granted->body, "4 agents are awaiting enrolment"));
+
+    HomeHarness u;
+    u.gate_status = 503; // a degraded gate is a note, never silence and never a scan
+    u.allow_enrollment = false;
+    auto degraded = u.sink.Get("/fragments/home/summary");
+    REQUIRE(degraded);
+    CHECK(u.enrolment_calls == 0);
+    CHECK(has(degraded->body, "Could not read Pending enrolments. This is not zero."));
 }
 
 // ── links ─────────────────────────────────────────────────────────────────
