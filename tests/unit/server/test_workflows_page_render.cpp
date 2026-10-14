@@ -218,3 +218,87 @@ TEST_CASE("schedules render: partial list, empty list and escaping", "[ui][workf
     CHECK_FALSE(has(html, "<img"));
     CHECK(has(html, "&lt;img src=x onerror=1&gt;"));
 }
+
+// ── runs (WF-2) ─────────────────────────────────────────────────────────────
+
+TEST_CASE("runs render: run and step pills follow the documented vocabulary",
+          "[ui][workflows][render][runs]") {
+    CHECK(run_status_pill("pending").label == "Pending");
+    CHECK(run_status_pill("running").cls == "info");
+    CHECK(run_status_pill("completed").cls == "ok");
+    CHECK(run_status_pill("failed").cls == "bad");
+    CHECK(run_status_pill("cancelled").label == "Cancelled");
+    CHECK(run_status_pill("weird").label == "weird");
+    CHECK(run_step_pill("pending", false).label == "Waiting");
+    CHECK(run_step_pill("success", false).label == "Dispatched");
+    CHECK(run_step_pill("success", true).label == "Dispatched (run-wide)");
+    CHECK(run_step_pill("skipped", true).label == "Skipped");
+    CHECK(run_step_pill("failed", true).cls == "bad");
+}
+
+TEST_CASE("runs render: duration is a dash unless both instants are set and ordered",
+          "[ui][workflows][render][runs]") {
+    CHECK(duration_text(0, 100) == "-");
+    CHECK(duration_text(100, 0) == "-");
+    CHECK(duration_text(100, 99) == "-");
+    CHECK(duration_text(100, 145) == "45s");
+    CHECK(duration_text(100, 172) == "1m 12s");
+    CHECK(duration_text(0 + 1, 1 + 7380) == "2h 3m");
+}
+
+TEST_CASE("runs render: the list carries ids for the controller and escapes names",
+          "[ui][workflows][render][runs]") {
+    RunListView v;
+    RunRowView r;
+    r.id = "r1";
+    r.workflow_id = "wf-1";
+    r.workflow_name = "<img src=x onerror=1>";
+    r.status = "completed";
+    r.started_at = 1700000000;
+    r.completed_at = 1700000072;
+    r.workflow_deleted = true;
+    v.rows.push_back(r);
+    const std::string html = render_runs_list(v);
+    CHECK(html.find("data-run-id=\"r1\"") != std::string::npos);
+    CHECK(html.find("data-workflow-id=\"wf-1\"") != std::string::npos);
+    CHECK(html.find("data-c=\"status\"") != std::string::npos);
+    CHECK(html.find("data-c=\"started\"") != std::string::npos);
+    CHECK(html.find("Workflow deleted") != std::string::npos);
+    CHECK(html.find("<img") == std::string::npos);
+    CHECK(html.find("1m 12s") != std::string::npos);
+}
+
+TEST_CASE("runs render: step detail comes from known shapes only",
+          "[ui][workflows][render][runs]") {
+    RunDetailView v;
+    v.id = "r1";
+    v.status = "failed";
+    v.device_count = 2;
+    auto step = [&](int i, const char* status, const char* result) {
+        RunStepView s;
+        s.index = i;
+        s.title = "t" + std::to_string(i);
+        s.status = status;
+        s.result_json = result;
+        v.steps.push_back(s);
+    };
+    step(0, "skipped", R"({"reason":"previous step failed"})");
+    step(1, "skipped", R"({"reason":"made up <b>"})");
+    step(2, "failed", R"({"error":"boom"})");
+    step(3, "failed", R"({"error":{"agent":"agent-secret"}})");
+    step(4, "failed", "not json");
+    step(5, "success", R"([{"agents_reached":2},{"agents_reached":3}])");
+    const std::string html = render_run_detail(v);
+    CHECK(html.find("previous step failed") != std::string::npos);
+    CHECK(html.find("made up") == std::string::npos);
+    CHECK(html.find("boom") != std::string::npos);
+    CHECK(html.find("agent-secret") == std::string::npos);
+    CHECK(html.find("Reached 5 devices") != std::string::npos);
+    CHECK(html.find("3 of 6") != std::string::npos);
+
+    v.confined = true;
+    const std::string c = render_run_detail(v);
+    CHECK(c.find("Reached") == std::string::npos);
+    CHECK(c.find("Dispatched (run-wide)") != std::string::npos);
+    CHECK(c.find("Devices in your scope") != std::string::npos);
+}

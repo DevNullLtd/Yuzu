@@ -94,11 +94,16 @@ TEST_CASE("operate pages: the embedded controller is CSP-clean and bounded",
     for (const char* sink : {"eval(", "new Function(", "document.write", "javascript:",
                              "insertAdjacentHTML", "outerHTML", "setTimeout(\"", "setInterval(\""})
         CHECK_FALSE(has(js, sink));
-    // The only innerHTML sinks are the five server-rendered fragment hosts (the Approvals
-    // list, the Executions list, the Selected execution panel, the Workflows list and the
-    // Schedules list); nothing else assigns markup (the workflow steps panel is filled by
-    // cloning nodes). Each is written from a 200 body only.
-    CHECK(count_of(js, ".innerHTML") == 5);
+    // The only innerHTML sinks are the eight server-rendered fragment hosts (the Approvals
+    // list, the Executions list, the Selected execution panel, the Workflows list, the
+    // Schedules list, the hidden newest-run-per-workflow store, the Latest run panel and the
+    // Recent runs list); nothing else assigns markup (the workflow steps panel is filled by
+    // cloning nodes, and the Last run / Result cells by cloning run-row cells). Each is
+    // written from a 200 body only.
+    CHECK(count_of(js, ".innerHTML") == 8);
+    CHECK(count_of(js, "runsStore.innerHTML = res.html;") == 1);
+    CHECK(count_of(js, "runBody.innerHTML = res.html;") == 1);
+    CHECK(count_of(js, "recentBody.innerHTML = res.html;") == 1);
     CHECK(count_of(js, "host.innerHTML = res.html;") == 2);
     CHECK(count_of(js, "panel.innerHTML = res.html;") == 1);
     CHECK(count_of(js, "wfHost.innerHTML = res.html;") == 1);
@@ -120,6 +125,10 @@ TEST_CASE("operate pages: the embedded controller is CSP-clean and bounded",
     CHECK(has(js, "if (mine !== sseq) return;"));
     CHECK(has(js, "var mine = ++dseq;"));
     CHECK(has(js, "if (mine !== dseq) return;"));
+    CHECK(has(js, "var mine = ++rseq;"));
+    CHECK(has(js, "if (mine !== rseq) return;"));
+    CHECK(has(js, "var mine = ++qseq;"));
+    CHECK(has(js, "if (mine !== qseq) return;"));
     // Every non-200 list answer maps to fixed copy; the body is never shown.
     CHECK(has(js, "'Could not load. Check your connection and retry.'"));
     CHECK(has(js, "'Your session has expired. Sign in again.'"));
@@ -239,9 +248,18 @@ TEST_CASE("operate pages: the Workflows template carries every hook the controll
     const auto& js = yuzu::server::kYuzuOperateJs;
 
     for (const char* id : {"id=\"wf-list\"", "id=\"sc-list\"", "id=\"wf-steps\"",
-                           "id=\"wf-steps-title\"", "id=\"wf-steps-body\""})
+                           "id=\"wf-steps-title\"", "id=\"wf-steps-body\"",
+                           "id=\"wf-runs-store\"", "id=\"wf-run-body\"", "id=\"wf-recent-det\"",
+                           "id=\"wf-recent-body\""})
         CHECK(has(html, id));
     CHECK(has(html, "<body data-page=\"workflows\">"));
+    // Runs: the exact fragment contract's URLs, the id always percent-encoded.
+    CHECK(has(js, "'/fragments/workflow-runs?latest_per_workflow=true&limit=500'"));
+    CHECK(has(js, "'/fragments/workflow-runs/' + encodeURIComponent(id)"));
+    CHECK(has(js, "'/fragments/workflow-runs?limit=10&workflow_id=' + encodeURIComponent(selectedId)"));
+    // Run rows are matched by attribute value, never interpolated into a selector.
+    CHECK(has(js, "r.getAttribute('data-workflow-id') === wid"));
+    CHECK(has(js, "if ($('.ops-list', runsStore)) loadRuns();"));
     // The controller asks exactly the fragment contract's URLs.
     CHECK(has(js, "'/fragments/workflows'"));
     CHECK(has(js, "'/fragments/schedules?view=page'"));

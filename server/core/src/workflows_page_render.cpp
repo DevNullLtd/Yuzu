@@ -2,6 +2,8 @@
 
 #include "web_utils.hpp" // html_escape, format_iso_utc, truncate_utf8
 
+#include <nlohmann/json.hpp>
+
 #include <cstddef>
 
 namespace yuzu::server::operate_pages {
@@ -11,6 +13,7 @@ namespace {
 constexpr std::size_t kDescriptionChars = 90;
 constexpr std::size_t kConditionChars = 80;
 constexpr std::size_t kScopeChars = 120;
+constexpr std::size_t kErrorChars = 160;
 
 std::string pill(std::string_view cls, std::string_view label) {
     return "<span class=\"pill " + std::string(cls) + "\">" + html_escape(std::string(label)) +
@@ -88,7 +91,7 @@ std::string render_workflows_list(const WorkflowListView& v) {
         return out;
     }
     out += "<div class=\"tw\"><table class=\"wf\"><thead><tr><th>Workflow</th><th>Steps</th>"
-           "</tr></thead><tbody>";
+           "<th>Last run</th><th>Result</th></tr></thead><tbody>";
     for (const auto& w : v.rows) {
         out += "<tr class=\"row\" tabindex=\"0\" aria-selected=\"false\" data-workflow-id=\"" +
                esc(w.id) + "\" data-workflow-name=\"" + esc(w.name) + "\"><td><span class=\"nm\" "
@@ -96,7 +99,9 @@ std::string render_workflows_list(const WorkflowListView& v) {
         if (!w.description.empty())
             out += "<span class=\"sub\" title=\"" + esc(w.description) + "\">" +
                    esc(truncate_utf8(w.description, kDescriptionChars)) + "</span>";
-        out += "</td><td>" + std::to_string(w.steps.size()) + "</td></tr>";
+        // Filled from the runs fragment by the controller (data-c cells are swapped in place).
+        out += "</td><td>" + std::to_string(w.steps.size()) +
+               "</td><td class=\"tm\" data-c=\"started\">-</td><td data-c=\"status\">-</td></tr>";
     }
     out += "</tbody></table></div><div class=\"ops-steps-store\" hidden>";
     for (const auto& w : v.rows)
@@ -106,6 +111,191 @@ std::string render_workflows_list(const WorkflowListView& v) {
         out += "<div class=\"ops-foot hint\">Showing the first " + std::to_string(v.page_cap) +
                " workflows.</div>";
     out += "</div>";
+    return out;
+}
+
+StepPolicy run_status_pill(std::string_view status) {
+    if (status == "pending")
+        return {"idle", "Pending"};
+    if (status == "running")
+        return {"info", "Running"};
+    if (status == "completed")
+        return {"ok", "Completed"};
+    if (status == "failed")
+        return {"bad", "Failed"};
+    if (status == "cancelled")
+        return {"idle", "Cancelled"};
+    return {"idle", std::string(status)};
+}
+
+StepPolicy run_step_pill(std::string_view status, bool confined) {
+    if (status == "pending")
+        return {"idle", "Waiting"};
+    if (status == "running")
+        return {"info", "Running"};
+    if (status == "success")
+        return {"ok", confined ? "Dispatched (run-wide)" : "Dispatched"};
+    if (status == "failed")
+        return {"bad", "Failed"};
+    if (status == "skipped")
+        return {"idle", "Skipped"};
+    return {"idle", std::string(status)};
+}
+
+std::string duration_text(int64_t started_at, int64_t completed_at) {
+    if (started_at <= 0 || completed_at < started_at)
+        return "-";
+    const int64_t d = completed_at - started_at;
+    if (d < 60)
+        return std::to_string(d) + "s";
+    if (d < 3600)
+        return std::to_string(d / 60) + "m " + std::to_string(d % 60) + "s";
+    return std::to_string(d / 3600) + "h " + std::to_string((d % 3600) / 60) + "m";
+}
+
+std::string render_runs_list(const RunListView& v) {
+    std::string out;
+    out.reserve(256 + v.rows.size() * 520);
+    out += std::string("<div class=\"ops-list\" data-state=\"") + (v.rows.empty() ? "empty" : "ok") +
+           "\" data-count=\"" + std::to_string(v.rows.size()) + "\" data-confined=\"" +
+           (v.confined ? "1" : "0") + "\">";
+    if (v.rows.empty()) {
+        out += "<div class=\"empty-state\">" +
+               esc(v.confined ? kRunsConfinedEmptyNote : kRunsEmptyNote) + "</div></div>";
+        return out;
+    }
+    out += "<div class=\"tw\"><table class=\"runs\"><thead><tr><th>Result</th><th>Workflow</th>"
+           "<th>Started</th><th>Took</th></tr></thead><tbody>";
+    for (const auto& r : v.rows) {
+        const StepPolicy p = run_status_pill(r.status);
+        const std::string name = r.workflow_name.empty() ? r.workflow_id : r.workflow_name;
+        out += "<tr class=\"row\" tabindex=\"0\" aria-selected=\"false\" data-run-id=\"" + esc(r.id) +
+               "\" data-workflow-id=\"" + esc(r.workflow_id) + "\" data-status=\"" +
+               esc(r.status) + "\"><td data-c=\"status\">" + pill(p.cls, p.label) + "</td><td>" +
+               "<span class=\"nm\" title=\"" + esc(name) + "\">" + esc(name) + "</span>";
+        if (r.workflow_deleted)
+            out += "<span class=\"sub\">Workflow deleted</span>";
+        out += "</td>";
+        if (r.started_at <= 0) {
+            out += "<td class=\"tm\" data-c=\"started\">-</td>";
+        } else {
+            const std::string iso = esc(format_iso_utc(r.started_at));
+            out += "<td class=\"tm\" data-c=\"started\" data-epoch-ms=\"" +
+                   std::to_string(r.started_at * 1000) + "\" title=\"" + iso + "\">" + iso +
+                   "</td>";
+        }
+        out += "<td class=\"tm\">" + esc(duration_text(r.started_at, r.completed_at)) +
+               "</td></tr>";
+    }
+    out += "</tbody></table></div></div>";
+    return out;
+}
+
+namespace {
+
+// The detail line of one step, from known result shapes only. A result is an object, or an
+// array of objects for a foreach step; anything else (nested error object, unknown keys,
+// unparsable text) is "No detail." for a failed or skipped step and nothing otherwise.
+std::string step_detail(const RunStepView& s, bool confined) {
+    nlohmann::json j = nlohmann::json::parse(s.result_json, nullptr, false);
+    std::vector<const nlohmann::json*> objs;
+    if (j.is_object())
+        objs.push_back(&j);
+    else if (j.is_array())
+        for (const auto& e : j)
+            if (e.is_object())
+                objs.push_back(&e);
+
+    if (s.status == "skipped") {
+        for (const auto* o : objs) {
+            auto it = o->find("reason");
+            if (it == o->end() || !it->is_string())
+                continue;
+            const std::string& r = it->get_ref<const std::string&>();
+            if (r == "condition not met" || r == "previous step failed" || r == "workflow aborted")
+                return esc(r);
+        }
+        return "No detail.";
+    }
+    if (s.status == "failed") {
+        for (const auto* o : objs) {
+            auto it = o->find("error");
+            if (it != o->end() && it->is_string() && !it->get_ref<const std::string&>().empty())
+                return esc(truncate_utf8(it->get_ref<const std::string&>(), kErrorChars));
+        }
+        return "No detail.";
+    }
+    if (s.status == "success" && !confined) {
+        int64_t reached = 0;
+        bool any = false;
+        for (const auto* o : objs) {
+            auto it = o->find("agents_reached");
+            if (it != o->end() && it->is_number_integer()) {
+                reached += it->get<int64_t>();
+                any = true;
+            }
+        }
+        if (any)
+            return "Reached " + plural(static_cast<int>(reached), "device", "devices");
+    }
+    return "";
+}
+
+std::string kv(std::string_view label, const std::string& value_html) {
+    return "<div><span>" + std::string(label) + "</span><b>" + value_html + "</b></div>";
+}
+
+} // namespace
+
+std::string render_run_detail(const RunDetailView& v) {
+    const StepPolicy rp = run_status_pill(v.status);
+    int failed = 0;
+    for (const auto& s : v.steps)
+        if (s.status == "failed")
+            ++failed;
+
+    std::string out;
+    out.reserve(768 + v.steps.size() * 360);
+    out += "<div data-slot=\"run\" data-run-id=\"" + esc(v.id) + "\" data-run-status=\"" +
+           esc(v.status) + "\" data-confined=\"" + (v.confined ? "1" : "0") + "\">";
+    out += "<div class=\"kvl\">";
+    out += kv("Status", pill(rp.cls, rp.label));
+    out += kv("Workflow", "<span class=\"clip\" title=\"" + esc(v.workflow_id) + "\">" +
+                              esc(v.workflow_name.empty() ? v.workflow_id : v.workflow_name) +
+                              "</span>");
+    if (v.started_at > 0) {
+        const std::string iso = esc(format_iso_utc(v.started_at));
+        out += kv("Started", "<span data-epoch-ms=\"" + std::to_string(v.started_at * 1000) +
+                                 "\" title=\"" + iso + "\">" + iso + "</span>");
+    } else {
+        out += kv("Started", "-");
+    }
+    out += kv("Took", esc(duration_text(v.started_at, v.completed_at)));
+    if (v.device_count >= 0)
+        out += kv(v.confined ? "Devices in your scope" : "Devices",
+                  std::to_string(v.device_count));
+    if (failed > 0)
+        out += kv("Failed steps", std::to_string(failed) + " of " + std::to_string(v.steps.size()));
+    out += kv("Run id", "<span class=\"mono clip\" title=\"" + esc(v.id) + "\">" + esc(v.id) +
+                            "</span>");
+    out += "</div>";
+
+    if (v.steps.empty()) {
+        out += "<div class=\"empty-state\">No step results recorded yet.</div></div>";
+        return out;
+    }
+    out += "<ol class=\"ops-steps\">";
+    for (const auto& s : v.steps) {
+        const StepPolicy p = run_step_pill(s.status, v.confined);
+        std::string sub = esc(duration_text(s.started_at, s.completed_at));
+        const std::string detail = step_detail(s, v.confined);
+        if (!detail.empty())
+            sub += " &middot; " + detail;
+        out += "<li><div class=\"st\"><b class=\"nm\" title=\"" + esc(s.title) + "\">" +
+               std::to_string(s.index + 1) + ". " + esc(s.title) + "</b><span class=\"sub\">" +
+               sub + "</span></div>" + pill(p.cls, p.label) + "</li>";
+    }
+    out += "</ol></div>";
     return out;
 }
 

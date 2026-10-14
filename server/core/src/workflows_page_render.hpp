@@ -23,6 +23,17 @@
 ///                  <div class="tw"><table class="sc">... <tr class="row" data-schedule-id
 ///                    data-owner="0|1"> ...</table></div>
 ///
+/// Runs (WF-2): `GET /fragments/workflow-runs` is a list of run rows (status pill, workflow,
+/// started, duration) used for the newest-run-per-workflow patch of the definitions table and
+/// for the "Recent runs" disclosure; `GET /fragments/workflow-runs/{id}` is one run's step
+/// table. Both are metadata the caller may see: no agent id is ever printed, an error text only
+/// when it is a plain string, and a confined caller's step pill reads "Dispatched (run-wide)".
+///   runs:   <div class="ops-list" data-state data-count data-confined="0|1">
+///             <div class="tw"><table class="runs">... <tr class="row" data-run-id
+///               data-workflow-id data-status> <td data-c="status"> <td data-c="started"> ...
+///   detail: <div data-slot="run" data-run-id data-run-status data-confined> <div class="kvl">
+///             ...</div><ol class="ops-steps">...
+///
 /// The step list of every listed workflow rides in the definitions fragment itself (a hidden
 /// store the controller clones from), so selecting a row needs no second request and no
 /// second read of the definitions.
@@ -99,6 +110,68 @@ struct ScheduleListView {
 [[nodiscard]] std::string cadence_text(std::string_view frequency_type, int interval_minutes);
 
 [[nodiscard]] std::string render_schedules_page(const ScheduleListView& v);
+
+struct RunRowView {
+    std::string id;
+    std::string workflow_id;
+    std::string workflow_name;
+    bool workflow_deleted{false};
+    std::string status;
+    int64_t started_at{0};
+    int64_t completed_at{0};
+};
+
+struct RunListView {
+    std::vector<RunRowView> rows;
+    bool confined{false}; ///< the caller's reads are narrowed to its device scope
+};
+
+[[nodiscard]] std::string render_runs_list(const RunListView& v);
+
+/// Run status pill: pending (idle) Pending, running (info) Running, completed (ok) Completed,
+/// failed (bad) Failed, cancelled (idle) Cancelled; any other value verbatim on an idle pill.
+[[nodiscard]] StepPolicy run_status_pill(std::string_view status);
+
+/// Step state pill: pending Waiting, running Running, success Dispatched (the command was sent;
+/// "Dispatched (run-wide)" for a confined caller, who cannot tell whether its own devices were
+/// reached), failed Failed, skipped Skipped.
+[[nodiscard]] StepPolicy run_step_pill(std::string_view status, bool confined);
+
+/// "-" unless both instants are set and ordered; else "45s", "1m 12s" or "2h 3m".
+[[nodiscard]] std::string duration_text(int64_t started_at, int64_t completed_at);
+
+struct RunStepView {
+    int index{0};
+    std::string title; ///< the definition's label, else the instruction id
+    std::string status;
+    int64_t started_at{0};
+    int64_t completed_at{0};
+    /// The step result as the confined projection dumped it ("" when none). Only known shapes
+    /// are read from it: `{"reason":<known text>}`, `{"error":<string>}`, `agents_reached`.
+    std::string result_json;
+};
+
+struct RunDetailView {
+    std::string id;
+    std::string workflow_id;
+    std::string workflow_name; ///< "" when the definition is gone: the id is shown
+    std::string status;
+    int64_t started_at{0};
+    int64_t completed_at{0};
+    bool confined{false};
+    int device_count{-1}; ///< size of the (confined) agent id array; -1 = unknown
+    std::vector<RunStepView> steps;
+};
+
+[[nodiscard]] std::string render_run_detail(const RunDetailView& v);
+
+inline constexpr std::string_view kRunsEmptyNote = "No runs yet.";
+inline constexpr std::string_view kRunsConfinedEmptyNote =
+    "No runs include devices in your scope.";
+inline constexpr std::string_view kRunsDeniedNote =
+    "You do not have permission to view workflow runs.";
+inline constexpr std::string_view kRunsDegradedNote = "Run history unavailable, retry shortly.";
+inline constexpr std::string_view kRunsInvalidNote = "Unknown or invalid run filter.";
 
 inline constexpr std::string_view kWorkflowsEmptyNote = "No workflows yet.";
 inline constexpr std::string_view kWorkflowsEmptyHint = "Ask an administrator to add one.";

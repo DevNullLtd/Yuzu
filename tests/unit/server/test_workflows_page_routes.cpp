@@ -13,9 +13,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <expected>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -33,6 +35,8 @@ struct Fx {
     int fleet_calls{0};
     std::string perm_type, perm_op;
     bool perm_grant{true};
+    bool fleet_grant{true};
+    yuzu::server::authz::VisibleSet fleet_scope{std::nullopt};
     std::string username{"alice"};
     std::string token_scope_service;
     std::vector<std::string> audit_actions;
@@ -41,6 +45,15 @@ struct Fx {
     WorkflowQuery seen_query;
     std::expected<std::vector<Workflow>, std::string> workflows{std::vector<Workflow>{}};
     std::expected<ScheduleListResult, std::string> schedules{ScheduleListResult{}};
+
+    // Runs (WF-2): the list and detail doubles, with what the route handed the seam.
+    int runs_calls{0};
+    WorkflowExecutionListQuery seen_run_query;
+    yuzu::server::authz::VisibleSet seen_run_scope{std::nullopt};
+    std::expected<WorkflowExecutionPage, std::string> runs{WorkflowExecutionPage{}};
+    int exec_calls{0};
+    std::expected<std::optional<WorkflowExecution>, std::string> exec{std::nullopt};
+    std::expected<std::optional<Workflow>, std::string> def{std::nullopt};
 
     WorkflowRoutes routes;
     yuzu::server::test::TestRouteSink sink; // declared AFTER the route owner (see the sink header)
@@ -68,10 +81,17 @@ struct Fx {
             }
             return true;
         };
-        d.fleet_read_fn = [this](const httplib::Request&, httplib::Response&, const std::string&,
+        d.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                                  const std::string&) -> authz::FleetReadGate {
             ++fleet_calls;
-            return {true, std::nullopt};
+            if (!fleet_grant) {
+                res.status = 403;
+                res.set_content("{\"error\":{\"code\":403,\"message\":\"missing Workflow:Read "
+                                "for role r-secret\"}}",
+                                "application/json");
+                return {false, {}};
+            }
+            return {true, fleet_scope};
         };
         d.audit_fn = [this](const httplib::Request&, const std::string& action, const std::string&,
                             const std::string&, const std::string&, const std::string&) {
@@ -83,8 +103,17 @@ struct Fx {
                 seen_query = q;
                 return workflows;
             },
-            yuzu::server::test::FnWorkflowApi::GetFn{},
-            yuzu::server::test::FnWorkflowApi::GetExecutionFn{});
+            [this](const std::string&) { return def; },
+            [this](const std::string&) {
+                ++exec_calls;
+                return exec;
+            },
+            [this](const WorkflowExecutionListQuery& q, const yuzu::server::authz::VisibleSet& sc) {
+                ++runs_calls;
+                seen_run_query = q;
+                seen_run_scope = sc;
+                return runs;
+            });
         d.schedule_api = std::make_shared<yuzu::server::test::FnScheduleApi>(
             [this](const ScheduleQuery&) { return schedules; });
         routes.register_routes(sink, std::move(d));
@@ -371,4 +400,204 @@ TEST_CASE("/fragments/schedules?view=page: an empty list and markup in names are
     fx.schedules = ScheduleListResult{{s}, false};
     res = fx.get("/fragments/schedules?view=page");
     CHECK_FALSE(has(res->body, "<img"));
+}
+
+// ── /fragments/workflow-runs (F2) and /fragments/workflow-runs/{id} (F3) ─────
+
+namespace {
+
+WorkflowExecutionSummary run_row(const std::string& id, const std::string& wf,
+                                 const std::string& status = "completed") {
+    WorkflowExecutionSummary r;
+    r.id = id;
+    r.workflow_id = wf;
+    r.workflow_name = "Name of " + wf;
+    r.status = status;
+    r.started_at = 1700000000;
+    r.completed_at = 1700000072;
+    return r;
+}
+
+WorkflowExecution run_exec(const std::string& id, const std::string& agents = R"(["a1","a2"])") {
+    WorkflowExecution e;
+    e.id = id;
+    e.workflow_id = "wf-1";
+    e.status = "completed";
+    e.agent_ids_json = agents;
+    e.started_at = 1700000000;
+    e.completed_at = 1700000072;
+    WorkflowStepResult s0;
+    s0.step_index = 0;
+    s0.instruction_id = "inst-0";
+    s0.status = "success";
+    s0.result_json = R"({"status":"dispatched","command_id":"c","agents_reached":2})";
+    s0.started_at = 1700000000;
+    s0.completed_at = 1700000012;
+    e.step_results.push_back(s0);
+    WorkflowStepResult s1;
+    s1.step_index = 1;
+    s1.instruction_id = "inst-1";
+    s1.status = "failed";
+    s1.result_json = R"({"error":"no agents reached for inst-1"})";
+    e.step_results.push_back(s1);
+    return e;
+}
+
+} // namespace
+
+TEST_CASE("/fragments/workflow-runs: fleet_read_fn is the sole gate and its scope reaches the seam",
+          "[workflow][workflows][page][runs]") {
+    Fx fx;
+    fx.fleet_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"a1"}};
+    fx.runs = WorkflowExecutionPage{{run_row("r1", "wf-1")}, std::nullopt, false};
+    auto res = fx.get("/fragments/workflow-runs?latest_per_workflow=true&limit=500");
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-run-id=\"r1\""));
+    CHECK(has(res->body, "data-confined=\"1\""));
+    CHECK(fx.fleet_calls == 1);
+    CHECK(fx.perm_calls == 0); // never stacked with perm_fn
+    CHECK(fx.runs_calls == 1);
+    CHECK(fx.seen_run_query.latest_per_workflow);
+    CHECK(fx.seen_run_query.limit == 500);
+    CHECK(fx.seen_run_scope.has_value());
+    CHECK(fx.audit_actions.empty());
+}
+
+TEST_CASE("/fragments/workflow-runs: a refusal is a 200 note and the store is not read",
+          "[workflow][workflows][page][runs][security]") {
+    Fx fx;
+    fx.fleet_grant = false;
+    auto res = fx.get("/fragments/workflow-runs");
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-denied=\"true\""));
+    CHECK(has(res->body, "You do not have permission to view workflow runs."));
+    CHECK_FALSE(has(res->body, "r-secret"));
+    CHECK(fx.runs_calls == 0);
+    CHECK(fx.perm_calls == 0);
+}
+
+TEST_CASE("/fragments/workflow-runs: unknown, repeated and malformed parameters are refused, not ignored",
+          "[workflow][workflows][page][runs]") {
+    Fx fx;
+    for (const char* target : {"/fragments/workflow-runs?since=1", "/fragments/workflow-runs?cursor=x",
+                               "/fragments/workflow-runs?limit=5&limit=6",
+                               "/fragments/workflow-runs?status=bogus",
+                               "/fragments/workflow-runs?workflow_id=a%20b",
+                               "/fragments/workflow-runs?nonsense=<script>"}) {
+        auto res = fx.get(target);
+        CHECK(res->status == 200);
+        CHECK(has(res->body, "data-invalid=\"true\""));
+        CHECK(has(res->body, "Unknown or invalid run filter."));
+        CHECK_FALSE(has(res->body, "<script>"));
+    }
+    CHECK(fx.runs_calls == 0);
+}
+
+TEST_CASE("/fragments/workflow-runs: a store failure is a degraded note, an empty page says no runs",
+          "[workflow][workflows][page][runs]") {
+    Fx fx;
+    fx.runs = std::unexpected(std::string{"statement timeout (internal)"});
+    auto res = fx.get("/fragments/workflow-runs");
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-degraded=\"true\""));
+    CHECK(has(res->body, "Run history unavailable, retry shortly."));
+    CHECK_FALSE(has(res->body, "statement timeout"));
+    CHECK_FALSE(has(res->body, "No runs yet."));
+
+    fx.runs = WorkflowExecutionPage{};
+    auto empty = fx.get("/fragments/workflow-runs");
+    CHECK(has(empty->body, "No runs yet."));
+    fx.fleet_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"a1"}};
+    auto confined = fx.get("/fragments/workflow-runs");
+    CHECK(has(confined->body, "No runs include devices in your scope."));
+}
+
+TEST_CASE("/fragments/workflow-runs/{id}: gate, audit and the confined projection",
+          "[workflow][workflows][page][runs]") {
+    Fx fx;
+    fx.exec = run_exec("r1");
+    Workflow w = workflow("wf-1", "Patch Tuesday", 2);
+    w.steps[0].label = "Preflight <b>";
+    fx.def = w;
+    auto res = fx.get("/fragments/workflow-runs/r1");
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "1. Preflight &lt;b&gt;"));
+    CHECK(has(res->body, "2. Step 1")); // label from the definition (step 1 has one)
+    CHECK(has(res->body, "Patch Tuesday"));
+    CHECK(has(res->body, "Dispatched"));
+    CHECK_FALSE(has(res->body, "run-wide"));
+    CHECK(has(res->body, "Reached 2 devices"));
+    CHECK(has(res->body, "no agents reached for inst-1"));
+    CHECK(has(res->body, "1 of 2"));
+    CHECK(fx.fleet_calls == 1);
+    CHECK(fx.perm_calls == 0);
+    REQUIRE(fx.audit_actions.size() == 1);
+    CHECK(fx.audit_actions[0] == "workflow_execution.detail.fetch");
+
+    // A confined caller: run-wide copy, no reach count, only its own devices counted.
+    fx.fleet_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"a1"}};
+    auto c = fx.get("/fragments/workflow-runs/r1");
+    CHECK(c->status == 200);
+    CHECK(has(c->body, "Dispatched (run-wide)"));
+    CHECK(has(c->body, "Devices in your scope"));
+    CHECK_FALSE(has(c->body, "Reached"));
+    CHECK_FALSE(has(c->body, "a2"));
+}
+
+TEST_CASE("/fragments/workflow-runs/{id}: hidden and unknown ids answer with identical bytes",
+          "[workflow][workflows][page][runs][security]") {
+    Fx fx;
+    fx.fleet_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"mine"}};
+    fx.exec = run_exec("r-hidden", R"(["other-1","other-2"])");
+    auto hidden = fx.get("/fragments/workflow-runs/r-hidden");
+    const size_t audits_after_hidden = fx.audit_actions.size();
+    fx.exec = std::optional<WorkflowExecution>{};
+    auto unknown = fx.get("/fragments/workflow-runs/r-unknown");
+    CHECK(hidden->status == 404);
+    CHECK(unknown->status == 404);
+    CHECK(hidden->body == unknown->body);
+    CHECK_FALSE(has(hidden->body, "r-hidden"));
+    CHECK_FALSE(has(hidden->body, "other-1"));
+    // The hidden fetch is audited as a denial; the unknown one writes nothing (as the v1 route).
+    REQUIRE(audits_after_hidden == 1);
+    CHECK(fx.audit_actions[0] == "workflow_execution.detail.fetch");
+    CHECK(fx.audit_actions.size() == 1);
+}
+
+TEST_CASE("/fragments/workflow-runs/{id}: a refusal and a failure are 200 notes",
+          "[workflow][workflows][page][runs]") {
+    Fx fx;
+    fx.fleet_grant = false;
+    auto denied = fx.get("/fragments/workflow-runs/r1");
+    CHECK(denied->status == 200);
+    CHECK(has(denied->body, "data-denied=\"true\""));
+    CHECK(fx.exec_calls == 0);
+    CHECK(fx.audit_actions.empty()); // the gate audits its own denial
+
+    fx.fleet_grant = true;
+    fx.exec = std::unexpected(std::string{"pool exhausted (internal)"});
+    auto degraded = fx.get("/fragments/workflow-runs/r1");
+    CHECK(degraded->status == 200);
+    CHECK(has(degraded->body, "data-degraded=\"true\""));
+    CHECK_FALSE(has(degraded->body, "pool exhausted"));
+}
+
+TEST_CASE("/fragments/workflow-runs/{id}: stored text is escaped and an unknown shape says no detail",
+          "[workflow][workflows][page][runs][security]") {
+    Fx fx;
+    WorkflowExecution e = run_exec("r1");
+    e.step_results[1].result_json = R"({"error":{"agent":"out-of-scope-9","text":"<img src=x onerror=1>"}})";
+    WorkflowStepResult s2;
+    s2.step_index = 2;
+    s2.instruction_id = "<img src=x onerror=1>";
+    s2.status = "skipped";
+    s2.result_json = R"({"reason":"something <b>new</b>"})";
+    e.step_results.push_back(s2);
+    fx.exec = e;
+    auto res = fx.get("/fragments/workflow-runs/r1");
+    CHECK(res->status == 200);
+    CHECK_FALSE(has(res->body, "out-of-scope-9"));
+    CHECK_FALSE(has(res->body, "<img"));
+    CHECK_FALSE(has(res->body, "<b>new"));
+    CHECK(has(res->body, "No detail."));
 }

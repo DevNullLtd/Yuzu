@@ -4,7 +4,10 @@
 // Both lists are server-rendered fragments (`/fragments/workflows`,
 // `/fragments/schedules?view=page`, see workflows_page_render.hpp) fetched and swapped in
 // by /static/yuzu-operate.js, which also copies the selected workflow's step list out of the
-// definitions fragment into the side panel. Read-only: Run now, New workflow, Delete and the
+// definitions fragment into the side panel, patches each row's Last run / Result cells from
+// `/fragments/workflow-runs?latest_per_workflow=true`, and loads the selected workflow's newest
+// run (`/fragments/workflow-runs/{id}`) and its ten most recent runs on demand.
+// Read-only: Run now, New workflow, Delete and the
 // schedule controls are not on this page yet (the Instructions page's Schedules tab keeps its
 // Delete).
 //
@@ -43,6 +46,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 <section class="panel ops-listbox">
 <div class="hd"><h2>Workflows</h2></div>
 <div id="wf-list"><div class="empty-state">Loading…</div></div>
+<div id="wf-runs-store" hidden></div>
 </section>
 <section class="panel ops-listbox ops-sc">
 <div class="hd"><h2>Schedules</h2></div>
@@ -53,6 +57,16 @@ constexpr std::string_view kBody = R"HTM(</style>
 <section class="panel ops-sel" id="wf-steps">
 <div class="hd"><h2 id="wf-steps-title">Steps</h2></div>
 <div id="wf-steps-body"><div class="empty-state">Select a workflow to see its steps.</div></div>
+</section>
+<section class="panel ops-sel" id="wf-run">
+<div class="hd"><h2>Latest run</h2></div>
+<div id="wf-run-body"><div class="empty-state">Select a workflow to see its latest run.</div></div>
+</section>
+<section class="panel ops-sel" id="wf-recent">
+<details id="wf-recent-det">
+<summary class="hd"><h2>Recent runs</h2></summary>
+<div id="wf-recent-body"><div class="empty-state">Select a workflow to see its recent runs.</div></div>
+</details>
 </section>
 </aside>
 </div>
