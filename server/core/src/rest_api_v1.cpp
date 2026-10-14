@@ -49,6 +49,7 @@
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
+#include "quarantine_visible.hpp" // quarantine_visible_records: shared admit-then-filter read (REST GET + dashboard fragments)
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
 #include "result_set_model.hpp" // #2146 Batch B2: shared REST v1 + MCP result-set JSON builder
 #include "scope_engine.hpp"     // yuzu::scope::validate — POST /api/v1/scope/validate
@@ -5923,51 +5924,31 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            // AUTHORITATIVE read (ADR-0047): nullopt is a degraded read, NEVER
-            // rendered as an empty quarantine list — a device could still be
-            // actively contained while the caller sees "nothing quarantined".
-            auto records = quarantine_store->list_quarantined();
-            if (!records) {
+            // AUTHORITATIVE read + per-record admit-then-filter, shared with the dashboard
+            // fragments (quarantine_visible.hpp — one copy of the rules): a nullopt store read
+            // is a degraded read, NEVER an empty list; an explicit 403 filters the record;
+            // ANY other probe outcome fails the WHOLE list closed (503). The per-record
+            // rationale (gov-fix security-guardian / unhappy-path Gate 4: a degraded authz
+            // check must not render as "not quarantined") lives in the header's banner.
+            const auto visible_set = quarantine_visible_records(
+                req, [quarantine_store] { return quarantine_store->list_quarantined(); },
+                scoped_perm_fn);
+            if (visible_set.status == QuarantineReadStatus::StoreDegraded) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "quarantine list unavailable — try again"),
                                 "application/json");
                 return;
             }
+            if (visible_set.status == QuarantineReadStatus::ProbeDegraded) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "authorization check unavailable — try again"),
+                    "application/json");
+                return;
+            }
             JArr arr;
             int64_t visible = 0;
-            for (const auto& r : *records) {
-                httplib::Response probe; // throwaway: per-record admit probe, never sent
-                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id)) {
-                    // gov-fix(security-guardian, widened by unhappy-path Gate 4):
-                    // a per-record degrade is NOT a denial and must not be
-                    // silently filtered out — that would render a degraded
-                    // authz check as "not quarantined", the exact fail-open
-                    // the store-layer nullopt check above exists to close,
-                    // just one layer up. The auth caller has ALREADY been
-                    // authenticated once by auth_fn above, using the SAME
-                    // req — every per-record call re-derives authorization
-                    // from scratch (require_scoped_permission calls
-                    // require_auth internally on every invocation), so any
-                    // outcome OTHER than an explicit 403 (a genuine scope
-                    // denial) is anomalous mid-request and must fail the
-                    // WHOLE list closed, not just the RBAC/tag-store-degrade
-                    // 503 case: a transient engine-principal store outage
-                    // landing between auth_fn's initial check and a later
-                    // per-record probe surfaces as a bare 401 (require_auth
-                    // does not distinguish "no session" from "could not
-                    // determine" for that principal class — see
-                    // EngineLookupStatus::StoreUnreachable's own comment,
-                    // auth_routes.cpp), which the original 503-only check
-                    // would have silently treated as a denial.
-                    if (probe.status != 403) {
-                        res.status = 503;
-                        res.set_content(
-                            detail::a4_error(res, "authorization check unavailable — try again"),
-                            "application/json");
-                        return;
-                    }
-                    continue;
-                }
+            for (const auto& r : visible_set.records) {
                 arr.add(JObj()
                             .add("agent_id", r.agent_id)
                             .add("status", r.status)

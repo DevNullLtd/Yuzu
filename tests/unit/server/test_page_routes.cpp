@@ -99,6 +99,8 @@ const std::vector<AssetExpectation> kStaticAssets = {
     {"/static/three-orbit-controls.js", "application/javascript; charset=utf-8", "max-age=86400"},
     {"/static/yuzu-viz.js", "application/javascript; charset=utf-8", "no-cache"},
     {"/static/yuzu-viz-host.js", "application/javascript; charset=utf-8", "no-cache"},
+    {"/static/yuzu-dialog.js", "application/javascript; charset=utf-8", "no-cache"},
+    {"/static/yuzu-estate.js", "application/javascript; charset=utf-8", "no-cache"},
     {"/static/cytoscape.min.js", "application/javascript; charset=utf-8", "max-age=86400"},
     {"/static/fonts/ibm-plex-sans-latin-400-normal.woff2", "font/woff2", "max-age=2592000"},
     {"/static/fonts/ibm-plex-sans-latin-500-normal.woff2", "font/woff2", "max-age=2592000"},
@@ -425,14 +427,14 @@ TEST_CASE("page_routes: /viz/host/:id rejects a malformed agent id with 400",
 
 // ── Registration order / shape ────────────────────────────────────────────
 
-TEST_CASE("page_routes: registers exactly 29 routes, with /viz/fleet reachable independently "
+TEST_CASE("page_routes: registers exactly 31 routes, with /viz/fleet reachable independently "
           "of /viz/host/:id (the documented registration order — /viz/fleet before the "
           "per-host regex — never lets one swallow the other)",
           "[server][routes][page_routes]") {
     Harness h;
     h.wire();
 
-    CHECK(h.sink.route_count() == 29);
+    CHECK(h.sink.route_count() == 31);
 
     auto fleet = h.sink.Get("/viz/fleet");
     REQUIRE(fleet);

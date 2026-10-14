@@ -25,6 +25,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp).
 extern const char* const kGuardianDetailPageHtml;
@@ -45,6 +46,12 @@ std::string page_shell(const std::string& title, const std::string& fragment_url
     };
     sub("{{TITLE}}", title);
     sub("{{FRAGMENT}}", fragment_url);
+    // The shared dialog module and the estate controller (quarantine, stored-data
+    // removal) load after the template's own scripts. Same-origin static files: the
+    // dashboard CSP needs no change.
+    if (const auto end = html.rfind("</body>"); end != std::string::npos)
+        html.insert(end, "<script src=\"/static/yuzu-dialog.js\"></script>"
+                         "<script src=\"/static/yuzu-estate.js\"></script>\n");
     // test_nav_shells.cpp pins that the shared shell carries the marker apply_shell fills.
     return shell::apply_shell(std::move(html), {.active_key = "hardware"});
 }
@@ -79,6 +86,15 @@ bool bad_hw_ident(std::string_view v) {
         return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
                  c == '_' || c == '.' || c == '-');
     });
+}
+
+std::string hw_lens_or_overview(const std::string& raw) {
+    static constexpr std::string_view kLenses[] = {"overview", "software", "tags",    "containment",
+                                                   "dex",      "guardian", "live",    "actions"};
+    for (const auto l : kLenses)
+        if (raw == l)
+            return raw;
+    return "overview";
 }
 
 std::int64_t now_secs() {
@@ -176,8 +192,13 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!session) { res.set_redirect("/login"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        send_html(res, page_shell("Yuzu \xE2\x80\x94 Hardware",
-                                  "/fragments/hardware/ci?id=" + url_encode_id(id)));
+        // `lens` is forwarded so a link can open a specific lens (the row's Quarantine
+        // link). It is only a hint here: the fragment applies the allowlist, and the value
+        // is URL-encoded so it can never break out of the fragment URL.
+        std::string fragment = "/fragments/hardware/ci?id=" + url_encode_id(id);
+        if (req.has_param("lens"))
+            fragment += "&lens=" + url_encode_id(req.get_param_value("lens"));
+        send_html(res, page_shell("Yuzu \xE2\x80\x94 Hardware", fragment));
     });
 
     // -- Fragment: CI list --
@@ -228,6 +249,27 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             for (auto& row : page.rows)
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
 
+        // Quarantined pill: ONE authoritative active-set read per render, intersected with
+        // the page's rows BEFORE any per-record probe, so the probe count is bounded by the
+        // page size and not by the number of quarantines. A degraded read or probe sets the
+        // banner flag and no pill (absence is then not evidence).
+        if (deps_.quarantine_list_fn && !page.rows.empty()) {
+            std::unordered_set<std::string> page_ids;
+            page_ids.reserve(page.rows.size());
+            for (const auto& row : page.rows)
+                page_ids.insert(row.agent_id);
+            QuarantineVisibleOptions opt;
+            opt.only_ids = &page_ids;
+            const auto vis = quarantine_visible_records(req, deps_.quarantine_list_fn,
+                                                        deps_.scoped_perm_fn, opt);
+            if (vis.status == QuarantineReadStatus::Ok) {
+                for (const auto& r : vis.records)
+                    page.quarantined_ids.insert(r.agent_id);
+            } else {
+                page.quarantine_degraded = true;
+            }
+        }
+
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list: devices=" + std::to_string(page.total_matching) +
@@ -252,7 +294,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
-        const std::string lens = req.has_param("lens") ? req.get_param_value("lens") : "overview";
+        // Allowlisted: the value reaches the audit detail and echoed markup, so an unknown
+        // or oversized `lens` falls back to the overview rather than being carried through.
+        const std::string lens = hw_lens_or_overview(req.has_param("lens") ? req.get_param_value("lens")
+                                                                          : std::string{});
         const bool lens_only = req.has_param("lens_only") && req.get_param_value("lens_only") == "1";
         if (!deps_.ci_detail_fn) {
             res.status = 503;

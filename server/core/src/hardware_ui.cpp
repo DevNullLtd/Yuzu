@@ -8,6 +8,7 @@
 
 #include "hardware_routes.hpp"
 
+#include "device_containment_render.hpp"
 #include "web_utils.hpp"
 
 #include <cctype>
@@ -307,11 +308,19 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
     return h;
 }
 
-std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q) {
+std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bool quarantined) {
     const std::string name = d.hostname.empty() ? d.agent_id : d.hostname;
     const std::string status_pill = d.online
         ? "<span class=\"hw-pill ok\">online</span>"
         : (d.stale ? "<span class=\"hw-pill warn\">stale</span>" : "<span class=\"hw-pill\">offline</span>");
+    // Quarantined pill + the row's route into the Containment lens. The link is a plain
+    // anchor (the create dialog needs OS/online/whitelist context, and 50 live buttons
+    // would need 50 scoped probes); yuzu-estate.js stops the row's own click handler from
+    // overriding its target.
+    const std::string quarantine_cell =
+        std::string(quarantined ? "<span class=\"hw-pill bad\">Quarantined</span> " : "") +
+        "<a class=\"hw-lab\" data-act=\"row-containment\" href=\"/hardware/ci?id=" + url_encode(d.agent_id) +
+        "&amp;lens=containment\">" + (quarantined ? "Containment" : "Quarantine") + "</a>";
     const std::string cpu_ram = [&] {
         const std::string ct = ci_cores_threads(d.ci_cpu_cores, d.ci_cpu_threads);
         const std::string ram = ci_ram_gb(d.ci_ram_bytes);
@@ -346,7 +355,7 @@ std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q) {
            esc(name) + "</a></td>"
            "<td class=\"hw-mono\">" + ip_cell + "</td>"
            "<td><span class=\"hw-os\">" + os_label(d.os) + "</span></td>"
-           "<td>" + status_pill + "</td>"
+           "<td>" + status_pill + " " + quarantine_cell + "</td>"
            "<td>" + dex_badge(d.dex_score) + "</td>"
            "<td class=\"hw-mono\">" + version_cell + "</td>"
            "<td>" + (d.last_seen.empty() ? "?" : esc(d.last_seen)) + "</td>"
@@ -405,6 +414,10 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     if (tags_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
              "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
+    if (page.quarantine_degraded)
+        h += "<div class=\"gp-banner hw-degrade\"><b>Quarantine state unavailable.</b> The quarantine "
+             "records could not be read or checked &mdash; a row without a Quarantined pill here is "
+             "not \"not quarantined\".</div>";
     // Sticky bulk-tag action bar (round-3 item 7) — hidden by CSS until a row is
     // checked (hwSelRender toggles a `show` class); JS lives in guardian_page_ui.cpp.
     // Applying loops the EXISTING single-agent /api/tags/set|delete per selected
@@ -453,7 +466,7 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
         h += sortable_th("OS version", HwSortKey::OsVersion, q);
         h += "</tr></thead><tbody>";
         for (const auto& row : page.rows)
-            h += row_html(row, q);
+            h += row_html(row, q, page.quarantined_ids.contains(row.agent_id));
         h += "</tbody></table></div>";
         h += pagination(q, page.total_matching);
     }
@@ -507,7 +520,9 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
     h += "</div></div>";
 
     h += render_hardware_results_region(page, ci_degraded, tags_degraded);
-    h += "</section></div>";
+    h += "</section>";
+    h += quarantine_panel_placeholder();
+    h += "</div>";
     return h;
 }
 
@@ -534,6 +549,10 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
                                            aff.sync);
     } else if (lens == "tags") {
         h += render_hardware_tags_lens(agent_id, detail.tags, aff.can_write_tags);
+    } else if (lens == "containment") {
+        // Lazy: the fragment takes its own Security:Read / Security:Execute probes, so a
+        // viewer who never opens this lens never pays the denied-probe audit rows.
+        h += containment_lens_placeholder(agent_id);
     } else if (lens == "actions") {
         // The route swaps this placeholder for the real actions lens on load —
         // rendering the lens itself needs actions_fn/classify_fn/schema_fn, which
@@ -704,6 +723,10 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
         h += "</div>";
     }
 
+    // Quarantine banner: one lazily loaded placeholder, empty unless the device has an
+    // active record. It sits above the lens bar so it shows on every lens, including Live
+    // and Actions, whose instructions a quarantined device withholds.
+    h += containment_banner_placeholder(agent_id);
     h += render_hardware_lens_bar(agent_id, active_lens, /*oob=*/false);
     h += "<div id=\"hw-ci-lens\">";
     h += render_hardware_lens_body(agent_id, detail, active_lens, now_secs, aff);
@@ -717,6 +740,7 @@ std::string render_hardware_lens_bar(const std::string& agent_id, const std::str
     h += device_lens_tab("overview", "Overview", agent_id, active);
     h += device_lens_tab("software", "Installed software", agent_id, active);
     h += device_lens_tab("tags", "Tags", agent_id, active);
+    h += device_lens_tab("containment", "Containment", agent_id, active);
     h += device_lens_tab("dex", "DEX", agent_id, active);
     h += device_lens_tab("guardian", "Guardian", agent_id, active);
     h += device_lens_tab("live", "Live", agent_id, active);

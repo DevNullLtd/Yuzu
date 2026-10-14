@@ -110,6 +110,14 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/hardware/ci/containment",
+    "capability_id": "get.fragments-hardware-ci-containment",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.fragments-hardware-quarantine"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/hardware/ci/result",
     "capability_id": "get.fragments-hardware-ci-result",
     "rest_v1_twin": null,
@@ -123,6 +131,17 @@
     "rest_v1_twin": {
       "method": "GET",
       "path": "/api/v1/hardware"
+    },
+    "mcp_twin": null,
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/hardware/quarantine",
+    "capability_id": "get.fragments-hardware-quarantine",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/quarantine"
     },
     "mcp_twin": null,
     "status": "twinned"

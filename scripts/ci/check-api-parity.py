@@ -198,7 +198,13 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get_software_versions (both already "twinned", count unchanged). The raw route's
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
-BASELINE_UNTWINNED = 199
+#
+# Device containment fragments (es-1): get.fragments-hardware-quarantine is "twinned" to GET
+# /api/v1/quarantine (no MCP list tool exists; the gap is recorded on the row), and
+# get.fragments-hardware-ci-containment is "composed-of:get.fragments-hardware-quarantine"
+# (a single-device read of the same active-record set; REST has no per-device GET). One
+# composed-of row, so 199 -> 200, measured by the checker, not hand-picked.
+BASELINE_UNTWINNED = 200
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

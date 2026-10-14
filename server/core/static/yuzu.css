@@ -487,6 +487,18 @@ td > .bar { min-width: 110px; }
 .toast-warning { border-color: color-mix(in srgb, var(--warn) 50%, var(--line2)); }
 .toast-info { border-color: color-mix(in srgb, var(--info) 50%, var(--line2)); }
 
+/* ===== Dialog (shared: Operate, Access) - native <dialog class="dlg"> built by yuzu-dialog.js ===== */
+dialog.dlg { width: min(540px, calc(100vw - 32px)); max-width: none; padding: 0; margin: auto; color: var(--ink);
+             background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-over); box-shadow: var(--shadow); }
+dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
+.dlg > h2 { margin: 0; padding: 14px 16px; font-size: 15px; font-weight: 600; border-bottom: 1px solid var(--line); }
+.dlg > .b { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4); max-height: 70vh; overflow: auto; font-size: var(--text-base); }
+.dlg > .b p { margin: 0; color: var(--ink2); }
+.dlg > .b .note { margin: 0; }
+.dlg > .b .fld textarea { background: var(--bg); }
+.dlg .err { color: var(--bad); font-size: var(--text-sm); }
+.dlg > .f { display: flex; justify-content: flex-end; gap: var(--sp-2); padding: 12px 16px; border-top: 1px solid var(--line); }
+
 /* Icons (inline SVG via sprite) */
 .icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2;
         stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }

@@ -34,6 +34,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -108,6 +109,11 @@ struct HardwareListPage {
     std::size_t total_matching{0};        // after q/os/status, before paging
     HardwareKpis kpis;                    // see hardware_kpis()
     HardwareListQuery query;              // the normalised, canonical echo
+    // Quarantine state for the page's rows ONLY (never the whole roster): ids whose
+    // active record the caller may read. `quarantine_degraded` = the read or a
+    // per-record authz check failed, so absence of a pill proves nothing.
+    std::unordered_set<std::string> quarantined_ids;
+    bool quarantine_degraded{false};
 };
 
 /// Filters, sorts, and paginates `roster` per `normalised` (already validated —
