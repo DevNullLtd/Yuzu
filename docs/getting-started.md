@@ -62,8 +62,11 @@ This YAML is the canonical authoring format. Post the file itself: the `yaml_sou
 
 ### Import it via the API
 
+Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
+
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/yaml \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   --data-urlencode "yaml_source@hello-system-info.yaml"
 ```
@@ -211,6 +214,7 @@ Key additions:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/yaml \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   --data-urlencode "yaml_source@service-inspect.yaml"
 ```
@@ -449,6 +453,7 @@ Key differences from a question:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/yaml \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   --data-urlencode "yaml_source@service-restart.yaml"
 ```
@@ -591,6 +596,7 @@ The `permissions` block is the key governance feature:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instruction-sets \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -634,6 +640,7 @@ When creating or updating an instruction definition, set the `instruction_set_id
 
 ```bash
 curl -s -X PUT http://localhost:8080/api/instructions/tutorial.service.inspect \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
