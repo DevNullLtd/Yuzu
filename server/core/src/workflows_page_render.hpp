@@ -11,7 +11,8 @@
 /// that reaches the markup goes through `html_escape`; no raw JSON is ever rendered.
 ///
 /// Markup contract (`yuzu-operate.js` reads it):
-///   definitions: <div class="ops-list" data-state="ok|empty" data-count="N" data-truncated="0|1">
+///   definitions: <div class="ops-list" data-state="ok|empty" data-count="N" data-truncated="0|1"
+///                  data-can-run data-can-write data-can-delete="0|1">
 ///                  <div class="tw"><table class="wf">... <tr class="row" data-workflow-id
 ///                    data-workflow-name> ...</table></div>
 ///                  <div class="ops-steps-store" hidden>
@@ -52,6 +53,9 @@ struct WorkflowStepView {
     std::string condition;
     std::string foreach_source;
     std::string on_failure; ///< "", "abort", "continue" or "skip_remaining"
+    /// The instruction's display name; "" unless the route proved the caller may read
+    /// instruction definitions (`InstructionDefinition:Read`), which Workflow:Read does not imply.
+    std::string instruction_name;
     int retry_count{0};
     int retry_delay_seconds{0};
 };
@@ -67,6 +71,11 @@ struct WorkflowListView {
     std::vector<WorkflowRowView> rows;
     bool truncated{false}; ///< more definitions exist than the page shows
     int page_cap{100};     ///< the number of rows the page shows at most
+    // Render hints probed once per render (never gates: the routes stay the gate). They ride
+    // on the list root as data-can-* and decide whether a control is offered or disabled.
+    bool can_run{false};    ///< Workflow:Execute
+    bool can_write{false};  ///< Workflow:Write (New workflow)
+    bool can_delete{false}; ///< Workflow:Delete
 };
 
 [[nodiscard]] std::string render_workflows_list(const WorkflowListView& v);
@@ -100,6 +109,10 @@ struct ScheduleRowView {
 struct ScheduleListView {
     std::vector<ScheduleRowView> rows;
     bool truncated{false}; ///< the store's list cap dropped schedules
+    // Render hints probed once per render (never a gate; each write route checks its own grant).
+    bool can_write{false};  ///< Schedule:Write (Disable, New schedule)
+    bool can_enable{false}; ///< Execution:Execute (Enable and New schedule arm a schedule)
+    bool can_delete{false}; ///< Schedule:Delete
 };
 
 /// "Once", "Every N minutes", "Daily (every 24 hours)", "Weekly (every 7 days)",
