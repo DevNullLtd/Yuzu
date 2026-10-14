@@ -526,6 +526,19 @@ place, **Hardware** and **Software**, each its own page:
     fragment, `GET /fragments/hardware/ci/properties?id=`; a degraded store reads
     "could not be read", never "No properties set." Property values are written to the
     audit log (`custom_property.set`) and take part in scope expressions.
+    Add tag, Remove tag, Add or edit property, Delete property and Save schema open a
+    dialog (`static/yuzu-device-data.js` on the shared dialog module); removing or setting
+    the `service` tag says that it decides which service-scoped API tokens can reach the
+    device. The **environment** tag accepts only `Dev`, `UAT` or `Production`, exact case.
+  - **Installed software** also shows "N applications, last synced <time>" (a device that
+    never synced and a degraded read are worded differently), and two **click-to-load**
+    panels: **Application usage** (hours and runs over the last 30 days, first and last
+    seen, the first 200 executables by hours; scoped `Forensics:Read`, audit verb
+    `app_usage.agent.view`) and **Detected licences** (scoped `SoftwareLicensing:Read`,
+    audit verb `sle.agent.view`; no per-user column). Both write the audit row before
+    reading and, when it cannot persist, show "withheld" with `Sec-Audit-Failed: true`
+    and no data. They are the HTML twins of `GET /api/v1/forensics/agents/{id}/app-usage`
+    and `GET /api/v1/sle/agents/{id}`.
   - **DEX**, **Guardian**, **Live** — not reimplemented: these mount the *same*
     `/fragments/device/*` fragments the (now-redirected) device page used, each gated on
     scoped `GuaranteedState:Read` as before. **Live** additionally carries the ten

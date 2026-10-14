@@ -203,7 +203,28 @@ std::string kpis_html(const HardwareKpis& k, bool ci_degraded) {
     h += kpi("Offline", std::to_string(k.offline));
     h += kpi("Stale", std::to_string(k.stale), k.stale > 0 ? "warn" : "");
     h += kpi("CI coverage", ci_degraded ? "&mdash;" : (std::to_string(k.with_ci) + " / " + std::to_string(k.total)));
+    // Readouts over the scoped roster: hidden when no device has synced the figure, and
+    // when the CI columns themselves are degraded (a blank would read as "none").
+    if (!ci_degraded && k.median_ram_gb) {
+        const double v = *k.median_ram_gb;
+        const long long tenths = static_cast<long long>(v * 10.0 + 0.5);
+        std::string text = std::to_string(tenths / 10);
+        if (tenths % 10)
+            text += "." + std::to_string(tenths % 10);
+        const std::string label = "Median memory, " + std::to_string(k.ram_devices) +
+                                  (k.ram_devices == 1 ? " device" : " devices") + " with hardware synced";
+        h += kpi(label.c_str(), text + " GB");
+    }
     h += "</div>";
+    if (!ci_degraded && !k.by_manufacturer.empty()) {
+        h += "<div class=\"gp-mute\" id=\"hw-by-vendor\">By manufacturer: ";
+        bool first = true;
+        for (const auto& [name, n] : k.by_manufacturer) {
+            h += std::string(first ? "" : " &middot; ") + esc(name) + " " + std::to_string(n);
+            first = false;
+        }
+        h += "</div>";
+    }
     return h;
 }
 
@@ -532,7 +553,7 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
     std::string h;
     if (lens == "software") {
         h += render_hardware_software_lens(agent_id, detail.software, detail.software_truncated, online,
-                                           aff.sync);
+                                           aff.sync, detail.software_last_seen);
     } else if (lens == "tags") {
         h += render_hardware_tags_lens(agent_id, detail.tags, aff.can_write_tags, aff.can_delete_tags);
     } else if (lens == "actions") {
@@ -762,7 +783,8 @@ std::string render_hardware_sync_terminal(const std::string& agent_id, const std
 
 std::string render_hardware_software_lens(const std::string& agent_id,
                                           const std::optional<std::vector<SoftwareEntry>>& software,
-                                          bool truncated, bool online, const HwSyncAffordance& sync) {
+                                          bool truncated, bool online, const HwSyncAffordance& sync,
+                                          std::optional<std::int64_t> software_last_seen) {
     if (!software)
         return "<div class=\"gp-banner hw-degrade\"><b>Installed software unavailable.</b> The software "
                "inventory store could not be read. Retry shortly.</div>";
@@ -778,7 +800,19 @@ std::string render_hardware_software_lens(const std::string& agent_id,
     // Round-3 item 3: a searchable text filter over this device's own installed-
     // software table (gpSearch, group "hwsw" — self-contained to this lens, no
     // server round-trip needed since a per-device list is small).
-    std::string h = "<div class=\"hw-panel\"><div class=\"hw-tools\"><input class=\"hw-search\" "
+    // "N applications, last synced <when>": a never-synced device (0) and a degraded
+    // read (nullopt) are told apart, neither is shown as a bare count.
+    std::string summary = std::to_string(software->size()) +
+                          (software->size() == 1 ? " application" : " applications");
+    if (!software_last_seen)
+        summary += ", last synced time unavailable";
+    else if (*software_last_seen <= 0)
+        summary += ", never synced";
+    else
+        summary += ", last synced " + esc(format_iso_utc(*software_last_seen));
+    std::string h = "<div class=\"hw-panel\"><div class=\"hw-page\" id=\"hw-sw-summary\">" + summary +
+                    (truncated ? " (list truncated)" : "") + "</div>"
+                    "<div class=\"hw-tools\"><input class=\"hw-search\" "
                     "placeholder=\"Filter installed software…\" oninput=\"gpSearch(this)\" "
                     "data-gpf=\"hwsw\"></div>";
     h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr><th>Name</th><th>Version</th><th>Publisher</th>"

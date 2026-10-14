@@ -88,6 +88,19 @@ struct UsageDeps {
 /// Fails fast on an unwired gate or reader; the audit sink may be null.
 void register_device_usage_routes(HttpRouteSink& sink, UsageDeps deps);
 
+/// GET /fragments/inventory/sources: the HTML twin of GET /api/v1/inventory/tables
+/// (REST gate Inventory:Read; the MCP twin list_inventory_tables is gated
+/// Infrastructure:Read, a mismatch recorded in the parity ledger row). Fleet-wide and
+/// unaudited, like the REST route. A caller without the fleet-wide grant gets a 200 note.
+struct SourcesDeps {
+    using GlobalProbeFn = Deps::GlobalProbeFn;
+    using SourcesFn = std::function<std::optional<std::vector<SourceRow>>()>;
+    Deps::AuthFn auth_fn;
+    GlobalProbeFn global_probe_fn;
+    SourcesFn sources_fn;
+};
+void register_inventory_sources_route(HttpRouteSink& sink, SourcesDeps deps);
+
 /// Registers the fragments on `sink`. Fails fast (std::invalid_argument) when a
 /// required closure is unwired, so a mis-wired server never serves an ungated read.
 void register_device_data_routes(HttpRouteSink& sink, Deps deps);

@@ -1239,3 +1239,96 @@ TEST_CASE("hardware shell loads the dialog module before the device-data control
     REQUIRE(list);
     CHECK(contains(list->body, "data-service-note="));
 }
+
+// ---- readouts over the scoped roster (median memory, manufacturer counts) -------------------
+
+namespace {
+yuzu::server::InventoryDeviceRow ci_row(const std::string& id, const std::string& ram,
+                                        const std::string& vendor) {
+    yuzu::server::InventoryDeviceRow r;
+    r.agent_id = id;
+    r.hostname = id;
+    r.ci_ram_bytes = ram;
+    r.ci_manufacturer = vendor;
+    return r;
+}
+constexpr const char* kGiB8 = "8589934592";
+constexpr const char* kGiB16 = "17179869184";
+constexpr const char* kGiB64 = "68719476736";
+} // namespace
+
+TEST_CASE("readouts: median memory over rows with a synced figure, odd and even",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    std::size_t n = 0;
+    CHECK(*median_ram_gb({ci_row("a", kGiB8, ""), ci_row("b", kGiB16, ""), ci_row("c", kGiB64, "")},
+                         &n) == 16.0);
+    CHECK(n == 3);
+    CHECK(*median_ram_gb({ci_row("a", kGiB8, ""), ci_row("b", kGiB16, "")}) == 12.0);
+    // Unsynced, "unknown", zero and non-numeric are not devices with hardware synced.
+    CHECK_FALSE(median_ram_gb({ci_row("a", "", ""), ci_row("b", "unknown", ""), ci_row("c", "0", ""),
+                               ci_row("d", "12x", "")}, &n));
+    CHECK(n == 0);
+}
+
+TEST_CASE("readouts: manufacturer counts fold case, sum the tail into Other and skip blanks",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    std::vector<InventoryDeviceRow> rows{ci_row("1", "", "Dell"), ci_row("2", "", " dell "),
+                                         ci_row("3", "", "HP"), ci_row("4", "", "unknown"),
+                                         ci_row("5", "", "")};
+    const auto c = count_by_manufacturer(rows);
+    REQUIRE(c.size() == 2);
+    CHECK(c[0].first == "Dell");
+    CHECK(c[0].second == 2);
+    CHECK(c[1].first == "HP");
+
+    rows.clear();
+    for (int i = 0; i < 10; ++i)
+        rows.push_back(ci_row("d" + std::to_string(i), "", "V" + std::to_string(i)));
+    const auto top = count_by_manufacturer(rows, 8);
+    REQUIRE(top.size() == 9);
+    CHECK(top.back().first == "Other");
+    CHECK(top.back().second == 2);
+    CHECK(count_by_manufacturer({}).empty());
+}
+
+TEST_CASE("readouts: list KPIs describe the scoped roster only and hide when nothing synced",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    // H12: only the rows the confinement gate admitted reach hardware_kpis, so a
+    // confined caller's figures cannot include an out-of-scope device.
+    const auto admitted = hardware_kpis({ci_row("in-1", kGiB8, "Dell"), ci_row("in-2", kGiB8, "Dell")});
+    CHECK(admitted.ram_devices == 2);
+    REQUIRE(admitted.by_manufacturer.size() == 1);
+    CHECK(admitted.by_manufacturer[0].second == 2);
+
+    HardwareListPage page;
+    page.kpis = admitted;
+    const auto shown = render_hardware_list_fragment(page, false, false);
+    CHECK(contains(shown, "Median memory, 2 devices with hardware synced"));
+    CHECK(contains(shown, "By manufacturer: Dell 2"));
+    // CI columns degraded: no readout (a blank would read as "none").
+    const auto degraded = render_hardware_list_fragment(page, true, false);
+    CHECK_FALSE(contains(degraded, "Median memory"));
+    // Nothing synced: hidden.
+    HardwareListPage bare;
+    bare.kpis = hardware_kpis({ci_row("x", "", "")});
+    const auto none = render_hardware_list_fragment(bare, false, false);
+    CHECK_FALSE(contains(none, "Median memory"));
+    CHECK_FALSE(contains(none, "By manufacturer"));
+}
+
+TEST_CASE("software lens header: count and last synced, never-synced told apart from degraded",
+          "[hardware][readouts]") {
+    using namespace yuzu::server;
+    const std::vector<SoftwareEntry> sw{SoftwareEntry{}};
+    HwSyncAffordance sync;
+    const auto synced = render_hardware_software_lens("a", sw, false, true, sync, 1700000000);
+    CHECK(contains(synced, "1 application, last synced 2023-11-14"));
+    CHECK(contains(render_hardware_software_lens("a", sw, false, true, sync, 0), "never synced"));
+    CHECK(contains(render_hardware_software_lens("a", sw, false, true, sync, std::nullopt),
+                   "last synced time unavailable"));
+    // Click-to-load hosts ride the same lens and nothing is fetched on render.
+    CHECK(contains(synced, "hx-trigger=\"click\""));
+}

@@ -121,6 +121,22 @@ void usage_fragment(const UsageDeps& deps, const httplib::Request& req, httplib:
 
 } // namespace
 
+void register_inventory_sources_route(HttpRouteSink& sink, SourcesDeps deps) {
+    if (!deps.auth_fn || !deps.global_probe_fn || !deps.sources_fn)
+        throw std::invalid_argument("device_data::SourcesDeps: every closure is required");
+    sink.Get("/fragments/inventory/sources",
+             [deps](const httplib::Request& req, httplib::Response& res) {
+                 if (!deps.auth_fn(req, res))
+                     return;
+                 std::variant<std::vector<SourceRow>, Unavailable, Denied> body{Unavailable{}};
+                 if (!deps.global_probe_fn(req, "Inventory", "Read"))
+                     body = Denied{};
+                 else if (auto rows = deps.sources_fn())
+                     body = std::move(*rows);
+                 send_html(res, render_inventory_sources_panel(body));
+             });
+}
+
 void register_device_usage_routes(HttpRouteSink& sink, UsageDeps deps) {
     if (!deps.auth_fn || !deps.probe_fn || !deps.usage_fn || !deps.licences_fn)
         throw std::invalid_argument("device_data::UsageDeps: every gate and reader is required");

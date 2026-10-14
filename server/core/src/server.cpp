@@ -18407,6 +18407,37 @@ private:
                 });
         }
 
+        // Software page: the "Inventory sources" panel, the HTML twin of
+        // GET /api/v1/inventory/tables (same global Inventory:Read gate).
+        {
+            HttplibRouteSink sources_sink{*web_server_};
+            yuzu::server::device_data::register_inventory_sources_route(
+                sources_sink,
+                yuzu::server::device_data::SourcesDeps{
+                    .auth_fn = auth_fn,
+                    .global_probe_fn =
+                        [perm_fn](const httplib::Request& req, const std::string& type,
+                                  const std::string& op) -> bool {
+                            httplib::Response probe;
+                            return perm_fn(req, probe, type, op);
+                        },
+                    .sources_fn =
+                        [this]() -> std::optional<std::vector<yuzu::server::device_data::SourceRow>> {
+                        if (!inventory_store_ || !inventory_store_->is_open())
+                            return std::nullopt;
+                        auto tables = inventory_store_->list_tables();
+                        if (!tables)
+                            return std::nullopt;
+                        std::vector<yuzu::server::device_data::SourceRow> out;
+                        out.reserve(tables->size());
+                        for (const auto& t : *tables)
+                            out.push_back({t.plugin, static_cast<std::int64_t>(t.agent_count),
+                                           static_cast<std::int64_t>(t.last_collected)});
+                        return out;
+                    },
+                });
+        }
+
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /
         // os_arch / free-disk / pending-reboot) across the operator-VISIBLE devices

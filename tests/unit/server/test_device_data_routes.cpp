@@ -326,3 +326,64 @@ TEST_CASE("usage routes: UsageDeps with an unwired gate is refused at registrati
     UsageDeps d;
     CHECK_THROWS_AS(register_device_usage_routes(sink, d), std::invalid_argument);
 }
+
+// ---- inventory sources -------------------------------------------------------------------
+
+TEST_CASE("inventory sources: gate, degrade, empty and rows are each their own state",
+          "[device_data][routes][sources]") {
+    bool authed = true, allowed = true, degraded = false;
+    std::vector<SourceRow> rows{{"installed_apps", 12, 1700000000}, {"<b>x", 3, 0}};
+    int reads = 0;
+    yuzu::server::test::TestRouteSink sink;
+    SourcesDeps d;
+    d.auth_fn = [&](const httplib::Request&, httplib::Response& res) -> std::optional<auth::Session> {
+        if (!authed) {
+            res.status = 401;
+            return std::nullopt;
+        }
+        return auth::Session{};
+    };
+    d.global_probe_fn = [&](const httplib::Request&, const std::string& t, const std::string& o) {
+        return allowed && t == "Inventory" && o == "Read";
+    };
+    d.sources_fn = [&]() -> std::optional<std::vector<SourceRow>> {
+        ++reads;
+        if (degraded)
+            return std::nullopt;
+        return rows;
+    };
+    register_inventory_sources_route(sink, d);
+
+    auto ok = sink.Get("/fragments/inventory/sources");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(contains(ok->body, "installed_apps"));
+    CHECK(contains(ok->body, "&lt;b&gt;x")); // escaped
+    CHECK(contains(ok->body, "Last collected"));
+
+    allowed = false;
+    reads = 0;
+    auto denied = sink.Get("/fragments/inventory/sources");
+    REQUIRE(denied);
+    CHECK(denied->status == 200);
+    CHECK(contains(denied->body, "fleet-wide <b>Inventory:Read</b>"));
+    CHECK(reads == 0);
+
+    allowed = true;
+    degraded = true;
+    auto bad = sink.Get("/fragments/inventory/sources");
+    REQUIRE(bad);
+    CHECK(contains(bad->body, "could not be read"));
+    CHECK_FALSE(contains(bad->body, "No inventory has been collected yet."));
+
+    degraded = false;
+    rows.clear();
+    CHECK(contains(sink.Get("/fragments/inventory/sources")->body,
+                   "No inventory has been collected yet."));
+
+    authed = false;
+    CHECK(sink.Get("/fragments/inventory/sources")->status == 401);
+
+    yuzu::server::test::TestRouteSink bare;
+    CHECK_THROWS_AS(register_inventory_sources_route(bare, SourcesDeps{}), std::invalid_argument);
+}

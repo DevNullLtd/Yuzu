@@ -236,6 +236,28 @@ std::string render_licences_panel(const LicencesView& v) {
     return h;
 }
 
+std::string render_inventory_sources_panel(
+    const std::variant<std::vector<SourceRow>, Unavailable, Denied>& v) {
+    std::string h = "<div class=\"hw-panel dd-panel\" id=\"dd-sources\" style=\"margin-top:22px\">"
+                    "<div class=\"hw-hd\"><h2>Inventory sources</h2><span class=\"hw-lab\">Each "
+                    "source is a daily sync from the agents.</span></div>";
+    if (std::holds_alternative<Denied>(v))
+        return h + note("Needs a fleet-wide <b>Inventory:Read</b> grant.") + "</div>";
+    if (std::holds_alternative<Unavailable>(v))
+        return h + degraded("<b>Inventory sources could not be read.</b> This is not an empty "
+                            "list; retry shortly.") + "</div>";
+    const auto& rows = std::get<std::vector<SourceRow>>(v);
+    if (rows.empty())
+        return h + note("No inventory has been collected yet.") + "</div>";
+    h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr><th>Source</th><th>Devices</th>"
+         "<th>Last collected</th></tr></thead><tbody>";
+    for (const auto& r : rows)
+        h += "<tr><td class=\"hw-name\">" + esc(r.plugin) + "</td><td class=\"hw-mono\">" +
+             std::to_string(r.agent_count) + "</td>" + when_cell(r.last_collected) + "</tr>";
+    h += "</tbody></table></div></div>";
+    return h;
+}
+
 std::string render_properties_panels(const PropertiesView& v) {
     // Schemas are only used to label property rows; a denied or degraded schema
     // read simply leaves the Schema column blank.

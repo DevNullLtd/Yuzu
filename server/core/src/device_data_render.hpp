@@ -103,6 +103,17 @@ struct LicencesView {
 
 std::string render_licences_panel(const LicencesView& v);
 
+/// One row of the Inventory sources panel (GET /api/inventory/tables twin).
+struct SourceRow {
+    std::string plugin;
+    std::int64_t agent_count{0};
+    std::int64_t last_collected{0}; // epoch seconds; 0 = never
+};
+
+/// `Denied` = the caller lacks a fleet-wide Inventory:Read (this panel is fleet-wide).
+std::string render_inventory_sources_panel(
+    const std::variant<std::vector<SourceRow>, Unavailable, Denied>& v);
+
 /// The two click-to-load hosts shown under the installed-software table. Nothing is
 /// fetched (and nothing is audited) until an operator clicks.
 std::string render_usage_load_hosts(const std::string& agent_id);
