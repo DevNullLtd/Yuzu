@@ -1013,10 +1013,10 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
-      "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "responses": {"200": {"description": "List of roles"}}}
+      "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "description": "Requires UserManagement:Read. A degraded RBAC store is a retryable 503 (retry_after_ms 5000), never an empty 200 list.", "responses": {"200": {"description": "List of roles"}, "403": {"description": "Requires UserManagement:Read"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
     },
     "/rbac/roles/{role}/permissions": {
-      "get": {"summary": "Get permissions for a role", "tags": ["RBAC"], "parameters": [{"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of permissions"}}}
+      "get": {"summary": "Get permissions for a role", "tags": ["RBAC"], "parameters": [{"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Requires UserManagement:Read. A role the roles table does not hold is 404 (not an empty 200); a degraded RBAC store is a retryable 503 (retry_after_ms 5000).", "responses": {"200": {"description": "List of permissions"}, "403": {"description": "Requires UserManagement:Read"}, "404": {"description": "No such role"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
     },
     "/rbac/check": {
       "post": {"summary": "Check if current user has a permission", "tags": ["RBAC"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"securable_type": {"type": "string"}, "operation": {"type": "string"}}}}}}, "responses": {"200": {"description": "Permission check result"}}}

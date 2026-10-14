@@ -2641,6 +2641,13 @@ List all defined roles.
 }
 ```
 
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Caller lacks `UserManagement:Read` | `403` |
+| The RBAC store is closed, its connection pool timed out, or the read failed | `503` with `retry_after_ms` `5000` and a fixed message. Never an empty `200` list: an empty list would read as "no roles exist". |
+
 ---
 
 #### `GET /api/v1/rbac/roles/{role_name}/permissions`
@@ -2673,6 +2680,14 @@ List all permissions granted to a role.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Caller lacks `UserManagement:Read` | `403` |
+| `{role_name}` is not in the roles table (matched exactly, case-sensitive) | `404` — `role not found`. Not an empty `200`. |
+| The RBAC store is closed, its connection pool timed out, or either read failed | `503` with `retry_after_ms` `5000` and a fixed message. A degrade is never reported as `404` or as an empty permission set. |
 
 ---
 
