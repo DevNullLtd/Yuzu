@@ -141,6 +141,8 @@ TEST_CASE("plugins page: the computed confirms read the data-* the hosted rows c
         CHECK_THAT(html, ContainsSubstring(std::string("'") + sfx + "'"));
     // An invalid (blank) rollout is never confirmed: validation reports instead.
     CHECK_THAT(html, ContainsSubstring("reportValidity()"));
+    // The posted text is read with stoi server-side: 1e2 would apply 1% under a "100%" prompt.
+    CHECK_THAT(html, ContainsSubstring("/^[0-9]{1,3}$/.test(pct)"));
 }
 
 // ── Gates ───────────────────────────────────────────────────────────────────

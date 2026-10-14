@@ -230,6 +230,13 @@ constexpr char kPart3[] = R"HTM(  <script>
       if (!f || !f.dataset || !f.dataset.confirm) return;
       e.preventDefault();
       if (!f.checkValidity()) { f.reportValidity(); return; }
+      /* A number input also accepts 1e2 or 5.0; the handler reads the posted text with
+         stoi, so 1e2 would apply 1% under a prompt that says 100%. Whole digits only. */
+      var pct = f.elements.rollout_pct.value;
+      if (!/^[0-9]{1,3}$/.test(pct) || Number(pct) > 100) {
+        showToast('Rollout must be a whole number from 0 to 100.', 'error');
+        return;
+      }
       var q = f.dataset.confirm === 'rollout' ? rolloutQuestion(f) : uploadQuestion(f);
       if (q && window.confirm(q)) e.detail.issueRequest(true);
     });
