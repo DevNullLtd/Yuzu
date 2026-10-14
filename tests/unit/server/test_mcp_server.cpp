@@ -20231,7 +20231,9 @@ TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders,
     REQUIRE(absent);
     CHECK(nlohmann::json::parse(theirs->body)["error"]["code"] ==
           yuzu::server::mcp::kInvalidParams);
-    CHECK(theirs->body == absent->body);
+    // Same code and message (only the per-request correlation id differs): no oracle.
+    CHECK(nlohmann::json::parse(theirs->body)["error"]["message"] ==
+          nlohmann::json::parse(absent->body)["error"]["message"]);
 
     auto noid = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"get_deployment",)"
