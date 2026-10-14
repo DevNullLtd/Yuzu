@@ -163,7 +163,9 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
     std::string reason;
     std::size_t seen = 0;
     for_each_line(out, [&](std::string_view line) {
-        const auto tok = split_tokens(line, 9); // store rows are nine tokens
+        // One more than the widest row (store rows are nine tokens) so an over-wide row
+        // fails the `!= N` width checks instead of being truncated to a valid width.
+        const auto tok = split_tokens(line, 10);
         if (tok[0] == "status") {
             if (tok.size() >= 4 && tok[1] == action) {
                 ++status_rows;
