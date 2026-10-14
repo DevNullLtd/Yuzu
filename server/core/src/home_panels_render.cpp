@@ -169,9 +169,9 @@ std::vector<ActivityRow> to_activity_rows(const std::vector<AuditEvent>& events)
 }
 
 std::string render_activity_panel(const Fact<std::vector<ActivityRow>>& f, std::int64_t as_of_secs,
-                                  bool audit_page_exists, const std::string& audit_href) {
+                                  const std::string& audit_href) {
     std::string head = header("Recent activity", {}, as_of_secs);
-    if (audit_page_exists) {
+    if (!audit_href.empty()) { // empty = no audit page, button omitted
         // The "Audit log" button sits in the header's trailing group.
         const std::string btn = "<a class=\"btn sm\" href=\"" + html_escape(audit_href) +
                                 "\">Audit log</a>";

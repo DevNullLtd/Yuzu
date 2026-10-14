@@ -135,7 +135,7 @@ TEST_CASE("home_panels: to_activity_rows copies only the five safe fields", "[se
     e.result = "success";
     auto rows = to_activity_rows({e});
     REQUIRE(rows.size() == 1);
-    auto html = render_activity_panel(Fact<std::vector<ActivityRow>>::ok(rows), kNow, true, "/access/audit");
+    auto html = render_activity_panel(Fact<std::vector<ActivityRow>>::ok(rows), kNow, "/access/audit");
     for (const char* leak : {"DETAIL-LEAK", "10.9.9.9", "UA-LEAK", "SESSION-LEAK", "admin-secret-role"})
         CHECK_FALSE(has(html, leak));
     CHECK(has(html, "Policy:p1"));
@@ -151,7 +151,7 @@ TEST_CASE("home_panels: activity result pill classes and escaping", "[server][ho
     rows.push_back({kNow, "<script>x</script>", "a", std::string(130, 'T'), "failure"});
     rows.push_back({kNow, "u", "a", "", "denied"});
     rows.push_back({kNow, "u", "a", "", "weird"});
-    auto html = render_activity_panel(Fact<std::vector<ActivityRow>>::ok(rows), kNow, false, "");
+    auto html = render_activity_panel(Fact<std::vector<ActivityRow>>::ok(rows), kNow, "");
     CHECK(has(html, "pill bad"));
     CHECK(has(html, "pill warn"));
     CHECK(has(html, "pill idle"));
@@ -165,12 +165,12 @@ TEST_CASE("home_panels: activity result pill classes and escaping", "[server][ho
 
 TEST_CASE("home_panels: activity states", "[server][home]") {
     using R = Fact<std::vector<ActivityRow>>;
-    CHECK(has(render_activity_panel(R::ok({}), kNow, false, ""), "No activity recorded yet."));
-    CHECK(has(render_activity_panel(R::of(FactState::AdminOnly), kNow, false, ""),
+    CHECK(has(render_activity_panel(R::ok({}), kNow, ""), "No activity recorded yet."));
+    CHECK(has(render_activity_panel(R::of(FactState::AdminOnly), kNow, ""),
               "administrators only"));
-    CHECK(has(render_activity_panel(R::of(FactState::Denied, "AuditLog:Read"), kNow, false, ""),
+    CHECK(has(render_activity_panel(R::of(FactState::Denied, "AuditLog:Read"), kNow, ""),
               "It needs AuditLog:Read."));
-    CHECK(has(render_activity_panel(R::of(FactState::Unavailable), kNow, false, ""),
+    CHECK(has(render_activity_panel(R::of(FactState::Unavailable), kNow, ""),
               "This is not zero."));
 }
 

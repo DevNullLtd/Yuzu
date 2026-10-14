@@ -93,7 +93,7 @@ struct ActivityRow {
 [[nodiscard]] std::vector<ActivityRow> to_activity_rows(const std::vector<AuditEvent>& events);
 
 [[nodiscard]] std::string render_activity_panel(const Fact<std::vector<ActivityRow>>& f,
-                                                std::int64_t as_of_secs, bool audit_page_exists,
+                                                std::int64_t as_of_secs,
                                                 const std::string& audit_href);
 
 // ── Server health ────────────────────────────────────────────────────────

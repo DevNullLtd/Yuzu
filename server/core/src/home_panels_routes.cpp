@@ -61,9 +61,8 @@ void register_home_panel_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/fragments/home/activity", [deps](const httplib::Request& req, httplib::Response& res) {
         using Rows = std::vector<ActivityRow>;
         const auto now = deps.now_fn();
-        const bool has_page = !deps.audit_href.empty();
         auto out = [&](const Fact<Rows>& f) {
-            serve(res, render_activity_panel(f, now, has_page, deps.audit_href));
+            serve(res, render_activity_panel(f, now, deps.audit_href));
         };
         if (service_scoped_refused(deps, req,
                                    "service-scoped tokens may not read the Home activity panel")) {
