@@ -187,7 +187,9 @@ TEST_CASE("executions_page_render: the selected panel lays out the execution",
     v.parameter_values = "{\"a\":1}";
     const auto html = render_exec_selected(v);
     CHECK(has(html, "<div data-slot=\"selected\" data-execution-id=\"0123456789abcdef0123\" "
-                    "data-execution-status=\"running\" data-confined=\"0\">"));
+                    "data-execution-status=\"running\" data-confined=\"0\" "
+                    "data-def-name=\"Name 0123456789abcdef0123\" data-by=\"alice\" "
+                    "data-responded=\"2\" data-targeted=\"5\">"));
     CHECK(has(html, "<h2>Selected execution</h2>"));
     CHECK(has(html, "<span>Devices</span><b>2 of 5 responded</b>"));
     // Lineage links to the page's own deep link, showing 12 characters.

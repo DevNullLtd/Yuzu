@@ -201,11 +201,24 @@ TEST_CASE("operate pages: the Executions template carries every hook the control
     CHECK(has(js, "if (res.status !== 200) { panelNote(detailCopy(res.status)); return; }"));
     // No auto-select: the detail read (one audit row) happens on a click, Enter/Space or
     // an explicit ?id= only.
-    CHECK(count_of(js, "showDetail(") == 3);
+    CHECK(count_of(js, "showDetail(") == 4); // definition, click path, deep link, live refresh
     CHECK(has(js, "if (wantId) showDetail(wantId);"));
-    // No polling and no live stream in the read-only pages.
+    // No polling. Live updates: exactly one EventSource, on the page's own detail stream,
+    // started only from a fresh detail response that says running|pending.
     CHECK_FALSE(has(js, "setInterval("));
-    CHECK_FALSE(has(js, "EventSource"));
+    CHECK(count_of(js, "new EventSource(") == 1);
+    CHECK(has(js, "'/sse/executions/' + encodeURIComponent(id)"));
+    CHECK(has(js, "var MIN_GAP_MS = 3000;"));
+    CHECK(has(js, "var LARGE_GAP_MS = 15000;"));
+    CHECK(has(js, "gapMs = targeted > 2000 ? LARGE_GAP_MS : MIN_GAP_MS;"));
+    CHECK(has(js, "var running = status === 'running' || status === 'pending';"));
+    CHECK(has(js, "} else if (running) {"));
+    CHECK(has(js, "mine.readyState === 2"));
+    CHECK(has(js, "window.addEventListener('pagehide', stopLive);"));
+    // Completion closes the stream and reads once; the stream close never clears the timer
+    // it is about to set (refreshNow owns that).
+    CHECK(has(js, "closeStream();\n        setChip('');\n        refreshNow();"));
+    CHECK(has(js, "Live updates unavailable."));
 }
 
 TEST_CASE("operate pages: Executions copy is exact and read-only", "[ui][operate][pages]") {

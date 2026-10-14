@@ -1,6 +1,6 @@
 /* yuzu-operate.js -- page controllers for the Operate pages (Approvals, Executions).
  *
- * Read-only: the server renders every list and panel as an HTML fragment (the fragment
+ * The server renders every list and panel as an HTML fragment (the fragment
  * routes' `view=page` branches); this file only fetches them, swaps them into their host
  * and fills the single detail panel from the selected row's data-* attributes with
  * textContent. One controller per page, chosen by <body data-page>.
@@ -329,6 +329,7 @@
       n.className = 'empty-state';
       n.textContent = text;
       panel.replaceChildren(hd, n);
+      stopLive();
       devices.hidden = true;
       devices.replaceChildren();
     }
@@ -352,6 +353,138 @@
       if (!seen.devices) { devices.hidden = true; devices.replaceChildren(); }
     }
 
+    // ---- Live updates (OpsLive) for the selected running|pending execution ----
+    // One EventSource per tab. Started only after a FRESH detail response says the
+    // execution is running|pending; closed by selecting another row, completion, a CLOSED
+    // source, or pagehide. Counters of the Selected panel are not patched from events (a
+    // confined caller's stream is sanitised); they arrive with the throttled refresh.
+    var MIN_GAP_MS = 3000;     // trailing refresh gap; every refresh is an audited read
+    var LARGE_GAP_MS = 15000;  // used when the execution targets more than 2000 devices
+    var es = null;
+    var opened = false;
+    var liveId = '';
+    var refreshTimer = 0;
+    var lastRefresh = 0;
+    var gapMs = MIN_GAP_MS;
+    var liveChip = doc.createElement('span');
+    liveChip.className = 'ops-live';
+    liveChip.setAttribute('role', 'status');
+    liveChip.hidden = true;
+
+    function setChip(state) {
+      var copy = { live: 'Live', reconnecting: 'Reconnecting\u2026',
+                   unavailable: 'Live updates unavailable.' };
+      if (!state || !copy[state]) { liveChip.hidden = true; liveChip.textContent = ''; return; }
+      liveChip.setAttribute('data-state', state);
+      var dot = doc.createElement('i');
+      var txt = doc.createElement('span');
+      txt.textContent = copy[state];
+      liveChip.replaceChildren(dot, txt);
+      liveChip.hidden = false;
+    }
+    // The slots are replaced on every refresh; the chip is re-seated into the new header.
+    function seatChip() {
+      var hd = $('[data-slot="selected"] > .hd', panel);
+      if (hd && liveChip.parentNode !== hd) hd.appendChild(liveChip);
+    }
+    function closeStream() {
+      if (es) { try { es.close(); } catch (e) { /* already closed */ } es = null; }
+      opened = false;
+    }
+    function cancelRefresh() {
+      if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = 0; }
+    }
+    function stopLive() {
+      closeStream();
+      cancelRefresh();
+      liveId = '';
+      setChip('');
+    }
+    function refreshNow() {
+      cancelRefresh();
+      lastRefresh = Date.now();
+      if (liveId) showDetail(liveId, true);
+    }
+    function scheduleRefresh() {
+      if (refreshTimer || !liveId) return;
+      var wait = Math.max(0, gapMs - (Date.now() - lastRefresh));
+      refreshTimer = setTimeout(function () { refreshTimer = 0; refreshNow(); }, wait);
+    }
+
+    function cssEsc(s) {
+      if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(String(s));
+      return String(s).replace(/(["\\])/g, '\\$1');
+    }
+    function applyAgentTransition(id, payload) {
+      if (!payload || !payload.agent_id) return;
+      var status = String(payload.status || '');
+      var dom = 'pending';
+      if (status === 'success') dom = 'succeeded';
+      else if (status === 'failure' || status === 'timeout' || status === 'rejected') dom = 'failed';
+      else if (status === 'running') dom = 'running';
+      var key = '[data-agent-id="' + cssEsc(payload.agent_id) + '"][data-exec-id="' + cssEsc(id) + '"]';
+      $$('.agent-cell' + key, devices).forEach(function (c) {
+        c.className = 'agent-cell agent-cell--' + dom;
+      });
+      $$('tr' + key, devices).forEach(function (r) {
+        var badge = $('.per-agent-status', r);
+        if (badge) {
+          badge.textContent = status;
+          badge.className = 'status-badge per-agent-status status-' + dom;
+        }
+        var ex = $('.per-agent-exit-code', r);
+        if (ex && typeof payload.exit_code === 'number') ex.textContent = String(payload.exit_code);
+      });
+    }
+    function applyProgress(id, payload) {
+      var strip = $('#exec-kpi-' + cssEsc(id), devices);
+      if (!strip || !payload) return;
+      var vals = $$('.exec-kpi-value', strip);
+      if (vals.length < 3) return;
+      if (typeof payload.agents_targeted === 'number') vals[0].textContent = String(payload.agents_targeted);
+      if (typeof payload.agents_success === 'number') vals[1].textContent = String(payload.agents_success);
+      if (typeof payload.agents_failure === 'number') vals[2].textContent = String(payload.agents_failure);
+    }
+
+    function startLive(id, targeted) {
+      stopLive();
+      liveId = id;
+      gapMs = targeted > 2000 ? LARGE_GAP_MS : MIN_GAP_MS;
+      lastRefresh = Date.now();
+      try { es = new EventSource('/sse/executions/' + encodeURIComponent(id)); } catch (e) { es = null; liveId = ''; return; }
+      var mine = es;
+      mine.addEventListener('open', function () { opened = true; setChip('live'); });
+      mine.addEventListener('agent-transition', function (ev) {
+        if (mine !== es) return;
+        try { applyAgentTransition(id, JSON.parse(ev.data)); } catch (e) { /* bad frame */ }
+        scheduleRefresh();
+      });
+      mine.addEventListener('execution-progress', function (ev) {
+        if (mine !== es) return;
+        try { applyProgress(id, JSON.parse(ev.data)); } catch (e) { /* bad frame */ }
+      });
+      mine.addEventListener('execution-completed', function () {
+        if (mine !== es) return;
+        closeStream();
+        setChip('');
+        refreshNow(); // exactly one final read for the terminal state
+      });
+      mine.addEventListener('heartbeat', function () {});
+      mine.onerror = function () {
+        if (mine !== es) return;
+        if (mine.readyState === 2) {
+          // CLOSED: before open it was refused (410 or the stream budget; the browser cannot
+          // read which), after open the server ended it, so read the final state once.
+          var wasOpen = opened;
+          closeStream();
+          if (wasOpen) { setChip(''); refreshNow(); } else { setChip('unavailable'); }
+        } else {
+          setChip('reconnecting');
+        }
+      };
+    }
+    window.addEventListener('pagehide', stopLive);
+
     function markSelected() {
       $$('tr.row', host).forEach(function (r) {
         var on = !!selectedId && r.dataset.executionId === selectedId;
@@ -370,16 +503,29 @@
     }
 
     // One audited detail read per call. Never run on load without an explicit ?id=.
-    function showDetail(id) {
+    // fromLive: a refresh of the already-selected execution; the stream stays as it is.
+    function showDetail(id, fromLive) {
       var mine = ++dseq;
-      selectedId = id;
-      markSelected();
-      writeQs(function (p) { p.set('id', id); });
+      if (!fromLive) {
+        stopLive();
+        selectedId = id;
+        markSelected();
+        writeQs(function (p) { p.set('id', id); });
+      }
       return fetchFragment('/fragments/executions/' + encodeURIComponent(id) +
                            '/detail?view=page').then(function (res) {
         if (mine !== dseq) return;
         if (res.status !== 200) { panelNote(detailCopy(res.status)); return; }
         applySlots(res.html); // server-rendered and escaped
+        var sel = $('[data-slot="selected"]', panel);
+        var status = sel ? sel.getAttribute('data-execution-status') : '';
+        var running = status === 'running' || status === 'pending';
+        if (fromLive) {
+          if (!running) stopLive();   // terminal: nothing more to watch
+        } else if (running) {
+          startLive(id, Number(sel.getAttribute('data-targeted')) || 0);
+        }
+        seatChip();
       });
     }
 

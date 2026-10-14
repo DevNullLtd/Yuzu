@@ -99,6 +99,10 @@ details.resp{border-top:1px solid var(--line);padding:10px 16px}
 details.resp summary{cursor:pointer;font-size:13px;color:var(--mut)}
 .resp-output pre{margin:6px 0;padding:8px;background:var(--bg);border:1px solid var(--line);border-radius:var(--rad-ctl);max-height:200px;overflow:auto;white-space:pre-wrap;font-family:var(--mds-font-family-mono);font-size:12.5px}
 .ops-cap-note{padding:8px 16px}
+.ops-live{display:inline-flex;align-items:center;gap:6px;margin-left:auto;font-size:12.5px;color:var(--mut)}
+.ops-live i{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.ops-live[data-state="reconnecting"] i{background:var(--warn)}
+.ops-live[data-state="unavailable"] i{background:var(--mut)}
 @media (max-width:820px){
 .pg{padding:16px}
 .nm,.sub{max-width:200px}

@@ -174,7 +174,10 @@ std::string render_exec_selected(const ExecSelectedView& v) {
     out.reserve(2048);
     out += "<div data-slot=\"selected\" data-execution-id=\"" + html_escape(e.id) +
            "\" data-execution-status=\"" + html_escape(e.status) + "\" data-confined=\"" +
-           (v.confined ? "1" : "0") + "\">";
+           (v.confined ? "1" : "0") + "\" data-def-name=\"" + html_escape(e.definition_name) +
+           "\" data-by=\"" + html_escape(e.dispatched_by) + "\" data-responded=\"" +
+           std::to_string(e.agents_responded) + "\" data-targeted=\"" +
+           std::to_string(e.agents_targeted) + "\">";
     out += "<div class=\"hd\"><h2>Selected execution</h2>" + pill(st) + "</div>";
     out += "<div class=\"kvl\">";
     out += "<div class=\"stack\"><span>Instruction</span><b class=\"l\">" +
