@@ -1218,9 +1218,69 @@ std::expected<FleetCompliance, PolicyReadError> PolicyStore::get_fleet_complianc
     return *fc;
 }
 
+std::expected<std::vector<ComplianceSummary>, PolicyReadError>
+PolicyStore::compliance_by_policy_checked() const {
+    if (!open_) {
+        spdlog::warn("PolicyStore::compliance_by_policy_checked: store not open");
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    {
+        std::lock_guard<std::mutex> lock(cache_mtx_);
+        if (by_policy_last_computed_.time_since_epoch().count() > 0 &&
+            (std::chrono::steady_clock::now() - by_policy_last_computed_) <
+                kFleetComplianceCacheTtl)
+            return cached_by_policy_;
+    }
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("PolicyStore::compliance_by_policy_checked: no connection in time ({})",
+                     pool_.last_error());
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT policy_id, status, COUNT(*) FROM policy_store.policy_status "
+        "GROUP BY policy_id, status ORDER BY policy_id",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("PolicyStore::compliance_by_policy_checked: query failed: {}",
+                     PQerrorMessage(lease.get()));
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    std::vector<ComplianceSummary> out;
+    for (int i = 0; i < PQntuples(res.get()); ++i) {
+        auto id = text_col(res.get(), i, 0);
+        if (out.empty() || out.back().policy_id != id) {
+            out.emplace_back();
+            out.back().policy_id = id;
+        }
+        auto& cs = out.back();
+        const auto status = text_col(res.get(), i, 1);
+        const auto count = to_i64(PQgetvalue(res.get(), i, 2));
+        if (status == "compliant")
+            cs.compliant = count;
+        else if (status == "non_compliant")
+            cs.non_compliant = count;
+        else if (status == "unknown")
+            cs.unknown = count;
+        else if (status == "fixing")
+            cs.fixing = count;
+        else if (status == "error")
+            cs.error = count;
+        cs.total += count;
+    }
+    {
+        std::lock_guard<std::mutex> lock(cache_mtx_);
+        cached_by_policy_ = out;
+        by_policy_last_computed_ = std::chrono::steady_clock::now();
+    }
+    return out;
+}
+
 void PolicyStore::invalidate_fleet_compliance_cache() const {
     std::lock_guard<std::mutex> lock(cache_mtx_);
     fleet_compliance_last_computed_ = {};
+    by_policy_last_computed_ = {};
 }
 
 // ── Cache invalidation ───────────────────────────────────────────────────────

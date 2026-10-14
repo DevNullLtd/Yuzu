@@ -11,9 +11,12 @@
 
 #include <yuzu/metrics.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -80,6 +83,13 @@ const std::vector<pg::PgMigration>& migrations() {
     return kMigrations;
 }
 
+bool ieq(std::string_view a, std::string_view b) {
+    return std::ranges::equal(a, b, [](char x, char y) {
+        return std::tolower(static_cast<unsigned char>(x)) ==
+               std::tolower(static_cast<unsigned char>(y));
+    });
+}
+
 std::int64_t to_i64(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0;
@@ -110,6 +120,26 @@ void record_presence_store_failure(yuzu::MetricsRegistry* metrics, std::string_v
 }
 
 } // namespace
+
+FleetPlatform fleet_platform_of(std::string_view os) {
+    if (ieq(os, "windows") || ieq(os, "win"))
+        return FleetPlatform::Windows;
+    if (ieq(os, "linux") || ieq(os, "lin"))
+        return FleetPlatform::Linux;
+    if (ieq(os, "darwin") || ieq(os, "macos") || ieq(os, "mac"))
+        return FleetPlatform::MacOs;
+    return FleetPlatform::Other;
+}
+
+FleetStatePartition partition_fleet_state(std::int64_t total, std::int64_t online,
+                                          std::int64_t stale) noexcept {
+    FleetStatePartition p;
+    total = std::max<std::int64_t>(total, 0);
+    p.online = std::clamp<std::int64_t>(online, 0, total);
+    p.not_seen = std::clamp<std::int64_t>(stale, 0, total - p.online);
+    p.offline = total - p.online - p.not_seen;
+    return p;
+}
 
 OfflineEndpointStore::OfflineEndpointStore(pg::PgPool& pool) : pool_(pool) {
     auto lease = pool_.acquire();
@@ -392,6 +422,50 @@ OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
         out.push_back(std::move(ep));
     }
     return out;
+}
+
+std::expected<FleetStateCounts, PresenceReadError>
+OfflineEndpointStore::fleet_state_counts(std::int64_t now_ms, std::chrono::seconds window,
+                                         std::chrono::milliseconds stale_after) {
+    if (!open_)
+        return std::unexpected(PresenceReadError::StoreUnavailable);
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("OfflineEndpointStore: fleet_state_counts failed, no connection in time ({})",
+                     pool_.last_error());
+        record_presence_store_failure(metrics_, "fleet_state_counts", /*had_lease=*/false);
+        return std::unexpected(PresenceReadError::StoreUnavailable);
+    }
+    const std::int64_t since = now_ms - static_cast<std::int64_t>(window.count()) * 1000;
+    const std::int64_t stale_before = now_ms - stale_after.count();
+
+    // One statement, one row per distinct lower(os) (a handful). The platform
+    // bucketing happens in fleet_platform_of so the SQL never restates the
+    // spelling list. Same window predicate as query_stale_within.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT lower(os), COUNT(*), COUNT(*) FILTER (WHERE last_heartbeat_ms < $2::bigint) "
+        "FROM endpoint_state.endpoints WHERE last_heartbeat_ms >= $1::bigint GROUP BY lower(os)",
+        std::vector<std::string>{std::to_string(since), std::to_string(stale_before)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("OfflineEndpointStore: fleet_state_counts failed: {}",
+                     PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "fleet_state_counts", /*had_lease=*/true);
+        return std::unexpected(PresenceReadError::DbError);
+    }
+    FleetStateCounts c;
+    for (int i = 0; i < PQntuples(res.get()); ++i) {
+        const std::int64_t n = to_i64(PQgetvalue(res.get(), i, 1));
+        c.total += n;
+        c.stale += to_i64(PQgetvalue(res.get(), i, 2));
+        switch (fleet_platform_of(PQgetvalue(res.get(), i, 0))) {
+            case FleetPlatform::Windows: c.windows += n; break;
+            case FleetPlatform::Linux: c.linux_os += n; break;
+            case FleetPlatform::MacOs: c.macos += n; break;
+            case FleetPlatform::Other: c.other += n; break;
+        }
+    }
+    return c;
 }
 
 } // namespace yuzu::server

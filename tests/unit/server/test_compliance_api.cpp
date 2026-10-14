@@ -239,6 +239,30 @@ TEST_CASE("ComplianceApi: fleet_compliance forwards to the store",
     CHECK(fc->non_compliant == 1);
 }
 
+TEST_CASE("ComplianceApi: compliance_by_policy forwards to the store",
+          "[pg][compliance_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, compliance_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    auto api = make_local_compliance_api(store);
+
+    auto frag = store.create_fragment(kFragmentWithFix);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-1", "compliant").has_value());
+    REQUIRE(store.update_agent_status(pol.value(), "agent-2", "non_compliant").has_value());
+
+    auto by = api->compliance_by_policy();
+    REQUIRE(by.has_value());
+    REQUIRE(by->size() == 1);
+    CHECK((*by)[0].policy_id == pol.value());
+    CHECK((*by)[0].compliant == 1);
+    CHECK((*by)[0].non_compliant == 1);
+}
+
 TEST_CASE("ComplianceApi: compliance_summary forwards to the store",
           "[pg][compliance_api]") {
     YUZU_REQUIRE_PG_DB_TPL(db, compliance_api_tpl);
@@ -326,6 +350,10 @@ TEST_CASE("ComplianceApi: a genuinely unreachable store degrades (kDegraded), ne
     auto fc = api->fleet_compliance();
     REQUIRE_FALSE(fc.has_value());
     CHECK(fc.error() == PolicyReadError::kDegraded);
+
+    auto by = api->compliance_by_policy();
+    REQUIRE_FALSE(by.has_value());
+    CHECK(by.error() == PolicyReadError::kDegraded);
 
     auto cs = api->compliance_summary("any-id");
     REQUIRE_FALSE(cs.has_value());

@@ -79,6 +79,126 @@ std::vector<OfflineEndpoint> stale_ok(OfflineEndpointStore& s, std::chrono::seco
 
 } // namespace
 
+using yuzu::server::FleetPlatform;
+using yuzu::server::fleet_platform_of;
+using yuzu::server::partition_fleet_state;
+
+TEST_CASE("fleet_platform_of puts every spelling in exactly one bucket", "[offline][fleet]") {
+    for (const char* os : {"windows", "Windows", "WIN", "win"})
+        CHECK(fleet_platform_of(os) == FleetPlatform::Windows);
+    for (const char* os : {"linux", "Linux", "lin"})
+        CHECK(fleet_platform_of(os) == FleetPlatform::Linux);
+    for (const char* os : {"darwin", "Darwin", "macos", "MacOS", "mac"})
+        CHECK(fleet_platform_of(os) == FleetPlatform::MacOs);
+    for (const char* os : {"freebsd", "?", "", "unknown", "windows server", "linuxish"})
+        CHECK(fleet_platform_of(os) == FleetPlatform::Other);
+}
+
+TEST_CASE("partition_fleet_state: segments always sum to the clamped total", "[offline][fleet]") {
+    auto sum = [](const yuzu::server::FleetStatePartition& p) {
+        return p.online + p.not_seen + p.offline;
+    };
+    SECTION("plain") {
+        auto p = partition_fleet_state(100, 60, 30);
+        CHECK(p.online == 60);
+        CHECK(p.not_seen == 30);
+        CHECK(p.offline == 10);
+    }
+    SECTION("online-and-stale overlap: stale is capped at what online leaves") {
+        // 10 rows, 8 online, 6 heartbeat-stale: at least 4 stale rows are
+        // online, so not_seen cannot exceed the 2 non-online rows.
+        auto p = partition_fleet_state(10, 8, 6);
+        CHECK(p.online == 8);
+        CHECK(p.not_seen == 2);
+        CHECK(p.offline == 0);
+        CHECK(sum(p) == 10);
+    }
+    SECTION("online above total clamps; nothing negative") {
+        auto p = partition_fleet_state(5, 9, 3);
+        CHECK(p.online == 5);
+        CHECK(p.not_seen == 0);
+        CHECK(p.offline == 0);
+    }
+    SECTION("negative and zero inputs") {
+        auto p = partition_fleet_state(-4, -1, -2);
+        CHECK(sum(p) == 0);
+        auto q = partition_fleet_state(7, -1, -2);
+        CHECK(q.online == 0);
+        CHECK(q.not_seen == 0);
+        CHECK(q.offline == 7);
+    }
+}
+
+TEST_CASE("OfflineEndpointStore fleet_state_counts tallies in SQL by window, stale and platform",
+          "[pg][offline][fleet]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    constexpr std::int64_t kNow = 1'800'000'000'000;
+    constexpr std::int64_t kHour = 3'600'000;
+    constexpr std::int64_t kDay = 24 * kHour;
+    const std::chrono::seconds window{30 * 24 * 3600};
+    const std::chrono::milliseconds stale_after{2 * kDay};
+
+    // fresh: win x2 (spellings), linux, darwin, freebsd (Other)
+    REQUIRE(store.upsert("w1", "h", "windows", kNow - kHour, 0));
+    REQUIRE(store.upsert("w2", "h", "WIN", kNow - kHour, 0));
+    REQUIRE(store.upsert("l1", "h", "linux", kNow - kHour, 0));
+    REQUIRE(store.upsert("m1", "h", "darwin", kNow - kHour, 0));
+    REQUIRE(store.upsert("o1", "h", "freebsd", kNow - kHour, 0));
+    // stale (older than 2 d, inside the 30 d window)
+    REQUIRE(store.upsert("l2", "h", "Linux", kNow - 3 * kDay, 0));
+    REQUIRE(store.upsert("b1", "h", "", kNow - 5 * kDay, 0));
+    // outside the window: must not be counted at all
+    REQUIRE(store.upsert("gone", "h", "linux", kNow - 40 * kDay, 0));
+
+    auto c = store.fleet_state_counts(kNow, window, stale_after);
+    REQUIRE(c.has_value());
+    CHECK(c->total == 7);
+    CHECK(c->stale == 2);
+    CHECK(c->windows == 2);
+    CHECK(c->linux_os == 2);
+    CHECK(c->macos == 1);
+    CHECK(c->other == 2);
+    CHECK(c->windows + c->linux_os + c->macos + c->other == c->total);
+}
+
+TEST_CASE("OfflineEndpointStore fleet_state_counts is an error, never a zero struct, when the "
+          "store cannot answer",
+          "[pg][offline][fleet]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore store{short_lock_pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto r = store.fleet_state_counts(1'800'000'000'000, std::chrono::hours(1),
+                                      std::chrono::milliseconds{1000});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == PresenceReadError::DbError);
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    CHECK(metrics
+              .counter("yuzu_server_agent_presence_store_failed_total",
+                       {{"op", "fleet_state_counts"}, {"reason", "db_error"}})
+              .value() == 1);
+}
+
 TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
