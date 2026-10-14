@@ -277,9 +277,7 @@ TEST_CASE("summary: TOP uses the SQL estate seam and never loads the roster", "[
     d.fleet_estate_fn = [&](std::int64_t now_ms) -> std::optional<EstateCounts> {
         ++estate_calls;
         CHECK(now_ms == 1'760'000'000LL * 1000);
-        auto c = partition_estate(250000, 240000, 5000);
-        c.windows = 250000;
-        return c;
+        return partition_estate(250000, 240000, 5000);
     };
     test::TestRouteSink sink;
     HomeRoutes r;
@@ -391,8 +389,8 @@ TEST_CASE("resolve_links falls back to today's pages and follows the nav when a 
 
 // ── pure roster tally ─────────────────────────────────────────────────────
 
-// Kills: a platform chip set that does not partition (F2) and double-counted states (F1).
-TEST_CASE("tally_roster partitions state and platform exactly", "[home][route]") {
+// Kills: double-counted states (F1): an online-and-stale row is online, once.
+TEST_CASE("tally_roster partitions state exactly", "[home][route]") {
     std::vector<InventoryDeviceRow> rows = {
         row("1", "windows", true),        row("2", "linux", true),
         row("3", "darwin", false),        row("4", "freebsd", false, true),
@@ -401,12 +399,7 @@ TEST_CASE("tally_roster partitions state and platform exactly", "[home][route]")
     const auto c = tally_roster(rows);
     CHECK(c.total == 6);
     CHECK(c.online + c.not_seen + c.offline == c.total);
-    CHECK(c.windows + c.linux_os + c.macos + c.other == c.total);
     CHECK(c.online == 3);
     CHECK(c.not_seen == 2);
     CHECK(c.offline == 1);
-    CHECK(c.windows == 2);
-    CHECK(c.linux_os == 1);
-    CHECK(c.macos == 1);
-    CHECK(c.other == 2);
 }

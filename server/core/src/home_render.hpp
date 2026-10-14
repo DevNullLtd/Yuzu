@@ -39,17 +39,12 @@ template <class T> struct Fact {
 
 // ── Figures ────────────────────────────────────────────────────────────────
 
-/// Device estate. `online + not_seen + offline == total` and
-/// `windows + linux_os + macos + other == total` always hold (partitions).
+/// Device estate. `online + not_seen + offline == total` always holds (a partition).
 struct EstateCounts {
     std::int64_t total{0};
     std::int64_t online{0};
     std::int64_t not_seen{0}; ///< not online, heartbeat older than the stale threshold
     std::int64_t offline{0};  ///< not online, heartbeat inside the stale threshold
-    std::int64_t windows{0};
-    std::int64_t linux_os{0};
-    std::int64_t macos{0};
-    std::int64_t other{0};
 };
 
 struct ComplianceFigure {
@@ -129,23 +124,13 @@ struct FailedRow {
 [[nodiscard]] FailedFigure failed_in_24h(const std::vector<FailedRow>& rows, std::int64_t now,
                                          std::size_t row_cap);
 
-/// Donut segment lengths along a circumference of `circumference_x100 / 100`.
-/// They sum exactly to the circumference; an all-zero input yields all zeros.
-struct DonutSegments {
-    std::int64_t len_x100[3]{0, 0, 0};
-};
-[[nodiscard]] DonutSegments donut_segments(std::int64_t a, std::int64_t b, std::int64_t c,
-                                           std::int64_t circumference_x100);
-
 // ── Renderers ──────────────────────────────────────────────────────────────
 
 /// The readout (four cells) as the main swap target `<section id="home-readout">`.
 [[nodiscard]] std::string render_readout(const SummaryView& v);
-/// Estate state panel, `<section id="home-estate" hx-swap-oob="outerHTML">`.
-[[nodiscard]] std::string render_estate(const SummaryView& v);
 /// Needs attention panel, `<section id="home-attention" hx-swap-oob="outerHTML">`.
 [[nodiscard]] std::string render_attention(const SummaryView& v);
-/// The whole `/fragments/home/summary` body: readout + both OOB panels.
+/// The whole `/fragments/home/summary` body: readout + the OOB attention panel.
 [[nodiscard]] std::string render_summary(const SummaryView& v);
 
 } // namespace yuzu::server::home

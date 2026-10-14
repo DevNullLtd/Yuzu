@@ -25,9 +25,6 @@ SummaryView all_ok() {
     SummaryView v;
     v.now_epoch = kNow;
     v.devices = Fact<EstateCounts>::make_ok(partition_estate(437, 412, 25));
-    v.devices.value.windows = 214;
-    v.devices.value.linux_os = 171;
-    v.devices.value.macos = 52;
     v.compliance = Fact<ComplianceFigure>::make_ok({4386, 4210, 100, 76, 96.0});
     v.failed = Fact<FailedFigure>::make_ok({14, CountBound::Exact, kNow - 840});
     v.approvals = Fact<ApprovalFigure>::make_ok({2, kNow - 360});
@@ -56,20 +53,6 @@ TEST_CASE("partition_estate: three segments always sum to the clamped total", "[
     const auto p = partition_estate(10, 10, 10);
     CHECK(p.online == 10);
     CHECK(p.not_seen == 0);
-}
-
-TEST_CASE("donut_segments: lengths sum exactly to the circumference", "[home][render]") {
-    const auto s = donut_segments(412, 13, 12, 33929);
-    CHECK(s.len_x100[0] + s.len_x100[1] + s.len_x100[2] == 33929);
-    // Zero total draws nothing (the track alone).
-    const auto z = donut_segments(0, 0, 0, 33929);
-    CHECK(z.len_x100[0] + z.len_x100[1] + z.len_x100[2] == 0);
-    // One device: its whole segment is the full circle.
-    const auto one = donut_segments(0, 1, 0, 33929);
-    CHECK(one.len_x100[1] == 33929);
-    // A one-device-in-a-thousand segment still sums exactly.
-    const auto t = donut_segments(999, 1, 0, 33929);
-    CHECK(t.len_x100[0] + t.len_x100[1] == 33929);
 }
 
 // ── failed executions ──────────────────────────────────────────────────────
@@ -189,45 +172,21 @@ TEST_CASE("readout: percent colour follows the 90/70 thresholds and never leaves
     CHECK_FALSE(has(none, "0%"));
 }
 
-// ── estate ────────────────────────────────────────────────────────────────
+// ── devices cell ──────────────────────────────────────────────────────────
 
-TEST_CASE("estate: donut and platform chips partition the total", "[home][render]") {
-    const std::string html = render_estate(all_ok());
-    CHECK(has(html, "id=\"home-estate\""));
-    CHECK(has(html, "hx-swap-oob=\"outerHTML\""));
-    CHECK(has(html, "<svg class=\"home-donut\""));
-    CHECK(has(html, "role=\"img\""));
-    CHECK(has(html, "<title>Estate state: 412 online"));
-    CHECK(has(html, "Not seen for 2 days or more"));
-    CHECK(has(html, "As of 08:53 UTC"));
-    CHECK(has(html, "Windows<b>214</b>"));
-    CHECK(has(html, "Linux<b>171</b>"));
-    CHECK(has(html, "macOS<b>52</b>"));
-    // "Other" appears only when non-zero.
-    CHECK_FALSE(has(html, "Other<b>"));
-}
-
-TEST_CASE("estate: an Other chip appears when an unknown platform exists", "[home][render]") {
-    SummaryView v = all_ok();
-    v.devices.value.windows = 200;
-    v.devices.value.other = 14;
-    CHECK(has(render_estate(v), "Other<b>14</b>"));
-}
-
-TEST_CASE("estate: empty fleet and each failure state read differently", "[home][render]") {
+TEST_CASE("devices cell: empty fleet and each failure state read differently", "[home][render]") {
     SummaryView v = all_ok();
     v.devices = Fact<EstateCounts>::make_ok(EstateCounts{});
-    const std::string empty = render_estate(v);
+    const std::string empty = render_readout(v);
     CHECK(has(empty, "No devices have reported in the last 30 days."));
-    CHECK_FALSE(has(empty, "<svg"));
 
     v.devices = Fact<EstateCounts>::with(FactState::Unavailable);
-    const std::string bad = render_estate(v);
+    const std::string bad = render_readout(v);
     CHECK(has(bad, "Could not read The device roster. This is not zero."));
     CHECK_FALSE(has(bad, "No devices have reported"));
 
     v.devices = Fact<EstateCounts>::with(FactState::Unwired);
-    const std::string unwired = render_estate(v);
+    const std::string unwired = render_readout(v);
     CHECK(has(unwired, "is not available on this server. This is not zero."));
     CHECK_FALSE(has(unwired, "No devices have reported"));
 }

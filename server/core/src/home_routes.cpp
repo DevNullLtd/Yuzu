@@ -4,7 +4,6 @@
 #include "home_routes.hpp"
 
 #include "authz_model.hpp"
-#include "hardware_list_model.hpp" // hw_row_matches: the Hardware list's own platform aliases
 #include "home_ui.hpp"
 
 #include <string>
@@ -113,15 +112,6 @@ EstateCounts tally_roster(const std::vector<InventoryDeviceRow>& rows) {
             ++c.not_seen;
         else
             ++c.offline;
-        // The Hardware list's own os aliases (windows|win, linux|lin, darwin|macos|mac).
-        if (hw_row_matches(r, {}, "windows", "all", ""))
-            ++c.windows;
-        else if (hw_row_matches(r, {}, "linux", "all", ""))
-            ++c.linux_os;
-        else if (hw_row_matches(r, {}, "macos", "all", ""))
-            ++c.macos;
-        else
-            ++c.other;
     }
     return c;
 }

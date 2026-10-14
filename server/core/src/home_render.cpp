@@ -19,8 +19,6 @@ namespace {
 std::string esc(const std::string& s) { return html_escape(s); }
 
 constexpr std::int64_t kDay = 24 * 60 * 60;
-/// Donut geometry: r = 54, circumference 2*pi*54 = 339.29 (x100 as integer).
-constexpr std::int64_t kCircumferenceX100 = 33929;
 
 std::string plural(std::int64_t n, const char* one, const char* many) {
     return n == 1 ? std::string(one) : std::string(many);
@@ -110,6 +108,8 @@ std::string devices_cell(const SummaryView& v) {
         return cell("", state_headline(f), "Devices online", state_sentence(f, "The device roster"),
                     "wn");
     const auto& c = f.value;
+    if (c.total == 0)
+        return cell("", "0", "No devices have reported in the last 30 days.", "");
     std::string label = "of " + fmt_int(c.total) + " seen in the last 30 days";
     std::string d;
     if (c.not_seen > 0)
@@ -163,65 +163,6 @@ std::string approvals_cell(const SummaryView& v) {
     if (c.oldest && *c.oldest > 0)
         d = "oldest submitted " + format_relative_time(*c.oldest, v.now_epoch);
     return cell("", fmt_int(c.count), "Approvals waiting", d, "wn");
-}
-
-// ── Estate ────────────────────────────────────────────────────────────────
-
-std::string donut_svg(const EstateCounts& c) {
-    const auto seg = donut_segments(c.online, c.offline, c.not_seen, kCircumferenceX100);
-    const std::string aria =
-        "Estate state: " + fmt_int(c.online) + " online, " + fmt_int(c.offline) + " offline, " +
-        fmt_int(c.not_seen) + " not seen for 2 days or more, of " + fmt_int(c.total) + " devices";
-    std::string out = "<svg class=\"home-donut\" viewBox=\"0 0 140 140\" role=\"img\" aria-label=\"" +
-                      esc(aria) + "\"><title>" + esc(aria) + "</title>";
-    out += "<circle class=\"home-track\" cx=\"70\" cy=\"70\" r=\"54\" fill=\"none\"/>";
-    static constexpr const char* kCls[3] = {"home-s-on", "home-s-off", "home-s-ns"};
-    static constexpr const char* kName[3] = {"Online", "Offline", "Not seen for 2 days or more"};
-    const std::int64_t vals[3] = {c.online, c.offline, c.not_seen};
-    std::int64_t offset = 0;
-    for (int i = 0; i < 3; ++i) {
-        const std::int64_t len = seg.len_x100[i];
-        if (len <= 0)
-            continue;
-        out += std::format(
-            "<circle class=\"{}\" cx=\"70\" cy=\"70\" r=\"54\" fill=\"none\" "
-            "stroke-dasharray=\"{}.{:02} {}.{:02}\" stroke-dashoffset=\"-{}.{:02}\" "
-            "transform=\"rotate(-90 70 70)\"><title>{}: {}</title></circle>",
-            kCls[i], len / 100, len % 100, (kCircumferenceX100 - len) / 100,
-            (kCircumferenceX100 - len) % 100, offset / 100, offset % 100, kName[i],
-            fmt_int(vals[i]));
-        offset += len;
-    }
-    out += "</svg>";
-    return out;
-}
-
-std::string platform_bar(const EstateCounts& c) {
-    struct Seg { const char* cls; const char* name; std::int64_t n; };
-    const Seg segs[] = {{"home-p-win", "Windows", c.windows},
-                        {"home-p-lin", "Linux", c.linux_os},
-                        {"home-p-mac", "macOS", c.macos},
-                        {"home-p-oth", "Other", c.other}};
-    std::string out = "<div class=\"home-sbar\" role=\"img\" aria-label=\"Devices by platform\">";
-    if (c.total > 0) {
-        for (const auto& s : segs) {
-            if (s.n <= 0)
-                continue;
-            const int w = clamp_pct(100.0 * static_cast<double>(s.n) / static_cast<double>(c.total));
-            out += std::format("<i class=\"{}\" style=\"width:{}%\" title=\"{}: {}\"></i>", s.cls, w,
-                               s.name, fmt_int(s.n));
-        }
-    }
-    out += "</div><div class=\"legend\">";
-    for (const auto& s : segs) {
-        // "Other" appears only when non-zero; the three named platforms always show.
-        if (s.n <= 0 && std::string_view(s.name) == "Other")
-            continue;
-        out += std::format("<span class=\"chip\"><i class=\"{}\"></i>{}<b>{}</b></span>", s.cls,
-                           s.name, fmt_int(s.n));
-    }
-    out += "</div>";
-    return out;
 }
 
 // ── Needs attention ───────────────────────────────────────────────────────
@@ -309,30 +250,6 @@ FailedFigure failed_in_24h(const std::vector<FailedRow>& rows, std::int64_t now,
     return f;
 }
 
-DonutSegments donut_segments(std::int64_t a, std::int64_t b, std::int64_t c,
-                             std::int64_t circumference_x100) {
-    DonutSegments s;
-    const std::int64_t in[3] = {std::max<std::int64_t>(a, 0), std::max<std::int64_t>(b, 0),
-                                std::max<std::int64_t>(c, 0)};
-    const std::int64_t total = in[0] + in[1] + in[2];
-    if (total <= 0 || circumference_x100 <= 0)
-        return s;
-    std::int64_t used = 0;
-    int last = 0;
-    for (int i = 0; i < 3; ++i)
-        if (in[i] > 0)
-            last = i;
-    for (int i = 0; i < 3; ++i) {
-        if (in[i] <= 0)
-            continue;
-        const std::int64_t len = (i == last) ? circumference_x100 - used
-                                             : circumference_x100 * in[i] / total;
-        s.len_x100[i] = len;
-        used += len;
-    }
-    return s;
-}
-
 // ── Renderers ──────────────────────────────────────────────────────────────
 
 std::string render_readout(const SummaryView& v) {
@@ -342,30 +259,6 @@ std::string render_readout(const SummaryView& v) {
     out += failed_cell(v);
     out += approvals_cell(v);
     out += "</section>";
-    return out;
-}
-
-std::string render_estate(const SummaryView& v) {
-    std::string out = panel_open("home-estate", "Estate state", "", v.now_epoch, true);
-    out += "<div class=\"pb\">";
-    const auto& f = v.devices;
-    if (!f.ok()) {
-        out += note(state_sentence(f, "The device roster"), f.state != FactState::Denied);
-    } else if (f.value.total == 0) {
-        out += "<p class=\"mut\">No devices have reported in the last 30 days.</p>";
-    } else {
-        const auto& c = f.value;
-        out += "<div class=\"home-estate\">" + donut_svg(c);
-        out += "<div class=\"home-donut-c\"><b>" + fmt_int(c.total) + "</b><span>devices</span></div>";
-        out += "<div class=\"legend home-legend\">";
-        out += "<span><i class=\"home-s-on\"></i>Online<b>" + fmt_int(c.online) + "</b></span>";
-        out += "<span><i class=\"home-s-off\"></i>Offline<b>" + fmt_int(c.offline) + "</b></span>";
-        out += "<span><i class=\"home-s-ns\"></i>Not seen for 2 days or more<b>" +
-               fmt_int(c.not_seen) + "</b></span>";
-        out += "</div></div>";
-        out += "<h3 class=\"home-sub\">By platform</h3>" + platform_bar(c);
-    }
-    out += "</div></section>";
     return out;
 }
 
@@ -460,7 +353,7 @@ std::string render_attention(const SummaryView& v) {
 }
 
 std::string render_summary(const SummaryView& v) {
-    return render_readout(v) + render_estate(v) + render_attention(v);
+    return render_readout(v) + render_attention(v);
 }
 
 } // namespace yuzu::server::home

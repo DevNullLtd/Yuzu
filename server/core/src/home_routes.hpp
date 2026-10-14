@@ -85,8 +85,7 @@ struct Deps {
 /// fallback, so Home merges before or after the pages that own those links.
 [[nodiscard]] Links resolve_links(std::span<const yuzu::server::shell::NavGroup> groups);
 
-/// Platform/state tally over a scoped roster slice. The three platform chips plus
-/// "other" and the three state segments each partition the total.
+/// State tally over a scoped roster slice: the three segments partition the total.
 [[nodiscard]] EstateCounts tally_roster(const std::vector<InventoryDeviceRow>& rows);
 
 class HomeRoutes {
