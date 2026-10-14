@@ -1917,7 +1917,7 @@ std::string SettingsRoutes::render_pending_fragment() {
             if (a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id)) {
                 // The id is empty, `.` or `..`: a browser collapses a dot-only
                 // path segment, so no per-row URL can be built for it. Offer no
-                // row action (the bulk buttons below still cover the queue).
+                // row action (the bulk buttons below act on the whole queue and show for it).
                 html += "<span class=\"muted\">identifier not supported for row actions</span>";
             } else if (a.status == auth::PendingStatus::pending) {
                 // The id is agent-supplied: percent-encode it as ONE path segment
@@ -1958,7 +1958,13 @@ std::string SettingsRoutes::render_pending_fragment() {
     auto pending_count = std::count_if(agents.begin(), agents.end(), [](const auto& a) {
         return a.status == auth::PendingStatus::pending;
     });
-    if (pending_count > 1) {
+    // The bulk bar also shows for a lone pending row whose id cannot be addressed
+    // per-row, so such a row is never left with no action at all.
+    const bool has_unaddressable_pending =
+        std::any_of(agents.begin(), agents.end(), [](const auto& a) {
+            return a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id);
+        });
+    if (pending_count > 1 || (pending_count == 1 && has_unaddressable_pending)) {
         html += "<div style=\"margin-top:0.75rem;display:flex;gap:0.5rem\">"
                 "<button class=\"btn btn-primary\" "
                 "onclick=\"twoClickConfirm(this, function() { "

@@ -2581,8 +2581,9 @@ env keys with defaults, which a reverted build ignores.
   until a real RPC or probe decides. Every other status still counts as a failure
   (1, 2, 4, 7, 8, 10, 12, 13, 14, 15, 16), as does every transport error, HTTP
   level error and exception out of the client. Not mirrored at the edge: an agent
-  id of 1 to 256 bytes that holds a control character or a comma is refused by the
-  server (`INVALID_ARGUMENT`, before enrolment) and reaches it, one upstream
+  id of 1 to 256 bytes that holds a control character, a comma, or (for an id the server
+  has not seen before) any character outside letters, digits, `.`, `_`, `:` and `-`, is refused by the
+  server (`INVALID_ARGUMENT`, before enrolment; the agent sees it wrapped in `INTERNAL`) and reaches it, one upstream
   call per request; the classification means it cannot open the breaker, and its
   gateway log lines are rate limited. The two signals for an edge refusal are the
   counter `yuzu_gw_register_refused_total{reason="agent_id_length"}` (every

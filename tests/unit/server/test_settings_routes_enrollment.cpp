@@ -490,12 +490,15 @@ TEST_CASE("settings pending: an empty-looking dot-only agent id gets no row acti
         auto a = h.sink.Post("/api/settings/pending-agents/" + seg + "/approve", "", kForm);
         REQUIRE(a);
         CHECK(a->status == 400);
+        CHECK(h.only("enrollment.approve").result == "denied");
         auto d = h.sink.Post("/api/settings/pending-agents/" + seg + "/deny", "", kForm);
         REQUIRE(d);
         CHECK(d->status == 400);
+        CHECK(h.only("enrollment.deny").result == "denied");
         auto r = h.sink.Delete("/api/settings/pending-agents/" + seg);
         REQUIRE(r);
         CHECK(r->status == 400);
+        CHECK(h.only("enrollment.remove").result == "denied");
         CHECK(h.status_of(seg) == auth::PendingStatus::pending);
     }
 }

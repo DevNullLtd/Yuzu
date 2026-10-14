@@ -1255,7 +1255,8 @@ TEST_CASE("Register: a comma or control byte in an id is still refused by the st
         auto req = make_plain_register(id);
         apb::RegisterResponse resp;
         auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
-        CHECK((!status.ok() || !resp.accepted()));
+        CHECK_FALSE(status.ok());
+        CHECK_FALSE(resp.accepted());
     }
 }
 
