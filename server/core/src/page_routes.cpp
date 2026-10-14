@@ -155,6 +155,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/static/yuzu-operate-extras.js", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuOperateExtrasJs, "application/javascript; charset=utf-8");
+    });
     // Hardware record tag / property controls; moves with the lens markup, so never cached.
     sink.Get("/static/yuzu-device-data.js", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
