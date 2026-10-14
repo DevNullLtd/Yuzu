@@ -780,7 +780,7 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
         std::vector<std::string> targets;
         targets.reserve(rows->size());
         for (const auto& d : *rows) {
-            std::string label;
+            std::string label = preflight_store_ ? std::string{} : std::string("Unavailable");
             if (preflight_store_) {
                 auto run = preflight_store_->get_run_checked(d.source_run_id, session->username);
                 if (!run)

@@ -7923,7 +7923,7 @@ row. It does not read the shelved `/software-deployments` store below. MCP twin:
 
 | Name | In | Required | Description |
 |---|---|---|---|
-| `limit` | query | No | Max deployments to return (default 20; a parseable value outside 1..100 is clamped, a non-numeric one is `400`) |
+| `limit` | query | No | Max deployments to return (default 20; a parseable value outside 1..100 is clamped, a non-numeric one, or one too large for a 64-bit integer, is `400`) |
 
 **Response:**
 
@@ -7959,7 +7959,7 @@ engine advance, which only happens while a Deployments page is open, so a `runni
 
 | Condition | Response |
 |---|---|
-| `limit` is not an integer | `400` |
+| `limit` is not an integer (or does not fit 64 bits) | `400` |
 | A service-scoped API token | `403`, audited under `deployment.list.view` |
 | Deployment run store never configured on this server | `503` (A4 envelope, no `retry_after_ms`) |
 | Deployment run store degraded (transient) | `503` (A4 envelope, `retry_after_ms: 2000`) — never an empty list |
@@ -8013,7 +8013,7 @@ in `error`.
 
 | Condition | Response |
 |---|---|
-| `limit` is not an integer | `400` |
+| `limit` is not an integer (or does not fit 64 bits) | `400` |
 | A service-scoped API token | `403`, audited under `deployment.detail.view` |
 | No such deployment, or it belongs to another operator | `404` — indistinguishable by design |
 | Store never configured / degraded | `503` as for the list |

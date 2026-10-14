@@ -258,8 +258,8 @@ they never create a run or a deployment.
 - `GET /api/v1/deployments` and `GET /api/v1/deployments/{id}` / MCP `list_deployments` and
   `get_deployment` — your deployments and one deployment's device grid, gated
   `SoftwareDeployment:Read`. These are the read-only way to see a rollout: unlike the page's
-  result poll (`/fragments/auto/deploy/result`) they never advance the engine and write no audit row
-  per read. A deployment shows **Running** or **Complete**; a finished one says how many devices
+  result poll (`/fragments/auto/deploy/result`) they never advance the engine and write no per-poll audit row
+  (the REST reads are unaudited; an MCP call records the generic `mcp.<tool>` success row). A deployment shows **Running** or **Complete**; a finished one says how many devices
   failed or were skipped ("Complete, 2 failed"). There is no staged, cancelled or rolled-back state
   in this pipeline. The installer URL and arguments are never shown, only whether arguments are set.
   A service-scoped token is denied under `deployment.list.view` / `deployment.detail.view`.
