@@ -442,19 +442,13 @@ fi
 # refused by the gate (a token is not an ambient credential). The cookie-session
 # counterpart, which must be refused, is in section 10.
 if [[ -n "$API_TOKEN" ]]; then
-    GATE_BODY=$(curl -s -m 10 -X POST -H "Authorization: Bearer $API_TOKEN" \
-        -H "Content-Type: application/json" \
+    GATE_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" -X POST \
+        -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
         -d "{\"name\":\"e2e-gate-token-instr\",\"plugin\":\"os_info\",\"action\":\"os_name\",\"type\":\"question\"}" \
-        "$SERVER_URL/api/instructions" 2>/dev/null) || GATE_BODY=""
-    TESTS=$((TESTS + 1))
-    if [[ -z "$GATE_BODY" ]]; then
-        fail "bearer-token POST /api/instructions without Origin: no response"
-    elif grep -qF -- "cross-site request refused" <<< "$GATE_BODY"; then
-        fail "bearer-token POST /api/instructions without Origin was refused by the same-site gate"
-    else
-        pass "bearer-token POST /api/instructions without Origin is not refused by the same-site gate"
-    fi
-    GATE_ID=$(extract_json_field "id" "$GATE_BODY")
+        "$SERVER_URL/api/instructions" 2>/dev/null) || GATE_STATUS="000"
+    assert_status_any "bearer-token POST /api/instructions without Origin is not refused by the same-site gate" \
+        "$GATE_STATUS" 200 201 400 503
+    GATE_ID=$(extract_json_field "id" "$(cat "$RESP_BODY")")
     [[ -n "$GATE_ID" ]] && http_delete "$SERVER_URL/api/instructions/$GATE_ID"
 fi
 
