@@ -154,10 +154,12 @@ if [ "$FULL" = "--full" ]; then
         BUILDDIR="build-linux"
     fi
 
-    # Erlang toolchain — required by both the standalone rebar3 step and the
-    # gateway custom_target inside meson, so it must be on PATH before the C++
-    # compile too. ensure-erlang.sh probes kerl, asdf, Homebrew, and the MSYS2
-    # installer paths in turn; it always returns 0, so we verify with command -v.
+    # Erlang toolchain for the standalone rebar3 step below (the Meson gateway
+    # target resolves the pinned OTP itself at configure). ensure-erlang.sh
+    # asks scripts/erlang_toolchain.py find-otp and activates what it picks; it
+    # always returns 0, and leaves PATH unchanged when nothing passes the pin,
+    # so `command -v erl` below only checks presence - the floor is enforced by
+    # the helper's activation, not by this check.
     # The explicit "" arg is load-bearing: a sourced script inherits the
     # caller's positional args, so without it the helper would receive "$1"
     # from THIS script (e.g. "v0.10.0") as its version. "" selects the pinned

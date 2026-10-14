@@ -10,7 +10,7 @@
 #   source scripts/ensure-erlang.sh           # default: erlang_toolchain.py's floor (28.4 => 28.4 or any later 28.x)
 #   source scripts/ensure-erlang.sh 28        # any 28.x
 #   source scripts/ensure-erlang.sh 28.4.2    # 28.4.2 or any later 28.x (never 29)
-#   command -v erl >/dev/null || { echo "Erlang/OTP missing" >&2; exit 1; }
+#   python3 scripts/erlang_toolchain.py find-otp >/dev/null || { echo "no Erlang/OTP passing the pin" >&2; exit 1; }
 #
 # This script:
 #   - Is a no-op if `erl` is already on PATH, runs, AND passes the pin.
@@ -61,7 +61,7 @@ _yz_desired_erlang="${1:-${YUZU_OTP_VERSION:-$_yz_pin_default}}"
 # Digits and dots only (the same rule as erlang_toolchain.py); anything else
 # falls back to the pinned default, never to something looser.
 case "$_yz_desired_erlang" in
-    ''|*[!0-9.]*|.*|*.)
+    ''|*[!0-9.]*|.*|*.|*..*)
         echo "[ensure-erlang] invalid version '$_yz_desired_erlang' - using the pinned default $_yz_pin_default" >&2
         _yz_desired_erlang="$_yz_pin_default"
         ;;
@@ -77,8 +77,22 @@ _yz_uname=$(uname -s 2>/dev/null || echo unknown)
 # missing libs, wrong-arch binaries.
 # Bounded where `timeout` exists (GNU coreutils: Linux, MSYS2; not stock
 # macOS), so a wedged erl cannot hang the caller's shell indefinitely there.
+# On MSYS2 the runners put C:\Windows\System32 before /usr/bin, so a bare
+# `timeout`/`sort` can be timeout.exe/sort.exe: call the GNU ones by path.
+# Stock macOS has no `timeout`; perl's alarm bounds the probe there.
+if [ -x /usr/bin/timeout ]; then _yz_timeout=/usr/bin/timeout
+elif command -v timeout >/dev/null 2>&1; then _yz_timeout=timeout
+else _yz_timeout=""
+fi
+if [ -x /usr/bin/sort ]; then _yz_sort=/usr/bin/sort; else _yz_sort=sort; fi
 _yz_bounded() {
-    if command -v timeout >/dev/null 2>&1; then timeout 30 "$@"; else "$@"; fi
+    if [ -n "$_yz_timeout" ]; then
+        "$_yz_timeout" 30 "$@"
+    elif command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm 30; exec @ARGV or exit 127' "$@"
+    else
+        "$@"
+    fi
 }
 
 _yz_have_erl() {
@@ -98,7 +112,7 @@ _yz_erl_version() {
 _yz_version_ok() {
     [ -n "$1" ] || return 1
     [ "${1%%.*}" = "${_yz_desired_erlang%%.*}" ] || return 1
-    [ "$(printf '%s\n%s\n' "$_yz_desired_erlang" "$1" | sort -V | head -n1)" = "$_yz_desired_erlang" ]
+    [ "$(printf '%s\n%s\n' "$_yz_desired_erlang" "$1" | "$_yz_sort" -V | head -n1)" = "$_yz_desired_erlang" ]
 }
 
 # A working erl of the desired version is first on PATH. Every probe below is
@@ -134,7 +148,8 @@ _yz_cleanup() {
           _yz_brew_prefix _yz_win_match _yz_win_bindir _yz_root _yz_cand \
           _yz_ver _yz_prev_nullglob _yz_uname _yz_orig_path _yz_vf \
           _yz_path_ver _yz_kerl_dir _yz_kerl_best _yz_kerl_best_ver _yz_brew_f \
-          _yz_script_dir _yz_pin_default _yz_pykind _yz_out _yz_rc _yz_bin
+          _yz_script_dir _yz_pin_default _yz_pykind _yz_out _yz_rc _yz_bin \
+          _yz_timeout _yz_sort
     unset -f _yz_log _yz_have_erl _yz_erl_version _yz_version_ok _yz_erl_ok \
              _yz_dir_otp_version _yz_bounded _yz_run_py _yz_cleanup
 }
@@ -187,13 +202,16 @@ if [ -n "$_yz_pykind" ] && [ -f "$_yz_script_dir/erlang_toolchain.py" ]; then
     _yz_rc=0
     _yz_out=$(_yz_run_py "$_yz_script_dir/erlang_toolchain.py" find-otp --version "$_yz_desired_erlang") || _yz_rc=$?
     if [ "$_yz_rc" -eq 0 ]; then
-        _yz_bin=$(printf '%s\n' "$_yz_out" | head -n1) || _yz_bin=""
+        _yz_bin=$(printf '%s\n' "$_yz_out" | head -n1 | tr -d '\r') || _yz_bin=""
         case "$_yz_uname" in
             MINGW*|MSYS*|CYGWIN*) _yz_bin=$(cygpath -u "$_yz_bin" 2>/dev/null) || true ;;
         esac
         if [ -n "$_yz_bin" ]; then
             export PATH="$_yz_bin:$PATH"
-            if _yz_erl_ok; then
+            # rc 0 means the resolver already checked the version with its own
+            # rule; re-checking here with sort -V could disagree on edge cases
+            # (28.4 vs a 28.4.0 pin) and silently undo a valid pick.
+            if _yz_have_erl && [ "$(command -v erl)" = "$_yz_bin/erl" -o "$(command -v erl)" = "$_yz_bin/erl.exe" ]; then
                 _yz_log "activated Erlang/OTP from $_yz_bin (scripts/erlang_toolchain.py find-otp)"
                 _yz_activated="resolver"
             else
@@ -226,7 +244,7 @@ for _yz_kerl_dir in \
     _yz_ver=$(_yz_dir_otp_version "$_yz_kerl_dir") || continue
     _yz_version_ok "$_yz_ver" || continue
     if [ -z "$_yz_kerl_best_ver" ] || \
-       [ "$(printf '%s\n%s\n' "$_yz_kerl_best_ver" "$_yz_ver" | sort -V | tail -n1)" = "$_yz_ver" ]; then
+       [ "$(printf '%s\n%s\n' "$_yz_kerl_best_ver" "$_yz_ver" | "$_yz_sort" -V | tail -n1)" = "$_yz_ver" ]; then
         _yz_kerl_best="$_yz_kerl_dir"
         _yz_kerl_best_ver="$_yz_ver"
     fi
@@ -263,7 +281,7 @@ fi
 if [ -z "$_yz_activated" ] && command -v asdf >/dev/null 2>&1; then
     _yz_asdf_erl=$(asdf which erl 2>/dev/null || true)
     if [ -z "$_yz_asdf_erl" ]; then
-        _yz_asdf_erl=$(asdf where erlang 2>/dev/null)/bin/erl
+        _yz_asdf_erl="$(asdf where erlang 2>/dev/null || true)/bin/erl"
     fi
     if [ -n "$_yz_asdf_erl" ] && [ -x "$_yz_asdf_erl" ]; then
         export PATH="$(dirname "$_yz_asdf_erl"):$PATH"
@@ -314,7 +332,7 @@ if [ -z "$_yz_activated" ]; then
                         _yz_cand="$_yz_root/Erlang OTP/bin/erl.exe"
                         [ -f "$_yz_cand" ] && printf '0.0.0\t%s\n' "$_yz_cand"
                     done
-                } | sort -V | tail -n1 | cut -f2-
+                } | "$_yz_sort" -V | tail -n1 | cut -f2- || true
             )
 
             eval "$_yz_prev_nullglob"
@@ -334,9 +352,13 @@ fi
 if [ -z "$_yz_activated" ] || [ "$_yz_activated" = "none" ]; then
     # Roll back any half-applied PATH mutations from failed probes.
     PATH="$_yz_orig_path"
-    _yz_log "Erlang/OTP $_yz_desired_erlang not found (kerl, asdf, Homebrew and installer paths searched)."
-    _yz_log "PATH is unchanged: the gateway build will fail or use the wrong OTP until it is installed."
-    _yz_log "See every install found, with its version: python3 scripts/erlang_toolchain.py find-otp"
+    _yz_log "no Erlang/OTP $_yz_desired_erlang or later ${_yz_desired_erlang%%.*}.x found."
+    _yz_log "PATH is unchanged, so the erl on it (if any) is not the pinned release; a Meson build skips the gateway with a warning until one is installed."
+    case "$_yz_pykind" in
+        py) _yz_log "Every install found, with its version: py -3 $_yz_script_dir/erlang_toolchain.py find-otp" ;;
+        "") _yz_log "Every install found, with its version: run $_yz_script_dir/erlang_toolchain.py find-otp with Python 3" ;;
+        *)  _yz_log "Every install found, with its version: $_yz_pykind $_yz_script_dir/erlang_toolchain.py find-otp" ;;
+    esac
     _yz_log "Install options:"
     _yz_log "  - kerl:    https://github.com/kerl/kerl"
     _yz_log "  - asdf:    asdf plugin add erlang && asdf install erlang $_yz_desired_erlang"

@@ -110,7 +110,9 @@ def _release_otp_version(root):
         return _read_text(files[0])
     if len(files) > 1:
         parts = _read_text(os.path.join(root, "releases", "start_erl.data")).split()
-        if len(parts) == 2:
+        # The release name is a bare OTP major ("28"); anything else (a relx
+        # app release, a "../" path) is not trusted to name a directory.
+        if len(parts) == 2 and re.fullmatch(r"\d+", parts[1]):
             live = os.path.join(root, "releases", parts[1], "OTP_VERSION")
             if os.path.isfile(live):
                 return _read_text(live)
@@ -544,7 +546,9 @@ def main(argv=None):
     """`erlang_toolchain.py find-otp [--version V]`
 
     Exit codes (Meson relies on them, so keep them distinct):
-      0  found: prints three lines (bin dir, full version, where it was found)
+      0  found: prints four lines (bin dir, full version, where it was found,
+         the pin it was checked against - Meson passes that pin to the
+         targets so a build re-checks against the CONFIGURED pin)
       1  no install passes the pin: lists every install inspected on stderr,
          so the operator sees why (e.g. "PATH: /opt/homebrew/bin -> 29.1.1")
       2  usage error
@@ -581,6 +585,7 @@ def _main(argv):
         print(bin_dir)
         print(version)
         print(source)
+        print(wanted)
         return EXIT_FOUND
     sys.stderr.write(f"erlang_toolchain: no Erlang/OTP {wanted} or later {major}.x found.\n")
     sys.stderr.write("  inspected:\n" + "".join(f"    {r}\n" for r in report) if report

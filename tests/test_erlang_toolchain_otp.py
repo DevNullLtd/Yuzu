@@ -209,20 +209,65 @@ class OtpPinTests(unittest.TestCase):
         self.assertEqual(et.wanted_otp_version(), "92.7")
         self.assertEqual(et.find_otp()[0], kerl_bin)
 
+    # A fake Windows filesystem: an attacker-planted C:\Erlang (any user can
+    # create it) beside a real C:\Program Files\Erlang OTP. glob answers
+    # every pattern against it, so a C:\Erlang re-added in literal OR glob
+    # form would be found - the test cannot pass vacuously.
+    WIN_FILES = {
+        "c:\\erlang\\bin\\erl.exe",
+        "c:\\erlang\\erts-16.3\\bin\\escript.exe",
+        "c:\\program files\\erlang otp\\bin\\erl.exe",
+        "c:\\program files\\erlang otp\\erts-16.3\\bin\\escript.exe",
+        "c:\\tools\\rebar3\\rebar3",
+    }
+
+    def _win_fs(self):
+        import fnmatch
+        dirs = {"c:\\erlang", "c:\\program files\\erlang otp"}
+
+        def norm(p):
+            return p.replace("/", "\\").lower()
+
+        def isfile(p):
+            return norm(p) in self.WIN_FILES
+
+        def glob_(pattern):
+            pat = norm(pattern)
+            return sorted(x for x in (self.WIN_FILES | dirs) if fnmatch.fnmatch(x, pat))
+
+        return (mock.patch.object(et.sys, "platform", "win32"),
+                mock.patch.object(et.shutil, "which", return_value=None),
+                mock.patch.object(et.os.path, "isfile", side_effect=isfile),
+                mock.patch.object(et.glob, "glob", side_effect=glob_))
+
     def test_c_erlang_is_never_a_windows_candidate(self):
         # Any authenticated Windows user can create C:\Erlang; the runners build
         # as LOCAL SYSTEM. It must not be scanned (only an explicit choice).
-        real_isfile = os.path.isfile
-
-        def isfile(p):
-            return p.replace("/", "\\").lower().startswith("c:\\erlang\\") or real_isfile(p)
-
-        with mock.patch.object(et.sys, "platform", "win32"), \
-                mock.patch.object(et.shutil, "which", return_value=None), \
-                mock.patch.object(et.os.path, "isfile", side_effect=isfile), \
-                mock.patch.object(et.glob, "glob", return_value=[]):
+        p1, p2, p3, p4 = self._win_fs()
+        with p1, p2, p3, p4:
             dirs = [d.replace("/", "\\").lower() for _, d in et.otp_candidates()]
-        self.assertFalse(any("c:\\erlang" in d and "program files" not in d for d in dirs), dirs)
+        # (On a POSIX test host abspath prefixes the fake C:\ paths with the
+        # cwd, so match on the tail.)
+        self.assertTrue(any(d.endswith("c:\\program files\\erlang otp\\bin") for d in dirs),
+                        dirs)  # the scan works...
+        self.assertFalse(any("c:\\erlang\\" in d + "\\" and "program files" not in d
+                             for d in dirs), dirs)  # ...and skips C:\Erlang
+
+    def test_rebar3_prefix_never_runs_an_escript_under_c_erlang(self):
+        os.environ.pop("YUZU_ESCRIPT", None)
+        p1, p2, p3, p4 = self._win_fs()
+        with p1, p2, p3, p4, mock.patch.object(et, "find_otp", return_value=(None, None, None, [])):
+            prefix = et.rebar3_prefix()
+        self.assertEqual(prefix[0].replace("/", "\\").lower(),
+                         "c:\\program files\\erlang otp\\erts-16.3\\bin\\escript.exe")
+
+    def test_start_erl_data_naming_a_path_is_not_followed(self):
+        root = os.path.join(self.tmp, "crafted")
+        bin_dir = make_install(root, "79.1", releases={"78": "78.4", "79": "79.1"},
+                               start_erl="../../outside")
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+        with mock.patch.object(et.subprocess, "run", return_value=failed):
+            self.assertIsNone(et.otp_version(bin_dir))
 
     # ── base_env ────────────────────────────────────────────────────────────
     def test_base_env_puts_the_pinned_otp_first_on_path(self):
@@ -246,7 +291,7 @@ class OtpPinTests(unittest.TestCase):
         kerl_bin = self.kerl("90.3", "90.3")
         out = self.cli("find-otp", "--version", "90.3")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(out.stdout.splitlines(), [kerl_bin, "90.3", "kerl"])
+        self.assertEqual(out.stdout.splitlines(), [kerl_bin, "90.3", "kerl", "90.3"])
 
     def test_cli_no_match_exits_1_and_lists_what_it_found(self):
         self.kerl("89.1", "89.1")
@@ -289,9 +334,11 @@ class PinCopiesAgree(unittest.TestCase):
                     walk(v)
 
         walk(contract)
+        self.assertTrue(found, "no erlang pin found in toolchain-contract.json")
         with open(os.path.join(REPO, ".github", "workflows", "ci.yml"), encoding="utf-8") as f:
-            found += re.findall(r"^\s*OTP_VERSION:\s*([0-9][0-9.]*)\s*$", f.read(), re.M)
-        self.assertTrue(found, "no pinned OTP versions found to check")
+            ci = re.findall(r"""^\s*OTP_VERSION:\s*['"]?([0-9][0-9.]*)['"]?\s*$""", f.read(), re.M)
+        self.assertTrue(ci, "no OTP_VERSION pin found in ci.yml (macOS download)")
+        found += ci
         for v in found:
             self.assertTrue(et.version_matches(v, et.DEFAULT_OTP_VERSION),
                             f"{v} does not pass DEFAULT_OTP_VERSION {et.DEFAULT_OTP_VERSION}")

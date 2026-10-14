@@ -67,12 +67,13 @@ Meson resolved is removed or replaced after configure, the gateway build stops
 with "...reconfigure the build" rather than falling back to another `erl`.
 
 **Overriding the choice.** Both overrides are read at **configure** time and
-baked into the build: set them on `meson setup` / `meson setup --reconfigure`,
-not on `ninja`. A value exported only when running `ninja` is ignored (Meson's
-target environment replaces it), and Ninja's automatic regeneration after a
-`meson.build` change reconfigures with the environment of THAT `ninja`
-invocation, so keep an override exported in the shell you build from, or
-reconfigure explicitly after changing it.
+baked into the build: configure passes the resolved `YUZU_OTP_BIN` and the pin
+it checked (`YUZU_OTP_VERSION`) to the gateway targets, whose environment
+replaces any value exported when running `ninja` - so set them on
+`meson setup` / `meson setup --reconfigure`, not on `ninja`. Ninja's automatic
+regeneration after a `meson.build` change reconfigures with the environment of
+THAT `ninja` invocation, so keep an override exported in the shell you build
+from, or reconfigure explicitly after changing it.
 
 - `YUZU_OTP_BIN=<install>/bin` picks one install. It must hold a matching
   `erl`; a wrong version or a path with no `erl` is reported, never replaced.
@@ -87,13 +88,24 @@ together:
 
 - `DEFAULT_OTP_VERSION` in `scripts/erlang_toolchain.py` (Meson, the wrappers
   and `ensure-erlang.sh` all read it);
-- every OTP the build actually installs: `ci.yml` (`setup-beam` `otp-version`
-  and the macOS `OTP_VERSION` + its sha256), `release.yml`, `nightly.yml`,
-  `deploy/windows/toolchain-contract.json` (and the runners' maintenance
-  record, `deploy/windows/README.md`), `runner-ops/upgrade-erlang-linux.sh`,
-  and the gateway image base tags (`Dockerfile.gateway` and siblings);
+- every OTP the build actually installs: the `setup-beam` `otp-version` in
+  `ci.yml`, `release.yml`, `nightly.yml`, `codeql.yml`, `sanitizer-tests.yml`
+  and `fork-dynamic-review.yml`; the macOS `OTP_VERSION` + its sha256 in
+  `ci.yml`; `deploy/windows/toolchain-contract.json`,
+  `deploy/windows/Provision-Windows-Runner.ps1` and
+  `Test-ToolchainContract.ps1` (and the runners' maintenance record,
+  `deploy/windows/README.md`); `scripts/runner-ops/upgrade-erlang-linux.sh`;
+  the gateway image base tags and the `otp_fix_min` guard in
+  `Dockerfile.gateway` and its siblings; and Dependabot's Erlang rules
+  (`.github/dependabot.yml`, `docs/dependency-updates.md`);
+- the scripts that name a version: `scripts/ensure-erlang.sh`'s fallback
+  literal (used only if it cannot read the pin), `scripts/ci/assert-gateway-tests.py`'s
+  message, and any `source scripts/ensure-erlang.sh <version>` caller
+  (`scripts/release-preflight.sh` and `scripts/integration-test.sh` pass `""`,
+  which selects the pin);
 - the user-facing statements: `docs/user-manual/gateway.md`,
-  `docs/build-guide.md`, `docs/darwin-compat.md`, `docs/rhel9-build-setup.md`.
+  `docs/build-guide.md`, `README.md`, `docs/darwin-compat.md`,
+  `docs/rhel9-build-setup.md`, `docs/testing/integration-tests.md`.
 
 `tests/test_erlang_toolchain_otp.py` fails if the Windows contract's or the
 macOS CI download's version stops passing the pin. A move to a new MAJOR also
@@ -101,7 +113,9 @@ needs the gateway dependency set (rebar.config) proven on it first, and on the
 Windows host the old and new OTP side by side until every active branch carries
 the bump, because branches not rebased onto it will refuse the new major.
 
-**Shells:** for running rebar3 or `erl` by hand, the sourceable helper asks the
+### Shells: `scripts/ensure-erlang.sh`
+
+For running rebar3 or `erl` by hand, the sourceable helper asks the
 same resolver (`find-otp`) and activates what it picks in the current shell -
 on MSYS2 through a native Windows Python, converting the path with `cygpath`.
 Only when no suitable Python exists does it fall back to its own narrower
@@ -110,7 +124,7 @@ search (kerl, asdf, Homebrew, the Windows installer).
 ```bash
 source scripts/ensure-erlang.sh           # the pin above: 28.4 or later 28.x
 source scripts/ensure-erlang.sh 28.4.2    # 28.4.2 or later 28.x
-erl -noshell -eval 'io:format("~s~n",[erlang:system_info(otp_release)]),halt().'   # check the version, not just presence
+python3 scripts/erlang_toolchain.py find-otp >/dev/null   # exit 0 = the erl it reports passes the pin
 ```
 
 A working `erl` of the wrong version on PATH is not success: the helper

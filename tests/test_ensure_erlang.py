@@ -98,10 +98,63 @@ class EnsureErlangTests(unittest.TestCase):
         rc, erl, err = self.source(pin="96.1")
         self.assertEqual(rc, 0, err)
         self.assertEqual(erl, os.path.join(self.path_dir, "erl"))
-        self.assertIn("not found", err)
+        self.assertIn("[ensure-erlang] no Erlang/OTP 96.1 or later 96.x found.", err)
+
+    def _fake_tools(self, **scripts):
+        """A dir of fake commands placed FIRST on PATH; `python3` among them
+        exits 3 (a resolver crash), forcing the shell's own fallback search."""
+        d = os.path.join(self.tmp, "tools")
+        os.makedirs(d, exist_ok=True)
+        scripts.setdefault("python3", "exit 3")
+        for name, body in scripts.items():
+            p = os.path.join(d, name)
+            with open(p, "w", encoding="ascii") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(p, 0o755)
+        return d
+
+    def source_with_tools(self, tools, pin="97.4"):
+        script = textwrap.dedent(f"""\
+            set -euo pipefail
+            source "{HELPER}" {pin}
+            echo "SURVIVED:$(command -v erl || true)"
+            """)
+        env = {"PATH": os.pathsep.join([tools, self.path_dir, "/usr/bin", "/bin"]),
+               "HOME": self.home}
+        out = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
+                             env=env, timeout=120)
+        erl = next((l[len("SURVIVED:"):] for l in out.stdout.splitlines()
+                    if l.startswith("SURVIVED:")), None)
+        return out.returncode, erl, out.stderr
+
+    def test_fallback_search_without_python_activates_kerl(self):
+        rc, erl, err = self.source_with_tools(self._fake_tools())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(erl, os.path.join(self.kerl_root, "bin", "erl"), err)
+
+    def test_fallback_with_an_asdf_that_has_no_erlang_survives(self):
+        # `asdf which erl` and `asdf where erlang` both fail when no erlang is
+        # installed: neither may kill a strict caller.
+        tools = self._fake_tools(asdf="exit 1")
+        rc, erl, err = self.source_with_tools(tools, pin="96.1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(erl, os.path.join(self.path_dir, "erl"), err)
+
+    def test_fallback_on_msys2_with_no_installer_survives(self):
+        # The MSYS2 installer scan's last `[ -f ... ]` is false when nothing is
+        # installed under Program Files (x86); under pipefail that must not
+        # kill the caller. No py/python reporting win32 exists here, so the
+        # shell's own search runs.
+        tools = self._fake_tools(uname="echo MINGW64_NT-10.0-26100")
+        rc, erl, err = self.source_with_tools(tools, pin="96.1")
+        self.assertEqual(rc, 0, err)
+        self.assertIsNotNone(erl, err)
 
     def test_an_invalid_pin_falls_back_to_the_default_never_looser(self):
         rc, _, err = self.source(pin="'28; rm -rf x'")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("using the pinned default", err)
+        rc, _, err = self.source(pin="28..4")
         self.assertEqual(rc, 0, err)
         self.assertIn("using the pinned default", err)
 

@@ -648,7 +648,9 @@ _rebar3 = find_program('rebar3', required: false)
 # base_env() puts first on PATH. A new OTP install after configure needs a
 # reconfigure to be picked up.
 _gw_otp_bin = ''
+_gw_otp_pin = ''
 _gw_skip_reason = 'rebar3 not found'
+_gw_skip_summary = 'SKIPPED (rebar3 not found)'
 if _rebar3.found()
   _gw_otp = run_command(
     yuzu_python, meson.project_source_root() / 'scripts' / 'erlang_toolchain.py', 'find-otp',
@@ -660,14 +662,18 @@ if _rebar3.found()
   if _gw_otp.returncode() == 0
     _gw_otp_out = _gw_otp.stdout().strip().split('\n')
     _gw_otp_bin = _gw_otp_out[0]
+    _gw_otp_pin = _gw_otp_out[3]
     _gw_otp_desc = 'Erlang/OTP ' + _gw_otp_out[1] + ' (' + _gw_otp_out[2] + ') at ' + _gw_otp_bin
   elif _gw_otp.returncode() == 1
     _gw_skip_reason = ('rebar3 found, but no Erlang/OTP passes the pin:\n'
                        + _gw_otp.stderr().strip())
+    _gw_skip_summary = ('SKIPPED (rebar3 found, but no Erlang/OTP passes the pin; '
+                        + 'see the WARNING above)')
   else
     error('scripts/erlang_toolchain.py find-otp failed (exit '
-          + _gw_otp.returncode().to_string() + '); this is a resolver error, not a '
-          + 'missing Erlang/OTP:\n' + _gw_otp.stderr().strip())
+          + _gw_otp.returncode().to_string() + ': 2 = invalid YUZU_OTP_VERSION pin, '
+          + '3 = resolver error); this is not a missing Erlang/OTP:\n'
+          + _gw_otp.stderr().strip())
   endif
 endif
 if _gw_otp_bin != ''
@@ -679,7 +685,7 @@ if _gw_otp_bin != ''
   # breaks cmd.exe on Windows.
   custom_target('gateway',
     command: [yuzu_python, _gw_build_script, _gw_src],
-    env: {'YUZU_OTP_BIN': _gw_otp_bin},
+    env: {'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
     output: '.gateway_built',
     build_always_stale: true,
     build_by_default: true,
@@ -720,7 +726,7 @@ if _gw_otp_bin != ''
     args: [_gw_test_script, _gw_src, 'eunit'],
     suite: 'gateway',
     timeout: 600,
-    env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit', 'YUZU_OTP_BIN': _gw_otp_bin},
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
   )
   # Timeout 600s — must stay ABOVE test_gateway.py's per-suite
   # `_SUITE_DEADLINE_SECS['ct']` (540) so the wrapper's process-tree dump
@@ -734,7 +740,7 @@ if _gw_otp_bin != ''
     args: [_gw_test_script, _gw_src, 'ct'],
     suite: 'gateway',
     timeout: 600,
-    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct', 'YUZU_OTP_BIN': _gw_otp_bin},
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
   )
   message('Erlang gateway: enabled, ' + _gw_otp_desc)
 else
@@ -808,7 +814,7 @@ summary({
   'Tests':      build_tests,
   'Enterprise': get_option('enable_enterprise'),
   # The gateway is optional, so a skip is easy to miss mid-log: restate it here.
-  'Gateway':    _gw_otp_bin != '' ? _gw_otp_desc : 'SKIPPED (' + _gw_skip_reason.split('\n')[0] + ')',
+  'Gateway':    _gw_otp_bin != '' ? _gw_otp_desc : _gw_skip_summary,
 }, section: 'Components')
 
 summary({

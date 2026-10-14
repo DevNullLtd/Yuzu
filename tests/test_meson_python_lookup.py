@@ -16,26 +16,32 @@ import unittest
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 LOOKUP = re.compile(r"find_program\(\s*'python")
+FIND_INSTALLATION = re.compile(r"find_installation\(")
 
 
 class MesonPythonLookup(unittest.TestCase):
     def test_no_ad_hoc_python_lookup_in_any_meson_build(self):
+        # Tracked files only: walking the tree would also scan build dirs and
+        # vcpkg_installed (third-party meson.build files, minutes of I/O).
         try:
             files = subprocess.run(
                 ["git", "-C", REPO, "ls-files", "*meson.build"],
                 capture_output=True, text=True, check=True, timeout=60,
             ).stdout.split()
         except (OSError, subprocess.SubprocessError):
-            files = []
-            for root, _, names in os.walk(REPO):
-                if "meson.build" in names and "/." not in root.replace("\\", "/"):
-                    files.append(os.path.relpath(os.path.join(root, "meson.build"), REPO))
-        offenders = []
+            self.skipTest("git unavailable: cannot list tracked meson.build files")
+        offenders, installations = [], []
         for rel in files:
             with open(os.path.join(REPO, rel), encoding="utf-8") as f:
-                for n, line in enumerate(f, 1):
-                    if LOOKUP.search(line) and not line.lstrip().startswith("#"):
-                        offenders.append(f"{rel}:{n}: {line.strip()}")
+                text = f.read()
+            code = "\n".join(l.split("#", 1)[0] for l in text.splitlines())
+            # Whitespace-insensitive, so a call split across lines is caught.
+            for m in LOOKUP.finditer(code):
+                line = code.count("\n", 0, m.start()) + 1
+                offenders.append(f"{rel}:{line}: {text.splitlines()[line - 1].strip()}")
+            installations += [rel for _ in FIND_INSTALLATION.finditer(code)]
+        self.assertEqual(installations, ["meson.build"],
+                         "exactly one find_installation() (the yuzu_python definition)")
         # The single definition (root meson.build, non-Windows branch).
         allowed = [o for o in offenders
                    if o.startswith("meson.build:") and "yuzu_python = find_program" in o]
