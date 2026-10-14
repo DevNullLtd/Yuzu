@@ -2,20 +2,26 @@
  * @file test_developer_routes.cpp
  * @brief Route tests for System > Developer and API (developer_routes.{hpp,cpp}):
  *        the page gate, the per-fragment Infrastructure:Read gate, the
- *        no-store header, and the null-store degraded states. In-process
- *        TestRouteSink; no socket, no Postgres.
+ *        no-store header, and the degraded states. In-process TestRouteSink;
+ *        no socket. Only the [pg]-tagged permissions cases need Postgres (an
+ *        open RbacStore); the rest run without it.
  */
 
 #include "developer_routes.hpp"
 
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
+#include "pg/pg_pool.hpp"
+#include "rbac_store.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <stdexcept>
 #include <string>
 
 using namespace yuzu::server;
@@ -26,6 +32,7 @@ struct DeveloperHarness {
     yuzu::server::test::TestRouteSink sink;
     bool allow_admin{true};
     bool allow_perm{true};
+    bool deny_user_mgmt{false}; ///< deny only the UserManagement:Read grid probe
     std::string last_securable, last_operation;
     int perm_calls{0};
 
@@ -34,7 +41,7 @@ struct DeveloperHarness {
     yuzu::MetricsRegistry metrics;
     detail::AgentRegistry registry{bus, metrics};
 
-    explicit DeveloperHarness(bool with_registry = true) {
+    explicit DeveloperHarness(bool with_registry = true, RbacStore* rbac = nullptr) {
         developer::Deps deps;
         deps.admin_fn = [this](const httplib::Request&, httplib::Response& res) {
             if (allow_admin)
@@ -47,17 +54,31 @@ struct DeveloperHarness {
             ++perm_calls;
             last_securable = s;
             last_operation = o;
+            if (deny_user_mgmt && s == "UserManagement") {
+                res.status = 403;
+                return false;
+            }
             if (allow_perm)
                 return true;
             res.status = 403;
             res.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
             return false;
         };
-        deps.rbac_store = nullptr;
+        deps.rbac_store = rbac;
         deps.registry = with_registry ? &registry : nullptr;
         developer::register_developer_routes(sink, std::move(deps));
     }
 };
+
+// Pre-migrated RbacStore template; shares the "rbacstore" key with
+// test_rbac_store.cpp and test_discovery_routes.cpp (identical setup).
+yuzu::test::PgTestTemplate developer_rbac_tpl{
+    "rbacstore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::RbacStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("rbac template: store failed to migrate/seed");
+    }};
 
 bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
@@ -178,4 +199,41 @@ TEST_CASE("developer plugins fragments: build-embedded list needs no registry; o
     auto empty = w.sink.Get("/fragments/settings/developer/plugins/observed");
     REQUIRE(empty);
     CHECK(has(empty->body, "No device is connected"));
+}
+
+TEST_CASE("developer permissions fragment: live RBAC catalogue with the role grid",
+          "[developer][routes][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, developer_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+
+    DeveloperHarness h(/*with_registry=*/true, &rbac);
+    auto r = h.sink.Get("/fragments/settings/developer/permissions");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(h.perm_calls == 2); // Infrastructure:Read gate, then the UserManagement:Read probe
+    CHECK(h.last_securable == "UserManagement");
+    CHECK(has(r->body, "<table"));
+    CHECK(has(r->body, "Administrator")); // a seeded role, from the live store
+    CHECK(has(r->body, "Infrastructure:Read"));
+    CHECK_FALSE(has(r->body, "could not be read"));
+}
+
+TEST_CASE("developer permissions fragment: denied UserManagement:Read keeps the taxonomy, drops the grid",
+          "[developer][routes][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, developer_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+
+    DeveloperHarness h(/*with_registry=*/true, &rbac);
+    h.deny_user_mgmt = true;
+    auto r = h.sink.Get("/fragments/settings/developer/permissions");
+    REQUIRE(r);
+    CHECK(r->status == 200); // the probe denial never 403s the fragment
+    CHECK(has(r->body, "securable types"));
+    CHECK(has(r->body, "UserManagement:Read"));
+    CHECK_FALSE(has(r->body, "<table"));
+    CHECK_FALSE(has(r->body, "Administrator"));
 }
