@@ -1,16 +1,17 @@
 /* yuzu-operate.js -- page controllers for the Operate pages (Approvals, Executions, Workflows).
  *
- * Read-only: the server renders every list and panel as an HTML fragment (the fragment
- * routes' `view=page` branches); this file only fetches them, swaps them into their host
+ * The server renders every list and panel as an HTML fragment (the fragment
+ * routes' `view=page` branches); this file fetches them, swaps them into their host
  * and fills the single detail panel from the selected row's data-* attributes with
- * textContent. One controller per page, chosen by <body data-page>.
+ * textContent. The decision and cancel actions are dialogs from /static/yuzu-dialog.js. One controller per page, chosen by <body data-page>.
  *
  * Rules this file keeps (pinned by test_operate_pages_ui.cpp):
  *   - no dynamic-code or raw-markup sinks of any kind (the test pins the exact list);
  *   - innerHTML is assigned ONLY from a 200 fragment the server rendered (and escaped), to
- *     the fragment hosts (#ap-list, #exec-list, #exec-selected, #wf-list, #sc-list, #wf-runs-store,
- *     #wf-run-body, #wf-recent-body); a non-200 body is
- *     never written anywhere;
+ *     the list and store hosts (#ap-list, #exec-list, #wf-list, #sc-list, #wf-runs-store,
+ *     #wf-run-body, #wf-recent-body); the selected-execution and devices panels receive
+ *     parsed [data-slot] nodes (DOMParser + replaceChildren); a non-200 body is never
+ *     written anywhere;
  *   - every fetch has a bounded timeout, and a late response never overwrites a newer one
  *     (request token).
  */
@@ -48,6 +49,28 @@
     if (status === 403) return 'You do not have permission to view ' + what + '.';
     if (status >= 500) return 'Could not load ' + what + ': the server reported a problem. Retry shortly.';
     return 'Could not load ' + what + ' (HTTP ' + status + ').';
+  }
+
+  // Transient confirmation in #toasts (textContent only); removed after 4 s.
+  function showToast(msg, level) {
+    var host = $('#toasts');
+    if (!host) return;
+    var t = doc.createElement('div');
+    t.className = 'toast toast-' + (level || 'info');
+    t.textContent = msg;
+    host.appendChild(t);
+    setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 4000);
+  }
+
+  function factRow(label, text, code) {
+    var r = doc.createElement('div');
+    var l = doc.createElement('span');
+    l.textContent = label;
+    var v = doc.createElement(code ? 'code' : 'b');
+    v.textContent = text;
+    r.appendChild(l);
+    r.appendChild(v);
+    return r;
   }
 
   function setNote(host, text) {
@@ -184,9 +207,10 @@
       var pending = d.status === 'pending';
       var mine = d.mine === '1';
       var mcp = d.mcp === '1';
+      var list = $('.ops-list', host);
+      var canDecide = !!list && list.getAttribute('data-can-decide') === '1';
       field(detail, 'self').hidden = !(pending && mine);
-      field(detail, 'where').hidden = !(pending && !mine);
-      field(detail, 'actions').hidden = !pending;
+      field(detail, 'actions').hidden = !(pending && !mine && canDecide);
       field(detail, 'n-mcp').hidden = !mcp;
       field(detail, 'n-params').hidden = mcp;
       field(detail, 'notes').hidden = !pending;
@@ -194,6 +218,65 @@
       field(detail, 'empty').hidden = true;
       field(detail, 'kv').hidden = false;
     }
+
+    // Approve / reject dialog for the selected pending request. The facts are the row's
+    // own data-* attributes (no refetch); the decision is one POST through YuzuDialog.
+    function decide(kind) {
+      var row = $('tr.row.sel', host);
+      if (!row || !window.YuzuDialog) return;
+      var d = row.dataset;
+      var id = d.id || '';
+      var approve = kind === 'approve';
+      var facts = doc.createElement('div');
+      facts.className = 'kvl dlg-facts';
+      facts.appendChild(factRow('Request', (d.name || '') + (d.def ? ' (' + d.def + ')' : '')));
+      facts.appendChild(factRow('Requested by', d.by || ''));
+      facts.appendChild(factRow('Scope', d.scope || 'None recorded', true));
+      facts.appendChild(factRow('Requested', d.age || ''));
+      var note = approve ?
+        'Your decision is recorded in the audit log. Your comment is saved on the request and is ' +
+        'visible to anyone who can read approvals. Approving does not run the instruction itself. ' +
+        'You cannot approve your own request. ' +
+        (d.mcp === '1' ?
+          'The requesting agent must re-call the tool with this approval id for it to run.' :
+          'The parameter values are not stored with this request. You are deciding on the ' +
+          'instruction and scope only.') :
+        'Your decision and reason are recorded. The requester can read the reason on the request.';
+      var url = '/api/approvals/' + encodeURIComponent(id) + '/' + kind;
+      YuzuDialog.form({
+        title: approve ? 'Approve request' : 'Reject request',
+        body: facts,
+        note: note,
+        danger: !approve,
+        fields: [{ name: 'comment', type: 'textarea', maxlength: 1000, rows: 3,
+                   label: approve ? 'Comment (optional)' : 'Reason (saved with your decision)' }],
+        cancelLabel: 'Go back',
+        submitLabel: approve ? 'Approve request' : 'Reject request',
+        submit: function (v) {
+          var comment = v.comment.trim();
+          return YuzuDialog.request('POST', url, { json: comment ? { comment: comment } : {} })
+            .then(function (r) {
+              if (r.ok) return null;
+              if (r.status === 400) return r.message || 'The request was refused.';
+              if (r.status === 401) return 'Your session has expired. Sign in again.';
+              if (r.status === 403) return 'You do not have permission to decide approvals.';
+              return 'Could not confirm the decision. Refresh to see the current state.';
+            });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast(approve ? 'Approved' : 'Rejected', 'success');
+        doc.dispatchEvent(new CustomEvent('yuzu:approvals-changed'));
+        load();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    detail.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-act]') : null;
+      if (!b || !detail.contains(b)) return;
+      var act = b.getAttribute('data-act');
+      if (act === 'approve' || act === 'reject') decide(act);
+    });
 
     function updateChip(list) {
       var status = currentStatus();
@@ -260,11 +343,13 @@
   function executionsController() {
     var host = $('#exec-list');
     var panel = $('#exec-selected');
+    var devices = $('#exec-devices');
     var chip = $('#exec-chip');
+    var statsHost = $('#exec-stats');
     var confinedNote = $('#exec-confined');
     var defSel = $('#f-def');
     var defHint = $('#f-def-hint');
-    if (!host || !panel || !defSel) return;
+    if (!host || !panel || !devices || !defSel) return;
 
     var STATUSES = ['', 'running', 'succeeded', 'completed', 'cancelled', 'pending'];
     var lseq = 0;          // request tokens: only the newest list / detail response is applied
@@ -328,7 +413,165 @@
       n.className = 'empty-state';
       n.textContent = text;
       panel.replaceChildren(hd, n);
+      stopLive();
+      devices.hidden = true;
+      devices.replaceChildren();
     }
+
+    // Moves each top-level [data-slot] of a page-view response into the host that carries
+    // its name. The response is parsed into an inert document (nothing in it runs) and the
+    // slot nodes are adopted whole, so no markup is ever assigned as a string here.
+    var SLOT_HOSTS = { selected: panel, devices: devices };
+    function applySlots(html) {
+      var parsed = new DOMParser().parseFromString(html, 'text/html');
+      var seen = {};
+      $$('[data-slot]', parsed.body).forEach(function (slot) {
+        var name = slot.getAttribute('data-slot');
+        var target = SLOT_HOSTS[name];
+        if (!target || seen[name]) return;
+        seen[name] = true;
+        target.replaceChildren(slot);
+        target.hidden = false;
+        renderLocalTimes(target);
+      });
+      if (!seen.devices) { devices.hidden = true; devices.replaceChildren(); }
+    }
+
+    // ---- Live updates (OpsLive) for the selected running|pending execution ----
+    // One EventSource per tab. Started only after a FRESH detail response says the
+    // execution is running|pending; closed by selecting another row, completion, a CLOSED
+    // source, or pagehide. Counters of the Selected panel are not patched from events (a
+    // confined caller's stream is sanitised); they arrive with the throttled refresh.
+    var MIN_GAP_MS = 3000;     // trailing refresh gap; every refresh is an audited read
+    var LARGE_GAP_MS = 15000;  // used when the execution targets more than 2000 devices
+    var es = null;
+    var opened = false;
+    var liveId = '';
+    var refreshTimer = 0;
+    var lastRefresh = 0;
+    var gapMs = MIN_GAP_MS;
+    var liveChip = doc.createElement('span');
+    liveChip.className = 'ops-live';
+    liveChip.setAttribute('role', 'status');
+    liveChip.hidden = true;
+
+    function setChip(state) {
+      var copy = { live: 'Live', reconnecting: 'Reconnecting\u2026',
+                   unavailable: 'Live updates unavailable.' };
+      if (!state || !copy[state]) { liveChip.hidden = true; liveChip.textContent = ''; return; }
+      liveChip.setAttribute('data-state', state);
+      var dot = doc.createElement('i');
+      var txt = doc.createElement('span');
+      txt.textContent = copy[state];
+      liveChip.replaceChildren(dot, txt);
+      liveChip.hidden = false;
+    }
+    // The slots are replaced on every refresh; the chip is re-seated into the new header.
+    function seatChip() {
+      var hd = $('[data-slot="selected"] > .hd', panel);
+      if (hd && liveChip.parentNode !== hd) hd.appendChild(liveChip);
+    }
+    function closeStream() {
+      if (es) { try { es.close(); } catch (e) { /* already closed */ } es = null; }
+      opened = false;
+    }
+    function cancelRefresh() {
+      if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = 0; }
+    }
+    function stopLive() {
+      closeStream();
+      cancelRefresh();
+      liveId = '';
+      setChip('');
+    }
+    function refreshNow() {
+      cancelRefresh();
+      lastRefresh = Date.now();
+      if (liveId) showDetail(liveId, true);
+    }
+    function scheduleRefresh() {
+      if (refreshTimer || !liveId) return;
+      var wait = Math.max(0, gapMs - (Date.now() - lastRefresh));
+      refreshTimer = setTimeout(function () { refreshTimer = 0; refreshNow(); }, wait);
+    }
+
+    function cssEsc(s) {
+      if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(String(s));
+      return String(s).replace(/(["\\])/g, '\\$1');
+    }
+    var TONES = { succeeded: 'ok', failed: 'bad', running: 'info', pending: 'idle' };
+    function applyAgentTransition(id, payload) {
+      if (!payload || !payload.agent_id) return;
+      var status = String(payload.status || '');
+      var dom = 'pending';
+      if (status === 'success') dom = 'succeeded';
+      else if (status === 'failure' || status === 'timeout' || status === 'rejected') dom = 'failed';
+      else if (status === 'running') dom = 'running';
+      var key = '[data-agent-id="' + cssEsc(payload.agent_id) + '"][data-exec-id="' + cssEsc(id) + '"]';
+      $$('.agent-cell' + key, devices).forEach(function (c) {
+        c.className = 'agent-cell agent-cell--' + dom;
+      });
+      $$('tr' + key, devices).forEach(function (r) {
+        var bar = $('.dbar', r);
+        if (bar) bar.className = 'dbar dbar--' + dom;
+        var badge = $('.per-agent-status', r);
+        if (badge) {
+          badge.textContent = status;
+          // Same pill vocabulary the server renders (pill_tone in executions_page_render.cpp).
+          badge.className = 'pill ' + TONES[dom] + ' per-agent-status';
+        }
+        var ex = $('.per-agent-exit-code', r);
+        if (ex && typeof payload.exit_code === 'number') ex.textContent = String(payload.exit_code);
+      });
+    }
+    function applyProgress(id, payload) {
+      var strip = $('#exec-kpi-' + cssEsc(id), devices);
+      if (!strip || !payload) return;
+      var vals = $$('.exec-kpi-value', strip);
+      if (vals.length < 3) return;
+      if (typeof payload.agents_targeted === 'number') vals[0].textContent = String(payload.agents_targeted);
+      if (typeof payload.agents_success === 'number') vals[1].textContent = String(payload.agents_success);
+      if (typeof payload.agents_failure === 'number') vals[2].textContent = String(payload.agents_failure);
+    }
+
+    function startLive(id, targeted) {
+      stopLive();
+      liveId = id;
+      gapMs = targeted > 2000 ? LARGE_GAP_MS : MIN_GAP_MS;
+      lastRefresh = Date.now();
+      try { es = new EventSource('/sse/executions/' + encodeURIComponent(id)); } catch (e) { es = null; liveId = ''; return; }
+      var mine = es;
+      mine.addEventListener('open', function () { opened = true; setChip('live'); });
+      mine.addEventListener('agent-transition', function (ev) {
+        if (mine !== es) return;
+        try { applyAgentTransition(id, JSON.parse(ev.data)); } catch (e) { /* bad frame */ }
+        scheduleRefresh();
+      });
+      mine.addEventListener('execution-progress', function (ev) {
+        if (mine !== es) return;
+        try { applyProgress(id, JSON.parse(ev.data)); } catch (e) { /* bad frame */ }
+      });
+      mine.addEventListener('execution-completed', function () {
+        if (mine !== es) return;
+        closeStream();
+        setChip('');
+        refreshNow(); // exactly one final read for the terminal state
+      });
+      mine.addEventListener('heartbeat', function () {});
+      mine.onerror = function () {
+        if (mine !== es) return;
+        if (mine.readyState === 2) {
+          // CLOSED: before open it was refused (410 or the stream budget; the browser cannot
+          // read which), after open the server ended it, so read the final state once.
+          var wasOpen = opened;
+          closeStream();
+          if (wasOpen) { setChip(''); refreshNow(); } else { setChip('unavailable'); }
+        } else {
+          setChip('reconnecting');
+        }
+      };
+    }
+    window.addEventListener('pagehide', stopLive);
 
     function markSelected() {
       $$('tr.row', host).forEach(function (r) {
@@ -348,19 +591,84 @@
     }
 
     // One audited detail read per call. Never run on load without an explicit ?id=.
-    function showDetail(id) {
+    // fromLive: a refresh of the already-selected execution; the stream stays as it is.
+    function showDetail(id, fromLive) {
       var mine = ++dseq;
-      selectedId = id;
-      markSelected();
-      writeQs(function (p) { p.set('id', id); });
+      if (!fromLive) {
+        stopLive();
+        selectedId = id;
+        markSelected();
+        writeQs(function (p) { p.set('id', id); });
+      }
       return fetchFragment('/fragments/executions/' + encodeURIComponent(id) +
                            '/detail?view=page').then(function (res) {
         if (mine !== dseq) return;
         if (res.status !== 200) { panelNote(detailCopy(res.status)); return; }
-        panel.innerHTML = res.html; // server-rendered and escaped
-        renderLocalTimes(panel);
+        applySlots(res.html); // server-rendered and escaped
+        var sel = $('[data-slot="selected"]', panel);
+        var cb = sel ? $('button[data-act="cancel"]', sel) : null;
+        if (cb && sel.getAttribute('data-can-cancel') === '0') {
+          cb.disabled = true;
+          cb.title = 'You do not have permission to cancel executions.';
+        }
+        var status = sel ? sel.getAttribute('data-execution-status') : '';
+        var running = status === 'running' || status === 'pending';
+        if (fromLive) {
+          if (!running) stopLive();   // terminal: nothing more to watch
+        } else if (running) {
+          startLive(id, Number(sel.getAttribute('data-targeted')) || 0);
+        }
+        seatChip();
       });
     }
+
+    // Cancel: the facts come from the selected slot's own data-* attributes (no refetch);
+    // the decision is one POST through YuzuDialog. The server stays the gate (a render hint
+    // only decides whether the button is offered).
+    function cancelExecution() {
+      var sel = $('[data-slot="selected"]', panel);
+      if (!sel || !window.YuzuDialog) return;
+      var d = sel.dataset;
+      var id = d.executionId || '';
+      if (!id) return;
+      var facts = doc.createElement('div');
+      facts.className = 'kvl dlg-facts';
+      facts.appendChild(factRow('Instruction', d.defName || ''));
+      facts.appendChild(factRow('Started by', d.by || ''));
+      facts.appendChild(factRow('Devices', (d.targeted || '0') + (d.confined === '1' ? ' in your scope' : ' targeted')));
+      facts.appendChild(factRow('Execution id', id, true));
+      var url = '/api/executions/' + encodeURIComponent(id) + '/cancel';
+      YuzuDialog.form({
+        title: 'Cancel execution',
+        body: facts,
+        note: 'Devices that have not started will not run it. Work already running on a device ' +
+              'is not interrupted. Your action is recorded in the audit log.',
+        danger: true,
+        fields: [],
+        cancelLabel: 'Go back',
+        submitLabel: 'Cancel execution',
+        submit: function () {
+          return YuzuDialog.request('POST', url, { json: {} }).then(function (r) {
+            if (r.ok) return null;
+            if (r.status === 409) return r.message || 'This execution has already finished.';
+            if (r.status === 401) return 'Your session has expired. Sign in again.';
+            if (r.status === 403) return 'You do not have permission to cancel executions.';
+            if (r.status === 404) return 'This execution was not found, or is outside your scope.';
+            return 'Could not confirm the cancellation. Refresh to see the current state.';
+          });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast('Execution cancelled', 'success');
+        stopLive();
+        showDetail(id, true);
+        loadList();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+    panel.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-act="cancel"]') : null;
+      if (b && panel.contains(b) && !b.disabled) cancelExecution();
+    });
 
     function updateChrome(list) {
       var count = Number(list.getAttribute('data-count')) || 0;
@@ -388,6 +696,12 @@
           return;
         }
         host.innerHTML = res.html; // server-rendered and escaped
+        // The optional fleet strip rides in the list response; adopt it into its own host
+        // (absent for a confined view or a store failure: the host is emptied, never stale).
+        var strip = $('[data-slot="stats"]', host);
+        if (statsHost) {
+          if (strip) statsHost.replaceChildren(strip); else statsHost.replaceChildren();
+        }
         var list = $('.ops-list', host);
         // A 200 note (denied, degraded, invalid) has no list: clear the previous list's chrome.
         if (list) updateChrome(list); else { chip.hidden = true; confinedNote.hidden = true; }

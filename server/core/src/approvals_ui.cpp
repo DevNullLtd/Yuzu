@@ -3,8 +3,8 @@
 //
 // The list is a server-rendered fragment (`/fragments/approvals?view=page`, see
 // approvals_page_render.hpp) fetched and swapped in by /static/yuzu-operate.js, which also
-// fills the detail panel from the selected row's data-* attributes. Decisions (approve /
-// reject) are NOT on this page yet: they stay on the Instructions page's Approvals tab.
+// fills the detail panel from the selected row's data-* attributes. Approve / reject open
+// the shared dialog (/static/yuzu-dialog.js) and POST /api/approvals/{id}/approve|reject.
 //
 // Product UI: HTMX loaded only for the shell's Sign out (`hx-post`), CSP-clean (no hx-on,
 // no inline handlers, htmx eval disabled), tokens from /static/yuzu.css, page-local CSS in
@@ -65,9 +65,10 @@ constexpr std::string_view kBody = R"HTM(</style>
 <div><span>Approval id</span><b><span class="mono clip" data-f="id"></span></b></div>
 </div>
 <div class="btns" data-f="actions" hidden>
-<span class="hint" data-f="self" hidden>You submitted this — another reviewer must approve</span>
-<span class="hint" data-f="where" hidden>Decisions are made from the Approvals tab on the Instructions page.</span>
+<button type="button" class="btn btn-primary" data-act="approve">Approve</button>
+<button type="button" class="btn btn-danger" data-act="reject">Reject</button>
 </div>
+<div class="btns"><span class="hint" data-f="self" hidden>You submitted this — another reviewer must approve</span></div>
 <div class="held" data-f="notes" hidden>
 <div>Pending requests are expired 7 days after submission, when the next request is submitted; until then they stay listed.</div>
 <div>Approving records a decision and audits it. It does not run the instruction itself.</div>
@@ -78,6 +79,8 @@ constexpr std::string_view kBody = R"HTM(</style>
 </aside>
 </div>
 </main>
+<div class="toast-container" id="toasts" aria-live="polite"></div>
+<script src="/static/yuzu-dialog.js" defer></script>
 <script src="/static/yuzu-operate.js" defer></script>
 </body></html>
 )HTM";

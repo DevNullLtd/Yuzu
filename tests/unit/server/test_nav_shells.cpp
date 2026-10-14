@@ -441,6 +441,8 @@ TEST_CASE("app shell: approvals badge is hidden until the count answers, polls e
     const auto html = render_shell({.active_key = "approvals"});
     CHECK(count_of(html, "fetch('/api/approvals/pending/count',{signal:AbortSignal.timeout(5000)})") == 1);
     CHECK(count_of(html, "setInterval(pollBadge,30000)") == 1);
+    // A decision on the Approvals page refreshes the badge at once.
+    CHECK(count_of(html, "document.addEventListener('yuzu:approvals-changed',pollBadge);") == 1);
     CHECK(count_of(html, "if(r.status===401||r.status===403){bstop=true;") == 1);
     CHECK(count_of(html, "if(!badge||bstop||document.hidden||binflight)return;") == 1);
     CHECK(count_of(html, "if(typeof n!=='number')throw new Error('payload');") == 2);
