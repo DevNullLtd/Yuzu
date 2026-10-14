@@ -5,6 +5,8 @@
 #include "mcp_input_bounds.hpp" // #4983 Gate 3 SHOULD -- kResultSetDeviceIdMaxLen
 #include "rest_audit.hpp" // detail::try_persist_audit (#5047 Gate 8 fix round, UP-10)
 #include "result_set_store.hpp"
+#include "instruction_store.hpp"
+#include "result_set_extras_render.hpp"
 #include "result_sets_ui.hpp"
 
 #include <nlohmann/json.hpp>
@@ -73,6 +75,39 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
         return true;
     };
 
+    // Re-evaluate is offered only while the stored source would still be a read-only,
+    // auto-approved dispatch: a definition edited to need approval since the set was made
+    // must not be re-run through a path that skips the ladder. Unwired = hidden.
+    auto read_only_dispatch = [deps](std::string_view plugin, std::string_view action) -> bool {
+        if (!deps.classify_fn)
+            return false;
+        auto cap = deps.classify_fn(plugin, action);
+        return cap && cap->dispatch_class == DispatchClass::ReadOnly;
+    };
+    auto reeval_allowed = [deps, read_only_dispatch](const ResultSet& rs,
+                                                    const httplib::Request& req) -> bool {
+        if (!deps.perm_fn)
+            return false;
+        httplib::Response probe; // a deny writes its 403 here, never to the page
+        if (!deps.perm_fn(req, probe, "Execution", "Execute"))
+            return false;
+        if (rs.source_kind == source_kind::kTarQuery)
+            return read_only_dispatch("tar", "sql");
+        if (rs.source_kind != source_kind::kInstructionResult)
+            return false;
+        if (!deps.instruction_store || !deps.instruction_store->is_open())
+            return false;
+        auto payload = nlohmann::json::parse(rs.source_payload, nullptr, false);
+        if (!payload.is_object() || !payload.contains("instruction_id") ||
+            !payload["instruction_id"].is_string())
+            return false;
+        auto def = deps.instruction_store->get_definition(payload["instruction_id"].get<std::string>());
+        if (!def || !def->has_value())
+            return false;
+        const auto& d = **def;
+        return d.enabled && d.approval_mode == "auto" && read_only_dispatch(d.plugin, d.action);
+    };
+
     // Owner-scoped sidebar list.
     //
     // guardian-confinement-2298 PR3 §3e: every result-set fragment here is
@@ -97,18 +132,30 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                 res.set_content("", "text/html; charset=utf-8");
                 return;
             }
-            std::string next;
             std::string selected =
                 req.has_param("selected") ? req.get_param_value("selected") : "";
-            auto sets = deps.store->list_by_owner(session->username, "", 200, next);
-            res.set_content(render_result_sets_sidebar(sets, selected),
+            // SPEC 5.4: a failed read says so (it is never "No result sets yet") and a full
+            // page says it is cut. Same checked read the REST list uses.
+            constexpr int kSidebarLimit = 200;
+            SidebarNotes notes;
+            notes.limit = kSidebarLimit;
+            std::vector<ResultSet> sets;
+            auto page = deps.store->list_by_owner_checked(session->username, "", kSidebarLimit);
+            if (!page) {
+                notes.degraded = true;
+            } else {
+                sets = std::move(page->sets);
+                notes.truncated = !page->next_cursor.empty();
+            }
+            res.set_content(render_result_sets_sidebar(sets, selected, notes),
                             "text/html; charset=utf-8");
         });
 
     // Detail pane for one set (owner-checked).
     sink.Get(
         R"(/fragments/result-sets/(rs_[0-9a-f]+)/detail)",
-        [deps, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
+        [deps, rs_get_owned, reeval_allowed](const httplib::Request& req,
+                                             httplib::Response& res) {
             if (deps.deny_service_scoped_fn(
                     req, res, "result_set.detail.access_denied",
                     "service-scoped tokens may not read result-set detail", "ResultSet",
@@ -125,12 +172,102 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             auto chain = deps.store->lineage(id, session->username);
-            res.set_content(render_result_set_detail(*row, chain), "text/html; charset=utf-8");
+            res.set_content(render_result_set_detail(*row, chain,
+                                                     {.reeval_allowed = reeval_allowed(*row, req)}),
+                            "text/html; charset=utf-8");
+        });
+
+    // Members of one set (B-5): ids only, owner-checked, paged. The REST twin is
+    // GET /api/v1/result-sets/{id}/members and MCP get_result_set_members; this fragment
+    // reads the same store call (members_checked), so a failed read is a note, not "empty".
+    sink.Get(
+        R"(/fragments/result-sets/(rs_[0-9a-f]+)/members)",
+        [deps, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
+            if (deps.deny_service_scoped_fn(
+                    req, res, "result_set.members.access_denied",
+                    "service-scoped tokens may not read result-set members", "ResultSet",
+                    req.matches[1].str()))
+                return;
+            auto session = deps.auth_fn(req, res);
+            if (!session)
+                return;
+            auto id = req.matches[1].str();
+            auto row = rs_get_owned(id, session->username);
+            if (!row) {
+                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                return;
+            }
+            constexpr int kMembersPage = 100;
+            const std::string cursor =
+                req.has_param("cursor") ? req.get_param_value("cursor") : "";
+            auto page = deps.store->members_checked(id, cursor, kMembersPage);
+            if (!page) {
+                res.set_content(render_result_set_members(id, {}, "", /*degraded=*/true),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            res.set_content(render_result_set_members(id, page->device_ids, page->next_cursor,
+                                                      /*degraded=*/false),
+                            "text/html; charset=utf-8");
+        });
+
+    // Producer picker (B-6): the enabled, read-only, auto-approval definitions From instruction
+    // may offer. The REST twin lists instructions (GET /api/v1/instructions) and MCP
+    // list_definitions; this fragment narrows that list with the Console's own classifier.
+    // Denied is a 200 note (htmx drops a 4xx body).
+    sink.Get(
+        "/fragments/result-sets/producers",
+        [deps](const httplib::Request& req, httplib::Response& res) {
+            if (deps.deny_service_scoped_fn(
+                    req, res, "result_set.producers.access_denied",
+                    "service-scoped tokens may not list result-set producers", "ResultSet", ""))
+                return;
+            auto session = deps.auth_fn(req, res);
+            if (!session)
+                return;
+            auto allowed = [&](const char* type, const char* op) {
+                if (!deps.perm_fn)
+                    return false;
+                httplib::Response probe;
+                return deps.perm_fn(req, probe, type, op);
+            };
+            if (!allowed("Execution", "Execute") || !allowed("InstructionDefinition", "Read")) {
+                res.set_content(render_result_set_producers_denied(), "text/html; charset=utf-8");
+                return;
+            }
+            if (!deps.instruction_store || !deps.instruction_store->is_open()) {
+                res.set_content(render_result_set_producers_degraded(),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            constexpr int kProducerLimit = 200;
+            InstructionQuery q;
+            q.enabled_only = true;
+            q.limit = kProducerLimit;
+            auto defs = deps.instruction_store->query_definitions(q);
+            if (!defs) {
+                res.set_content(render_result_set_producers_degraded(),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            std::vector<ResultSetProducer> out;
+            for (const auto& d : *defs) {
+                if (d.approval_mode != "auto" || !deps.classify_fn)
+                    continue;
+                auto cap = deps.classify_fn(d.plugin, d.action);
+                if (!cap || cap->dispatch_class != DispatchClass::ReadOnly)
+                    continue;
+                out.push_back({d.id, d.name, d.plugin, d.action});
+            }
+            res.set_content(render_result_set_producers(
+                                out, static_cast<int>(defs->size()) >= kProducerLimit),
+                            "text/html; charset=utf-8");
         });
 
     // Pin / unpin — return the refreshed detail and trigger a sidebar reload.
-    auto rs_detail_after = [deps, rs_get_owned](const std::string& id, const std::string& owner,
-                                                httplib::Response& res) {
+    auto rs_detail_after = [deps, rs_get_owned, reeval_allowed](
+                               const httplib::Request& req, const std::string& id,
+                               const std::string& owner, httplib::Response& res) {
         auto row = rs_get_owned(id, owner);
         if (!row) {
             res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
@@ -138,12 +275,13 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
         }
         auto chain = deps.store->lineage(id, owner);
         res.set_header("HX-Trigger", "resultSetsChanged");
-        res.set_content(render_result_set_detail(*row, chain), "text/html; charset=utf-8");
+        res.set_content(render_result_set_detail(*row, chain,
+                                                     {.reeval_allowed = reeval_allowed(*row, req)}), "text/html; charset=utf-8");
     };
 
     sink.Post(
         R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
-        [deps, rs_detail_after, rs_get_owned, tier_ok](const httplib::Request& req,
+        [deps, rs_detail_after, rs_get_owned, tier_ok, reeval_allowed](const httplib::Request& req,
                                               httplib::Response& res) {
             if (deps.deny_service_scoped_fn(req, res, "result_set.pin.access_denied",
                                             "service-scoped tokens may not pin result sets",
@@ -176,17 +314,18 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                                     {{"level", "error"}, {"message", to_string(pinned.error())}}}}
                         .dump());
                 auto chain = deps.store->lineage(id, session->username);
-                res.set_content(render_result_set_detail(*row, chain),
+                res.set_content(render_result_set_detail(*row, chain,
+                                                     {.reeval_allowed = reeval_allowed(*row, req)}),
                                 "text/html; charset=utf-8");
                 return;
             }
             deps.audit_fn(req, "result_set.pin", "success", "ResultSet", id, "");
-            rs_detail_after(id, session->username, res);
+            rs_detail_after(req, id, session->username, res);
         });
 
     sink.Post(
         R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
-        [deps, rs_detail_after, rs_get_owned, tier_ok](const httplib::Request& req,
+        [deps, rs_detail_after, rs_get_owned, tier_ok, reeval_allowed](const httplib::Request& req,
                                               httplib::Response& res) {
             if (deps.deny_service_scoped_fn(req, res, "result_set.unpin.access_denied",
                                             "service-scoped tokens may not unpin result sets",
@@ -215,17 +354,19 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                                                 {"message", to_string(unpinned.error())}}}}
                                    .dump());
                 auto chain = deps.store->lineage(id, session->username);
-                res.set_content(render_result_set_detail(*row, chain),
+                res.set_content(render_result_set_detail(*row, chain,
+                                                     {.reeval_allowed = reeval_allowed(*row, req)}),
                                 "text/html; charset=utf-8");
                 return;
             }
             deps.audit_fn(req, "result_set.unpin", "success", "ResultSet", id, "");
-            rs_detail_after(id, session->username, res);
+            rs_detail_after(req, id, session->username, res);
         });
 
     sink.Post(
         R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
-        [deps, rs_get_owned, tier_ok](const httplib::Request& req, httplib::Response& res) {
+        [deps, rs_get_owned, tier_ok, reeval_allowed](const httplib::Request& req,
+                                                      httplib::Response& res) {
             if (deps.deny_service_scoped_fn(req, res, "result_set.delete.access_denied",
                                             "service-scoped tokens may not delete result sets",
                                             "ResultSet", req.matches[1].str()))
@@ -247,8 +388,18 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
             if (!del) {
                 // Pinned sets must be unpinned first — re-render the detail
                 // so the operator sees why nothing was deleted.
+                // htmx drops a non-2xx body, so the reason rides a toast on this 200.
+                res.set_header(
+                    "HX-Trigger",
+                    nlohmann::json{{"showToast",
+                                    {{"level", "error"},
+                                     {"message", row->pinned
+                                                     ? "Unpin this result set before deleting it."
+                                                     : "The result set could not be deleted."}}}}
+                        .dump());
                 auto chain = deps.store->lineage(id, session->username);
-                res.set_content(render_result_set_detail(*row, chain),
+                res.set_content(render_result_set_detail(*row, chain,
+                                                     {.reeval_allowed = reeval_allowed(*row, req)}),
                                 "text/html; charset=utf-8");
                 return;
             }

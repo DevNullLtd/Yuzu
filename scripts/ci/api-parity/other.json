@@ -577,6 +577,17 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/result-sets/producers",
+    "capability_id": "get.fragments-result-sets-producers",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/instructions"
+    },
+    "mcp_twin": "list_definitions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/result-sets/sidebar",
     "capability_id": "get.fragments-result-sets-sidebar",
     "rest_v1_twin": {
@@ -606,6 +617,17 @@
       "path": "/api/v1/result-sets/{param}"
     },
     "mcp_twin": "get_result_set",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/result-sets/{param}/members",
+    "capability_id": "get.fragments-result-sets-param-members",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/result-sets/{param}/members"
+    },
+    "mcp_twin": "get_result_set_members",
     "status": "twinned"
   },
   {

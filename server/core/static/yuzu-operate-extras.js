@@ -374,7 +374,235 @@
     if (btnTar) btnTar.addEventListener('click', openTarForm);
   }
 
-  var controllers = { dashboard: dashboard };
+  /* ---------------------------------------------------------------------- */
+  /* Result sets                                                            */
+  /* ---------------------------------------------------------------------- */
+  function resultSets() {
+    var out = $('ox-rs-out');
+    var busy = false;
+
+    function say(kind, text) {
+      clear(out);
+      if (text) out.appendChild(el('div', 'ox-note ' + (kind || ''), text));
+    }
+    function refresh() {
+      if (window.htmx) window.htmx.trigger(body, 'resultSetsChanged');
+    }
+
+    /* Route errors, SPEC 5.4. The 500 after dispatch is the one that must not be re-sent. */
+    function failText(r) {
+      var m = errText(r.data, '');
+      if (r.status === 0) return 'The request may not have applied. Check the list before retrying.';
+      if (r.status === 500 && /FAULT_AFTER_DISPATCH/.test(m)) {
+        return 'The command was sent but the result set was not saved. Do not send it again; ' +
+               'check the Executions page.';
+      }
+      if (r.status === 403) return 'Your role may not do this. Ask an administrator for the permission.';
+      if (r.status === 429) return m || 'You have reached the result set limit. Delete one first.';
+      return m || 'The request failed. Nothing was created.';
+    }
+
+    /* Run one producer call: dialogs finished, show the outcome, reload the list. */
+    function send(url, json, what) {
+      if (busy) return Promise.resolve();
+      busy = true;
+      say('', 'Sending...');
+      return api('POST', url, json).then(function (r) {
+        busy = false;
+        if (r.ok) {
+          var d = r.data && r.data.data;
+          say('ok', what + ' ' + (r.status === 202 ? 'started' : 'created') +
+              (d && d.name ? ': ' + d.name : '') + '.' +
+              (r.status === 202 ? ' It stays Pending until devices respond.' : ''));
+          refresh();
+        } else {
+          say('bad', failText(r));
+        }
+      });
+    }
+
+    /* The caller's own sets, for the parent select (`__all__` = no parent). */
+    function parentOptions() {
+      return api('GET', '/api/v1/result-sets?limit=200').then(function (r) {
+        var opts = [{ label: 'Entire fleet (no parent)', value: '' }];
+        var sets = r.ok && r.data && r.data.data && r.data.data.result_sets;
+        (Array.isArray(sets) ? sets : []).forEach(function (s) {
+          opts.push({ label: (s.name || s.id) + ' (' + s.device_count + ' devices)', value: s.id });
+        });
+        return opts;
+      });
+    }
+
+    function add(json, f) { if (f.parent) json.parent_id = f.parent; if (f.name.trim()) json.name = f.name.trim(); return json; }
+
+    /* ---- R3 From instruction ---- */
+    function fromInstruction() {
+      /* The one raw fetch: the producer picker is an HTML fragment, which the shared JSON helper
+         does not return. Same-origin, no cache, bounded by a 15 s timeout. */
+      var init = { credentials: 'same-origin', cache: 'no-store' };
+      try { init.signal = AbortSignal.timeout(15000); } catch (e) { /* older browsers: no timeout */ }
+      window.fetch('/fragments/result-sets/producers', init)
+        .then(function (r) { return r.text(); })
+        .then(function (t) {
+          var doc = new DOMParser().parseFromString(t, 'text/html');
+          if (doc.querySelector('[data-denied]') || doc.querySelector('[data-degraded]') ||
+              doc.querySelector('[data-empty]') || !doc.querySelector('option')) {
+            var n = doc.querySelector('[data-denied],[data-degraded],[data-empty]');
+            say('warn', n ? n.textContent : 'No instruction can produce a result set.');
+            return null;
+          }
+          var instr = [];
+          doc.querySelectorAll('option').forEach(function (o) {
+            instr.push({ label: o.textContent, value: o.value });
+          });
+          return Promise.all([parentOptions()]).then(function (p) { return { instr: instr, parents: p[0] }; });
+        })
+        .then(function (c) {
+          if (!c) return;
+          return window.YuzuDialog.form({
+            title: 'Create from an instruction',
+            body: ['Runs the instruction on every device in the parent scope and keeps the ' +
+                   'devices that answer. Approval rules are not applied; only read-only ' +
+                   'instructions that need no approval are listed.'],
+            fields: [
+              { name: 'instruction', label: 'Instruction', type: 'select', options: c.instr },
+              { name: 'parent', label: 'Parent scope', type: 'select', options: c.parents },
+              { name: 'name', label: 'Name (optional)', type: 'text', maxlength: 128 },
+              { name: 'column', label: 'Keep devices where column (optional)', type: 'text', maxlength: 128 },
+              { name: 'op', label: 'Operator', type: 'select', options: [
+                { label: 'equals', value: '==' }, { label: 'not equal', value: '!=' },
+                { label: 'contains', value: 'contains' }, { label: 'greater than', value: '>' },
+                { label: 'less than', value: '<' }] },
+              { name: 'value', label: 'Value', type: 'text', maxlength: 512 }
+            ],
+            submitLabel: 'Review',
+            validate: function (v) {
+              return v.column.trim() && !v.value.trim() ? 'Enter a value for the column.' : null;
+            }
+          }).then(function (v) {
+            if (!v) return;
+            var json = add({ instruction_id: v.instruction }, v);
+            if (v.column.trim()) json.matcher = { column: v.column.trim(), op: v.op, value: v.value };
+            return oxConfirm({
+              title: 'Run this instruction?',
+              paragraphs: ['This dispatches to every device in the parent scope.'],
+              facts: [['Parent', v.parent || 'Entire fleet']],
+              confirmLabel: 'Create result set',
+              danger: true
+            }).then(function (ok) { if (ok) return send('/api/v1/result-sets/from-instruction-result', json, 'Result set'); });
+          });
+        })
+        .catch(function () { say('bad', 'The producer list could not be read.'); });
+    }
+
+    /* ---- R4 From inventory (reads inventory only, synchronous) ---- */
+    function fromInventory() {
+      parentOptions().then(function (parents) {
+        return window.YuzuDialog.form({
+          title: 'Create from an inventory query',
+          body: ['Keeps the devices whose stored inventory matches. Nothing is sent to devices.'],
+          fields: [
+            { name: 'plugin', label: 'Plugin', type: 'text', required: true, maxlength: 128 },
+            { name: 'field', label: 'Field', type: 'text', required: true, maxlength: 128 },
+            { name: 'op', label: 'Operator', type: 'select', options: [
+              { label: 'equals', value: '==' }, { label: 'not equal', value: '!=' },
+              { label: 'contains', value: 'contains' }, { label: 'exists', value: 'exists' },
+              { label: 'at least version', value: 'version_gte' },
+              { label: 'at most version', value: 'version_lte' },
+              { label: 'greater or equal', value: '>=' }, { label: 'less or equal', value: '<=' }] },
+            { name: 'value', label: 'Value', type: 'text', maxlength: 512 },
+            { name: 'parent', label: 'Parent scope', type: 'select', options: parents },
+            { name: 'name', label: 'Name (optional)', type: 'text', maxlength: 128 }
+          ],
+          submitLabel: 'Create result set',
+          validate: function (v) {
+            return v.op !== 'exists' && !v.value.trim() ? 'Enter a value.' : null;
+          }
+        });
+      }).then(function (v) {
+        if (!v) return;
+        var cond = { plugin: v.plugin.trim(), field: v.field.trim(), op: v.op };
+        if (v.op !== 'exists') cond.value = v.value;
+        return send('/api/v1/result-sets/from-inventory-query',
+                    add({ conditions: [cond], combine: 'all' }, v), 'Result set');
+      });
+    }
+
+    /* ---- R5 From TAR query: the home of the retired Ad-hoc TAR SQL frame ---- */
+    function fromTar() {
+      parentOptions().then(function (parents) {
+        return window.YuzuDialog.form({
+          title: 'Create from a TAR query',
+          body: ['Runs the SELECT on every device in the parent scope and keeps the devices ' +
+                 'that return rows.'],
+          fields: [
+            { name: 'parent', label: 'Parent scope', type: 'select', options: parents },
+            { name: 'sql', label: 'SQL (SELECT only)', type: 'textarea', rows: 6,
+              maxlength: 100000, required: true,
+              placeholder: "SELECT DISTINCT pid FROM process_live WHERE name = 'chrome.exe'" },
+            { name: 'name', label: 'Name (optional)', type: 'text', maxlength: 120 },
+            { name: 'empty', label: 'Devices that return 0 rows', type: 'select', options: [
+              { label: 'Leave out', value: 'no' }, { label: 'Include', value: 'yes' }] }
+          ],
+          submitLabel: 'Review'
+        });
+      }).then(function (v) {
+        if (!v) return;
+        var sql = v.sql.trim();
+        var shown = sql.length > 200 ? sql.slice(0, 200) + '... (' + sql.length + ' characters)' : sql;
+        return oxConfirm({
+          title: 'Run this query?',
+          paragraphs: ['Queries every device in the parent scope. The text below is exactly ' +
+                       'what is sent.'],
+          facts: [['Parent', v.parent || 'Entire fleet']],
+          pre: shown,
+          confirmLabel: 'Create result set',
+          danger: true
+        }).then(function (ok) {
+          if (!ok) return;
+          return send('/api/v1/result-sets/from-tar-query',
+                      add({ sql: sql, include_empty: v.empty === 'yes' }, v), 'Result set');
+        });
+      });
+    }
+
+    /* ---- R8 Re-evaluate: always a NEW set; the existing one is unchanged ---- */
+    function rerun(id, name) {
+      oxConfirm({
+        title: 'Re-evaluate this result set?',
+        paragraphs: ['This runs the original query again on every device in scope. It creates a ' +
+                     'new set; the existing set is unchanged.'],
+        facts: [['Result set', name || id]],
+        confirmLabel: 'Re-evaluate',
+        danger: true
+      }).then(function (ok) {
+        if (ok) return send('/api/v1/result-sets/' + encodeURIComponent(id) + '/re-eval', undefined,
+                            'Re-evaluation');
+      });
+    }
+
+    var b = $('ox-rs-instr'); if (b) b.addEventListener('click', fromInstruction);
+    b = $('ox-rs-inv'); if (b) b.addEventListener('click', fromInventory);
+    b = $('ox-rs-tar'); if (b) b.addEventListener('click', fromTar);
+
+    /* The detail pane is swapped by htmx, so its buttons are handled by delegation
+       (the page CSP forbids inline handlers). */
+    body.addEventListener('click', function (e) {
+      var t = e.target && e.target.closest ? e.target.closest('[data-ox-copy],[data-ox-reeval]') : null;
+      if (!t) return;
+      if (t.hasAttribute('data-ox-copy')) {
+        var text = t.getAttribute('data-ox-copy');
+        var done = function () { t.textContent = 'Copied'; };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, function () { t.textContent = 'Copy failed'; });
+        } else { t.textContent = 'Copy failed'; }
+      } else {
+        rerun(t.getAttribute('data-ox-reeval'), t.getAttribute('data-ox-name'));
+      }
+    });
+  }
+
+  var controllers = { dashboard: dashboard, 'result-sets': resultSets };
   function boot() {
     var c = controllers[page];
     if (c) c();

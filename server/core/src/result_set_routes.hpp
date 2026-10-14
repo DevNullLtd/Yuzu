@@ -133,6 +133,12 @@
 /// `device_ids` (or supplies an empty array) is completely unaffected — the
 /// gate, the registry read, and the audit call are all skipped.
 ///
+/// Operate extras added two read-only routes (8 in all), each gated like the rest on
+/// deny_service_scoped THEN auth (owner scope), with the producer picker additionally gated on
+/// `Execution:Execute` and `InstructionDefinition:Read` (denied is a 200 note):
+///   GET  /fragments/result-sets/(rs_[0-9a-f]+)/members (B-5; owner-checked, ids only)
+///   GET  /fragments/result-sets/producers              (B-6)
+///
 /// Routes (6) — every route gates on `deps.deny_service_scoped_fn` (target
 /// varies per-route below) THEN `deps.auth_fn`; none uses `perm_fn`/
 /// `scoped_perm_fn` (this is an owner-scoped surface, not an RBAC-securable
@@ -146,20 +152,24 @@
 ///   POST /fragments/result-sets/create                 (target_type="ResultSet", no target_id)
 
 #include "authz_gates.hpp" // #4983 -- authz::FleetReadGate, the create route's device_ids gate result
+#include "command_capability.hpp" // operate extras: CommandCapability / ClassificationError
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include <httplib.h>
 
+#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
 class HttpRouteSink;
 class ResultSetStore;
+class InstructionStore;
 } // namespace yuzu::server
 
 namespace yuzu::server::result_set {
@@ -229,6 +239,19 @@ struct Deps {
         std::function<bool(const httplib::Request&, httplib::Response&, const auth::Session&,
                            const std::string& securable_type, const std::string& operation)>;
 
+    /// Operate extras (B-6, re-evaluate verdict): the RBAC probe, same shape as every other
+    /// module's `perm_fn` (writes a 403 to `res` on deny). Used ONLY by the producer picker and
+    /// the re-evaluate button's visibility, always against a throwaway Response so a denial
+    /// becomes a 200 note, never a dropped 4xx body. Unwired `{}` = both read as denied.
+    using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
+                                      const std::string& type, const std::string& op)>;
+    /// The SAME classifier the Console and MCP consult (`capability_registry_.classify`). Unwired
+    /// `{}` = nothing classifies as read-only: the picker is empty and Re-evaluate is hidden
+    /// (fail closed), never "everything is fine".
+    using ClassifyFn = std::function<std::expected<yuzu::server::CommandCapability,
+                                                   yuzu::server::ClassificationError>(
+        std::string_view plugin, std::string_view action)>;
+
     AuthFn auth_fn;
     DenyServiceScopedFn deny_service_scoped_fn;
     AuditFn audit_fn;
@@ -247,6 +270,10 @@ struct Deps {
     /// `custom_properties_store_`/`CustomPropertiesStore`, whose routes DO
     /// check `is_open()`).
     ResultSetStore* store{nullptr};
+    PermFn perm_fn;
+    ClassifyFn classify_fn;
+    /// `ServerImpl::instruction_store_`; null or not open = the picker says "unavailable".
+    InstructionStore* instruction_store{nullptr};
     /// `&ServerImpl::metrics_`. UNLIKE the original inline code (where
     /// `metrics_` is a non-pointer `ServerImpl` member, always valid), this
     /// field is a nullable pointer — the create route's quota-rejection
@@ -258,7 +285,7 @@ struct Deps {
     yuzu::MetricsRegistry* metrics{nullptr};
 };
 
-/// Register all 6 Result Sets fragment routes against `sink`.
+/// Register all 8 Result Sets fragment routes against `sink`.
 void register_result_set_routes(HttpRouteSink& sink, Deps deps);
 
 } // namespace yuzu::server::result_set

@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "operate_extras_ui.hpp"
+#include "result_sets_ui.hpp"
 
 #include <cstring>
 #include <regex>
@@ -94,8 +95,11 @@ TEST_CASE("operate extras: the controller never writes server data as markup",
     // Every request goes through the shared helper (15 s bound, step-up, 401 redirect) and no
     // second dialog or fetch implementation lives here.
     CHECK(has(js, "window.YuzuDialog.request("));
-    CHECK_FALSE(has(js, "fetch("));
     CHECK_FALSE(has(js, "showModal"));
+    // The only raw fetch is the producer picker's HTML fragment, and it is bounded.
+    CHECK(js.find("fetch(") == js.rfind("fetch("));
+    CHECK(has(js, "window.fetch('/fragments/result-sets/producers', init)"));
+    CHECK(has(js, "AbortSignal.timeout(15000)"));
 }
 
 TEST_CASE("operate extras: the scope helper uses the real routes and bounds its output",
@@ -146,4 +150,36 @@ TEST_CASE("operate extras: an expression send omits scope-input and needs a prev
     // The route's 400 reason is shown, read as text.
     CHECK(has(js, "DOMParser"));
     CHECK(has(js, "[data-reason]"));
+}
+
+TEST_CASE("operate extras: the Result sets page hosts the producers and the controller",
+          "[ui][operate_extras]") {
+    const std::string page = yuzu::server::kResultSetsPageHtml;
+    CHECK(has(page, "<body data-page=\"result-sets\">"));
+    CHECK(has(page, "id=\"ox-rs-instr\""));
+    CHECK(has(page, "id=\"ox-rs-inv\""));
+    CHECK(has(page, "id=\"ox-rs-tar\""));
+    const auto d = page.find("src=\"/static/yuzu-dialog.js\"");
+    REQUIRE(d != std::string::npos);
+    CHECK(d < page.find("src=\"/static/yuzu-operate-extras.js\""));
+    // CSP: the page carries no inline handler and no hx-on.
+    CHECK_FALSE(has(page, "hx-on"));
+    CHECK_FALSE(std::regex_search(page, std::regex("\\son(click|change|submit)\\s*=")));
+}
+
+TEST_CASE("operate extras: result set producers call the real REST routes and confirm first",
+          "[ui][operate_extras][security]") {
+    const auto& js = yuzu::server::kYuzuOperateExtrasJs;
+    CHECK(has(js, "/api/v1/result-sets/from-instruction-result"));
+    CHECK(has(js, "/api/v1/result-sets/from-inventory-query"));
+    CHECK(has(js, "/api/v1/result-sets/from-tar-query"));
+    CHECK(has(js, "/re-eval"));
+    CHECK(has(js, "/fragments/result-sets/producers"));
+    // A fan-out or re-run is confirmed with what it will do.
+    CHECK(has(js, "'Run this instruction?'"));
+    CHECK(has(js, "'Run this query?'"));
+    CHECK(has(js, "the existing set is unchanged"));
+    // The after-dispatch store fault must tell the operator not to re-send.
+    CHECK(has(js, "FAULT_AFTER_DISPATCH"));
+    CHECK(has(js, "Do not send it again"));
 }
