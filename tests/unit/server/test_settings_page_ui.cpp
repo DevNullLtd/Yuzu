@@ -1,6 +1,6 @@
 /// @file test_settings_page_ui.cpp
 /// Pure-string pins on the /settings page shell (`kSettingsHtml`, settings_ui.cpp,
-/// served verbatim by GET /settings). The page is one static document whose 22 panels each
+/// served verbatim by GET /settings). The page is one static document whose 21 panels each
 /// lazy-load one fragment, so a panel dropped, renamed or detached from its loader by a
 /// restyle leaves every route test green. Data in, markup out: no server, no store, no
 /// request. The fragment routes themselves are covered by the test_settings_routes_*.cpp
@@ -25,7 +25,7 @@ struct Panel {
 };
 
 // In page order.
-constexpr std::array<Panel, 22> kPanels{{
+constexpr std::array<Panel, 21> kPanels{{
     {"Server Configuration", "server-config-section", "/fragments/settings/server-config"},
     {"TLS / mTLS Configuration", "tls-section", "/fragments/settings/tls"},
     {"HTTPS Dashboard", "https-section", "/fragments/settings/https"},
@@ -60,7 +60,7 @@ std::size_t count_of(const std::string& haystack, std::string_view needle) {
 
 } // namespace
 
-TEST_CASE("Settings page carries all 22 panels, each wired to its fragment loader",
+TEST_CASE("Settings page carries all 21 panels, each wired to its fragment loader",
           "[settings][settings_page]") {
     const std::string html = kSettingsHtml;
 
