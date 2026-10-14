@@ -157,6 +157,20 @@ static std::string oidc_bind_cookie_clear(bool https) {
            "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (https ? "; Secure" : "");
 }
 
+// Probes (`AuthRoutes::has_permission`) in flight on this thread. While it is non-zero
+// `audit_log` is a no-op that reports success: the probe runs `require_permission` unchanged and
+// only its denial audit row is withheld. thread_local because httplib serves a request start to
+// finish on one thread and `require_permission` is synchronous, so a probe never leaks into
+// another request's audit writes.
+thread_local int g_audit_probe_depth = 0;
+
+struct AuditProbeScope {
+    AuditProbeScope() { ++g_audit_probe_depth; }
+    ~AuditProbeScope() { --g_audit_probe_depth; }
+    AuditProbeScope(const AuditProbeScope&) = delete;
+    AuditProbeScope& operator=(const AuditProbeScope&) = delete;
+};
+
 } // namespace
 
 namespace detail {
@@ -659,6 +673,13 @@ bool AuthRoutes::service_scope_admits(std::string_view securable_type,
         return false;
     }
     return authz::service_scope_global_safe(securable_type, operation);
+}
+
+bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& securable_type,
+                                const std::string& operation) {
+    httplib::Response discarded; // require_permission writes its 403/503 here, never to the page
+    const AuditProbeScope probe;
+    return require_permission(req, discarded, securable_type, operation);
 }
 
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
@@ -1488,6 +1509,8 @@ void AuthRoutes::reap_mfa_pending_locked() {
 bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
+    if (g_audit_probe_depth > 0)
+        return true; // a has_permission probe: nothing was attempted, so nothing is recorded
     if (!audit_store_)
         return true; // audit-off deployment — not a failure relative to config
     auto event = make_audit_event(req, action, result);

@@ -569,6 +569,7 @@ yuzu_server_core_lib = static_library(
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
+    'src/result_set_extras_render.cpp',
     'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
     'src/approvals_ui.cpp',
     'src/executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
