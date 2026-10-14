@@ -1,0 +1,1 @@
+- Private key files are now created with owner-only permissions from the start (the TLS server key written by the Settings certificate upload and paste routes, and the directory those routes create).

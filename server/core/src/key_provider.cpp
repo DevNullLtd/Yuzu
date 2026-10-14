@@ -304,20 +304,38 @@ std::optional<std::string> FileKeyProvider::store_key(std::string_view key_id,
     return dest.string();
 }
 
+bool FileKeyProvider::store_named_file(std::string_view file_name, std::string_view bytes) {
+    if (!is_safe_key_id(file_name)) {
+        spdlog::error("key_provider: rejected unsafe file name '{}'", std::string(file_name));
+        return false;
+    }
+    if (bytes.empty() || bytes.size() > kMaxKeyPemSize) {
+        spdlog::error("key_provider: refusing empty/oversized file '{}' ({} bytes)",
+                      std::string(file_name), bytes.size());
+        return false;
+    }
+    return write_file_atomic(file_name, base_dir_ / std::string(file_name),
+                             {reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()},
+                             /*tighten_existing_dir=*/false);
+}
+
 bool FileKeyProvider::write_file_atomic(std::string_view key_id, const fs::path& dest,
-                                        std::span<const std::uint8_t> bytes) {
+                                        std::span<const std::uint8_t> bytes,
+                                        bool tighten_existing_dir) {
     std::error_code ec;
-    fs::create_directories(base_dir_, ec);
+    const bool dir_created = fs::create_directories(base_dir_, ec);
     if (ec) {
         spdlog::error("key_provider: cannot create {}: {}", base_dir_.string(), ec.message());
         return false;
     }
     // Owner-only directory so the brief pre-chmod window on the temp file is not
     // exposed to other local users.
-    fs::permissions(base_dir_, fs::perms::owner_all, fs::perm_options::replace, ec);
-    if (ec)
-        spdlog::warn("key_provider: could not set 0700 on {}: {}", base_dir_.string(),
-                     ec.message()); // UP-13: files are 0600, so exposure is listing-only
+    if (tighten_existing_dir || dir_created) {
+        fs::permissions(base_dir_, fs::perms::owner_all, fs::perm_options::replace, ec);
+        if (ec)
+            spdlog::warn("key_provider: could not set 0700 on {}: {}", base_dir_.string(),
+                         ec.message()); // UP-13: files are 0600, so exposure is listing-only
+    }
 
 #ifdef _WIN32
     // POSIX mode bits are advisory on Windows; the real owner-only control is

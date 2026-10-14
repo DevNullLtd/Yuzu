@@ -18,11 +18,17 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 using namespace yuzu::server;
 
@@ -64,6 +70,72 @@ TEST_CASE("FileKeyProvider: stored key is 0600", "[key_provider][posix]") {
     REQUIRE((p & fs::perms::others_all) == fs::perms::none);
 }
 #endif
+
+#ifndef _WIN32
+TEST_CASE("FileKeyProvider: store_named_file writes 0600 regardless of umask",
+          "[key_provider][posix][security]") {
+    namespace fs = std::filesystem;
+    yuzu::test::TempDir dir;
+    FileKeyProvider provider(dir.path / "fresh"); // created by the call => 0700
+
+    const mode_t old = ::umask(0); // a plain create would now be 0666
+    const bool ok = provider.store_named_file("server-key.pem", kSampleKey);
+    ::umask(old);
+    REQUIRE(ok);
+
+    const auto key = dir.path / "fresh" / "server-key.pem";
+    REQUIRE((fs::status(key).permissions() & fs::perms::mask) ==
+            (fs::perms::owner_read | fs::perms::owner_write));
+    REQUIRE((fs::status(dir.path / "fresh").permissions() & fs::perms::mask) ==
+            fs::perms::owner_all);
+}
+
+TEST_CASE("FileKeyProvider: store_named_file replaces a planted symlink, never follows it",
+          "[key_provider][posix][security]") {
+    namespace fs = std::filesystem;
+    yuzu::test::TempDir dir;
+    const auto victim = dir.path / "victim";
+    REQUIRE(fs::create_directories(dir.path / "certs"));
+    {
+        std::ofstream v(victim);
+        v << "untouched";
+    }
+    fs::create_symlink(victim, dir.path / "certs" / "server-key.pem");
+
+    FileKeyProvider provider(dir.path / "certs");
+    REQUIRE(provider.store_named_file("server-key.pem", kSampleKey));
+
+    std::ifstream in(victim);
+    std::string got((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    REQUIRE(got == "untouched");
+    REQUIRE_FALSE(fs::is_symlink(dir.path / "certs" / "server-key.pem"));
+}
+
+TEST_CASE("FileKeyProvider: store_named_file leaves an existing dir's mode alone",
+          "[key_provider][posix]") {
+    namespace fs = std::filesystem;
+    yuzu::test::TempDir dir;
+    REQUIRE(fs::create_directories(dir.path));
+    fs::permissions(dir.path,
+                    fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec,
+                    fs::perm_options::replace); // 0750
+    FileKeyProvider provider(dir.path);
+    REQUIRE(provider.store_named_file("server-key.pem", kSampleKey));
+    REQUIRE((fs::status(dir.path).permissions() & fs::perms::mask) ==
+            (fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec));
+}
+#endif
+
+TEST_CASE("FileKeyProvider: store_named_file rejects unsafe names and bad sizes",
+          "[key_provider][security][negative]") {
+    yuzu::test::TempDir dir;
+    FileKeyProvider provider(dir.path);
+    REQUIRE_FALSE(provider.store_named_file("../evil.pem", kSampleKey));
+    REQUIRE_FALSE(provider.store_named_file("a/b.pem", kSampleKey));
+    REQUIRE_FALSE(provider.store_named_file("", kSampleKey));
+    REQUIRE_FALSE(provider.store_named_file("k.pem", ""));
+    REQUIRE_FALSE(provider.store_named_file("k.pem", std::string(1024 * 1024 + 1, 'x')));
+}
 
 TEST_CASE("FileKeyProvider: rejects unsafe key_id (traversal)", "[key_provider][security]") {
     yuzu::test::TempDir dir;

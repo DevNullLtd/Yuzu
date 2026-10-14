@@ -1687,6 +1687,7 @@ if build_server
       'unit/server/test_settings_routes_enrollment.cpp', # WS-6 6.2 enrollment mutations: audit rows, atomic bulk, fail-closed
       'unit/server/test_settings_routes_dex_alerts.cpp',
       'unit/server/test_settings_routes_ota_audit.cpp',
+      'unit/server/test_settings_routes_cert_upload.cpp', # TLS server key created 0600 / dir 0700, symlink replaced not followed
       'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
