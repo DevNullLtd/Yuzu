@@ -80,6 +80,7 @@
 #include "data_export.hpp"
 #include "deployment_store.hpp"
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
+#include "discovered_devices_reader.hpp" // make_discovered_devices_reader (core wiring)
 #include "discovery_store.hpp"
 #include "engine_principal_store.hpp"
 #include "execution_event_bus.hpp"
@@ -17583,8 +17584,15 @@ private:
         // MCP network tools, so all three can never disagree.
         auto network_api = make_local_network_api(health_store_, registry_, tag_store_.get());
 
+        // Discovered-devices read seam: one reader over the discovery store,
+        // shared by the REST + fragment routes below and the MCP tool. A null
+        // or unopened store yields a reader that errors, so a store fault is
+        // never rendered as "no hosts".
+        auto discovered_reader = make_discovered_devices_reader(discovery_store_.get());
+
         network_routes_ = std::make_unique<NetworkRoutes>();
-        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, network_api);
+        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, network_api,
+                                         discovered_reader);
 
         // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
         // page; Device-info lens). Sourced from the live registry (the CONNECTED
@@ -20290,6 +20298,8 @@ private:
             // DeploymentRoutes already hold (constructed well before this
             // point, server.cpp:4041) — no new construction needed.
             mcp_server_->set_preflight_run_store(preflight_run_store_.get());
+            // Network discovery read twin — the same reader NetworkRoutes holds.
+            mcp_server_->set_discovered_devices_reader(discovered_reader);
             // #2146 Batch B2 — backs the 12 result-set MCP tools. Same store
             // ResultSetRoutes/rest_api_v1's result-set routes already hold
             // (constructed well before this point) — no new construction

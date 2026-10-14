@@ -29,6 +29,7 @@
  * documented on that macro.
  */
 
+#include "discovered_devices_reader.hpp"
 #include "discovery_store.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -293,5 +294,60 @@ TEST_CASE("DiscoveryStore: clear_results", "[pg][discovery][crud]") {
         REQUIRE(rows.has_value());
         CHECK(find(*rows, "10.0.7.1") == nullptr);
         CHECK(find(*rows, "10.0.7.2") == nullptr);
+    }
+}
+
+// ── bounded read + summary (the discovered-devices read twin) ───────────────
+
+TEST_CASE("DiscoveryStore: list_devices_checked bounds, filters and orders",
+          "[pg][discovery][twin]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+
+    for (int i = 1; i <= 5; ++i)
+        REQUIRE(store.upsert_device(make_device("10.0.0." + std::to_string(i))));
+    REQUIRE(store.upsert_device(make_device("10.0.1.1", "10.0.1.0/24")));
+    REQUIRE(store.upsert_device(make_device("10.0.2.1", ""))); // no subnet recorded
+
+    SECTION("limit caps the rows; a non-positive limit still reads one") {
+        auto three = store.list_devices_checked("", 3);
+        REQUIRE(three.has_value());
+        CHECK(three->size() == 3);
+        auto floor = store.list_devices_checked("", 0);
+        REQUIRE(floor.has_value());
+        CHECK(floor->size() == 1);
+    }
+    SECTION("subnet filter is exact") {
+        auto rows = store.list_devices_checked("10.0.1.0/24", 50);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK((*rows)[0].ip_address == "10.0.1.1");
+        auto none = store.list_devices_checked("10.9.9.0/24", 50);
+        REQUIRE(none.has_value());
+        CHECK(none->empty()); // a genuine empty value, not a failure
+    }
+    SECTION("summarize counts rows and distinct non-empty subnets, filtered or not") {
+        auto all = store.summarize();
+        REQUIRE(all.has_value());
+        CHECK(all->total == 7);
+        CHECK(all->subnets == 2);
+        auto one = store.summarize("10.0.0.0/24");
+        REQUIRE(one.has_value());
+        CHECK(one->total == 5);
+        CHECK(one->subnets == 1);
+    }
+    SECTION("the reader flags truncation only when more rows matched") {
+        auto read = yuzu::server::make_discovered_devices_reader(&store);
+        auto cut = read("10.0.0.0/24", 3);
+        REQUIRE(cut.has_value());
+        CHECK(cut->devices.size() == 3);
+        CHECK(cut->truncated);
+        CHECK(cut->summary.total == 5); // counts are over the filter, not the page
+        auto exact = read("10.0.0.0/24", 5);
+        REQUIRE(exact.has_value());
+        CHECK(exact->devices.size() == 5);
+        CHECK_FALSE(exact->truncated);
     }
 }
