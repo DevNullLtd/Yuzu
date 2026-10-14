@@ -1118,6 +1118,9 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/mcp"
     "/fragments/settings/nvd"
     "/fragments/settings/directory"
+    "/fragments/access/tokens/list"
+    "/fragments/access/principals/list"
+    "/fragments/access/principals/detail"
 )
 
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do
