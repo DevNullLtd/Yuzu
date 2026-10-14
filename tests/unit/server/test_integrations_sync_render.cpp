@@ -401,18 +401,9 @@ TEST_CASE("no renderer emits hx-on or an inline event handler", "[integrations][
     std::string all = render_webhooks(std::vector<WebhookRow>{hook(1, "https://a.example.invalid")});
     all += render_offload_targets(std::vector<OffloadRow>{target(1, "t", "https://a.example.invalid")});
     all += render_directory_panel(ok_view());
-    all += sync_panels_loader_html();
     CHECK(!contains(all, "hx-on"));
     CHECK(!contains(all, " onclick="));
     CHECK(!contains(all, " onchange="));
     CHECK(!contains(all, " onsubmit="));
     CHECK(!contains(all, " onerror="));
-}
-
-TEST_CASE("panel loader refreshes per panel, not body-wide", "[integrations][render]") {
-    const auto& html = sync_panels_loader_html();
-    CHECK_THAT(html, ContainsSubstring("refreshWebhooks from:body"));
-    CHECK_THAT(html, ContainsSubstring("refreshOffload from:body"));
-    CHECK_THAT(html, ContainsSubstring("refreshDirectory from:body"));
-    CHECK_THAT(html, ContainsSubstring("/static/yuzu-integrations-sync.js"));
 }

@@ -541,16 +541,4 @@ std::string render_not_found_note(std::string_view what) {
            "have been deleted.</div>";
 }
 
-const std::string& sync_panels_loader_html() {
-    static const std::string k =
-        "<section id=\"webhooks-section\" hx-get=\"/fragments/settings/webhooks\" "
-        "hx-trigger=\"load, refreshWebhooks from:body\" hx-swap=\"innerHTML\"></section>"
-        "<section id=\"offload-section\" hx-get=\"/fragments/settings/offload-targets\" "
-        "hx-trigger=\"load, refreshOffload from:body\" hx-swap=\"innerHTML\"></section>"
-        "<section id=\"directory-section\" hx-get=\"/fragments/settings/directory-sync\" "
-        "hx-trigger=\"load, refreshDirectory from:body\" hx-swap=\"innerHTML\"></section>"
-        "<script src=\"/static/yuzu-integrations-sync.js\" defer></script>";
-    return k;
-}
-
 } // namespace yuzu::server::integrations

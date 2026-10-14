@@ -113,10 +113,6 @@ render_directory_users(const std::expected<std::vector<DirectoryUser>, ReadError
 /// "Webhook/target not found" body for a deliveries fragment of a missing id.
 [[nodiscard]] std::string render_not_found_note(std::string_view what);
 
-/// The three section placeholders that load the panels above, plus the script
-/// tag for the page controller. Included by the Integrations page template.
-[[nodiscard]] const std::string& sync_panels_loader_html();
-
 // ── small pure helpers (exposed for tests) ───────────────────────────────────
 
 /// "2026-10-14 05:40 UTC"; "Never" for t <= 0.

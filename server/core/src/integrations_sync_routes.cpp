@@ -30,20 +30,7 @@ void send_html(httplib::Response& res, const std::string& body) {
     res.set_content(body, "text/html; charset=utf-8");
 }
 
-LastDelivery last_of(const std::optional<std::vector<WebhookDelivery>>& d) {
-    LastDelivery out;
-    if (!d) {
-        out.kind = LastDelivery::Kind::unknown;
-    } else if (!d->empty()) {
-        out.kind = LastDelivery::Kind::known;
-        out.status_code = d->front().status_code;
-        out.at = d->front().delivered_at;
-        out.error = d->front().error;
-    }
-    return out;
-}
-
-LastDelivery last_of(const std::optional<std::vector<OffloadDelivery>>& d) {
+template <class D> LastDelivery last_of(const std::optional<std::vector<D>>& d) {
     LastDelivery out;
     if (!d) {
         out.kind = LastDelivery::Kind::unknown;
