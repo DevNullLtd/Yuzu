@@ -41,6 +41,19 @@ TEST_CASE("dialog module: bundle shape, CSP-clean, bounded request",
     CHECK(has(js, "Promise.reject(new Error('dialog busy'))"));
 }
 
+TEST_CASE("dialog module: request is same-origin only and replays byte-identical content",
+          "[ui][dialog]") {
+    const auto& js = yuzu::server::kYuzuDialogJs;
+    // The url is resolved against the page and refused unless it is same-origin.
+    CHECK(has(js, "new URL(String(url), location.href)"));
+    CHECK(has(js, "u.origin !== location.origin"));
+    CHECK(has(js, "Only same-origin requests are allowed."));
+    // The body is serialised once; the MFA replay re-sends that snapshot, not live opts.
+    CHECK(has(js, "var prep = prepare(opts);"));
+    CHECK(has(js, "return send(method, url, prep);"));
+    CHECK_FALSE(has(js, "return rawRequest(method, url, opts);"));
+}
+
 TEST_CASE("dialog module: request maps both error shapes and the step-up contract",
           "[ui][dialog]") {
     const auto& js = yuzu::server::kYuzuDialogJs;
