@@ -126,6 +126,10 @@ TEST_CASE("known_agent_count is local UNION presence, deduped, and typed on a de
     (void)registry.register_agent(make_agent_info("local-1", "linux", "h1"));
     (void)registry.register_agent(make_agent_info("local-2", "linux", "h2"));
 
+    // No reader configured yet: the count is the local-only size, as all_ids().
+    REQUIRE(registry.known_agent_count().has_value());
+    CHECK(*registry.known_agent_count() == registry.local_agent_count());
+
     std::expected<std::vector<PresenceIdentity>, PresenceReadError> reply =
         std::vector<PresenceIdentity>{{"local-1", "h1", "linux", "", ""},
                                       {"remote-1", "h3", "windows", "", ""},
