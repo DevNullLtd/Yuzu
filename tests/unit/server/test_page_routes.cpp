@@ -2,7 +2,7 @@
 /// HTTP-level coverage for the page-shell/static-asset route module (#2542)
 /// — driven in-process through TestRouteSink (no httplib acceptor, #438),
 /// mirroring test_plugin_config_routes.cpp's Harness shape. None of these
-/// 34 routes touches Postgres (no store), so every case here runs without
+/// 35 routes touches Postgres (no store), so every case here runs without
 /// YUZU_TEST_POSTGRES_DSN.
 
 #include "page_routes.hpp"
@@ -101,6 +101,7 @@ const std::vector<AssetExpectation> kStaticAssets = {
     {"/static/yuzu-viz-host.js", "application/javascript; charset=utf-8", "no-cache"},
     {"/static/yuzu-operate.js", "application/javascript; charset=utf-8", "no-cache"},
     {"/static/yuzu-dialog.js", "application/javascript; charset=utf-8", "no-cache"},
+    {"/static/yuzu-device-data.js", "application/javascript; charset=utf-8", "no-cache"},
     {"/static/cytoscape.min.js", "application/javascript; charset=utf-8", "max-age=86400"},
     {"/static/fonts/ibm-plex-sans-latin-400-normal.woff2", "font/woff2", "max-age=2592000"},
     {"/static/fonts/ibm-plex-sans-latin-500-normal.woff2", "font/woff2", "max-age=2592000"},
