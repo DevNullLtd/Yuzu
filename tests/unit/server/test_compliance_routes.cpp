@@ -783,6 +783,35 @@ TEST_CASE("/fragments/policy-fragments: counts policies per fragment, honest emp
     CHECK(res->body.find("0 policies") != std::string::npos);
 }
 
+TEST_CASE("/fragments/policy-fragments: a capped policy list falls back to per-fragment counts",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto used = store.create_fragment(make_fragment_yaml("Capped Fragment"));
+    auto idle = store.create_fragment(make_fragment_yaml("Free Fragment"));
+    REQUIRE(used.has_value());
+    REQUIRE(idle.has_value());
+    // PolicyQuery{}.limit policies: the one policy read is cut at its cap, so
+    // counting from it would undercount and make Delete look safe.
+    const int cap = PolicyQuery{}.limit;
+    for (int i = 0; i < cap; ++i)
+        REQUIRE(store.create_policy(make_policy_yaml(used.value(), "Cap " + std::to_string(i)))
+                    .has_value());
+
+    ComplianceHarness h{&store};
+    auto res = h.sink.Get("/fragments/policy-fragments");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // The filtered read for the used fragment also hits its cap: "N+", Delete disabled.
+    CHECK(res->body.find(std::to_string(cap) + "+ policies") != std::string::npos);
+    CHECK(res->body.find("disabled title=\"In use by policies\"") != std::string::npos);
+    // The idle fragment is counted from its own filtered read, not the capped list.
+    CHECK(res->body.find("Free Fragment") != std::string::npos);
+    CHECK(res->body.find("0 policies") != std::string::npos);
+}
+
 TEST_CASE("compliance page: hosts the summary, detail, fragments and tag panels with denied notes",
           "[compliance][fragments]") {
     const std::string page = kComplianceHtml;
