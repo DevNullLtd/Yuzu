@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 
+namespace yuzu::server {
+extern const std::string kYuzuDeviceDataJs; // static/yuzu-device-data.js (build-time embed)
+}
+
 using namespace yuzu::server::device_data;
 
 namespace {
@@ -105,4 +109,24 @@ TEST_CASE("device data render: every operator and agent string is escaped and no
     CHECK_FALSE(contains(html, "onclick"));
     CHECK_FALSE(contains(html, "hx-on"));
     CHECK(contains(html, "&lt;img src=x onerror=1&gt;"));
+}
+
+// Bundle pin: the delegated listener is the only entry point and no server string can
+// reach a markup or code sink. Kills: an innerHTML write or a second listener per control.
+TEST_CASE("device data js: one delegated listener, no markup or dynamic-code sink",
+          "[device_data][js]") {
+    const auto& js = yuzu::server::kYuzuDeviceDataJs;
+    REQUIRE(js.size() > 2000);
+    for (const char* sink : {"innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "new Function(",
+                             "document.write", "hx-on", "window.confirm"})
+        CHECK_FALSE(contains(js, sink));
+    CHECK(contains(js, "data-act"));
+    CHECK(contains(js, "document.addEventListener('click'"));
+    // Exactly one document-level listener.
+    CHECK(js.find("addEventListener('click'") == js.rfind("addEventListener('click'"));
+    // Path segments are encoded and the property key regex matches the server's.
+    CHECK(contains(js, "'/api/agents/' + enc(agent) + '/properties/' + enc(key)"));
+    CHECK(contains(js, "/^[A-Za-z0-9_.:-]{1,64}$/"));
+    // These routes ignore the audit result (A2): no audit-failed banner here.
+    CHECK_FALSE(contains(js, "auditFailed"));
 }

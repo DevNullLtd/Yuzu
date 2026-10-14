@@ -1165,23 +1165,23 @@ TEST_CASE("route: Tags lens offers Remove only behind a Tag:Delete probe and hos
 
     auto full = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags");
     REQUIRE(full);
-    CHECK(contains(full->body, "hwTagSet(this)"));
-    CHECK(contains(full->body, "hwTagDelete(this)"));
+    CHECK(contains(full->body, "data-act=\"tag-add\""));
+    CHECK(contains(full->body, "data-act=\"tag-del\""));
     CHECK(contains(full->body, "/fragments/hardware/ci/properties?id=agent-1"));
     CHECK(contains(full->body, ">Tags and properties<"));
 
     h.allow_tag_delete = false;
     auto write_only = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags&lens_only=1");
     REQUIRE(write_only);
-    CHECK(contains(write_only->body, "hwTagSet(this)"));
-    CHECK_FALSE(contains(write_only->body, "hwTagDelete(this)"));
+    CHECK(contains(write_only->body, "data-act=\"tag-add\""));
+    CHECK_FALSE(contains(write_only->body, "data-act=\"tag-del\""));
 
     h.allow_tag_write = false;
     h.allow_tag_delete = true;
     auto delete_only = h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags&lens_only=1");
     REQUIRE(delete_only);
-    CHECK_FALSE(contains(delete_only->body, "hwTagSet(this)"));
-    CHECK(contains(delete_only->body, "hwTagDelete(this)"));
+    CHECK_FALSE(contains(delete_only->body, "data-act=\"tag-add\""));
+    CHECK(contains(delete_only->body, "data-act=\"tag-del\""));
 }
 
 // A record view on another lens must not pay a denied-probe audit row for a control it
@@ -1198,4 +1198,44 @@ TEST_CASE("route: the Tag:Delete probe is taken only when the Tags lens is the a
 
     REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags"));
     CHECK(std::count(h.probes.begin(), h.probes.end(), "Tag:Delete") == 1);
+}
+
+// The tags lens moved off the inline hwTagSet/hwTagDelete handlers onto data-act controls
+// served by static/yuzu-device-data.js and the shared dialog (A8b: no window.confirm).
+// Kills: restoring an inline onclick on Add or Remove.
+TEST_CASE("tags lens: controls are data-act, carry no inline handler, and name the service "
+          "sentences",
+          "[hardware][tags][render]") {
+    const std::vector<DeviceTag> tags{{"agent-1", "service", "web", "api", 0},
+                                      {"agent-1", "owner", "ops", "api", 0}};
+    const auto html = yuzu::server::render_hardware_tags_lens("agent-1", tags, true, true);
+    CHECK_FALSE(contains(html, "onclick="));
+    CHECK_FALSE(contains(html, "hwTag"));
+    CHECK(contains(html, "data-act=\"tag-add\""));
+    // The hint lists the real categories including the closed environment set.
+    CHECK(contains(html, "environment (Dev, UAT or Production, exact case)"));
+    CHECK(contains(html, "management group if it does not exist"));
+    // The Remove sentence rides only on the service row.
+    const auto svc = html.find("data-key=\"service\"");
+    const auto own = html.find("data-key=\"owner\"");
+    REQUIRE(svc != std::string::npos);
+    REQUIRE(own != std::string::npos);
+    CHECK(contains(html.substr(svc, own - svc), "data-service-note="));
+    CHECK_FALSE(contains(html.substr(own), "data-service-note="));
+}
+
+TEST_CASE("hardware shell loads the dialog module before the device-data controls",
+          "[hardware][route]") {
+    HwHarness h;
+    auto page = h.sink.Get("/hardware");
+    REQUIRE(page);
+    const auto dlg = page->body.find("src=\"/static/yuzu-dialog.js\" defer");
+    const auto dd = page->body.find("src=\"/static/yuzu-device-data.js\" defer");
+    REQUIRE(dlg != std::string::npos);
+    REQUIRE(dd != std::string::npos);
+    CHECK(dlg < dd);
+    // The bulk bar's Apply buttons carry the service sentence hwBulkTag shows.
+    auto list = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(list);
+    CHECK(contains(list->body, "data-service-note="));
 }

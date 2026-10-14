@@ -45,6 +45,11 @@ std::string page_shell(const std::string& title, const std::string& fragment_url
     };
     sub("{{TITLE}}", title);
     sub("{{FRAGMENT}}", fragment_url);
+    // The tags lens and the bulk bar open dialogs and post through the shared module; the
+    // shell is shared with pages that load neither, so only this route family adds them.
+    if (const auto end = html.rfind("</body>"); end != std::string::npos)
+        html.insert(end, "<script src=\"/static/yuzu-dialog.js\" defer></script>"
+                         "<script src=\"/static/yuzu-device-data.js\" defer></script>\n");
     // test_nav_shells.cpp pins that the shared shell carries the marker apply_shell fills.
     return shell::apply_shell(std::move(html), {.active_key = "hardware"});
 }

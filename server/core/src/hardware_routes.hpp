@@ -36,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -108,6 +109,17 @@ std::string render_hardware_sync_terminal(const std::string& agent_id, const std
 std::string render_hardware_software_lens(const std::string& agent_id,
                                           const std::optional<std::vector<SoftwareEntry>>& software,
                                           bool truncated, bool online, const HwSyncAffordance& sync);
+
+/// Tag dialog wording, shared by the tags lens, the bulk bar and their tests.
+/// The environment value set is closed and exact-case (TagStore::set_tag_checked).
+inline constexpr std::string_view kHwTagKeyHint =
+    "Common keys: role, environment (Dev, UAT or Production, exact case), location, service.";
+inline constexpr std::string_view kHwServiceTagSetNote =
+    "Setting it also creates the service's management group if it does not exist. The service "
+    "tag decides which service-scoped API tokens can reach this device.";
+inline constexpr std::string_view kHwServiceTagRemoveNote =
+    "The service tag decides which service-scoped API tokens can reach this device. Removing it "
+    "takes the device out of that service's scope.";
 
 std::string render_hardware_tags_lens(const std::string& agent_id,
                                       const std::optional<std::vector<DeviceTag>>& tags,

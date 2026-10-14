@@ -417,11 +417,11 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
          "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\">"
          "<input id=\"hw-bulk-value\" class=\"hw-search\" placeholder=\"value\" style=\"min-width:120px\" "
          "maxlength=\"448\">"
-         "<button type=\"button\" class=\"gp-btn accent\" onclick=\"hwBulkTag(this,'set')\">Apply</button>"
+         "<button type=\"button\" class=\"gp-btn accent\" data-service-note=\"" + esc(std::string(kHwServiceTagSetNote)) + "\" onclick=\"hwBulkTag(this,'set')\">Apply</button>"
          "<span class=\"hw-lab\">Remove tag</span>"
          "<input id=\"hw-bulk-rkey\" class=\"hw-search\" placeholder=\"key\" style=\"min-width:120px\" "
          "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\">"
-         "<button type=\"button\" class=\"gp-btn\" onclick=\"hwBulkTag(this,'delete')\">Apply</button>"
+         "<button type=\"button\" class=\"gp-btn\" data-service-note=\"" + esc(std::string(kHwServiceTagRemoveNote)) + "\" onclick=\"hwBulkTag(this,'delete')\">Apply</button>"
          "<button type=\"button\" class=\"gp-btn\" onclick=\"hwSelClear()\">Clear</button>"
          "</div>";
     h += "<div class=\"hw-toolbar\"><div class=\"gp-filters\">" + chip("All OS", "all", q, true) +
@@ -813,14 +813,13 @@ std::string render_hardware_tags_lens(const std::string& agent_id,
                "Retry shortly.</div>" + properties_host;
     std::string h = "<div class=\"hw-panel\">";
     if (can_write) {
-        // Posts JSON to the EXISTING /api/tags/set (scoped Tag:Write, audited tag.set)
-        // via hwTagSet — no new route. Key rules mirror TagStore::validate_key.
-        h += "<form class=\"hw-hdr\" data-agent=\"" + esc(agent_id) + "\" onsubmit=\"return false\">"
-             "<input class=\"hw-search\" name=\"key\" placeholder=\"key (e.g. owner)\" "
-             "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\" style=\"min-width:160px\">"
-             "<input class=\"hw-search\" name=\"value\" placeholder=\"value\" maxlength=\"448\">"
-             "<button type=\"button\" class=\"gp-btn accent\" onclick=\"hwTagSet(this)\">Add tag</button>"
-             "</form>";
+        // The Add tag dialog (static/yuzu-device-data.js) posts JSON to the EXISTING
+        // /api/tags/set (scoped Tag:Write, audited tag.set). The hint and the service
+        // sentence are server-authored so the page and its tests share one wording.
+        h += "<div class=\"hw-hdr\"><button type=\"button\" class=\"gp-btn accent\" "
+             "data-act=\"tag-add\" data-agent=\"" + esc(agent_id) + "\" data-hint=\"" +
+             esc(std::string(kHwTagKeyHint)) + "\" data-service-set-note=\"" +
+             esc(std::string(kHwServiceTagSetNote)) + "\">Add tag</button></div>";
     }
     if (tags->empty()) {
         h += "<div class=\"hw-empty\">No tags set on this device.</div></div>";
@@ -834,8 +833,12 @@ std::string render_hardware_tags_lens(const std::string& agent_id,
         h += "<tr><td class=\"hw-name\">" + esc(t.key) + "</td><td class=\"hw-mono\">" + esc(t.value) +
              "</td><td class=\"hw-mono\">" + esc(t.source) + "</td>";
         if (can_delete)
-            h += "<td><a class=\"gp-btn danger\" data-agent=\"" + esc(agent_id) + "\" data-key=\"" + esc(t.key) +
-                 "\" onclick=\"hwTagDelete(this)\">remove</a></td>";
+            h += "<td><button type=\"button\" class=\"gp-btn danger\" data-act=\"tag-del\" data-agent=\"" +
+                 esc(agent_id) + "\" data-key=\"" + esc(t.key) + "\"" +
+                 (t.key == "service"
+                      ? " data-service-note=\"" + esc(std::string(kHwServiceTagRemoveNote)) + "\""
+                      : std::string()) +
+                 ">Remove</button></td>";
         h += "</tr>";
     }
     h += "</tbody></table></div></div>";

@@ -761,23 +761,34 @@ const char* const kGuardianDetailPageTemplate =
       }
       if (!key) { showToast('Tag key is required', 'error'); return; }
       if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) { showToast('Tag key: letters, digits, _ . : - (max 64)', 'error'); return; }
-      btn.disabled = true;
-      var url = mode === 'set' ? '/api/tags/set' : '/api/tags/delete';
-      hwBulkRun(ids, function (id) {
-        var body = mode === 'set' ? { agent_id: id, key: key, value: value } : { agent_id: id, key: key };
-        return hwBulkFetchTag(url, body);
-      }, function (ok, denied, failed) {
-        btn.disabled = false;
-        var verb = mode === 'set' ? 'Tagged' : 'Untagged';
-        if (!failed.length) {
-          showToast(verb + ' ' + ok + '/' + ids.length, 'success');
-        } else {
-          var shown = failed.slice(0, 3).join(', ') + (failed.length > 3 ? ', …' : '');
-          var reason = denied ? (denied + ' denied') : (failed.length + ' failed');
-          showToast(verb + ' ' + ok + '/' + ids.length + ' — ' + reason + ': ' + shown, 'error');
-        }
-        hwBulkRefresh();
-      });
+      var apply = function () {
+        btn.disabled = true;
+        var url = mode === 'set' ? '/api/tags/set' : '/api/tags/delete';
+        hwBulkRun(ids, function (id) {
+          var body = mode === 'set' ? { agent_id: id, key: key, value: value } : { agent_id: id, key: key };
+          return hwBulkFetchTag(url, body);
+        }, function (ok, denied, failed) {
+          btn.disabled = false;
+          var verb = mode === 'set' ? 'Tagged' : 'Untagged';
+          if (!failed.length) {
+            showToast(verb + ' ' + ok + '/' + ids.length, 'success');
+          } else {
+            var shown = failed.slice(0, 3).join(', ') + (failed.length > 3 ? ', …' : '');
+            var reason = denied ? (denied + ' denied') : (failed.length + ' failed');
+            showToast(verb + ' ' + ok + '/' + ids.length + ' — ' + reason + ': ' + shown, 'error');
+          }
+          hwBulkRefresh();
+        });
+      };
+      // Confirm through the shared dialog when this page loaded it; the Guardian and
+      // DEX pages that share this script block do not, and keep the direct apply.
+      if (!window.YuzuDialog) { apply(); return; }
+      var body = [(mode === 'set' ? 'Set ' : 'Remove ') + 'tag ' + key + (mode === 'set' ? '=' + value : '') +
+        ' on ' + ids.length + ' selected device' + (ids.length === 1 ? '' : 's') + '?'];
+      if (key === 'service') body.push(btn.getAttribute('data-service-note') || '');
+      window.YuzuDialog.confirm({ title: mode === 'set' ? 'Set tag on devices' : 'Remove tag from devices',
+        body: body, confirmLabel: mode === 'set' ? 'Set tag' : 'Remove tag', danger: mode !== 'set' })
+        .then(function (ok) { if (ok) apply(); });
     }
   </script>
 )HTM"
