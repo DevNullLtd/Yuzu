@@ -109,7 +109,8 @@ std::string render_kill_switch_panel(const KillSwitchPanel& p) {
          "</div></form>";
 
     if (!p.input_error.empty())
-        return h + "<div class=\"pb\">" + "<p class=\"feedback-error\">" + esc(p.input_error) + "</p>" + "</div>";
+        return h + "<div class=\"pb\"><p class=\"feedback-error\">" + esc(p.input_error) +
+               "</p></div>";
     if (p.plugin.empty())
         return h + "<div class=\"pb hint\">Enter a plugin to see its switch at the all-OS layer "
                    "and each OS layer. A plugin with no switch set runs.</div>";

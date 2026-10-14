@@ -2398,9 +2398,11 @@ std::string SettingsRoutes::render_updates_fragment() {
                 const std::string pkg_path = url_path_segment(pkg.platform) + "/" +
                                              url_path_segment(pkg.arch) + "/" +
                                              url_path_segment(pkg.version);
-                // A number input, required and prefilled with the row's current value: a
-                // blank or non-numeric rollout_pct is read as 100 by the handler, so an empty
-                // box must never be submittable. data-* feed the page's confirm listener.
+                // A whole-number text input (digits 0 to 100 only: a number input also
+                // accepts 1e2, which stoi reads as 1), required and prefilled with the row's
+                // current value: a blank or non-numeric rollout_pct is read as 100 by the
+                // handler, so an empty box must never be submittable. data-* feed the page's
+                // confirm listener.
                 rollout_cell =
                     "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
                     "hx-post=\"/api/settings/updates/" +
@@ -2411,8 +2413,8 @@ std::string SettingsRoutes::render_updates_fragment() {
                     std::string(sig_covers ? "yes" : "no") + "\" data-mandatory=\"" +
                     std::string(pkg.mandatory ? "yes" : "no") +
                     "\">"
-                    "<input type=\"number\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
-                    "step=\"1\" required value=\"" +
+                    "<input type=\"text\" inputmode=\"numeric\" name=\"rollout_pct\" "
+                    "pattern=\"(100|[1-9]?[0-9])\" required value=\"" +
                     std::to_string(pkg.rollout_pct) +
                     "\" style=\"width:72px\" "
                     "aria-label=\"Offered to this percentage of devices\">"
@@ -2549,8 +2551,8 @@ std::string SettingsRoutes::render_updates_fragment() {
             "<span class=\"hint\">PEM CMS block, up to 64 KB.</span></div>"
             "<div class=\"mini-field\">"
             "<label>Rollout %</label>"
-            "<input type=\"number\" name=\"rollout_pct\" min=\"0\" max=\"100\" step=\"1\" "
-            "required value=\"100\" style=\"width:72px\">"
+            "<input type=\"text\" inputmode=\"numeric\" name=\"rollout_pct\" "
+            "pattern=\"(100|[1-9]?[0-9])\" required value=\"100\" style=\"width:72px\">"
             "<span class=\"hint\">0 to 100. Offered to this share of devices, chosen by device "
             "identity.</span></div>"
             "<div class=\"mini-field\" style=\"display:flex;align-items:center;gap:0.3rem\">"
@@ -3093,8 +3095,6 @@ std::optional<std::expected<TrustBundleStats, std::string>> read_on_disk_bundle(
 } // namespace
 
 std::string SettingsRoutes::render_plugin_signing_fragment() {
-    std::string html;
-
     // #4028 — shared builder (also feeds the hardened
     // GET /api/v2/agent/plugin-policy, plugin-signing's only REST twin —
     // #4144 moved it from /v1/, now deprecated);
@@ -3131,6 +3131,16 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             required = rc->has_value() && rc->value().value == "true";
         }
     }
+    return render_plugin_signing_panel(bundle, required, required_status_unknown);
+}
+
+// Pure renderer: the three inputs are everything the panel depends on, so a unit test can
+// drive every state (bundle present or absent, required on or off, 17+ subjects) without
+// touching the real certs directory.
+std::string render_plugin_signing_panel(
+    const std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>>& bundle,
+    bool required, bool required_status_unknown) {
+    std::string html;
     const auto v = settings_model::build_plugin_signing_settings(required, bundle);
     const bool enabled = v.at("enabled").get<bool>();
 

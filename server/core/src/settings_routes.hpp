@@ -14,6 +14,7 @@
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
+#include "plugin_signing_helpers.hpp"
 #include "runtime_config_store.hpp"
 #include "settings_model.hpp" // RetentionEnforced
 #include "tag_store.hpp"
@@ -45,6 +46,12 @@ class ScimStore;
 /// enrol), so a token the server refuses as expired is never listed Active.
 [[nodiscard]] bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
                                             std::chrono::system_clock::time_point now) noexcept;
+
+/// The plugin-signing panel for a given trust-bundle read, require flag and flag-read health
+/// (see SettingsRoutes::render_plugin_signing_fragment, which gathers them).
+std::string render_plugin_signing_panel(
+    const std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>>& bundle,
+    bool required, bool required_status_unknown);
 
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {

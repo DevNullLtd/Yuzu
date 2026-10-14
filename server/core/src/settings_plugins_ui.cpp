@@ -5,7 +5,7 @@
 // confirms; never `hx-on`, no inline handlers (the CSP blocks them, CLAUDE.md).
 //
 // MSVC: each raw-string chunk stays well under the 16,380-byte C2026 cap; the checks in
-// test_settings_plugins_ui.cpp pin the template as a whole.
+// test_settings_plugins_page.cpp pin the template as a whole.
 
 #include "app_shell.hpp"
 
@@ -241,12 +241,6 @@ constexpr char kPart3[] = R"HTM(  <script>
       if (q && window.confirm(q)) e.detail.issueRequest(true);
     });
 
-    document.addEventListener('keydown', function (e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        window.location.href = '/?palette=1';
-      }
-    });
   </script>
 </body>
 </html>

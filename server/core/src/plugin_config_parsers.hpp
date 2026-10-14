@@ -240,6 +240,12 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
     return yuzu::protective::is_protective_action(scope.plugin, scope.action);
 }
 
+/// Reason cap — an operator-entered free-text explanation for a kill-switch
+/// flip. Capped so a pathological submission can't bloat the audit/kill-
+/// switch row indefinitely; control characters rejected (it renders in an
+/// operator UI and lands in an audit `detail` string verbatim).
+inline constexpr std::size_t kMaxReasonBytes = 512;
+
 /// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
 /// `, protective_exempt=true` when the row covers a protective action (stored
 /// but never gating dispatch), plus `, reason="<text>"` when the operator gave
@@ -257,11 +263,10 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
     if (kill_switch_row_covers_protective(scope))
         detail += ", protective_exempt=true";
     if (!reason.empty()) {
-        constexpr std::size_t kMaxAuditReasonBytes = 512;
         detail += ", reason=\"";
         std::size_t n = 0;
         for (const char c : reason) {
-            if (n++ == kMaxAuditReasonBytes)
+            if (n++ == kMaxReasonBytes)
                 break;
             const auto u = static_cast<unsigned char>(c);
             if (c == '\\' || c == '"') {
@@ -313,12 +318,6 @@ resolve_kill_switch(std::string_view action, std::span<const KillSwitchRowView> 
     }
     return off;
 }
-
-/// Reason cap — an operator-entered free-text explanation for a kill-switch
-/// flip. Capped so a pathological submission can't bloat the audit/kill-
-/// switch row indefinitely; control characters rejected (it renders in an
-/// operator UI and lands in an audit `detail` string verbatim).
-inline constexpr std::size_t kMaxReasonBytes = 512;
 
 [[nodiscard]] inline bool is_valid_reason(std::string_view reason) {
     if (reason.size() > kMaxReasonBytes)
