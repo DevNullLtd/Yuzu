@@ -62,9 +62,13 @@ std::string list_json(nlohmann::json data, int64_t total, int64_t start = 0,
 // Markup lives in compliance_fragments.hpp (pure, fixture-testable); this file
 // owns the store reads, confinement and the degrade decisions.
 
-std::string ComplianceRoutes::render_compliance_summary_fragment() {
+std::string ComplianceRoutes::render_compliance_summary_fragment(bool can_write, bool can_execute,
+                                                                 bool can_delete) {
     namespace ch = compliance_html;
     ch::SummaryView view;
+    view.can_write = can_write;
+    view.can_execute = can_execute;
+    view.can_delete = can_delete;
     PolicyQuery query;
     view.policy_limit = static_cast<std::size_t>(query.limit);
 
@@ -342,7 +346,16 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                      [this](const httplib::Request& req, httplib::Response& res) {
                          if (deny_service_scoped_(req, res)) return;
                          if (!perm_fn_(req, res, "Policy", "Read")) return;
-                         res.set_content(render_compliance_summary_fragment(),
+                         // Probe once per summary render, into a throwaway
+                         // response (perm_fn_ writes a 403 into what it is
+                         // handed and audits each denial). The detail and
+                         // fragment panels reuse these flags client-side.
+                         httplib::Response probe;
+                         const bool can_write = perm_fn_(req, probe, "Policy", "Write");
+                         const bool can_execute = perm_fn_(req, probe, "Policy", "Execute");
+                         const bool can_delete = perm_fn_(req, probe, "Policy", "Delete");
+                         res.set_content(render_compliance_summary_fragment(can_write, can_execute,
+                                                                           can_delete),
                                          "text/html; charset=utf-8");
                      });
 

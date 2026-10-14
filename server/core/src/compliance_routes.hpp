@@ -98,7 +98,10 @@ public:
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
 
-    std::string render_compliance_summary_fragment();
+    /// `can_*` are the route's one-shot Policy:Write / :Execute / :Delete
+    /// probes; the markup omits controls the viewer cannot use.
+    std::string render_compliance_summary_fragment(bool can_write = false, bool can_execute = false,
+                                                   bool can_delete = false);
     /// `scope` is the caller's admitted visible set (nullopt = whole fleet).
     /// `rows_read` is set to the number of agent rows read when the store
     /// answered (the caller audits that read) and left empty otherwise.

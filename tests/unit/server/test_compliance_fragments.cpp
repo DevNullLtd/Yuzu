@@ -210,3 +210,75 @@ TEST_CASE("tag compliance: Display Name and Free-form marker kept, every cell es
 
     CHECK_FALSE(has(ch::render_tag_compliance(rows, 0, 0), "agents have all required tags"));
 }
+
+TEST_CASE("compliance summary: controls follow the probed flags", "[compliance][fragments]") {
+    ch::SummaryView v;
+    v.policies.push_back(row("A", 1, 0));
+    // Read-only viewer: no switch, no Evaluate, no Delete, no New policy.
+    auto html = ch::render_summary(v);
+    CHECK_FALSE(has(html, "class=\"sw\""));
+    CHECK_FALSE(has(html, "data-act=\"evaluate\""));
+    CHECK_FALSE(has(html, "data-act=\"delete-policy\""));
+    CHECK_FALSE(has(html, "data-act=\"new-policy\""));
+    CHECK(has(html, "data-can-write=\"0\""));
+
+    v.can_write = true;
+    html = ch::render_summary(v);
+    CHECK(has(html, "class=\"sw\""));
+    CHECK(has(html, "data-act=\"new-policy\""));
+    CHECK_FALSE(has(html, "data-act=\"evaluate\""));
+    CHECK_FALSE(has(html, "data-act=\"invalidate-all\""));
+
+    v.can_execute = true;
+    v.can_delete = true;
+    html = ch::render_summary(v);
+    CHECK(has(html, "data-act=\"evaluate\""));
+    CHECK(has(html, "data-act=\"invalidate-all\""));
+    CHECK(has(html, "data-act=\"delete-policy\""));
+    // Names reach attributes only escaped.
+    v.policies[0].name = "x\" onmouseover=\"1";
+    html = ch::render_summary(v);
+    CHECK_FALSE(has(html, "onmouseover=\"1"));
+}
+
+TEST_CASE("compliance detail: actions render only for a read policy; Remediate needs remediation",
+          "[compliance][fragments]") {
+    ch::DetailView d;
+    d.policy_id = "p1";
+    d.policy_name = "P <1>";
+    d.have_policy = true;
+    d.summary.non_compliant = 7;
+    auto html = ch::render_detail(d);
+    CHECK_FALSE(has(html, "data-act=\"remediate\""));
+    CHECK(has(html, "data-act=\"invalidate\""));
+    CHECK(has(html, "data-act=\"delete-policy\""));
+    CHECK(has(html, "P &lt;1&gt;"));
+
+    d.remediation_available = true;
+    html = ch::render_detail(d);
+    CHECK(has(html, "data-act=\"remediate\""));
+    CHECK(has(html, "data-n=\"7\""));
+
+    d.confined = true; // counts cover only the viewer's scope: do not state N
+    CHECK_FALSE(has(ch::render_detail(d), "data-n="));
+
+    d.degraded = true;
+    CHECK_FALSE(has(ch::render_detail(d), "data-act="));
+}
+
+TEST_CASE("policy fragments: Delete is disabled while a policy uses the fragment",
+          "[compliance][fragments]") {
+    ch::FragmentsView v;
+    v.fragments.push_back({"f1", "Idle", "c", 0, false});
+    v.fragments.push_back({"f2", "Used", "c", 3, false});
+    v.fragments.push_back({"f3", "Capped", "c", 100, true});
+    const auto html = ch::render_fragments(v);
+    CHECK(has(html, "data-act=\"new-fragment\""));
+    const auto f1 = html.find("data-id=\"f1\"");
+    const auto f2 = html.find("data-id=\"f2\"");
+    const auto f3 = html.find("data-id=\"f3\"");
+    REQUIRE(f1 != std::string::npos);
+    CHECK(html.substr(f1, f2 - f1).find("disabled") == std::string::npos);
+    CHECK(html.substr(f2, f3 - f2).find("disabled") != std::string::npos);
+    CHECK(html.substr(f3).find("disabled") != std::string::npos);
+}

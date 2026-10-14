@@ -75,6 +75,8 @@ struct ComplianceHarness {
     std::string agents_json{"[]"};
     int agents_json_calls{0};
     bool perm_admitted{true};
+    /// Deny only this operation (e.g. "Write"); empty = deny none.
+    std::string perm_deny_op;
     std::vector<std::pair<std::string, std::string>> perm_calls;
     /// Number of times the fleet-read gate was consulted.
     int fleet_read_calls{0};
@@ -103,7 +105,7 @@ struct ComplianceHarness {
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
                               const std::string& securable, const std::string& op) -> bool {
             perm_calls.emplace_back(securable, op);
-            if (!perm_admitted) {
+            if (!perm_admitted || (!perm_deny_op.empty() && op == perm_deny_op)) {
                 res.status = 403;
                 res.set_content(R"({"error":{"message":"permission denied"}})",
                                 "application/json");
@@ -822,4 +824,66 @@ TEST_CASE("/fragments/compliance/{id}: reads the agent registry once per render 
     CHECK(res->body.find("host-one") != std::string::npos);
     CHECK(res->body.find("host-two") != std::string::npos);
     CHECK(res->body.find("agent-3") != std::string::npos); // unknown host falls back to its id
+}
+
+TEST_CASE("compliance page: actions use one delegated [data-act] listener, no inline handlers",
+          "[compliance][fragments]") {
+    const std::string page = kComplianceHtml;
+    for (const char* act : {"toggle-enabled", "evaluate", "invalidate-all", "invalidate", "remediate",
+                            "delete-policy", "delete-fragment", "new-policy", "new-fragment"}) {
+        CAPTURE(act);
+        CHECK(page.find(std::string("'") + act + "':") != std::string::npos);
+    }
+    CHECK(page.find("document.addEventListener('click'") != std::string::npos);
+    CHECK(page.find("hx-on") == std::string::npos);
+    CHECK(page.find(" onclick=") == std::string::npos);
+    CHECK(page.find("innerHTML =") == std::string::npos);
+    // The dialog module loads before the script that reads it, and the page
+    // falls back to window.confirm when it is absent.
+    const auto dlg = page.find("<script src=\"/static/yuzu-dialog.js\"></script>");
+    const auto own = page.find("function confirmAct(");
+    REQUIRE(dlg != std::string::npos);
+    REQUIRE(own != std::string::npos);
+    CHECK(dlg < own);
+    CHECK(page.find("window.confirm(") != std::string::npos);
+    // Confirm copy and the delete boolean the route actually answers with.
+    CHECK(page.find("the fix runs on whichever are non-compliant when you confirm") != std::string::npos);
+    CHECK(page.find("r.data.deleted === true") != std::string::npos);
+}
+
+TEST_CASE("/fragments/compliance/summary: probes Write, Execute and Delete once and echoes them",
+          "[compliance][fragments]") {
+    {
+        ComplianceHarness h;
+        auto res = h.sink.Get("/fragments/compliance/summary");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        using P = std::pair<std::string, std::string>;
+        REQUIRE(h.perm_calls.size() == 4);
+        CHECK(h.perm_calls[0] == P{"Policy", "Read"});
+        CHECK(h.perm_calls[1] == P{"Policy", "Write"});
+        CHECK(h.perm_calls[2] == P{"Policy", "Execute"});
+        CHECK(h.perm_calls[3] == P{"Policy", "Delete"});
+        CHECK(res->body.find("data-can-write=\"1\"") != std::string::npos);
+        CHECK(res->body.find("data-act=\"new-policy\"") != std::string::npos);
+    }
+    {
+        // A viewer with Read only: probes failing must leave the response
+        // untouched (throwaway Response) and render no controls.
+        ComplianceHarness h;
+        h.perm_deny_op = "Write";
+        auto res = h.sink.Get("/fragments/compliance/summary");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("data-can-write=\"0\"") != std::string::npos);
+        CHECK(res->body.find("data-can-execute=\"1\"") != std::string::npos);
+        CHECK(res->body.find("data-act=\"new-policy\"") == std::string::npos);
+        CHECK(res->body.find("data-act=\"invalidate-all\"") != std::string::npos);
+    }
+    {
+        // The detail and fragment fragments never re-probe Write/Execute/Delete.
+        ComplianceHarness h;
+        h.sink.Get("/fragments/policy-fragments");
+        REQUIRE(h.perm_calls.size() == 1);
+    }
 }

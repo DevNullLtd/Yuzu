@@ -112,6 +112,17 @@ const char* const kCompliancePageTemplate =
     .htmx-request .htmx-indicator,
     .htmx-request.htmx-indicator { display: inline; }
 
+    /* ── Actions: summary header, detail row, per-viewer visibility ──── */
+    .hd .acts, .detail-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .hd .acts { margin-left: auto; }
+    .detail-actions { padding: 0 16px 14px; }
+    /* Detail and fragment controls stay hidden until the summary probe says the
+       viewer holds the permission (body classes set from #policies-panel). */
+    [data-perm] { display: none; }
+    body.can-write [data-perm="write"], body.can-execute [data-perm="execute"],
+    body.can-delete [data-perm="delete"] { display: inline-flex; }
+    [hidden] { display: none !important; }
+
     @media (max-width: 640px) { .content { padding: 16px; } }
   </style>
 </head>
@@ -176,7 +187,11 @@ const char* const kCompliancePageTemplate =
 
   <div id="toast-container" class="toast-container"></div>
 
-  <script>
+  <!-- Shared dialog module: must precede the page script. Absent (404) means the
+       page falls back to window.confirm and hides the YAML dialogs. -->
+  <script src="/static/yuzu-dialog.js"></script>
+)HTM"
+    R"HTM(  <script>
     /* ── Toast notification system ─────────────────────────── */
     function showToast(message, level) {
       var c = document.getElementById('toast-container');
@@ -214,12 +229,222 @@ const char* const kCompliancePageTemplate =
       t.className = 'empty-state';
     });
 
+    /* Per-viewer controls: the summary render probes Policy:Write/Execute/Delete
+       once and leaves the answer on #policies-panel; the detail and fragment
+       panels read it from there. No panel (summary refused or degraded) = none. */
+    function applyPerms() {
+      var p = document.getElementById('policies-panel');
+      var b = document.body.classList;
+      b.toggle('can-write', !!p && p.getAttribute('data-can-write') === '1');
+      b.toggle('can-execute', !!p && p.getAttribute('data-can-execute') === '1');
+      b.toggle('can-delete', !!p && p.getAttribute('data-can-delete') === '1');
+    }
+    function showDialogControls(root) {
+      if (!(window.YuzuDialog && window.YuzuDialog.form)) return;
+      var n = root.querySelectorAll('[data-needs-dialog]');
+      for (var i = 0; i < n.length; i++) n[i].hidden = false;
+    }
+    document.body.addEventListener('htmx:afterSwap', function(e) {
+      applyPerms();
+      showDialogControls(e.target || document);
+    });
+
     /* Ctrl+K / Cmd+K — navigate to dashboard command palette */
     document.addEventListener('keydown', function(e) {
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
         e.preventDefault();
         window.location.href = '/?palette=1';
       }
+    });
+  </script>
+)HTM"
+    R"HTM(  <script>
+    /* ── Policy actions: one delegated listener over [data-act] ─────────
+       fetch() ignores HX-Trigger, so toasts are composed here from the JSON
+       body. Server text is only ever set with textContent. */
+    function api(method, url, body) {
+      var init = { method: method, credentials: 'same-origin', cache: 'no-store', headers: {} };
+      if (body !== undefined) {
+        init.headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(body);
+      }
+      return fetch(url, init).then(function(r) {
+        var audit = r.headers.get('Sec-Audit-Failed') === 'true';
+        return r.json().catch(function() { return null; }).then(function(d) {
+          return { ok: r.ok, status: r.status, data: d, audit: audit };
+        });
+      }, function() { return { ok: false, status: 0, data: null, audit: false }; });
+    }
+    function errText(r, fallback) {
+      var d = r.data;
+      if (d && typeof d.error === 'string') return d.error;
+      if (d && d.error && typeof d.error.message === 'string') return d.error.message;
+      if (r.status === 403) return 'You do not have permission for this action.';
+      if (r.status === 0) return 'The request may not have applied. Refresh to check.';
+      return fallback;
+    }
+    function done(r, okMsg, failMsg) {
+      if (r.status === 401) { location.assign('/login'); return false; }
+      if (!r.ok) { showToast(errText(r, failMsg), 'error'); return false; }
+      showToast(okMsg + (r.audit ? ' The audit record could not be written.' : ''),
+                r.audit ? 'warning' : 'success');
+      return true;
+    }
+    function confirmAct(title, lines, label, danger) {
+      if (window.YuzuDialog && window.YuzuDialog.confirm) {
+        return window.YuzuDialog.confirm({ title: title, body: lines, confirmLabel: label, danger: !!danger });
+      }
+      return Promise.resolve(window.confirm(title + '\n\n' + lines.join('\n')));
+    }
+    function reload(sel, url) {
+      if (window.htmx) htmx.ajax('GET', url, { target: sel, swap: 'innerHTML' });
+    }
+    function reloadSummary() { reload('#compliance-summary', '/fragments/compliance/summary'); }
+    function reloadFragments() { reload('#policy-fragments', '/fragments/policy-fragments'); }
+    function reloadDetail(id) { reload('#compliance-detail', '/fragments/compliance/' + encodeURIComponent(id)); }
+    function clearDetail(text) {
+      var d = document.getElementById('compliance-detail');
+      d.textContent = text;
+      d.className = 'empty-state';
+    }
+    var MAX_YAML = 1048576;
+    function yamlDialog(title, note, url, okMsg) {
+      return window.YuzuDialog.form({
+        title: title, note: note, submitLabel: 'Create',
+        fields: [{ name: 'yaml', label: 'YAML', type: 'textarea', rows: 14, required: true }],
+        validate: function(v) { return v.yaml.length > MAX_YAML ? 'The YAML is larger than 1 MiB.' : null; },
+        submit: function(v) {
+          return api('POST', url, { yaml_source: v.yaml }).then(function(r) {
+            if (r.ok) { showToast(okMsg, 'success'); return null; }
+            return errText(r, 'The server refused the YAML.');
+          });
+        }
+      });
+    }
+    var ACTS = {
+      'toggle-enabled': function(el, id, name) {
+        var on = el.getAttribute('data-enabled') !== '1';
+        var lines = on
+          ? ['It will be re-checked on its schedule, dispatching a read-only check to the devices in its scope.']
+          : ['Scheduled checks stop for this policy. Its last results stay on the page and go stale.'];
+        return confirmAct((on ? 'Enable ' : 'Disable ') + name + '?', lines, on ? 'Enable' : 'Disable', !on)
+          .then(function(ok) {
+            if (!ok) return;
+            return api('POST', '/api/policies/' + encodeURIComponent(id) + (on ? '/enable' : '/disable'))
+              .then(function(r) {
+                done(r, name + (on ? ' enabled.' : ' disabled.'), 'Could not change the policy.');
+                reloadSummary();
+              });
+          });
+      },
+      'evaluate': function(el, id, name) {
+        return api('POST', '/api/policies/' + encodeURIComponent(id) + '/evaluate').then(function(r) {
+          var eid = r.data && r.data.execution_id;
+          if (done(r, 'Evaluation of ' + name + ' dispatched' + (eid ? ' (execution ' + eid + ').' : '.'),
+                   'Could not evaluate the policy.')) reloadSummary();
+        });
+      },
+      'invalidate-all': function() {
+        return confirmAct('Invalidate all compliance results?', [
+          'Every policy result is reset to unknown, so fleet compliance reads 0% until devices check in again.',
+          'This cannot be undone.'], 'Invalidate all', true).then(function(ok) {
+          if (!ok) return;
+          return api('POST', '/api/policies/invalidate-all').then(function(r) {
+            done(r, 'All results invalidated.', 'Could not invalidate results.');
+            reloadSummary();
+          });
+        });
+      },
+      'invalidate': function(el, id, name) {
+        return confirmAct('Invalidate cache for ' + name + '?', [
+          'Its results reset to unknown until devices check in again, and fix attempt counts restart.'],
+          'Invalidate', true).then(function(ok) {
+          if (!ok) return;
+          return api('POST', '/api/policies/' + encodeURIComponent(id) + '/invalidate').then(function(r) {
+            if (done(r, 'Cache invalidated for ' + name + '.', 'Could not invalidate the policy.')) {
+              reloadSummary();
+              reloadDetail(id);
+            }
+          });
+        });
+      },
+      'remediate': function(el, id, name) {
+        var n = el.getAttribute('data-n');
+        var lines = [(n !== null ? 'Currently ' + n + ' non-compliant devices; the fix runs on whichever are non-compliant when you confirm.'
+                                : 'The fix runs on whichever devices are non-compliant when you confirm.'),
+          'It dispatches the policy fragment\u2019s fix instruction directly, with no approval step. Review the fragment before you proceed.'];
+        return confirmAct('Remediate ' + name + '?', lines, 'Remediate', true).then(function(ok) {
+          if (!ok) return;
+          return api('POST', '/api/policies/' + encodeURIComponent(id) + '/remediate', {}).then(function(r) {
+            var d = r.data || {};
+            if (done(r, 'Remediation dispatched' + (d.agents !== undefined ? ' to ' + d.agents + ' devices' : '') +
+                        (d.execution_id ? ' (execution ' + d.execution_id + ').' : '.'),
+                     'Could not remediate the policy.')) {
+              reloadSummary();
+              reloadDetail(id);
+            }
+          });
+        });
+      },
+      'delete-policy': function(el, id, name) {
+        return confirmAct('Delete ' + name + '?', [
+          'The policy and its compliance results are removed. This cannot be undone.'],
+          'Delete', true).then(function(ok) {
+          if (!ok) return;
+          return api('DELETE', '/api/policies/' + encodeURIComponent(id)).then(function(r) {
+            /* The route answers 200 {"deleted":false} when nothing was removed. */
+            if (r.ok && !(r.data && r.data.deleted === true)) {
+              showToast(name + ' was not deleted; it may already be gone.', 'warning');
+              reloadSummary();
+              return;
+            }
+            if (done(r, name + ' deleted.', 'Could not delete the policy.')) {
+              clearDetail('Policy deleted.');
+              reloadSummary();
+              reloadFragments();
+            }
+          });
+        });
+      },
+      'delete-fragment': function(el, id, name) {
+        return confirmAct('Delete fragment ' + name + '?', [
+          'This cannot be undone. A fragment that a policy still uses is refused.'],
+          'Delete', true).then(function(ok) {
+          if (!ok) return;
+          return api('DELETE', '/api/policy-fragments/' + encodeURIComponent(id)).then(function(r) {
+            if (r.ok && !(r.data && r.data.deleted === true)) {
+              showToast(name + ' was not deleted; a policy may still use it.', 'warning');
+            } else if (!done(r, name + ' deleted.', 'Could not delete the fragment.')) {
+              return;
+            }
+            reloadFragments();
+          });
+        });
+      },
+      'new-policy': function() {
+        return yamlDialog('New policy',
+          'Paste a Policy YAML document (kind: Policy). Once enabled it dispatches a read-only check on a schedule.',
+          '/api/policies', 'Policy created.').then(function(v) { if (v) reloadSummary(); });
+      },
+      'new-fragment': function() {
+        return yamlDialog('New fragment',
+          'Paste a PolicyFragment YAML document (kind: PolicyFragment). Its fix instruction runs on devices when a policy using it is remediated, so author it with the care of any instruction.',
+          '/api/policy-fragments', 'Fragment created.').then(function(v) { if (v) reloadFragments(); });
+      }
+    };
+    var busy = false;
+    document.addEventListener('click', function(e) {
+      var el = e.target.closest ? e.target.closest('[data-act]') : null;
+      if (!el || el.disabled) return;
+      var fn = ACTS[el.getAttribute('data-act')];
+      if (!fn) return;
+      /* A switch must not flip until the server confirms: the refresh redraws it. */
+      if (el.type === 'checkbox') e.preventDefault();
+      if (busy) return;
+      busy = true;
+      Promise.resolve(fn(el, el.getAttribute('data-id') || '', el.getAttribute('data-name') || ''))
+        .catch(function() { showToast('The action did not complete.', 'error'); })
+        .then(function() { busy = false; });
     });
   </script>
 </body>

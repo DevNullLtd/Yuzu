@@ -1,0 +1,1 @@
+- **Compliance page: manage policies in place.** Enable or disable a policy, evaluate it, remediate non-compliant devices, invalidate cached results, delete a policy or fragment, and create policies and fragments from YAML. Each control appears only for roles holding the matching Policy permission, and every destructive action asks for confirmation.

@@ -68,7 +68,22 @@ struct SummaryView {
     /// `PolicyQuery{}.limit`: a list this long was cut by the store.
     std::size_t policy_limit{100};
     FleetCompliance fleet;
+    /// Probed once per summary render by the route (Policy:Write / :Execute /
+    /// :Delete) and echoed as data- flags on the Policies panel. Controls the
+    /// viewer cannot use are not rendered; the server re-checks every call.
+    bool can_write{false};
+    bool can_execute{false};
+    bool can_delete{false};
 };
+
+/// The confirm copy and dialogs name policies and fragments by their own text,
+/// so every action button carries id and name as escaped attributes.
+inline std::string act_button(const char* act, const char* label, const std::string& id,
+                              const std::string& name, const char* extra = "") {
+    return std::string("<button class=\"btn btn-secondary btn-sm\" type=\"button\" data-act=\"") +
+           act + "\" data-id=\"" + html_escape(id) + "\" data-name=\"" + html_escape(name) +
+           "\"" + extra + ">" + label + "</button>";
+}
 
 /// Status pill for one policy row. "N failing" counts non_compliant + error,
 /// the same definition as the "Failing checks" readout so the two agree.
@@ -116,22 +131,43 @@ inline std::string render_summary(const SummaryView& v) {
             "<div class=\"d\">of " +
             std::to_string(v.fleet.total_checks) + " device checks</div></div></div>";
 
-    html += "<div class=\"panel\"><div class=\"hd\"><h2>Policies</h2></div>";
+    html += std::string("<div class=\"panel\" id=\"policies-panel\" data-can-write=\"") +
+            (v.can_write ? "1" : "0") + "\" data-can-execute=\"" + (v.can_execute ? "1" : "0") +
+            "\" data-can-delete=\"" + (v.can_delete ? "1" : "0") + "\"><div class=\"hd\"><h2>Policies</h2>";
+    if (v.can_write || v.can_execute) {
+        html += "<div class=\"acts\">";
+        if (v.can_execute)
+            html += "<button class=\"btn btn-secondary btn-sm\" type=\"button\" "
+                    "data-act=\"invalidate-all\">Invalidate all</button>";
+        if (v.can_write)
+            html += "<button class=\"btn btn-sm\" type=\"button\" data-act=\"new-policy\" "
+                    "data-needs-dialog hidden>New policy</button>";
+        html += "</div>";
+    }
+    html += "</div>";
     if (v.policies.size() >= v.policy_limit) {
         html += "<div class=\"pb\"><div class=\"note\">Showing the first " +
                 std::to_string(v.policy_limit) + " policies.</div></div>";
     }
     html += "<div class=\"tw\"><table class=\"policy-table\"><thead><tr>"
-            "<th>Policy</th><th>Scope</th><th>Status</th><th>Compliance</th><th>Devices</th>"
+            "<th>On</th><th>Policy</th><th>Scope</th><th>Status</th><th>Compliance</th><th>Devices</th>"
             "<th></th></tr></thead><tbody>";
     if (v.policies.empty()) {
-        html += "<tr><td colspan=\"6\" class=\"empty-state\">"
+        html += "<tr><td colspan=\"7\" class=\"empty-state\">"
                 "No policies defined. Create policies in the Policy Engine to track compliance."
                 "</td></tr>";
     }
     for (const auto& p : v.policies) {
         const int pct = p.total > 0 ? static_cast<int>(p.compliant * 100 / p.total) : 0;
-        html += "<tr><td class=\"policy-name\">" + html_escape(p.name) +
+        html += "<tr><td>";
+        if (v.can_write) {
+            html += "<input type=\"checkbox\" class=\"sw\" role=\"switch\" data-act=\"toggle-enabled\" "
+                    "data-id=\"" + html_escape(p.id) + "\" data-name=\"" + html_escape(p.name) +
+                    "\" data-enabled=\"" + (p.enabled ? "1" : "0") + "\"" +
+                    (p.enabled ? " checked" : "") + " aria-label=\"Enabled: " + html_escape(p.name) +
+                    "\">";
+        }
+        html += "</td><td class=\"policy-name\">" + html_escape(p.name) +
                 "</td><td class=\"policy-scope\">" + html_escape(p.scope) + "</td><td>" +
                 policy_status_pill(p) + "</td><td>";
         if (p.total > 0) {
@@ -146,7 +182,12 @@ inline std::string render_summary(const SummaryView& v) {
                 std::to_string(p.total) +
                 "</td><td><button class=\"btn btn-secondary btn-sm\" hx-get=\"/fragments/compliance/" +
                 html_escape(p.id) +
-                "\" hx-target=\"#compliance-detail\" hx-swap=\"innerHTML\">View</button></td></tr>";
+                "\" hx-target=\"#compliance-detail\" hx-swap=\"innerHTML\">View</button>";
+        if (v.can_execute)
+            html += act_button("evaluate", "Evaluate", p.id, p.name);
+        if (v.can_delete)
+            html += act_button("delete-policy", "Delete", p.id, p.name);
+        html += "</td></tr>";
     }
     html += "</tbody></table></div></div>";
     return html;
@@ -208,6 +249,23 @@ inline std::string render_detail(const DetailView& v) {
                 "</b></div><div><span>Remediation</span><b>" +
                 (v.remediation_available ? "Available" : "None") + "</b></div></div>";
     }
+    if (v.have_policy && !v.degraded) {
+        // Gated client-side by the flags the summary probe left on the page
+        // (data-perm): the detail fragment never re-probes. The server
+        // re-checks every call.
+        html += "<div class=\"detail-actions\">";
+        if (v.remediation_available) {
+            std::string extra = " data-perm=\"execute\"";
+            if (!v.confined)
+                extra += " data-n=\"" + std::to_string(v.summary.non_compliant) + "\"";
+            html += act_button("remediate", "Remediate", v.policy_id, v.policy_name, extra.c_str());
+        }
+        html += act_button("invalidate", "Invalidate cache", v.policy_id, v.policy_name,
+                           " data-perm=\"execute\"");
+        html += act_button("delete-policy", "Delete policy", v.policy_id, v.policy_name,
+                           " data-perm=\"delete\"");
+        html += "</div>";
+    }
     if (v.degraded) {
         // Must not read as "no data yet": that tells an operator to wait.
         return html + "<div class=\"empty-state\">Compliance data temporarily unavailable (store "
@@ -257,7 +315,10 @@ struct FragmentsView {
 };
 
 inline std::string render_fragments(const FragmentsView& v) {
-    std::string html = "<div class=\"panel\"><div class=\"hd\"><h2>Policy fragments</h2></div>";
+    std::string html = "<div class=\"panel\"><div class=\"hd\"><h2>Policy fragments</h2>"
+                       "<div class=\"acts\"><button class=\"btn btn-sm\" type=\"button\" "
+                       "data-act=\"new-fragment\" data-perm=\"write\" data-needs-dialog hidden>"
+                       "New fragment</button></div></div>";
     if (v.fragments.size() >= v.fragment_limit) {
         html += "<div class=\"pb\"><div class=\"note\">Showing the first " +
                 std::to_string(v.fragment_limit) + " fragments.</div></div>";
@@ -266,12 +327,17 @@ inline std::string render_fragments(const FragmentsView& v) {
         return html + "<div class=\"empty-state\">No policy fragments</div></div>";
     }
     html += "<div class=\"tw\"><table class=\"policy-table\"><thead><tr>"
-            "<th>Fragment</th><th>Check</th><th>Used by</th></tr></thead><tbody>";
+            "<th>Fragment</th><th>Check</th><th>Used by</th><th></th></tr></thead><tbody>";
     for (const auto& f : v.fragments) {
         html += "<tr><td class=\"policy-name\">" + html_escape(f.name) +
                 "</td><td class=\"mono-id\">" + html_escape(f.check_instruction) +
                 "</td><td class=\"policy-count\">" + std::to_string(f.used_by) +
                 (f.used_by_capped ? "+" : "") + " " + (f.used_by == 1 && !f.used_by_capped ? "policy" : "policies") +
+                "</td><td>" +
+                act_button("delete-fragment", "Delete", f.id, f.name,
+                           (f.used_by > 0 || f.used_by_capped)
+                               ? " data-perm=\"delete\" disabled title=\"In use by policies\""
+                               : " data-perm=\"delete\"") +
                 "</td></tr>";
     }
     html += "</tbody></table></div></div>";
