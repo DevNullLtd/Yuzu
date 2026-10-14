@@ -1,12 +1,26 @@
 // Unified dashboard UI HTML — compiled in its own translation unit to isolate
-// the long raw string literal from MSVC's brace-matching in server.cpp.
+// the long raw string literals from MSVC's brace-matching in server.cpp.
+//
+// The page is a chain of NAMED parts. Each is one raw-string literal pinned
+// under kPartCap by a static_assert (MSVC C2026 caps a literal at 16,380
+// bytes; 15,000 leaves room for a fix-up without a re-split) and the parts
+// are joined once at static init (the home_ui.cpp precedent). Add markup to
+// the part it belongs to; when a part nears the cap, cut a new named part
+// rather than growing it.
 
 #include "app_shell.hpp"
+#include "agent_registry.hpp" // scope_kind_catalog(): the scope bar's reference line
+#include "web_utils.hpp"
 
-// NOLINTBEGIN(cert-err58-cpp)
-const char* const kDashboardIndexTemplate =
-    // Part 1: CSS + HTML markup (split to stay under MSVC's 16380-byte string limit)
-    R"HTM(<!DOCTYPE html>
+#include <cstddef>
+#include <string>
+
+namespace {
+
+constexpr std::size_t kPartCap = 15000;
+
+// DOCTYPE, head, console CSS
+constexpr char kDashHead[] = R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -26,40 +40,19 @@ const char* const kDashboardIndexTemplate =
   <script src="/static/echarts.min.js"></script>
   <script src="/static/yuzu-charts.js"></script>
   <style>
-    body {
-      display: flex; flex-direction: column; height: 100vh;
-      overflow: hidden;
-    }
-
-    /* ── Page frame: title, console + results, scope/history rail ── */
-    /* Fills the viewport below the shell header (--shell-top-h; 72px = the current nav + context bar). */
-    .dash-grid {
-      display: grid; gap: 22px; height: calc(100vh - var(--shell-top-h, 72px));
-      padding: 22px 28px 14px;
-      grid-template-columns: minmax(0, 1fr) 320px;
-      grid-template-rows: auto auto minmax(0, 1fr) auto;
-      grid-template-areas:
-        "head     head"
-        "instrbar rail"
-        "results  rail"
-        "footer   rail";
-    }
-    /* Grid items default to min-width:auto (= min-content); min-width:0 lets
-       the centre track compress instead of pushing the rail off-screen. */
-    .dash-grid > * { min-width: 0; }
-    .dash-head { grid-area: head; }
-    .dash-head h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; color: var(--ink); }
-    .dash-head p { margin-top: 4px; color: var(--mut); }
-    .rail { grid-area: rail; display: flex; flex-direction: column; gap: 22px; min-height: 0; }
-    .dash-grid :focus-visible, .modal :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+    /* ── Page frame ── The rows are the shared `.dash` grid in yuzu.css
+       ("Dashboard rows (delta 2026-10-14)"); this sheet only styles what is
+       specific to the console. The page scrolls like every other shell page. */
+    .dash-page { padding: 22px 28px 36px; display: flex; flex-direction: column; gap: 22px; }
+    .dash :focus-visible, .modal :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
     /* Panels are bordered regions, not floating cards. */
-    .instr-bar, .results, .scope-panel, .history-panel {
+    .instr-bar, .results, .history-panel {
       background: var(--surface); border: 1px solid var(--line);
       border-radius: var(--rad-panel);
     }
-    .results, .scope-panel, .history-panel { display: flex; flex-direction: column; }
-    .scope-panel, .history-panel { overflow: hidden; }
+    .results, .history-panel { display: flex; flex-direction: column; }
+    .history-panel { overflow: hidden; }
     .panel-hd, .results-header, .scope-header, .history-header {
       display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
       padding: 12px 16px; border-bottom: 1px solid var(--line);
@@ -69,7 +62,6 @@ const char* const kDashboardIndexTemplate =
     .panel-hd #status-badge { margin-left: auto; }
 
     /* ── Console (instruction bar) ───────────────────────────── */
-    .instr-bar { grid-area: instrbar; }
     .instr-body { display: grid; gap: 12px; padding: 16px; }
     .instr-field { display: flex; flex-direction: column; gap: 5px; }
     .instr-field label { font-size: 13px; font-weight: 500; color: var(--ink2); }
@@ -135,15 +127,17 @@ const char* const kDashboardIndexTemplate =
     .ac-item:hover { background: var(--surface2); }
     .ac-item.sel { background: color-mix(in srgb, var(--hl) 8%, transparent); box-shadow: inset 3px 0 0 var(--hl); }
     .ac-item .ac-desc { margin-left: 16px; text-align: right; font-family: var(--font); font-size: 12.5px; color: var(--mut); }
-)HTM"
-    // Part 1a: CSS continued (split to stay under MSVC's 16380-byte string
-    // limit — this session's degrade-banner/filter-bar CSS additions pushed
-    // Part 1 over it, CI-measured C2026).
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashHead) < kPartCap, "kDashHead must stay under the MSVC raw-string cap: split it");
+
+// results, history, modal and palette CSS
+constexpr char kDashCss2[] = R"HTM(
 
     /* ── Results ─────────────────────────────────────────────── */
-    /* The whole results panel scrolls (chart deck, filter bar, table together). */
-    .results { grid-area: results; overflow-y: auto; }
+    /* The whole results panel scrolls (chart deck, filter bar, table together);
+       it sits under the console in the row grid and is capped so the page keeps
+       scrolling past it to the readout and panels. */
+    .results { min-height: 420px; max-height: 72vh; overflow-y: auto; }
     .result-context, #result-summary { font-size: 13px; font-weight: 400; color: var(--mut); }
     .result-context.is-error { color: var(--bad); }
     #result-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
@@ -242,11 +236,13 @@ const char* const kDashboardIndexTemplate =
     .form-hint { font-size: 12.5px; color: var(--mut); }
     .feedback-error { font-size: 13px; color: var(--bad); }
 
-    /* ── Scope and history rail ──────────────────────────────── */
-    .scope-panel { flex: 1 1 0; min-height: 160px; }
-    .history-panel { flex: 0 1 240px; min-height: 120px; }
+    /* ── Scope bar and history ───────────────────────────────── */
+    /* The picker is a full-width bar: its list scrolls past six rows. History fills
+       its column beside the console (the row grid sets the height). */
+    .scope-list { max-height: 220px; overflow-y: auto; }
     .scope-count { font-size: 13px; font-weight: 400; color: var(--mut); }
-    .scope-list, .history-list { flex: 1; min-height: 0; overflow-y: auto; }
+    .history-panel { min-height: 160px; }
+    .history-list { flex: 1; min-height: 0; overflow-y: auto; }
     .scope-section-header {
       padding: 8px 16px; background: var(--surface2); border-bottom: 1px solid var(--line);
       font-size: 12.5px; font-weight: 500; color: var(--mut);
@@ -267,7 +263,7 @@ const char* const kDashboardIndexTemplate =
     .history-empty { padding: 24px 16px; text-align: center; font-size: 13px; color: var(--mut); }
 
     .dash-foot {
-      grid-area: footer; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px;
+      display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px;
       font-size: 12px; color: var(--faint);
     }
     .dash-foot kbd, .cmd-palette-footer kbd {
@@ -333,39 +329,53 @@ const char* const kDashboardIndexTemplate =
       display: flex; align-items: center; gap: 16px; padding: 8px 16px;
       border-top: 1px solid var(--line); font-size: 12px; color: var(--faint);
     }
-    /* ── Narrow windows: one column, the page scrolls, the scope list stays reachable.
-       1336px = 1100px of page + the 236px shell sidebar. ── */
-    @media (max-width: 1336px) {
-      .dash-grid {
-        overflow-y: auto; align-content: start;
-        grid-template-columns: minmax(0, 1fr); grid-template-rows: none;
-        grid-template-areas: "head" "instrbar" "results" "rail" "footer";
-      }
-      .results { min-height: 420px; }
-      .rail { min-height: auto; }
-      .scope-panel, .history-panel { flex: none; min-height: 0; }
-      .scope-list, .history-list { flex: none; }
-      .scope-list { max-height: 320px; }
-      .history-list { max-height: 240px; }
-    }
   </style>
 </head>
-)HTM"
-    // Split here: chunk 1 (head + <style>) was ~16 KB and bumped against
-    // the MSVC C2026 16380-byte raw-string-literal limit after the round-2
-    // visualization additions. Adjacent string literals concatenate at
-    // compile time, so the runtime HTML is byte-identical.
-    R"HTM(<body>
+)HTM";
+static_assert(sizeof(kDashCss2) < kPartCap, "kDashCss2 must stay under the MSVC raw-string cap: split it");
+
+// shell, page header, scope bar (the kinds line follows at run time)
+constexpr char kDashBodyScope[] = R"HTM(<body>
 
   <!--yuzu:shell--><!--/yuzu:shell-->
 
-  <div class="dash-grid">
+  <main class="dash-page">
 
-  <header class="dash-head">
-    <h1>Dashboard</h1>
-    <p>Run an instruction against the fleet and watch responses arrive.</p>
-  </header>
+  <div class="page-header">
+    <div>
+      <h1>Dashboard</h1>
+      <p class="subtitle">Run an instruction against the fleet and watch responses arrive.</p>
+    </div>
+  </div>
 
+  <!-- Rows, top to bottom (design delta 2026-10-14, section 2): scope bar; console
+       beside history; readout; needs attention beside server health; recent events;
+       estate state beside compliance by policy. Rows with no real data source
+       (devices ranking, events by severity, command throughput, activity by hour)
+       are not drawn: no invented figures (P17). -->
+  <div class="dash">
+
+  <!-- ── Row 1: Scope bar. The picker fills #scope-list (polled). The reference
+       line under it is the Scope DSL catalogue (/api/v1/discover/scope-kinds),
+       rendered once from the same table so it cannot drift. ───────────── -->
+  <section class="panel scope-bar" aria-label="Scope">
+      <div class="scope-header">
+        Scope <span class="scope-count" id="agent-count">0 agents</span>
+      </div>
+      <div class="scope-list" id="scope-list"
+           hx-get="/fragments/scope-list"
+           hx-trigger="load, every 5s, agentChanged from:body"
+           hx-swap="innerHTML">
+      </div>
+)HTM";
+static_assert(sizeof(kDashBodyScope) < kPartCap, "kDashBodyScope must stay under the MSVC raw-string cap: split it");
+
+// row 2: console, results, history
+constexpr char kDashBodyConsole[] = R"HTM(  </section>
+
+  <!-- ── Row 2: Console (results below it) beside History ─────────── -->
+  <div class="rw cons">
+  <div class="col">
   <!-- ── Console: instruction bar ───────────────────────────── -->
   <!-- The page script's htmx:beforeRequest listener on this form clears
        the chart deck the instant the operator clicks Send so a stale
@@ -404,48 +414,8 @@ const char* const kDashboardIndexTemplate =
     </div>
   </form>
 
-  <!-- ── About Modal ──────────────────────────────────────── -->
-  <div class="modal-overlay" id="about-modal" onclick="closeAbout(event)">
-    <div class="modal">
-      <h2>Yuzu</h2>
-      <div class="version">Endpoint Management Platform</div>
-      <p id="about-details">Loading...</p>
-      <p>Built with C++23, gRPC, Protobuf, SQLite</p>
-      <p>
-        <a href="https://github.com/anthropics/yuzu" target="_blank">GitHub</a>
-        &nbsp;&middot;&nbsp;
-        <a href="/help">Documentation</a>
-      </p>
-      <p>AGPL-3.0-or-later (community) &middot; commercial license available for enterprise edition</p>
-      <button class="btn-close" onclick="closeAbout()">Close</button>
-    </div>
-  </div>
-)HTM"
-    // Part 1b: Command palette overlay
-    R"HTM(
-  <!-- ── Command Palette ─────────────────────────────────────── -->
-  <div id="cmd-palette" class="cmd-palette-overlay" style="display:none" onclick="if(event.target===this)cmdPalette.close()">
-    <div class="cmd-palette">
-      <div class="cmd-palette-input-row">
-        <svg class="icon"><use href="/static/icons.svg#search"></use></svg>
-        <input type="text" id="cmd-input" placeholder="Search agents, instructions, settings..." autocomplete="off" spellcheck="false">
-        <span class="cmd-palette-hint">ESC to close</span>
-      </div>
-      <div id="cmd-results" class="cmd-palette-results"></div>
-      <div class="cmd-palette-footer">
-        <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
-        <span><kbd>&crarr;</kbd> select</span>
-        <span><kbd>esc</kbd> close</span>
-      </div>
-    </div>
-  </div>
-
-)HTM"
-    // Part 2: HTML body continued
-    R"HTM(
-
   <!-- ── Results ────────────────────────────────────────────── -->
-  <div class="results">
+  <div class="results panel">
     <div class="results-header">
       <h2>Results</h2>
       <span id="result-context" class="result-context"></span>
@@ -491,19 +461,9 @@ const char* const kDashboardIndexTemplate =
     <div id="group-form-slot"></div>
   </div>
 
-  <!-- ── Scope and history rail ─────────────────────────────── -->
-  <div class="rail">
-    <div class="scope-panel">
-      <div class="scope-header">
-        Scope <span class="scope-count" id="agent-count">0 agents</span>
-      </div>
-      <div class="scope-list" id="scope-list"
-           hx-get="/fragments/scope-list"
-           hx-trigger="load, every 5s, agentChanged from:body"
-           hx-swap="innerHTML">
-      </div>
-    </div>
-    <div class="history-panel">
+  </div>
+  <div class="col">
+    <div class="history-panel panel">
       <div class="history-header">
         History
         <button onclick="clearHistory()" title="Clear history">&times; Clear</button>
@@ -513,11 +473,61 @@ const char* const kDashboardIndexTemplate =
       </div>
     </div>
   </div>
+  </div>
+)HTM";
+static_assert(sizeof(kDashBodyConsole) < kPartCap, "kDashBodyConsole must stay under the MSVC raw-string cap: split it");
+
+// rows 3-6: readout, attention + health, events, estate + policies
+constexpr char kDashBodyRows[] = R"HTM(
+  <!-- ── Row 3: Readout. The summary fragment replaces this section and swaps
+       Needs attention and Estate state out of band (home_render.hpp). ───── -->
+  <section id="dash-readout" class="readout" aria-label="Estate readout"
+           hx-get="/fragments/dashboard/summary" hx-trigger="load" hx-swap="outerHTML">
+    <div class="ro"><div class="l">Loading</div></div>
+  </section>
+
+  <!-- ── Row 4: Needs attention beside Server health ──────────────── -->
+  <div class="rw">
+    <section id="dash-attention" class="panel">
+      <div class="hd"><h2>Needs attention</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+    <section class="panel" id="dash-health" hx-get="/fragments/dashboard/health"
+             hx-trigger="load" hx-swap="outerHTML">
+      <div class="hd"><h2>Server health</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+  </div>
+
+  <!-- ── Row 5: Recent events, full width (the audit read) ─────────── -->
+  <div class="rw t1">
+    <section class="panel" id="dash-events" hx-get="/fragments/dashboard/activity"
+             hx-trigger="load" hx-swap="outerHTML">
+      <div class="hd"><h2>Recent events</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+  </div>
+
+  <!-- ── Row 6: Estate state beside Compliance by policy (equal columns) ── -->
+  <div class="rw t3">
+    <section id="dash-estate" class="panel">
+      <div class="hd"><h2>Estate state</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+    <section class="panel" id="dash-policies" hx-get="/fragments/dashboard/policies"
+             hx-trigger="load" hx-swap="outerHTML">
+      <div class="hd"><h2>Compliance by policy</h2></div>
+      <div class="pb mut">Loading</div>
+    </section>
+  </div>
 
   <footer class="dash-foot">
     <span>Yuzu Server &mdash; Dashboard</span>
     <span>Press <kbd>Ctrl+K</kbd> to search</span>
   </footer>
+
+  </div><!-- /.dash -->
+  </main>
 
   <!-- HTMX-driven data loaders (no JS fetch calls) -->
   <div id="help-loader" hx-get="/api/help" hx-trigger="load, agentChanged from:body"
@@ -531,10 +541,49 @@ const char* const kDashboardIndexTemplate =
        hx-trigger="loadHelp from:body">
   </div>
 
-  </div><!-- /.dash-grid -->
-)HTM"
-    // Part 2: JavaScript
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashBodyRows) < kPartCap, "kDashBodyRows must stay under the MSVC raw-string cap: split it");
+
+// about modal, command palette
+constexpr char kDashOverlays[] = R"HTM(  <!-- ── About Modal ──────────────────────────────────────── -->
+  <div class="modal-overlay" id="about-modal" onclick="closeAbout(event)">
+    <div class="modal">
+      <h2>Yuzu</h2>
+      <div class="version">Endpoint Management Platform</div>
+      <p id="about-details">Loading...</p>
+      <p>Built with C++23, gRPC, Protobuf, SQLite</p>
+      <p>
+        <a href="https://github.com/anthropics/yuzu" target="_blank">GitHub</a>
+        &nbsp;&middot;&nbsp;
+        <a href="/help">Documentation</a>
+      </p>
+      <p>AGPL-3.0-or-later (community) &middot; commercial license available for enterprise edition</p>
+      <button class="btn-close" onclick="closeAbout()">Close</button>
+    </div>
+  </div>
+
+  <!-- ── Command Palette ─────────────────────────────────────── -->
+  <div id="cmd-palette" class="cmd-palette-overlay" style="display:none" onclick="if(event.target===this)cmdPalette.close()">
+    <div class="cmd-palette">
+      <div class="cmd-palette-input-row">
+        <svg class="icon"><use href="/static/icons.svg#search"></use></svg>
+        <input type="text" id="cmd-input" placeholder="Search agents, instructions, settings..." autocomplete="off" spellcheck="false">
+        <span class="cmd-palette-hint">ESC to close</span>
+      </div>
+      <div id="cmd-results" class="cmd-palette-results"></div>
+      <div class="cmd-palette-footer">
+        <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
+        <span><kbd>&crarr;</kbd> select</span>
+        <span><kbd>esc</kbd> close</span>
+      </div>
+    </div>
+  </div>
+
+)HTM";
+static_assert(sizeof(kDashOverlays) < kPartCap, "kDashOverlays must stay under the MSVC raw-string cap: split it");
+
+// state, instruction map
+constexpr char kDashJs1[] = R"HTM(
   <script>
     /* ── State ─────────────────────────────────────────────── */
     var selectedScope = '__all__';
@@ -563,9 +612,11 @@ const char* const kDashboardIndexTemplate =
     }
 
     /* Column schemas moved server-side — server renders <tr> HTML via SSE */
-)HTM"
-    // Part 3: Helpers and table management
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs1) < kPartCap, "kDashJs1 must stay under the MSVC raw-string cap: split it");
+
+// helpers, detail drawer, density
+constexpr char kDashJs2[] = R"HTM(
     /* ── Helpers ──────────────────────────────────────────── */
     function escapeHtml(s) {
       var d = document.createElement('div');
@@ -623,9 +674,11 @@ const char* const kDashboardIndexTemplate =
 
     /* Apply saved density on load */
     applyDensity();
-)HTM"
-    // Part 3b: Table management and row operations
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs2) < kPartCap, "kDashJs2 must stay under the MSVC raw-string cap: split it");
+
+// table management, scope selection
+constexpr char kDashJs3[] = R"HTM(
     /* ── Table management ─────────────────────────────────── */
     var currentColumns = [];
 
@@ -737,8 +790,11 @@ const char* const kDashboardIndexTemplate =
        POST /api/dashboard/execute returns HX-Trigger: {"loadHelp": true}
        which triggers the declarative #help-trigger element. */
 
-)HTM"
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs3) < kPartCap, "kDashJs3 must stay under the MSVC raw-string cap: split it");
+
+// send, history, autocomplete
+constexpr char kDashJs4[] = R"HTM(
     /* Trigger the HTMX form submission programmatically.
        Called by Enter key, history clicks, and global shortcut. */
     function sendInstruction() {
@@ -858,9 +914,11 @@ const char* const kDashboardIndexTemplate =
         closeAC();
       }
     });
-)HTM"
-    // Part 4: HTMX SSE event hooks + menu JavaScript
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs4) < kPartCap, "kDashJs4 must stay under the MSVC raw-string cap: split it");
+
+// SSE hooks, about modal, toasts
+constexpr char kDashJs5[] = R"HTM(
     /* SSE output rows, row counting, auto-scroll, empty-state removal,
        agent-online/offline → all handled by server OOB swaps + HTMX
        attributes.  No JS event listeners needed. */
@@ -901,9 +959,11 @@ const char* const kDashboardIndexTemplate =
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
     });
-)HTM"
-    // Part 5: Command palette JavaScript
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs5) < kPartCap, "kDashJs5 must stay under the MSVC raw-string cap: split it");
+
+// command palette
+constexpr char kDashJs6[] = R"HTM(
     /* ── Command Palette ─────────────────────────────────── */
     var cmdPalette = {
       isOpen: false,
@@ -1158,7 +1218,11 @@ const char* const kDashboardIndexTemplate =
       }
     });
 
-    /* ── Global Keyboard Shortcuts ───────────────────────── */
+)HTM";
+static_assert(sizeof(kDashJs6) < kPartCap, "kDashJs6 must stay under the MSVC raw-string cap: split it");
+
+// global shortcuts, CSP-safe htmx bindings, init
+constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ───────────────────────── */
     document.addEventListener('keydown', function(e) {
       var tag = (e.target.tagName || '').toLowerCase();
       var isInput = (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable);
@@ -1307,12 +1371,11 @@ const char* const kDashboardIndexTemplate =
       history.replaceState(null, '', '/');
       setTimeout(function() { cmdPalette.open(); }, 100);
     }
-)HTM"
-    // Split here: the PR2 MFA step-up intercept block pushed this chunk to
-    // ~18.3 KB, over MSVC's C2026 16380-byte raw-string-literal limit.
-    // Adjacent string literals concatenate at compile time, so the runtime
-    // HTML is byte-identical.
-    R"HTM(
+)HTM";
+static_assert(sizeof(kDashJs7) < kPartCap, "kDashJs7 must stay under the MSVC raw-string cap: split it");
+
+// MFA step-up intercept, close
+constexpr char kDashJs8[] = R"HTM(
     /* PR2 — MFA step-up intercept. High-risk REST/Settings handlers return
        401 + A4 envelope `{"error":{...},"meta":{"mfa_step_up_required":true,
        "challenge_url":"/login/mfa/stepup"}}` when the session's
@@ -1366,6 +1429,34 @@ const char* const kDashboardIndexTemplate =
 </body>
 </html>
 )HTM";
+static_assert(sizeof(kDashJs8) < kPartCap, "kDashJs8 must stay under the MSVC raw-string cap: split it");
+
+// The scope bar's reference line: the ground kinds the picker offers (`__all__`,
+// `group:<name>`, the same two /api/v1/discover/scope-kinds lists) and every
+// attribute kind of the Scope DSL from the resolver's own catalogue, so the line
+// is the `scope.kinds` capability rendered, never a copy that can drift.
+std::string scope_kinds_line() {
+    using yuzu::server::html_escape;
+    std::string out = "    <div class=\"kinds\"><span class=\"k0\">Scope kinds</span>"
+                      "<span>all<b class=\"mono\">__all__</b></span>"
+                      "<span>group<b class=\"mono\">group:&lt;name&gt;</b></span>";
+    for (const auto& k : yuzu::server::detail::scope_kind_catalog())
+        out += "<span>" + html_escape(k.kind) + "<b class=\"mono\">" + html_escape(k.example) +
+               "</b></span>";
+    out += "<span class=\"end\">All Agents targets every enrolled agent</span></div>\n";
+    return out;
+}
+
+// Composed once at static init; one owner string keeps the baked page's source alive.
+// NOLINTBEGIN(cert-err58-cpp)
+const std::string kDashboardTemplateStr = std::string(kDashHead) + kDashCss2 + kDashBodyScope +
+                                          scope_kinds_line() + kDashBodyConsole + kDashBodyRows +
+                                          kDashOverlays + kDashJs1 + kDashJs2 + kDashJs3 + kDashJs4 +
+                                          kDashJs5 + kDashJs6 + kDashJs7 + kDashJs8;
+
+} // namespace
+
+const char* const kDashboardIndexTemplate = kDashboardTemplateStr.c_str();
 
 // The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
 extern const char* const kDashboardIndexHtml =
