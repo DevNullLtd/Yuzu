@@ -86,7 +86,7 @@ TEST_CASE("groups page: only the enrolment fragments that already exist are load
           "[groups][page]") {
     const std::string t = kGroupsTemplate;
     std::vector<std::string> gets;
-    for (std::sregex_iterator it(t.begin(), t.end(), std::regex(R"(hx-get="([^"]+)")")), end;
+    for (std::sregex_iterator it(t.begin(), t.end(), std::regex(R"re(hx-get="([^"]+)")re")), end;
          it != end; ++it)
         gets.push_back((*it)[1].str());
     CHECK(gets == std::vector<std::string>{"/fragments/settings/pending",
@@ -127,7 +127,7 @@ TEST_CASE("groups page: no inline handlers or style, same-origin scripts only, o
     CHECK(std::strlen(kGroupsTemplate) < 15000);
 
     std::vector<std::string> srcs;
-    for (std::sregex_iterator it(t.begin(), t.end(), std::regex(R"(<script src="([^"]+)")")), end;
+    for (std::sregex_iterator it(t.begin(), t.end(), std::regex(R"re(<script src="([^"]+)")re")), end;
          it != end; ++it)
         srcs.push_back((*it)[1].str());
     CHECK(srcs == std::vector<std::string>{"/static/htmx.js", "/static/sse.js",
