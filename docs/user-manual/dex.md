@@ -16,7 +16,9 @@ It is reached from the **DEX** link in the dashboard nav, or directly at
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
 links* into seven deep pages. A shared sub-nav switches between **Overview ·
 Apps · Catalogue · Health score · Trends · Performance · App Performance ·
-Network**; the window selector (below) applies to the signal views (Performance
+Network · Alerts**; the Alerts tab is the configuration page for DEX alert
+routing and is for administrators only (anyone else sees a role note). The
+window selector (below) applies to the signal views (Performance
 and Network are now-views — see below). The Network view also has its own URL,
 `/network`, but it is a DEX sub-view, not a standalone top-level nav item.
 
@@ -513,7 +515,7 @@ A standing incident re-alerts at most once per cooldown period (per-pair), and
 a global per-minute fan-out cap keeps a correlated multi-subject incident (e.g.
 a bad update crashing many apps at once) from flooding your ITSM. The
 thresholds (default **5 devices / 15 min window / 1 h cooldown**) are
-**operator-tunable under Settings → DEX alerts** and apply immediately — no
+**operator-tunable on the DEX → Alerts tab** and apply immediately — no
 restart. The memory and fan-out bounds are not configurable (they are DoS
 posture, not policy). Detector activity is observable via the
 `yuzu_server_dex_blast_radius_*` Prometheus metrics. Subscribe to the event in
@@ -522,7 +524,7 @@ posture, not policy). Detector activity is observable via the
 ## Routing signals to alerts
 
 Beyond fleet incidents, you can route **individual signal types** to alerts
-under **Settings → DEX alerts**: tick the types you care about (grouped by the
+on the **DEX → Alerts** tab: tick the types you care about (grouped by the
 same families as the Catalogue) and each routed observation raises an operator
 notification and fires the **`dex.signal`** webhook/offload event
 (`obs_type`, `subject`, `agent_id`) — **once per device per hour** per type, so
@@ -561,7 +563,7 @@ rejected; percentages clamp at 100) so a single misbehaving agent cannot poison
 a fleet percentile. Agents with `--dex-disable` ship no perf tags at all.
 
 **Per-cohort export (opt-in).** Setting a **cohort export tag key** in
-Settings → DEX alerts additionally publishes the same stats per cohort of that
+The DEX → Alerts tab additionally publishes the same stats per cohort of that
 key:
 
 | Gauge | Meaning |

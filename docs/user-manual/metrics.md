@@ -1339,7 +1339,7 @@ exactly what the fleet-wide families above already are:
 | `yuzu_fleet_perf_os_disk_lat_ms{stat,os}` | gauge | Per-OS per-IO disk service time (ms) |
 
 **Per-cohort export (opt-in)** — published only when a cohort export tag key
-is configured (Settings → DEX alerts; `runtime_config` key
+is configured (DEX → Alerts tab; `runtime_config` key
 `dex_cohort_export_key`):
 
 | Metric | Type | Description |
@@ -2430,7 +2430,7 @@ The `/metrics` endpoint exposes aggregated fleet composition data through gauge 
 | `yuzu_fleet_agents_by_os` | `os` | OS distribution (windows, linux, darwin counts) |
 | `yuzu_fleet_agents_by_arch` | `arch` | CPU architecture distribution (x64, arm64 counts) |
 | `yuzu_fleet_agents_by_version` | `version` | Agent version inventory |
-| `yuzu_fleet_perf_cohort_*` | `cohort` | **Operator tag values** (only when the opt-in cohort export key is set — Settings → DEX alerts). Cohort labels carry the raw tag values of the exported key; if those values encode personnel-relevant or confidential groupings (`department`, `cost-center`, owner names…), they flow to whatever scrapes `/metrics`, including third-party monitoring stacks. **Choose export keys whose values are non-sensitive organizational identifiers** (hardware model, image name). |
+| `yuzu_fleet_perf_cohort_*` | `cohort` | **Operator tag values** (only when the opt-in cohort export key is set — DEX → Alerts tab). Cohort labels carry the raw tag values of the exported key; if those values encode personnel-relevant or confidential groupings (`department`, `cost-center`, owner names…), they flow to whatever scrapes `/metrics`, including third-party monitoring stacks. **Choose export keys whose values are non-sensitive organizational identifiers** (hardware model, image name). |
 
 This data reveals your fleet's attack surface to anyone who can reach the metrics endpoint. An attacker who learns that 80% of your fleet runs Windows x64 with agent v0.4.2 can target known vulnerabilities for that specific combination.
 

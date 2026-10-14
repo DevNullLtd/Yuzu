@@ -1,6 +1,6 @@
 /// @file test_settings_page_ui.cpp
 /// Pure-string pins on the /settings page shell (`kSettingsHtml`, settings_ui.cpp,
-/// served verbatim by GET /settings). The page is one static document whose 23 panels each
+/// served verbatim by GET /settings). The page is one static document whose 22 panels each
 /// lazy-load one fragment, so a panel dropped, renamed or detached from its loader by a
 /// restyle leaves every route test green. Data in, markup out: no server, no store, no
 /// request. The fragment routes themselves are covered by the test_settings_routes_*.cpp
@@ -25,7 +25,7 @@ struct Panel {
 };
 
 // In page order.
-constexpr std::array<Panel, 23> kPanels{{
+constexpr std::array<Panel, 22> kPanels{{
     {"Server Configuration", "server-config-section", "/fragments/settings/server-config"},
     {"TLS / mTLS Configuration", "tls-section", "/fragments/settings/tls"},
     {"HTTPS Dashboard", "https-section", "/fragments/settings/https"},
@@ -43,7 +43,6 @@ constexpr std::array<Panel, 23> kPanels{{
     {"Gateway", "gateway-section", "/fragments/settings/gateway"},
     {"Analytics &amp; Telemetry", "analytics-section", "/fragments/settings/analytics"},
     {"Data Retention", "data-retention-section", "/fragments/settings/data-retention"},
-    {"DEX Alerts", "dex-alerts-section", "/fragments/settings/dex-alerts"},
     {"MCP (AI Integration)", "mcp-section", "/fragments/settings/mcp"},
     {"Vulnerability Management", "nvd-section", "/fragments/settings/nvd"},
     {"Management Groups", "mgmt-groups-section", "/fragments/settings/management-groups"},
@@ -62,7 +61,7 @@ std::size_t count_of(const std::string& haystack, std::string_view needle) {
 
 } // namespace
 
-TEST_CASE("Settings page carries all 23 panels, each wired to its fragment loader",
+TEST_CASE("Settings page carries all 22 panels, each wired to its fragment loader",
           "[settings][settings_page]") {
     const std::string html = kSettingsHtml;
 

@@ -130,7 +130,7 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 |---|---:|---:|---:|
 | devices | 14 | 9 | 5 |
 | inventory | 3 | 3 | 0 |
-| dex | 26 | 18 | 8 |
+| dex | 27 | 18 | 9 |
 | guardian | 16 | 6 | 10 |
 | tar | 12 | 4 | 8 |
 | auto-preflight | 4 | 1 | 3 |
@@ -151,11 +151,11 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 13 | 61 |
-| **Total** | **282** | **83** | **199** |
+| **Total** | **283** | **83** | **200** |
 
 Registered `/api/vN/*` routes: 246. OpenAPI `paths` entries: 245. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 186.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 199.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 200.
 
 <!-- END GENERATED -->
 
