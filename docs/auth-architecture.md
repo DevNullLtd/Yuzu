@@ -2991,6 +2991,9 @@ Not suppressed: the one-off `role.elevation.expired` lifecycle row minted when t
 reaps an expired elevation, and `RbacStore`'s own store-read telemetry (latency histogram,
 circuit breaker).
 
+Only `require_permission` (with its tier belt) has a quiet form; `require_fleet_read` and
+`require_scoped_permission` can still narrow a verdict a probe allowed.
+
 A probe is a rendering hint, never a gate: use it to hide or disable a control, and let the
 action route re-check through the loud gate. `ServerImpl::probe_permission` is the binding
 for a `std::function<bool(const httplib::Request&, const std::string& securable,
