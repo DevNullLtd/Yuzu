@@ -14887,6 +14887,13 @@ private:
                     res.set_content(
                         R"({"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}})",
                         "application/json");
+                } else if (!req.get_header_value("HX-Request").empty()) {
+                    // An htmx panel request: a 302 would be followed silently and the
+                    // whole sign-in page swapped (script tags included) into the panel.
+                    // 401 plus HX-Redirect makes htmx leave the page instead.
+                    res.status = 401;
+                    res.set_header("HX-Redirect", "/home");
+                    res.set_content("", "text/plain");
                 } else {
                     // The landing page, carrying the requested screen as a
                     // validated key so it can say "Sign in to open <area>."

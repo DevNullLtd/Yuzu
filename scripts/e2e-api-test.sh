@@ -1187,6 +1187,16 @@ for pair in "/devices|/home?next=devices" "/compliance|/home?next=compliance" "/
     fi
 done
 
+# An htmx panel request with no session: 401 + HX-Redirect to the landing page, never a 302
+# that XHR would follow and swap the sign-in page into the panel.
+hx=$(curl -s -o /dev/null -D - -H "HX-Request: true" "$SERVER_URL/fragments/dashboard/summary" 2>/dev/null | tr -d '\r')
+TESTS=$((TESTS + 1))
+if [[ "$hx" == HTTP/*\ 401* && "$hx" == *[Hh][Xx]-[Rr]edirect:\ /home* ]]; then
+    pass "htmx request with no session -> 401 with HX-Redirect: /home"
+else
+    fail "htmx request with no session did not answer 401 + HX-Redirect"
+fi
+
 # Dashboard: the admin session is unconfined, so the page and the summary fragment must
 # answer 200 with their own markup. The loose status list above would also accept a route
 # that was never registered.

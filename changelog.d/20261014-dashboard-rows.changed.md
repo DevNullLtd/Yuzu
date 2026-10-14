@@ -5,6 +5,5 @@
   policy. Rows share one grid with a 22px gutter and stack to one column under 1140px. The page
   scrolls as a whole instead of pinning the results table to the viewport. The panels that were on
   the Home page moved here, and their fragment routes moved from `/fragments/home/*` to
-  `/fragments/dashboard/*` (audit action `home.fragment.access_denied` is now
-  `dashboard.fragment.access_denied`). Rows the design draws without a data source on the server
+  `/fragments/dashboard/*` (their audit action is `dashboard.fragment.access_denied`). Rows the design draws without a data source on the server
   (a ranked device list, events by severity, command throughput, activity by hour) are not shown.
