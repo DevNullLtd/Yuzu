@@ -5213,7 +5213,7 @@ A store that does not answer is shown as an unavailable panel, never as an empty
 
 ### Tokens and principals page
 
-`/access/tokens` (Access group in the navigation) lists API tokens and engine principals. It is read-only: creating, rotating and revoking stay in Settings. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty.
+`/access/tokens` (Access group in the navigation) lists and manages API tokens and engine principals. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty. A control is drawn only when your account can use it; a panel that hides one says what it needs ("Creating tokens needs the Administrator account role", or the named permission when RBAC is enforced).
 
 | Method | Route | Description |
 |---|---|---|
@@ -5223,6 +5223,21 @@ A store that does not answer is shown as an unavailable panel, never as an empty
 | `GET` | `/fragments/access/principals/detail` | One principal with its active credentials and roles (HTMX). `?id=engine:<slug>`. Same gate. Writes an `engine_principal.get` audit row, plus `engine_principal.role.listed` when the roles were read. A revoked principal's revocation detail needs `AuditLog:Read` and is otherwise shown as withheld (also when the grant could not be confirmed). |
 
 Each panel loads on its own. A refused browser session writes no denied-access audit row for any of them (the panels load automatically, so opening the page must not fill the audit log); a refused API or MCP token that reaches a fragment URL does. The no-administrator check at the top of the principals panel (a call to `/api/v1/engine-principals/audit/no-admin`, which needs `AuditLog:Read`) runs only when the principals fragment reports that the caller holds that permission. The `AuditLog:Read` checks that decide this (and whether a revoked principal's free-text detail is shown) are quiet for browser sessions only: a non-browser caller that holds `EnginePrincipal:Read` but not `AuditLog:Read` writes one ordinary permission-denied row per principals-list load and per revoked-principal detail load. The no-administrator result is a statement about the roles and grants the server could read: a role read that degrades is not distinguishable from "no roles" on that route, so the page words a clean result accordingly. Device tokens are not shown on this page.
+
+#### Changing credentials from the page
+
+Every change is a call to an existing REST v1 route, so each keeps its own step-up, validation and audit row; the page adds no route. An account with a second factor enrolled is asked for a fresh code before a token or principal change.
+
+| Action | Route | Needs |
+|---|---|---|
+| New API token | `POST /api/v1/tokens` | `ApiToken:Write` (RBAC off: administrator) |
+| Rotate / Confirm rotation | `POST /api/v1/tokens/{id}/rotate`, `/confirm` | `ApiToken:Rotate`; the token's owner only (RBAC off: any signed-in owner) |
+| Revoke API token | `DELETE /api/v1/tokens/{id}` | `ApiToken:Delete` and the token's owner or an administrator (RBAC off: administrator) |
+| New principal, mint / rotate / confirm credential, transfer owner, revoke principal, assign / remove role | `/api/v1/engine-principals/...` | `Security:Write` (RBAC off: administrator) |
+
+A new secret (API token, rotated token, engine credential) is shown once in a strip at the top of the page. The strip has no timer: it stays until you press "I have stored this", and the page will not mint another secret while one is showing, so a secret that has not been stored is never overwritten or discarded on a clock. Leaving the page with an unstored secret asks first. The secret is never put in a URL, the page history, browser storage or a later fragment. The responses that carry a secret (`POST /api/v1/tokens`, and the rotate and engine mint routes) are sent `Cache-Control: no-store`. If the response is lost, rotating again within two minutes returns the same secret; after that, revoke the new token or credential and rotate again.
+
+Assigning a role to an engine principal offers custom roles only: built-in roles are refused for an engine principal, and no route creates a custom role, so on a stock install the button is disabled with that reason.
 
 ### OTA Updates
 

@@ -1086,6 +1086,8 @@ The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in
 
 > **Warning:** Copy the `token` value immediately. It cannot be retrieved after this response.
 
+The response is sent `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache`, because the body carries a raw one-time secret (the same headers as the rotate and engine mint routes).
+
 ---
 
 #### `DELETE /api/v1/tokens/{token_id}`
@@ -8942,7 +8944,8 @@ Mint a one-time upload grant for an agent. Operator-facing.
 ```
 
 `grant_secret` is returned **exactly once** — the store persists only its
-SHA-256 digest.
+SHA-256 digest. The response is sent `Cache-Control: no-store, no-cache, must-revalidate`
+and `Pragma: no-cache`.
 
 #### `GET /api/v1/upload-grants`
 
