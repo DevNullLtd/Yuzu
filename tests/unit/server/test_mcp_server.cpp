@@ -18737,6 +18737,17 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
     CHECK(payload["items"][0]["serial_hex"] == "AB12");
     CHECK(payload["items"][0]["subject"] == "agent-007");
     CHECK(payload["items"][0]["status"] == "active");
+    // ADR-1005 twin parity: the five CRL figures GET /api/v1/ca/issued carries in `meta` are
+    // present here (top level), always, null when unknown (no CRL published in this fixture).
+    for (const char* k : {"crl_version", "crl_published_at", "crl_next_update",
+                          "crl_revoked_count", "crl_stale"}) {
+        INFO(k);
+        REQUIRE(payload.contains(k));
+    }
+    CHECK(payload["crl_version"].is_null());
+    CHECK(payload["crl_published_at"].is_null());
+    CHECK(payload["crl_next_update"].is_null());
+    CHECK(payload["crl_revoked_count"].is_null());
     CHECK(ts.audit_log.back() == "mcp.list_issued_certs|success");
 }
 

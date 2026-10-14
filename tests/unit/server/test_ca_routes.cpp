@@ -1472,6 +1472,48 @@ TEST_CASE("ca_routes: /ca/issued meta and the MCP-shared figures carry the CRL f
     CHECK(figs["crl_stale"] == false);
 }
 
+TEST_CASE("ca_routes: no key path, key material or PEM reaches the pki fragment, the inventory or an error body",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    CaRoot root = sample_root();
+    root.key_ref = "/var/lib/yuzu/SENTINEL-ca-signing.key";
+    root.cert_pem = "-----BEGIN CERTIFICATE-----\nSENTINELCERTBODY\n-----END CERTIFICATE-----\n";
+    REQUIRE(h.store->set_root(root));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.wire();
+    const std::unordered_map<std::string, std::string> same_origin = {
+        {"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}};
+
+    std::vector<std::string> bodies;
+    auto grab = [&](const httplib::Response* r) {
+        REQUIRE(r != nullptr);
+        bodies.push_back(r->body);
+        for (const auto& hd : r->headers)
+            bodies.push_back(hd.first + ": " + hd.second);
+    };
+    auto frag = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(frag);
+    grab(&*frag);
+    auto inv = h.sink.Get("/api/v1/ca/issued");
+    REQUIRE(inv);
+    grab(&*inv);
+    auto bad = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=zz&view=pki", "",
+                               "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(bad);
+    grab(&*bad);
+    auto none = h.sink.dispatch("POST", "/api/settings/ca/import-chain?view=pki", "",
+                                "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(none);
+    grab(&*none);
+
+    REQUIRE(bodies.size() > 4);
+    for (const auto& b : bodies) {
+        CHECK(b.find("SENTINEL") == std::string::npos); // key_ref path and the stored PEM body
+        CHECK(b.find("PRIVATE KEY") == std::string::npos);
+        CHECK(b.find("passphrase") == std::string::npos);
+    }
+}
+
 TEST_CASE("ca_routes: a pre-count CRL row reports a null revoked count, not 0",
           "[ca_routes][pki][pg]") {
     Harness h;

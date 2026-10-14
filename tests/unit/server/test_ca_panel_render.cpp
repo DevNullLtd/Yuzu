@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <regex>
 #include <string>
 
 using namespace yuzu::server::ca_panel;
@@ -204,6 +205,33 @@ TEST_CASE("ca panel: every agent- and operator-controlled string is escaped",
     e.subject = "a\" hx-on:click=\"x";
     q.issued.push_back(e);
     CHECK_FALSE(has(render(q), "hx-on:click=\"x"));
+}
+
+TEST_CASE("ca panel: no URL-bearing attribute is built from a stored string",
+          "[ca_panel][pki][ui][security]") {
+    // Serials, subjects and the fingerprint are attacker-influenced (agent-supplied CNs). Escaping
+    // alone is not enough if one reached a path: "./x?" and "../y" would redirect a request.
+    auto m = ready();
+    m.root.fingerprint_sha256 = "../y?z=./x?ab12";
+    for (const char* evil : {"./x?", "../y", "..%2f..%2fadmin", "x?a=1#f"}) {
+        auto r = row(evil, "agent");
+        r.subject = evil;
+        m.issued.push_back(r);
+    }
+    const auto h = render(m);
+    static const std::regex url_attr(R"RX((?:href|src|action|formaction|hx-(?:get|post|put|patch|delete|push-url|vals))="([^"]*)")RX");
+    std::size_t seen = 0;
+    for (std::sregex_iterator it(h.begin(), h.end(), url_attr), end; it != end; ++it, ++seen) {
+        const std::string v = (*it)[1];
+        INFO(v);
+        CHECK(v.find("./x") == std::string::npos);
+        CHECK(v.find("../y") == std::string::npos);
+        CHECK(v.find("..%2f") == std::string::npos);
+        CHECK(v.find("x?a=1") == std::string::npos);
+    }
+    CHECK(seen > 0); // the scan matched real attributes
+    // The only fingerprint-derived path piece is hex digits.
+    CHECK_THAT(h, ContainsSubstring("href=\"/api/v1/ca/root?v=ab12\""));
 }
 
 TEST_CASE("ca panel: the output carries no inline handler, hx-on or private-key input",
