@@ -187,8 +187,9 @@ DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int6
     f.hangs = hangs;
     f.distinct_devices = affected;
     f.last_seen = r.last_seen;
-    // An unknown or zero population, or affected > population, is a refusal
-    // (null share / rate), not a failure.
+    // An unknown or zero population nulls both share and rate; affected >
+    // population nulls the share only (the rate stays published). A refusal,
+    // not a failure.
     if (population && *population > 0) {
         if (affected >= 0 && affected <= *population)
             f.share_affected = dex_proportion(affected, *population);

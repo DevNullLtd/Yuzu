@@ -8372,6 +8372,17 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
                               "versions_truncated"})
             CHECK(row.contains(k));
         CHECK(row["versions"]["items"]["properties"].contains("version"));
+        // The nested objects are always emitted in full: pin their required keys.
+        const auto interval_req = nlohmann::json::array({"estimate", "lower", "upper", "reliable"});
+        const auto deduction_req = nlohmann::json::array({"name", "points", "assessed"});
+        CHECK(row["versions"]["items"]["required"] ==
+              nlohmann::json::array({"version", "crashes", "hangs", "distinct_devices", "last_seen",
+                                     "share_affected", "rate_per_1000", "score"}));
+        for (const auto* node : {&row, &row["versions"]["items"]["properties"]}) {
+            CHECK((*node)["share_affected"]["required"] == interval_req);
+            CHECK((*node)["rate_per_1000"]["required"] == interval_req);
+            CHECK((*node)["score"]["properties"]["deductions"]["items"]["required"] == deduction_req);
+        }
     }
     CHECK(found);
 }
