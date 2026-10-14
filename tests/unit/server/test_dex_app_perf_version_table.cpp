@@ -124,7 +124,7 @@ TEST_CASE("version table: unknown exposure is distinct from zero and never shows
           "[dex][app_perf][ui][version_table]") {
     SECTION("null exposure reads unknown, with the failures-without-samples cue") {
         const auto h = table_of(report_of({mk("2.0.0.0", std::nullopt, 2, 1, 2)}));
-        CHECK(has(h, "unknown"));
+        CHECK(has(h, "<td><span class=\"gp-mute\">unknown</span><div"));
         CHECK(has(h, "failures recorded, no samples for this version"));
         CHECK(has(h, "no rate: exposure unknown"));
         CHECK_FALSE(has(h, "exposed devices</div>")); // no population line without a rate
