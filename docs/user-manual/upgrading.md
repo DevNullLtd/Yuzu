@@ -27,6 +27,19 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: the Settings link follows the server's own admin decision (#5779, #4208)
+
+`GET /api/me` and `GET /api/v1/me` now report `effective_role`, `elevated`,
+`elevated_until` (only while elevated) and `can_access_settings`, and the shell
+shows the Settings entry only when `can_access_settings` is `true`. Users with an
+active just-in-time elevation now see the link; RBAC PlatformEngineer or
+`Administrator`-label holders who are not legacy admins no longer see a link that
+redirected away. During a rolling upgrade an older replica omits the new keys, so
+the Settings link is hidden for every user, administrators included, whenever
+`/api/me` is answered by an older replica; open `/settings` directly by URL (it is
+unaffected) or wait for the upgrade to finish. Tabs opened before the upgrade keep
+the old shell until reloaded. No configuration change is needed.
+
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
 **What changed.** Deleting (deactivating) an account and demoting a local `admin` account now go through

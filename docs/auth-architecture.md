@@ -678,7 +678,11 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   (a backward clock step below the grant). It is also bounded by the session's own
   absolute expiry, and auto-reverts when the window lapses or on explicit
   revoke/logout, but **not** on restart. See `docs/auth-architecture.md` →
-  "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
+  "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)". The session reports its
+  own elevation state on `GET /api/me` and `GET /api/v1/me` (`effective_role`,
+  `elevated`, `elevated_until`, `can_access_settings`); `role` there stays the
+  persisted role. `can_access_settings` comes from `authz::admin_gate_verdict`
+  (`admin_gate.hpp`), the same function `require_admin` applies.
 - **Scope: interactive cookie sessions only.** `/api/v1/elevate` reads the
   session cookie and `elevate_session` keys on the cookie token; API and MCP
   tokens resolve through `synthesize_token_session` (no cookie, no
