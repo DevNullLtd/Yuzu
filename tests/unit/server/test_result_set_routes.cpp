@@ -1395,3 +1395,111 @@ TEST_CASE("result_set_routes: [pg] a list read that fails renders the degraded n
     CHECK(broken->body.find("This is not an empty list.") != std::string::npos);
     CHECK(broken->body.find("No result sets yet") == std::string::npos);
 }
+
+TEST_CASE("result_set_routes: [pg] Re-evaluate is drawn only while the stored source is still "
+          "an enabled, auto-approval, read-only dispatch the caller may run "
+          "(mutation: drop any term of the verdict and a row below shows the button)",
+          "[pg][server][routes][result_set_routes][extras][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    yuzu::server::pg::PgPool ipool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore is{ipool};
+    REQUIRE(is.is_open());
+    auto good = is.create_definition(def_for("Good read", "os_info", "os_version", "auto"));
+    auto needs_approval = is.create_definition(def_for("Needs approval", "os_info", "os_name", "always"));
+    auto disabled = is.create_definition(def_for("Disabled", "os_info", "os_version", "auto", false));
+    auto destructive = is.create_definition(def_for("Destructive", "tar", "purge_source", "auto"));
+    REQUIRE(good);
+    REQUIRE(needs_approval);
+    REQUIRE(disabled);
+    REQUIRE(destructive);
+
+    auto make_set = [&](const std::string& payload) {
+        CreateRequest r;
+        r.owner_principal = "alice";
+        r.source_kind = std::string(source_kind::kInstructionResult);
+        r.source_payload = payload;
+        auto rs = w.store.create_materialized(r, {"dev-1"});
+        REQUIRE(rs.has_value());
+        return rs->id;
+    };
+    auto shows_button = [&](Harness& h, const std::string& id) {
+        auto r = h.sink.Get("/fragments/result-sets/" + id + "/detail");
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+        return r->body.find("data-ox-reeval=\"" + id + "\"") != std::string::npos;
+    };
+    auto payload_for = [](const std::string& def_id) {
+        return nlohmann::json{{"instruction_id", def_id}}.dump();
+    };
+
+    const auto ok_id = make_set(payload_for(*good));
+    const auto approval_id = make_set(payload_for(*needs_approval));
+    const auto disabled_id = make_set(payload_for(*disabled));
+    const auto destructive_id = make_set(payload_for(*destructive));
+    const auto gone_id = make_set(payload_for("no-such-definition"));
+    const auto bad_payload_id = make_set("{}");
+
+    Harness h;
+    h.store = &w.store;
+    h.instruction_store = &is;
+    h.wire();
+    CHECK(shows_button(h, ok_id));
+    CHECK_FALSE(shows_button(h, approval_id));    // approval_mode != auto
+    CHECK_FALSE(shows_button(h, disabled_id));    // definition disabled since
+    CHECK_FALSE(shows_button(h, destructive_id)); // not ReadOnly
+    CHECK_FALSE(shows_button(h, gone_id));        // definition deleted
+    CHECK_FALSE(shows_button(h, bad_payload_id)); // no instruction_id
+
+    SECTION("a caller without Execution:Execute never sees it") {
+        Harness d;
+        d.store = &w.store;
+        d.instruction_store = &is;
+        d.perm_ok = false;
+        d.wire();
+        CHECK_FALSE(shows_button(d, ok_id));
+    }
+    SECTION("an unwired perm_fn or classifier fails closed") {
+        Harness np;
+        np.store = &w.store;
+        np.instruction_store = &is;
+        np.wire_perm_fn = false;
+        np.wire();
+        CHECK_FALSE(shows_button(np, ok_id));
+        Harness nc;
+        nc.store = &w.store;
+        nc.instruction_store = &is;
+        nc.classify_wired = false;
+        nc.wire();
+        CHECK_FALSE(shows_button(nc, ok_id));
+    }
+    SECTION("no instruction store: hidden") {
+        Harness ni;
+        ni.store = &w.store;
+        ni.wire();
+        CHECK_FALSE(shows_button(ni, ok_id));
+    }
+}
+
+TEST_CASE("result_set_routes: [pg] the create route's re-rendered list is also degraded, "
+          "never the empty-state sentence, when the list read fails",
+          "[pg][server][routes][result_set_routes][extras]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "DROP TABLE result_set_store.result_sets CASCADE")};
+        REQUIRE(r.ok());
+    }
+    // An empty create body is refused, and the refusal re-renders the owner's list.
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->body.find("data-degraded=\"1\"") != std::string::npos);
+    CHECK(r->body.find("No result sets yet") == std::string::npos);
+}

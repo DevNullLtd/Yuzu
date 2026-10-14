@@ -34,7 +34,7 @@ std::string render_result_sets_sidebar(const std::vector<ResultSet>& sets,
 // read-only, auto-approved dispatch; the Re-evaluate button also needs a source kind the
 // REST route supports (tar_query, instruction_result), checked here.
 struct DetailOptions {
-    bool reeval_allowed{true};
+    bool reeval_allowed{false}; // fail closed: a caller that forgets the verdict shows no button
 };
 std::string render_result_set_detail(const ResultSet& rs, const std::vector<LineageNode>& chain,
                                      const DetailOptions& opts = {});

@@ -138,20 +138,24 @@ TEST_CASE("result_sets_ui: Re-evaluate needs a supported kind, a verdict, and a 
           "[result_set][ui]") {
     auto tar = make("rs_t", "tarset", 2, false);
     tar.source_kind = std::string(source_kind::kTarQuery);
-    CHECK(render_result_set_detail(tar, {}).find("data-ox-reeval=\"rs_t\"") != std::string::npos);
+    const DetailOptions yes{.reeval_allowed = true};
+    CHECK(render_result_set_detail(tar, {}, yes).find("data-ox-reeval=\"rs_t\"") !=
+          std::string::npos);
+    // No verdict supplied = no button (fail closed).
+    CHECK(render_result_set_detail(tar, {}).find("data-ox-reeval") == std::string::npos);
     // The route's verdict (instruction no longer read-only / auto) hides it.
     CHECK(render_result_set_detail(tar, {}, {.reeval_allowed = false}).find("data-ox-reeval") ==
           std::string::npos);
     // The REST route answers 400 for these kinds, so the button is never drawn.
     auto inv = make("rs_i", "inv", 2, false); // inventory_query
-    CHECK(render_result_set_detail(inv, {}).find("data-ox-reeval") == std::string::npos);
+    CHECK(render_result_set_detail(inv, {}, yes).find("data-ox-reeval") == std::string::npos);
     auto manual = make("rs_m", "paste", 2, false);
     manual.source_kind = std::string(source_kind::kManualCurate);
-    CHECK(render_result_set_detail(manual, {}).find("data-ox-reeval") == std::string::npos);
+    CHECK(render_result_set_detail(manual, {}, yes).find("data-ox-reeval") == std::string::npos);
     // Pending: nothing to re-run yet.
     auto pend = make("rs_pp", "p", 0, false, ResultSetStatus::Pending);
     pend.source_kind = std::string(source_kind::kTarQuery);
-    CHECK(render_result_set_detail(pend, {}).find("data-ox-reeval") == std::string::npos);
+    CHECK(render_result_set_detail(pend, {}, yes).find("data-ox-reeval") == std::string::npos);
 }
 
 TEST_CASE("result_set_extras_render: members escape ids, page with a cursor, and a failed read "

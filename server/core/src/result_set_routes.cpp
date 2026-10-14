@@ -75,6 +75,24 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
         return true;
     };
 
+    // The owner's sidebar list, for the list route AND every create-route response that
+    // re-renders it. SPEC 5.4: a failed read says so (it is never "No result sets yet") and a
+    // full page says it is cut. Same checked read the REST list uses.
+    auto render_owner_sidebar = [deps](const std::string& owner, const std::string& selected) {
+        constexpr int kSidebarLimit = 200;
+        SidebarNotes notes;
+        notes.limit = kSidebarLimit;
+        std::vector<ResultSet> sets;
+        auto page = deps.store->list_by_owner_checked(owner, "", kSidebarLimit);
+        if (!page) {
+            notes.degraded = true;
+        } else {
+            sets = std::move(page->sets);
+            notes.truncated = !page->next_cursor.empty();
+        }
+        return render_result_sets_sidebar(sets, selected, notes);
+    };
+
     // Re-evaluate is offered only while the stored source would still be a read-only,
     // auto-approved dispatch: a definition edited to need approval since the set was made
     // must not be re-run through a path that skips the ladder. Unwired = hidden.
@@ -120,7 +138,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
     // pin/unpin/delete/create).
     sink.Get(
         "/fragments/result-sets/sidebar",
-        [deps](const httplib::Request& req, httplib::Response& res) {
+        [deps, render_owner_sidebar](const httplib::Request& req, httplib::Response& res) {
             if (deps.deny_service_scoped_fn(
                     req, res, "result_set.sidebar.access_denied",
                     "service-scoped tokens may not read the result-set sidebar", "ResultSet", ""))
@@ -134,20 +152,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
             }
             std::string selected =
                 req.has_param("selected") ? req.get_param_value("selected") : "";
-            // SPEC 5.4: a failed read says so (it is never "No result sets yet") and a full
-            // page says it is cut. Same checked read the REST list uses.
-            constexpr int kSidebarLimit = 200;
-            SidebarNotes notes;
-            notes.limit = kSidebarLimit;
-            std::vector<ResultSet> sets;
-            auto page = deps.store->list_by_owner_checked(session->username, "", kSidebarLimit);
-            if (!page) {
-                notes.degraded = true;
-            } else {
-                sets = std::move(page->sets);
-                notes.truncated = !page->next_cursor.empty();
-            }
-            res.set_content(render_result_sets_sidebar(sets, selected, notes),
+            res.set_content(render_owner_sidebar(session->username, selected),
                             "text/html; charset=utf-8");
         });
 
@@ -411,7 +416,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
     // Create from pasted device IDs (CSV import) — returns refreshed sidebar.
     sink.Post(
         "/fragments/result-sets/create",
-        [deps, tier_ok](const httplib::Request& req, httplib::Response& res) {
+        [deps, tier_ok, render_owner_sidebar](const httplib::Request& req, httplib::Response& res) {
             if (deps.deny_service_scoped_fn(req, res, "result_set.create.access_denied",
                                             "service-scoped tokens may not create result sets",
                                             "ResultSet", ""))
@@ -483,9 +488,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                            std::format("a device_ids entry exceeds {} bytes",
                                        yuzu::server::mcp::kResultSetDeviceIdMaxLen)}}}}
                         .dump());
-                std::string next;
-                auto sets = deps.store->list_by_owner(session->username, "", 200, next);
-                res.set_content(render_result_sets_sidebar(sets, ""),
+                res.set_content(render_owner_sidebar(session->username, ""),
                                 "text/html; charset=utf-8");
                 return;
             }
@@ -509,9 +512,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                                     {{"level", "error"},
                                      {"message", to_string(ResultSetError::TooManyMembers)}}}}
                         .dump());
-                std::string next;
-                auto sets = deps.store->list_by_owner(session->username, "", 200, next);
-                res.set_content(render_result_sets_sidebar(sets, ""),
+                res.set_content(render_owner_sidebar(session->username, ""),
                                 "text/html; charset=utf-8");
                 return;
             }
@@ -551,9 +552,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                               {"message", "RESULT_SET_STORE_UNAVAILABLE: device visibility "
                                           "check unavailable"}}}}
                             .dump());
-                    std::string next;
-                    auto sets = deps.store->list_by_owner(session->username, "", 200, next);
-                    res.set_content(render_result_sets_sidebar(sets, ""),
+                    res.set_content(render_owner_sidebar(session->username, ""),
                                     "text/html; charset=utf-8");
                     return;
                 }
@@ -576,9 +575,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                               {"message",
                                "RESULT_SET_STORE_UNAVAILABLE: device registry unavailable"}}}}
                             .dump());
-                    std::string next;
-                    auto sets = deps.store->list_by_owner(session->username, "", 200, next);
-                    res.set_content(render_result_sets_sidebar(sets, ""),
+                    res.set_content(render_owner_sidebar(session->username, ""),
                                     "text/html; charset=utf-8");
                     return;
                 }
@@ -672,9 +669,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                                "that does not exist or is not visible to you: " +
                                    cited}}}}
                             .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
-                    std::string next;
-                    auto sets = deps.store->list_by_owner(session->username, "", 200, next);
-                    res.set_content(render_result_sets_sidebar(sets, ""),
+                    res.set_content(render_owner_sidebar(session->username, ""),
                                     "text/html; charset=utf-8");
                     return;
                 }
@@ -698,18 +693,14 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                                                {{"level", "error"},
                                                 {"message", to_string(created.error())}}}}
                                    .dump());
-                std::string next;
-                auto sets = deps.store->list_by_owner(session->username, "", 200, next);
-                res.set_content(render_result_sets_sidebar(sets, ""),
+                res.set_content(render_owner_sidebar(session->username, ""),
                                 "text/html; charset=utf-8");
                 return;
             }
             deps.audit_fn(req, "result_set.create", "success", "ResultSet", created->id,
                           cr.source_kind);
-            std::string next;
-            auto sets = deps.store->list_by_owner(session->username, "", 200, next);
             res.set_header("HX-Trigger", "resultSetsChanged");
-            res.set_content(render_result_sets_sidebar(sets, created->id),
+            res.set_content(render_owner_sidebar(session->username, created->id),
                             "text/html; charset=utf-8");
         });
 }

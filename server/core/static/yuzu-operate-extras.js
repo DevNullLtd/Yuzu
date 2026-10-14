@@ -442,7 +442,11 @@
       var init = { credentials: 'same-origin', cache: 'no-store' };
       try { init.signal = AbortSignal.timeout(15000); } catch (e) { /* older browsers: no timeout */ }
       window.fetch('/fragments/result-sets/producers', init)
-        .then(function (r) { return r.text(); })
+        .then(function (r) {
+          /* A 401/403/5xx body is not an empty list; say it failed. */
+          if (!r.ok) throw new Error('producers ' + r.status);
+          return r.text();
+        })
         .then(function (t) {
           var doc = new DOMParser().parseFromString(t, 'text/html');
           if (doc.querySelector('[data-denied]') || doc.querySelector('[data-degraded]') ||
