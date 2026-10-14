@@ -30,38 +30,12 @@ const char* const kCompliancePageTemplate =
     .page-header .subtitle { font-size: 14px; color: var(--mut); margin-top: 4px; max-width: 70ch; }
     .page-header .btn { margin-left: auto; }
 
-    /* ── Sections: flat group, or a bordered panel ─────────── */
-    .section { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-    .section-header {
-      display: flex; align-items: center; gap: 8px;
-      font-size: 14px; font-weight: 600; color: var(--ink);
-    }
-    .cmp-panel {
-      background: var(--surface); border: 1px solid var(--line);
-      border-radius: var(--rad-panel); min-width: 0;
-    }
-    .section.cmp-panel { gap: 0; }
-    .cmp-panel > .section-header { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    /* ── Layout: a stack of shared .readout / .panel blocks ──── */
     #compliance-summary { display: flex; flex-direction: column; gap: 16px; }
+    .page-stack { display: flex; flex-direction: column; gap: 16px; }
     .tw { overflow-x: auto; }
-
-    /* ── Readout row (fleet compliance + counts) ───────────── */
-    .compliance-hero {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-      overflow: hidden; background: var(--surface);
-      border: 1px solid var(--line); border-radius: var(--rad-panel);
-    }
-    .hero-cell {
-      padding: 14px 18px; min-width: 0;
-      box-shadow: -1px 0 0 var(--line), 0 -1px 0 var(--line);
-    }
-    .hero-v { font-size: 26px; font-weight: 500; letter-spacing: -.02em; line-height: 1.15; color: var(--ink); }
-    .hero-l { font-size: 13px; color: var(--mut); margin-top: 2px; }
-    .compliance-bar { height: 6px; margin-top: 8px; background: var(--line); border-radius: 2px; overflow: hidden; }
-    .compliance-fill { height: 100%; }
-    .compliance-fill.good { background: var(--ok); }
-    .compliance-fill.warn { background: var(--warn); }
-    .compliance-fill.bad  { background: var(--bad); }
+    .panel > .pb + .tw { border-top: 1px solid var(--line); }
+    .compliance-bar { margin-top: 8px; }
 
     /* ── Tables ────────────────────────────────────────────── */
     .policy-table, .detail-table { width: 100%; min-width: 640px; border-collapse: collapse; }
@@ -78,7 +52,6 @@ const char* const kCompliancePageTemplate =
     .policy-table tbody tr:hover td, .detail-table tbody tr:hover td { background: var(--surface2); }
     .policy-table td:last-child { text-align: right; }
     /* Cell classes carry the table prefix so they outrank the table's own td rule above */
-    .policy-table .policy-idx { color: var(--faint); }
     .policy-table .policy-name { font-weight: 600; color: var(--ink); }
     .policy-scope, .mono-id {
       font-family: var(--mds-font-family-mono); font-size: 12.5px;
@@ -109,16 +82,6 @@ const char* const kCompliancePageTemplate =
     }
     .detail-id { font-size: 12.5px; font-weight: 400; color: var(--mut); }
     .detail-badges { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px 14px; }
-
-    /* ── Status pills ─────────────────────────────────────── */
-    .status-compliant, .status-non-compliant, .status-pending-eval, .status-remediated {
-      display: inline-flex; align-items: center; padding: 1px 8px;
-      border-radius: 3px; font-size: 12.5px; font-weight: 500; white-space: nowrap;
-    }
-    .status-compliant     { color: var(--ok);   background: color-mix(in srgb, var(--ok) 14%, transparent); }
-    .status-non-compliant { color: var(--bad);  background: color-mix(in srgb, var(--bad) 14%, transparent); }
-    .status-pending-eval  { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
-    .status-remediated    { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); }
 
     /* ── Empty / loading states ───────────────────────────── */
     .empty-state, .policy-table td.empty-state {
@@ -160,7 +123,7 @@ const char* const kCompliancePageTemplate =
 
     <div class="page-header">
       <div>
-        <h1>Compliance Dashboard</h1>
+        <h1>Compliance</h1>
         <div class="subtitle">Policy compliance status across the fleet</div>
       </div>
       <button class="btn btn-secondary"
@@ -172,30 +135,39 @@ const char* const kCompliancePageTemplate =
       </button>
     </div>
 
-    <!-- ── Fleet Compliance Summary ─────────────────────── -->
-    <div class="section">
-      <div class="section-header">
-        Fleet Compliance Overview
-        <span class="htmx-indicator" style="margin-left:auto">Refreshing...</span>
+    <div class="page-stack">
+      <div id="compliance-summary"
+           hx-get="/fragments/compliance/summary"
+           hx-trigger="load"
+           hx-swap="innerHTML"
+           data-denied="Needs the Policy Read permission.">
+        <div class="empty-state">Loading compliance data...</div>
       </div>
-      <div class="section-body">
-        <div id="compliance-summary"
-             hx-get="/fragments/compliance/summary"
-             hx-trigger="load"
-             hx-swap="innerHTML">
-          <div class="empty-state">Loading compliance data...</div>
+
+      <div class="panel">
+        <div class="hd"><h2>Policy detail</h2><span class="sub">Per-device results for one policy</span></div>
+        <div id="compliance-detail" data-denied="Needs the Policy Read permission.">
+          <div class="empty-state">Click <strong>View</strong> on a policy above to see per-device compliance.</div>
         </div>
       </div>
-    </div>
 
-    <!-- ── Per-Policy Detail (loaded on demand) ─────────── -->
-    <div class="section cmp-panel">
-      <div class="section-header">
-        Policy Detail
+      <div id="policy-fragments"
+           hx-get="/fragments/policy-fragments"
+           hx-trigger="load"
+           hx-swap="innerHTML"
+           data-denied="Needs the Policy Read permission.">
+        <div class="empty-state">Loading policy fragments...</div>
       </div>
-      <div class="section-body">
-        <div id="compliance-detail">
-          <div class="empty-state">Click <strong>View</strong> on a policy above to see per-agent compliance.</div>
+
+      <div class="panel">
+        <div class="hd"><h2>Compliance by tag</h2>
+          <span class="sub">Devices should have all structured tag categories assigned. Devices missing tags are flagged but keep working.</span></div>
+        <div id="tag-compliance"
+             hx-get="/fragments/settings/tag-compliance"
+             hx-trigger="load"
+             hx-swap="innerHTML"
+             data-denied="Needs the Tag Read permission.">
+          <div class="empty-state">Loading tag compliance...</div>
         </div>
       </div>
     </div>
@@ -227,6 +199,19 @@ const char* const kCompliancePageTemplate =
     document.body.addEventListener('showToast', function(e) {
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
+    });
+
+    /* htmx drops 4xx/5xx bodies, so a refused or failed panel would sit on
+       "Loading..." forever: say why in the panel the request targeted. */
+    document.body.addEventListener('htmx:responseError', function(e) {
+      var d = e.detail || {};
+      var t = d.target;
+      if (!t || !t.hasAttribute || !t.hasAttribute('data-denied')) return;
+      var st = d.xhr ? d.xhr.status : 0;
+      t.textContent = (st === 401 || st === 403)
+        ? t.getAttribute('data-denied')
+        : 'Temporarily unavailable. Try Refresh in a moment.';
+      t.className = 'empty-state';
     });
 
     /* Ctrl+K / Cmd+K — navigate to dashboard command palette */

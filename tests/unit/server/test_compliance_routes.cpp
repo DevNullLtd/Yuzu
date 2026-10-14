@@ -70,6 +70,10 @@ struct ComplianceHarness {
     /// #4042 — `perm_fn` outcome the test controls, plus the (securable,
     /// operation) pairs it was asked for, so a test can pin WHICH grant a
     /// fragment requires and that a denial stops the render.
+    /// Registry snapshot the detail fragment reads for hostname/OS, and how
+    /// many times it was read (once per render, never once per row).
+    std::string agents_json{"[]"};
+    int agents_json_calls{0};
     bool perm_admitted{true};
     std::vector<std::pair<std::string, std::string>> perm_calls;
     /// Number of times the fleet-read gate was consulted.
@@ -113,7 +117,10 @@ struct ComplianceHarness {
             audit_calls.push_back({action, result, target_type, target_id, detail});
             return audit_ok;
         };
-        auto agents_json_fn = []() -> std::string { return "[]"; };
+        auto agents_json_fn = [this]() -> std::string {
+            ++agents_json_calls;
+            return agents_json;
+        };
         ComplianceRoutes::FleetReadFn fleet_read_fn =
             [this](const httplib::Request&, httplib::Response& res, const std::string&,
                   const std::string&) -> authz::FleetReadGate {
@@ -666,6 +673,7 @@ TEST_CASE("/fragments/compliance/{id}: confined to the caller's scope, audited w
     CHECK(res->status == 200);
     CHECK(res->body.find("agent-in") != std::string::npos);
     CHECK(res->body.find("agent-out") == std::string::npos);
+    CHECK(res->body.find("Rows cover devices in your scope") != std::string::npos);
 
     const AuditCall* seen = nullptr;
     for (const auto& c : h.audit_calls)
@@ -699,4 +707,119 @@ TEST_CASE("/fragments/compliance/{id}: an audit-persist failure flags the header
     CHECK(res->status == 200); // dashboard posture: proceed, flag
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(res->body.find("agent-1") != std::string::npos);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// N1 — GET /fragments/policy-fragments (the HTML twin of the fragment list)
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("/fragments/policy-fragments: is not shadowed by the per-policy id route",
+          "[compliance][fragments]") {
+    // The detail regex /fragments/compliance/(\w[\w\-]*) is the policy-id
+    // namespace; the list lives outside it so no registration order and no
+    // policy id can swallow it. A policy literally named "fragments" still
+    // resolves through the detail route.
+    ComplianceHarness h;
+
+    auto list = h.sink.Get("/fragments/policy-fragments");
+    REQUIRE(list);
+    CHECK(list->status == 200);
+    CHECK(list->body.find("Fragments temporarily unavailable") != std::string::npos);
+    CHECK(h.fleet_read_calls == 0); // did not route to the detail fragment
+
+    auto detail = h.sink.Get("/fragments/compliance/fragments");
+    REQUIRE(detail);
+    CHECK(detail->status == 200);
+    CHECK(h.fleet_read_calls == 1);
+}
+
+TEST_CASE("/fragments/policy-fragments: gated on service scope then Policy:Read",
+          "[compliance][security][authz]") {
+    {
+        ComplianceHarness h;
+        h.mock_token_scope_service = "printers";
+        auto res = h.sink.Get("/fragments/policy-fragments");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.perm_calls.empty());
+    }
+    {
+        ComplianceHarness h;
+        h.perm_admitted = false;
+        auto res = h.sink.Get("/fragments/policy-fragments");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        REQUIRE(h.perm_calls.size() == 1);
+        CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Policy", "Read"});
+    }
+}
+
+TEST_CASE("/fragments/policy-fragments: counts policies per fragment, honest empty state",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    ComplianceHarness h{&store};
+    auto empty = h.sink.Get("/fragments/policy-fragments");
+    REQUIRE(empty);
+    CHECK(empty->body.find("No policy fragments") != std::string::npos);
+
+    auto used = store.create_fragment(make_fragment_yaml("Used Fragment"));
+    auto idle = store.create_fragment(make_fragment_yaml("Idle Fragment"));
+    REQUIRE(used.has_value());
+    REQUIRE(idle.has_value());
+    REQUIRE(store.create_policy(make_policy_yaml(used.value(), "P1")).has_value());
+    REQUIRE(store.create_policy(make_policy_yaml(used.value(), "P2")).has_value());
+
+    auto res = h.sink.Get("/fragments/policy-fragments");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("Used Fragment") != std::string::npos);
+    CHECK(res->body.find("2 policies") != std::string::npos);
+    CHECK(res->body.find("Idle Fragment") != std::string::npos);
+    CHECK(res->body.find("0 policies") != std::string::npos);
+}
+
+TEST_CASE("compliance page: hosts the summary, detail, fragments and tag panels with denied notes",
+          "[compliance][fragments]") {
+    const std::string page = kComplianceHtml;
+    CHECK(page.find("hx-get=\"/fragments/compliance/summary\"") != std::string::npos);
+    CHECK(page.find("hx-get=\"/fragments/policy-fragments\"") != std::string::npos);
+    CHECK(page.find("hx-get=\"/fragments/settings/tag-compliance\"") != std::string::npos);
+    CHECK(page.find("id=\"compliance-detail\"") != std::string::npos);
+    // htmx drops 4xx bodies: each loader names its denied note, and one
+    // listener writes it into the targeted panel.
+    CHECK(page.find("data-denied=\"Needs the Policy Read permission.\"") != std::string::npos);
+    CHECK(page.find("data-denied=\"Needs the Tag Read permission.\"") != std::string::npos);
+    CHECK(page.find("htmx:responseError") != std::string::npos);
+    // CSP forbids hx-on; the page also carries no inline handler attributes.
+    CHECK(page.find("hx-on") == std::string::npos);
+    CHECK(page.find(" onclick=") == std::string::npos);
+}
+
+TEST_CASE("/fragments/compliance/{id}: reads the agent registry once per render and names hosts",
+          "[compliance][rest][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value(), "Registry Read Policy"));
+    REQUIRE(pol.has_value());
+    for (const char* a : {"agent-1", "agent-2", "agent-3"})
+        REQUIRE(store.update_agent_status(pol.value(), a, "compliant").has_value());
+
+    ComplianceHarness h{&store};
+    h.agents_json = R"([{"agent_id":"agent-1","hostname":"host-one","os":"linux"},
+                        {"agent_id":"agent-2","hostname":"host-two","os":"windows"}])";
+
+    auto res = h.sink.Get("/fragments/compliance/" + pol.value());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.agents_json_calls == 1); // three rows, one registry read
+    CHECK(res->body.find("host-one") != std::string::npos);
+    CHECK(res->body.find("host-two") != std::string::npos);
+    CHECK(res->body.find("agent-3") != std::string::npos); // unknown host falls back to its id
 }

@@ -105,6 +105,7 @@ private:
     std::string render_compliance_detail_fragment(const std::string& policy_id,
                                                   const authz::VisibleSet& scope,
                                                   std::optional<std::size_t>& rows_read);
+    std::string render_policy_fragments_fragment();
 
     // guardian-confinement-2298 PR3 §3e: blanket service-scoped-token deny for
     // the two compliance fragments, ahead of their grant gates (#4042:
@@ -115,10 +116,6 @@ private:
     // for this route class, not a fragment-specific shape).
     [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req,
                                             httplib::Response& res) const;
-
-    // -- Static helpers -------------------------------------------------------
-
-    static const char* compliance_level(int pct);
 
     // -- Dependency pointers (stored by register_routes) -----------------------
 
