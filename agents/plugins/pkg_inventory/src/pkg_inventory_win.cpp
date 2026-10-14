@@ -1,11 +1,12 @@
 /**
  * pkg_inventory_win.cpp — Windows leg entry point: PLANNED placeholder.
  *
- * Both actions report `status|<action>|unsupported|windows:planned` and no data
- * rows. The real legs (Chocolatey lib\ walk + nuspec metadata; winget presence)
- * follow as their own PR; no winget argv and no libxml2 dependency lands here
- * (unwired code is not committed). The descriptor declares both Windows legs
- * YUZU_SUPPORT_PLANNED to match.
+ * Every action (managers, packages, store_packages) reports
+ * `status|<action>|unsupported|windows:planned` and no data rows. The real legs
+ * (Chocolatey lib\ walk + nuspec metadata; winget presence; the Appx store
+ * roster) follow as their own PRs; no winget argv and no libxml2 dependency
+ * lands here (unwired code is not committed). The descriptor declares every
+ * Windows leg YUZU_SUPPORT_PLANNED to match.
  */
 #include "pkg_inventory_legs.hpp"
 

@@ -10,16 +10,17 @@
  * SCOPE. MACHINE-SCOPE package-manager state only: per-user package stores
  * (npm/pip/cargo/per-user Homebrew) are out of scope and deferred to the
  * user-session helper (ADR-3003). This release ships the macOS Homebrew
- * legs; the Linux `managers` leg (manager identity/presence and manager-level
- * config facts) follows as its own PR and reports the PLANNED token until then.
- * Linux never reports a package roster (installed_apps.get_inventory_linux owns
- * that), so Linux `packages` is UNSUPPORTED by design.
+ * legs and the Linux `managers` (tool presence + capture-backed facts) and
+ * `store_packages` (snap, flatpak) legs. Linux never reports a distro package
+ * roster (installed_apps.list_inventory owns that), so Linux `packages` is
+ * UNSUPPORTED by design. The Windows legs are PLANNED.
  *
  * WIRE GRAMMAR. Every action writes the status row FIRST, then data rows:
  *
  *   status|<action>|<supported|constrained|unsupported>|<tokens or ->
  *   manager|<dpkg|apt|rpm|dnf|pacman|apk|homebrew>|<present|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->
  *   package|homebrew|<id>|<version>|<formula|cask>
+ *   package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<active|inactive|unknown>
  *
  * Every free-text field goes through yuzu::util::safe_output_field (a trailing
  * backslash or a pipe in an OS-supplied value can never shift a column).
@@ -35,6 +36,15 @@
  * `supported` + zero data rows. A failed or unreadable read yields
  * `constrained` + a token (accumulated with yuzu::shared::ConstraintAccumulator),
  * never an empty success.
+ *
+ * TWO TOKEN CLASSES (store_packages). The installed-software collector fails any
+ * constrained store_packages answer (a partial roster would delete server rows),
+ * so a persistent per-item anomaly must never constrain the action:
+ *   - PER-ITEM FIELD DEGRADATION is silent on the status row and visible on the
+ *     data row: the row is still emitted with version `-` / kind `unknown` /
+ *     state `unknown` or `inactive`, and the status stays `supported`.
+ *   - `constrained` is reserved for LIST INCOMPLETENESS: an unlistable root or
+ *     nested level, entry_cap, walk_budget, row_cap, byte_cap, busy.
  *
  * NOT IN kKeyValuePlugins: this plugin is not decoded by the server as a
  * two-cell key|rest plugin (the README states this; checked at wiring time).
@@ -93,9 +103,9 @@ struct Limits {
 // ── fixed vocabularies (emitted verbatim, never through safe_output_field) ──
 
 /// The full manager-name vocabulary (a wire contract; the definition lists every
-/// value). Only `homebrew` is emitted today: the Linux names are produced by
-/// the Linux `managers` leg, which follows as its own PR.
-enum class Manager { dpkg, apt, rpm, dnf, pacman, apk, homebrew };
+/// value). `homebrew` is emitted by the macOS leg, the other eight by the Linux
+/// `managers` leg.
+enum class Manager { dpkg, apt, rpm, dnf, pacman, apk, homebrew, snap, flatpak };
 
 [[nodiscard]] constexpr std::string_view manager_name(Manager m) noexcept {
     switch (m) {
@@ -106,6 +116,8 @@ enum class Manager { dpkg, apt, rpm, dnf, pacman, apk, homebrew };
     case Manager::pacman:   return "pacman";
     case Manager::apk:      return "apk";
     case Manager::homebrew: return "homebrew";
+    case Manager::snap:     return "snap";
+    case Manager::flatpak:  return "flatpak";
     }
     return "dpkg";
 }
@@ -134,6 +146,30 @@ enum class PackageKind { formula, cask };
     return "formula";
 }
 
+/// The store ecosystems of the `store_packages` action.
+enum class Store { snap, flatpak };
+
+[[nodiscard]] constexpr std::string_view store_name(Store s) noexcept {
+    switch (s) {
+    case Store::snap:    return "snap";
+    case Store::flatpak: return "flatpak";
+    }
+    return "snap";
+}
+
+/// `active`: the installed revision/commit currently in use. `inactive`: present
+/// on disk but not current. `unknown`: the state could not be determined.
+enum class StoreState { active, inactive, unknown };
+
+[[nodiscard]] constexpr std::string_view store_state_token(StoreState s) noexcept {
+    switch (s) {
+    case StoreState::active:   return "active";
+    case StoreState::inactive: return "inactive";
+    case StoreState::unknown:  return "unknown";
+    }
+    return "unknown";
+}
+
 enum class StatusLevel { supported, constrained, unsupported };
 
 [[nodiscard]] constexpr std::string_view status_level_token(StatusLevel l) noexcept {
@@ -149,7 +185,7 @@ enum class StatusLevel { supported, constrained, unsupported };
 
 /// Fixed tokens for the by-design unsupported outcomes and the planned legs.
 inline constexpr std::string_view kTokenLinuxPackagesOwned = "linux:owned_by_installed_apps";
-inline constexpr std::string_view kTokenLinuxPlanned = "linux:planned";
+inline constexpr std::string_view kTokenMacosStoreOwned = "macos:owned_by_installed_apps";
 inline constexpr std::string_view kTokenWindowsPlanned = "windows:planned";
 /// The exception firewall's fixed provenance (never the exception's own text).
 inline constexpr std::string_view kTokenException = "pkg_inventory:exception";
@@ -270,6 +306,36 @@ private:
     return out;
 }
 
+/// package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
+/// Nine columns. Empty free fields are written as "-"; every free field goes
+/// through safe_output_field. `kind` is a fixed token chosen by the caller
+/// (snap_kind_token, or app/runtime for flatpak) and is written verbatim.
+[[nodiscard]] inline std::string format_store_row(Store store, std::string_view id,
+                                                  std::string_view version, std::string_view kind,
+                                                  std::string_view revision, std::string_view arch,
+                                                  std::string_view branch, StoreState state) {
+    auto field = [](std::string_view v) {
+        return v.empty() ? std::string{"-"} : yuzu::util::safe_output_field(v);
+    };
+    std::string out = "package|";
+    out += store_name(store);
+    out += '|';
+    out += field(id);
+    out += '|';
+    out += field(version);
+    out += '|';
+    out += kind;
+    out += '|';
+    out += field(revision);
+    out += '|';
+    out += field(arch);
+    out += '|';
+    out += field(branch);
+    out += '|';
+    out += store_state_token(state);
+    return out;
+}
+
 // ── pure name validation ─────────────────────────────────────────────────
 
 /// True when `name` is an acceptable Homebrew directory name at the formula /
@@ -285,6 +351,159 @@ private:
         const auto u = static_cast<unsigned char>(c);
         return u >= 0x20 && u < 0x7f && c != '/' && c != '\\' && c != '|';
     });
+}
+
+// ── snap / flatpak grammar (pure) ────────────────────────────────────────
+
+/// Upper bound on the bytes read from one snap.yaml (captured files are 182-955
+/// bytes). An oversized file is a silent `-`/unknown row, so the exact cap is not
+/// load-bearing.
+inline constexpr std::size_t kMaxSnapYamlBytes = 64 * 1024;
+
+/// One `<name>_<revision>.snap` file of /var/lib/snapd/snaps.
+struct SnapFile {
+    std::string name;     ///< snap INSTANCE name == the /snap/<name> mount directory
+    std::string revision; ///< `^x?[0-9]{1,10}$`
+};
+
+/// snapd's instance-name grammar (snap/naming/validate.go): a snap part of 2..40
+/// bytes of [a-z0-9-] with at least one letter, no leading/trailing `-`, no `--`;
+/// optionally `_` + an instance key of 1..10 [a-z0-9].
+[[nodiscard]] inline bool snap_instance_name_ok(std::string_view name) noexcept {
+    const auto us = name.find('_');
+    const auto snap = name.substr(0, us);
+    if (snap.size() < 2 || snap.size() > 40) return false;
+    if (snap.front() == '-' || snap.back() == '-') return false;
+    bool letter = false;
+    char prev = 0;
+    for (const char c : snap) {
+        const bool lower = c >= 'a' && c <= 'z';
+        const bool digit = c >= '0' && c <= '9';
+        if (!lower && !digit && c != '-') return false;
+        if (c == '-' && prev == '-') return false;
+        if (lower) letter = true;
+        prev = c;
+    }
+    if (!letter) return false;
+    if (us == std::string_view::npos) return true;
+    const auto key = name.substr(us + 1);
+    if (key.empty() || key.size() > 10) return false;
+    return std::all_of(key.begin(), key.end(), [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+    });
+}
+
+/// `^x?[0-9]{1,10}$`
+[[nodiscard]] inline bool snap_revision_ok(std::string_view rev) noexcept {
+    if (!rev.empty() && rev.front() == 'x') rev.remove_prefix(1);
+    if (rev.empty() || rev.size() > 10) return false;
+    return std::all_of(rev.begin(), rev.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+/// `<instance>_<revision>.snap`, split at the LAST `_` (a parallel-instance file
+/// `foo_bar_12.snap` is an ordinary row named `foo_bar`). nullopt for `partial`,
+/// `README` and every other shape.
+[[nodiscard]] inline std::optional<SnapFile> parse_snap_file_name(std::string_view file) {
+    constexpr std::string_view kExt = ".snap";
+    if (file.size() <= kExt.size() || file.substr(file.size() - kExt.size()) != kExt)
+        return std::nullopt;
+    file.remove_suffix(kExt.size());
+    const auto us = file.rfind('_');
+    if (us == std::string_view::npos) return std::nullopt;
+    const auto name = file.substr(0, us);
+    const auto rev = file.substr(us + 1);
+    if (!snap_revision_ok(rev) || !snap_instance_name_ok(name)) return std::nullopt;
+    return SnapFile{std::string{name}, std::string{rev}};
+}
+
+namespace detail {
+[[nodiscard]] inline std::string_view trim_ws(std::string_view v) noexcept {
+    constexpr std::string_view kWs = " \t\r";
+    const auto b = v.find_first_not_of(kWs);
+    if (b == std::string_view::npos) return {};
+    return v.substr(b, v.find_last_not_of(kWs) - b + 1);
+}
+} // namespace detail
+
+/// The value of the first COLUMN-0 `<key>:` line of a snap.yaml (an indented
+/// `  version:` under `apps:` is not a hit). One-line scalars only:
+///   - absent key or empty value                 -> nullopt
+///   - quoted ('..' or "..")                     -> the text up to the closing
+///                                                  quote (none -> nullopt; a `#`
+///                                                  inside quotes is not a comment)
+///   - starts with `|`, `>`, `[` or `{`          -> nullopt (not one line)
+///   - plain scalar                              -> cut at the first ` #`/`\t#`
+///                                                  (a YAML comment needs leading
+///                                                  whitespace), trimmed
+[[nodiscard]] inline std::optional<std::string> snap_yaml_top_level_value(std::string_view text,
+                                                                          std::string_view key) {
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        const auto nl = text.find('\n', pos);
+        const auto end = nl == std::string_view::npos ? text.size() : nl;
+        const auto line = text.substr(pos, end - pos);
+        pos = end + 1;
+        if (line.size() <= key.size() || line.substr(0, key.size()) != key ||
+            line[key.size()] != ':')
+            continue;
+        const auto v = detail::trim_ws(line.substr(key.size() + 1));
+        if (v.empty()) return std::nullopt;
+        const char c = v.front();
+        if (c == '\'' || c == '"') {
+            const auto close = v.find(c, 1);
+            if (close == std::string_view::npos) return std::nullopt;
+            return std::string{v.substr(1, close - 1)};
+        }
+        if (c == '|' || c == '>' || c == '[' || c == '{' || c == '#') return std::nullopt;
+        auto cut = v.size();
+        for (std::size_t i = 1; i < v.size(); ++i)
+            if (v[i] == '#' && (v[i - 1] == ' ' || v[i - 1] == '\t')) {
+                cut = i;
+                break;
+            }
+        const auto plain = detail::trim_ws(v.substr(0, cut));
+        if (plain.empty()) return std::nullopt;
+        return std::string{plain};
+    }
+    return std::nullopt;
+}
+
+/// The snap `type:` as a closed token. `yaml_read` false -> `unknown` (the
+/// snap.yaml could not be read); read with no `type:` -> `app` (snapd's default);
+/// `application` -> `app`; the snapd closed set passes through; anything else is
+/// `other` (a snap author controls this text, so it never reaches the wire).
+[[nodiscard]] inline std::string_view snap_kind_token(bool yaml_read,
+                                                      std::optional<std::string_view> type) noexcept {
+    if (!yaml_read) return "unknown";
+    if (!type) return "app";
+    const auto t = *type;
+    if (t == "application" || t == "app") return "app";
+    for (const std::string_view known : {"gadget", "kernel", "base", "snapd", "os"})
+        if (t == known) return known;
+    return "other";
+}
+
+/// snapd's isValidVersion: `^[a-zA-Z0-9](?:[a-zA-Z0-9:.+~-]{0,30}[a-zA-Z0-9+~])?$`
+/// (1..32 bytes), as a loop.
+[[nodiscard]] inline bool snap_version_ok(std::string_view v) noexcept {
+    if (v.empty() || v.size() > 32) return false;
+    auto alnum = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+    };
+    if (!alnum(v.front())) return false;
+    if (v.size() == 1) return true;
+    for (std::size_t i = 1; i + 1 < v.size(); ++i)
+        if (!alnum(v[i]) && v[i] != ':' && v[i] != '.' && v[i] != '+' && v[i] != '~' && v[i] != '-')
+            return false;
+    const char last = v.back();
+    return alnum(last) || last == '+' || last == '~';
+}
+
+/// Exactly 64 lowercase hex digits (a flatpak commit checksum).
+[[nodiscard]] inline bool is_hex64(std::string_view v) noexcept {
+    return v.size() == 64 && std::all_of(v.begin(), v.end(), [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
 }
 
 } // namespace yuzu::pkg_inventory

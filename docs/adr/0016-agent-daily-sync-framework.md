@@ -425,6 +425,11 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > for casks) and Windows optional features (ecosystem `optional_feature`, kind
 > `feat`) are collected since #5335.
 
+> **Update (2026-10-14, M.6):** `pkg_inventory.store_packages` is collected as
+> ecosystems `snap` (kind `app` or `pkg`; version from the mounted revision's
+> `snap.yaml`; release = the revision) and `flatpak` (kind `app` or `pkg`;
+> version empty, a branch being a ref; release = the commit), active rows only.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no

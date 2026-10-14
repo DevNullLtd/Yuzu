@@ -221,7 +221,9 @@ FRAGMENT_FILES = [
 # mgmt_posture (posture, +1) lands on top of dev's 230 (merge-arithmetic: this branch's own delta
 # added to dev's CURRENT total, re-derived by running parse_fragment_gate_rows over
 # FRAGMENT_FILES with both fragments present, not by hand): 231.
-EXPECTED_TOTAL_ROWS = 231
+# M.6: +1 pkg_inventory.store_packages (ReadOnly, Inventory:Read, gate None) on top of 231 = 232,
+# re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
+EXPECTED_TOTAL_ROWS = 232
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

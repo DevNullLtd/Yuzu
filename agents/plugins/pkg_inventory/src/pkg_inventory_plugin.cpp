@@ -2,37 +2,38 @@
  * pkg_inventory_plugin.cpp — machine-scope package-manager inventory for Yuzu.
  *
  * Actions:
- *   "managers" — which package managers are present on this host and their
- *                manager-level configuration facts (row PR10.1-c). macOS
- *                Homebrew ships in this release; the Linux and Windows legs are
- *                PLANNED placeholders (see below).
- *   "packages" — macOS Homebrew formulae and casks (Cellar/Caskroom directory
- *                names). Linux is UNSUPPORTED by construction (see below);
- *                Windows is a PLANNED placeholder.
+ *   "managers"       — which package managers are present on this host and their
+ *                      manager-level configuration facts (row PR10.1-c). macOS
+ *                      Homebrew and the Linux tool-presence leg (dpkg, apt, rpm,
+ *                      dnf, pacman, apk, snap, flatpak) ship; Windows is PLANNED.
+ *   "packages"       — macOS Homebrew formulae and casks (Cellar/Caskroom
+ *                      directory names). Linux is UNSUPPORTED by construction
+ *                      (see below); Windows is a PLANNED placeholder.
+ *   "store_packages" — Linux snaps and flatpak apps/runtimes from the system
+ *                      stores. macOS is UNSUPPORTED by design (installed_apps owns
+ *                      the application list); the Windows Appx leg is PLANNED.
  *
  * SCOPE. MACHINE-SCOPE ONLY: per-user package stores (npm global-vs-user, pip
  * user installs, cargo, per-user Homebrew) are out of scope and deferred to
  * the user-context session helper (docs/adr/3003-user-session-helper.md).
  *
- * LINUX SCOPE. The Linux leg is scoped to package-manager
- * identity/presence and manager-level config facts ONLY. It never enumerates an
- * individual package in any form: installed_apps.get_inventory_linux already
- * covers dpkg + rpm + pacman + apk, so `packages` is UNSUPPORTED on Linux by
- * design rather than a second, drifting roster. That identity/config `managers`
- * leg follows as its own PR; until it lands, Linux `managers` reports the
- * PLANNED token.
+ * LINUX SCOPE. `managers` is tool identity/presence plus a few capture-backed
+ * counts (versions are not read); `store_packages` lists snaps and flatpaks,
+ * which no distro-package roster covers. It never enumerates a dpkg/rpm/pacman/
+ * apk package: installed_apps.list_inventory already covers those, so `packages`
+ * is UNSUPPORTED on Linux by design rather than a second, drifting roster.
  *
- * ZERO SUBPROCESSES. Every read is a filesystem read (open/openat/readdir with
- * O_NOFOLLOW); no dpkg-query / rpm / pacman / apk / brew / winget is spawned.
+ * ZERO SUBPROCESSES. Every read is a filesystem read (open/openat/readdir/
+ * readlinkat with O_NOFOLLOW); no dpkg-query / rpm / pacman / apk / snap /
+ * flatpak / brew / winget is spawned.
  *
  * Every walk takes an injected root (production passes "/") so the unit suite
- * can drive it over a fixture tree; the macOS leg TU is a one-line wrapper.
+ * can drive it over a fixture tree; the per-OS leg TUs are one-line wrappers.
  *
- * All six per-OS legs are declared unconditionally so the capability-matrix
+ * All nine per-OS legs are declared unconditionally so the capability-matrix
  * generator (#2204) sees a complete, stable shape whichever OS built the
- * plugin. The Windows legs and the Linux `managers` leg are PLANNED
- * placeholders: the Chocolatey walk and winget presence, and the Linux manager
- * identity/config walk, each follow as their own PR.
+ * plugin. The Windows legs are PLANNED placeholders: the Chocolatey walk, winget
+ * presence and the Appx store roster each follow as their own PR.
  *
  * Read-only: no action here mutates host state.
  */
@@ -48,20 +49,23 @@
 
 namespace {
 
-// The six per-action per-OS legs (two actions x three OSes) are FIXED and
-// never wrapped in a preprocessor conditional.
+// The nine per-action per-OS legs (three actions x three OSes) are FIXED and
+// never wrapped in a preprocessor conditional. An unsupported-by-design leg is
+// rung 0 with no mechanism (the repo idiom: antivirus_plugin.cpp,
+// app_control_plugin.cpp); the note names the owner.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "managers",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "tool presence + /var/lib/dpkg/arch, /etc/apt/sources.list.d count, /etc/yum.repos.d "
-         "count, /etc/dnf/dnf.conf, /etc/pacman.conf + pacman.d/mirrorlist, "
-         "/etc/apk/repositories + /etc/apk/arch",
-         "follows as its own PR"},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "tool presence by fstatat(AT_SYMLINK_NOFOLLOW) under /usr/bin, /usr/sbin, /bin, /sbin; "
+         "facts: /etc/apt/sources.list.d *.list/*.sources count, /var/lib/snapd/snaps file count, "
+         "/var/lib/flatpak/{app,runtime} counts",
+         nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "Homebrew prefix layout: Library/Taps, Cellar, Caskroom",
-         nullptr},
+         "cask rows, non-zero tap counts and the Intel prefix are exercised by synthetic in-code "
+         "layouts only, never a real capture"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1,
          "ProgramData\\chocolatey lib/ walk + Program Files\\WindowsApps DesktopAppInstaller "
@@ -71,14 +75,31 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "packages",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_UNSUPPORTED, 1, "none by design",
-         "installed_apps.get_inventory_linux owns the Linux package roster"},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+         "installed_apps.list_inventory owns the Linux package roster"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "Cellar/<formula>/<version>, Caskroom/<cask>/<version> directory names",
-         nullptr},
+         "cask rows and the Intel prefix are exercised by synthetic in-code layouts only, never a "
+         "real capture"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1,
          "chocolatey lib/<id>/<id>.nuspec via libxml2; follows as its own PR", nullptr},
+    },
+    {
+        /* .action      = */ "store_packages",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "/var/lib/snapd/snaps/<name>_<rev>.snap + /snap/<name>/current readlink + "
+         "<rev>/meta/snap.yaml; /var/lib/flatpak/{app,runtime}/<id>/<arch>/<branch> + active "
+         "readlink",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "installed_apps owns the macOS application list"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_PLANNED, 1,
+         "HKLM AppxAllUserStore + WindowsApps single-level + one AppxManifest.xml read; follows as "
+         "its own PR",
+         nullptr},
     },
 };
 
@@ -89,12 +110,12 @@ public:
     std::string_view name() const noexcept override { return "pkg_inventory"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Machine-scope package-manager inventory (managers and packages); per-user "
-               "package stores are out of scope, deferred to the user-session helper";
+        return "Machine-scope package-manager inventory (managers, packages and store_packages); "
+               "per-user package stores are out of scope, deferred to the user-session helper";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"managers", "packages", nullptr};
+        static const char* acts[] = {"managers", "packages", "store_packages", nullptr};
         return acts;
     }
 

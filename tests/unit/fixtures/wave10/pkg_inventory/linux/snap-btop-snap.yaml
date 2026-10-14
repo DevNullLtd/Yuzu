@@ -1,0 +1,38 @@
+name: btop
+version: 1.4.7
+summary: Resource monitor that shows usage and stats
+description: |
+  Resource monitor that shows usage and stats for processor, memory, disks, network and processes.
+  C++ version and continuation of bashtop and bpytop.
+license: Apache-2.0
+architectures:
+- amd64
+base: core24
+apps:
+  btop:
+    command: usr/local/bin/btop
+    plugs:
+    - mount-observe
+    - process-control
+    - system-observe
+    - hardware-observe
+    - network
+    - network-observe
+    - home
+    - removable-media
+    - opengl
+    environment:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+confinement: strict
+grade: stable
+environment:
+  LD_LIBRARY_PATH: ${SNAP_LIBRARY_PATH}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+  PATH: $SNAP/usr/sbin:$SNAP/usr/bin:$SNAP/sbin:$SNAP/bin:$PATH
+links:
+  contact:
+  - https://github.com/kz6fittycent/btop/issues
+  issues:
+  - https://github.com/kz6fittycent/btop/issues
+  source-code:
+  - https://github.com/aristocratos/btop

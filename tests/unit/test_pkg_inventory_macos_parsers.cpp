@@ -776,9 +776,9 @@ TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in f
     REQUIRE(build_macos_tree(dir.path, err));
 
     {
-        const auto held = mac::WalkSlot::try_acquire(Action::managers);
+        const auto held = WalkSlot::try_acquire(Action::managers);
         REQUIRE(held.has_value());
-        CHECK_FALSE(mac::WalkSlot::try_acquire(Action::managers).has_value()); // single-flight
+        CHECK_FALSE(WalkSlot::try_acquire(Action::managers).has_value()); // single-flight
 
         const auto busy = run_leg(dir.path, Action::managers, Via::guarded);
         CHECK(busy.rc == 0); // a busy answer is a degraded read, not a failed command
@@ -805,8 +805,8 @@ TEST_CASE("pkg_inventory macos seam: a same-action dispatch while a walk is in f
         CHECK(rows[0] == "status|managers|supported|-");
         CHECK(again.result_status == YUZU_RESULT_STATUS_OK);
     }
-    CHECK(mac::WalkSlot::try_acquire(Action::managers).has_value());
-    CHECK(mac::WalkSlot::try_acquire(Action::packages).has_value());
+    CHECK(WalkSlot::try_acquire(Action::managers).has_value());
+    CHECK(WalkSlot::try_acquire(Action::packages).has_value());
 }
 
 #if defined(__APPLE__)
@@ -816,7 +816,7 @@ TEST_CASE("pkg_inventory macos seam: the plugin's own run_macos entry point walk
     // run_macos is what execute() calls in production (pkg_inventory_macos.cpp). Holding
     // the slot proves THAT call site is the guarded one, without walking this host's
     // real "/" tree. MUTATION: calling run_macos_at from run_macos walks instead.
-    const auto held = mac::WalkSlot::try_acquire(Action::packages);
+    const auto held = WalkSlot::try_acquire(Action::packages);
     REQUIRE(held.has_value());
     const auto busy = run_leg(fs::path{"/"}, Action::packages, Via::entry);
     CHECK(busy.rc == 0);

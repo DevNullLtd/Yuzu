@@ -19,15 +19,21 @@
 #include <yuzu/plugin.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
 #include <yuzu/agent/scoped_fd.hpp>
+
+#include <constraint_accumulator.hpp>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -38,12 +44,16 @@
 namespace yuzu::pkg_inventory {
 
 /// One value per `actions()` entry (pkg_inventory_plugin.cpp).
-enum class Action { managers, packages };
+enum class Action { managers, packages, store_packages };
+
+/// Number of `Action` values; sizes the per-action WalkSlot array.
+inline constexpr std::size_t kActionCount = 3;
 
 [[nodiscard]] constexpr std::string_view action_name(Action a) noexcept {
     switch (a) {
     case Action::managers: return "managers";
     case Action::packages: return "packages";
+    case Action::store_packages: return "store_packages";
     }
     return "managers";
 }
@@ -53,6 +63,7 @@ enum class Action { managers, packages };
 [[nodiscard]] constexpr std::optional<Action> parse_action(std::string_view action) noexcept {
     if (action == "managers") return Action::managers;
     if (action == "packages") return Action::packages;
+    if (action == "store_packages") return Action::store_packages;
     return std::nullopt;
 }
 
@@ -92,8 +103,8 @@ inline void emit_result(yuzu::CommandContext& ctx, Action a,
         ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
 }
 
-/// The by-design unsupported and planned outcomes (Linux `packages`, the planned
-/// Linux `managers` leg, both Windows legs): `status|<action>|unsupported|<token>`
+/// The by-design unsupported and planned outcomes (Linux `packages`, macOS
+/// `store_packages`, the Windows legs): `status|<action>|unsupported|<token>`
 /// and no data rows.
 inline void emit_unsupported(yuzu::CommandContext& ctx, Action a, std::string_view token) {
     ctx.write_output(unsupported_status_row(action_name(a), token));
@@ -131,10 +142,12 @@ int run_guarded(yuzu::CommandContext& ctx, std::string_view action, Body&& body)
 
 // ── POSIX directory primitives (thin shell; not compiled on Windows) ─────
 //
-// Used by the macOS walk shell (pkg_inventory_macos_parsers.hpp). Nothing
-// here spawns a process: every read is open/openat/fstatat/readdir with
-// O_NOFOLLOW on the leaf, so a swapped-in symlink is refused rather than
-// followed (a private copy of the autoruns_macos.cpp dir_open_outcome_from_fd
+// Used by the macOS and Linux walk shells (pkg_inventory_macos_parsers.hpp,
+// pkg_inventory_linux_parsers.hpp). Nothing here spawns a process: every read
+// is open/openat/fstatat/readdir/readlinkat with O_NOFOLLOW on the leaf (leaf
+// no-follow; root-owned parents trusted -- open_dir_no_follow opens ONE joined
+// path, so only its final component is refused if a link), so a swapped-in
+// symlink is refused rather than followed (a private copy of the autoruns_macos.cpp dir_open_outcome_from_fd
 // / open_dir_no_follow_checked shape; posix_dir_walk.hpp deliberately leaves
 // opening to each caller). Guarded because posix_dir_walk.hpp does not exist on
 // Windows; the portable row/text layer is pkg_inventory_parsers.hpp.
@@ -256,6 +269,41 @@ struct EntryClass {
     return {EntryKind::other, {}};
 }
 
+/// Outcome of a readlinkat. Exactly one of: `text` (the validated link text, a
+/// single path component, never resolved), `absent` (ENOENT), or `detail`
+/// (`not_a_directory` is NOT used here: EINVAL -> `not_a_symlink`, a malformed
+/// target -> `unexpected_target`, else an open_failure_token).
+struct ReadLink {
+    std::optional<std::string> text;
+    bool absent = false;
+    std::string_view detail{};
+};
+
+/// Reads the symlink `name` inside `parent` without resolving it. The text must
+/// be 1..max_len bytes with no `/` and no NUL (a bare component such as a
+/// revision number or a commit hash); anything else is `unexpected_target`.
+[[nodiscard]] inline ReadLink read_link_name(const Dir& parent, const char* name,
+                                             std::size_t max_len) {
+    ReadLink r;
+    std::string buf(max_len + 1, '\0');
+    const auto n = ::readlinkat(parent.fd(), name, buf.data(), buf.size());
+    if (n < 0) {
+        const int err = errno;
+        if (is_benign_absent_errno(err)) r.absent = true;
+        else if (err == EINVAL) r.detail = "not_a_symlink";
+        else r.detail = open_failure_token(err);
+        return r;
+    }
+    const auto len = static_cast<std::size_t>(n);
+    buf.resize(len);
+    if (len == 0 || len > max_len || buf.find_first_of(std::string_view{"/\0", 2}) != std::string::npos) {
+        r.detail = "unexpected_target";
+        return r;
+    }
+    r.text = std::move(buf);
+    return r;
+}
+
 /// Records a directory-listing outcome into `acc`. Truncation and readdir
 /// errors are real constraints (`entry_cap`, `enumeration_error`) -- the names
 /// read so far are still usable by the caller, but the result is flagged
@@ -279,6 +327,98 @@ inline void note_listing(yuzu::shared::ConstraintAccumulator& acc, std::string_v
 }
 
 } // namespace posix
+
+// ── whole-action walk budget + single-flight slot (shared by both shells) ──
+
+/// Whole-ACTION budget (entries read, output bytes, wall clock), one per action
+/// (constructed once) and threaded by reference through every listing that
+/// action performs. Each directory listing is bounded on its own by
+/// lim.max_entries_per_dir, but nothing else bounds how many such listings a
+/// whole action performs: a tree of max_entries_per_dir id/org directories x
+/// max_entries_per_dir entries each (or a Cellar full of plain files that never
+/// classify as a version directory, so row_cap never trips) would otherwise be
+/// read in full on every call. Not agents/core/include/yuzu/agent/
+/// confined_fs_rules.hpp's `EnumBudget`: that type is scoped, by its own banner,
+/// to confined recursive DELETE (a different subsystem) -- this is a small
+/// pkg_inventory-local equivalent of the same shape, not a shared import.
+struct WalkBudget {
+    std::size_t remaining_entries;
+    std::size_t remaining_bytes;
+    std::chrono::steady_clock::time_point deadline;
+
+    [[nodiscard]] static WalkBudget from(const Limits& lim) {
+        return {lim.max_walk_entries, lim.max_output_bytes,
+                std::chrono::steady_clock::now() + std::chrono::seconds(lim.max_walk_seconds)};
+    }
+    /// The wall-clock half alone: what a loop over ALREADY-charged entries checks
+    /// (the entries were paid for when their listing was charged).
+    [[nodiscard]] bool timed_out() const noexcept {
+        return std::chrono::steady_clock::now() >= deadline;
+    }
+    [[nodiscard]] bool exhausted() const noexcept { return remaining_entries == 0 || timed_out(); }
+    void charge(std::size_t n) noexcept { remaining_entries -= std::min(n, remaining_entries); }
+    /// Charges one emitted row; false when it would exceed the output-byte
+    /// allowance, which is then spent for good (like row_cap, once the cap trips no
+    /// later, shorter row slips in).
+    [[nodiscard]] bool charge_row(std::size_t n) noexcept {
+        if (n > remaining_bytes) {
+            remaining_bytes = 0;
+            return false;
+        }
+        remaining_bytes -= n;
+        return true;
+    }
+};
+
+/// Folds `from`'s comma-joined tokens into `into` (ConstraintAccumulator has no
+/// merge; tokens never contain a comma, so the split is lossless).
+inline void merge_tokens(yuzu::shared::ConstraintAccumulator& into,
+                         const yuzu::shared::ConstraintAccumulator& from) {
+    const std::string joined = from.reason();
+    std::size_t pos = 0;
+    while (pos < joined.size()) {
+        const auto comma = joined.find(',', pos);
+        const auto end = comma == std::string::npos ? joined.size() : comma;
+        into.add_failure(std::string_view{joined}.substr(pos, end - pos));
+        pos = end + 1;
+    }
+    if (from.incomplete()) into.mark_incomplete();
+}
+
+/// Process-wide single-flight slot, one per action, held for the duration of a
+/// walk. The walk's wall clock is cooperative (it cannot interrupt a syscall
+/// that blocks on a stalled mount inside the tree) and the agent has no
+/// per-command timeout, so without this every further dispatch of the action
+/// would pin another pool worker behind the stalled one, starving unrelated
+/// commands (quarantine among them). With it a stall pins at most one worker per
+/// action; a concurrent dispatch is answered at once with the visible,
+/// retryable `<os>:<action>:busy` constraint. No thread is involved: the slot
+/// is released by the walking worker itself when it returns.
+class WalkSlot {
+public:
+    [[nodiscard]] static std::optional<WalkSlot> try_acquire(Action a) noexcept {
+        auto& flag = flag_for(a);
+        if (flag.exchange(true, std::memory_order_acquire)) return std::nullopt;
+        return WalkSlot{&flag};
+    }
+    WalkSlot(const WalkSlot&) = delete;
+    WalkSlot& operator=(const WalkSlot&) = delete;
+    WalkSlot& operator=(WalkSlot&&) = delete;
+    WalkSlot(WalkSlot&& o) noexcept : flag_(std::exchange(o.flag_, nullptr)) {}
+    ~WalkSlot() {
+        if (flag_ != nullptr) flag_->store(false, std::memory_order_release);
+    }
+
+private:
+    explicit WalkSlot(std::atomic<bool>* flag) noexcept : flag_(flag) {}
+    [[nodiscard]] static std::atomic<bool>& flag_for(Action a) noexcept {
+        static std::atomic<bool> flags[kActionCount]{};
+        static_assert(kActionCount == static_cast<std::size_t>(Action::store_packages) + 1,
+                      "one slot per Action value");
+        return flags[static_cast<std::size_t>(a)];
+    }
+    std::atomic<bool>* flag_;
+};
 
 #endif // !defined(_WIN32)
 
