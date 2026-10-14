@@ -144,7 +144,7 @@ TEST_CASE("actions glue: every mutation is a dialog form with a submit hook, so 
     CHECK(count_of(js(), "D.form(") == 1);   // inside mutate()
     CHECK_THAT(js(), !ContainsSubstring("D.confirm("));
     CHECK(count_of(js(), "D.request(") == 1);
-    CHECK_THAT(js(), ContainsSubstring("return why(r);"));
+    CHECK_THAT(js(), ContainsSubstring("return r.message || 'The request failed (HTTP ' + r.status + ').';"));
     // A 5xx on a credential write may have changed state: the detail is reloaded, never retried.
     CHECK_THAT(js(), ContainsSubstring("function refreshOnFail(id) { return function (r) { if (r.status >= 500) reloadDetail(id); }; }"));
     CHECK(count_of(js(), "onFail: refreshOnFail(d.principalId)") == 3);

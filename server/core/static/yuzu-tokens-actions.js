@@ -39,12 +39,6 @@
   var nowBase = 0;
   var nowAt = 0;
 
-  function el(tag, cls, text) {
-    var n = document.createElement(tag);
-    if (cls) n.className = cls;
-    if (text !== undefined) n.textContent = text;
-    return n;
-  }
   function byId(id) { return document.getElementById(id); }
   function seg(v) { return encodeURIComponent(v); }
   function flash(text) { var f = byId('flash'); if (f) f.textContent = text || ''; }
@@ -138,14 +132,14 @@
   // ---- mutation plumbing ------------------------------------------------------------------
   function auditBanner() {
     if (byId('audit-failed')) return;
-    var b = el('div', 'failbox', AUDIT_FAILED);
+    var b = document.createElement('div');
+    b.className = 'failbox';
+    b.textContent = AUDIT_FAILED;
     b.id = 'audit-failed';
     b.setAttribute('role', 'alert');
     var main = document.querySelector('main.page');
     if (main) main.insertBefore(b, main.children[1] || null);
   }
-
-  function why(r) { return r.message || 'The request failed (HTTP ' + r.status + ').'; }
 
   // One form-with-submit dialog: a refusal keeps the dialog open with the server's sentence, so
   // the operator does not retype. Resolves the response on success, null on cancel.
@@ -161,7 +155,7 @@
         return D.request(o.method, o.path, opts).then(function (r) {
           if (!r.ok) {
             if (o.onFail) o.onFail(r);
-            return why(r);
+            return r.message || 'The request failed (HTTP ' + r.status + ').';
           }
           res = r;
           return null;

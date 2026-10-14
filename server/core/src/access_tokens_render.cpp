@@ -132,8 +132,6 @@ std::string need_note(bool rbac_enforced, const char* what, const char* perm) {
            "</p>";
 }
 
-bool any_action(const TokenCaps& c) { return c.rotate || c.revoke; }
-
 // "New principal" (or the sentence saying what it needs). Rows carry no actions: every
 // principal action lives in the detail panel, where the credential facts they depend on are read.
 std::string principals_toolbar(const PrincipalsView& v) {
@@ -147,13 +145,6 @@ std::string principals_toolbar(const PrincipalsView& v) {
 constexpr std::int64_t kRotationGraceSecs = 120;
 constexpr std::int64_t kRotateMinRemainingSecs = 24 * 3600;
 
-const ApiToken* find_by_id(const std::vector<ApiToken>& rows, const std::string& id) {
-    for (const auto& r : rows)
-        if (r.token_id == id)
-            return &r;
-    return nullptr;
-}
-
 std::string token_actions(const ApiToken& t, const std::vector<ApiToken>& all, const PageFlags& f) {
     // A row whose id could not safely sit in a request path gets no controls at all.
     if (!safe_token_id(t.token_id))
@@ -165,7 +156,8 @@ std::string token_actions(const ApiToken& t, const std::vector<ApiToken>& all, c
     if (f.caps.rotate && mine && human && !t.revoked && !expired) {
         if (!t.supersedes_token_id.empty()) {
             // A pending successor: Confirm retires its predecessor.
-            const ApiToken* pred = find_by_id(all, t.supersedes_token_id);
+            const auto pi = std::ranges::find(all, t.supersedes_token_id, &ApiToken::token_id);
+            const ApiToken* pred = pi == all.end() ? nullptr : &*pi;
             out += act("token-confirm",
                        {{"data-token-id", t.token_id},
                         {"data-predecessor", pred && !pred->name.empty() ? pred->name : t.supersedes_token_id}},
@@ -327,7 +319,7 @@ std::string render_tokens_list(const std::variant<TokensView, Unavailable>& v, c
         return out + "</div>";
     }
 
-    const bool actions = any_action(flags.caps);
+    const bool actions = flags.caps.rotate || flags.caps.revoke;
     out += "<div class=\"tw\"><table><thead><tr><th>Token</th><th>Type</th><th>Owner</th><th>Created</th>"
            "<th>Expires</th><th>Last used</th><th>Status</th>" +
            std::string(actions ? "<th><span class=\"sr\">Actions</span></th>" : "") +
