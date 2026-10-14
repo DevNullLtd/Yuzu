@@ -23,7 +23,7 @@ namespace yuzu::server::cert_upload {
 /// create_directories, plus 0700 when THIS call created the leaf directory
 /// (POSIX). An existing directory is left as the operator/installer set it.
 inline void create_cert_dir(const std::filesystem::path& dir, std::error_code& ec) {
-    const bool created = std::filesystem::create_directories(dir, ec);
+    [[maybe_unused]] const bool created = std::filesystem::create_directories(dir, ec);
 #ifndef _WIN32
     if (!ec && created) {
         std::error_code perm_ec;
@@ -33,8 +33,6 @@ inline void create_cert_dir(const std::filesystem::path& dir, std::error_code& e
             spdlog::warn("cert upload: could not set 0700 on {}: {}", dir.string(),
                          perm_ec.message());
     }
-#else
-    (void)created;
 #endif
 }
 
