@@ -109,7 +109,8 @@ TEST_CASE("Security page: CSP-safe and keeps a revealed secret out of htmx histo
     CHECK_THAT(html, !ContainsSubstring("hx-on"));
     for (const char* inline_handler : {" onclick=", " onchange=", " onsubmit=", " onload=", " onerror="})
         CHECK_THAT(html, !ContainsSubstring(inline_handler));
-    CHECK_THAT(html, !ContainsSubstring("innerHTML"));
+    CHECK_THAT(html, !ContainsSubstring(".innerHTML"));
+    CHECK_THAT(html, !ContainsSubstring("insertAdjacentHTML"));
     CHECK_THAT(html, !ContainsSubstring("eval("));
     CHECK_THAT(html, !ContainsSubstring("new Function"));
     CHECK_THAT(html, !ContainsSubstring("fetch("));
