@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file operate_ui.hpp
-/// Page-local CSS shared by the two Operate pages (Approvals, Executions).
+/// Page-local CSS shared by the Operate pages (Approvals, Executions, Workflows).
 ///
 /// Why not `yuzu.css`: these rules are page layout, not design primitives, and Phase 1's
 /// convention is page-local CSS built from the design tokens; keeping `yuzu.css` untouched
@@ -104,6 +104,12 @@ details.resp summary{cursor:pointer;font-size:13px;color:var(--mut)}
 .ops-live i{width:7px;height:7px;border-radius:50%;background:var(--ok)}
 .ops-live[data-state="reconnecting"] i{background:var(--warn)}
 .ops-live[data-state="unavailable"] i{background:var(--mut)}
+.ops-steps{list-style:none;margin:0;padding:0}
+.ops-steps li{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.ops-steps li:last-child{border-bottom:0}
+.ops-steps .st{min-width:0}
+.ops-steps .nm,.ops-steps .sub{max-width:none;white-space:normal;overflow-wrap:anywhere}
+.ops-sc td .sub{max-width:240px}
 @media (max-width:820px){
 .pg{padding:16px}
 .nm,.sub{max-width:200px}

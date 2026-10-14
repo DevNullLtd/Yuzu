@@ -1118,6 +1118,10 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/mcp"
     "/fragments/settings/nvd"
     "/fragments/settings/directory"
+    "/fragments/workflows"
+    "/fragments/schedules?view=page"
+    "/fragments/workflow-runs"
+    "/fragments/workflow-runs/e2e-no-such-run"
 )
 
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do
