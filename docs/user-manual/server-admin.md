@@ -1383,8 +1383,9 @@ value through. Direct access, and proxies configured to preserve `Host`, are una
 need no change.
 
 **The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
-— CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, and the
-gated settings POSTs. The dashboard renders fine and reads work; only the destructive actions
+— CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
+gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
+Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
@@ -2809,11 +2810,10 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | API Tokens | `/fragments/settings/api-tokens` | Create and revoke bearer tokens for REST API automation. |
 | Plugin Code Signing | `/fragments/settings/plugin-signing` | Upload a PEM trust bundle for agent plugin CMS signature verification, toggle the require-signed-plugins flag, and remove the bundle. The trust bundle persists at `<cert-dir>/plugin-trust-bundle.pem`; the require flag persists in `runtime_config` under key `plugin_signing_required`. Distribution to agents is operator-driven today (curl into a local file referenced by `--plugin-trust-bundle`); automatic agent-side fetch is a forthcoming change. See the user-manual *Agent Plugins → Plugin Code Signing* section. |
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
-| Tag Compliance | `/fragments/settings/tag-compliance` | View compliance summary across the fleet based on tag-driven policies. |
+| Tag Compliance | *(moved)* | Now the **Compliance by tag** panel on the Compliance page; see [Tag Compliance](#tag-compliance). |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
 | OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart reverts to the command-line/environment value, so a durable rotation must update that too; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
-| DEX Alerts | `/fragments/settings/dex-alerts` | Route individual DEX signal types to operator notifications and the `dex.signal` webhook, tune the fleet blast-radius thresholds (min devices / window / cooldown), and set the per-cohort Prometheus gauge **export tag key**. Admin-only; changes apply live (no restart) and are audit-logged (`settings.dex_alerts.routing`, `settings.dex_alerts.blast`, `settings.dex_alerts.cohort_export`). See the user-manual *DEX → Routing signals to alerts* and *DEX → Fleet performance rollup* sections. |
 | Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). A view over the same `AuditLog:Read`/`AuditLog:Attest`-gated `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. See `docs/auth-architecture.md` "Periodic access reviews". |
 
 ### Revoking an agent certificate from the dashboard
@@ -3988,13 +3988,16 @@ For the full RBAC model, see `docs/user-manual/rbac.md`.
 
 ## Tag Compliance
 
-The Tag Compliance section provides a fleet-wide view of compliance based on tag-driven policies.
+Tag compliance shows how many devices carry each structured tag category. It lives on the
+**Compliance** page, in the **Compliance by tag** panel (it was a Settings panel before).
 
-1. Navigate to **Settings > Tag Compliance**.
-2. View the compliance summary showing:
-   - Total devices, compliant count, non-compliant count.
-   - Breakdown by tag category.
-   - Devices missing required tags.
+1. Open **Compliance** and scroll to **Compliance by tag**.
+2. For each category the table shows the display name, how many devices are tagged, how many
+   are missing the tag, and the allowed values (**Free-form** when any value is accepted),
+   with a summary line of how many devices have every required tag.
+
+Reading it needs the `Tag:Read` permission; without it the panel says so and the rest of the
+page still loads.
 
 Tag compliance data is also available via the REST API (`GET /api/v1/tag-compliance`) for integration with external dashboards and reporting tools.
 
@@ -5050,19 +5053,22 @@ The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin r
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/fragments/settings/tag-compliance` | Render the tag compliance summary fragment (HTMX). |
+| `GET` | `/fragments/settings/tag-compliance` | Render the tag compliance table fragment (HTMX); loaded by the Compliance page. |
 | `GET` | `/api/v1/tag-compliance` | Tag compliance summary (JSON, via REST API v1). |
 
 ### DEX Alerts
 
+DEX alerting is configured on the **DEX page, Alerts tab** (it moved out of Settings). The tab routes individual DEX signal types to operator notifications and the `dex.signal` webhook, tunes the fleet blast-radius thresholds (min devices / window / cooldown, clamped to their ranges on save) and sets the per-cohort Prometheus gauge **export tag key** (saving it asks for confirmation because the key's tag values become `/metrics` labels). Changes apply live and are audit-logged. A non-administrator who opens the tab sees a role note instead of the settings. See the user-manual *DEX -> Routing signals to alerts* and *DEX -> Fleet performance rollup* sections.
+
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/fragments/settings/dex-alerts` | Render the DEX alerts configuration fragment (HTMX). Admin-only. |
+| `GET` | `/fragments/dex/alerts` | The Alerts tab: DEX sub-nav, role note and the configuration form (HTMX). Any signed-in viewer may load it; the form renders for administrators only. Composed of the settings fragment below. |
+| `GET` | `/fragments/settings/dex-alerts` | Render the DEX alerts configuration form body only (HTMX). Admin-only. |
 | `POST` | `/api/settings/dex-alerts/routing` | Update the routed signal types. Body: form-encoded `types=<obs_type>` repeated per checked type; values are allow-listed against the signal catalogue. Persisted to `runtime_config` key `dex_alert_routing` (sorted JSON array). Applied live. Audit: `settings.dex_alerts.routing` (detail records the full routed set). |
 | `POST` | `/api/settings/dex-alerts/blast` | Update the blast-radius thresholds. Body: `min_devices`, `window_seconds`, `cooldown_seconds` (clamped server-side to `[2,100000]` / `[60,86400]` / `[0,604800]`). Persisted to the `dex_blast_*` keys. Applied live. Audit: `settings.dex_alerts.blast`. |
 | `POST` | `/api/settings/dex-alerts/cohort-export` | Set (or clear) the cohort metrics export tag key. Body: `export_key` (tag-key alphabet `[A-Za-z0-9_.:-]`, max 64; empty disables — the default). When set, the per-cohort `yuzu_fleet_perf_cohort_*` Prometheus gauges are published for that key's cohorts (top 50 by population, 10-device floor, `yuzu_fleet_perf_cohort_clipped` makes capping visible). Persisted to `dex_cohort_export_key`. Applied on the next gauge sweep. Audit: `settings.dex_alerts.cohort_export`. |
 
-**New `runtime_config` keys.** All are runtime-set via the DEX Alerts panel and applied live (and re-applied at boot):
+**New `runtime_config` keys.** All are runtime-set via the DEX Alerts tab and applied live (and re-applied at boot):
 
 | Key | Type | Default | Description |
 |---|---|---|---|

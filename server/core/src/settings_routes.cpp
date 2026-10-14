@@ -13,6 +13,7 @@
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "compliance_fragments.hpp" // pure renderer for the tag-compliance table
 #include "config_secret_keys.hpp" // is_exactly_redaction_placeholder in the OIDC handler
 #include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
 #include "dex_blast_radius.hpp" // F1: BlastRadiusConfig defaults for the threshold form
@@ -83,6 +84,10 @@ extern const char* const kSettingsHtml;
 // their incomplete types.
 
 namespace yuzu::server {
+
+// Shared DEX sub-nav (defined in dex_routes.cpp; the same declaration dex_perf_ui.cpp,
+// dex_app_perf_ui.cpp and network_ui.cpp carry). N2 renders it around the Alerts form.
+std::string dex_subnav(const std::string& active, int window_days);
 
 // ── Anonymous namespace: YAML helpers and JSON extraction ────────────────────
 
@@ -803,6 +808,11 @@ std::string bulk_audit_detail(const std::vector<std::string>& ids) {
 }
 } // namespace
 
+bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
+                              std::chrono::system_clock::time_point now) noexcept {
+    return expires_at != (std::chrono::system_clock::time_point::max)() && expires_at <= now;
+}
+
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
     // The reveal block is built first: a freshly minted raw token is shown ONCE, so
     // it must survive even when the follow-up list read fails.
@@ -824,6 +834,7 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
     if (!tokens_result)
         return std::string(kEnrollmentStoreUnavailableHtml) + reveal;
     const auto& tokens = *tokens_result;
+    const auto now = std::chrono::system_clock::now();
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>ID</th><th>Label</th><th>Uses</th>"
                        "  <th>Expires</th><th>Status</th><th></th></tr></thead>"
@@ -854,6 +865,9 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
             } else if (t.max_uses > 0 && t.use_count >= t.max_uses) {
                 status_cls = "role-user";
                 status_txt = "Exhausted";
+            } else if (enrollment_token_expired(t.expires_at, now)) {
+                status_cls = "role-user";
+                status_txt = "Expired";
             } else {
                 status_cls = "role-admin";
                 status_txt = "Active";
@@ -2064,16 +2078,6 @@ std::string SettingsRoutes::render_auto_approve_fragment() {
 std::string SettingsRoutes::render_tag_compliance_fragment() {
     const auto& categories = get_tag_categories();
 
-    std::string html;
-    html += "<table class=\"user-table\">"
-            "<thead><tr>"
-            "<th>Category</th>"
-            "<th>Display Name</th>"
-            "<th>Agents Tagged</th>"
-            "<th>Agents Missing</th>"
-            "<th>Allowed Values</th>"
-            "</tr></thead><tbody>";
-
     // Two bulk reads (ADR-0050 — the pre-migration version issued up to nine
     // queries per render: gaps + agents_with_tag per category twice over).
     // Dashboard render caller: a degraded read returns an explicit error
@@ -2087,7 +2091,7 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
         auto values_res = tag_store_->get_values_for_keys(
             std::vector<std::string>(std::begin(kCategoryKeys), std::end(kCategoryKeys)));
         if (!gaps_res || !values_res) {
-            return "<div class=\"feedback-error\">Tag store unavailable — tag-compliance data "
+            return "<div class=\"note\">Tag store unavailable — tag-compliance data "
                    "cannot be read right now.</div>";
         }
         gaps = std::move(*gaps_res);
@@ -2108,42 +2112,19 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
             missing_count[k]++;
     }
 
+    std::vector<compliance_html::TagRow> rows;
     for (const auto& cat : categories) {
-        std::string key_str(cat.key);
-        int tagged = tagged_count.count(key_str) ? tagged_count[key_str] : 0;
-        int missing = missing_count.count(key_str) ? missing_count[key_str] : 0;
-
-        std::string vals_str;
-        if (cat.allowed_values.empty()) {
-            vals_str = "<span class=\"muted\">Free-form</span>";
-        } else {
-            for (size_t i = 0; i < cat.allowed_values.size(); ++i) {
-                if (i > 0)
-                    vals_str += ", ";
-                vals_str += std::string(cat.allowed_values[i]);
-            }
-        }
-
-        std::string missing_cls = missing > 0 ? "role-bad" : "role-ok";
-        html += "<tr><td><code>" + key_str + "</code></td>";
-        html += "<td>" + std::string(cat.display_name) + "</td>";
-        html += "<td>" + std::to_string(tagged) + "</td>";
-        html += "<td><span class=\"role-badge " + missing_cls + "\">" + std::to_string(missing) +
-                "</span></td>";
-        html += "<td>" + vals_str + "</td></tr>";
+        compliance_html::TagRow row;
+        row.key = std::string(cat.key);
+        row.display_name = std::string(cat.display_name);
+        row.tagged = tagged_count.count(row.key) ? tagged_count[row.key] : 0;
+        row.missing = missing_count.count(row.key) ? missing_count[row.key] : 0;
+        for (const auto& v : cat.allowed_values)
+            row.allowed_values.emplace_back(v);
+        rows.push_back(std::move(row));
     }
-
-    html += "</tbody></table>";
-
-    if (total_agents > 0) {
-        size_t compliant = total_agents - gaps.size();
-        html += "<div class=\"section-note\">"
-                "Compliance: " +
-                std::to_string(compliant) + "/" + std::to_string(total_agents) +
-                " agents have all required tags</div>";
-    }
-
-    return html;
+    return compliance_html::render_tag_compliance(rows, total_agents,
+                                                  total_agents > 0 ? total_agents - gaps.size() : 0);
 }
 
 std::string SettingsRoutes::render_management_groups_fragment() {
@@ -2741,95 +2722,144 @@ std::string SettingsRoutes::render_data_retention_fragment() {
     return html;
 }
 
+namespace {
+
+// Page-local rules for the DEX Alerts form body. The sub-nav's own style block
+// (dex_fragment_style) carries the DEX shell rules; these cover only the three
+// alert panels. Tokens only; one rule per line source, joined to one line.
+const char* const kDexAlertsCss = R"CSS(
+.dxa{margin-top:16px}
+.dxa .form{gap:12px}
+.dxa .btns{padding:0}
+.dxa .fld input{max-width:14rem}
+.dxa-intro{margin:0;color:var(--mut)}
+.dxa details{border-top:1px solid var(--line)}
+.dxa summary{cursor:pointer;padding:10px 16px;font-weight:500;color:var(--ink2)}
+.dxa .grp{padding:2px 16px 12px 32px}
+.dxa .chk{display:flex;gap:8px;align-items:baseline;padding:3px 0}
+.dxa .chk code{color:var(--mut);font-size:12.5px}
+.dxa .pb p{margin:0 0 8px}
+.dxa .pb p:last-child{margin-bottom:0}
+)CSS";
+
+std::string dex_alerts_style() {
+    static const std::string css = [] {
+        std::string s = kDexAlertsCss;
+        std::erase(s, '\n');
+        return "<style>" + s + "</style>";
+    }();
+    return css;
+}
+
+} // namespace
+
+// The form body only. This is what every DEX-alert POST answers with and what
+// the forms swap into #dex-alerts-section, so a save never re-renders the DEX
+// sub-nav or the role note around it (GET /fragments/dex/alerts adds those).
 std::string SettingsRoutes::render_dex_alerts_fragment() {
+    if (!runtime_config_store_ || !runtime_config_store_->is_open())
+        return "<div class=\"note warn\"><b>Config store unavailable.</b> Alert settings cannot be "
+               "read or saved until the server's runtime-config store is open. Check server "
+               "/healthz.</div>";
+
     // Current state straight from runtime_config (the single source of truth;
     // the live router/detector were fed the same values via the apply fn).
     // Defaults derive from BlastRadiusConfig{} so the form can never drift from
     // the struct defaults the POST clamp + update_alert_shape use (gov N1).
     const BlastRadiusConfig kBlastDefaults{};
-    std::unordered_set<std::string> routed;
     std::string min_dev = std::to_string(kBlastDefaults.min_devices);
     std::string win_s = std::to_string(kBlastDefaults.window_seconds);
     std::string cool_s = std::to_string(kBlastDefaults.cooldown_seconds);
-    std::string export_key; // F2a PR3: empty = cohort export disabled (the default)
-    if (runtime_config_store_ && runtime_config_store_->is_open()) {
-        routed = parse_routed_types(runtime_config_store_->get_value("dex_alert_routing"));
-        auto v = runtime_config_store_->get_value("dex_blast_min_devices");
-        if (!v.empty()) min_dev = v;
-        v = runtime_config_store_->get_value("dex_blast_window_seconds");
-        if (!v.empty()) win_s = v;
-        v = runtime_config_store_->get_value("dex_blast_cooldown_seconds");
-        if (!v.empty()) cool_s = v;
-        export_key = runtime_config_store_->get_value("dex_cohort_export_key");
-    }
+    const auto routed = parse_routed_types(runtime_config_store_->get_value("dex_alert_routing"));
+    auto v = runtime_config_store_->get_value("dex_blast_min_devices");
+    if (!v.empty()) min_dev = v;
+    v = runtime_config_store_->get_value("dex_blast_window_seconds");
+    if (!v.empty()) win_s = v;
+    v = runtime_config_store_->get_value("dex_blast_cooldown_seconds");
+    if (!v.empty()) cool_s = v;
+    // F2a PR3: empty = cohort export disabled (the default).
+    const std::string export_key = runtime_config_store_->get_value("dex_cohort_export_key");
 
     std::string html;
+    html += "<p class=\"dxa-intro\">Route DEX reliability signals to operator notifications and "
+            "the <code>dex.signal</code> webhook event, and tune the fleet blast-radius incident "
+            "thresholds. Changes apply immediately.</p>";
 
-    // ── Blast-radius alert shape ─────────────────────────────────────────────
-    html += "<div class=\"sub-head\">Fleet blast-radius thresholds</div>";
-    html += "<form hx-post=\"/api/settings/dex-alerts/blast\" "
-            "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">";
-    auto num_row = [&](const char* label, const char* name, const std::string& value,
-                       const char* hint) {
-        html += "<div class=\"form-row\"><label>" + std::string(label) +
-                "</label><input type=\"number\" name=\"" + name + "\" value=\"" +
-                html_escape(value) +
-                "\" style=\"width:7rem;flex:0 0 auto\"> <span class=\"hint\">" +
-                hint + "</span></div>";
+    // -- Blast-radius alert shape ---------------------------------------------
+    html += "<section class=\"panel dxa\"><div class=\"hd\"><h2>Fleet blast-radius thresholds</h2>"
+            "</div><form class=\"form\" hx-post=\"/api/settings/dex-alerts/blast\" "
+            "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\"><div class=\"row2\">";
+    auto num_fld = [&](const char* label, const char* name, const std::string& value,
+                       int lo, int hi, const char* hint) {
+        html += "<div class=\"fld\"><label for=\"dxa-" + std::string(name) + "\">" +
+                std::string(label) + "</label><input class=\"in\" id=\"dxa-" + name +
+                "\" type=\"number\" name=\"" + name + "\" min=\"" + std::to_string(lo) +
+                "\" max=\"" + std::to_string(hi) + "\" value=\"" + html_escape(value) +
+                "\"><span class=\"hint\">" + hint + "</span></div>";
     };
-    num_row("Min devices", "min_devices", min_dev, "distinct devices that make an incident (>= 2)");
-    num_row("Window (s)", "window_seconds", win_s, "sliding window, 60..86400");
-    num_row("Cooldown (s)", "cooldown_seconds", cool_s, "per-incident re-alert suppression");
-    html += "<button type=\"submit\" class=\"btn btn-secondary\" "
-            "style=\"margin-top:0.3rem\">Save thresholds</button></form>";
+    num_fld("Min devices", "min_devices", min_dev, 2, 100000,
+            "Distinct devices that make an incident, 2 to 100000.");
+    num_fld("Window (seconds)", "window_seconds", win_s, 60, 86400,
+            "Sliding window, 60 to 86400.");
+    num_fld("Cooldown (seconds)", "cooldown_seconds", cool_s, 0, 7 * 86400,
+            "Per-incident re-alert suppression, 0 to 604800.");
+    html += "</div><p class=\"hint\">A value outside its range is clamped to the nearest limit "
+            "when you save, not rejected; the form shows the stored value afterwards.</p>"
+            "<div class=\"btns\"><button type=\"submit\" class=\"btn btn-secondary\">"
+            "Save thresholds</button></div></form></section>";
 
-    // ── Cohort metrics export (F2a PR3 — Grafana) ────────────────────────────
-    html += "<div class=\"sub-head\">Cohort metrics export (Prometheus)</div>"
-            "<p class=\"hint\" style=\"margin-bottom:0.5rem\">"
-            "When a tag key is set, per-cohort fleet performance gauges "
+    // -- Cohort metrics export (F2a PR3 - Grafana) ----------------------------
+    // hx-confirm is a plain attribute (no script, no hx-on): the prompt appears on
+    // every save of this form because the stored key is what becomes a label, and
+    // an empty key (export off) is covered by the same copy.
+    html += "<section class=\"panel dxa\"><div class=\"hd\"><h2>Cohort metrics export key</h2>"
+            "<div class=\"end\"><span class=\"pill " +
+            std::string(export_key.empty() ? "idle" : "warn") + "\">" +
+            (export_key.empty() ? "Export off" : "Export on") + "</span></div></div>"
+            "<div class=\"pb\"><p>When a tag key is set, per-cohort fleet performance gauges "
             "(<code>yuzu_fleet_perf_cohort_*</code>) are exported on /metrics for that key's "
-            "cohorts &mdash; top 50 by population, 10-device statistical floor, a "
-            "<code>_clipped</code> gauge makes any capping visible. Empty disables the export "
-            "(the default). Fleet-level gauges are always exported. <b>The key's tag values "
-            "become Prometheus labels</b> visible to whatever scrapes /metrics &mdash; choose "
-            "keys whose values are non-sensitive organizational identifiers (hardware model, "
-            "image name), never personnel-relevant strings.</p>";
-    html += "<form hx-post=\"/api/settings/dex-alerts/cohort-export\" "
-            "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">"
-            "<div class=\"form-row\"><label>Export tag key</label>"
-            "<input type=\"text\" name=\"export_key\" value=\"" +
-            html_escape(export_key) +
-            "\" placeholder=\"e.g. model\" style=\"width:12rem;flex:0 0 auto\"> "
-            "<span class=\"hint\">[A-Za-z0-9_.:-], max 64; empty = "
-            "off</span></div>"
-            "<button type=\"submit\" class=\"btn btn-secondary\" "
-            "style=\"margin-top:0.3rem\">Save export key</button></form>";
+            "cohorts: top 50 by population, a 10-device statistical floor, and a "
+            "<code>_clipped</code> gauge that makes any capping visible. Empty disables the "
+            "export (the default). Fleet-level gauges are always exported.</p>"
+            "<p><b>The key's tag values become Prometheus labels</b> visible to whatever scrapes "
+            "/metrics. Choose keys whose values are non-sensitive organizational identifiers "
+            "(hardware model, image name), never personnel-relevant strings.</p></div>"
+            "<form class=\"form\" hx-post=\"/api/settings/dex-alerts/cohort-export\" "
+            "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\" "
+            "hx-confirm=\"Save the cohort export key? A non-empty key exposes that tag's values "
+            "as Prometheus labels to everything that scrapes /metrics. An empty key turns the "
+            "export off.\">"
+            "<div class=\"fld\"><label for=\"dxa-export_key\">Export tag key</label>"
+            "<input class=\"in mono\" id=\"dxa-export_key\" type=\"text\" name=\"export_key\" "
+            "maxlength=\"64\" value=\"" + html_escape(export_key) +
+            "\" placeholder=\"e.g. model\"><span class=\"hint\">Letters, digits and "
+            "<code>_ . : -</code>, up to 64 characters. Empty turns the export off.</span></div>"
+            "<div class=\"btns\"><button type=\"submit\" class=\"btn btn-secondary\">"
+            "Save export key</button></div></form></section>";
 
-    // ── Per-signal routing ───────────────────────────────────────────────────
-    html += "<div class=\"sub-head\">Per-signal alerts</div>"
-            "<p class=\"hint\" style=\"margin-bottom:0.5rem\">"
-            "A routed signal raises an operator notification and fires the "
-            "<code>dex.signal</code> webhook event, once per device per hour. "
-            "Nothing is routed by default — blast-radius incidents always alert.</p>";
-    html += "<form hx-post=\"/api/settings/dex-alerts/routing\" "
+    // -- Per-signal routing ---------------------------------------------------
+    html += "<section class=\"panel dxa\"><div class=\"hd\"><h2>Per-signal alerts</h2></div>"
+            "<div class=\"pb\"><p>A routed signal raises an operator notification and fires the "
+            "<code>dex.signal</code> webhook event, once per device per hour. Nothing is routed "
+            "by default; blast-radius incidents always alert.</p></div>"
+            "<form class=\"form\" hx-post=\"/api/settings/dex-alerts/routing\" "
             "hx-target=\"#dex-alerts-section\" hx-swap=\"innerHTML\">";
     std::unordered_set<std::string> known;
     for (const auto& g : dex_signal_groups()) {
-        // Open families that contain a routed type so current state is visible.
+        // A family opens when any member is routed, so the current state is
+        // visible without expanding every group.
         bool any_routed = false;
         for (const char* t : g.types)
             if (routed.count(t)) any_routed = true;
-        html += std::string("<details") + (any_routed ? " open" : "") +
-                "><summary style=\"cursor:pointer;padding:0.2rem 0\">" +
-                html_escape(g.name) + "</summary><div style=\"padding:0.2rem 0 0.4rem 1rem\">";
+        html += std::string("<details") + (any_routed ? " open" : "") + "><summary>" +
+                html_escape(g.name) + "</summary><div class=\"grp\">";
         for (const char* t : g.types) {
             known.insert(t);
-            const bool checked = routed.count(t) > 0;
-            html += std::string("<label style=\"display:block;"
-                                "padding:0.1rem 0\"><input type=\"checkbox\" name=\"types\" "
+            html += std::string("<label class=\"chk\"><input type=\"checkbox\" name=\"types\" "
                                 "value=\"") +
-                    t + "\"" + (checked ? " checked" : "") + "> " + dex_signal_label(t) +
-                    " <code class=\"muted\">" + t + "</code></label>";
+                    html_escape(t) + "\"" + (routed.count(t) > 0 ? " checked" : "") + "> " +
+                    html_escape(dex_signal_label(t)) + " <code>" + html_escape(t) +
+                    "</code></label>";
         }
         html += "</div></details>";
     }
@@ -2838,15 +2868,13 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
     std::string strays;
     for (const auto& t : routed)
         if (!known.count(t))
-            strays += "<label style=\"display:block\"><input "
-                      "type=\"checkbox\" name=\"types\" value=\"" +
+            strays += "<label class=\"chk\"><input type=\"checkbox\" name=\"types\" value=\"" +
                       html_escape(t) + "\" checked> <code>" + html_escape(t) + "</code></label>";
     if (!strays.empty())
-        html += "<details open><summary style=\"cursor:pointer\">Other routed types"
-                "</summary><div style=\"padding:0.2rem 0 0.4rem 1rem\">" +
+        html += "<details open><summary>Other routed types</summary><div class=\"grp\">" +
                 strays + "</div></details>";
-    html += "<button type=\"submit\" class=\"btn btn-secondary\" "
-            "style=\"margin-top:0.5rem\">Save routing</button></form>";
+    html += "<div class=\"btns\"><button type=\"submit\" class=\"btn btn-secondary\">"
+            "Save routing</button></div></form></section>";
     return html;
 }
 
@@ -3699,6 +3727,37 @@ void SettingsRoutes::register_routes(
                  if (!admin_fn_(req, res))
                      return;
                  res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
+             });
+
+    // -- N2: the DEX page's Alerts tab ------------------------------------------
+    // Sub-nav + role note + the same form body, in one fragment so the tab shows
+    // the DEX chrome around it. The admin test reads the already-resolved
+    // session's effective role and writes NO audit row: the sub-nav links here
+    // for every viewer, so a require_admin() probe would log one denied row per
+    // non-admin click (REVIEW S1). The three POSTs below keep admin_fn_, which is
+    // the real enforcement.
+    sink.Get("/fragments/dex/alerts",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 const auto session = auth_fn_(req, res);
+                 if (!session)
+                     return;
+                 // Same definition require_admin applies: an active JIT elevation
+                 // counts; service-scoped and MCP tokens never do.
+                 const bool admin = session->token_scope_service.empty() &&
+                                    session->mcp_tier.empty() &&
+                                    auth::effective_role(*session) == auth::Role::admin;
+                 std::string html = dex_subnav("alerts", 7) + dex_alerts_style();
+                 if (!admin) {
+                     html += "<div class=\"note\" data-denied=\"admin\"><b>Alert settings need the "
+                             "Administrator role.</b> Ask an administrator to change DEX alert "
+                             "routing, blast-radius thresholds or the cohort export key.</div>";
+                 } else {
+                     // #dex-alerts-section is the inner swap target of every form
+                     // and POST response; the sub-nav above it is never re-rendered.
+                     html += "<div id=\"dex-alerts-section\">" + render_dex_alerts_fragment() +
+                             "</div>";
+                 }
+                 res.set_content(html, "text/html; charset=utf-8");
              });
 
     sink.Post("/api/settings/dex-alerts/routing", [this](const httplib::Request& req,

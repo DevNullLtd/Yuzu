@@ -100,6 +100,7 @@
 
 #include <libpq-fe.h> // direct-SQL secret-row verification (M5 remediation)
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -9355,10 +9356,13 @@ yuzu::server::DexPerfSnapshot mcp_perf_snapshot(const std::string& key) {
     return snap;
 }
 /// The MCP result rides as JSON text inside result.content[0].text.
-nlohmann::json mcp_tool_payload(const std::string& body) {
+std::string mcp_tool_text(const std::string& body) {
     auto j = nlohmann::json::parse(body);
     REQUIRE(j.contains("result"));
-    return nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+    return j["result"]["content"][0]["text"].get<std::string>();
+}
+nlohmann::json mcp_tool_payload(const std::string& body) {
+    return nlohmann::json::parse(mcp_tool_text(body));
 }
 } // namespace
 
@@ -9811,6 +9815,23 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
         -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
         return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)}; // >= kDexCohortFloor
     };
+    // One version, exposure 3 devices (published all the same: the join carries no
+    // device floor), 2 affected devices (6 crashes + 3 hangs fleet-wide), all 9
+    // events on exposed devices.
+    yuzu::server::AppPerfVersionFailureRow failure_row;
+    failure_row.version = "124.0";
+    failure_row.exposure_devices = 3;
+    failure_row.crashes = 6;
+    failure_row.hangs = 3;
+    failure_row.affected_devices = 2;
+    failure_row.exposed_crashes = 6;
+    failure_row.exposed_hangs = 3;
+    ts.app_perf_providers_for_test.failures =
+        [failure_row](std::string_view, const std::vector<std::string>&, std::int64_t,
+                      std::int64_t, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfVersionFailureRow>> {
+        return std::vector<yuzu::server::AppPerfVersionFailureRow>{failure_row};
+    };
     ts.app_perf_providers_for_test.group =
         [mk_row](std::string_view, std::string_view, std::string_view)
         -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
@@ -9830,14 +9851,130 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     REQUIRE(apps["apps"].size() == 1);
     CHECK(apps["apps"][0]["app_name"] == "chrome.exe");
 
-    auto fleet = mcp_tool_payload(
+    const std::string fleet_text = mcp_tool_text(
         ts.call(
               R"({"jsonrpc":"2.0","method":"tools/call","id":81,"params":{"name":"get_dex_app_perf","arguments":{"app":"chrome.exe"}}})")
             ->body);
+    auto fleet = nlohmann::json::parse(fleet_text);
+    // The bytes ahead of versions[] are the unchanged fleet-trend body (the same point
+    // layout REST serialises, two-decimal means included).
+    {
+        const auto from = fleet_text.find("\"app\":");
+        const auto to = fleet_text.find(",\"versions\":");
+        REQUIRE(from != std::string::npos);
+        REQUIRE(to != std::string::npos);
+        CHECK(fleet_text.substr(from, to - from) ==
+              R"("app":"chrome.exe","version":"","points":[)"
+              R"({"version":"124.0","day":1700000000,"device_count":20,"suppressed":false,)"
+              R"("cpu_mean":5.00,"cpu_max":9.00,"cpu_p50":null,"cpu_p95":null,"ws_mean":100,)"
+              R"("ws_max":200,"ws_p50":null,"ws_p95":null,"hist_stale":false}])");
+    }
     CHECK(fleet["app"] == "chrome.exe");
     REQUIRE(fleet["points"].size() == 1);
     CHECK(fleet["points"][0]["version"] == "124.0");
     CHECK(fleet["points"][0]["device_count"] == 20);
+    // The per-version join rides the same payload, serialised by the SAME shared
+    // function REST uses: compare against an independent join of the same inputs.
+    const auto expected_report = yuzu::server::app_perf_version_failure_join(
+        yuzu::server::app_perf_fleet_trend({mk_row(20)}), {failure_row}, 30);
+    REQUIRE(fleet["versions"].size() == 1);
+    CHECK(fleet["versions"] ==
+          nlohmann::json::parse(yuzu::server::dex_app_perf_versions_json(expected_report)));
+    CHECK(fleet["versions"][0]["exposure_devices"] == 3);
+    CHECK(fleet["versions"][0]["crashes"] == 6);
+    CHECK(fleet["versions"][0]["hangs"] == 3);
+    CHECK(fleet["versions"][0]["exposed_crashes"] == 6);
+    CHECK_FALSE(fleet["versions"][0].contains("below_floor"));
+    CHECK_FALSE(fleet["versions"][0].contains("exposure_below_floor"));
+    CHECK(fleet["versions"][0]["failure_rate"]["estimate"].get<double>() ==
+          Catch::Approx(9.0 / 3.0));
+    CHECK(fleet["versions"][0]["failure_rate_ratio"].is_null()); // a single version
+    CHECK(fleet["versions_truncated"] == false);
+    CHECK(fleet["failure_window_days"] == 30);
+    CHECK(fleet["exposure_basis"] == "resource_significant");
+    CHECK(fleet["stat_failures"] == 0);
+
+    // The advertised outputSchema declares the new typed fields.
+    {
+        auto listed = nlohmann::json::parse(
+            ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":85})")->body)["result"]["tools"];
+        const nlohmann::json* schema = nullptr;
+        for (const auto& t : listed)
+            if (t["name"] == "get_dex_app_perf")
+                schema = &t["outputSchema"];
+        REQUIRE(schema != nullptr);
+        const auto& props = (*schema)["properties"];
+        CHECK(props["versions_truncated"] == nlohmann::json{{"type", "boolean"}});
+        CHECK(props["failure_window_days"] == nlohmann::json{{"type", "integer"}});
+        CHECK(props["exposure_basis"] == nlohmann::json{{"type", "string"}});
+        CHECK(props["stat_failures"] == nlohmann::json{{"type", "integer"}});
+        CHECK((*schema)["required"] ==
+              nlohmann::json::array({"app", "version", "points", "versions", "versions_truncated",
+                                     "failure_window_days", "exposure_basis", "stat_failures"}));
+        // The whole per-version item contract, written out from the advertised shape.
+        const nlohmann::json integer_or_null = {{"type", nlohmann::json::array({"integer", "null"})}};
+        const nlohmann::json number_or_null = {{"type", nlohmann::json::array({"number", "null"})}};
+        const nlohmann::json rate = {
+            {"type", nlohmann::json::array({"object", "null"})},
+            {"properties",
+             {{"estimate", {{"type", "number"}}},
+              {"lower", {{"type", "number"}}},
+              {"upper", {{"type", "number"}}},
+              {"reliable", {{"type", "boolean"}}}}}};
+        const nlohmann::json ratio = {
+            {"type", nlohmann::json::array({"object", "null"})},
+            {"properties",
+             {{"estimate", number_or_null},
+              {"lower", {{"type", "number"}}},
+              {"upper", number_or_null},
+              {"unbounded", {{"type", "boolean"}}},
+              {"reliable", {{"type", "boolean"}}}}}};
+        const nlohmann::json event_total = {
+            {"type", "integer"}, {"description", "Fleet-wide event count, always present"}};
+        const nlohmann::json versions_items = {
+            {"type", "object"},
+            {"properties",
+             {{"version", {{"type", "string"}}},
+              {"latest_day", {{"type", "integer"}}},
+              {"day_count", {{"type", "integer"}}},
+              {"device_count", {{"type", "integer"}}},
+              {"suppressed", {{"type", "boolean"}}},
+              {"affected_devices", {{"type", "integer"}}},
+              {"crashes", event_total},
+              {"hangs", event_total},
+              {"exposure_devices",
+               {{"type", nlohmann::json::array({"integer", "null"})},
+                {"description",
+                 "Devices with retained resource-significant samples; null = unknown, never "
+                 "zero"}}},
+              {"exposed_crashes", integer_or_null},
+              {"exposed_hangs", integer_or_null},
+              {"failure_rate", rate},
+              {"previous_version", {{"type", nlohmann::json::array({"string", "null"})}}},
+              {"failure_rate_ratio", ratio}}},
+            {"required", nlohmann::json::array({"version", "affected_devices", "crashes", "hangs",
+                                                "exposure_devices"})}};
+        CHECK(props["versions"]["items"] == versions_items);
+
+        // Every key a row emits is declared, and every required key is emitted. The
+        // negative control proves the check fails on a schema missing one key.
+        const auto declared = [](const nlohmann::json& row, const nlohmann::json& items) {
+            for (auto it = row.begin(); it != row.end(); ++it)
+                if (!items["properties"].contains(it.key()))
+                    return false;
+            for (const auto& key : items["required"])
+                if (!row.contains(key.get<std::string>()))
+                    return false;
+            return true;
+        };
+        const auto& items = props["versions"]["items"];
+        REQUIRE_FALSE(fleet["versions"].empty());
+        for (const auto& row : fleet["versions"])
+            CHECK(declared(row, items));
+        auto missing_key = items;
+        missing_key["properties"].erase("failure_rate_ratio");
+        CHECK_FALSE(declared(fleet["versions"][0], missing_key));
+    }
 
     auto group = mcp_tool_payload(
         ts.call(
@@ -9886,6 +10023,52 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     auto tek_body = nlohmann::json::parse(tag_empty_key->body);
     REQUIRE(tek_body.contains("error"));
     CHECK(tek_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP app-perf: the failure read is asked for exactly the versions the report keeps",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.fleet =
+        [](std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        std::vector<yuzu::server::AppPerfFleetRow> rows;
+        for (int i = 1; i <= 21; ++i) { // oldest first; 21 > the 20-version cap
+            yuzu::server::AppPerfFleetRow r;
+            r.app_name = "chrome.exe";
+            r.version = std::to_string(i) + ".0.0.0";
+            r.day = 1'700'000'000;
+            r.device_count = 20;
+            r.cpu_sum = 100.0;
+            r.cpu_max = 9.0;
+            r.ws_sum = 2000;
+            r.ws_max = 200;
+            r.hist_version = yuzu::server::kAppPerfHistVersion;
+            r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+            r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+            rows.push_back(std::move(r));
+        }
+        return rows;
+    };
+    auto asked = std::make_shared<std::vector<std::string>>();
+    ts.app_perf_providers_for_test.failures =
+        [asked](std::string_view, const std::vector<std::string>& versions, std::int64_t,
+                std::int64_t, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfVersionFailureRow>> {
+        *asked = versions;
+        return std::vector<yuzu::server::AppPerfVersionFailureRow>{};
+    };
+    ts.start("readonly");
+
+    auto fleet = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":86,"params":{"name":"get_dex_app_perf","arguments":{"app":"chrome.exe"}}})")
+            ->body);
+    CHECK(fleet["versions_truncated"] == true);
+    REQUIRE(fleet["versions"].size() == yuzu::server::kAppPerfVersionJoinCap);
+    REQUIRE(asked->size() == fleet["versions"].size());
+    for (std::size_t i = 0; i < asked->size(); ++i)
+        CHECK((*asked)[i] == fleet["versions"][i]["version"].get<std::string>());
+    CHECK(std::find(asked->begin(), asked->end(), "1.0.0.0") == asked->end());
 }
 
 TEST_CASE("MCP get_dex_tag_app_perf: store degrade (wired provider returns nullopt) "
@@ -10175,6 +10358,52 @@ TEST_CASE("MCP app-perf: unavailable provider + missing arg degrade",
                 ->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams); // missing 'app'
+
+        // A present non-string `version` is rejected, never read as the all-versions
+        // sentinel; omitting it stays all-versions.
+        for (const char* bad : {"5", "null", "true", "[\"1.0\"]", "{}"}) {
+            CAPTURE(bad);
+            const auto call = std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":87,)") +
+                              R"("params":{"name":"get_dex_app_perf","arguments":)" +
+                              R"({"app":"chrome.exe","version":)" + bad + "}}}";
+            auto b = nlohmann::json::parse(ts.call(call)->body);
+            REQUIRE(b.contains("error"));
+            CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(b["error"]["message"] == "invalid parameter 'version'");
+        }
+    }
+    {
+        // The trend reads fine but the failure read degrades: the whole call is an
+        // internal error, never a result with an empty versions[].
+        McpTestServer ts;
+        ts.app_perf_providers_for_test.fleet =
+            [](std::string_view, std::string_view)
+            -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+            yuzu::server::AppPerfFleetRow r;
+            r.app_name = "chrome.exe";
+            r.version = "124.0";
+            r.day = 1'700'000'000;
+            r.device_count = 20; // >= kDexCohortFloor
+            r.cpu_sum = 100.0;
+            r.hist_version = yuzu::server::kAppPerfHistVersion;
+            r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+            r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+            return std::vector<yuzu::server::AppPerfFleetRow>{r};
+        };
+        ts.app_perf_providers_for_test.failures =
+            [](std::string_view, const std::vector<std::string>&, std::int64_t, std::int64_t,
+               std::string_view)
+            -> std::optional<std::vector<yuzu::server::AppPerfVersionFailureRow>> {
+            return std::nullopt;
+        };
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":86,"params":{"name":"get_dex_app_perf","arguments":{"app":"chrome.exe"}}})")
+                ->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK_FALSE(body.contains("result"));
     }
 }
 

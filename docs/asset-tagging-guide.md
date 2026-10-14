@@ -262,7 +262,7 @@ A fully compliant fleet returns an empty array: `{"data": []}`.
 
 ### Compliance in the Dashboard
 
-The **Settings** page includes a **Tag Compliance** section that shows a summary table:
+The **Compliance** page includes a **Compliance by tag** panel that shows a summary table:
 
 | Category | Tagged | Missing | % Compliant |
 |---|---|---|---|
@@ -774,7 +774,7 @@ image comparison), `location`, `role`. Pick any key from the tab's
 devices** show "n too small" rather than noisy percentiles, and untagged
 devices always appear as an explicit "(untagged)" residual row.
 
-> **Choosing keys for the Prometheus cohort export** (Settings → DEX alerts):
+> **Choosing keys for the Prometheus cohort export** (DEX → Alerts):
 > the exported key's tag *values* become metric labels visible to whatever
 > scrapes `/metrics`. Use non-sensitive organizational identifiers (hardware
 > model, image name) — never personnel-relevant strings. See

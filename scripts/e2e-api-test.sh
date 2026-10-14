@@ -1118,6 +1118,10 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/mcp"
     "/fragments/settings/nvd"
     "/fragments/settings/directory"
+    "/fragments/workflows"
+    "/fragments/schedules?view=page"
+    "/fragments/workflow-runs"
+    "/fragments/workflow-runs/e2e-no-such-run"
 )
 
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do
@@ -1140,6 +1144,7 @@ DASH_FRAGMENTS=(
     "/fragments/schedules"
     "/fragments/health/summary"
     "/fragments/compliance/summary"
+    "/fragments/policy-fragments"
 )
 
 for frag in "${DASH_FRAGMENTS[@]}"; do

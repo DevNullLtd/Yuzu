@@ -197,10 +197,21 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # the title-catalogue row gains its MCP twin query_software_catalogue and the versions row
 # get_software_versions (both already "twinned", count unchanged). The raw route's
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
-# same data through the MCP cursor. get.api-audit flips "planned:#2146" -> "twinned" (GET
-# /api/v1/audit + MCP query_audit_log, now at filter/paging parity). Measured post-flip at 198
-# (199 - 1), not hand-picked.
-BASELINE_UNTWINNED = 198
+# same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
+# DEX Alerts tab (posture PR-E): GET /fragments/dex/alerts is "composed-of" the legacy
+# settings fragment (+1, 199 -> 200); the fragment's three POSTs stay planned:#2146.
+#
+# Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
+# is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
+# which counts as untwinned by design, so the count rises 199 -> 200.
+#
+# Both of the two changes above landed on 199; merged together the count is 201
+# (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
+#
+# Audit filter parity: get.api-audit flips "planned:#2146" -> "twinned" (GET /api/v1/audit +
+# MCP query_audit_log, now at filter/paging parity), 201 - 1 = 200, the value the checker
+# reports on the merged tree.
+BASELINE_UNTWINNED = 200
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

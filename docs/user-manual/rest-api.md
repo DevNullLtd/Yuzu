@@ -4749,13 +4749,13 @@ most keys:
   the agent's own `--plugin-require-signature` flag paired with an operator-distributed
   `--plugin-trust-bundle`. Setting this key records the operator's intent and changes what Settings
   displays; **it does not harden anything by itself**.
-- **persisted only, applied at next boot or next DEX-alerts Settings save** - `dex_alert_routing`,
+- **persisted only, applied at next boot or next save on the DEX → Alerts tab** - `dex_alert_routing`,
   `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`,
   `dex_cohort_export_key`. The live consumers (`DexAlertRouter`, the blast-radius detector, the
   cohort-gauge export key) are **cached in memory** and refreshed only by `apply_dex_alert_config()`,
-  which runs at server startup and from the Settings -> DEX alerts save handler - never from this
+  which runs at server startup and from the DEX -> Alerts tab save handlers - never from this
   endpoint. A `PUT` through this API is inert on the running server until one of those two happens.
-  To change DEX alerting and have it apply at once, use Settings -> DEX alerts.
+  To change DEX alerting and have it apply at once, use the DEX -> Alerts tab.
 - **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
@@ -5395,8 +5395,8 @@ Create a new webhook subscription.
 | `agent.registered` | An agent enrolls or re-enrolls | `agent_id`, `hostname`, `os`, `arch`, `agent_version` |
 | `command.completed` / `execution.completed` | An instruction finishes across its targets | command/execution identifiers |
 | `policy.violation` | A policy evaluation finds a non-compliant device | policy + device identifiers |
-| `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable under Settings → DEX alerts (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
-| `dex.signal` | A device reports a DEX signal type the operator routed to alerts (Settings → DEX alerts; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
+| `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable on the DEX → Alerts tab (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
+| `dex.signal` | A device reports a DEX signal type the operator routed to alerts (DEX → Alerts tab; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
 
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — a server restart, a network blip, or a gateway bounce that strands and reconnects a fleet produces one delivery per reconnecting agent, not one per genuinely new device. A target wired to a low-tolerance channel (e.g. a Slack alert intended for "new device joined the fleet") should filter or debounce on the receiving end if reconnect noise matters; the dashboard's own "Agent Enrolled" notification does not have this problem (it fires once, on first enrollment only).
 
@@ -5894,6 +5894,8 @@ surfaces admit the same **result set** for a given caller: `GET /api/v1/executio
 branch (below) is materially broader than the pre-existing MCP `list_executions` confinement
 (own-dispatches-only) — a disclosed, pre-#4030 difference, not a silent one (`docs/user-manual/mcp.md`).
 
+`GET /fragments/executions` also takes `view=page` (the Executions page list) and `status`, an allow-list of this fragment's own (`running`, `succeeded`, `completed`, `cancelled`, `pending`), not the v1 twin's enum. An empty `status` is no filter; an unknown `status` or a malformed `definition_id` answers `200` with a `data-invalid` note, never an empty list.
+
 **Prerequisite fix bundled with this PR:** `Workflow` was used as an RBAC securable throughout
 `workflow_routes.cpp` but was never seeded into `RbacStore`'s securable-types catalogue — meaning
 no role, including Administrator, could ever be granted `Workflow:Read` while RBAC was enabled.
@@ -6131,6 +6133,54 @@ confine against), then `Schedule:Read`. The v1 twin of `GET /fragments/schedules
 route's parsing, where any presence of `enabled_only` is treated as true regardless of value. This
 route remains a distinct, separately-ledgered twin of `GET /fragments/schedules`, not of `GET
 /api/schedules` documented above.
+
+`GET /fragments/schedules` also takes `view=page` (the Workflows page's Schedules panel) behind the
+same two-stage gate and the same read; a refused caller gets `200` with a `data-denied` note and a
+failed read `200` with `data-degraded` (the dashboard drops `4xx` bodies). The page view adds the
+cadence the scheduler really applies (the time-of-day, weekday and day-of-month fields are stored
+and ignored), Count and Last run, and an owner flag computed from the session. A schedule the
+caller did not create shows only All devices or Targeted: the scope expression, interval, approval
+flag, parameters and creator are in no read that carries another user's schedule (REST v1, MCP) and
+are not rendered for one. The default view is unchanged.
+
+#### `GET /fragments/workflows`
+
+HTML fragment behind the Workflows page (`/workflows`). Requires `Workflow:Read` through the same
+gate as `GET /api/v1/workflows` (a management-group-scoped-only caller is refused, as there). Lists
+the 100 newest definitions with their steps (label, instruction id, condition, retries, `foreach`,
+failure policy) and marks a cut list with `data-truncated="1"`. A refused caller gets `200` with
+`data-denied="true"`, a failed store read `200` with `data-degraded="true"`; neither is an empty
+list. Step rows carry the workflow's own labels and instruction ids; instruction names are not looked
+up (that read needs `InstructionDefinition:Read`). Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
+
+#### `GET /fragments/workflow-runs`
+
+HTML fragment of workflow run rows for the Workflows page: each workflow's newest run
+(`latest_per_workflow=true&limit=500`) or one workflow's recent runs (`workflow_id=<id>&limit=10`).
+The sole gate is the fleet-read gate for `Workflow:Read`, the one `GET /api/v1/workflow-executions`
+uses; its scope narrows the rows in the store before ordering and limiting, so a confined caller's
+rows are exactly the runs with a device in its scope. A `latest_per_workflow` list cut off by the
+`limit` is marked `data-truncated="1"`, and the page then shows Unknown rather than Not run for a
+workflow the list did not include. Only `workflow_id`, `status`, `limit` and
+`latest_per_workflow` are accepted; any other parameter, a repeated one or an out-of-vocabulary value
+answers `200` with `data-invalid="true"` and a fixed note (a mistyped filter never reads as all
+runs). A refused caller gets `200` with `data-denied="true"`, a failed read `200` with
+`data-degraded="true"`; an empty list says "No runs yet." or, for a confined caller, "No runs
+include devices in your scope." No audit row on a list. Twin: `GET /api/v1/workflow-executions`, MCP
+`list_workflow_executions`.
+
+#### `GET /fragments/workflow-runs/{id}`
+
+HTML fragment of one run: status, workflow, start, duration, device count (the count of the
+caller's in-scope target devices when confined) and one row per step. Same sole gate and same
+record-level visibility rule as `GET /api/v1/workflow-executions/{id}`. A run the caller may not see
+and an unknown id both answer `404` with the identical body, so the route is not an existence
+oracle. Step titles are the workflow definition's labels, falling back to the step's instruction id.
+Error text is rendered only when the stored error is a plain string (never a nested object), skipped
+steps only from the three reasons the engine writes, and a confined caller sees "Dispatched
+(run-wide)" with no per-step device count. Audited as `workflow_execution.detail.fetch`
+(`success`, or `denied` for a hidden run), like the v1 twin. Twin:
+`GET /api/v1/workflow-executions/{id}`, MCP `get_workflow_execution`.
 
 **Response:**
 
@@ -8268,7 +8318,7 @@ The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` 
 
 Browser-facing page that renders the 3D fleet topology. The page itself is auth-gated only; per-request RBAC enforcement happens when the page's JS hits `GET /api/v1/viz/fleet/topology` (see below).
 
-**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables only the API endpoint, not the page shell — the page continues to load and the `503` from the disabled API surfaces in the browser console.
+**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/login` first).
 
 **Browser requirements:** the dashboard stylesheet needs Chrome 111+, Edge 111+, Firefox 121+ or Safari 16.2+ (`color-mix()` and `:has()`), and this page also requires importmap support (Safari 16.4+; the other browsers already meet it). On a browser without importmap the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
 
@@ -8944,7 +8994,12 @@ The fleet trend for one application — one point per `(version, UTC day)` over 
 
 - **Permission:** `GuaranteedState:Read`
 - **Query parameters:** `app` — **required**, ≤ 512 bytes, no control characters (a `400` otherwise; a NUL would truncate the bound query). `version` — optional; omitted = every version interleaved, each point tagged with its canonicalized `version`; same length/charset rule.
-- **Response:** `{app, version, points[]}`. Each point: `{version, day, device_count, suppressed}` plus the full stat fields (`cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale`) **only when `suppressed` is false** — a sub-floor `(version, day)` point (fewer than 10 devices) carries `device_count` only, the same suppression the group endpoint applies (see the percentile/suppression note above). `400` on a missing/invalid `app` or `version`; `503` on store degrade. Not audited.
+- **Response:** `{app, version, points[], versions[], versions_truncated, failure_window_days, exposure_basis, stat_failures}`. Each point: `{version, day, device_count, suppressed}` plus the full stat fields (`cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale`) **only when `suppressed` is false** — a sub-floor `(version, day)` point (fewer than 10 devices) carries `device_count` only, the same suppression the group endpoint applies (see the percentile/suppression note above). `400` on a missing/invalid `app` or `version`; `503` (with `retry_after_ms: 2000`) when either the performance read or the crash-and-hang read degrades. Not audited.
+- **Per-version crash and hang join (additive):** the response also carries `versions[]`, `versions_truncated`, `failure_window_days`, `exposure_basis` and `stat_failures`; `app`, `version` and `points[]` are unchanged. `versions[]` has one row per version, newest canonical (four-part, numeric) version first, at most **20** rows (`versions_truncated: true` when older versions were dropped; the unknown-version `""` bucket sorts last). The cap keeps the 20 highest version strings the agents reported, so a device reporting implausible versions can push real ones out of the default list (`versions_truncated: true`); `?version=` reaches any of them. The list is derived from the same row-capped read as `points[]`, which returns at most 100,000 `(version, day)` rows ordered by version string and then day: an application with more retained rows than that (about 556 versions over the 180-day window) has its later-sorting version strings cut off before the numeric newest-20 selection runs, so a numerically newest version can be absent while `versions_truncated` reports only the 20-row cap. It names only versions with retained performance rows, so **the absence of a row is not the absence of failures**. Each row carries `version`, `latest_day` and `day_count` (days the version appears in the window), `device_count` and `suppressed` (the latest day's device count and its sub-floor flag, as on a point), `affected_devices`, `crashes` and `hangs`, the exposure fields below, `previous_version` and `failure_rate_ratio`. Failures are joined to a row on the exact canonical version and subject the agent reported: a row with `affected_devices > 0` and `exposure_devices: null` is failures recorded under a version that has no samples, and a zero rate covers only failures recorded under exactly that version (a packaged app whose crash events carry no version lands in the `""` bucket). **This join carries no device floor** (maintainer ruling, 2026-10-14): every figure below is published at any device count, 1 device included. It is a fleet-wide aggregate by application and version only, with no `agent_id` or device identifier, behind `GuaranteedState:Read`; the per-`(version, day)` point floor on `points[]` is unchanged:
+  - **Breadth** — `affected_devices` is the number of fleet-wide devices that reported a crash or hang for the version in the window, and `crashes` and `hangs` are the fleet-wide event counts; all three are always present (a type with no events is `0`). Breadth counts every reporting device, sampled or not.
+  - **Exposure** — `exposure_devices` is the number of devices with retained resource-significant samples for that exact image and version in the window. It is a selected subset (the daily top-N consumers), **not a census**, hence `exposure_basis: "resource_significant"`. `null` means unknown (no sample rows), never zero. When it is known, `exposed_crashes` and `exposed_hangs` count the crash and hang events on **exposed devices only** (each `null` only when exposure is unknown), and, when it is positive, `failure_rate` is `{estimate, lower, upper, reliable}` — those exposed events per exposed device over the window, with an exact (Garwood) 95 percent interval, at full double precision (it is up to the view to scale to per 1,000). A zero `exposure_devices` gives a `null` rate (never a divide by zero, never a healthy zero). The rate is per exposed device over the window, **not per day of use**: a version with fewer days in the window (`day_count`, `latest_day`) has had less time to fail, so read the rate beside `day_count`: it counts days in the 180-day trend window, so only a value below `failure_window_days` + 1 means shorter in-window tenure. `reliable` is `false` below 20 events, an evidence-quality marker and not a floor: print the interval beside it.
+  - `previous_version` is the next-older known version in the list (`null` for the oldest known version in the list (see `versions_truncated`) and for `""`). `failure_rate_ratio` is `{estimate, lower, upper, unbounded, reliable}` — this version's rate over the previous version's, with an exact conditional (Clopper-Pearson) 95 percent interval — present only when **both** versions have a known, positive exposure; `null` otherwise, and `null` when neither version saw an exposed event. When the previous version saw no exposed events, `estimate` and `upper` are `null` with `unbounded: true` (a finite `lower` still holds). A request for one exact `version` yields a one-row `versions[]` with no previous version.
+  - `failure_window_days` is the effective window for both the events and the exposure: 30, clamped to one day less than the observation retention (`--guardian-event-retention-days`) when that is 1 to 30 days, so no counted day has had its events reaped (at the default retention of 30 days it reports 29). That holds at a steady retention: raising `guardian_event_retention_days` and restarting widens the window at once but does not restore events already reaped under the old value, so for up to `failure_window_days` days after such a restart the counts and the rate can read low against a full exposure window (an accepted residual); lowering it is safe. The window is that many whole UTC days plus the current day so far, cut at one UTC midnight for both; an observation stamped after the end of the current UTC day is excluded. `stat_failures` counts statistics that returned nothing on valid input (expected `0`); documented refusals — both arms zero-event, an arm above one billion events — are not counted. If either underlying read degrades the whole request is a `503`, never a `200` with an empty `versions[]`.
 
 #### `GET /api/v1/dex/perf/app/devices`
 
@@ -10072,6 +10127,8 @@ complete-cohort admission check for a confined caller; a **global** grant is nev
 #### `POST /api/executions/{id}/cancel`
 
 **Permission:** `Execution:Execute` AND `Execution:Read`, same confinement rule as `rerun`.
+**Response (409):** the execution already finished (`succeeded`, `completed` or `cancelled`);
+nothing changed. Audited as `execution.cancel` / `denied`. A degraded execution store is a `503`.
 **Response (404):** unknown execution id (this route no longer reports a false success for a
 nonexistent id), outside-scope, or an incomplete/partial target cohort. **Escape hatch:** an
 execution whose targeted cohort never fully reports (an agent gone offline mid-run, for example)
@@ -10204,13 +10261,17 @@ Postgres failure this route silently returns `{"count": 0}` — indistinguishabl
 empty queue — rather than a `503`; prefer `GET /api/v1/approvals/pending/count` or MCP
 `get_pending_approval_count` for failure-honest polling.
 
+#### `GET /fragments/approvals`
+
+HTML fragment behind the Instructions Approvals tab and the Approvals page (`/approvals`). Requires `Approval:Read`. `view=page` renders the page list (pending by default); `status` is one of `pending`, `approved`, `rejected`, `expired`, and an empty value means every status. An unknown `status` answers `200` with a `data-invalid="status"` note, a failed store read answers `200` with `data-degraded="store"`, and a refused caller gets `200` with `data-denied="true"` (the dashboard drops `4xx` bodies). The page view lists the 100 most recent rows and marks a cut list with `data-truncated="1"`.
+
 #### `POST /api/approvals/{id}/approve`
 
-Approve a pending instruction execution.
+Approve a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
 
 #### `POST /api/approvals/{id}/reject`
 
-Reject a pending instruction execution.
+Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
 
 ---
 
