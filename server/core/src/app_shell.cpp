@@ -158,7 +158,7 @@ void append_nav_item(std::string& out, const NavItem& it, std::string_view activ
 }
 
 void append_sidebar(std::string& out, std::string_view active) {
-    out += R"(<aside class="shell-side"><a class="shell-brand" href="/" aria-label="Yuzu home">Yuzu<i></i></a>)"
+    out += R"(<aside class="shell-side"><a class="shell-brand" href="/home" aria-label="Yuzu home">Yuzu<i></i></a>)"
            R"(<nav aria-label="Primary">)";
     for (const auto& g : kGroups) {
         out += R"(<div class="shell-grp"><div class="shell-gt">)";
