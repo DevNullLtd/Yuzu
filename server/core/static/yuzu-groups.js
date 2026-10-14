@@ -1,4 +1,4 @@
-/* Groups and enrolment page: client glue. Delegated listeners only; nothing inline, no hx-on.
+/* Groups and enrolment page: client glue. Delegated listeners only; no inline handlers, no htmx eval attributes.
  * All server-derived text goes in with textContent.
  *
  *  - showToast (HX-Trigger from the enrolment routes): a toast. Error toasts stay until closed.
@@ -88,7 +88,7 @@
     var r = e.target.closest('[data-act="reload"]');
     if (r) {
       var t = document.getElementById(r.dataset.target);
-      if (t && t.dataset.src) htmx.ajax('GET', t.dataset.src, { target: '#' + t.id, swap: 'innerHTML' });
+      if (t && t.dataset.src) htmx.ajax('GET', t.dataset.src, { target: '#' + t.id });
       return;
     }
     var c = e.target.closest('[data-copy-token]');
