@@ -438,8 +438,9 @@ today this is a documented limitation rather than something the setup script can
   skipped` and the C++ build proceeds normally; the `gateway eunit` / `gateway ct` meson tests simply
   never register. With rebar3 but no Erlang/OTP **28.4 or later 28.x** (EPEL's OTP 26 does not
   qualify), configure prints `WARNING: Erlang gateway: SKIPPED.` with every install it inspected.
-  Neither `meson setup` nor `scripts/ensure-erlang.sh` downloads an OTP; they only find one. Adding the gateway means kerl or asdf for OTP 28
-  plus a downloaded rebar3 3.24 escript. See `docs/erlang-gateway-build.md`.
+  Neither `meson setup` nor `scripts/ensure-erlang.sh` downloads an OTP; they only find one.
+  Adding the gateway means kerl or asdf for OTP 28.4 or later 28.x plus a downloaded rebar3 3.24
+  escript. See `docs/erlang-gateway-build.md`.
 - **The UAT rigs.** No container runtime is installed. `podman` + `podman-docker` are available in
   AppStream if you later want `scripts/start-UAT.sh` et al.; `scripts/ci/ensure-postgres.sh` prefers
   a `docker` binary but falls through to the native cluster this recipe provisions.

@@ -667,7 +667,7 @@ if _rebar3.found()
     _gw_otp_out = _gw_otp.stdout().strip().split('\n')
     _gw_otp_bin = _gw_otp_out[0]
     _gw_otp_pin = _gw_otp_out[3]
-    _gw_otp_desc = 'Erlang/OTP ' + _gw_otp_out[1] + ' (' + _gw_otp_out[2] + ') at ' + _gw_otp_bin
+    _gw_otp_desc = 'Erlang/OTP ' + _gw_otp_out[1] + ' (' + _gw_otp_out[2] + ') at ' + _gw_otp_bin + ', pin ' + _gw_otp_pin + ' or later ' + _gw_otp_pin.split('.')[0] + '.x'
   elif _gw_otp.returncode() == 1
     _gw_skip_reason = ('rebar3 found, but no Erlang/OTP passes the pin:\n'
                        + _gw_otp.stderr().strip())

@@ -2705,6 +2705,10 @@ env keys with defaults, which a reverted build ignores.
 - Erlang/OTP 28.4 or any later 28.x (OTP 29 is not yet supported; `meson setup` skips the gateway with a warning on any other release)
 - rebar3
 
+The `rebar3` commands below run on whichever `erl` is first on PATH and do not check its
+version. Run `source scripts/ensure-erlang.sh` from the repository root first to put the
+pinned release on PATH.
+
 ### Build
 
 ```bash

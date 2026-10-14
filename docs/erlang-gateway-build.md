@@ -35,7 +35,8 @@ prefixes and the Windows installer directories, and accepts an install only if
 the OTP_VERSION of its LIVE release passes the pin (with several `releases/<n>/`
 left by installing one major over another, the live one is the release named in
 `releases/start_erl.data`). Selection: an explicit `YUZU_OTP_BIN` must itself
-match or configure reports it; otherwise the `erl` already on PATH wins when it
+match, or configure skips the gateway with the WARNING (an error under
+`-Drequire_gateway=true`); otherwise the `erl` already on PATH wins when it
 matches (it is your active choice); otherwise the highest matching release
 found. `C:\Erlang` is never searched on Windows: any user can create it, and
 the CI runners build as SYSTEM. The resolved `bin/` reaches the
@@ -136,7 +137,7 @@ It **always returns 0**, including under a caller's `set -euo pipefail`, so it
 can't kill the caller; callers verify the version. Native `cmd.exe`/PowerShell is out of scope; the
 documented Windows build path is MSYS2 bash.
 
-OTP 28 is the only supported toolchain for the gateway test gates:
+Erlang/OTP 28.4 or later 28.x is the only supported toolchain for the gateway test gates:
 `scripts/test_gateway.py` no longer carries the old OTP-25 CT teardown-race
 override (removed in #4800 because it could pass a run with an auto-skipped
 suite), so an OTP 25 run that hits that race fails closed.
