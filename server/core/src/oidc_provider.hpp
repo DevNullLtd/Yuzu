@@ -314,13 +314,14 @@ public:
     /// The one bounded GET used for discovery, the JWKS and Test Connection. `timeout_ms`
     /// (5 s by default) is the connect/read/write timeout PER OPERATION. The whole request is
     /// also bounded at TWICE that (10 s by default), measured from the start of the request and
-    /// covering the connect and the response; on Linux/macOS a deadline watchdog extends the same
-    /// bound to the TLS handshake, which httplib's own total bound does not cover (a server that
-    /// drips handshake bytes would otherwise hold the call). On Windows the handshake phase has
-    /// no total bound. The watchdog reserves a spare descriptor first; when none is available the
-    /// call fails closed ("request failed: no file descriptor available") before any socket is
-    /// opened. A 256 KiB body cap, redirects NOT followed (a 3xx is a failure), TLS verification
-    /// honored. The URL's authority must be a well-formed `host[:port]` (see
+    /// covering the connect and the response; a deadline watchdog extends the same bound to the
+    /// TLS handshake, which httplib's own total bound does not cover (a server that drips
+    /// handshake bytes would otherwise hold the call). On Linux/macOS the watchdog reserves a
+    /// spare descriptor first; when none is available the call fails closed ("request failed: no
+    /// file descriptor available") before any socket is opened. On Windows it takes a private
+    /// duplicate of the socket instead, and a duplicate that cannot be taken fails the call
+    /// closed with the same text. A 256 KiB body cap, redirects NOT followed (a 3xx is a failure),
+    /// TLS verification honored. The URL's authority must be a well-formed `host[:port]` (see
     /// `fetch_discovery_document`). Returns the body of a 200 response.
     ///
     /// EGRESS POLICY. Before any socket exists the host is resolved here (IP literals are

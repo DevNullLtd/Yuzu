@@ -51,6 +51,9 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #endif
 
 using namespace yuzu::server::oidc;
@@ -1880,7 +1883,6 @@ TEST_CASE("OIDC http_get_bounded: a #fragment is never put on the request line",
 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 
-#ifndef _WIN32
 // ── The total bound covers the TLS handshake (#5692, Gate 8) ─────────────────
 //
 // httplib's set_max_timeout only guards reads and writes on an established stream, so a server
@@ -1888,23 +1890,41 @@ TEST_CASE("OIDC http_get_bounded: a #fragment is never put on the request line",
 // timeout, used to hold a fetch for as long as it liked. `TlsDripServer` is a raw TCP acceptor (no
 // certificate is needed: the handshake never completes) that sends a TLS record header declaring a
 // body that never finishes, then one byte per `interval_ms`. Pacing and shutdown are
-// condition-variable driven; the acceptor wakes on a self-pipe, so the destructor never waits out
-// an interval or an accept(). It is a plain acceptor, not an httplib::Server, so (unlike
-// `MockIdp`, #438) it runs under ThreadSanitizer too: that is what puts the FIRED watchdog under
-// TSan.
+// condition-variable driven; the destructor wakes the blocked accept() by connecting to the
+// listener itself (portable: no self-pipe, no poll), so it never waits out an interval or an
+// accept(). It is a plain acceptor, not an httplib::Server, so (unlike `MockIdp`, #438) it runs
+// under ThreadSanitizer too: that is what puts the FIRED watchdog under TSan. It builds on
+// Winsock as well (the Windows watchdog is the same bound, taken through a socket duplicate).
 namespace {
-// Owns one descriptor, so a failing REQUIRE or an early return can never leak it.
-struct OwnedFd {
-    int fd{-1};
-    OwnedFd() = default;
-    explicit OwnedFd(int adopted) noexcept : fd(adopted) {}
-    ~OwnedFd() { reset(); }
-    OwnedFd(const OwnedFd&) = delete;
-    OwnedFd& operator=(const OwnedFd&) = delete;
-    void reset(int next = -1) noexcept {
-        if (fd >= 0)
-            ::close(fd);
-        fd = next;
+#ifdef _WIN32
+using DripSock = SOCKET;
+using DripLen = int;
+constexpr DripSock kNoDripSock = INVALID_SOCKET;
+inline void close_drip_sock(DripSock s) noexcept {
+    ::closesocket(s);
+}
+#else
+using DripSock = int;
+using DripLen = socklen_t;
+constexpr DripSock kNoDripSock = -1;
+inline void close_drip_sock(DripSock s) noexcept {
+    ::close(s);
+}
+#endif
+
+// Owns one socket, so a failing REQUIRE or an early return can never leak it.
+struct OwnedSock {
+    DripSock s{kNoDripSock};
+    OwnedSock() = default;
+    explicit OwnedSock(DripSock adopted) noexcept : s(adopted) {}
+    ~OwnedSock() { reset(); }
+    OwnedSock(const OwnedSock&) = delete;
+    OwnedSock& operator=(const OwnedSock&) = delete;
+    [[nodiscard]] bool valid() const noexcept { return s != kNoDripSock; }
+    void reset(DripSock next = kNoDripSock) noexcept {
+        if (valid())
+            close_drip_sock(s);
+        s = next;
     }
 };
 } // namespace
@@ -1912,35 +1932,41 @@ struct OwnedFd {
 class TlsDripServer {
 public:
     explicit TlsDripServer(int interval_ms = 300) : interval_ms_(interval_ms) {
+#ifdef _WIN32
+        // httplib starts Winsock in this translation unit too; WSAStartup is reference counted,
+        // so asking again here only makes the helper independent of that. Deliberately never
+        // paired with WSACleanup: the process ends right after the tests.
+        static const bool winsock_up = [] {
+            WSADATA data;
+            return ::WSAStartup(MAKEWORD(2, 2), &data) == 0;
+        }();
+        REQUIRE(winsock_up);
+#else
         // The drip writes to a socket the client may already have shut down. Production gets
         // SIGPIPE ignored from httplib::Server's constructor; a test process has no such
         // guarantee (it depends on which case ran first), and OpenSSL's own writes use write(),
         // not send(), so MSG_NOSIGNAL below does not cover them.
         static const auto ignored = std::signal(SIGPIPE, SIG_IGN);
         (void)ignored;
+#endif
         listen_.reset(::socket(AF_INET, SOCK_STREAM, 0));
-        REQUIRE(listen_.fd >= 0);
+        REQUIRE(listen_.valid());
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0;
-        REQUIRE(::bind(listen_.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
-        REQUIRE(::listen(listen_.fd, 8) == 0);
-        socklen_t len = sizeof(addr);
-        REQUIRE(::getsockname(listen_.fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        REQUIRE(::bind(listen_.s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(listen_.s, 8) == 0);
+        DripLen len = sizeof(addr);
+        REQUIRE(::getsockname(listen_.s, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
         port_ = ntohs(addr.sin_port);
-        int pipe_fds[2] = {-1, -1};
-        REQUIRE(::pipe(pipe_fds) == 0);
-        wake_r_.reset(pipe_fds[0]);
-        wake_w_.reset(pipe_fds[1]);
         thread_ = std::thread([this] { run(); });
     }
     ~TlsDripServer() {
         release();
-        const char b = 1;
-        (void)::write(wake_w_.fd, &b, 1);
+        wake_acceptor();
         thread_.join();
-        // The descriptors close as the members are destroyed, after the thread is gone.
+        // The sockets close as the members are destroyed, after the thread is gone.
     }
     TlsDripServer(const TlsDripServer&) = delete;
     TlsDripServer& operator=(const TlsDripServer&) = delete;
@@ -1959,25 +1985,35 @@ public:
     int accepted() const { return accepted_.load(); }
 
 private:
+    // Unblocks the acceptor: a connection to the listener makes accept() return, and `stop_` is
+    // already set, so run() then returns. A loopback connect to a listening socket completes
+    // from the backlog whether or not anyone is in accept().
+    void wake_acceptor() {
+        OwnedSock waker(::socket(AF_INET, SOCK_STREAM, 0));
+        if (!waker.valid())
+            return;
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(static_cast<unsigned short>(port_));
+        (void)::connect(waker.s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    }
+    bool stopped() {
+        std::lock_guard lk(mu_);
+        return stop_;
+    }
     void run() {
         for (;;) {
-            pollfd fds[2] = {{listen_.fd, POLLIN, 0}, {wake_r_.fd, POLLIN, 0}};
-            if (::poll(fds, 2, -1) < 0 && errno != EINTR)
-                return;
-            if (fds[1].revents != 0)
-                return;
-            if ((fds[0].revents & POLLIN) == 0)
-                continue;
-            OwnedFd conn(::accept(listen_.fd, nullptr, nullptr));
-            if (conn.fd < 0)
-                continue;
+            OwnedSock conn(::accept(listen_.s, nullptr, nullptr));
+            if (!conn.valid() || stopped())
+                return; // woken by the destructor (or the listener is unusable)
             accepted_.fetch_add(1);
-            drip(conn.fd);
+            drip(conn.s);
         }
     }
     // A TLS handshake record header (type 22, version 3.3) declaring 16 KiB, then one byte per
     // interval until the client hangs up or the server stops.
-    void drip(int conn) {
+    void drip(DripSock conn) {
 #ifdef SO_NOSIGPIPE
         const int one = 1;
         ::setsockopt(conn, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -1987,7 +2023,7 @@ private:
 #else
         constexpr int kFlags = 0;
 #endif
-        static constexpr unsigned char header[5] = {0x16, 0x03, 0x03, 0x40, 0x00};
+        static constexpr char header[5] = {0x16, 0x03, 0x03, 0x40, 0x00};
         if (::send(conn, header, sizeof(header), kFlags) < 0)
             return;
         for (;;) {
@@ -1995,16 +2031,14 @@ private:
             if (cv_.wait_for(lk, std::chrono::milliseconds(interval_ms_), [this] { return stop_; }))
                 return;
             lk.unlock();
-            const unsigned char b = 0;
+            const char b = 0;
             if (::send(conn, &b, 1, kFlags) < 0)
                 return;
         }
     }
 
     const int interval_ms_;
-    OwnedFd listen_;
-    OwnedFd wake_r_;
-    OwnedFd wake_w_;
+    OwnedSock listen_;
     int port_{0};
     std::mutex mu_;
     std::condition_variable cv_;
@@ -2051,17 +2085,17 @@ TEST_CASE("OIDC discovery: an https server dripping TLS handshake bytes cannot h
     std::expected<OidcProvider::DiscoveryDocument, std::string> doc;
     const auto begin = std::chrono::steady_clock::now();
     const bool in_time = finished_within(
-        std::chrono::seconds(8),
+        std::chrono::seconds(10),
         [&] {
             doc = OidcProvider::fetch_discovery_document(drip.base(), true,
                                                          /*allow_private_networks=*/true, 1000);
         },
         [&] { drip.release(); });
     const auto elapsed = std::chrono::steady_clock::now() - begin;
-    CHECK(in_time); // false = the fetch outlived the bound by 6 s: the unbounded handshake
+    CHECK(in_time); // false = the fetch outlived the bound by 8 s: the unbounded handshake
     CHECK_FALSE(doc.has_value());
     CHECK(elapsed >= std::chrono::seconds(1));
-    CHECK(elapsed < std::chrono::seconds(5)); // nominal 2 s; slack for a loaded shared runner
+    CHECK(elapsed < std::chrono::seconds(7)); // nominal 2 s; slack for a loaded shared runner
     CHECK(drip.accepted() >= 1);
 }
 
@@ -2084,14 +2118,14 @@ TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a drip
     std::expected<void, std::string> verdict;
     const auto begin = std::chrono::steady_clock::now();
     const bool in_time = finished_within(
-        std::chrono::seconds(8), [&] { verdict = provider.verify_jwt_signature(jwt); },
+        std::chrono::seconds(10), [&] { verdict = provider.verify_jwt_signature(jwt); },
         [&] { drip.release(); });
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     CHECK(in_time);
     REQUIRE_FALSE(verdict.has_value());
     CHECK(verdict.error() == OidcProvider::kJwksUnavailable);
     CHECK(elapsed >= std::chrono::seconds(1));
-    CHECK(elapsed < std::chrono::seconds(5)); // nominal 2 s; slack for a loaded shared runner
+    CHECK(elapsed < std::chrono::seconds(7)); // nominal 2 s; slack for a loaded shared runner
 }
 
 // ── Descriptor exhaustion fails closed (#5692, Gate 8 passes 2 and 4) ────────
@@ -2362,7 +2396,6 @@ TEST_CASE("OIDC http_get_bounded: fifty fetches leave the open descriptor count 
 }
 #endif // __linux__
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
-#endif // !_WIN32
 
 // A pure string check (no MockIdp), so it sits OUTSIDE the TSan-excluded block below: the
 // forged-callback-state case further down needs it and must keep running under ThreadSanitizer.

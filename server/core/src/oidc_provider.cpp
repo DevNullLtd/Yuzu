@@ -50,6 +50,7 @@
 
 #ifdef _WIN32
 // clang-format off
+#include <winsock2.h> // WSADuplicateSocketW / WSASocketW for RequestDeadlineWatchdog
 #include <windows.h>
 #include <bcrypt.h>
 #include <winhttp.h>
@@ -1514,9 +1515,13 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme,
 // measured in Gate 5, not the handshake-drip case); with SHUT_RD there were none. Production is
 // protected anyway: httplib::Server's constructor ignores SIGPIPE process-wide (httplib.h:10405)
 // and nothing in server/core/src installs another disposition; the read side is simply the
-// smaller hammer. Tests that drive the watchdog set SIGPIPE to ignored themselves. Windows: no
-// watchdog (no WSADuplicateSocket); only httplib's own timeouts apply there (connect, read/write,
-// `set_max_timeout`), so the TLS handshake phase is NOT covered by the total bound on Windows.
+// smaller hammer. Tests that drive the watchdog set SIGPIPE to ignored themselves.
+//
+// Windows has the same watchdog with a different owner (the second class below): there is no dup2,
+// and a SOCKET is a plain number that httplib closes and Windows may hand out again, so the
+// watchdog never keeps httplib's value. `adopt` takes a PRIVATE duplicate of the socket
+// (WSADuplicateSocketW + WSASocketW from the protocol info), a second handle on the same kernel
+// socket that only this object closes, and shutdown() on it acts on the socket httplib is using.
 #ifndef _WIN32
 class RequestDeadlineWatchdog {
 public:
@@ -1611,12 +1616,103 @@ private:
     std::thread thread_; // last: starts running once every member above exists
 };
 #else
+// The Windows leg. Winsock is up when `adopt` runs: httplib initializes it (a static WSAStartup
+// in every translation unit that includes it) before any client exists. Every use of the
+// duplicate happens under `mu_`, and a candidate address that failed has its duplicate closed
+// before the next one is taken, so at most one is open. Unlike the POSIX leg nothing is reserved
+// up front (a handle, not a descriptor-table slot, is what a duplicate costs), so `reserved()` is
+// always true and a duplicate that cannot be taken sets `failed()`: the caller refuses the answer
+// with the same fixed error as the POSIX dup2 failure. Windows has no SIGPIPE, so SD_BOTH is safe.
+// shutdown() of a socket that is not connected yet fails with WSAENOTCONN and is assumed not to
+// persist (unmeasured), so the 50 ms re-issue is what cuts a connect that completes after the
+// deadline.
 class RequestDeadlineWatchdog {
 public:
-    explicit RequestDeadlineWatchdog(std::chrono::milliseconds) {}
+    explicit RequestDeadlineWatchdog(std::chrono::milliseconds budget)
+        : deadline_(std::chrono::steady_clock::now() + budget), thread_([this] { run(); }) {}
+
+    ~RequestDeadlineWatchdog() {
+        {
+            std::lock_guard lock(mu_);
+            done_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+
+    RequestDeadlineWatchdog(const RequestDeadlineWatchdog&) = delete;
+    RequestDeadlineWatchdog& operator=(const RequestDeadlineWatchdog&) = delete;
+    RequestDeadlineWatchdog(RequestDeadlineWatchdog&&) = delete;
+    RequestDeadlineWatchdog& operator=(RequestDeadlineWatchdog&&) = delete;
+
     [[nodiscard]] bool reserved() const noexcept { return true; }
-    [[nodiscard]] bool failed() const { return false; }
-    void adopt(socket_t) noexcept {}
+
+    // True when a socket could not be put under watch (no duplicate): the answer is not trusted.
+    [[nodiscard]] bool failed() const {
+        std::lock_guard lock(mu_);
+        return failed_;
+    }
+
+    // httplib::Client::set_socket_options callback: runs on the request thread, after socket()
+    // and before connect(). Replaces the duplicate held for a candidate address that failed.
+    void adopt(socket_t sock) noexcept {
+        std::lock_guard lock(mu_);
+        dup_.reset();
+        SOCKET dup = INVALID_SOCKET;
+        WSAPROTOCOL_INFOW info{};
+        if (::WSADuplicateSocketW(sock, ::GetCurrentProcessId(), &info) == 0)
+            dup = ::WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, &info, 0,
+                               WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+        if (dup == INVALID_SOCKET) {
+            failed_ = true;
+            // Best effort, as on POSIX: the socket cannot be watched, so shut it down at once so
+            // that the connect or handshake fails fast instead of running unbounded. Unlike
+            // Linux, a Windows shutdown of a socket that is not connected yet does not persist.
+            // Unreachable in practice: duplicating a handle of our own process does not fail
+            // short of handle exhaustion.
+            ::shutdown(sock, SD_BOTH);
+            return;
+        }
+        dup_.reset(dup);
+        if (expired_)
+            ::shutdown(dup_.s, SD_BOTH);
+    }
+
+private:
+    // Owns the one private duplicate.
+    struct OwnedSocket {
+        SOCKET s{INVALID_SOCKET};
+        OwnedSocket() noexcept = default;
+        ~OwnedSocket() { reset(); }
+        OwnedSocket(const OwnedSocket&) = delete;
+        OwnedSocket& operator=(const OwnedSocket&) = delete;
+        void reset(SOCKET next = INVALID_SOCKET) noexcept {
+            if (s != INVALID_SOCKET)
+                ::closesocket(s);
+            s = next;
+        }
+    };
+
+    void run() {
+        using namespace std::chrono_literals;
+        std::unique_lock lock(mu_);
+        if (cv_.wait_until(lock, deadline_, [this] { return done_; }))
+            return; // the request finished first
+        expired_ = true;
+        do {
+            if (dup_.s != INVALID_SOCKET)
+                ::shutdown(dup_.s, SD_BOTH);
+        } while (!cv_.wait_for(lock, 50ms, [this] { return done_; }));
+    }
+
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    bool done_{false};
+    bool expired_{false};
+    bool failed_{false};
+    const std::chrono::steady_clock::time_point deadline_;
+    OwnedSocket dup_;
+    std::thread thread_; // last: starts running once every member above exists
 };
 #endif
 
@@ -1668,11 +1764,11 @@ std::expected<std::string, std::string> OidcProvider::http_get_bounded(const std
             // set_connection_timeout (per candidate address); set_max_timeout bounds the
             // response waits on the established stream at twice the per-operation timeout (10 s
             // by default), measured from the start of the request. Neither covers the TLS
-            // handshake, so on POSIX the watchdog shuts the socket down at the same deadline (and
-            // keeps doing so every 50 ms); on Windows the handshake phase has no total bound (see
-            // RequestDeadlineWatchdog). The bound counts from the start of this call, so the
-            // time spent resolving the name (and on earlier attempts) comes off what this
-            // exchange may take.
+            // handshake, so the watchdog shuts the socket down at the same deadline (and keeps
+            // doing so every 50 ms; see RequestDeadlineWatchdog for the POSIX and Windows
+            // owners). The bound counts from the start of this call, so the time spent
+            // resolving the name (and on earlier attempts) comes off what this exchange may
+            // take.
             client->set_max_timeout(
                 std::max(std::chrono::milliseconds(1),
                          kHttpTotalBoundMultiplier * t -
