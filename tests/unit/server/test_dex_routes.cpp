@@ -844,7 +844,9 @@ TEST_CASE("DEX overview: renders real multi-signal aggregations", "[pg][dex][rou
     seed_boot(store, "e6", "WS-2", 91000.0, kDayB + "T08:05:00Z");
 
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{10, 12});
-    CHECK(html.find("Digital Employee Experience") != std::string::npos);
+    // Heading matches the nav label; the long form is the subtitle only.
+    CHECK(html.find("<h1>DEX</h1>") != std::string::npos);
+    CHECK(html.find("gp-sub\">Digital Employee Experience:") != std::string::npos);
     // Hub slim: the All-signals / boot / faulting-modules panels moved to the
     // deep pages (Catalogue + App reliability) — the hub summarises and links.
     CHECK(html.find("All signals") == std::string::npos);
