@@ -1673,7 +1673,11 @@ struct NoStoreHarness {
 std::string iso_utc_ago(int seconds_ago) {
     const std::time_t t = std::time(nullptr) - seconds_ago;
     std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
     gmtime_r(&t, &tm);
+#endif
     char buf[32];
     std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tm);
     return buf;
