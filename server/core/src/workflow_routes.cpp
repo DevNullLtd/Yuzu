@@ -6,6 +6,7 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
 #include "executions_page_render.hpp" // Operate O1: view=page renderers
+#include "workflows_page_render.hpp" // Operate WF-A: workflows + schedules page renderers
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
 #include "execution_scope_rules.hpp" // execution_visible / confined_projection (shared with GET /api/v1/executions)
@@ -47,6 +48,16 @@ namespace yuzu::server {
 namespace {
 constexpr const char* kParamRejectRoute = "instruction_execute";
 constexpr const char* kParamRejectReasons[] = {"shape", "violation", "schema_invalid"};
+
+// The Workflows page fragments answer every refusal and degrade as a 200 note (htmx drops
+// 4xx/5xx bodies); nothing from the gate's own body reaches the fragment.
+void fragment_note(httplib::Response& res, const char* attr, std::string_view text) {
+    res.status = 200;
+    res.headers.erase("Retry-After");
+    res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
+                        html_escape(std::string(text)) + "</div>",
+                    "text/html; charset=utf-8");
+}
 
 // Operate Executions page (`detail?view=page`): the collapsed responses list of the devices
 // slot. The drawer keeps its own inline copy of this lookup in the detail route; the two
@@ -1580,23 +1591,42 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     };
 
     // GET /fragments/schedules -- schedule list HTMX fragment
-    sink.Get("/fragments/schedules", [perm_fn, schedule_api,
+    sink.Get("/fragments/schedules", [auth_fn, perm_fn, schedule_api,
                                       deny_service_scoped_schedule_list](
                                          const httplib::Request& req, httplib::Response& res) {
+        // `view=page` (Operate Workflows page) serves the same rows through
+        // operate_pages::render_schedules_page behind the SAME two-stage gate and the same
+        // seam call; only the output differs. The default view below is the Schedules tab on
+        // /instructions and stays byte-identical (pinned by test_workflows_page_routes.cpp).
+        // htmx drops 4xx/5xx bodies, so in the page view a 403 becomes a 200 note.
+        const bool view_page = req.get_param_value("view") == "page";
+        auto page_note = [&res](const char* attr, std::string_view text) {
+            fragment_note(res, attr, text);
+        };
         // deny_service_scoped_schedule_list already resolved (and validated)
         // the session via auth_fn — a second auth_fn call here would be
         // redundant, matching the original handler's only use of `session`
         // (the existence check; the body never read the session itself).
-        if (deny_service_scoped_schedule_list(req, res))
+        if (deny_service_scoped_schedule_list(req, res)) {
+            if (view_page && res.status == 403)
+                page_note("denied", operate_pages::kSchedulesDeniedNote);
             return;
+        }
         // sec-M1-style gate (mirrors /fragments/executions immediately above):
         // the LIST exposes every schedule's name/frequency/enabled state/
         // execution count fleet-wide — previously reachable by ANY
         // authenticated session with no RBAC check at all (guardian-
         // confinement-2298 hardening sweep).
-        if (!perm_fn(req, res, "Schedule", "Read"))
+        if (!perm_fn(req, res, "Schedule", "Read")) {
+            if (view_page && res.status == 403)
+                page_note("denied", operate_pages::kSchedulesDeniedNote);
             return;
+        }
         if (!schedule_api) {
+            if (view_page) {
+                page_note("degraded", operate_pages::kSchedulesDegradedNote);
+                return;
+            }
             res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
             return;
         }
@@ -1623,6 +1653,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // value is intentionally discarded, never rendered (the fixed
             // banner text below is the only thing sent to the client).
             (void)yuzu::server::genericize_db_error("list_schedules", result.error());
+            if (view_page) {
+                page_note("degraded", operate_pages::kSchedulesDegradedNote);
+                return;
+            }
             res.set_content(
                 "<div class=\"empty-state\">Schedule list temporarily unavailable &mdash; "
                 "retry shortly.</div>",
@@ -1630,6 +1664,44 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto& scheds = result->schedules;
+        if (view_page) {
+            // The owner flag is computed HERE from the session and only that boolean reaches
+            // the page. The expression, interval, approval flag and parameter count are in no
+            // read that carries a non-owner's schedule (REST v1, MCP), so they are filled in
+            // for a row the caller created and left at their defaults for every other row;
+            // created_by is never copied. An empty created_by is nobody's (the #4131 gap).
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            operate_pages::ScheduleListView view;
+            view.truncated = result->truncated;
+            view.rows.reserve(scheds.size());
+            for (const auto& sc : scheds) {
+                operate_pages::ScheduleRowView row;
+                row.id = sc.id;
+                row.name = sc.name;
+                row.definition_id = sc.definition_id;
+                row.frequency_type = sc.frequency_type;
+                row.enabled = sc.enabled;
+                row.next_execution_at = sc.next_execution_at;
+                row.last_executed_at = sc.last_executed_at;
+                row.execution_count = sc.execution_count;
+                row.targeted = !sc.scope_expression.empty();
+                row.owner = !sc.created_by.empty() && sc.created_by == session->username;
+                if (row.owner) {
+                    row.interval_minutes = sc.interval_minutes;
+                    row.scope_expression = sc.scope_expression;
+                    row.requires_approval = sc.requires_approval;
+                    const auto params = nlohmann::json::parse(sc.parameter_values, nullptr, false);
+                    row.parameter_count =
+                        params.is_object() ? static_cast<int>(params.size()) : 0;
+                }
+                view.rows.push_back(std::move(row));
+            }
+            res.set_content(operate_pages::render_schedules_page(view),
+                            "text/html; charset=utf-8");
+            return;
+        }
         std::string html;
         // adversarial-review-kimi round (Codex C1 / Kimi K1, both independently):
         // schedule_api.hpp's own contract says "every caller (REST, MCP, and the
@@ -1674,6 +1746,235 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         html += "</section>";
         res.set_content(html, "text/html; charset=utf-8");
+    });
+
+    // GET /fragments/workflows -- the Workflows page's definitions list (Operate WF-A).
+    //
+    // SINGLE gate: perm_fn(Workflow, Read), exactly the one GET /api/v1/workflows uses. It is
+    // never stacked with fleet_read_fn (a definition carries no agent axis, and a stacked
+    // pair on one tuple is the BLOCKING defect FleetReadFn's doc comment names). Step labels
+    // and instruction ids come from the workflow's own definition: there is NO instruction
+    // name lookup, because that read needs InstructionDefinition:Read, which Workflow:Read
+    // does not imply. Reads one past the 100 shown so truncation is known, not guessed.
+    // list_workflows loads every row's yaml_source and steps (one query per row under one
+    // lease), so the page limit stays at 101 and the YAML is never rendered.
+    sink.Get("/fragments/workflows", [perm_fn, workflow_api](const httplib::Request& req,
+                                                             httplib::Response& res) {
+        // htmx drops 4xx/5xx bodies: every refusal and degrade is a 200 note, and nothing from
+        // the gate's own body (reason, role or permission names) reaches the fragment.
+        auto note = [&res](const char* attr, std::string_view text) {
+            fragment_note(res, attr, text);
+        };
+        if (!perm_fn(req, res, "Workflow", "Read")) {
+            if (res.status == 403)
+                note("denied", operate_pages::kWorkflowsDeniedNote);
+            return;
+        }
+        if (!workflow_api) {
+            note("degraded", operate_pages::kWorkflowsDegradedNote);
+            return;
+        }
+        operate_pages::WorkflowListView view;
+        WorkflowQuery q;
+        q.limit = view.page_cap + 1;
+        auto result = workflow_api->list_workflows(q);
+        if (!result) {
+            // Called for its logging side effect only; the fixed note is all that is sent.
+            (void)yuzu::server::genericize_db_error("list_workflows", result.error());
+            note("degraded", operate_pages::kWorkflowsDegradedNote);
+            return;
+        }
+        const auto shown = std::min<std::size_t>(result->size(),
+                                                 static_cast<std::size_t>(view.page_cap));
+        view.truncated = result->size() > shown;
+        view.rows.reserve(shown);
+        for (std::size_t i = 0; i < shown; ++i) {
+            const auto& w = (*result)[i];
+            operate_pages::WorkflowRowView row;
+            row.id = w.id;
+            row.name = w.name;
+            row.description = w.description;
+            row.steps.reserve(w.steps.size());
+            for (const auto& st : w.steps) {
+                operate_pages::WorkflowStepView sv;
+                sv.index = st.index;
+                sv.instruction_id = st.instruction_id;
+                sv.label = st.label;
+                sv.condition = st.condition;
+                sv.foreach_source = st.foreach_source;
+                sv.on_failure = st.on_failure;
+                sv.retry_count = st.retry_count;
+                sv.retry_delay_seconds = st.retry_delay_seconds;
+                row.steps.push_back(std::move(sv));
+            }
+            view.rows.push_back(std::move(row));
+        }
+        res.set_content(operate_pages::render_workflows_list(view), "text/html; charset=utf-8");
+    });
+
+    // The two run fragments answer every refusal and degrade as a 200 note (htmx drops 4xx
+    // bodies) and never forward text from the gate's own body.
+    auto run_note = fragment_note;
+
+    // GET /fragments/workflow-runs -- run rows for the Workflows page (Operate WF-A, WF-2):
+    // each workflow's newest run (`latest_per_workflow=true`) and one workflow's recent runs.
+    //
+    // SOLE gate: fleet_read_fn(Workflow, Read), the gate GET /api/v1/workflow-executions uses;
+    // never stacked with perm_fn on the same tuple. Its scope goes to the store, which applies
+    // it before ORDER BY/LIMIT, so a confined caller's rows are exactly the runs it may see.
+    // Parameters are forwarded only if they are one of workflow_id, status, limit,
+    // latest_per_workflow, and the shared strict parser then refuses repeats and bad values;
+    // a refusal is a fixed 200 note that never echoes the caller's text. No audit row on a
+    // list, as the v1 route.
+    sink.Get("/fragments/workflow-runs", [fleet_read_fn, workflow_api, run_note](
+                                             const httplib::Request& req,
+                                             httplib::Response& res) {
+        if (!fleet_read_fn) {
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+        if (!gate.admitted) {
+            if (res.status == 403)
+                run_note(res, "denied", operate_pages::kRunsDeniedNote);
+            return;
+        }
+        static constexpr std::string_view kKnown[] = {"workflow_id", "status", "limit",
+                                                      "latest_per_workflow"};
+        std::vector<RawParam> raw;
+        raw.reserve(req.params.size());
+        for (const auto& kv : req.params) {
+            if (std::find(std::begin(kKnown), std::end(kKnown), kv.first) == std::end(kKnown)) {
+                run_note(res, "invalid", operate_pages::kRunsInvalidNote);
+                return;
+            }
+            raw.emplace_back(kv.first, kv.second);
+        }
+        auto query = parse_workflow_execution_list_params(raw);
+        if (!query) {
+            run_note(res, "invalid", operate_pages::kRunsInvalidNote);
+            return;
+        }
+        if (!workflow_api) {
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        auto page = workflow_api->list_workflow_executions(*query, gate.scope);
+        if (!page) {
+            (void)yuzu::server::genericize_db_error("list_workflow_executions", page.error());
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        operate_pages::RunListView view;
+        view.confined = gate.scope.has_value();
+        view.truncated = page->truncated_by_cap;
+        view.rows.reserve(page->rows.size());
+        for (const auto& r : page->rows) {
+            operate_pages::RunRowView row;
+            row.id = r.id;
+            row.workflow_id = r.workflow_id;
+            row.workflow_name = r.workflow_name;
+            row.workflow_deleted = r.workflow_deleted;
+            row.status = r.status;
+            row.started_at = r.started_at;
+            row.completed_at = r.completed_at;
+            view.rows.push_back(std::move(row));
+        }
+        res.set_content(operate_pages::render_runs_list(view), "text/html; charset=utf-8");
+    });
+
+    // GET /fragments/workflow-runs/{id} -- one run's step table (Operate WF-A, WF-2).
+    //
+    // The twin of GET /api/v1/workflow-executions/{id}: the same sole fleet_read_fn gate, the
+    // same record-level visibility check, the same confined projections of the step results and
+    // agent ids, and the same audit rows (success and denied). A run the caller may not see and
+    // an id that does not exist answer with the SAME status and body (the fixed-empty-
+    // correlation body of the legacy route; the per-request id rides the header only), so the
+    // route is no existence oracle. Step titles come from the workflow's own definition (label,
+    // else the step's instruction id); no instruction-name lookup, as the definitions fragment.
+    sink.Get(R"(/fragments/workflow-runs/([^/]+))",
+             [fleet_read_fn, audit_fn, workflow_api, run_note](const httplib::Request& req,
+                                                               httplib::Response& res) {
+        if (!fleet_read_fn) {
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+        if (!gate.admitted) {
+            if (res.status == 403)
+                run_note(res, "denied", operate_pages::kRunsDeniedNote);
+            return;
+        }
+        if (!workflow_api) {
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        auto not_found = [&res]() {
+            res.status = 404;
+            detail::ensure_correlation_id(res);
+            res.set_content(detail::error_json_a4(404, "execution not found", ""),
+                            "application/json");
+        };
+        const std::string id = req.matches[1].str();
+        auto exec_result = workflow_api->get_workflow_execution(id);
+        if (!exec_result) {
+            (void)yuzu::server::genericize_db_error("get_execution", exec_result.error());
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        if (!*exec_result) {
+            not_found();
+            return;
+        }
+        const auto& exec = **exec_result;
+        if (!workflow_execution_visible(exec, gate.scope)) {
+            if (audit_fn)
+                audit_fn(req, "workflow_execution.detail.fetch", "denied", "WorkflowExecution",
+                         exec.id,
+                         "not found or outside caller's fleet-read scope "
+                         "(management-group confinement)");
+            not_found();
+            return;
+        }
+        if (audit_fn)
+            audit_fn(req, "workflow_execution.detail.fetch", "success", "WorkflowExecution",
+                     exec.id, "");
+
+        const bool confined = gate.scope.has_value();
+        operate_pages::RunDetailView view;
+        view.id = exec.id;
+        view.workflow_id = exec.workflow_id;
+        view.status = exec.status;
+        view.started_at = exec.started_at;
+        view.completed_at = exec.completed_at;
+        view.confined = confined;
+        auto agents = confined_workflow_agent_ids_json(exec.agent_ids_json, gate.scope);
+        if (agents.is_array())
+            view.device_count = static_cast<int>(agents.size());
+
+        // The definition supplies step labels and the workflow name; a deleted or unreadable
+        // definition just leaves the instruction ids.
+        std::map<int, std::string> labels;
+        if (auto wf = workflow_api->get_workflow(exec.workflow_id); wf && *wf) {
+            view.workflow_name = (*wf)->name;
+            for (const auto& st : (*wf)->steps)
+                if (!st.label.empty())
+                    labels[st.index] = st.label;
+        }
+        view.steps.reserve(exec.step_results.size());
+        for (const auto& sr : exec.step_results) {
+            operate_pages::RunStepView sv;
+            sv.index = sr.step_index;
+            auto it = labels.find(sr.step_index);
+            sv.title = it != labels.end() ? it->second : sr.instruction_id;
+            sv.status = sr.status;
+            sv.started_at = sr.started_at;
+            sv.completed_at = sr.completed_at;
+            sv.result_json = confined_workflow_step_result_json(sr.result_json, confined).dump();
+            view.steps.push_back(std::move(sv));
+        }
+        detail::ensure_correlation_id(res);
+        res.set_content(operate_pages::render_run_detail(view), "text/html; charset=utf-8");
     });
 
     // -- Scope estimate API ----------------------------------------------------

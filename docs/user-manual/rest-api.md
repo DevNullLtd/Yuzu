@@ -6120,6 +6120,54 @@ route's parsing, where any presence of `enabled_only` is treated as true regardl
 route remains a distinct, separately-ledgered twin of `GET /fragments/schedules`, not of `GET
 /api/schedules` documented above.
 
+`GET /fragments/schedules` also takes `view=page` (the Workflows page's Schedules panel) behind the
+same two-stage gate and the same read; a refused caller gets `200` with a `data-denied` note and a
+failed read `200` with `data-degraded` (the dashboard drops `4xx` bodies). The page view adds the
+cadence the scheduler really applies (the time-of-day, weekday and day-of-month fields are stored
+and ignored), Count and Last run, and an owner flag computed from the session. A schedule the
+caller did not create shows only All devices or Targeted: the scope expression, interval, approval
+flag, parameters and creator are in no read that carries another user's schedule (REST v1, MCP) and
+are not rendered for one. The default view is unchanged.
+
+#### `GET /fragments/workflows`
+
+HTML fragment behind the Workflows page (`/workflows`). Requires `Workflow:Read` through the same
+gate as `GET /api/v1/workflows` (a management-group-scoped-only caller is refused, as there). Lists
+the 100 newest definitions with their steps (label, instruction id, condition, retries, `foreach`,
+failure policy) and marks a cut list with `data-truncated="1"`. A refused caller gets `200` with
+`data-denied="true"`, a failed store read `200` with `data-degraded="true"`; neither is an empty
+list. Step rows carry the workflow's own labels and instruction ids; instruction names are not looked
+up (that read needs `InstructionDefinition:Read`). Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
+
+#### `GET /fragments/workflow-runs`
+
+HTML fragment of workflow run rows for the Workflows page: each workflow's newest run
+(`latest_per_workflow=true&limit=500`) or one workflow's recent runs (`workflow_id=<id>&limit=10`).
+The sole gate is the fleet-read gate for `Workflow:Read`, the one `GET /api/v1/workflow-executions`
+uses; its scope narrows the rows in the store before ordering and limiting, so a confined caller's
+rows are exactly the runs with a device in its scope. A `latest_per_workflow` list cut off by the
+`limit` is marked `data-truncated="1"`, and the page then shows Unknown rather than Not run for a
+workflow the list did not include. Only `workflow_id`, `status`, `limit` and
+`latest_per_workflow` are accepted; any other parameter, a repeated one or an out-of-vocabulary value
+answers `200` with `data-invalid="true"` and a fixed note (a mistyped filter never reads as all
+runs). A refused caller gets `200` with `data-denied="true"`, a failed read `200` with
+`data-degraded="true"`; an empty list says "No runs yet." or, for a confined caller, "No runs
+include devices in your scope." No audit row on a list. Twin: `GET /api/v1/workflow-executions`, MCP
+`list_workflow_executions`.
+
+#### `GET /fragments/workflow-runs/{id}`
+
+HTML fragment of one run: status, workflow, start, duration, device count (the count of the
+caller's in-scope target devices when confined) and one row per step. Same sole gate and same
+record-level visibility rule as `GET /api/v1/workflow-executions/{id}`. A run the caller may not see
+and an unknown id both answer `404` with the identical body, so the route is not an existence
+oracle. Step titles are the workflow definition's labels, falling back to the step's instruction id.
+Error text is rendered only when the stored error is a plain string (never a nested object), skipped
+steps only from the three reasons the engine writes, and a confined caller sees "Dispatched
+(run-wide)" with no per-step device count. Audited as `workflow_execution.detail.fetch`
+(`success`, or `denied` for a hidden run), like the v1 twin. Twin:
+`GET /api/v1/workflow-executions/{id}`, MCP `get_workflow_execution`.
+
 **Response:**
 
 ```json
