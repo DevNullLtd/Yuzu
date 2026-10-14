@@ -3295,6 +3295,29 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"run_id":{"type":"string","minLength":1,"description":"The source pre-flight run id"}},"required":["run_id"]})j",
      R"j({"type":"object","properties":{"run_id":{"type":"string"},"name":{"type":"string"},"go":{"type":"integer"},"warn":{"type":"integer"}},"required":["run_id","name","go","warn"]})j"},
 
+    // Read-only deployment list/detail (the live /auto engine's missing read route).
+    // Both call the SAME builders as GET /api/v1/deployments[/{id}] (deployment_routes.hpp).
+    // Named distinctly from the dormant list_software_deployments (capability 7.6,
+    // SoftwareDeploymentStore -- never constructed). Never advances the engine.
+    {"list_deployments",
+     "List the caller's own software deployments (owner-scoped, newest first). Mirrors GET "
+     "/api/v1/deployments. Read-only: it never advances or dispatches (the dashboard's "
+     "poll-driven advance is a separate action). States are running | complete, with the "
+     "failed and skipped counts carried in state.label. The installer URL and installer "
+     "arguments are never returned (has_args only). Requires SoftwareDeployment:Read.",
+     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Max deployments to return, newest first; defaults to 20"}}})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"deployment_id":{"type":"string"},"source_run_id":{"type":"string"},"name":{"type":"string"},"artifact_filename":{"type":"string"},"artifact_sha256":{"type":"string"},"has_args":{"type":"boolean","description":"Installer arguments are set (the arguments themselves are never returned)"},"status":{"type":"string","description":"running | complete"},"state":{"type":"object","properties":{"code":{"type":"string"},"label":{"type":"string"},"tone":{"type":"string"}}},"created_at_ms":{"type":"integer"},"completed_at_ms":{"type":"integer"},"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"skipped":{"type":"integer"},"active":{"type":"integer"}}}}},"required":["data"]})j"},
+
+    {"get_deployment",
+     "One of the caller's own deployments with its device grid (owner-scoped; a deployment "
+     "that is not yours reads as not found). Mirrors GET /api/v1/deployments/{id}. "
+     "Read-only: it never advances the engine and writes no per-poll audit row. Counts are "
+     "exact from the run row; devices are ordered by hostname and capped by limit "
+     "(default 500, max 5000) with truncated set when more exist. Requires "
+     "SoftwareDeployment:Read.",
+     R"j({"type":"object","properties":{"deployment_id":{"type":"string","minLength":1,"description":"The deployment id (from list_deployments)"},"limit":{"type":"integer","minimum":1,"maximum":5000,"description":"Max device rows; defaults to 500"}},"required":["deployment_id"]})j",
+     R"j({"type":"object","properties":{"data":{"type":"object"}},"required":["data"]})j"},
+
     // ── #2146 Batch B3 (api-parity programme): fleet visualization + execution/
     // fleet statistics REST+MCP twins. All 6 are confirmed pure reads with no
     // dispatch -- both stats tools call the SAME ExecutionTracker aggregate
@@ -4215,6 +4238,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // would be a false claim per ServiceScopeClass's own doc comment.
     {"list_preflight_runs", {"Infrastructure", "Read"}},
     {"get_deployment_preview", {"SoftwareDeployment", "Read"}},
+    // Read-only deployment list/detail: same gate as get_deployment_preview and the
+    // REST twins, and `denied` (not `confined`) for the same owner-scope reason.
+    {"list_deployments", {"SoftwareDeployment", "Read"}},
+    {"get_deployment", {"SoftwareDeployment", "Read"}},
 
     // #2146 Batch B3 — fleet visualization + execution/fleet statistics read
     // twins. Default (2-element) form: none of these routes reason about
@@ -4945,6 +4972,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // shape for unchanged server state.
     {"list_preflight_runs", {ToolEffect::ReadOnly, true, "List pre-flight runs"}},
     {"get_deployment_preview", {ToolEffect::ReadOnly, true, "Get deployment preview"}},
+    {"list_deployments", {ToolEffect::ReadOnly, true, "List deployments"}},
+    {"get_deployment", {ToolEffect::ReadOnly, true, "Get deployment"}},
     // #2146 Batch B3 — plain reads, repeat calls return the same shape for
     // unchanged server state (get_fleet_topology's fresh=true param busts a
     // shared cache but is still safe/repeatable -- it never mutates
@@ -21315,6 +21344,100 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 nlohmann::json payload =
                     deploy_preview_json(run->run_id, run->name, run->go, run->warn);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // Read-only deployment list: owner-scoped by session->username, matching GET
+            // /api/v1/deployments exactly (same builders, same checked store reader). A
+            // store fault is a retryable error, never an empty list.
+            if (tool_name == "list_deployments") {
+                if (!tier_allows(tier, "SoftwareDeployment", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
+                    return;
+                if (!deployment_run_store_) {
+                    res.set_content(a4_error(kInternalError, "deployment run store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                int64_t limit = param_int(args, "limit", kDeploymentListDefault);
+                if (limit < 1)
+                    limit = 1;
+                if (limit > kDeploymentListMax)
+                    limit = kDeploymentListMax;
+                auto rows_or = deployment_run_store_->list_deployments_checked(
+                    session->username, /*is_admin=*/false, static_cast<int>(limit));
+                if (!rows_or) {
+                    res.set_content(a4_error(kInternalError, "deployment run store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& d : *rows_or)
+                    arr.push_back(deployment_row_json(d));
+                nlohmann::json payload = {{"data", arr}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // Read-only deployment detail: see list_deployments. Never advances the engine.
+            if (tool_name == "get_deployment") {
+                if (!tier_allows(tier, "SoftwareDeployment", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
+                    return;
+                if (!deployment_run_store_) {
+                    res.set_content(a4_error(kInternalError, "deployment run store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto deployment_id = param_str(args, "deployment_id");
+                if (deployment_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "deployment_id is required"),
+                                    "application/json");
+                    return;
+                }
+                int64_t limit = param_int(args, "limit", kDeploymentDeviceDefault);
+                if (limit < 1)
+                    limit = 1;
+                if (limit > kDeploymentDeviceMax)
+                    limit = kDeploymentDeviceMax;
+                const auto read = read_deployment_detail(*deployment_run_store_, deployment_id,
+                                                         session->username,
+                                                         static_cast<int>(limit));
+                using DetailOutcome = DeploymentDetailRead::Outcome;
+                if (read.outcome == DetailOutcome::kStoreFault) {
+                    res.set_content(a4_error(kInternalError, "deployment run store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                if (read.outcome == DetailOutcome::kNotFound) {
+                    res.set_content(a4_error(kInvalidParams, "deployment not found"),
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json payload = {
+                    {"data", deployment_detail_json(read.deployment, read.devices,
+                                                    read.device_limit)}};
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
