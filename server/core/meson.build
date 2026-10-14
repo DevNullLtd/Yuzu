@@ -457,6 +457,7 @@ yuzu_server_core_lib = static_library(
     'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
     'src/home_ui.cpp',     # Home page (/home): baked page + scoped CSS
+    'src/home_render.cpp', # Home: pure value structs + renderers
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
