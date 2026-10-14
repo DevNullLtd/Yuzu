@@ -404,6 +404,9 @@ TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are
         const auto lin = r->body.find("<td>Linux</td>");
         const auto mac = r->body.find("<td>macOS</td>");
         REQUIRE(all != std::string::npos);
+        REQUIRE(win != std::string::npos);
+        REQUIRE(lin != std::string::npos);
+        REQUIRE(mac != std::string::npos);
         CHECK(all < win);
         CHECK(win < lin);
         CHECK(lin < mac);
