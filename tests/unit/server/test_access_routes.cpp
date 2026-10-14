@@ -726,7 +726,8 @@ TEST_CASE("access routes: the wiring in server.cpp uses the checked reads and th
     const std::string server = slurp(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     const auto at = server.find("register_access_routes(");
     REQUIRE(at != std::string::npos);
-    const auto end = server.find("register_access_tokens_routes(", at);
+    // The call's own closing line: the block does not depend on which page registers next.
+    const auto end = server.find("\n            });", at);
     REQUIRE(end != std::string::npos);
     const std::string blk = server.substr(at, end - at);
     // The loud account-role gate really is require_admin, not a permissive lambda.
