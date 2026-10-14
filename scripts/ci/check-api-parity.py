@@ -198,7 +198,12 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get_software_versions (both already "twinned", count unchanged). The raw route's
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
-BASELINE_UNTWINNED = 199
+#
+# Estate deployment read twins: GET /fragments/auto/deployments and .../detail are new routes
+# ledgered "twinned" (GET /api/v1/deployments[/{id}] + MCP list_deployments / get_deployment,
+# count unchanged). The new GET /fragments/auto/nvd status card is ledgered "exception"
+# (grandfathered NVD surface, no get_nvd_status MCP): +1, measured at 200 (199 + 1).
+BASELINE_UNTWINNED = 200
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

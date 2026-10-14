@@ -7910,6 +7910,116 @@ service-scoped-token denial is audited under `deployment.config.view` — alread
 
 ---
 
+#### `GET /api/v1/deployments`
+
+Your own software deployments from the live `/auto` pipeline, newest first. This is the read-only
+list the dashboard fragment `GET /fragments/auto/deployments` renders; unlike
+`GET /fragments/auto/deploy/result` it **never advances the engine** and writes no per-poll audit
+row. It does not read the shelved `/software-deployments` store below. MCP twin: `list_deployments`.
+
+**Permission:** `SoftwareDeployment:Read`
+
+**Parameters:**
+
+| Name | In | Required | Description |
+|---|---|---|---|
+| `limit` | query | No | Max deployments to return (default 20; a parseable value outside 1..100 is clamped, a non-numeric one is `400`) |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "deployment_id": "0a1b2c3d4e5f6071",
+      "source_run_id": "a1b2c3d4e5f6a7b8",
+      "name": "AcmeVPN 4.2.0 rollout",
+      "artifact_filename": "acmevpn-4.2.0.msi",
+      "artifact_sha256": "3a7bd3e2...",
+      "has_args": true,
+      "status": "complete",
+      "state": { "code": "complete_failed", "label": "Complete, 2 failed", "tone": "warn" },
+      "created_at_ms": 1758000000000,
+      "completed_at_ms": 1758000900000,
+      "total": 35, "succeeded": 32, "failed": 2, "skipped": 1, "active": 0
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 20 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`status` is `running` or `complete`; the live engine has no staged, cancelled or rolled-back state.
+`state.label` carries the failed or skipped count of a finished deployment ("Complete, 2 failed").
+The installer URL and installer arguments are **never** returned (either can carry a signed-URL
+token or a licence key); `has_args` says only whether arguments are set. Counts are as of the last
+engine advance, which only happens while a Deployments page is open, so a `running` row can be stale.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| `limit` is not an integer | `400` |
+| A service-scoped API token | `403`, audited under `deployment.list.view` |
+| Deployment run store never configured on this server | `503` (A4 envelope, no `retry_after_ms`) |
+| Deployment run store degraded (transient) | `503` (A4 envelope, `retry_after_ms: 2000`) — never an empty list |
+
+**Audit:** unaudited on a successful read (run lifecycle metadata, not per-agent behavioural PII);
+a service-scoped-token denial is audited under `deployment.list.view`.
+
+---
+
+#### `GET /api/v1/deployments/{id}`
+
+One of your deployments with its device grid. MCP twin: `get_deployment`. Read-only: it never
+advances the engine and writes no per-poll audit row.
+
+**Permission:** `SoftwareDeployment:Read`
+
+**Parameters:**
+
+| Name | In | Required | Description |
+|---|---|---|---|
+| `id` | path | Yes | The deployment id (lowercase hex, from the list) |
+| `limit` | query | No | Max device rows (default 500, capped at 5000). The run counts are exact regardless; `truncated` is `true` when the grid holds fewer rows than `total` |
+
+**Response:** `data` is the list row above plus `devices` (ordered by hostname), `device_limit` and
+`truncated`:
+
+```json
+{
+  "data": {
+    "deployment_id": "0a1b2c3d4e5f6071",
+    "status": "running",
+    "total": 2, "succeeded": 1, "failed": 0, "skipped": 0, "active": 1,
+    "devices": [
+      { "agent_id": "ag-1", "hostname": "host-1", "os": "windows", "step": "succeeded",
+        "exit_code": 0, "error": "", "updated_at_ms": 1758000100000 },
+      { "agent_id": "ag-2", "hostname": "host-2", "os": "windows", "step": "executing",
+        "exit_code": 0, "error": "", "updated_at_ms": 1758000100000 }
+    ],
+    "device_limit": 500,
+    "truncated": false
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`step` is one of `pending`, `staging`, `staged`, `executing`, `succeeded`, `failed`, `skipped`. A
+device the engine refused (quarantined, kill-switched, out of scope) carries the engine's own text
+in `error`.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| `limit` is not an integer | `400` |
+| A service-scoped API token | `403`, audited under `deployment.detail.view` |
+| No such deployment, or it belongs to another operator | `404` — indistinguishable by design |
+| Store never configured / degraded | `503` as for the list |
+
+---
+
 ### Software Deployment
 
 Manage software packages and their deployments to agents. `SoftwareDeploymentStore` is
@@ -10550,6 +10660,15 @@ once the underlying condition clears.
 
 Trigger a manual NVD database sync. Requires `Infrastructure:Execute` (held by Administrator
 and ITServiceOwner, not Administrator alone). Runs asynchronously and returns immediately.
+
+The request is **audited before it is made** as `nvd.sync.request` (`result=success`, or
+`result=disabled` when sync is off on this server and the call answers `503`). If the audit row
+cannot be persisted the request is refused with `503` and no sync is started.
+
+The same status JSON drives the dashboard card `GET /fragments/auto/nvd` (gated
+`Infrastructure:Read`), which shows the CVE count, last sync, whether a sync is running, and the
+last error (escaped and length-capped). The NVD proxy shown by `GET /fragments/settings/nvd` has
+any `user:password@` removed before display.
 
 #### `POST /api/nvd/match`
 

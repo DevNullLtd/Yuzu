@@ -33,5 +33,27 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/auto/deployments",
+    "capability_id": "get.fragments-auto-deployments",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/deployments"
+    },
+    "mcp_twin": "list_deployments",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/auto/deployments/detail",
+    "capability_id": "get.fragments-auto-deployments-detail",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/deployments/{id}"
+    },
+    "mcp_twin": "get_deployment",
+    "status": "twinned"
   }
 ]
