@@ -5880,6 +5880,8 @@ surfaces admit the same **result set** for a given caller: `GET /api/v1/executio
 branch (below) is materially broader than the pre-existing MCP `list_executions` confinement
 (own-dispatches-only) — a disclosed, pre-#4030 difference, not a silent one (`docs/user-manual/mcp.md`).
 
+`GET /fragments/executions` also takes `view=page` (the Executions page list) and `status`, an allow-list of this fragment's own (`running`, `succeeded`, `completed`, `cancelled`, `pending`), not the v1 twin's enum. An empty `status` is no filter; an unknown `status` or a malformed `definition_id` answers `200` with a `data-invalid` note, never an empty list.
+
 **Prerequisite fix bundled with this PR:** `Workflow` was used as an RBAC securable throughout
 `workflow_routes.cpp` but was never seeded into `RbacStore`'s securable-types catalogue — meaning
 no role, including Administrator, could ever be granted `Workflow:Read` while RBAC was enabled.
@@ -5915,6 +5917,62 @@ you've already narrowed them.
 **Permission:** `Workflow:Read`. Fetch one workflow's full detail, including `yaml_source`. The v1
 twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
 soft-deleted id.
+
+#### `GET /api/v1/workflow-executions`
+
+**Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (ADR-0017), the same sole gate as
+the detail route below. Lists workflow **runs** (`WorkflowEngine`'s own multi-step run records, a
+different data model from the instruction `Execution`s `GET /api/v1/executions` lists; a workflow
+run never appears there). MCP twin `list_workflow_executions`; there is no legacy unversioned list.
+
+Rows carry metadata only: `id`, `workflow_id`, `workflow_name`, `workflow_deleted` (`true` when the
+workflow was soft-deleted; its history is kept), `status`, `current_step`, `started_at`,
+`completed_at`. Never agent ids, step results or `agents_reached` (use the detail route for those).
+Newest first by `(started_at, id)`.
+
+A confined caller (management-group or service-scoped) sees only runs with at least one agent in
+its scope. The scope is applied in the database **before** ordering and the page limit, so a run
+the caller cannot see never takes a page slot, `next_cursor` and the page length depend only on
+runs the caller may see, and a hand-made cursor naming a hidden run reveals nothing. A run whose
+stored agent list is malformed, empty or not an array is invisible to a confined caller.
+`pagination.total` is the number of rows **in this page**, never a fleet-wide count.
+
+| Parameter | Meaning |
+|---|---|
+| `workflow_id` | Exact workflow filter (1-128 characters of `A-Z a-z 0-9 _ -`). |
+| `status` | Exact filter: `pending`, `running`, `completed`, `failed`, `cancelled`. |
+| `since` / `until` | Epoch seconds, `started_at >= since` and `started_at < until`; `0` to `2^53`; `since` must not be after `until`. |
+| `limit` | Page size, default 50. Below 1 is a `400`; above 500 is clamped to 500. |
+| `cursor` | The previous page's `next_cursor`. A position only: it does not bind the other filters. |
+| `latest_per_workflow` | `true` returns at most one run per workflow: its newest run among those passing the other filters **and** the caller's visibility (so a confined caller gets its newest *visible* run, never a blanked newest one), ordered by `workflow_id`, with no cursor. `result_truncated_by_cap` is `true` when more workflows matched than `limit`. |
+
+Input is strict: an unknown or repeated parameter, a value outside the vocabulary or bounds above, or
+`cursor` together with `latest_per_workflow` is a `400` (A4 envelope) rather than being ignored, so a
+mistyped filter can never read as "all runs". No audit row is written for a successful list (run
+metadata, not operator-supplied step parameters); a refusal is audited by the gate as
+`auth.fleet_read_required`. A store failure or the 1.5 s statement timeout is a `503` with
+`retry_after_ms`, never an empty `200`.
+
+**Scale.** Only `workflow_id` is indexed (`idx_wf_exec_workflow`). `since`, `until` and `status`
+narrow the result but not the scan, and there is no `started_at` index, so a large run table is
+scanned and sorted on every call. A confined caller also pays to check the stored agent list of every
+candidate run, so a confined caller on a large table should always pass `workflow_id`. A read that
+does not finish inside the 1.5 s budget answers an honest `503` (never a short or empty page):
+narrow by `workflow_id` and retry.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "exec-wf-9", "workflow_id": "wf-1", "workflow_name": "Patch and Reboot",
+      "workflow_deleted": false, "status": "failed", "current_step": 1,
+      "started_at": 1735693200, "completed_at": 1735693260 }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50, "next_cursor": null },
+  "meta": { "api_version": "v1" }
+}
+```
 
 #### `GET /api/v1/workflow-executions/{id}`
 
@@ -8198,7 +8256,7 @@ The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` 
 
 Browser-facing page that renders the 3D fleet topology. The page itself is auth-gated only; per-request RBAC enforcement happens when the page's JS hits `GET /api/v1/viz/fleet/topology` (see below).
 
-**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables only the API endpoint, not the page shell — the page continues to load and the `503` from the disabled API surfaces in the browser console.
+**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/login` first).
 
 **Browser requirements:** the dashboard stylesheet needs Chrome 111+, Edge 111+, Firefox 121+ or Safari 16.2+ (`color-mix()` and `:has()`), and this page also requires importmap support (Safari 16.4+; the other browsers already meet it). On a browser without importmap the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
 
@@ -10133,6 +10191,10 @@ v1 `{data, meta}` envelope above. **Not migrated onto the checked read path**: o
 Postgres failure this route silently returns `{"count": 0}` — indistinguishable from a genuinely
 empty queue — rather than a `503`; prefer `GET /api/v1/approvals/pending/count` or MCP
 `get_pending_approval_count` for failure-honest polling.
+
+#### `GET /fragments/approvals`
+
+HTML fragment behind the Instructions Approvals tab and the Approvals page (`/approvals`). Requires `Approval:Read`. `view=page` renders the page list (pending by default); `status` is one of `pending`, `approved`, `rejected`, `expired`, and an empty value means every status. An unknown `status` answers `200` with a `data-invalid="status"` note, a failed store read answers `200` with `data-degraded="store"`, and a refused caller gets `200` with `data-denied="true"` (the dashboard drops `4xx` bodies). The page view lists the 100 most recent rows and marks a cut list with `data-truncated="1"`.
 
 #### `POST /api/approvals/{id}/approve`
 

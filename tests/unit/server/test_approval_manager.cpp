@@ -874,28 +874,6 @@ void backdate(pg::PgPool& pool, const std::string& id, const char* column, int64
 constexpr int64_t k8Days = 8 * 24 * 3600;
 } // namespace
 
-namespace {
-/// Bulk-inserts `count` pending approvals directly via SQL (bypassing
-/// `submit()`'s own cap, which would refuse past 1000) so cap-boundary tests
-/// stay fast — one INSERT instead of `count` round-trips through submit().
-void seed_pending(pg::PgPool& pool, const std::string& id_prefix, int count, int64_t age_seconds) {
-    auto lease = pool.acquire();
-    REQUIRE(lease);
-    auto sql = std::string(
-                   "INSERT INTO approval_manager.approvals "
-                   "(id, definition_id, status, submitted_by, submitted_at) "
-                   "SELECT '") +
-               id_prefix +
-               "' || gs, 'def-seeded', 'pending', 'operator1', "
-               "extract(epoch from now())::bigint - $1 "
-               "FROM generate_series(1, $2) AS gs";
-    pg::PgResult res = pg::exec_params(
-        lease.get(), sql.c_str(),
-        std::vector<std::string>{std::to_string(age_seconds), std::to_string(count)});
-    REQUIRE(res.status() == PGRES_COMMAND_OK);
-}
-} // namespace
-
 TEST_CASE("ApprovalManager: a full stale pending queue self-heals on the next submit "
           "(governance adversarial review 2026-08-31 — was permanently wedged)",
           "[pg][approval_manager][approval]") {
@@ -903,7 +881,8 @@ TEST_CASE("ApprovalManager: a full stale pending queue self-heals on the next su
     ApprovalManager& mgr = *mgr_bundle;
 
     // At the cap, all 8 days old and expirable.
-    seed_pending(mgr_bundle.pool(), "stale-", ApprovalManager::kMaxPendingApprovals, k8Days);
+    yuzu::test::seed_pending(mgr_bundle.pool(), "stale-", ApprovalManager::kMaxPendingApprovals,
+                             k8Days);
 
     // Before the fix, this returned "approval queue is full" and never ran
     // the expiry sweep, permanently wedging the store.
@@ -926,8 +905,8 @@ TEST_CASE("ApprovalManager: a full queue of NON-stale pending approvals still re
 
     // At the cap, fresh (not expirable) — the cap must still bind when there
     // is genuinely nothing for the sweep to clear.
-    seed_pending(mgr_bundle.pool(), "fresh-", ApprovalManager::kMaxPendingApprovals,
-                /*age_seconds=*/60);
+    yuzu::test::seed_pending(mgr_bundle.pool(), "fresh-", ApprovalManager::kMaxPendingApprovals,
+                             /*age_seconds=*/60);
 
     auto id = mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(!id.has_value());
@@ -1849,7 +1828,7 @@ TEST_CASE("ApprovalManager: query_checked at exactly the list cap is not misrepo
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
 
-    seed_pending(mgr_bundle.pool(), "cap-", 100, /*age_seconds=*/60);
+    yuzu::test::seed_pending(mgr_bundle.pool(), "cap-", 100, /*age_seconds=*/60);
 
     auto list_checked = mgr.query_checked();
     REQUIRE(list_checked.has_value());
@@ -1863,7 +1842,7 @@ TEST_CASE("ApprovalManager: query_checked truncates and flags a queue one over "
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
 
-    seed_pending(mgr_bundle.pool(), "cap-", 101, /*age_seconds=*/60);
+    yuzu::test::seed_pending(mgr_bundle.pool(), "cap-", 101, /*age_seconds=*/60);
 
     auto list_checked = mgr.query_checked();
     REQUIRE(list_checked.has_value());

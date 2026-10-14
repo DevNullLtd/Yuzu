@@ -64,6 +64,7 @@
 #include "test_verify_api_double.hpp"
 #include "test_guardian_api_double.hpp" // ADR-0031 WS-A4 (ninth family): FnGuardianApi, seam-bypass tripwire tests
 #include "test_workflow_api_double.hpp" // ADR-0031 WS-A4 (eighth family): FnWorkflowApi, seam-bypass tripwire tests
+#include "store_errors.hpp"               // kDbErrorPrefix (list_workflow_executions degrade test)
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 #include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
 #include "test_schedule_engine_pg_helper.hpp" // ScheduleEnginePg - #2146 A2-R1
@@ -12690,6 +12691,313 @@ TEST_CASE("MCP get_workflow_execution: answers via the WorkflowApi seam, not "
     REQUIRE(res);
     auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
     CHECK(sc["status"] == "seam-double-status");
+}
+
+// ── list_workflow_executions (the run LIST) ─────────────────────────────────
+// Driven through the WorkflowApi seam double: the seam's store applies the scope (proved in
+// test_workflow_engine.cpp), so what is asserted here is what the TOOL hands the seam and how it
+// answers: gate first, strict input, exact scope, envelope, degrade.
+
+namespace {
+
+struct WfListSeam {
+    int calls{0};
+    yuzu::server::WorkflowExecutionListQuery seen_query;
+    yuzu::server::authz::VisibleSet seen_scope;
+    std::expected<yuzu::server::WorkflowExecutionPage, std::string> result{
+        yuzu::server::WorkflowExecutionPage{}};
+
+    std::shared_ptr<yuzu::server::test::FnWorkflowApi> api() {
+        return std::make_shared<yuzu::server::test::FnWorkflowApi>(
+            yuzu::server::test::FnWorkflowApi::ListFn{}, yuzu::server::test::FnWorkflowApi::GetFn{},
+            yuzu::server::test::FnWorkflowApi::GetExecutionFn{},
+            [this](const yuzu::server::WorkflowExecutionListQuery& q,
+                   const yuzu::server::authz::VisibleSet& scope) {
+                ++calls;
+                seen_query = q;
+                seen_scope = scope;
+                return result;
+            });
+    }
+};
+
+std::string wf_list_call(const std::string& arguments) {
+    return R"({"jsonrpc":"2.0","method":"tools/call","id":950,"params":{"name":"list_workflow_executions","arguments":)" +
+           arguments + "}}";
+}
+
+} // namespace
+
+TEST_CASE("MCP list_workflow_executions: rows cursor and the seam's exact inputs",
+          "[mcp][workflow][executions][list]") {
+    WfListSeam seam;
+    yuzu::server::WorkflowExecutionSummary row;
+    row.id = "run-1";
+    row.workflow_id = "wf-1";
+    row.workflow_name = "Patch Tuesday";
+    row.status = "failed";
+    row.started_at = 100;
+    seam.result = yuzu::server::WorkflowExecutionPage{{row}, yuzu::server::keyset::Position{100, "run-1"}, false};
+    McpTestServer ts;
+    ts.workflow_api_for_test = seam.api();
+    ts.start("readonly"); // Workflow:Read is a read-tier pair
+
+    auto res = ts.call(wf_list_call(R"({"workflow_id":"wf-1","status":"failed","since":10,"limit":5})"));
+    REQUIRE(res);
+    const auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(sc["executions"].size() == 1);
+    CHECK(sc["executions"][0]["id"] == "run-1");
+    CHECK(sc["executions"][0]["workflow_name"] == "Patch Tuesday");
+    CHECK_FALSE(sc["executions"][0].contains("agent_ids"));
+    CHECK(sc["next_cursor"] == "w1:100:cnVuLTE");
+    CHECK_FALSE(sc.contains("result_truncated_by_cap"));
+
+    CHECK(seam.calls == 1);
+    CHECK(seam.seen_query.workflow_id == "wf-1");
+    CHECK(seam.seen_query.status == "failed");
+    CHECK(seam.seen_query.since == 10);
+    CHECK(seam.seen_query.limit == 5);
+    CHECK_FALSE(seam.seen_scope.has_value()); // fixture gate admits unfiltered
+    bool audited = false;
+    for (const auto& a : ts.audit_log)
+        audited = audited || a.find("list_workflow_executions") != std::string::npos;
+    CHECK(audited);
+
+    // The token feeds straight back.
+    ts.call(wf_list_call(R"({"cursor":"w1:100:cnVuLTE","latest_per_workflow":false})"));
+    REQUIRE(seam.seen_query.after.has_value());
+    CHECK(seam.seen_query.after->id == "run-1");
+}
+
+TEST_CASE("MCP list_workflow_executions: latest mode flags the cap and carries a null cursor",
+          "[mcp][workflow][executions][list]") {
+    WfListSeam seam;
+    seam.result = yuzu::server::WorkflowExecutionPage{{}, std::nullopt, true};
+    McpTestServer ts;
+    ts.workflow_api_for_test = seam.api();
+    ts.start();
+    auto res = ts.call(wf_list_call(R"({"latest_per_workflow":true})"));
+    REQUIRE(res);
+    const auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["executions"].is_array());
+    CHECK(sc["next_cursor"].is_null());
+    CHECK(sc["result_truncated_by_cap"] == true);
+    CHECK(seam.seen_query.latest_per_workflow);
+}
+
+TEST_CASE("MCP list_workflow_executions: strict input is refused before the seam is reached",
+          "[mcp][workflow][executions][list]") {
+    WfListSeam seam;
+    McpTestServer ts;
+    ts.workflow_api_for_test = seam.api();
+    ts.start();
+    for (const char* args : {R"({"bogus":1})", R"({"workflow-id":"x"})", R"({"status":"nope"})",
+                             R"({"limit":0})", R"({"limit":"5"})", R"({"since":20,"until":10})",
+                             R"({"cursor":"garbage"})", R"({"latest_per_workflow":"true"})",
+                             R"({"latest_per_workflow":true,"cursor":"w1:1:YQ"})"}) {
+        INFO(args);
+        auto res = ts.call(wf_list_call(args));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInvalidParams);
+        // A4 envelope: a caller-input rejection is not retryable, but still carries a correlation
+        // id and a remediation.
+        REQUIRE(body["error"].contains("data"));
+        CHECK_FALSE(body["error"]["data"]["correlation_id"].get<std::string>().empty());
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["data"]["remediation"].is_string());
+    }
+    CHECK(seam.calls == 0);
+}
+
+TEST_CASE("MCP list_workflow_executions: the gate runs before argument validation",
+          "[mcp][workflow][executions][list][confinement]") {
+    // A caller the gate refuses must get the gate's answer even when its arguments are malformed:
+    // validating first would answer invalid-params and hand an unauthorised caller a validation
+    // oracle. This is the case that goes red if parsing moves above the gate.
+    WfListSeam seam;
+    int gate_calls = 0;
+    McpTestServer ts;
+    ts.workflow_api_for_test = seam.api();
+    ts.fleet_read_fn_for_test = [&gate_calls](const httplib::Request&, httplib::Response& r,
+                                              const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        ++gate_calls;
+        r.set_content(
+            R"({"jsonrpc":"2.0","id":950,"error":{"code":-32001,"message":"gate refused"}})",
+            "application/json");
+        return {false, yuzu::server::authz::deny_all()};
+    };
+    ts.start();
+    auto res = ts.call(wf_list_call(R"({"bogus":1})"));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "gate refused");
+    CHECK(body["error"]["code"].get<int>() != yuzu::server::mcp::kInvalidParams);
+    CHECK(gate_calls == 1);
+    CHECK(seam.calls == 0);
+}
+
+TEST_CASE("MCP list_workflow_executions: the gate's scope reaches the seam and a refusal stops it",
+          "[mcp][workflow][executions][list][confinement]") {
+    using yuzu::server::authz::FleetReadGate;
+    using Gate = yuzu::server::mcp::McpServer::FleetReadFn;
+    // One fresh server per gate behaviour: the gate is captured when the handler is installed.
+    const auto run = [](WfListSeam& seam, Gate gate) {
+        McpTestServer ts;
+        ts.workflow_api_for_test = seam.api();
+        ts.fleet_read_fn_for_test = std::move(gate);
+        ts.start();
+        auto res = ts.call(wf_list_call("{}"));
+        REQUIRE(res);
+        return res->body;
+    };
+    {
+        WfListSeam seam;
+        run(seam, [](const httplib::Request&, httplib::Response&, const std::string& type,
+                     const std::string& op) -> FleetReadGate {
+            CHECK(type == "Workflow");
+            CHECK(op == "Read");
+            return {true, std::unordered_set<std::string>{"agent-1"}};
+        });
+        REQUIRE(seam.seen_scope.has_value());
+        CHECK(*seam.seen_scope == std::unordered_set<std::string>{"agent-1"});
+    }
+    {
+        // Deny-all stays engaged-empty (never widened to "no filter").
+        WfListSeam seam;
+        run(seam, [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) -> FleetReadGate {
+            return {true, yuzu::server::authz::deny_all()};
+        });
+        REQUIRE(seam.seen_scope.has_value());
+        CHECK(seam.seen_scope->empty());
+    }
+    {
+        // A refusing gate has already written the response; the tool must not reach the seam.
+        WfListSeam seam;
+        const auto body = run(seam, [](const httplib::Request&, httplib::Response& r,
+                                       const std::string&, const std::string&) -> FleetReadGate {
+            r.set_content(
+                R"({"jsonrpc":"2.0","id":950,"error":{"code":-32001,"message":"gate refused"}})",
+                "application/json");
+            return {false, yuzu::server::authz::deny_all()};
+        });
+        CHECK(body.find("gate refused") != std::string::npos);
+        CHECK(seam.calls == 0);
+    }
+}
+
+TEST_CASE("MCP list_workflow_executions: an unwired gate fails closed and a service token is not "
+          "denied outright",
+          "[mcp][workflow][executions][list][confinement]") {
+    WfListSeam seam;
+    {
+        McpTestServer ts;
+        ts.workflow_api_for_test = seam.api();
+        ts.fleet_read_fn_for_test = {};
+        ts.start();
+        auto res = ts.call(wf_list_call("{}"));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"] == "service unavailable");
+        CHECK_FALSE(body["error"]["data"]["correlation_id"].get<std::string>().empty());
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // wired once: a retry cannot help
+        CHECK(seam.calls == 0);
+    }
+    {
+        // `confined`, not `denied`: a service-scoped token reaches the fleet-read gate, which
+        // narrows it. The gate here is a fake; the REAL gate's exact id sets are proved over REST
+        // in test_workflow_executions_real_gate_authz.cpp (there is no MCP-over-real-gate case).
+        McpTestServer ts;
+        ts.workflow_api_for_test = seam.api();
+        ts.mock_token_scope_service = "printers";
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                       const std::string&,
+                                       const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::unordered_set<std::string>{"printer-1"}};
+        };
+        ts.start();
+        auto res = ts.call(wf_list_call("{}"));
+        REQUIRE(res);
+        CHECK(nlohmann::json::parse(res->body).contains("result"));
+        REQUIRE(seam.seen_scope.has_value());
+        CHECK(*seam.seen_scope == std::unordered_set<std::string>{"printer-1"});
+    }
+}
+
+TEST_CASE("MCP list_workflow_executions: an unwired WorkflowApi answers an A4 error",
+          "[mcp][workflow][executions][list]") {
+    McpTestServer ts; // no workflow seam wired: the tool's own readiness guard answers
+    ts.start();
+    auto res = ts.call(wf_list_call("{}"));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "Workflow engine unavailable");
+    CHECK_FALSE(body["error"]["data"]["correlation_id"].get<std::string>().empty());
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // wired once: a retry cannot help
+    CHECK_FALSE(body.contains("result"));
+}
+
+TEST_CASE("MCP list_workflow_executions: a store failure is a retryable error never an empty list",
+          "[mcp][workflow][executions][list][degrade]") {
+    WfListSeam seam;
+    seam.result = std::unexpected(std::string(yuzu::server::kDbErrorPrefix) +
+                                  "canceling statement due to statement timeout (internal)");
+    McpTestServer ts;
+    ts.workflow_api_for_test = seam.api();
+    ts.start();
+    auto res = ts.call(wf_list_call("{}"));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
+    // Without this guard a reply that has no `data` object (a plain error_response) aborts the
+    // whole test binary inside nlohmann instead of failing this one case.
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(body["error"]["message"].get<std::string>().find("statement timeout") == std::string::npos);
+    CHECK_FALSE(body.contains("result"));
+}
+
+TEST_CASE("MCP list_workflow_executions: advertised read-only with a bounded input schema",
+          "[mcp][workflow][executions][list]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":951})");
+    REQUIRE(res);
+    nlohmann::json tool;
+    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+        if (t["name"] == "list_workflow_executions")
+            tool = t;
+    REQUIRE_FALSE(tool.is_null());
+    CHECK(tool["annotations"]["readOnlyHint"] == true);
+    const auto& props = tool["inputSchema"]["properties"];
+    CHECK(props["workflow_id"]["maxLength"] == 128);
+    CHECK(props["status"]["enum"].size() == 5);
+    CHECK(props["limit"]["maximum"] == 500);
+    CHECK(props["cursor"]["maxLength"] == 2048);
+    // The handler refuses unknown arguments (D9), so the machine-readable contract says so too.
+    CHECK(tool["inputSchema"]["additionalProperties"] == false);
+    CHECK(tool["description"].get<std::string>().size() < 4096);
+
+    // A typed output schema, not the generic object placeholder.
+    const auto& out = tool["outputSchema"];
+    CHECK(out["required"] == nlohmann::json::array({"executions", "next_cursor"}));
+    CHECK(out["properties"]["executions"]["type"] == "array");
+    const auto& item = out["properties"]["executions"]["items"];
+    CHECK(item["required"].size() == 8);
+    CHECK(item["properties"]["workflow_deleted"]["type"] == "boolean");
+    CHECK(item["properties"]["current_step"]["type"] == "integer");
+    CHECK(item["properties"]["started_at"]["type"] == "integer");
+    CHECK_FALSE(item["properties"].contains("agent_ids"));
+    CHECK(out["properties"]["next_cursor"]["type"] == nlohmann::json::array({"string", "null"}));
+    CHECK(out["properties"]["result_truncated_by_cap"]["type"] == "boolean");
 }
 
 // #1634: execution rows carry no single agent_id, so a confined caller is

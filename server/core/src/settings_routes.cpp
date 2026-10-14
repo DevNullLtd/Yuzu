@@ -807,6 +807,11 @@ std::string bulk_audit_detail(const std::vector<std::string>& ids) {
 }
 } // namespace
 
+bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
+                              std::chrono::system_clock::time_point now) noexcept {
+    return expires_at != (std::chrono::system_clock::time_point::max)() && expires_at <= now;
+}
+
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
     // The reveal block is built first: a freshly minted raw token is shown ONCE, so
     // it must survive even when the follow-up list read fails.
@@ -828,6 +833,7 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
     if (!tokens_result)
         return std::string(kEnrollmentStoreUnavailableHtml) + reveal;
     const auto& tokens = *tokens_result;
+    const auto now = std::chrono::system_clock::now();
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>ID</th><th>Label</th><th>Uses</th>"
                        "  <th>Expires</th><th>Status</th><th></th></tr></thead>"
@@ -858,6 +864,9 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
             } else if (t.max_uses > 0 && t.use_count >= t.max_uses) {
                 status_cls = "role-user";
                 status_txt = "Exhausted";
+            } else if (enrollment_token_expired(t.expires_at, now)) {
+                status_cls = "role-user";
+                status_txt = "Expired";
             } else {
                 status_cls = "role-admin";
                 status_txt = "Active";
