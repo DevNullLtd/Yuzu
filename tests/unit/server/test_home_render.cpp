@@ -203,17 +203,35 @@ TEST_CASE("attention: the green row appears only when every contributor is Ok an
     CHECK(has(render_attention(v), "Nothing needs attention"));
 }
 
-// Kills: rendering the green row while a contributor is Denied/Limited/Unavailable (S4).
+// Kills: rendering the green row while ANY contributor is Denied/Limited/Unavailable (S4);
+// every contributor is varied in turn so dropping one contributor's flag is caught.
 TEST_CASE("attention: a non-Ok contributor renders a note and no green row", "[home][render]") {
-    for (auto s : {FactState::Denied, FactState::Limited, FactState::Unavailable, FactState::Unwired}) {
+    auto quiet = [] {
         SummaryView v = all_ok();
         v.devices = Fact<EstateCounts>::make_ok(estate(10, 0, 0));
+        v.failed = Fact<FailedFigure>::make_ok({});
         v.approvals = Fact<ApprovalFigure>::make_ok({});
-        v.failed = Fact<FailedFigure>::with(s, "Execution:Read");
-        const std::string html = render_attention(v);
+        v.show_enrolment = true;
+        v.enrolment = Fact<std::int64_t>::make_ok(0);
+        return v;
+    };
+    CHECK(has(render_attention(quiet()), "Nothing needs attention"));
+
+    for (auto s : {FactState::Denied, FactState::Limited, FactState::Unavailable, FactState::Unwired}) {
         INFO(static_cast<int>(s));
-        CHECK_FALSE(has(html, "Nothing needs attention"));
-        CHECK(has(html, "class=\"note warn\""));
+        for (int who = 0; who < 4; ++who) {
+            SummaryView v = quiet();
+            switch (who) {
+            case 0: v.devices = Fact<EstateCounts>::with(s, "Inventory:Read"); break;
+            case 1: v.failed = Fact<FailedFigure>::with(s, "Execution:Read"); break;
+            case 2: v.approvals = Fact<ApprovalFigure>::with(s, "Approval:Read"); break;
+            default: v.enrolment = Fact<std::int64_t>::with(s); break;
+            }
+            const std::string html = render_attention(v);
+            INFO("contributor " << who);
+            CHECK_FALSE(has(html, "Nothing needs attention"));
+            CHECK(has(html, "class=\"note warn\""));
+        }
     }
 }
 
