@@ -370,6 +370,9 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 .pill.idle, .badge-neutral { color: var(--mut); background: var(--surface2); }
 .chip { font-size: 13px; color: var(--mut); }
 .chip b { color: var(--ink); font-weight: 600; margin-left: 3px; }
+/* OS name tag: a hairline-boxed mono label */
+.os-tag { padding: 0 5px; white-space: nowrap; border: 1px solid var(--line2); border-radius: 3px; color: var(--mut);
+          font-family: var(--mds-font-family-mono); font-size: 11.5px; }
 /* Status square beside a name */
 .sd { width: 8px; height: 8px; display: inline-block; margin-right: 8px; }
 .s-on { background: var(--ok); }
