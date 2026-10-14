@@ -216,11 +216,12 @@ TEST_CASE("/fragments/compliance/summary: an ordinary session reaches the summar
     }
 }
 
-TEST_CASE("compliance page: cell text rules are table-prefixed so they outrank the td default",
+TEST_CASE("compliance page CSS declares the table-prefixed Scope / Detail cell rules",
           "[compliance]") {
-    // `.policy-table td { color: var(--ink2); white-space: nowrap }` has specificity (0,1,1); a
-    // bare single-class cell rule (0,1,0) loses to it, so the muted/faint/ink hierarchy and the
-    // Scope / Detail wrapping never apply.
+    // yuzu.css's `:is(.panel table, .tw table) td { color: var(--ink2); white-space: nowrap }` has
+    // specificity (0,1,2); a bare single-class cell rule loses to it, so the Scope / Detail
+    // wrapping rules carry the table prefix. This pins that they are declared, not their computed
+    // outcome.
     const std::string page = kComplianceHtml;
     CHECK(page.find(".policy-table .policy-scope { color: var(--mut); white-space: normal;") !=
           std::string::npos);

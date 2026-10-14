@@ -19,32 +19,14 @@ button,input,select,textarea{font:inherit;color:inherit}
 code{font-family:var(--mds-font-family-mono);font-size:12.5px}
 /* page frame */
 .pg{padding:22px 28px 36px;display:flex;flex-direction:column;gap:20px}
-.ph h1{font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
-.ph p{color:var(--mut);margin-top:4px;max-width:70ch}
-.tabs{display:flex;flex-wrap:wrap;gap:2px;border-bottom:1px solid var(--line)}
-.tab{padding:8px 14px;cursor:pointer;color:var(--mut);border-bottom:2px solid transparent;margin-bottom:-1px;font-weight:500;transition:color .12s}
-.tab:hover{color:var(--ink)}
-.tab.active{color:var(--ink);border-bottom-color:var(--hl);font-weight:600}
-/* panel: a bordered region, not a floating card */
-.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel);min-width:0}
+/* tabs, panel, .tw and tables are yuzu.css's; only the stacked-panel gap is local */
 .panel+.panel{margin-top:22px}
-.panel>.hd{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
-.panel>.hd h2{font-size:14px;font-weight:600;color:var(--ink)}
-.panel>.hd .end{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.panel>.pb{padding:16px}
-.tw{overflow-x:auto}
 .empty-state{color:var(--mut);text-align:center;padding:32px 16px;font-size:13.5px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
 .panel .empty-state,.exec-detail .empty-state{background:none;border:0}
 .exec-detail .empty-state{padding:12px}
-.note{margin-bottom:12px;padding:12px 14px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:13.5px}
-.note.warn{border-color:color-mix(in srgb,var(--warn) 50%,var(--line2))}
+.note{margin-bottom:12px}
 .hint{color:var(--mut);font-size:12.5px}
-/* tables */
-table{width:100%;border-collapse:collapse}
-th{text-align:left;font-size:12.5px;font-weight:500;color:var(--mut);padding:8px 16px;background:var(--surface2);border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:var(--cell-y) 16px;border-bottom:1px solid var(--line);color:var(--ink2)}
-tr:last-child>td{border-bottom:0}
-tbody tr:hover>td{background:var(--surface2)}
+/* tables: row skin comes from yuzu.css (.tw table / .panel table) */
 td strong{color:var(--ink);font-weight:600}
 td.act{text-align:right;white-space:nowrap}
 .sub-id{display:block;font-size:12px;color:var(--faint)}
@@ -177,7 +159,7 @@ textarea{height:auto;padding:8px 10px;min-height:84px;resize:vertical;font-famil
 
 )HTM"
     R"HTM(<div class="pg">
-<header class="ph"><div><h1>Instructions</h1><p>Author, validate and dispatch instructions.</p></div></header>
+<header class="page-header"><div><h1>Instructions</h1><p class="subtitle">Author, validate and dispatch instructions.</p></div></header>
 <div class="tabs">
     <div class="tab active" onclick="showTab('definitions',this)">Definitions</div>
     <div class="tab" onclick="showTab('executions',this)">Executions</div>

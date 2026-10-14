@@ -112,7 +112,7 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
     }
 
     if (degraded) {
-        return "<div class=\"cmp-panel\"><div class=\"empty-state\">"
+        return "<div class=\"panel\"><div class=\"empty-state\">"
                "Policy data temporarily unavailable (store degraded) — try again shortly."
                "</div></div>";
     }
@@ -122,7 +122,7 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
     if (api_) {
         auto fc_res = api_->fleet_compliance();
         if (!fc_res) {
-            return "<div class=\"cmp-panel\"><div class=\"empty-state\">"
+            return "<div class=\"panel\"><div class=\"empty-state\">"
                    "Fleet compliance temporarily unavailable (store degraded) — try again "
                    "shortly.</div></div>";
         }
@@ -150,10 +150,10 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
             "</div>";
 
     // Policy table
-    html += "<div class=\"cmp-panel\"><div class=\"tw\"><table class=\"policy-table\">"
+    html += "<div class=\"panel\"><div class=\"tw\"><table class=\"policy-table\">"
             "<thead><tr>"
             "<th>#</th><th>Policy</th><th>Scope</th>"
-            "<th>Compliance</th><th></th><th></th>"
+            "<th>Compliance</th><th></th><th class=\"r\"></th>"
             "</tr></thead><tbody>";
 
     if (policies.empty()) {
@@ -167,17 +167,17 @@ std::string ComplianceRoutes::render_compliance_summary_fragment() {
             html += "<tr>"
                     "<td class=\"policy-idx\">" + std::to_string(row) + "</td>"
                     "<td class=\"policy-name\">" + html_escape(p.name) + "</td>"
-                    "<td class=\"policy-scope\">" + html_escape(p.scope) + "</td>"
+                    "<td class=\"policy-scope mono\">" + html_escape(p.scope) + "</td>"
                     "<td>"
                     "<span class=\"policy-pct " + std::string(compliance_level(p.pct)) + "\">"
                     + std::to_string(p.pct) + "%</span>"
-                    "<div class=\"mini-bar\"><div class=\"mini-fill " + std::string(compliance_level(p.pct)) +
+                    "<div class=\"compliance-bar mini-bar\"><div class=\"compliance-fill " + std::string(compliance_level(p.pct)) +
                     "\" style=\"width:" + std::to_string(p.pct) + "%\"></div></div>"
                     "</td>"
                     "<td class=\"policy-count\">"
                     + std::to_string(p.compliant) + "/" + std::to_string(p.total) +
                     "</td>"
-                    "<td>"
+                    "<td class=\"r\">"
                     "<button class=\"btn btn-secondary btn-sm\" "
                     "hx-get=\"/fragments/compliance/" + html_escape(p.id) + "\" "
                     "hx-target=\"#compliance-detail\" "
@@ -306,10 +306,10 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
 
     // Status summary badges
     html += "<div class=\"detail-badges\">"
-            "<span class=\"status-compliant\">" + std::to_string(compliant) + " compliant</span>"
-            "<span class=\"status-non-compliant\">" + std::to_string(non_compliant) + " non-compliant</span>"
-            "<span class=\"status-pending-eval\">" + std::to_string(unknown) + " unknown</span>"
-            "<span class=\"status-remediated\">" + std::to_string(fixing) + " fixing</span>"
+            "<span class=\"badge badge-success\">" + std::to_string(compliant) + " compliant</span>"
+            "<span class=\"badge badge-danger\">" + std::to_string(non_compliant) + " non-compliant</span>"
+            "<span class=\"badge badge-warning\">" + std::to_string(unknown) + " unknown</span>"
+            "<span class=\"badge badge-info\">" + std::to_string(fixing) + " fixing</span>"
             "</div>";
 
     // Per-agent table
@@ -320,11 +320,11 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
             "</tr></thead><tbody>";
 
     for (const auto& a : agents) {
-        std::string status_class = "status-compliant";
-        if (a.status == "non_compliant") status_class = "status-non-compliant";
-        else if (a.status == "unknown") status_class = "status-pending-eval";
-        else if (a.status == "fixing") status_class = "status-remediated";
-        else if (a.status == "error") status_class = "status-non-compliant";
+        std::string status_class = "badge badge-success";
+        if (a.status == "non_compliant") status_class = "badge badge-danger";
+        else if (a.status == "unknown") status_class = "badge badge-warning";
+        else if (a.status == "fixing") status_class = "badge badge-info";
+        else if (a.status == "error") status_class = "badge badge-danger";
 
         std::string status_label = a.status;
         if (status_label == "non_compliant") status_label = "Non-Compliant";
@@ -334,7 +334,7 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
         else if (status_label == "error") status_label = "Error";
 
         html += "<tr>"
-                "<td class=\"mono-id\">" + html_escape(a.agent_id) + "</td>"
+                "<td class=\"mono\">" + html_escape(a.agent_id) + "</td>"
                 "<td>" + html_escape(a.hostname) + "</td>"
                 "<td class=\"cell-mut\">" + html_escape(a.os) + "</td>"
                 "<td><span class=\"" + status_class + "\">" + status_label + "</span></td>"

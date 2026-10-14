@@ -631,8 +631,8 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                 // Self-revoke is permitted (recoverable — operator just
                 // re-authenticates) and routes through `/api/v1/sessions/me`
                 // so the audit row records `session.revoke_all.self`.
-                html += "<span class=\"current-user-badge\" "
-                        "style=\"color:var(--mut);font-size:12.5px;margin-right:0.5rem\" "
+                html += "<span class=\"current-user-badge hint\" "
+                        "style=\"margin-right:0.5rem\" "
                         "title=\"You cannot remove your own account\">"
                         "Current user</span>"
                         "<button class=\"btn btn-secondary\" "
@@ -1223,8 +1223,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                             html_escape(p.principal_id) +
                             "\">"
                             "<input type=\"hidden\" name=\"ttl_days\" value=\"90\">"
-                            "<button class=\"btn btn-secondary\" type=\"submit\" "
-                            ">"
+                            "<button class=\"btn btn-secondary\" type=\"submit\">"
                             "Mint</button></form> ";
                 } else {
                     // Rotate credential — overlap-pair rotation (design doc §7).
@@ -1248,8 +1247,7 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                         "\">"
                         "<input type=\"text\" name=\"new_owner\" placeholder=\"new owner\" "
                         "style=\"width:110px\" required>"
-                        "<button class=\"btn btn-secondary\" type=\"submit\" "
-                        ">"
+                        "<button class=\"btn btn-secondary\" type=\"submit\">"
                         "Transfer</button></form> ";
 
                 // Revoke — terminal, never un-revocable (design doc §3.1 /
@@ -2310,7 +2308,7 @@ std::string SettingsRoutes::render_updates_fragment() {
         } catch (...) {}
 
         if (!version_counts.empty()) {
-            html += "<div class=\"callout\" style=\"margin-bottom:1rem\">"
+            html += "<div class=\"note\" style=\"margin-bottom:1rem\">"
                     "<div class=\"sub-head\" style=\"margin-top:0\">Fleet versions</div>";
             for (const auto& [ver, cnt] : version_counts) {
                 html += "<span style=\"display:inline-block;margin-right:1rem\"><code>" +
@@ -2405,8 +2403,7 @@ std::string SettingsRoutes::render_updates_fragment() {
                     "<span style=\"width:2.5em\">" +
                     std::to_string(pkg.rollout_pct) +
                     "%</span>"
-                    "<button class=\"btn btn-secondary\" type=\"submit\" "
-                    ">Set</button>"
+                    "<button class=\"btn btn-secondary\" type=\"submit\">Set</button>"
                     "</form></td>"
                     "<td>" +
                     std::string(pkg.mandatory ? "Yes" : "No") +
@@ -2432,7 +2429,7 @@ std::string SettingsRoutes::render_updates_fragment() {
     // container (the <form>'s own inline `display:flex` is), so
     // `.add-user-form`'s `flex-wrap: wrap` never reached the row it was
     // meant to protect. It worked anyway, by coincidence — the row fits
-    // today purely from the `min-width:0`/`max-width:180px` compression —
+    // today purely from the `min-width:0`/`max-width:260px` compression —
     // but a future wider row would silently overflow again. Matching the
     // other `.add-user-form` consumers (add-user, enrollment-token,
     // api-token, engine-principal: class on the <form>, no div wrapper, no
@@ -2774,7 +2771,7 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
         html += "<div class=\"form-row\"><label>" + std::string(label) +
                 "</label><input type=\"number\" name=\"" + name + "\" value=\"" +
                 html_escape(value) +
-                "\" style=\"width:7rem;flex:0 0 auto\"> <span class=\"hint\">" +
+                "\" class=\"num-narrow\"> <span class=\"hint\">" +
                 hint + "</span></div>";
     };
     num_row("Min devices", "min_devices", min_dev, "distinct devices that make an incident (>= 2)");
@@ -2915,7 +2912,7 @@ std::string SettingsRoutes::render_mcp_fragment() {
 
     std::string url = v.at("endpoint_url").get<std::string>();
 
-    html += "<div class=\"callout\" style=\"margin-top:0.75rem\">"
+    html += "<div class=\"note\" style=\"margin-top:0.75rem\">"
             "  <div class=\"sub-head\" style=\"margin-top:0\">MCP client connection</div>"
             "  <div style=\"margin-bottom:0.3rem\">"
             "    Endpoint: <code>" +
@@ -3196,9 +3193,8 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
                     "<label>Subjects</label>"
                     "<div style=\"flex:1;min-width:0\">";
             for (const auto& s : subjects) {
-                html += "<div "
-                        "style=\"font-family:var(--mds-font-family-mono);font-size:12.5px;"
-                        "color:var(--ink2);overflow-wrap:anywhere\">" +
+                html += "<div class=\"mono\" "
+                        "style=\"color:var(--ink2);overflow-wrap:anywhere\">" +
                         html_escape(s) + "</div>";
             }
             html += "</div></div>";
