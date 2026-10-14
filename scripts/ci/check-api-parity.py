@@ -214,10 +214,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # Stored data panel (es-1): get.fragments-hardware-ci-stored-data is an "exception:" row (the
 # erase it fronts is DELETE /api/v1/sle/agents/{id}, which has no ledger row to compose), so
 # 201 -> 202, measured by the checker, not hand-picked.
-BASELINE_UNTWINNED = 202
-# Both of the two changes above landed on 199; merged together the count is 201
-# (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
-BASELINE_UNTWINNED = 201
+#
+# The DEX Alerts and policy-fragments changes above landed on 199 and merged together to 201
+# (199 + 1 + 1). The two containment rows above landed on that, so merged with them the count
+# is 203 (201 + 1 composed-of + 1 exception), the value the checker reports on the merged tree.
+BASELINE_UNTWINNED = 203
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
