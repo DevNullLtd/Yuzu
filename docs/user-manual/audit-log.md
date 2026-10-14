@@ -419,10 +419,13 @@ curl -s -b cookies.txt \
 **`total` is the number of rows returned in this response, not the number of
 rows that matched.** `start` echoes `offset` and `page_size` echoes `limit`; a
 page shorter than `limit` is the last page. Rows are ordered newest first and
-rows with an identical timestamp break by `id` (newest first), so `offset`
-paging neither repeats nor skips rows; use `id` to de-duplicate across pages.
-`offset` is capped at 10000 and never clamped (a larger value is a `400`). To
-read deeper, freeze a window with `since`/`until` and page inside it.
+rows with an identical timestamp break by `id` (newest first). On an unchanging
+result set `offset` paging neither repeats nor skips rows; the log is live, so a
+new event or a retention delete between page fetches shifts later pages. Pin the
+window with a fixed `until` in the past and use `id` to de-duplicate. `offset` is
+capped at 10000 and never clamped (a larger value is a `400`). To read deeper,
+set `until` to the oldest `timestamp` already seen (inclusive), restart at
+`offset=0`, and de-duplicate on `id`.
 
 **Example --- filter by principal and action:**
 
@@ -469,7 +472,7 @@ The legacy response envelope differs from v1:
 ```
 
 The legacy response includes additional fields per event not present in the v1
-response: `id`, `principal_role`, `source_ip`.
+response: `principal_role`, `source_ip` (`id` is on both).
 
 ```bash
 curl -s -b cookies.txt \

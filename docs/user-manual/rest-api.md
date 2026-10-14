@@ -3545,10 +3545,13 @@ Query audit events.
 not the number of rows that matched; `start` echoes `offset` and `page_size`
 echoes `limit`. A page shorter than `limit` is the last page. Rows are
 ordered newest first, and rows with an identical timestamp break by `id`
-(newest first), so `offset` paging neither repeats nor skips rows. Use `id`
-to de-duplicate across pages. `offset` is capped at 10000 and is never
-clamped: a larger value is a `400`. To read past that depth, narrow the
-window with `since`/`until` and page inside it.
+(newest first). On an unchanging result set `offset` paging neither repeats nor
+skips rows; the log is live, though, so a new event (or a retention delete)
+between two page fetches shifts later pages. Pin the window with a fixed
+`until` in the past and use `id` to de-duplicate across pages. `offset` is
+capped at 10000 and is never clamped: a larger value is a `400`. To read past
+that depth, set `until` to the oldest `timestamp` already seen (it is
+inclusive), restart at `offset=0`, and de-duplicate on `id`.
 
 Rows carry `id`, `timestamp`, `principal`, `action`, `result`, `target_type`,
 `target_id` and `detail`. `principal_role` and `source_ip` are returned only
@@ -10218,10 +10221,9 @@ Reject a pending instruction execution.
 Query audit events. Legacy route — **not** merely `GET /api/v1/audit` without
 the v1 envelope; the response shape and accepted parameters both genuinely
 differ. Accepts `principal`, `action`, `target_type`, `target_id`, `since`,
-`until`, `limit`, and `offset` (more than the v1 route's `limit`/`principal`/
-`action`). Response is `{"events": [...], "count": N, "total": <number-or-
+`until`, `limit`, and `offset` (the same filters as the v1 route). Response is `{"events": [...], "count": N, "total": <number-or-
 null>}` (field names `events`/`count`/`total`, not v1's `data`/`pagination`/
-`meta`), and each event row additionally carries `id`, `principal_role`, and
+`meta`), and each event row additionally carries `principal_role` and
 `source_ip`, which v1's row shape omits. `total` is a best-effort second read
 taken after the page itself succeeds — it is `null`, not `0` or the page
 size, when that second read degrades; do not treat `null` as "unknown but

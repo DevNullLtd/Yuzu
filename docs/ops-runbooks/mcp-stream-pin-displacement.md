@@ -99,12 +99,10 @@ Add `&principal=<name>` to scope to a candidate you already suspect. Each row's
 `target_id` is the reclaimed call's `execution_id` — empty specifically for an orphan
 (no surviving record to name), never for the ordinary case — and `detail` says whether it
 was a parked final or an orphan. There is no `session_id` field on this row; if you need a
-time window rather than a principal, the legacy `GET /api/audit` endpoint additionally
-takes `since`/`until` and `offset` (parameters `/api/v1/audit` does not have). **A response
-at exactly `limit` rows is not proof you have everything** — `/api/v1/audit` truncates
-silently, and its `total`/`page_size` fields describe what came back, not what matched
-([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)); scope further with `&principal=`,
-or fall back to the legacy endpoint. There, `since`/`until` alone only bounds the time
+time window rather than a principal, `GET /api/v1/audit` also takes `since`/`until`
+and `offset`. **A response at exactly `limit` rows is not proof you have everything** —
+its `total` describes the rows in the response, not what matched (`start`/`page_size`
+echo `offset`/`limit`); scope further with `&principal=`, or page with `offset`. There, `since`/`until` alone only bounds the time
 window — it does not by itself guarantee you retrieved everything inside that window if
 more rows matched than one call returns. The reliable recipe is both together: freeze a
 bounded window with `since`/`until` first, then page exhaustively through it with `offset`.
@@ -210,12 +208,10 @@ take, which happens in three states:
    `reason=post_pin_slots` for exactly this rejection — other reasons on the same action
    share the row shape but not the reason. `GET /api/v1/audit?action=mcp.session.reject&limit=1000`,
    filtering the `detail` field for `reason=post_pin_slots`; if you already have a candidate
-   session id, the legacy `GET /api/audit?action=mcp.session.reject&target_id=<8 chars>` narrows
-   directly (the `/api/v1/audit` route does not take `target_id`). **A response at exactly
-   `limit` rows is not proof you have everything** — `/api/v1/audit` truncates silently, and
-   its `total`/`page_size` fields describe what came back, not what matched
-   ([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)); if you hit the cap, the legacy
-   endpoint also takes `offset`, and `since`/`until` alone only bounds the time window — it
+   session id, `GET /api/v1/audit?action=mcp.session.reject&target_type=<type>&target_id=<8 chars>`
+   narrows directly (`target_id` requires `target_type`). **A response at exactly
+   `limit` rows is not proof you have everything** — `total` describes the rows in the
+   response, not what matched; if you hit the cap, page with `offset`, and `since`/`until` alone only bounds the time window — it
    does not guarantee completeness inside that window by itself. Freeze the window with
    `since`/`until` first, then page through it with `offset` if you need everything in it.
    A `503` from either endpoint is the deny-on-degrade behavior `YuzuAuditReadDegraded`

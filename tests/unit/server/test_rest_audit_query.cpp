@@ -84,6 +84,7 @@ struct QueryHarness {
             PGresult* up = PQexec(lease.get(), "UPDATE audit_store.audit_events "
                                                "SET principal = 'admin2' WHERE action = 'tie.a'");
             REQUIRE(PQresultStatus(up) == PGRES_COMMAND_OK);
+            REQUIRE(std::string(PQcmdTuples(up)) == "1");
             PQclear(up);
         }
         auto auth_fn = [](const httplib::Request&,
@@ -115,7 +116,7 @@ struct QueryHarness {
 
 } // namespace
 
-TEST_CASE("v1 audit: target_type/target_id narrow, rows carry id and no legacy-only fields",
+TEST_CASE("v1 audit: target filters narrow and rows carry id without legacy-only fields",
           "[pg][audit][rest]") {
     QueryHarness h;
     auto j = h.get("?target_type=Tag&target_id=t1");
@@ -137,7 +138,7 @@ TEST_CASE("v1 audit: since/until are inclusive", "[pg][audit][rest]") {
     CHECK(h.get("?since=0&until=0")["data"].size() == 6);
 }
 
-TEST_CASE("v1 audit: offset pages, pagination reports start/page_size, ties are stable",
+TEST_CASE("v1 audit: offset pages with real start and page_size and ties are stable",
           "[pg][audit][rest]") {
     QueryHarness h;
     std::set<int64_t> seen;
@@ -169,16 +170,16 @@ TEST_CASE("v1 audit: offset pages, pagination reports start/page_size, ties are 
     }
 }
 
-TEST_CASE("v1 audit: malformed filters are 400, never silently dropped", "[audit][rest]") {
+TEST_CASE("v1 audit: malformed filters are 400 and never silently dropped", "[audit][rest]") {
     QueryHarness h(/*populated=*/false); // validation precedes the store read
     for (const char* q : {"?since=abc", "?since=-1", "?until=1.5", "?since=2000&until=1000",
-                          "?offset=-1", "?offset=10001", "?offset=x", "?target_id=t1"}) {
+                          "?offset=-1", "?offset=10001", "?offset=x", "?target_id=t1", "?target_type=a%00b"}) {
         INFO(q);
         h.get(q, 400);
     }
 }
 
-TEST_CASE("v1 audit: offset=10000 is accepted by validation; degraded store is 503",
+TEST_CASE("v1 audit: offset 10000 passes validation and a degraded store is 503",
           "[audit][rest]") {
     QueryHarness h(/*populated=*/false);
     h.get("?offset=10000", 503); // passed validation, hit the closed store

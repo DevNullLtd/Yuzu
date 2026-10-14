@@ -1,1 +1,1 @@
-- **`GET /api/audit` bounds `limit` and `offset`.** `limit` is clamped to 1000 and an `offset` above 10000 returns `400`, matching the v1 and MCP audit reads. Previously an oversized `limit` asked the database for the whole table.
+- **Breaking - `GET /api/audit` bounds `limit` and `offset`.** `limit` is clamped to 1000 and an `offset` above 10000 returns `400`, matching the v1 and MCP audit reads. Previously an oversized `limit` asked the database for the whole table.
