@@ -43,6 +43,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -390,9 +391,8 @@ TEST_CASE("settings enrollment: bulk approve/deny with the store down are 503 + 
     CHECK(h.only("enrollment.bulk_deny").result == "failure");
 }
 
-// The table has no Expired state, so an Active pill is shown for a lapsed token too; it must
-// never wear the green OK colour (role-ok), which would assert health for a dead credential.
-// A lapsed token cannot be minted without a clock wait, so this pins the shared Active branch.
+// A token still in date is Active, and its pill must never wear the green OK colour (role-ok),
+// which would assert health for a credential an operator is meant to watch.
 TEST_CASE("settings enrollment: the Active token pill is not the green OK pill",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
@@ -553,4 +553,52 @@ TEST_CASE("settings auto-approve: an overlong numeric index is a denied no-op, n
     CHECK(row.target_id == huge);
     CHECK(h.auto_approve.list_rules().size() == 1);
     CHECK(h.auto_approve.list_rules()[0].enabled);
+}
+
+// A lapsed token cannot be minted without waiting out a TTL, so the store row's expiry is
+// pushed into the past the way test_auth.cpp does for the consume path. It must list Expired
+// (neutral pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
+// never expires stays Active.
+TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as Active",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    auto lapsed = h.auth_mgr.create_enrollment_token("lapsed-one", 0, std::chrono::hours(1), "admin");
+    REQUIRE(lapsed.has_value());
+    auto never = h.auth_mgr.create_enrollment_token("never-one", 0, std::chrono::seconds(0), "admin");
+    REQUIRE(never.has_value());
+    {
+        auto lease = h.auth_db->pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        auto upd = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE auth.enrollment_tokens SET expires_at = now() - interval '1 hour' "
+            "WHERE token_id = $1",
+            std::vector<std::string>{lapsed->token_id});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = h.sink.Get("/fragments/settings/tokens");
+    REQUIRE(res);
+    // The pill that follows a row's id cell.
+    const auto pill_of = [&](const std::string& id) {
+        const auto row = res->body.find("<code>" + id + "</code>");
+        REQUIRE(row != std::string::npos);
+        const auto pill = res->body.find("role-badge ", row);
+        REQUIRE(pill != std::string::npos);
+        return res->body.substr(pill, res->body.find("</span>", pill) - pill);
+    };
+    CHECK(pill_of(lapsed->token_id) == "role-badge role-user\">Expired");
+    CHECK(pill_of(never->token_id) == "role-badge role-admin\">Active");
+    CHECK(res->body.find("role-ok") == std::string::npos);
+}
+
+// The pure decision behind that pill, with the clock injected: no Postgres, no TTL wait.
+TEST_CASE("settings enrollment: enrollment_token_expired compares expiry with the injected now",
+          "[settings_routes][enrollment]") {
+    using clock = std::chrono::system_clock;
+    const auto now = clock::time_point{std::chrono::seconds(1'800'000'000)};
+    CHECK_FALSE(enrollment_token_expired((clock::time_point::max)(), now)); // never expires
+    CHECK(enrollment_token_expired(now - std::chrono::hours(1), now));
+    CHECK(enrollment_token_expired(now, now)); // the consume path needs expires_at > now()
+    CHECK_FALSE(enrollment_token_expired(now + std::chrono::seconds(1), now));
 }
