@@ -29,7 +29,7 @@
   ],
   "caveats": [
     "**No documented customer driver.** No documented customer driver for this plugin was found (as in `mgmt_posture`'s caveat); it exists to answer what this host exposes over SMB and NFS, which no other plugin reports. Pure capability-gap reasoning.",
-    "**Configured, not live; some Samba scope is not read.** Linux reports what the files say, not whether `nfsd` or `smbd` runs or what a client sees. The Samba registry backend, `include =` files and usershares are reported as `constrained` tokens, never as a wrong share list.",
+    "**Configured, not live; some Samba scope is not read.** Linux reports what the files say, not whether `nfsd` or `smbd` runs or what a client sees. The Samba registry backend, `include =` files and usershares are reported as `constrained` tokens, never as a wrong share list. `[global]` parameters written after a share section apply to it here but not in Samba.",
     "**Windows and macOS are planned.** The Windows `NetShareEnum` level-2 read, which will flag the administrative `STYPE_SPECIAL` shares (`ADMIN$`, `IPC$`, drive shares) as `special` rather than hide them, and the macOS share-point and `/etc/exports` read are not implemented; each leg reports one `unsupported` row, `windows:planned` or `macos:planned`.",
     "**Names and paths can identify people.** See the sensitivity bullet: a share name or path may contain an account name, so dispatch is gated at `Infrastructure:Read` (the stored result is readable by `Response:Read` holders, as for every plugin) and the definition says so."
   ],
@@ -133,7 +133,7 @@
           "values": null
         },
         {
-          "description": "share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, or an all-zero network), false when not, \"-\" when unknown. For SMB this reflects `guest ok` as written; whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). Not used by the other kinds.",
+          "description": "share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, or a network with an all-zero mask), false when not, \"-\" when unknown. For SMB this reflects `guest ok` as written; whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). Not used by the other kinds.",
           "example": "false",
           "name": "field_5",
           "platforms": [
@@ -166,7 +166,7 @@
       "definition_id": "crossplatform.network.shares"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, and the first row is always `status|list|<supported\\|constrained\\|permission_denied\\|unsupported>|<reason or ->`. A `source|<exports\\|exports_d\\|smb_conf>|<read\\|absent\\|refused\\|failed>|<share count or ->` row follows for every source the leg knows about (Linux three; the planned macOS and Windows legs answer the status row alone; `absent` is a state, not a failure). Each share is `share|<nfs\\|smb>|<name or ->|<path or ->|<ro\\|rw\\|mixed\\|->|<true\\|false\\|->|<flags or ->|<source>`: the name is the SMB share name and `-` for NFS (identified by path), `mixed` means clients, security flavours, or a Samba read/write list disagree with the share default, and the flags are a closed set: `hidden`, `unavailable` (Samba `available = no`), `special` (Samba `[homes]`, `[printers]`, `[print$]`), `no_root_squash` (root is not squashed: no `root_squash` or `all_squash` in effect) and `clients_<n>`. Every free field is scrubbed of NUL and invalid UTF-8 and pipe-escaped.",
+  "outputs_note": "Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, and the first row is always `status|list|<supported\\|constrained\\|permission_denied\\|unsupported>|<reason or ->`. A `source|<exports\\|exports_d\\|smb_conf>|<read\\|absent\\|refused\\|failed>|<share count or ->` row follows for every source the leg knows about (Linux three; the macOS and Windows placeholders answer the status row alone; `absent` is a state, not a failure). Each share is `share|<nfs\\|smb>|<name or ->|<path or ->|<ro\\|rw\\|mixed\\|->|<true\\|false\\|->|<flags or ->|<source>`: the name is the SMB share name and `-` for NFS (identified by path), `mixed` means clients, security flavours, or a Samba read/write list disagree with the share default, and the flags are a closed set: `hidden`, `unavailable` (Samba `available = no`), `special` (Samba `[homes]`, `[printers]`, `[print$]`), `no_root_squash` (root is not squashed: no `root_squash` or `all_squash` in effect) and `clients_<n>`. Every free field is scrubbed of NUL and invalid UTF-8 and pipe-escaped.",
   "platforms": {
     "linux": "supported",
     "macos": "planned",
@@ -213,13 +213,13 @@
       "completeness": "partial",
       "provenance": "`linux:shares:exports_d:too_many`",
       "status": "`CONSTRAINED`",
-      "when": "Linux: more than 64 `exports.d` snippets or 4096 directory entries; the source row stays `read` with the count of snippets read and the excess is cut"
+      "when": "Linux: more than 64 `exports.d` snippets or 4096 directory entries; the source row stays `read` with the count of shares read, and the excess snippets are cut"
     },
     {
       "completeness": "partial",
       "provenance": "`linux:shares:smb_conf:registry_backend`, `linux:shares:smb_conf:include_unresolved`, `linux:shares:smb_conf:copy_unresolved`, `linux:shares:smb_conf:usershares_not_read`",
       "status": "`CONSTRAINED`",
-      "when": "Linux: the Samba shares are incomplete by design: a registry backend (`config backend = registry`, `registry shares = yes`), a live `include =` or `config file =`, a `copy =` target that is missing, cyclic, over 255 bytes, deeper than 8, defined after the copying share or re-opened after it (Samba snapshots a copy target where the directive stands), or usershares (configured, or the default usershares directory exists and `usershare max shares` is not `0`). A stock Debian host has a compiled-in usershare default the file does not show, so with `usershare max shares` unset and the directory present it lands here, because usershares may be in use and are not listed; `usershare max shares = 0` states they are off and gives `OK`, whatever `usershare path` says"
+      "when": "Linux: the Samba shares are incomplete by design: a registry backend (`config backend = registry`, `registry shares = yes`), a live `include =` or `config file =`, a `copy =` target that is missing, names `[global]`, is cyclic, over 255 bytes, deeper than 8, defined after the copying share or re-opened after it (Samba snapshots a copy target where the directive stands; any `copy` line counts, not only the last, and a flagged copying share is still listed, with inherited values that may differ from what Samba applies), or usershares (configured, or the default usershares directory exists and `usershare max shares` is not `0`). A stock Debian host has a compiled-in usershare default the file does not show, so with `usershare max shares` unset and the directory present it lands here, because usershares may be in use and are not listed; `usershare max shares = 0` states they are off and gives `OK`, whatever `usershare path` says"
     },
     {
       "completeness": "partial",

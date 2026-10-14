@@ -13,7 +13,8 @@
  * `anonymous` flag). A refused or failed read is reported as permission_denied/constrained
  * with a token, never as an empty result.
  *
- * This TU is portable except for its single dispatch #if (the mgmt_posture shape). All
+ * This TU is portable except for its single dispatch #if, which selects the platform's leg
+ * function and exception token (`kLeg`, `kLegExceptionToken`) and ends in an #error. All
  * three descriptor legs are declared unconditionally so the capability-matrix generator
  * sees a stable shape on every host.
  */

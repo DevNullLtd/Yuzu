@@ -27,6 +27,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::shares {
@@ -147,29 +148,34 @@ inline std::size_t flags_bytes(const std::vector<std::string>& f) {
     return n;
 }
 
-/// All-zero IPv4 in the inet_aton short forms nfs-utils accepts: 1-4 dot-separated
-/// non-empty groups, each only `0` digits (`0`, `0.0`, `0.0.0.0`).
-inline bool is_zero_v4(std::string_view a) {
+/// IPv4 literal in the inet_aton short forms nfs-utils accepts: 1-4 dot-separated non-empty
+/// groups of digits; `zero_only` further requires every group to be all `0` (`0`, `0.0`,
+/// `0.0.0.0`), the shape of an all-zero mask.
+inline bool is_v4(std::string_view a, bool zero_only) {
     if (a.empty())
         return false;
     const auto groups = split(a, '.');
-    return groups.size() <= 4 && std::ranges::all_of(groups, [](std::string_view g) {
-               return !g.empty() && g.find_first_not_of('0') == std::string_view::npos;
+    return groups.size() <= 4 && std::ranges::all_of(groups, [zero_only](std::string_view g) {
+               return !g.empty() && (zero_only ? g.find_first_not_of('0') == std::string_view::npos
+                                               : std::ranges::all_of(g, [](unsigned char c) {
+                                                     return std::isdigit(c) != 0;
+                                                 }));
            });
 }
 
-/// All-zero IPv6: at most one `::`, every non-empty colon group 1-4 `0`s, exactly 8 groups
-/// without `::` and at most 7 with it (`::`, `0::`, `0:0:0:0:0:0:0:0`); no stray single colon.
-inline bool is_zero_v6(std::string_view a) {
+/// IPv6 literal shape: every non-empty colon group 1-4 hex digits, exactly 8 groups without
+/// `::` and at most 7 with it (`::`, `0::`, `1::`, `::1`, `0:0:0:0:0:0:0:0`); no stray single
+/// colon. A second `::` leaves an empty group in the tail and fails the group check. The
+/// dotted-tail form (`::ffff:0.0.0.0`) is not a hex group and is not recognised.
+inline bool is_v6(std::string_view a) {
     const auto dc = a.find("::");
-    if (dc != std::string_view::npos && a.find("::", dc + 1) != std::string_view::npos)
-        return false; // a second `::` (also `:::`)
     std::size_t n = 0;
     const auto count = [&n](std::string_view part) {
         if (part.empty())
             return true;
         for (const auto g : split(part, ':')) {
-            if (g.empty() || g.size() > 4 || g.find_first_not_of('0') != std::string_view::npos)
+            if (g.empty() || g.size() > 4 ||
+                !std::ranges::all_of(g, [](unsigned char c) { return std::isxdigit(c) != 0; }))
                 return false;
             ++n;
         }
@@ -180,10 +186,14 @@ inline bool is_zero_v6(std::string_view a) {
     return count(a.substr(0, dc)) && count(a.substr(dc + 2)) && n <= 7;
 }
 
-/// A client spec that admits everyone: empty, made only of `*`/`?`, or an all-zero address
-/// (IPv4 or IPv6) with a `/0` prefix or an all-zero dotted mask (`0.0.0.0/0`, `::/0`, `0/0`,
-/// `0.0.0.0/0.0.0.0`). A bare zero address is one host, not the world, and a malformed
-/// zero-looking string (`::::/0`, `0.../0`, `:/0`) is no address nfs-utils can resolve.
+/// A client spec that admits everyone: empty, made only of `*`/`?`, or an IPv4/IPv6 literal
+/// with a `/0` prefix or an all-zero dotted mask (`0.0.0.0/0`, `::/0`, `0/0`, `10.1.2.3/0`,
+/// `1.2.3.4/0.0.0.0`). The mask decides, not the address: nfs-utils tests
+/// `((a ^ b) & mask) == 0` for a dotted mask, so any literal with mask 0.0.0.0 matches every
+/// client, whereas a `/0` PREFIX shifts by the full width (undefined; x86-64/aarch64 mask the
+/// count to 0 and give an all-ones mask), so `/0` is world only by the conservative reading.
+/// A bare zero address is one host, not the world, and a malformed address (`::::/0`,
+/// `0.../0`, `:/0`, `host/0`) is none nfs-utils can resolve.
 inline bool is_world_client(std::string_view c) {
     if (c.empty() || c.find_first_not_of("*?") == std::string_view::npos)
         return true;
@@ -191,7 +201,7 @@ inline bool is_world_client(std::string_view c) {
     if (slash == std::string_view::npos)
         return false;
     const auto addr = c.substr(0, slash);
-    return (is_zero_v4(addr) || is_zero_v6(addr)) && is_zero_v4(c.substr(slash + 1));
+    return (is_v4(addr, false) || is_v6(addr)) && is_v4(c.substr(slash + 1), true);
 }
 
 /// Calls fn(logical_line) for each logical line: CR stripped, backslash-newline joined.
@@ -231,6 +241,7 @@ void for_each_logical_line(std::string_view text, Fn&& fn) {
 struct Tok {
     std::string text;
     bool quoted = false;
+    bool unterminated = false; ///< an opening `"` with no closing one before end of line
 };
 
 inline void skip_ws(std::string_view s, std::size_t& i) {
@@ -240,7 +251,8 @@ inline void skip_ws(std::string_view s, std::size_t& i) {
 
 /// One whitespace-delimited token (or one `"`-quoted string; exports(5) knows no other quote).
 /// The only escape is `\NNN` (octal byte), as nfs-utils' xgettok decodes; any other backslash
-/// stays literal. An unterminated quote runs to end of line.
+/// stays literal. An unterminated quote marks the token `unterminated`; the caller skips the
+/// line (nfsd never exports it either: xgettok runs the quote past the newline).
 inline Tok next_token(std::string_view s, std::size_t& i) {
     Tok t;
     const char q = s[i] == '"' ? '"' : '\0';
@@ -265,8 +277,12 @@ inline Tok next_token(std::string_view s, std::size_t& i) {
         t.text += c;
         ++i;
     }
-    if (q != '\0' && i < s.size())
-        ++i; // closing quote
+    if (q != '\0') {
+        if (i < s.size())
+            ++i; // closing quote
+        else
+            t.unterminated = true;
+    }
     return t;
 }
 
@@ -400,15 +416,20 @@ inline void parse_exports(std::string_view text, std::string_view source,
             return true;
         const auto path = detail::next_token(line, i);
         // nfsd export points are absolute: a pathless or option-first line is skipped.
-        if (path.text.empty() || path.text[0] != '/')
+        if (path.unterminated || path.text.empty() || path.text[0] != '/')
             return true;
         detail::ExportDefaults defaults;
         std::vector<detail::SpecResult> specs;
+        bool bad = false;
         for (;;) {
             detail::skip_ws(line, i);
             if (i >= line.size() || line[i] == '#')
                 break;
             const auto t = detail::next_token(line, i);
+            if (t.unterminated) {
+                bad = true;
+                break;
+            }
             if (t.text.empty())
                 continue;
             if (!t.quoted && t.text[0] == '-')
@@ -416,6 +437,8 @@ inline void parse_exports(std::string_view text, std::string_view source,
             else
                 specs.push_back(detail::parse_spec(t.text, defaults));
         }
+        if (bad)
+            return true; // an unterminated quote: skip the whole line, emit nothing
         bool nrs = specs.empty() && defaults.root_exposed();
         bool anon = specs.empty();
         Access access = specs.empty() ? defaults.access : Access::unknown;
@@ -442,8 +465,9 @@ struct SmbConf {
     bool include_present = false;       ///< any live `include =` or a global `config file =`
     bool usershares_configured = false; ///< global `usershare max shares` > 0 or `usershare path`
     bool usershares_off = false;        ///< global `usershare max shares` present and all zero
-    /// a `copy =` target missing, cyclic, too long, too deep, defined after the copying share or
-    /// re-opened after it (Samba snapshots the target where the directive stands)
+    /// any `copy =` line (not only the last) whose target is missing, `global`, cyclic, too long,
+    /// too deep, defined after the copying share or re-opened after it (Samba snapshots the
+    /// target where the directive stands and refuses a config whose copy source is not found)
     bool copy_unresolved = false;
     bool truncated = false;
     bool field_oversized = false;
@@ -496,11 +520,15 @@ inline const std::string* find_kv(const KvMap& sec, const std::string& key) {
 /// Samba section names are case-insensitive and a re-opened section merges with last
 /// assignment winning. Rewrites every `[Header]` to its lowercase form so parse_ini merges
 /// all case variants into one map in source order, records the FIRST spelling of each
-/// (what Samba keeps as the service name) in `display`, and appends every header occurrence's
-/// lower-cased name, reopenings included, to `occurrences` in source order.
+/// (what Samba keeps as the service name) in `display`, appends every header occurrence's
+/// lower-cased name, reopenings included, to `occurrences` in source order, and records EVERY
+/// `copy =` line of a non-global section as (section, value) in `copies` (the INI map keeps
+/// only the last one, but Samba refuses the file over any unresolvable copy line).
 inline std::string fold_section_headers(const std::string& text,
                                         std::map<std::string, std::string>& display,
-                                        std::vector<std::string>& occurrences) {
+                                        std::vector<std::string>& occurrences,
+                                        std::vector<std::pair<std::string, std::string>>& copies) {
+    std::string cur; // current section, lower-cased; empty before the first header or after a bad one
     std::string out;
     out.reserve(text.size());
     std::size_t pos = 0;
@@ -516,8 +544,22 @@ inline std::string fold_section_headers(const std::string& text,
             const auto l = lower(name);
             display.emplace(l, name);
             occurrences.push_back(l);
+            cur = l;
             out += '[' + l + "]\n";
         } else {
+            if (line.empty() || line.front() == '#' || line.front() == ';') {
+                // blank or comment: parse_ini skips it too
+            } else if (line.front() == '[') {
+                cur.clear(); // malformed header: parse_ini ignores its keys
+            } else if (!cur.empty() && cur != "global") {
+                if (const auto eq = line.find('='); eq != std::string::npos) {
+                    std::string key{yuzu::shared::ini_trim(std::string_view(line).substr(0, eq))};
+                    std::string value;
+                    smb_canon(key, value);
+                    if (key == "copy")
+                        copies.emplace_back(cur, yuzu::shared::ini_trim(std::string_view(line).substr(eq + 1)));
+                }
+            }
             out += line;
             out += '\n';
         }
@@ -529,7 +571,8 @@ inline std::string fold_section_headers(const std::string& text,
 
 /// Parses smb.conf into shares. Lookup chain per parameter: own section, then the `copy =`
 /// target chain (depth <= 8, cycle-safe; unresolved sets copy_unresolved, as does a target
-/// defined after, or re-opened after, the copying share), then [global],
+/// defined after, or re-opened after, the copying share, or `copy = global`; every `copy =`
+/// line is checked, not only the last one), then [global],
 /// then Samba's built-in default (read only = yes, guest ok = no, browseable = yes,
 /// available = yes). Lines before the first `[header]` belong to [global], as in Samba.
 /// Registry backend, `include =` / `config file =` and usershares are DETECTED, never read.
@@ -539,9 +582,10 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
     SmbConf out;
     std::map<std::string, std::string> display; // lowercase section name -> first spelling
     std::vector<std::string> occurrences;       // every header, lower-cased, in source order
+    std::vector<std::pair<std::string, std::string>> copies; // every (section, `copy =` value)
     const auto doc = yuzu::shared::parse_ini(
         "[global]\n" +
-            detail::fold_section_headers(detail::join_continuations(text), display, occurrences),
+            detail::fold_section_headers(detail::join_continuations(text), display, occurrences, copies),
         &detail::smb_canon);
     const auto& global = doc.sections.at("global"); // always present: see the prefix above
 
@@ -580,20 +624,17 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
         first_at.emplace(occurrences[i], i);
         last_at[occurrences[i]] = i;
     }
-    for (const auto& l : doc.section_order) {
-        if (l == "global" || l.empty())
-            continue;
-        const auto* cp = detail::find_kv(doc.sections.at(l), "copy");
-        if (cp == nullptr)
-            continue;
-        if (cp->size() > kMaxCopyTargetBytes) { // not a section name: no lower-casing
+    for (const auto& [l, cp] : copies) {
+        if (cp.size() > kMaxCopyTargetBytes) { // not a section name: no lower-casing
             out.copy_unresolved = true;
             continue;
         }
-        const auto t = detail::lower(*cp);
+        const auto t = detail::lower(cp);
         const auto at = last_at.find(t);
-        // `at` is absent for [global], which has no header of its own before its first use.
-        if (t == l || !doc.sections.contains(t) || (at != last_at.end() && at->second > first_at.at(l)))
+        // Samba has no service named `global` to copy from. `at` is absent for [global] when it
+        // has no header of its own, hence the explicit test.
+        if (t == "global" || t == l || !doc.sections.contains(t) ||
+            (at != last_at.end() && at->second > first_at.at(l)))
             out.copy_unresolved = true;
     }
     const auto lookup = [&](const std::string& own_lower, const std::string& key) -> const std::string* {

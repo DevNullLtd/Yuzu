@@ -463,7 +463,10 @@ TEST_CASE("shares exports: an oversized path is cut and flagged", "[shares]") {
 TEST_CASE("shares exports: every world-equivalent client reads anonymous", "[shares]") {
     // One row per spelling; each is a client that admits everyone.
     for (const char* spec : {"*(rw)", "(rw)", "?*(rw)", "**(rw)", "0.0.0.0/0(rw)", "::/0(rw)", "0/0(rw)",
-                             "0.0.0.0/0.0.0.0(rw)", "0:0:0:0:0:0:0:0/0(rw)"}) {
+                             "0.0.0.0/0.0.0.0(rw)", "0:0:0:0:0:0:0:0/0(rw)",
+                             // the mask decides, not the address (nfs-utils: ((a ^ b) & mask) == 0)
+                             "10.1.2.3/0(rw)", "1.2.3.4/0.0.0.0(rw)", "::1/0(rw)", "0::/0(rw)",
+                             "0:0:0::0/0(rw)", "1::/0(rw)"}) {
         const auto p = lin(std::string("/srv/w ") + spec + "\n");
         REQUIRE(p.shares.size() == 1);
         INFO(spec);
@@ -476,7 +479,8 @@ TEST_CASE("shares exports: every world-equivalent client reads anonymous", "[sha
     for (const char* spec : {"10.0.0.0/8(rw)", "0.0.0.0(rw)", "0.0.0.0/8(rw)", "*.corp(rw)", "?x(rw)",
                              "@trusted(rw)", "gss/krb5i(rw)", "::::/0(rw)", "0.../0(rw)", ":/0(rw)",
                              "0.:/0(rw)", "0.0.0.0.0/0(rw)", "0::0::0/0(rw)", "0:0:0:0:0:0:0:0:0/0(rw)",
-                             "0.0.0.0/..(rw)", "0.0.0.0/(rw)"}) {
+                             "0.0.0.0/..(rw)", "0.0.0.0/(rw)", "0:0:0:0:0:0:0/0(rw)", "0:0:0:0::0:0:0:0/0(rw)",
+                             "00000::/0(rw)", "host/0(rw)", "1.2.3.4/0.0.0.1(rw)"}) {
         const auto p = lin(std::string("/srv/w ") + spec + "\n");
         REQUIRE(p.shares.size() == 1);
         INFO(spec);
@@ -516,6 +520,22 @@ TEST_CASE("shares exports: only a double quote quotes and only octal escapes dec
     CHECK(p.shares[0].path == "/srv/my dir");
     CHECK(p.shares[1].path == "/srv/a\\"); // `\ ` is no escape: the blank ends the token
     CHECK(p.shares[2].path == "/srv/q\\");  // `\"` closes the quote: the backslash stays literal
+    // An octal escape that ends the line exactly (the `i + 3 < size` boundary).
+    const auto e = lin("/srv/x\\040\n");
+    REQUIRE(e.shares.size() == 1);
+    CHECK(e.shares[0].path == "/srv/x ");
+}
+
+TEST_CASE("shares exports: an unterminated quote skips the line, never leaks clients into the path",
+          "[shares]") {
+    // nfsd's xgettok runs an open quote past the newline, so it never exports such a line.
+    const auto p = lin("\"/srv/a 10.0.0.5(rw) 192.168.1.7(ro)\n/srv/ok host(ro)\n");
+    REQUIRE(p.shares.size() == 1);
+    CHECK(p.shares[0].path == "/srv/ok");
+    // A later token left open skips the whole line too, not just that token.
+    const auto q = lin("/srv/b host(rw) \"oops\n/srv/ok2 host\n");
+    REQUIRE(q.shares.size() == 1);
+    CHECK(q.shares[0].path == "/srv/ok2");
 }
 
 TEST_CASE("shares exports: a quoted non-absolute path is skipped like an unquoted one", "[shares]") {
@@ -665,6 +685,30 @@ TEST_CASE("shares smb.conf: a copy target Samba has not loaded at the directive 
     CHECK_FALSE(smb("[tpl]\npath=/t\n[x]\ncopy = TPL\n[y]\ncopy = x\n").copy_unresolved);
     CHECK_FALSE(smb("[tpl]\npath=/t\n[tpl]\nguest ok = yes\n[x]\ncopy = tpl\n").copy_unresolved);
     CHECK(smb("[x]\ncopy = x\npath=/x\n").copy_unresolved);
+
+    // Every copy line counts, not only the last: Samba refuses the file at the first bad one.
+    CHECK(smb("[b]\n[a]\ncopy = C\ncopy = b\n").copy_unresolved);
+    // `global` is no service to copy from, even with no [global] header after it.
+    CHECK(smb("[a]\ncopy = global\n").copy_unresolved);
+    // All seven keys local: only the eager pass can see the bad directive.
+    const std::string local = "path=/a\nread only = no\nwrite list = x\nread list = y\n"
+                              "guest ok = no\nbrowseable = yes\navailable = yes\n";
+    CHECK(smb("[a]\ncopy = global\n" + local).copy_unresolved);
+    CHECK(smb("[a]\ncopy = a\n" + local).copy_unresolved);
+    // Keys after a malformed header are ignored, as parse_ini does, so its copy is not recorded.
+    CHECK_FALSE(smb("[a]\npath=/a\n[broken\ncopy = nowhere\n").copy_unresolved);
+}
+
+TEST_CASE("shares smb.conf: the copy target length limit is 255 bytes exactly", "[shares]") {
+    const std::string n255(255, 'x');
+    const std::string n256(256, 'x');
+    const auto ok = smb("[" + n255 + "]\nguest ok = yes\npath=/t\n[a]\ncopy = " + n255 + "\n");
+    CHECK_FALSE(ok.copy_unresolved);
+    CHECK(by_name(ok, "a").anonymous == true); // inherited through the 255-byte target
+    // 256: both the eager pass and the lookup refuse it without lower-casing, so nothing inherits.
+    const auto bad = smb("[" + n256 + "]\nguest ok = yes\npath=/t\n[a]\ncopy = " + n256 + "\n");
+    CHECK(bad.copy_unresolved);
+    CHECK(by_name(bad, "a").anonymous == false);
 }
 
 TEST_CASE("shares smb.conf: Samba's built-in read only = yes applies when nothing sets it",
@@ -757,6 +801,7 @@ TEST_CASE("shares smb.conf: registry backend, include and usershares are detecte
     CHECK(smb("[global]\nusershare max shares = 000\n").usershares_off);
     CHECK_FALSE(smb("[global]\nusershare max shares = many\n").usershares_off); // not a number
     CHECK_FALSE(smb("[a]\npath=/a\n").usershares_off); // unset is not off
+    CHECK_FALSE(smb("[global]\nusershare max shares =\n").usershares_off); // empty is not zero
     const auto p = smb("[global]\nusershare path = /var/lib/samba/us\n");
     CHECK(p.usershares_configured);
     // An explicit all-zero max wins over a set path: usershares are definitively off.

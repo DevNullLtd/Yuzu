@@ -60,6 +60,8 @@ class SharesDefinitionContract(unittest.TestCase):
         self.assertEqual(spec["permissions"]["executeRoles"], ["endpoint-admin", "endpoint-operator"])
         self.assertEqual(spec["compatibility"]["requiredPlugins"], ["shares"])
         self.assertEqual(spec["parameters"]["properties"], {})
+        self.assertEqual(spec["type"], "question")  # read-only: the catalogue gate relies on it
+        self.assertEqual(doc["status"]["phase"], "active")
 
 
 if __name__ == "__main__":

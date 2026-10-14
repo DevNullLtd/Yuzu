@@ -88,7 +88,7 @@ spec:
         platforms: [linux]
       - name: field_5
         type: string
-        description: 'share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, or an all-zero network), false when not, "-" when unknown. For SMB this reflects `guest ok` as written; whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). Not used by the other kinds.'
+        description: 'share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, or a network with an all-zero mask), false when not, "-" when unknown. For SMB this reflects `guest ok` as written; whether a client can actually connect as guest also depends on global authentication settings (`map to guest`, `security`). Not used by the other kinds.'
         example: 'false'
         platforms: [linux]
       - name: field_6
