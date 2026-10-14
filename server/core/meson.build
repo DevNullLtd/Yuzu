@@ -470,6 +470,8 @@ yuzu_server_core_lib = static_library(
     'src/execution_model.cpp',
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
+    'src/home_panels_render.cpp',
+    'src/home_panels_routes.cpp',
     'src/leader_elector.cpp',
     'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
