@@ -290,7 +290,7 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
             res.set_content("auth required", "text/plain");
             return;
         }
-        res.set_content(page_shell("Yuzu \xE2\x80\x94 Pre-flight", "/fragments/auto"),
+        res.set_content(page_shell("Yuzu \xE2\x80\x94 Deployments", "/fragments/auto"),
                         "text/html; charset=utf-8");
     });
 

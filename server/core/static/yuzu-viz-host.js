@@ -109,6 +109,70 @@ function buildElements(machine) {
 
 let _cy = null;
 
+// Cytoscape cannot read CSS variables, so resolve the slate tokens
+// (yuzu.css) at render time and hand it the values.
+function graphStyle() {
+  const css = getComputedStyle(document.documentElement);
+  const tok = (name) => css.getPropertyValue(name).trim();
+  // Cytoscape's font-family grammar rejects single quotes; the token uses them.
+  const mono = tok("--mds-font-family-mono").replace(/'/g, '"');
+  return [
+    {
+      selector: "node",
+      style: {
+        label: "data(label)",
+        "font-family": mono,
+      },
+    },
+    {
+      selector: 'node[kind = "process"]',
+      style: {
+        "background-color": tok("--c1"),
+        width: 32,
+        height: 32,
+        color: tok("--ink2"),
+        "font-size": 11,
+        "text-valign": "top",
+        "text-margin-y": -6,
+        "text-background-color": tok("--surface"),
+        "text-background-opacity": 1,
+        "text-background-padding": 3,
+        "text-background-shape": "roundrectangle",
+      },
+    },
+    {
+      selector: 'node[kind = "socket"]',
+      style: {
+        "background-color": tok("--c3"),
+        shape: "round-rectangle",
+        width: "label",
+        height: 18,
+        padding: 6,
+        color: tok("--bg"),
+        "font-size": 9.5,
+        "font-weight": 500,
+        "text-valign": "center",
+      },
+    },
+    {
+      selector: "node:selected",
+      style: {
+        "border-width": 2,
+        "border-style": "dashed",
+        "border-color": tok("--primary-h"),
+      },
+    },
+    {
+      selector: 'edge[kind = "owns"]',
+      style: { "line-color": tok("--faint"), "line-style": "dashed", width: 1 },
+    },
+    {
+      selector: 'edge[kind = "connection"]',
+      style: { "line-color": tok("--c2"), width: 2 },
+    },
+  ];
+}
+
 function renderGraph(machine) {
   const container = document.getElementById("ipc-graph");
   if (!container) return null;
@@ -117,12 +181,7 @@ function renderGraph(machine) {
     container,
     elements: buildElements(machine),
     layout: { name: "cose", animate: false },
-    style: [
-      { selector: 'node[kind = "process"]', style: { "background-color": "#58a6ff", label: "data(label)" } },
-      { selector: 'node[kind = "socket"]', style: { "background-color": "#fff2cc", shape: "round-rectangle", label: "data(label)" } },
-      { selector: 'edge[kind = "owns"]', style: { "line-color": "#888", "line-style": "dashed" } },
-      { selector: 'edge[kind = "connection"]', style: { "line-color": "#7ec4f8", width: 2 } },
-    ],
+    style: graphStyle(),
   });
 
   // Slice 4: tap a process node → broadcast the pid so the TAR tree
@@ -144,8 +203,7 @@ function updateStaleBanner(topo) {
   if (!banner) {
     banner = document.createElement("div");
     banner.id = "stale-banner";
-    banner.style.cssText =
-      "padding:8px 12px;background:#d29922;color:#000;font-size:13px;display:none;";
+    banner.className = "vh-stale";
     const root = document.getElementById("viz-host-root");
     if (root && root.firstChild) root.insertBefore(banner, root.firstChild);
   }
@@ -168,7 +226,10 @@ function showError(err) {
         : err && err.status === 503
           ? "The viz endpoint is disabled by the operator."
           : `Could not load topology: ${err && err.message ? err.message : err}`;
-  container.textContent = msg;
+  const note = document.createElement("div");
+  note.className = "vh-error";
+  note.textContent = msg;
+  container.replaceChildren(note);
 }
 
 async function refresh() {
