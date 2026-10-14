@@ -18,7 +18,6 @@
 /// per-request logic, so a null registry now 503s even a request that would
 /// not have touched the registry (e.g. an empty `?q=`).
 ///
-/// Routes (35) — gate in parens, `-` = no gate:
 /// Routes — gate in parens, `-` = no gate:
 ///   GET /static/yuzu.css                    -
 ///   GET /static/icons.svg                   -
@@ -106,7 +105,6 @@ struct Deps {
     const yuzu::server::detail::AgentRegistry* registry{nullptr};
 };
 
-/// Register all 35 page-shell / static-asset routes against `sink`.
 /// Register all the page-shell / static-asset routes against `sink`.
 void register_page_routes(HttpRouteSink& sink, Deps deps);
 
