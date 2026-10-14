@@ -138,6 +138,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/static/yuzu-dialog.js", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuDialogJs, "application/javascript; charset=utf-8");
+    });
     // Operate O1: the Executions / Approvals page controller. It is coupled to the fragment
     // markup the same release serves, so it is never cached (a 24 h cache would skew a page
     // against its fragment after an upgrade).
