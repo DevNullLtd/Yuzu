@@ -66,10 +66,16 @@ TEST_CASE("operate pages: no inline handlers and no hx-on and htmx eval disabled
         CHECK(has(p.html, "<meta name=\"htmx-config\" content='{\"allowEval\":false}'>"));
         CHECK(count_of(p.html, "src=\"/static/yuzu-operate.js\"") == 1);
         // The dialog module loads first (deferred scripts run in order); toasts are polite.
+        // Workflows is read-only (no dialog, no toasts), so it pays for neither.
         const auto dlg = p.html.find("src=\"/static/yuzu-dialog.js\" defer");
-        REQUIRE(dlg != std::string::npos);
-        CHECK(dlg < p.html.find("src=\"/static/yuzu-operate.js\""));
-        CHECK(count_of(p.html, "id=\"toasts\" aria-live=\"polite\"") == 1);
+        if (std::string_view(p.name) == "workflows") {
+            CHECK(dlg == std::string::npos);
+            CHECK(count_of(p.html, "id=\"toasts\"") == 0);
+        } else {
+            REQUIRE(dlg != std::string::npos);
+            CHECK(dlg < p.html.find("src=\"/static/yuzu-operate.js\""));
+            CHECK(count_of(p.html, "id=\"toasts\" aria-live=\"polite\"") == 1);
+        }
         // Sign out is hx-post, so the page must load htmx for the shell.
         CHECK(has(p.html, "src=\"/static/htmx.js\""));
         CHECK(count_of(p.html, "<!--yuzu:shell-->") == 1);
