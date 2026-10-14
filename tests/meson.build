@@ -2954,6 +2954,15 @@ test('compose wizard certs',
   timeout: 60,
 )
 
+# Shell notifications bell: runs kBellScript (cut from server/core/src/app_shell.cpp) under
+# node against a fake DOM/clock/fetch; skips (77) when node is absent.
+test('shell bell script behaviour',
+  _python3_test,
+  args: [files('test_bell_script_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
+)
+
 # README Docker Compose quickstart (#5419): the compose the README downloads must
 # pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
 # and take the headless admin seed at the image's --config path. Stdlib only;
