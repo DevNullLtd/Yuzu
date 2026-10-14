@@ -69,8 +69,9 @@ TEST_CASE("dialog module: request maps both error shapes and the step-up contrac
     CHECK(has(js, "location.assign('/login')"));
     // A network failure or timeout never throws and never claims nothing changed.
     CHECK(has(js, "The request may not have applied."));
-    // Secrets are cleared on error and on close.
+    // Secrets are cleared on error and on close, and a password field is not spell-checked.
     CHECK(has(js, "cleaners.push(function () { input.value = ''; });"));
+    CHECK(has(js, "if (spec.type === 'password') input.setAttribute('spellcheck', 'false');"));
 }
 
 TEST_CASE("dialog module: the CSS block is tokens-only and styles the module's own slots",
