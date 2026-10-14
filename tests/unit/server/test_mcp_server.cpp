@@ -20412,6 +20412,54 @@ yuzu::server::DeploymentRow mcp_dep(const std::string& id, const std::string& ru
 
 } // namespace
 
+TEST_CASE("MCP list_deployments / get_deployment: the A5 schemas are bounded and typed",
+          "[mcp][operator_surface]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    const nlohmann::json* list = nullptr;
+    const nlohmann::json* get = nullptr;
+    for (const auto& t : tools) {
+        if (t["name"] == "list_deployments")
+            list = &t;
+        else if (t["name"] == "get_deployment")
+            get = &t;
+    }
+    REQUIRE(list != nullptr);
+    REQUIRE(get != nullptr);
+
+    // Input: the id is bounded (ids are 16 hex characters, so 64 is generous).
+    const auto& id = (*get)["inputSchema"]["properties"]["deployment_id"];
+    CHECK(id["type"] == "string");
+    CHECK(id["minLength"] == 1);
+    CHECK(id["maxLength"] == 64);
+
+    // Output: typed, not {"data":{"type":"object"}}. Every field is declared and required.
+    const auto& data = (*get)["outputSchema"]["properties"]["data"];
+    REQUIRE(data.contains("properties"));
+    for (const char* f : {"deployment_id", "source_run_id", "name", "status", "state", "total",
+                          "succeeded", "failed", "skipped", "active", "devices", "device_limit",
+                          "truncated"}) {
+        INFO("get_deployment field: " << f);
+        CHECK(data["properties"].contains(f));
+        CHECK(std::find(data["required"].begin(), data["required"].end(), f) !=
+              data["required"].end());
+    }
+    CHECK(data["properties"]["devices"]["type"] == "array");
+    CHECK(data["properties"]["devices"]["items"]["properties"].contains("agent_id"));
+    CHECK(data["properties"]["devices"]["items"]["properties"].contains("step"));
+    CHECK(data["properties"]["truncated"]["type"] == "boolean");
+
+    // The list result says whether it is the whole list.
+    const auto& lo = (*list)["outputSchema"];
+    CHECK(lo["properties"]["truncated"]["type"] == "boolean");
+    CHECK(std::find(lo["required"].begin(), lo["required"].end(), "truncated") !=
+          lo["required"].end());
+    CHECK((*list)["description"].get<std::string>().find("truncated") != std::string::npos);
+}
+
 TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders, no secrets, "
           "and a read never advances the engine",
           "[pg][mcp][integration][operator_surface]") {
@@ -20440,7 +20488,16 @@ TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders,
     REQUIRE(lp["data"].size() == 2); // someone-else's row is not ours
     CHECK(lp["data"][0]["deployment_id"] == "00000000000000a1"); // newest first
     CHECK(lp["data"][0]["has_args"] == true);
+    CHECK(lp["truncated"] == false); // two rows, default limit 20
     CHECK(list->body.find("MCPSECRET") == std::string::npos);
+    // A page of 1 over two owned rows must say more exist.
+    auto one = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"list_deployments",)"
+        R"("arguments":{"limit":1}}})");
+    REQUIRE(one);
+    auto op = operator_surface_payload(one);
+    CHECK(op["data"].size() == 1);
+    CHECK(op["truncated"] == true);
     // The row IS the shared builder's output (REST/MCP parity by construction).
     auto direct = store.get_deployment("00000000000000a1", "test-user");
     REQUIRE(direct);
@@ -20455,6 +20512,34 @@ TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders,
     CHECK(dp["data"]["devices"].size() == 1);
     CHECK(dp["data"]["truncated"] == true);
     CHECK(det->body.find("MCPSECRET") == std::string::npos);
+
+    // The published output schemas name exactly the keys the handlers return, so a field added
+    // to the builder without the schema (or the reverse) fails here, not in a client.
+    {
+        auto tl = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":9})");
+        REQUIRE(tl);
+        const auto tools = nlohmann::json::parse(tl->body)["result"]["tools"];
+        auto keys_of = [](const nlohmann::json& o) {
+            std::vector<std::string> k;
+            for (auto it = o.begin(); it != o.end(); ++it)
+                k.push_back(it.key());
+            std::sort(k.begin(), k.end());
+            return k;
+        };
+        for (const auto& tool : tools) {
+            const auto name = tool["name"].get<std::string>();
+            if (name == "get_deployment") {
+                INFO("get_deployment data keys");
+                CHECK(keys_of(tool["outputSchema"]["properties"]["data"]["properties"]) ==
+                      keys_of(dp["data"]));
+            } else if (name == "list_deployments") {
+                INFO("list_deployments top-level and row keys");
+                CHECK(keys_of(tool["outputSchema"]["properties"]) == keys_of(lp));
+                CHECK(keys_of(tool["outputSchema"]["properties"]["data"]["items"]["properties"]) ==
+                      keys_of(lp["data"][0]));
+            }
+        }
+    }
 
     // Not-yours reads exactly like not-found: kInvalidParams, no oracle.
     auto theirs = ts.call(

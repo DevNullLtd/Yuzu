@@ -3366,9 +3366,12 @@ static const ToolDef kTools[] = {
      "/api/v1/deployments. Read-only: it never advances or dispatches (the dashboard's "
      "poll-driven advance is a separate action). States are running | complete, with the "
      "failed and skipped counts carried in state.label. The installer URL and installer "
-     "arguments are never returned (has_args only). Requires SoftwareDeployment:Read.",
-     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Max deployments to return, newest first; defaults to 20"}}})j",
-     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"deployment_id":{"type":"string"},"source_run_id":{"type":"string"},"name":{"type":"string"},"artifact_filename":{"type":"string"},"artifact_sha256":{"type":"string"},"has_args":{"type":"boolean","description":"Installer arguments are set (the arguments themselves are never returned)"},"status":{"type":"string","description":"running | complete"},"state":{"type":"object","properties":{"code":{"type":"string"},"label":{"type":"string"},"tone":{"type":"string"}}},"created_at_ms":{"type":"integer"},"completed_at_ms":{"type":"integer"},"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"skipped":{"type":"integer"},"active":{"type":"integer"}}}}},"required":["data"]})j"},
+     "arguments are never returned (has_args only). `truncated` is true when more deployments "
+     "exist than `limit` returned: raise `limit` (max 100); there is no paging cursor, so an "
+     "older deployment beyond the newest 100 is not reachable through this tool. Requires "
+     "SoftwareDeployment:Read.",
+     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Max deployments to return, newest first; defaults to 20. `truncated` in the result says whether more exist"}}})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"deployment_id":{"type":"string"},"source_run_id":{"type":"string"},"name":{"type":"string"},"artifact_filename":{"type":"string"},"artifact_sha256":{"type":"string"},"has_args":{"type":"boolean","description":"Installer arguments are set (the arguments themselves are never returned)"},"status":{"type":"string","description":"running | complete"},"state":{"type":"object","properties":{"code":{"type":"string"},"label":{"type":"string"},"tone":{"type":"string"}}},"created_at_ms":{"type":"integer"},"completed_at_ms":{"type":"integer"},"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"skipped":{"type":"integer"},"active":{"type":"integer"}}}},"truncated":{"type":"boolean","description":"True when more deployments exist than limit returned"}},"required":["data","truncated"]})j"},
 
     {"get_deployment",
      "One of the caller's own deployments with its device grid (owner-scoped; a deployment "
@@ -3377,8 +3380,8 @@ static const ToolDef kTools[] = {
      "exact from the run row; devices are ordered by hostname and capped by limit "
      "(default 500, max 5000) with truncated set when more exist. Requires "
      "SoftwareDeployment:Read.",
-     R"j({"type":"object","properties":{"deployment_id":{"type":"string","minLength":1,"description":"The deployment id (from list_deployments)"},"limit":{"type":"integer","minimum":1,"maximum":5000,"description":"Max device rows; defaults to 500"}},"required":["deployment_id"]})j",
-     R"j({"type":"object","properties":{"data":{"type":"object"}},"required":["data"]})j"},
+     R"j({"type":"object","properties":{"deployment_id":{"type":"string","minLength":1,"maxLength":64,"description":"The deployment id (from list_deployments); 16 hex characters"},"limit":{"type":"integer","minimum":1,"maximum":5000,"description":"Max device rows; defaults to 500"}},"required":["deployment_id"]})j",
+     R"j({"type":"object","properties":{"data":{"type":"object","properties":{"deployment_id":{"type":"string"},"source_run_id":{"type":"string"},"name":{"type":"string"},"artifact_filename":{"type":"string"},"artifact_sha256":{"type":"string"},"has_args":{"type":"boolean","description":"Installer arguments are set (the arguments themselves are never returned)"},"status":{"type":"string","description":"running | complete"},"state":{"type":"object","properties":{"code":{"type":"string"},"label":{"type":"string"},"tone":{"type":"string"}}},"created_at_ms":{"type":"integer"},"completed_at_ms":{"type":"integer"},"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"skipped":{"type":"integer"},"active":{"type":"integer"},"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"step":{"type":"string"},"exit_code":{"type":"integer"},"error":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["agent_id","hostname","os","step","exit_code","error","updated_at_ms"]}},"device_limit":{"type":"integer","description":"The device-row cap that applied to this read"},"truncated":{"type":"boolean","description":"True when more devices exist than device_limit returned; the counts above stay exact"}},"required":["deployment_id","source_run_id","name","artifact_filename","artifact_sha256","has_args","status","state","created_at_ms","completed_at_ms","total","succeeded","failed","skipped","active","devices","device_limit","truncated"]}},"required":["data"]})j"},
 
     // ── #2146 Batch B3 (api-parity programme): fleet visualization + execution/
     // fleet statistics REST+MCP twins. All 6 are confirmed pure reads with no
@@ -21478,9 +21481,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     limit = 1;
                 if (limit > kDeploymentListMax)
                     limit = kDeploymentListMax;
-                auto rows_or = deployment_run_store_->list_deployments_checked(
+                auto page_or = deployment_run_store_->list_deployments_checked(
                     session->username, /*is_admin=*/false, static_cast<int>(limit));
-                if (!rows_or) {
+                if (!page_or) {
                     res.set_content(a4_error(kInternalError, "deployment run store unavailable",
                                              "retry once the server reports ready",
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
@@ -21488,9 +21491,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& d : *rows_or)
+                for (const auto& d : page_or->rows)
                     arr.push_back(deployment_row_json(d));
-                nlohmann::json payload = {{"data", arr}};
+                nlohmann::json payload = {{"data", arr}, {"truncated", page_or->truncated}};
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
