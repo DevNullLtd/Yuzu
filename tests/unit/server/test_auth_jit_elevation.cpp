@@ -872,6 +872,11 @@ TEST_CASE("an elevated operator cannot grant elevation eligibility, but can revo
     CHECK(h.audit_detail("user.elevation_eligibility.set", "alice") ==
           "elevated_session_eligibility_grant_blocked");
     CHECK(h.auth_db->is_elevation_eligible("bob").value() == false);
+    // Revoking stays open to the elevated session.
+    REQUIRE(h.auth_db->set_elevation_eligible("bob", true).has_value());
+    REQUIRE(h.post("/api/v1/users/bob/elevation-eligibility", alice, R"({"eligible":false})")
+                ->status == 200);
+    CHECK(h.auth_db->is_elevation_eligible("bob").value() == false);
     // An administrator's own role still grants it.
     auto admin = h.session_for("admin", Role::admin);
     REQUIRE(h.post("/api/v1/users/bob/elevation-eligibility", admin, R"({"eligible":true})")
