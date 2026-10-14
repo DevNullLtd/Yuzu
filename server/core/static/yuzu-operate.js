@@ -388,7 +388,8 @@
         }
         host.innerHTML = res.html; // server-rendered and escaped
         var list = $('.ops-list', host);
-        if (list) updateChrome(list);
+        // A 200 note (denied, degraded, invalid) has no list: clear the previous list's chrome.
+        if (list) updateChrome(list); else { chip.hidden = true; confinedNote.hidden = true; }
         renderLocalTimes(host);
         markSelected(); // re-apply the selection without a refetch
       });

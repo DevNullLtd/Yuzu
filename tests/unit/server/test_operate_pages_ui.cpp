@@ -114,6 +114,8 @@ TEST_CASE("operate pages: the embedded controller is CSP-clean and bounded",
     CHECK(has(js, "'Your session has expired. Sign in again.'"));
     CHECK(has(js, "'You do not have permission to view ' + what + '.'"));
     CHECK(has(js, "the server reported a problem. Retry shortly."));
+    // A 200 note has no list, so the previous list's count chip and confined-view note go.
+    CHECK(has(js, "else { chip.hidden = true; confinedNote.hidden = true; }"));
 }
 
 TEST_CASE("operate pages: the Approvals template carries every hook the controller binds",

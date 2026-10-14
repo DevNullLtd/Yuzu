@@ -885,6 +885,25 @@ TEST_CASE("executions page list: an unknown filter is a 200 note, not an empty l
     CHECK(longid->body.find("data-invalid=\"definition_id\"") != std::string::npos);
 }
 
+TEST_CASE("executions page list: an unknown filter is answered before the tracker is read",
+          "[pg][workflow][executions][list][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-O", "O");
+    h.make_exec("def-O", "completed", 1, 1, 0);
+
+    // With the tracker table hidden a read degrades; an invalid filter must still be named
+    // as invalid, which only holds when validation runs before the read.
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_order");
+    auto res = h.sink.Get("/fragments/executions?view=page&status=bogus");
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.executions_hidden_order RENAME TO executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("data-invalid=\"status\"") != std::string::npos);
+    CHECK(res->body.find("data-degraded") == std::string::npos);
+}
+
 TEST_CASE("executions page list: empty filter values mean no filter",
           "[pg][workflow][executions][list][page]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
