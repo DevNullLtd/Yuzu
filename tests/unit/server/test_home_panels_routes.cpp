@@ -1,5 +1,5 @@
 /// @file test_home_panels_routes.cpp
-/// /fragments/home/policies and /fragments/home/activity through TestRouteSink:
+/// /fragments/dashboard/policies and /fragments/dashboard/activity through TestRouteSink:
 /// gate order, caller classes, 200-note refusals, no-store, and the pinned
 /// "a non-admin writes zero denial rows from the activity fragment" rule.
 
@@ -121,20 +121,20 @@ TEST_CASE("home_panels_routes: registers exactly two routes and rejects unbound 
           "[server][routes][home]") {
     Harness h;
     test::TestRouteSink sink;
-    home_panels::register_home_panel_routes(sink, h.deps());
+    home_panels::register_dashboard_panel_routes(sink, h.deps());
     CHECK(sink.route_count() == 2);
 
     auto d = h.deps();
     d.audit_fn = nullptr;
     test::TestRouteSink s2;
-    CHECK_THROWS_AS(home_panels::register_home_panel_routes(s2, d), std::invalid_argument);
+    CHECK_THROWS_AS(home_panels::register_dashboard_panel_routes(s2, d), std::invalid_argument);
 }
 
 TEST_CASE("home_panels_routes: policies gate order, exact securable, no-store", "[server][routes][home]") {
     Harness h;
     test::TestRouteSink sink;
-    home_panels::register_home_panel_routes(sink, h.deps());
-    auto r = sink.dispatch("GET", "/fragments/home/policies");
+    home_panels::register_dashboard_panel_routes(sink, h.deps());
+    auto r = sink.dispatch("GET", "/fragments/dashboard/policies");
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK(r->get_header_value("Cache-Control") == "no-store");
@@ -145,7 +145,7 @@ TEST_CASE("home_panels_routes: policies gate order, exact securable, no-store", 
     CHECK(h.order[0] == "deny");
     CHECK(h.order[1] == "auth");
     CHECK(h.order[2] == "fleet:Policy:Read");
-    CHECK(h.last_deny_verb == "home.fragment.access_denied");
+    CHECK(h.last_deny_verb == "dashboard.fragment.access_denied");
 }
 
 TEST_CASE("home_panels_routes: policies refusals are 200 notes, never the gate body",
@@ -154,8 +154,8 @@ TEST_CASE("home_panels_routes: policies refusals are 200 notes, never the gate b
         Harness h;
         h.deny_scoped = true;
         test::TestRouteSink sink;
-        home_panels::register_home_panel_routes(sink, h.deps());
-        auto r = sink.dispatch("GET", "/fragments/home/policies");
+        home_panels::register_dashboard_panel_routes(sink, h.deps());
+        auto r = sink.dispatch("GET", "/fragments/dashboard/policies");
         REQUIRE(r);
         CHECK(r->status == 200);
         CHECK_FALSE(has(r->body, "GATE-BODY-TEXT"));
@@ -167,8 +167,8 @@ TEST_CASE("home_panels_routes: policies refusals are 200 notes, never the gate b
         Harness h;
         h.fleet_admit = false;
         test::TestRouteSink sink;
-        home_panels::register_home_panel_routes(sink, h.deps());
-        auto r = sink.dispatch("GET", "/fragments/home/policies");
+        home_panels::register_dashboard_panel_routes(sink, h.deps());
+        auto r = sink.dispatch("GET", "/fragments/dashboard/policies");
         REQUIRE(r);
         CHECK(r->status == 200);
         CHECK_FALSE(has(r->body, "GATE-BODY-TEXT"));
@@ -180,8 +180,8 @@ TEST_CASE("home_panels_routes: policies refusals are 200 notes, never the gate b
         h.fleet_admit = false;
         h.fleet_status = 503;
         test::TestRouteSink sink;
-        home_panels::register_home_panel_routes(sink, h.deps());
-        auto r = sink.dispatch("GET", "/fragments/home/policies");
+        home_panels::register_dashboard_panel_routes(sink, h.deps());
+        auto r = sink.dispatch("GET", "/fragments/dashboard/policies");
         REQUIRE(r);
         CHECK(has(r->body, "This is not zero."));
     }
@@ -189,8 +189,8 @@ TEST_CASE("home_panels_routes: policies refusals are 200 notes, never the gate b
         Harness h;
         h.session = false;
         test::TestRouteSink sink;
-        home_panels::register_home_panel_routes(sink, h.deps());
-        auto r = sink.dispatch("GET", "/fragments/home/policies");
+        home_panels::register_dashboard_panel_routes(sink, h.deps());
+        auto r = sink.dispatch("GET", "/fragments/dashboard/policies");
         REQUIRE(r);
         CHECK(r->status == 401);
         CHECK(h.policies_calls == 0);
@@ -202,8 +202,8 @@ TEST_CASE("home_panels_routes: engaged scope is Limited and the aggregate read n
     Harness h;
     h.fleet_scoped = true;
     test::TestRouteSink sink;
-    home_panels::register_home_panel_routes(sink, h.deps());
-    auto r = sink.dispatch("GET", "/fragments/home/policies");
+    home_panels::register_dashboard_panel_routes(sink, h.deps());
+    auto r = sink.dispatch("GET", "/fragments/dashboard/policies");
     REQUIRE(r);
     CHECK(has(r->body, "limited to a group of devices"));
     CHECK_FALSE(has(r->body, "Disk encryption"));
@@ -215,8 +215,8 @@ TEST_CASE("home_panels_routes: a degraded policies read is Unavailable, never ze
     Harness h;
     h.policies_degraded = true;
     test::TestRouteSink sink;
-    home_panels::register_home_panel_routes(sink, h.deps());
-    auto r = sink.dispatch("GET", "/fragments/home/policies");
+    home_panels::register_dashboard_panel_routes(sink, h.deps());
+    auto r = sink.dispatch("GET", "/fragments/dashboard/policies");
     REQUIRE(r);
     CHECK(has(r->body, "This is not zero."));
     CHECK_FALSE(has(r->body, "No policies are defined."));
@@ -228,8 +228,8 @@ TEST_CASE("home_panels_routes: activity for an effective admin reads 8 rows, saf
     Harness h;
     h.audit_href = "/access/audit";
     test::TestRouteSink sink;
-    home_panels::register_home_panel_routes(sink, h.deps());
-    auto r = sink.dispatch("GET", "/fragments/home/activity");
+    home_panels::register_dashboard_panel_routes(sink, h.deps());
+    auto r = sink.dispatch("GET", "/fragments/dashboard/activity");
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK(r->get_header_value("Cache-Control") == "no-store");
@@ -247,9 +247,9 @@ TEST_CASE("home_panels_routes: a non-admin writes ZERO denial rows from the acti
     h.role = auth::Role::user;
     h.perm_admit = false; // would deny AND write an auth.permission_required row if asked
     test::TestRouteSink sink;
-    home_panels::register_home_panel_routes(sink, h.deps());
+    home_panels::register_dashboard_panel_routes(sink, h.deps());
     for (int i = 0; i < 3; ++i) {
-        auto r = sink.dispatch("GET", "/fragments/home/activity");
+        auto r = sink.dispatch("GET", "/fragments/dashboard/activity");
         REQUIRE(r);
         CHECK(r->status == 200);
         CHECK(has(r->body, "administrators only"));
@@ -264,8 +264,8 @@ TEST_CASE("home_panels_routes: an admin without AuditLog:Read gets a Denied note
     Harness h;
     h.perm_admit = false;
     test::TestRouteSink sink;
-    home_panels::register_home_panel_routes(sink, h.deps());
-    auto r = sink.dispatch("GET", "/fragments/home/activity");
+    home_panels::register_dashboard_panel_routes(sink, h.deps());
+    auto r = sink.dispatch("GET", "/fragments/dashboard/activity");
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK(has(r->body, "It needs AuditLog:Read."));
@@ -277,8 +277,8 @@ TEST_CASE("home_panels_routes: activity degraded and service-scoped states", "[s
         Harness h;
         h.audit_degraded = true;
         test::TestRouteSink sink;
-        home_panels::register_home_panel_routes(sink, h.deps());
-        auto r = sink.dispatch("GET", "/fragments/home/activity");
+        home_panels::register_dashboard_panel_routes(sink, h.deps());
+        auto r = sink.dispatch("GET", "/fragments/dashboard/activity");
         REQUIRE(r);
         CHECK(has(r->body, "This is not zero."));
         CHECK_FALSE(has(r->body, "No activity recorded yet."));
@@ -287,8 +287,8 @@ TEST_CASE("home_panels_routes: activity degraded and service-scoped states", "[s
         Harness h;
         h.deny_scoped = true;
         test::TestRouteSink sink;
-        home_panels::register_home_panel_routes(sink, h.deps());
-        auto r = sink.dispatch("GET", "/fragments/home/activity");
+        home_panels::register_dashboard_panel_routes(sink, h.deps());
+        auto r = sink.dispatch("GET", "/fragments/dashboard/activity");
         REQUIRE(r);
         CHECK(r->status == 200);
         CHECK_FALSE(has(r->body, "GATE-BODY-TEXT"));

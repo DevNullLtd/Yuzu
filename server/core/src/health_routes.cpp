@@ -875,14 +875,14 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         }
     });
 
-    // -- Home "Server health" panel (HM-2) ------------------------------------
+    // -- Dashboard "Server health" panel (HM-2; on Home until the 2026-10-14 delta) --
     // Lives here so it can call the registered `health_handler` in-process: one
     // definition of "healthy". Gate order matches /fragments/health/summary
     // (deny_service_scoped_fn, then auth_fn). Every outcome is a 200 panel note
     // so htmx swaps it. The JSON is parsed and only seven fields are read;
     // `system.*`, `tls.*` and `agents.pending` are never rendered.
-    sink.Get("/fragments/home/health", [deps, health_handler](const httplib::Request& req,
-                                                              httplib::Response& res) {
+    sink.Get("/fragments/dashboard/health", [deps, health_handler](const httplib::Request& req,
+                                                                   httplib::Response& res) {
         using home_panels::Fact;
         using home_panels::FactState;
         using home_panels::HealthPanel;
@@ -896,8 +896,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         };
         {
             httplib::Response scratch;
-            if (deps.deny_service_scoped_fn(req, scratch, "home.fragment.access_denied",
-                                            "service-scoped tokens may not read the Home health panel",
+            if (deps.deny_service_scoped_fn(req, scratch, "dashboard.fragment.access_denied",
+                                            "service-scoped tokens may not read the Dashboard health panel",
                                             "", "")) {
                 serve(Fact<HealthPanel>::with(FactState::Denied, "an interactive session"));
                 return;

@@ -102,7 +102,7 @@ TEST_CASE("fmt_int and hhmm_utc", "[home][render]") {
 
 TEST_CASE("readout: populated cells carry the real figures and their bases", "[home][render]") {
     const std::string html = render_readout(all_ok());
-    CHECK(has(html, "id=\"home-readout\""));
+    CHECK(has(html, "id=\"dash-readout\""));
     CHECK(has(html, "<div class=\"v\">412</div>"));
     CHECK(has(html, "of 437 seen in the last 30 days"));
     CHECK(has(html, "25 not seen for 2 days or more"));
@@ -183,8 +183,8 @@ TEST_CASE("devices cell: empty fleet and each failure state read differently", "
 TEST_CASE("summary: the readout swaps in place and Needs attention is the one OOB target",
           "[home][render]") {
     const std::string html = render_summary(all_ok());
-    const auto ro = html.find("<section id=\"home-readout\"");
-    const auto att = html.find("<section id=\"home-attention\"");
+    const auto ro = html.find("<section id=\"dash-readout\"");
+    const auto att = html.find("<section id=\"dash-attention\"");
     REQUIRE(ro == 0);
     REQUIRE(att != std::string::npos);
     CHECK(ro < att);

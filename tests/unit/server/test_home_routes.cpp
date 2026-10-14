@@ -1,5 +1,5 @@
 /// @file test_home_routes.cpp
-/// GET /home and GET /fragments/home/summary through TestRouteSink: the exact
+/// GET /fragments/dashboard/summary through TestRouteSink: the exact
 /// (securable, op) per figure, 403 -> 200 note without gate text, scope-engaged
 /// confinement, degrade -> Unavailable (never 0), service-scoped denial first, and
 /// no store scan for non-admins. Every closure is a fake; nothing spawns or sleeps.
@@ -42,7 +42,7 @@ InventoryDeviceRow row(std::string id, std::string os, bool online, bool stale =
 
 struct HomeHarness {
     test::TestRouteSink sink;
-    HomeRoutes routes;
+    DashboardSummaryRoutes routes;
 
     // Caller.
     bool signed_in = true;
@@ -89,7 +89,7 @@ struct HomeHarness {
             if (!service_scoped)
                 return false;
             ++service_denials;
-            CHECK(action == "home.fragment.access_denied");
+            CHECK(action == "dashboard.fragment.access_denied");
             res.status = 403;
             return true;
         };
@@ -166,21 +166,14 @@ struct HomeHarness {
 
 // ── page ──────────────────────────────────────────────────────────────────
 
-TEST_CASE("/home: signed-out redirects to /login, signed-in serves the baked page", "[home][route]") {
+// Kills: a /fragments/home/* registration surviving the move to the Dashboard, or a
+// second page route creeping back in beside page_routes.cpp's GET /.
+TEST_CASE("summary: registers exactly the one Dashboard fragment and no page", "[home][route]") {
     HomeHarness h;
-    h.signed_in = false;
-    auto out = h.sink.Get("/home");
-    REQUIRE(out);
-    CHECK(out->status == 302);
-    CHECK(out->get_header_value("Location") == "/login");
-
-    h.signed_in = true;
-    auto page = h.sink.Get("/home");
-    REQUIRE(page);
-    CHECK(page->status == 200);
-    CHECK(has(page->body, "<h1>Home</h1>"));
-    CHECK(has(page->body, "hx-get=\"/fragments/home/summary\""));
-    CHECK(has(page->get_header_value("Cache-Control"), "no-store"));
+    CHECK(h.sink.route_count() == 1);
+    CHECK(h.sink.Get("/home") == nullptr);
+    CHECK(h.sink.Get("/fragments/home/summary") == nullptr);
+    REQUIRE(h.sink.Get("/fragments/dashboard/summary"));
 }
 
 // ── fragment: ordering and headers ────────────────────────────────────────
@@ -189,7 +182,7 @@ TEST_CASE("/home: signed-out redirects to /login, signed-in serves the baked pag
 TEST_CASE("summary: service-scoped denial runs first and nothing is read", "[home][route]") {
     HomeHarness h;
     h.service_scoped = true;
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(out->status == 403);
     CHECK(h.service_denials == 1);
@@ -202,7 +195,7 @@ TEST_CASE("summary: service-scoped denial runs first and nothing is read", "[hom
 TEST_CASE("summary: no-store, html, one gate call per figure with the exact securable", "[home][route]") {
     HomeHarness h;
     h.roster.rows = {row("a", "windows", true)};
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(out->status == 200);
     CHECK(has(out->get_header_value("Cache-Control"), "no-store"));
@@ -221,7 +214,7 @@ TEST_CASE("summary: no-store, html, one gate call per figure with the exact secu
 TEST_CASE("summary: a refused gate becomes a 200 note that names the securable only", "[home][route]") {
     HomeHarness h;
     h.allow_inventory = h.allow_policy = h.allow_execution = h.allow_approval = false;
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(out->status == 200);
     CHECK_FALSE(has(out->body, "SECRET-GATE-BODY"));
@@ -242,7 +235,7 @@ TEST_CASE("summary: a 503 gate is Unavailable, not Denied", "[home][route]") {
     HomeHarness h;
     h.allow_policy = false;
     h.gate_status = 503;
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(has(out->body, "Could not read Compliance. This is not zero."));
     CHECK_FALSE(has(out->body, "You do not have access to this figure. It needs <span class=\"mono\">Policy"));
@@ -258,7 +251,7 @@ TEST_CASE("summary: an engaged scope narrows devices and limits fleet aggregates
     h.wire_estate = false;
     h.roster.rows = {row("a", "windows", true), row("b", "linux", false, true),
                      row("c", "darwin", true), row("d", "windows", true)};
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(has(out->body, "<div class=\"v\">1</div>"));        // online: only "a" is in scope
     CHECK(has(out->body, "of 2 seen in the last 30 days"));   // total narrowed to the scope
@@ -295,9 +288,9 @@ TEST_CASE("summary: TOP uses the SQL estate seam and never loads the roster", "[
         return EstateCounts{250000, 240000, 5000, 5000};
     };
     test::TestRouteSink sink;
-    HomeRoutes r;
+    DashboardSummaryRoutes r;
     r.register_routes(sink, std::move(d));
-    auto out = sink.Get("/fragments/home/summary");
+    auto out = sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(estate_calls == 1);
     CHECK(roster_calls == 0);
@@ -317,9 +310,9 @@ TEST_CASE("summary: a failed TOP estate read is Unavailable, never zero, and nev
         return std::nullopt;
     };
     test::TestRouteSink sink;
-    HomeRoutes r;
+    DashboardSummaryRoutes r;
     r.register_routes(sink, std::move(d));
-    auto out = sink.Get("/fragments/home/summary");
+    auto out = sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(out->status == 200);
     CHECK(estate_calls == 1);
@@ -342,14 +335,14 @@ TEST_CASE("summary: the TOP estate read is cached 60 s on the server clock", "[h
         CHECK(now_ms == now * 1000);
         return EstateCounts{100 + estate_calls, 90, 5, 5};
     };
-    HomeRoutes r;
+    DashboardSummaryRoutes r;
     test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
 
-    REQUIRE(sink.Get("/fragments/home/summary"));
+    REQUIRE(sink.Get("/fragments/dashboard/summary"));
     CHECK(estate_calls == 1);
     now += 59;
-    auto hit = sink.Get("/fragments/home/summary");
+    auto hit = sink.Get("/fragments/dashboard/summary");
     REQUIRE(hit);
     CHECK(estate_calls == 1);
     CHECK(has(hit->body, "of 101 seen in the last 30 days"));
@@ -357,12 +350,12 @@ TEST_CASE("summary: the TOP estate read is cached 60 s on the server clock", "[h
     CHECK(has(hit->body, "As of " + hhmm_utc(now)));
     CHECK_FALSE(has(hit->body, "As of " + hhmm_utc(now - 59)));
     now += 1; // 60 s after the read
-    auto miss = sink.Get("/fragments/home/summary");
+    auto miss = sink.Get("/fragments/dashboard/summary");
     REQUIRE(miss);
     CHECK(estate_calls == 2);
     CHECK(has(miss->body, "of 102 seen in the last 30 days"));
     now -= 5; // a clock that stepped backwards is a miss, never a stale hit
-    REQUIRE(sink.Get("/fragments/home/summary"));
+    REQUIRE(sink.Get("/fragments/dashboard/summary"));
     CHECK(estate_calls == 3);
 }
 
@@ -383,39 +376,39 @@ TEST_CASE("summary: a failed TOP estate read is never a figure and backs off bri
             return std::nullopt;
         return EstateCounts{200, 190, 5, 5};
     };
-    HomeRoutes r;
+    DashboardSummaryRoutes r;
     test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
 
-    auto down = sink.Get("/fragments/home/summary");
+    auto down = sink.Get("/fragments/dashboard/summary");
     REQUIRE(down);
     CHECK(has(down->body, "Could not read The device roster. This is not zero."));
     fail = false; // recovered, but the backoff window is still open: no re-read, still not a figure
     now = start + kEstateFailBackoffSecs - 1;
-    auto held = sink.Get("/fragments/home/summary");
+    auto held = sink.Get("/fragments/dashboard/summary");
     REQUIRE(held);
     CHECK(estate_calls == 1);
     CHECK(has(held->body, "Could not read The device roster. This is not zero."));
     CHECK_FALSE(has(held->body, "Nothing needs attention"));
     now = start - 1; // a clock that stepped backwards ends the backoff instead of extending it
-    REQUIRE(sink.Get("/fragments/home/summary"));
+    REQUIRE(sink.Get("/fragments/dashboard/summary"));
     CHECK(estate_calls == 2);
     // (that read succeeded and filled the cache; expire it and fail again below)
     now += kEstateCacheTtlSecs;
     fail = true; // expired entry + failed read: Unavailable, not the old figure
-    auto again = sink.Get("/fragments/home/summary");
+    auto again = sink.Get("/fragments/dashboard/summary");
     REQUIRE(again);
     CHECK(estate_calls == 3);
     CHECK(has(again->body, "Could not read The device roster. This is not zero."));
     CHECK_FALSE(has(again->body, "of 200 seen"));
     now = start + 30; // stepped back into the old entry's 60 s window: still not the old figure
-    auto stepped = sink.Get("/fragments/home/summary");
+    auto stepped = sink.Get("/fragments/dashboard/summary");
     REQUIRE(stepped);
     CHECK(has(stepped->body, "Could not read The device roster. This is not zero."));
     CHECK_FALSE(has(stepped->body, "of 200 seen"));
     fail = false;
     now += kEstateFailBackoffSecs; // backoff over: the next view reads again and recovers
-    auto recovered = sink.Get("/fragments/home/summary");
+    auto recovered = sink.Get("/fragments/dashboard/summary");
     REQUIRE(recovered);
     CHECK(estate_calls == 5);
     CHECK(has(recovered->body, "of 200 seen in the last 30 days"));
@@ -450,11 +443,11 @@ TEST_CASE("summary: viewers queued behind a failing TOP estate read share its fa
         }
         return std::nullopt;
     };
-    HomeRoutes r;
+    DashboardSummaryRoutes r;
     test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
 
-    auto view = [&] { return sink.Get("/fragments/home/summary")->body; };
+    auto view = [&] { return sink.Get("/fragments/dashboard/summary")->body; };
     std::vector<std::future<std::string>> viewers;
     viewers.push_back(std::async(std::launch::async, view));
     entered.get_future().wait();
@@ -480,12 +473,12 @@ TEST_CASE("summary: the failure backoff starts when a slow failed read ends", "[
         now += 2 * kEstateFailBackoffSecs; // the read itself outlasts the backoff window
         return std::nullopt;
     };
-    HomeRoutes r;
+    DashboardSummaryRoutes r;
     test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
-    REQUIRE(sink.Get("/fragments/home/summary"));
+    REQUIRE(sink.Get("/fragments/dashboard/summary"));
     REQUIRE(estate_calls == 1);
-    auto queued = sink.Get("/fragments/home/summary"); // a viewer that got the lock after it
+    auto queued = sink.Get("/fragments/dashboard/summary"); // a viewer that got the lock after it
     REQUIRE(queued);
     CHECK(estate_calls == 1);
     CHECK(has(queued->body, "Could not read The device roster. This is not zero."));
@@ -503,15 +496,15 @@ TEST_CASE("summary: the estate cache is instance-local", "[home][route][cache]")
         };
         return d;
     };
-    HomeRoutes a, b;
+    DashboardSummaryRoutes a, b;
     test::TestRouteSink sink_a, sink_b;
     a.register_routes(sink_a, make(calls_a, 111));
     b.register_routes(sink_b, make(calls_b, 222));
-    auto fa = sink_a.Get("/fragments/home/summary");
-    auto fb = sink_b.Get("/fragments/home/summary");
+    auto fa = sink_a.Get("/fragments/dashboard/summary");
+    auto fb = sink_b.Get("/fragments/dashboard/summary");
     REQUIRE(fa);
     REQUIRE(fb);
-    CHECK(sink_a.Get("/fragments/home/summary"));
+    CHECK(sink_a.Get("/fragments/dashboard/summary"));
     CHECK(calls_a == 1);
     CHECK(calls_b == 1);
     CHECK(has(fa->body, "of 111 seen"));
@@ -527,11 +520,11 @@ TEST_CASE("summary: without a server clock the TOP estate read is not cached", "
         ++estate_calls;
         return EstateCounts{10, 9, 0, 1};
     };
-    HomeRoutes r;
+    DashboardSummaryRoutes r;
     test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
-    REQUIRE(sink.Get("/fragments/home/summary"));
-    REQUIRE(sink.Get("/fragments/home/summary"));
+    REQUIRE(sink.Get("/fragments/dashboard/summary"));
+    REQUIRE(sink.Get("/fragments/dashboard/summary"));
     CHECK(estate_calls == 2);
 }
 
@@ -559,22 +552,22 @@ TEST_CASE("summary: a scoped caller is never served a TOP caller's cached estate
         res.rows = {row("a", "linux", true), row("b", "linux", true)};
         return res;
     };
-    HomeRoutes r;
+    DashboardSummaryRoutes r;
     test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
 
-    auto top = sink.Get("/fragments/home/summary");
+    auto top = sink.Get("/fragments/dashboard/summary");
     REQUIRE(top);
     CHECK(has(top->body, "999,999"));
     CHECK(estate_calls == 1);
     for (int i = 0; i < 3; ++i) {
-        auto scoped = sink.Get("/fragments/home/summary", {{"X-Test-Scoped", "1"}});
+        auto scoped = sink.Get("/fragments/dashboard/summary", {{"X-Test-Scoped", "1"}});
         REQUIRE(scoped);
         CHECK_FALSE(has(scoped->body, "999,999"));
         CHECK(has(scoped->body, "of 1 seen in the last 30 days"));
     }
     CHECK(estate_calls == 1); // the scoped views never reached the seam or refreshed the cache
-    auto top_again = sink.Get("/fragments/home/summary");
+    auto top_again = sink.Get("/fragments/dashboard/summary");
     REQUIRE(top_again);
     CHECK(has(top_again->body, "999,999"));
     CHECK(estate_calls == 1);
@@ -595,11 +588,11 @@ TEST_CASE("summary: a scoped caller never touches the estate seam", "[home][rout
         return EstateCounts{999999, 999999, 0, 0};
     };
     d.roster_fn = [] { return InventoryDevicesResult{}; };
-    HomeRoutes r;
+    DashboardSummaryRoutes r;
     test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
     for (int i = 0; i < 3; ++i) {
-        auto out = sink.Get("/fragments/home/summary");
+        auto out = sink.Get("/fragments/dashboard/summary");
         REQUIRE(out);
         CHECK_FALSE(has(out->body, "999,999"));
     }
@@ -616,7 +609,7 @@ TEST_CASE("summary: a scoped roster read at the row cap is labelled a lower boun
         h.roster.rows.assign(n, row("z", "linux", true));
         h.roster.rows[0] = row("a", "windows", true);
         h.roster.rows[1] = row("b", "linux", false, true);
-        auto out = h.sink.Get("/fragments/home/summary");
+        auto out = h.sink.Get("/fragments/dashboard/summary");
         REQUIRE(out);
         return out->body;
     };
@@ -638,7 +631,7 @@ TEST_CASE("summary: degraded readers are Unavailable, never zero", "[home][route
     h.compliance = std::nullopt;
     h.failed = std::nullopt;
     h.approvals = std::nullopt;
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(out->status == 200);
     CHECK(has(out->body, "Could not read The device roster. This is not zero."));
@@ -654,7 +647,7 @@ TEST_CASE("summary: an unwired roster is not an empty fleet", "[home][route]") {
     HomeHarness h;
     h.roster.rows.clear();
     h.roster.ci_degraded = true; // what build_hw_roster returns with no offline store
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK_FALSE(has(out->body, "No devices have reported"));
     CHECK(has(out->body, "This is not zero."));
@@ -663,7 +656,7 @@ TEST_CASE("summary: an unwired roster is not an empty fleet", "[home][route]") {
 TEST_CASE("summary: a genuinely empty fleet says so", "[home][route]") {
     HomeHarness h;
     h.roster.rows.clear();
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(has(out->body, "No devices have reported in the last 30 days."));
 }
@@ -677,7 +670,7 @@ TEST_CASE("summary: failed executions use the 24 h window and the read cap", "[h
     for (int i = 0; i < 100; ++i)
         rows.push_back({now - 60, now - 70});
     h.failed = rows;
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(has(out->body, "100+"));
 }
@@ -685,7 +678,7 @@ TEST_CASE("summary: failed executions use the 24 h window and the read cap", "[h
 TEST_CASE("summary: approvals print the exact count; oldest only when known", "[home][route]") {
     HomeHarness h;
     h.approvals = ApprovalFigure{137, std::nullopt}; // truncated list: no honest oldest
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(has(out->body, "<div class=\"v\">137</div>"));
     CHECK_FALSE(has(out->body, "oldest submitted"));
@@ -701,7 +694,7 @@ TEST_CASE("summary: the enrolment scan runs only for an Enrollment:Read caller",
     h.role = auth::Role::admin; // the legacy role alone must not open the row
     h.allow_enrollment = false;
     h.enrolment = 4;
-    auto out = h.sink.Get("/fragments/home/summary");
+    auto out = h.sink.Get("/fragments/dashboard/summary");
     REQUIRE(out);
     CHECK(h.gated("Enrollment", "Read"));
     CHECK(h.enrolment_calls == 0);
@@ -711,7 +704,7 @@ TEST_CASE("summary: the enrolment scan runs only for an Enrollment:Read caller",
     HomeHarness a;
     a.role = auth::Role::user; // and a non-admin role with the grant sees it
     a.enrolment = 4;
-    auto granted = a.sink.Get("/fragments/home/summary");
+    auto granted = a.sink.Get("/fragments/dashboard/summary");
     REQUIRE(granted);
     CHECK(a.enrolment_calls == 1);
     CHECK(has(granted->body, "4 agents are awaiting enrolment"));
@@ -719,7 +712,7 @@ TEST_CASE("summary: the enrolment scan runs only for an Enrollment:Read caller",
     HomeHarness u;
     u.gate_status = 503; // a degraded gate is a note, never silence and never a scan
     u.allow_enrollment = false;
-    auto degraded = u.sink.Get("/fragments/home/summary");
+    auto degraded = u.sink.Get("/fragments/dashboard/summary");
     REQUIRE(degraded);
     CHECK(u.enrolment_calls == 0);
     CHECK(has(degraded->body, "Could not read Pending enrolments. This is not zero."));
@@ -773,10 +766,10 @@ TEST_CASE("tally_roster partitions state exactly", "[home][route]") {
 
 // ── production wiring ─────────────────────────────────────────────────────
 
-// Kills: every case above passing while server.cpp drops the HomeRoutes registration or
-// one of its seams (the real server would 404 both routes, or render a figure Unwired).
-// Precedent: test_health_routes.cpp's wiring tripwire.
-TEST_CASE("home_routes: wiring -- server.cpp registers HomeRoutes and binds every seam",
+// Kills: every case above passing while server.cpp drops the DashboardSummaryRoutes
+// registration or one of its seams (the real server would 404 the fragment, or render a
+// figure Unwired). Precedent: test_health_routes.cpp's wiring tripwire.
+TEST_CASE("home_routes: wiring -- server.cpp registers DashboardSummaryRoutes and binds every seam",
           "[home][route]") {
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
@@ -784,7 +777,7 @@ TEST_CASE("home_routes: wiring -- server.cpp registers HomeRoutes and binds ever
     std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(in.is_open());
     const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    const auto at = src.find("home_routes_->register_routes(");
+    const auto at = src.find("dashboard_summary_routes_->register_routes(");
     REQUIRE(at != std::string::npos);
     const std::string block = src.substr(at, 6000);
     for (const char* seam :

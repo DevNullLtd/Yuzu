@@ -1145,9 +1145,9 @@ DASH_FRAGMENTS=(
     "/fragments/health/summary"
     "/fragments/compliance/summary"
     "/fragments/policy-fragments"
-    "/fragments/home/policies"
-    "/fragments/home/activity"
-    "/fragments/home/health"
+    "/fragments/dashboard/policies"
+    "/fragments/dashboard/activity"
+    "/fragments/dashboard/health"
 )
 
 for frag in "${DASH_FRAGMENTS[@]}"; do
@@ -1155,23 +1155,24 @@ for frag in "${DASH_FRAGMENTS[@]}"; do
     assert_status_any "GET $frag" "$HTTP_STATUS" 200 400 404
 done
 
-# Home: the admin session is unconfined, so both routes must answer 200 with their own
-# markup. The loose status list above would also accept a route that was never registered.
-http_get "$SERVER_URL/home"
-assert_eq "GET /home status" "200" "$HTTP_STATUS"
+# Dashboard: the admin session is unconfined, so the page and the summary fragment must
+# answer 200 with their own markup. The loose status list above would also accept a route
+# that was never registered.
+http_get "$SERVER_URL/"
+assert_eq "GET / status" "200" "$HTTP_STATUS"
 TESTS=$((TESTS + 1))
-if [[ "$HTTP_BODY" == *'id="home-readout"'* ]]; then
-    pass "GET /home carries the readout target"
+if [[ "$HTTP_BODY" == *'id="dash-readout"'* && "$HTTP_BODY" == *'hx-get="/fragments/dashboard/summary"'* ]]; then
+    pass "GET / carries the readout placeholder"
 else
-    fail "GET /home missing id=home-readout"
+    fail "GET / missing the dash-readout placeholder"
 fi
-http_get "$SERVER_URL/fragments/home/summary"
-assert_eq "GET /fragments/home/summary status" "200" "$HTTP_STATUS"
+http_get "$SERVER_URL/fragments/dashboard/summary"
+assert_eq "GET /fragments/dashboard/summary status" "200" "$HTTP_STATUS"
 TESTS=$((TESTS + 1))
-if [[ "$HTTP_BODY" == *'id="home-readout"'* && "$HTTP_BODY" == *'id="home-attention"'* ]]; then
-    pass "GET /fragments/home/summary carries both panels"
+if [[ "$HTTP_BODY" == *'id="dash-readout"'* && "$HTTP_BODY" == *'id="dash-attention"'* && "$HTTP_BODY" == *'id="dash-estate"'* ]]; then
+    pass "GET /fragments/dashboard/summary carries all three panels"
 else
-    fail "GET /fragments/home/summary missing a panel"
+    fail "GET /fragments/dashboard/summary missing a panel"
 fi
 
 # /fragments/executions renders a store degrade as a 200 body carrying data-degraded (the

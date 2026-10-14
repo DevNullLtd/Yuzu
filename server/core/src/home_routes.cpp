@@ -1,10 +1,9 @@
 /// @file home_routes.cpp
-/// `GET /home` + `GET /fragments/home/summary`. See home_routes.hpp for the gate table.
+/// `GET /fragments/dashboard/summary`. See home_routes.hpp for the gate table.
 
 #include "home_routes.hpp"
 
 #include "authz_model.hpp"
-#include "home_ui.hpp"
 
 #include <string>
 #include <string_view>
@@ -114,7 +113,7 @@ EstateCounts tally_roster(const std::vector<InventoryDeviceRow>& rows) {
     return c;
 }
 
-std::optional<EstateCounts> HomeRoutes::cached_estate() const {
+std::optional<EstateCounts> DashboardSummaryRoutes::cached_estate() const {
     if (!deps_.now_fn)
         return deps_.fleet_estate_fn(0);
     std::lock_guard lk(estate_mu_);
@@ -139,7 +138,7 @@ std::optional<EstateCounts> HomeRoutes::cached_estate() const {
     return c;
 }
 
-SummaryView HomeRoutes::build_summary(const httplib::Request& req) const {
+SummaryView DashboardSummaryRoutes::build_summary(const httplib::Request& req) const {
     SummaryView v;
     v.now_epoch = deps_.now_fn ? deps_.now_fn() : 0;
     v.links = resolve_links(shell::nav_groups());
@@ -245,32 +244,24 @@ SummaryView HomeRoutes::build_summary(const httplib::Request& req) const {
     return v;
 }
 
-void HomeRoutes::register_routes(httplib::Server& svr, Deps deps) {
+void DashboardSummaryRoutes::register_routes(httplib::Server& svr, Deps deps) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(deps));
 }
 
-void HomeRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
+void DashboardSummaryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     deps_ = std::move(deps);
     estate_cache_.reset();
     estate_failed_at_.reset();
 
-    // Page: auth-only chrome. The fragment carries every per-figure gate.
-    sink.Get("/home", [this](const httplib::Request& req, httplib::Response& res) {
-        auto session = deps_.auth_fn(req, res);
-        if (!session) {
-            res.set_redirect("/login");
-            return;
-        }
-        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.set_content(kHomeHtml, "text/html; charset=utf-8");
-    });
-
-    sink.Get("/fragments/home/summary", [this](const httplib::Request& req, httplib::Response& res) {
+    // The Dashboard page itself is served by page_routes.cpp; this fragment carries
+    // every per-figure gate.
+    sink.Get("/fragments/dashboard/summary",
+             [this](const httplib::Request& req, httplib::Response& res) {
         if (deps_.deny_service_scoped_fn &&
-            deps_.deny_service_scoped_fn(req, res, "home.fragment.access_denied",
-                                         "service-scoped tokens may not read the Home summary", "",
-                                         ""))
+            deps_.deny_service_scoped_fn(req, res, "dashboard.fragment.access_denied",
+                                         "service-scoped tokens may not read the Dashboard summary",
+                                         "", ""))
             return;
         if (!deps_.auth_fn(req, res))
             return;

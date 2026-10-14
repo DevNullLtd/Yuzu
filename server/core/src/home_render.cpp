@@ -1,5 +1,5 @@
 /// @file home_render.cpp
-/// Home renderers: PURE value-in, string-out. See home_render.hpp.
+/// Dashboard summary renderers: PURE value-in, string-out. See home_render.hpp.
 
 #include "home_render.hpp"
 
@@ -170,8 +170,8 @@ std::string approvals_cell(const SummaryView& v) {
 
 std::string att_row(const char* dot, const std::string& title, const std::string& sub,
                     const std::string& href, const char* button) {
-    std::string out = std::string("<div class=\"home-row\"><span class=\"sd ") + dot +
-                      "\"></span><div class=\"home-rowb\"><b>" + title + "</b>";
+    std::string out = std::string("<div class=\"att-row\"><span class=\"sd ") + dot +
+                      "\"></span><div class=\"att-rowb\"><b>" + title + "</b>";
     if (!sub.empty())
         out += "<div class=\"mut\">" + sub + "</div>";
     out += "</div>";
@@ -245,7 +245,7 @@ FailedFigure failed_in_24h(const std::vector<FailedRow>& rows, std::int64_t now,
 // ── Renderers ──────────────────────────────────────────────────────────────
 
 std::string render_readout(const SummaryView& v) {
-    std::string out = "<section id=\"home-readout\" class=\"readout\" aria-label=\"Estate readout\">";
+    std::string out = "<section id=\"dash-readout\" class=\"readout\" aria-label=\"Estate readout\">";
     out += devices_cell(v);
     out += compliance_cell(v);
     out += failed_cell(v);
@@ -255,8 +255,8 @@ std::string render_readout(const SummaryView& v) {
 }
 
 std::string render_attention(const SummaryView& v) {
-    std::string out = panel_open("home-attention", "Needs attention", "", v.now_epoch, true);
-    out += "<div class=\"pb home-att\">";
+    std::string out = panel_open("dash-attention", "Needs attention", "", v.now_epoch, true);
+    out += "<div class=\"pb att-list\">";
     int rows = 0;
     bool all_ok = true;
 
@@ -339,14 +339,38 @@ std::string render_attention(const SummaryView& v) {
     }
 
     if (rows == 0 && all_ok)
-        out += "<div class=\"home-row\"><span class=\"sd s-on\"></span><div class=\"home-rowb\">"
+        out += "<div class=\"att-row\"><span class=\"sd s-on\"></span><div class=\"att-rowb\">"
                "<b>Nothing needs attention</b></div></div>";
     out += "</div></section>";
     return out;
 }
 
+std::string render_estate(const SummaryView& v) {
+    std::string out = panel_open("dash-estate", "Estate state", "", v.now_epoch, true);
+    const auto& f = v.devices;
+    if (!f.ok()) {
+        out += "<div class=\"pb\">" + note(state_sentence(f, "The device roster"), true) + "</div>";
+        return out + "</section>";
+    }
+    const auto& c = f.value;
+    if (c.total == 0)
+        return out + "<div class=\"pb\">" + note("No devices have reported in the last 30 days.") +
+               "</div></section>";
+    const std::string lb = c.at_least ? "at least " : "";
+    auto row = [&](const char* k, std::int64_t n) {
+        return std::string("<div><span>") + k + "</span><b>" + lb + fmt_int(n) + "</b></div>";
+    };
+    out += "<div class=\"kvl fill\">";
+    out += row("Seen in the last 30 days", c.total);
+    out += row("Online", c.online);
+    out += row("Offline, seen within 2 days", c.offline);
+    out += row("Not seen for 2 days or more", c.not_seen);
+    out += "</div></section>";
+    return out;
+}
+
 std::string render_summary(const SummaryView& v) {
-    return render_readout(v) + render_attention(v);
+    return render_readout(v) + render_attention(v) + render_estate(v);
 }
 
 } // namespace yuzu::server::home

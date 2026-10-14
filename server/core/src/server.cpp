@@ -220,8 +220,8 @@
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
 #include "hardware_routes.hpp"
-#include "home_routes.hpp" // Home (/home): landing worklist over injected seams
-#include "home_panels_routes.hpp" // HM-2: Home policies + activity fragments
+#include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
+#include "home_panels_routes.hpp" // HM-2: Dashboard policies + events fragments
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
@@ -15478,7 +15478,7 @@ private:
                              .auth_fn = auth_fn,
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
-                             .fleet_read_fn = fleet_read_fn, // HM-2 /fragments/home/health
+                             .fleet_read_fn = fleet_read_fn, // HM-2 /fragments/dashboard/health
                              .cfg = &cfg_,
                              .metrics = &metrics_,
                              .registry = &registry_,
@@ -18207,14 +18207,15 @@ private:
                                  },
                          });
 
-        // HomeRoutes — /home landing worklist (readout, estate, needs attention).
-        // Every figure arrives through a closure over an existing typed read; the
-        // gates are the SAME fleet_read_fn / perm_fn the sibling pages receive.
-        // `build_hw_roster` is UNFILTERED: HomeRoutes narrows it by the gate's scope.
+        // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
+        // attention, estate state). Every figure arrives through a closure over an
+        // existing typed read; the gates are the SAME fleet_read_fn / perm_fn the
+        // sibling pages receive. `build_hw_roster` is UNFILTERED: the route narrows
+        // it by the gate's scope.
         static_assert(static_cast<int>(home::kRosterReadCap) == OfflineEndpointStore::kQueryRowCap,
-                      "Home labels a roster read as a lower bound at the store's row cap");
-        home_routes_ = std::make_unique<home::HomeRoutes>();
-        home_routes_->register_routes(
+                      "The Dashboard labels a roster read as a lower bound at the store's row cap");
+        dashboard_summary_routes_ = std::make_unique<home::DashboardSummaryRoutes>();
+        dashboard_summary_routes_->register_routes(
             *web_server_,
             home::Deps{
                 .auth_fn = auth_fn,
@@ -18234,8 +18235,8 @@ private:
                 // count is durable presence only (local sessions not yet persisted are
                 // not in it) and uses the same TTL as the registry's presence read
                 // (cfg_.session_timeout).
-                // NOT confined: HomeRoutes only calls this when the gate returned
-                // `scope == nullopt`, and caches a successful answer for 60 s.
+                // NOT confined: the summary route only calls this when the gate
+                // returned `scope == nullopt`, and caches a successful answer for 60 s.
                 .fleet_estate_fn =
                     [this](std::int64_t now_ms) -> std::optional<home::EstateCounts> {
                     if (!offline_endpoint_store_)
@@ -18305,7 +18306,7 @@ private:
                 },
             });
 
-        // HM-2: Home "Compliance by policy" and "Recent activity" fragments (the
+        // HM-2: Dashboard "Compliance by policy" and "Recent events" fragments (the
         // "Server health" panel registers from health_routes.cpp, where
         // `health_handler` is in scope). Gates are the same closures
         // HardwareRoutes receives; the audit panel is effective-admin-only and is
@@ -18338,7 +18339,7 @@ private:
             // Nav-resolved: empty when no `audit` nav item exists, which omits the
             // "Audit log" button.
             hp.audit_href = home::resolve_links(shell::nav_groups()).audit;
-            yuzu::server::home_panels::register_home_panel_routes(home_panels_sink, std::move(hp));
+            yuzu::server::home_panels::register_dashboard_panel_routes(home_panels_sink, std::move(hp));
         }
 
         // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the
@@ -21407,7 +21408,7 @@ private:
     std::unique_ptr<DeviceLensRoutes> device_lens_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<HardwareRoutes> hardware_routes_;
-    std::unique_ptr<home::HomeRoutes> home_routes_;
+    std::unique_ptr<home::DashboardSummaryRoutes> dashboard_summary_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;
     std::unique_ptr<AppUsageRoutes> app_usage_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;

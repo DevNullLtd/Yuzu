@@ -129,8 +129,8 @@
   },
   {
     "method": "GET",
-    "path": "/fragments/home/summary",
-    "capability_id": "get.fragments-home-summary",
+    "path": "/fragments/dashboard/summary",
+    "capability_id": "get.fragments-dashboard-summary",
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "composed-of:get.fragments-hardware-list,get.api-approvals-pending-count,get.fragments-executions,get.api-compliance"
