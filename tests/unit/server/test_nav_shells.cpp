@@ -195,7 +195,7 @@ TEST_CASE("app shell: sub-items show only for the active family and light their 
     const auto on_instructions = render_shell({.active_key = "instructions"});
     CHECK(count_of(on_instructions, "class=\"shell-sub\"") == 1);
     CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/executions\">Executions</a>"));
-    CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/approvals\">Approvals</a>"));
+    CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/approvals\">Approvals<span class=\"shell-badge\""));
     const auto on_executions = render_shell({.active_key = "executions"});
     CHECK(highlighted_hrefs(on_executions) ==
           std::vector<std::string>{"/instructions", "/executions"});
@@ -411,6 +411,31 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         const auto page_only = html.substr(0, sb) + html.substr(se);
         CHECK(count_of(page_only, "palette=1'") + count_of(page_only, "palette=1\"") == 0);
     }
+}
+
+TEST_CASE("app shell: approvals badge is hidden until the count answers, polls every 30 s and stops on a refusal",
+          "[nav][shell]") {
+    const std::string_view badge =
+        R"(<span class="shell-badge" id="nav-approvals-badge" hidden><span id="nav-approvals-n"></span>)"
+        R"(<span class="shell-sr"> pending</span></span>)";
+    for (const char* key : {"approvals", "executions", "instructions"})
+        CHECK(count_of(render_shell({.active_key = key}), badge) == 1);
+    CHECK(count_of(render_shell({.active_key = "dashboard"}), badge) == 0);
+
+    const auto html = render_shell({.active_key = "approvals"});
+    CHECK(count_of(html, "fetch('/api/approvals/pending/count',{signal:AbortSignal.timeout(5000)})") == 1);
+    CHECK(count_of(html, "setInterval(pollBadge,30000)") == 1);
+    CHECK(count_of(html, "if(r.status===401||r.status===403){bstop=true;") == 1);
+    CHECK(count_of(html, "if(!badge||bstop||document.hidden||binflight)return;") == 1);
+    CHECK(count_of(html, "if(typeof n!=='number')throw new Error('payload');") == 2);
+    CHECK(count_of(html, ".catch(function(){badge.hidden=true;})") == 1);
+    CHECK(count_of(html, "badge.hidden=n<=0;") == 1);
+    CHECK(count_of(html, "n>99?'99+'") == 1);
+    // Only the health poll omits credentials; the badge fetch rides the session cookie.
+    CHECK(count_of(html, "credentials:'omit'") == 1);
+    // No aria-label on the span (A18) and no event dispatch (O7).
+    CHECK_THAT(html, !ContainsSubstring("setAttribute('aria-label'"));
+    CHECK_THAT(html, !ContainsSubstring("yuzu:approvals-count"));
 }
 
 TEST_CASE("the shared detail shell re-targets to every route that reuses it", "[nav][shell][pages]") {
