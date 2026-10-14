@@ -7313,9 +7313,9 @@ Page through a result set's member device ids.
 
 | Status | Reason |
 |---|---|
-| 403 | Service-scoped API token |
+| 403 | Service-scoped API token, or the caller lacks `Infrastructure:Read` |
 | 404 | No such set, or not owned by the caller |
-| 503 | Result-set store unavailable |
+| 503 | Result-set store unavailable, or the visibility check is unavailable |
 
 #### `GET /api/v1/result-sets/{id}/lineage`
 
@@ -10932,7 +10932,7 @@ data: {"execution_id":"exec-abc123","event_id":119,"timestamp_ms":...,"type":"ag
 
 Execute a TAR warehouse SQL query against targeted agents. Returns HTMX HTML fragments: a `thead` OOB swap with dynamic column headers and sets up an SSE stream for result rows.
 
-**Permission:** `Execution:Execute`
+**Permission:** `Execution:Execute`. A browser (session-cookie) caller must also send a same-site `Origin` or `Referer` naming the console; one without either, or from another site, is answered `403` and audited as `csrf.denied` before anything is parsed or dispatched. Token callers are exempt. The same rule applies to `POST /api/dashboard/execute`.
 
 **Request body (form-encoded):**
 
@@ -10946,6 +10946,7 @@ Execute a TAR warehouse SQL query against targeted agents. Returns HTMX HTML fra
 ```bash
 curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
   -H "Cookie: yuzu_session=abc123" \
+  -H "Origin: https://yuzu.example.com" \
   -d "sql=SELECT name, pid FROM \$Process_Live LIMIT 10" \
   -d "scope=__all__"
 ```
@@ -10960,7 +10961,7 @@ curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
 
 #### `GET /tar`
 
-Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list, the ad-hoc TAR SQL frame, and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`).
+Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list, the capture sources frame and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`). The Ad-hoc TAR SQL form is no longer on this page: a short note links to the Result sets page, where **From TAR query** takes the same parent scope, SQL, name and include-empty fields.
 
 **Permission:** Session-only (the page itself; embedded fragment endpoints carry their own permission gates — see below).
 
