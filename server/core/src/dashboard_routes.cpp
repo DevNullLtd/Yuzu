@@ -1385,6 +1385,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // the reverse-lookup resolved one, so SIEM correlation
                  // between command.dispatch and execution.visualization.fetch
                  // (2s later) is traceable by definition.
+                 // The one marker that a send was dispatched. Every refusal above also answers
+                 // 200 (the console swaps fragments and a 4xx body would be dropped), so the
+                 // page cannot tell a send from a refusal by status: its History list adds a row
+                 // only when this header is present.
+                 res.set_header("X-Yuzu-Dispatched", std::to_string(sent));
                  std::string detail =
                      plugin + ":" + action + " -> " + std::to_string(sent) + " agent(s)";
                  if (!def_id.empty())

@@ -772,10 +772,12 @@ const char* const kDashboardIndexTemplate =
     }
 
     /* ── Command history ─────────────────────────────────── */
-    function addHistory(cmd, scope) {
+    /* masked: the text shown had secret values replaced, so it is not the command that ran and
+       must never be sent again from History. */
+    function addHistory(cmd, scope, masked) {
       var now = new Date();
       var ts = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      commandHistory.unshift({ cmd: cmd, scope: scope, timestamp: ts });
+      commandHistory.unshift({ cmd: cmd, scope: scope, timestamp: ts, masked: !!masked });
       if (commandHistory.length > 50) commandHistory.length = 50;
       renderHistory();
     }
@@ -800,7 +802,18 @@ const char* const kDashboardIndexTemplate =
         div.innerHTML = '<div class="history-cmd">' + escapeHtml(h.cmd) + '</div>' +
           '<div class="history-meta">' + escapeHtml(h.timestamp) + ' &middot; ' + escapeHtml(h.scope) + '</div>';
         div.setAttribute('data-cmd', h.cmd);
+        if (h.masked) div.setAttribute('data-masked', '1');
         div.addEventListener('click', function() {
+          if (this.getAttribute('data-masked') === '1') {
+            /* The stored text has the secret values replaced; putting it in the box and
+               sending would send the placeholder as the value. Ask for it to be typed again. */
+            var rc = document.getElementById('result-context');
+            if (rc) {
+              rc.textContent = 'That command had secret values, which History does not keep. Type it again to send it.';
+              rc.className = 'result-context is-error';
+            }
+            return;
+          }
           document.getElementById('instr-input').value = this.getAttribute('data-cmd');
           sendInstruction();
         });

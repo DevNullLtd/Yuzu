@@ -387,6 +387,49 @@ TEST_CASE("scope_expression audit: a send that reaches no agent records a failur
     CHECK(failure);
 }
 
+TEST_CASE("dashboard execute: only a dispatched send carries X-Yuzu-Dispatched, the marker the "
+          "History list waits for (mutation: set it before the refusals and a refused send is "
+          "logged as sent)",
+          "[server][dashboard][execute][history]") {
+    SECTION("a send that reaches agents carries the count") {
+        Harness h;
+        auto res = h.post("instruction=version&scope=__all__");
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("X-Yuzu-Dispatched") == "3");
+    }
+    SECTION("an expression send that reaches agents carries it too") {
+        Harness h;
+        auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+        CHECK(res->get_header_value("X-Yuzu-Dispatched") == "3");
+    }
+    SECTION("the Destructive refusal answers 200 and does not carry it") {
+        Harness h;
+        h.resolve_to = {kDestructive.first, kDestructive.second};
+        auto res = h.post("instruction=purge&scope=__all__");
+        CHECK(res->status == 200);
+        CHECK(h.calls.empty());
+        CHECK(contains(res->body, "is-error"));
+        CHECK_FALSE(res->has_header("X-Yuzu-Dispatched"));
+    }
+    SECTION("a send that reaches no agent answers 200 and does not carry it") {
+        Harness h;
+        h.sent = 0;
+        auto res = h.post("instruction=version&scope=__all__");
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "is-error"));
+        CHECK_FALSE(res->has_header("X-Yuzu-Dispatched"));
+    }
+    SECTION("an empty instruction, a refused expression and an unstored audit row do not carry it") {
+        Harness h;
+        CHECK_FALSE(h.post("instruction=")->has_header("X-Yuzu-Dispatched"));
+        CHECK_FALSE(h.post("instruction=version&scope_expression=" + enc(R"(ostypo != "windows")"))
+                        ->has_header("X-Yuzu-Dispatched"));
+        h.persist_ok = false;
+        CHECK_FALSE(h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"))
+                        ->has_header("X-Yuzu-Dispatched"));
+    }
+}
+
 // Same-site gate (browser_write_is_cross_site): a cookie session needs an Origin or Referer naming
 // this site. The refusal comes before any parsing, the audit-before-dispatch row and the dispatch.
 TEST_CASE("dashboard execute: a cookie-session write without a same-site Origin is refused",

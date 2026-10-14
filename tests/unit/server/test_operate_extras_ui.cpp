@@ -132,12 +132,46 @@ TEST_CASE("operate extras: fan-out confirm, history masking and the 403 listener
     // History and the confirm echo both pass typed text through the mask.
     CHECK(has(js, "body.dataset.secretParams"));
     CHECK(has(js, "(hidden: the secret parameter list is unavailable)"));
-    CHECK(has(js, "window.addHistory(maskSecrets(cmd)"));
+    CHECK(has(js, "var shown = maskSecrets(cmd);"));
+    CHECK(has(js, "window.addHistory(shown,"));
+    // The raw command is never handed to History, and History is not fed from a status alone.
+    CHECK_FALSE(has(js, "window.addHistory(cmd"));
     CHECK(has(js, "['Command', maskSecrets(cmd)]"));
     // The TAR form explains the substring blocklist (S10).
     CHECK(has(js, "updated_at or created_by"));
     // The SQL is shown before it is sent.
     CHECK(has(js, "'Run this query?'"));
+}
+
+TEST_CASE("operate extras: History is fed only by a dispatched send and never replays a masked "
+          "command",
+          "[ui][operate_extras][security]") {
+    const auto& js = yuzu::server::kYuzuOperateExtrasJs;
+    const std::string page = kDashboardIndexHtml;
+    // A 2xx is not a send (refusals answer 200): the hook waits for the server's own marker.
+    const auto hook = js.find("form.addEventListener('htmx:afterRequest'");
+    REQUIRE(hook != std::string::npos);
+    const auto marker = js.find("getResponseHeader('X-Yuzu-Dispatched')", hook);
+    const auto add = js.find("window.addHistory(", hook);
+    REQUIRE(marker != std::string::npos);
+    REQUIRE(add != std::string::npos);
+    CHECK(marker < add);
+    // An entry whose text changed under the mask is flagged.
+    CHECK(has(js, "shown !== cmd"));
+    // The page stores the flag and refuses to replay a flagged entry: the check comes before the
+    // placeholder text is put in the box and before the send.
+    CHECK(has(page, "function addHistory(cmd, scope, masked)"));
+    CHECK(has(page, "masked: !!masked"));
+    CHECK(has(page, "div.setAttribute('data-masked', '1')"));
+    const auto click = page.find("if (this.getAttribute('data-masked') === '1')");
+    const auto fill = page.find("getElementById('instr-input').value = this.getAttribute('data-cmd')");
+    const auto send = page.find("sendInstruction();", fill);
+    REQUIRE(click != std::string::npos);
+    REQUIRE(fill != std::string::npos);
+    REQUIRE(send != std::string::npos);
+    CHECK(click < fill);
+    CHECK(fill < send);
+    CHECK(has(page, "which History does not keep. Type it again to send it."));
 }
 
 TEST_CASE("operate extras: an expression send omits scope-input and needs a preview or a retype",
@@ -147,7 +181,7 @@ TEST_CASE("operate extras: an expression send omits scope-input and needs a prev
     CHECK(has(js, "scopeField.disabled = !!e"));
     CHECK(has(js, "exprField.disabled = !e"));
     const std::string page = kDashboardIndexHtml;
-    CHECK(has(page.c_str(), "name=\"scope_expression\" id=\"ox-scope-expression\" value=\"\" disabled"));
+    CHECK(has(page, "name=\"scope_expression\" id=\"ox-scope-expression\" value=\"\" disabled"));
     // Rule 8: reaches the send only through a same-expression preview or a typed retype.
     CHECK(has(js, "previewed.expression === expr"));
     CHECK(has(js, "Retype the expression to confirm."));

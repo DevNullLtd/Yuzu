@@ -809,15 +809,23 @@
     if (window.YuzuDialog) window.__yuzuDashboardConfirmReady = true;
 
     /* ---- History: the Console's History panel has had no caller since the
-       HTMX refactor (e39654155); feed it from a completed send, masked. ---- */
+       HTMX refactor (e39654155); feed it from a send the server dispatched.
+       The route answers 200 for a refusal too (destructive target, no agent reached,
+       unknown command), so success is not a status: only the dispatch response carries
+       X-Yuzu-Dispatched. Only the masked text is ever stored. An entry whose text changed
+       under the mask carries masked=true, and the page does not replay it. ---- */
     var form = $('instr-form');
     if (form) {
       form.addEventListener('htmx:afterRequest', function (evt) {
         if (evt.target !== form || !evt.detail || !evt.detail.successful) return;
+        var xhr = evt.detail.xhr;
+        if (!xhr || !xhr.getResponseHeader('X-Yuzu-Dispatched')) return;
         var input = $('instr-input');
         var cmd = input ? input.value.trim() : '';
         if (!cmd || typeof window.addHistory !== 'function') return;
-        window.addHistory(maskSecrets(cmd), exprValue() ? 'Expression: ' + exprValue() : sendTarget().label);
+        var shown = maskSecrets(cmd);
+        window.addHistory(shown, exprValue() ? 'Expression: ' + exprValue() : sendTarget().label,
+                          shown !== cmd);
       });
     }
 
