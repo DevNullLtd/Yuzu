@@ -107,6 +107,52 @@ enum class PresenceReadError { StoreUnavailable, DbError, Truncated };
 /// One offline-roster read, as `OfflineEndpointStore::query_stale_within` returns it (#5531).
 using OfflineRosterRead = std::expected<std::vector<OfflineEndpoint>, PresenceReadError>;
 
+/// Fleet-wide roster tallies from one SQL statement (no row materialised, no
+/// `kQueryRowCap`). `total` is every endpoint inside the roster window; the
+/// platform buckets partition it exactly (`windows + linux + macos + other ==
+/// total`). `stale` counts rows whose last HEARTBEAT is older than the stale
+/// threshold, so it overlaps rows the registry reports online — combine with
+/// the online count through `partition_fleet_state`, never subtract blindly.
+struct FleetStateCounts {
+    std::int64_t total{0};
+    std::int64_t stale{0};
+    /// Rows `query_live_ids(live_ttl)` would return (non-blank session, DB-clock
+    /// `last_seen_at` inside the TTL) AND inside the roster window — counted in
+    /// SQL, so it stays exact past `kQueryRowCap` where `known_agent_count()`
+    /// is unavailable. Durable-presence only: it does not add local sessions
+    /// the store has not yet persisted.
+    std::int64_t live{0};
+    std::int64_t windows{0};
+    std::int64_t linux_os{0};
+    std::int64_t macos{0};
+    std::int64_t other{0};
+};
+
+enum class FleetPlatform { Windows, Linux, MacOs, Other };
+
+/// Maps a stored `os` string onto exactly one platform bucket, using the same
+/// spellings the Hardware list filters accept (`windows|win`, `linux|lin`,
+/// `darwin|macos|mac`, case-insensitive). Anything else, blank included, is
+/// `Other`, so the buckets always partition.
+[[nodiscard]] FleetPlatform fleet_platform_of(std::string_view os);
+
+/// Three disjoint segments that always sum to the (clamped) total.
+struct FleetStatePartition {
+    std::int64_t online{0};
+    std::int64_t not_seen{0}; ///< Not online and heartbeat older than the stale threshold.
+    std::int64_t offline{0};  ///< Not online, heartbeat inside the stale threshold.
+};
+
+/// `online` is the registry's count, `stale` the SQL heartbeat-age count; the
+/// two overlap on online-and-stale rows. Online wins, `not_seen` is capped at
+/// the rows left over, `offline` takes the remainder; nothing is negative and
+/// the sum is always `max(total, 0)`. Over-states `not_seen` by the number of
+/// online-and-stale rows (a connected agent whose heartbeat row lags). An
+/// `online` above `total` is clamped, which hides agents the store holds no
+/// row for (failed presence upserts, or rows outside the roster window).
+[[nodiscard]] FleetStatePartition partition_fleet_state(std::int64_t total, std::int64_t online,
+                                                        std::int64_t stale) noexcept;
+
 class OfflineEndpointStore {
 public:
     /// Hard cap on rows materialised by `query_stale_within`/`query_live_ids`
@@ -192,6 +238,28 @@ public:
     /// store that never opened — boot-time migration failure — answers
     /// `StoreUnavailable` without a count or warn, as `query_live_ids` does).
     [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window);
+
+    /// Fleet tallies over the same roster window `query_stale_within` serves,
+    /// computed in ONE `COUNT(*) [FILTER ...] ... GROUP BY lower(os)` statement.
+    /// `now_ms` is injected (the caller's clock); `stale_after` is the "not seen"
+    /// threshold; `live_ttl` is the presence TTL for `FleetStateCounts::live`
+    /// (judged on the DATABASE clock, unlike `total`/`stale`, which use `now_ms`).
+    ///
+    /// UNCACHED, and it costs seconds at fleet scale (a parallel seq scan holding
+    /// one pool lease; 1-3 s measured at 2M rows on one noisy host): the consumer
+    /// MUST cache it (~60 s) rather than call it per view. Typed like
+    /// `query_stale_within`: a failed read is `std::unexpected`
+    /// (`StoreUnavailable` / `DbError`, counted on
+    /// `yuzu_server_agent_presence_store_failed_total{op=fleet_state_counts}`),
+    /// never a zero struct. `Truncated` is never produced: there is no row cap.
+    ///
+    /// NOT CONFINED: this is a fleet-wide aggregate that knows nothing about
+    /// the caller's management-group scope. Callers must gate (fleet read, and
+    /// `scope == nullopt`); a scope-engaged caller keeps the roster +
+    /// `authz::in_scope` path.
+    [[nodiscard]] std::expected<FleetStateCounts, PresenceReadError>
+    fleet_state_counts(std::int64_t now_ms, std::chrono::seconds window,
+                       std::chrono::milliseconds stale_after, std::chrono::seconds live_ttl);
 
     /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
     /// DATABASE clock (`now()` in-SQL, never the replica's own

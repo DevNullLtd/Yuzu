@@ -220,6 +220,8 @@
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
 #include "hardware_routes.hpp"
+#include "home_routes.hpp" // Home (/home): landing worklist over injected seams
+#include "home_panels_routes.hpp" // HM-2: Home policies + activity fragments
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
@@ -15476,6 +15478,7 @@ private:
                              .auth_fn = auth_fn,
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .fleet_read_fn = fleet_read_fn, // HM-2 /fragments/home/health
                              .cfg = &cfg_,
                              .metrics = &metrics_,
                              .registry = &registry_,
@@ -18203,6 +18206,140 @@ private:
                                                              dex_iso_since(7));
                                  },
                          });
+
+        // HomeRoutes — /home landing worklist (readout, estate, needs attention).
+        // Every figure arrives through a closure over an existing typed read; the
+        // gates are the SAME fleet_read_fn / perm_fn the sibling pages receive.
+        // `build_hw_roster` is UNFILTERED: HomeRoutes narrows it by the gate's scope.
+        static_assert(static_cast<int>(home::kRosterReadCap) == OfflineEndpointStore::kQueryRowCap,
+                      "Home labels a roster read as a lower bound at the store's row cap");
+        home_routes_ = std::make_unique<home::HomeRoutes>();
+        home_routes_->register_routes(
+            *web_server_,
+            home::Deps{
+                .auth_fn = auth_fn,
+                .deny_service_scoped_fn = deny_service_scoped_fn,
+                .fleet_read_fn = fleet_read_fn,
+                .perm_fn = perm_fn,
+                .now_fn = []() -> std::int64_t {
+                    return std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+                },
+                .roster_fn = build_hw_roster,
+                // TOP callers: one SQL statement instead of the 100k-row-capped roster.
+                // Online is the registry's union count (local sessions + durable
+                // presence); when that is typed-unavailable (past the presence row cap,
+                // or a presence-store error) the SQL durable-live count stands in. That
+                // count is durable presence only (local sessions not yet persisted are
+                // not in it) and uses the same TTL as the registry's presence read
+                // (cfg_.session_timeout).
+                // NOT confined: HomeRoutes only calls this when the gate returned
+                // `scope == nullopt`, and caches a successful answer for 60 s.
+                .fleet_estate_fn =
+                    [this](std::int64_t now_ms) -> std::optional<home::EstateCounts> {
+                    if (!offline_endpoint_store_)
+                        return std::nullopt;
+                    auto c = offline_endpoint_store_->fleet_state_counts(
+                        now_ms, kHardwareRosterWindow,
+                        std::chrono::milliseconds(kHardwareStaleAfterMs), cfg_.session_timeout);
+                    if (!c)
+                        return std::nullopt;
+                    std::int64_t online = c->live;
+                    if (auto known = registry_.known_agent_count())
+                        online = static_cast<std::int64_t>(*known);
+                    const auto p = partition_fleet_state(c->total, online, c->stale);
+                    return home::EstateCounts{c->total, p.online, p.not_seen, p.offline};
+                },
+                .compliance_fn = [compliance_api]() -> std::optional<home::ComplianceFigure> {
+                    if (!compliance_api)
+                        return std::nullopt;
+                    auto fc = compliance_api->fleet_compliance();
+                    if (!fc)
+                        return std::nullopt;
+                    return home::ComplianceFigure{fc->total_checks, fc->compliant, fc->non_compliant,
+                                                  fc->unknown, fc->compliance_pct};
+                },
+                .failed_fn = [this]() -> std::optional<std::vector<home::FailedRow>> {
+                    if (!execution_tracker_)
+                        return std::nullopt;
+                    auto rows = execution_tracker_->query_executions_checked(
+                        {.status = "failed", .limit = static_cast<int>(home::kFailedReadCap)});
+                    if (!rows)
+                        return std::nullopt;
+                    std::vector<home::FailedRow> out;
+                    out.reserve(rows->size());
+                    for (const auto& e : *rows)
+                        out.push_back({e.completed_at, e.dispatched_at});
+                    return out;
+                },
+                .approvals_fn = [this]() -> std::optional<home::ApprovalFigure> {
+                    if (!approval_manager_)
+                        return std::nullopt;
+                    auto n = approval_manager_->pending_count_checked();
+                    if (!n)
+                        return std::nullopt;
+                    home::ApprovalFigure f;
+                    f.count = *n;
+                    // "Oldest" needs the capped list; a truncated list has no honest oldest.
+                    auto list = approval_manager_->query_checked({.status = "pending"});
+                    if (list && !list->truncated) {
+                        std::int64_t oldest = 0;
+                        for (const auto& a : list->approvals)
+                            if (a.submitted_at > 0 && (oldest == 0 || a.submitted_at < oldest))
+                                oldest = a.submitted_at;
+                        if (oldest > 0)
+                            f.oldest = oldest;
+                    }
+                    return f;
+                },
+                .enrolment_fn = [this]() -> std::optional<std::int64_t> {
+                    auto pending = auth_mgr_.list_pending_agents();
+                    if (!pending)
+                        return std::nullopt;
+                    std::int64_t n = 0;
+                    for (const auto& a : *pending)
+                        if (a.status == auth::PendingStatus::pending)
+                            ++n;
+                    return n;
+                },
+            });
+
+        // HM-2: Home "Compliance by policy" and "Recent activity" fragments (the
+        // "Server health" panel registers from health_routes.cpp, where
+        // `health_handler` is in scope). Gates are the same closures
+        // HardwareRoutes receives; the audit panel is effective-admin-only and is
+        // NOT confined (see home_panels_routes.hpp).
+        {
+            HttplibRouteSink home_panels_sink{*web_server_};
+            yuzu::server::home_panels::Deps hp;
+            hp.auth_fn = auth_fn;
+            hp.deny_service_scoped_fn = deny_service_scoped_fn;
+            hp.fleet_read_fn = fleet_read_fn;
+            hp.perm_fn = perm_fn;
+            // One cached read of every policy's counts; NOT confined, and only
+            // called when the gate returned `scope == nullopt`.
+            hp.policies_fn = [compliance_api]() {
+                return yuzu::server::home_panels::read_policy_panel(*compliance_api);
+            };
+            hp.audit_fn = [this](int limit) -> std::optional<std::vector<AuditEvent>> {
+                if (!audit_store_)
+                    return std::nullopt;
+                AuditQuery q;
+                q.limit = limit;
+                return audit_store_->query(q);
+            };
+            hp.now_fn = [] {
+                return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                                     std::chrono::system_clock::now()
+                                                         .time_since_epoch())
+                                                     .count());
+            };
+            // Nav-resolved: empty when no `audit` nav item exists, which omits the
+            // "Audit log" button.
+            hp.audit_href = home::resolve_links(shell::nav_groups()).audit;
+            yuzu::server::home_panels::register_home_panel_routes(home_panels_sink, std::move(hp));
+        }
 
         // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the
         // NEW SoftwareLicensing securable via the FAIL-CLOSED enforcement primitive
@@ -21270,6 +21407,7 @@ private:
     std::unique_ptr<DeviceLensRoutes> device_lens_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<HardwareRoutes> hardware_routes_;
+    std::unique_ptr<home::HomeRoutes> home_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;
     std::unique_ptr<AppUsageRoutes> app_usage_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;

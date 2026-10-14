@@ -73,6 +73,10 @@ public:
     policy_agent_statuses(const std::string&) const override {
         return std::vector<PolicyAgentStatus>{};
     }
+    std::expected<std::vector<ComplianceSummary>, PolicyReadError>
+    compliance_by_policy() const override {
+        return std::vector<ComplianceSummary>{};
+    }
 };
 
 ComplianceRoutes::ComplianceApiPtr empty_seam() {

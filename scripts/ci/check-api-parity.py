@@ -201,13 +201,22 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # DEX Alerts tab (posture PR-E): GET /fragments/dex/alerts is "composed-of" the legacy
 # settings fragment (+1, 199 -> 200); the fragment's three POSTs stay planned:#2146.
 #
+# 2026-10-14 (Home page, HM-1): +1 `composed-of:` row, GET /fragments/home/summary (readout,
+# needs attention) over the existing hardware roster, approvals count,
+# executions and fleet-compliance reads; a UI fragment, no machine twin owed (ADR-1005).
+# Measured with the checker at 200 (199 + 1), not hand-picked; whoever lands second re-reads it.
 # Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
 # is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
 # which counts as untwinned by design, so the count rises 199 -> 200.
 #
 # Both of the two changes above landed on 199; merged together the count is 201
 # (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
-BASELINE_UNTWINNED = 201
+#
+# 2026-10-14 (Home panels, HM-2): +3. The three Home fragments (/fragments/home/policies,
+# /fragments/home/activity, /fragments/home/health) are UI-only compositions over existing
+# twinned or planned reads, so each is a composed-of row that counts untwinned. Measured with the checker at 204 (201 + 3).
+# Merged with dev (201) in the Home and bell bundle: 201 + 1 + 3, re-read from the checker below.
+BASELINE_UNTWINNED = 205
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -144,6 +145,28 @@ public:
     [[nodiscard]] std::expected<ComplianceSummary, PolicyReadError>
     get_compliance_summary(const std::string& policy_id) const;
     [[nodiscard]] std::expected<FleetCompliance, PolicyReadError> get_fleet_compliance() const;
+    /// Per-policy compliance for EVERY policy with at least one status row, in
+    /// one `GROUP BY policy_id, status` read (replaces an N+1 of
+    /// `get_compliance_summary`; the per-policy counts are the same raw
+    /// `status` tally, so the two agree). Rows come back ordered by
+    /// `policy_id`. Cached for the same 60 s as `get_fleet_compliance` and
+    /// dropped by the same invalidation hook; a degraded read is
+    /// `kDegraded` and never populates the cache.
+    ///
+    /// NOT CONFINED: fleet-wide counts with no management-group scope. Callers
+    /// must gate (fleet read, `scope == nullopt`).
+    ///
+    /// Counts raw `status` rows (so each row equals `get_compliance_summary(id)`),
+    /// NOT the `effective_status` staleness rule `get_fleet_compliance` applies —
+    /// do not sum these rows into a fleet figure. Policies with no status row are
+    /// absent; the caller joins against the policy list.
+    [[nodiscard]] std::expected<std::vector<ComplianceSummary>, PolicyReadError>
+    compliance_by_policy_checked() const;
+
+    /// Test seam: the by-policy cache reads this clock instead of
+    /// `steady_clock::now()` so TTL expiry is testable without sleeping.
+    using CacheClock = std::function<std::chrono::steady_clock::time_point()>;
+    void set_cache_clock_for_test(CacheClock clock) { cache_clock_ = std::move(clock); }
 
     // ── Cache invalidation ───────────────────────────────────────────────
     /// Reset all agent statuses to 'unknown' for a specific policy, forcing
@@ -268,6 +291,10 @@ private:
     mutable FleetCompliance cached_fleet_compliance_;
     mutable std::chrono::steady_clock::time_point fleet_compliance_last_computed_{};
     static constexpr auto kFleetComplianceCacheTtl = std::chrono::seconds(60);
+    // Same TTL and the same invalidation hook, guarded by cache_mtx_.
+    mutable std::vector<ComplianceSummary> cached_by_policy_;
+    mutable std::chrono::steady_clock::time_point by_policy_last_computed_{};
+    CacheClock cache_clock_; // test seam: set before first use, single-threaded; NOT under cache_mtx_
 
     // ADR-0012 §4 rule 2: invalidate synchronously on the store's OWN writes,
     // after the write lands. Called by every mutator of policy_status
