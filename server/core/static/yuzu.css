@@ -423,6 +423,15 @@ td > .bar { min-width: 110px; }
 .page-header .subtitle { color: var(--mut); margin-top: 4px; max-width: 70ch; }
 .page-header .header-actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 
+/* Operate pages (approvals, executions): count chip, key-value list, button row */
+.chip { font-size: 13px; color: var(--mut); }
+.chip b { color: var(--ink); font-weight: 600; margin-left: 3px; }
+.btns { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 16px; }
+.kvl > div { display: flex; justify-content: space-between; gap: 16px; padding: 9px 16px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+.kvl > div:last-child { border-bottom: 0; }
+.kvl span { color: var(--mut); }
+.kvl b { font-weight: 500; color: var(--ink); text-align: right; }
+
 /* Toasts - pop-overs, so they alone carry the shadow. No entrance animation. */
 .toast-container { position: fixed; top: var(--sp-4); right: var(--sp-4); z-index: 5000;
                    display: flex; flex-direction: column; gap: var(--sp-2); pointer-events: none; }
