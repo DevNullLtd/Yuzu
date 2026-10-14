@@ -169,6 +169,22 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 
 ---
 
+## Settings: Integrations page
+
+**Settings → Integrations** (`/settings/integrations`, admin only; both panels also stay on the
+`/settings` page).
+
+- **MCP server** enables or disables the endpoint and sets Read-only or Full access, with one
+  Save. The confirmation names the state being saved (MCP off, on in read-only mode, or on with
+  write and execute tools). A change lasts until the server restarts, then the start-up flags
+  (`--mcp-disable`, `--mcp-read-only`) apply again; a server started with `--mcp-disable` does not
+  serve MCP until it is restarted without it.
+- **Gateway** shows the upstream-service state, the listen address, the gateway mode and the
+  number of agents connected through the gateway, the flag guidance for a server where the
+  upstream service is not running, and the gateway environment-variable reference.
+
+---
+
 ## Configuration Files
 
 The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg` on Linux, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) and its runtime state files live on disk; the state files are written to `--data-dir` (default: the directory containing the config file). Apart from those files, the NVD cache and the `agent-updates/`/`upload-blobs/` file directories, everything — users, sessions, MFA/TOTP, SCIM and every other server store — lives in PostgreSQL (see [PostgreSQL Substrate](#postgresql-substrate)). There is no `auth.db`; legacy `*.db` files left in `--data-dir` by older releases are only probed at startup to warn, never read.
@@ -234,6 +250,15 @@ separately.
 ---
 
 ## Upgrade Notes
+
+### vNEXT - `POST /api/settings/mcp` now refuses a body that omits or repeats `enabled` or `read_only` (breaking for scripted callers)
+
+The dashboard route behind the MCP settings form used to read the first `enabled` and `read_only`
+value it found and treat an absent one as `false`: a request carrying only `enabled=true` switched
+Read-only MCP to Full access, and an empty request switched MCP off. It now requires exactly one
+`enabled` and exactly one `read_only`, each `true` or `false`, and answers `400` with nothing
+changed otherwise. The rebuilt panel always sends both. A script that posted a single field must
+send both.
 
 ### vNEXT - `--gateway-upstream` refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs)
 
