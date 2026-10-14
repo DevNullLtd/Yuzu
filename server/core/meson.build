@@ -617,8 +617,10 @@ yuzu_server_core_lib = static_library(
     'src/guardian_page_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',
+    'src/list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
     'src/workflow_engine.cpp',
     'src/workflow_model.cpp',
+    'src/workflow_execution_list_model.cpp', # shared REST+MCP parser/row builder for the run list
     'src/workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
