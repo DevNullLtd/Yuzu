@@ -376,10 +376,11 @@ Query audit events with filtering and pagination. Maximum page size is 1000.
 | `limit` | integer | Number of events to return (default 100, max 1000) |
 | `principal` | string | Filter by principal username |
 | `action` | string | Filter by action (exact match) |
-
-Note: the v1 endpoint supports `principal` and `action` filters only. For
-additional filters (`target_type`, `target_id`, `since`, `until`, `offset`),
-use the legacy `/api/audit` endpoint.
+| `target_type` | string | Filter by target type (exact match) |
+| `target_id` | string | Filter by target id (exact match); requires `target_type` |
+| `since` | integer | Inclusive lower bound, epoch seconds; `0` or absent is unbounded |
+| `until` | integer | Inclusive upper bound, epoch seconds; `0` or absent is unbounded |
+| `offset` | integer | Rows to skip, `0`..`10000` (default 0) |
 
 **Example --- fetch the 20 most recent events:**
 
@@ -394,6 +395,7 @@ curl -s -b cookies.txt \
 {
   "data": [
     {
+      "id": 4101,
       "timestamp": 1710849600,
       "principal": "admin",
       "action": "tag.set",
@@ -406,7 +408,7 @@ curl -s -b cookies.txt \
   "pagination": {
     "total": 20,
     "start": 0,
-    "page_size": 50
+    "page_size": 100
   },
   "meta": {
     "api_version": "v1"
@@ -415,17 +417,12 @@ curl -s -b cookies.txt \
 ```
 
 **`total` is the number of rows returned in this response, not the number of
-rows that matched** — the route caps at `limit` (max 1000) with no `offset`
-support, so a response at exactly `limit` rows can mean there are older
-matches you have not seen, not that you have everything. `page_size` is
-likewise always `50`, independent of the `limit` you actually passed
-([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If you hit the cap,
-narrow with `principal=`/`action=`, or use the legacy `GET /api/audit`
-endpoint, which also accepts `offset`. `since`/`until` alone only bounds the
-time window — it does not by itself guarantee completeness inside that
-window if more rows matched than one call returns. The reliable recipe is
-both together: freeze a bounded window with `since`/`until` first, then page
-through it with `offset`.
+rows that matched.** `start` echoes `offset` and `page_size` echoes `limit`; a
+page shorter than `limit` is the last page. Rows are ordered newest first and
+rows with an identical timestamp break by `id` (newest first), so `offset`
+paging neither repeats nor skips rows; use `id` to de-duplicate across pages.
+`offset` is capped at 10000 and never clamped (a larger value is a `400`). To
+read deeper, freeze a window with `since`/`until` and page inside it.
 
 **Example --- filter by principal and action:**
 
@@ -443,16 +440,17 @@ curl -s -b cookies.txt \
 
 ### GET /api/audit (legacy)
 
-The legacy endpoint supports the full set of query parameters and has no
-hard-coded limit cap. New integrations should prefer `/api/v1/audit` once
-additional filters are added there.
+The legacy endpoint caps `limit` at 1000 and rejects `offset` above 10000, the
+same ceilings as `/api/v1/audit`. New integrations should prefer
+`/api/v1/audit`, which now accepts the same filters and validates them
+strictly.
 
 **Query parameters:**
 
 | Parameter | Type | Description |
 |---|---|---|
-| `limit` | integer | Number of events to return (default 100, no hard cap) |
-| `offset` | integer | Offset for pagination (default 0) |
+| `limit` | integer | Number of events to return (default 100, max 1000) |
+| `offset` | integer | Offset for pagination, `0`..`10000` (default 0; larger is a `400`) |
 | `principal` | string | Filter by principal username |
 | `action` | string | Filter by action (exact match) |
 | `target_type` | string | Filter by target type |
@@ -475,7 +473,7 @@ response: `id`, `principal_role`, `source_ip`.
 
 ```bash
 curl -s -b cookies.txt \
-  'http://localhost:8080/api/audit?limit=5000&principal=admin' | jq .
+  'http://localhost:8080/api/audit?limit=1000&principal=admin' | jq .
 ```
 
 ## Dashboard viewer

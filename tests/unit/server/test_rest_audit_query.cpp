@@ -14,6 +14,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <memory>
@@ -74,6 +75,16 @@ struct QueryHarness {
             log("tie.a", "Tie", "x", 5000);
             log("tie.b", "Tie", "x", 5000);
             log("tie.c", "Tie", "x", 5000);
+            // Re-version the OLDEST tie row with an indexed column changed (non-HOT):
+            // its idx_audit_ts entry moves to the end of the tie group, so a bare
+            // `ORDER BY timestamp DESC` no longer yields ids in descending order by
+            // accident of insertion order. Only the `id DESC` tiebreak does.
+            auto lease = audit_pool->acquire();
+            REQUIRE(lease);
+            PGresult* up = PQexec(lease.get(), "UPDATE audit_store.audit_events "
+                                               "SET principal = 'admin2' WHERE action = 'tie.a'");
+            REQUIRE(PQresultStatus(up) == PGRES_COMMAND_OK);
+            PQclear(up);
         }
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
@@ -145,6 +156,17 @@ TEST_CASE("v1 audit: offset pages, pagination reports start/page_size, ties are 
     CHECK(total_rows == 6);
     CHECK(seen.size() == 6);
     CHECK(h.get("?limit=2&offset=6")["data"].size() == 0);
+
+    // Ties break on id DESC: the whole log is strictly newest-first by (timestamp, id).
+    auto all = h.get("?limit=6");
+    REQUIRE(all["data"].size() == 6);
+    for (size_t i = 1; i < all["data"].size(); ++i) {
+        const auto& prev = all["data"][i - 1];
+        const auto& cur = all["data"][i];
+        INFO("row " << i);
+        CHECK((prev["timestamp"] > cur["timestamp"] ||
+               (prev["timestamp"] == cur["timestamp"] && prev["id"] > cur["id"])));
+    }
 }
 
 TEST_CASE("v1 audit: malformed filters are 400, never silently dropped", "[audit][rest]") {

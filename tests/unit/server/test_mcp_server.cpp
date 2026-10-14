@@ -17301,11 +17301,14 @@ TEST_CASE("MCP query_audit_log: target_id and offset filter and page; wrong type
     CHECK(rows("{" + base + R"(,"target_id":"id-b"})").size() == 2);
     CHECK(rows("{" + base + R"(,"limit":2,"offset":2})").size() == 1);
     CHECK(rows("{" + base + R"(,"offset":3})").size() == 0);
+    // The inclusive maximum is accepted (empty page, not an error).
+    CHECK(rows("{" + base + R"(,"offset":10000})").size() == 0);
 
     // Present-but-wrong-type and out-of-range are refused, not dropped.
     for (const std::string bad :
          {R"({"offset":"5"})", R"({"offset":-1})", R"({"offset":10001})", R"({"target_id":7})",
-          R"({"target_id":"id-a"})" /* no target_type */}) {
+          R"({"target_id":"id-a"})" /* no target_type */, R"({"target_type":7})",
+          R"({"since":"1"})", R"({"until":-1})", R"({"since":9,"until":3})"}) {
         INFO(bad);
         auto body = call(bad);
         REQUIRE(body.contains("error"));

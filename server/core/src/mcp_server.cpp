@@ -8435,11 +8435,28 @@ McpServer::HandlerFn McpServer::build_handler(
                 AuditQuery aq;
                 aq.principal = param_str(args, "principal");
                 aq.action = param_str(args, "action");
-                aq.target_type = param_str(args, "target_type");
                 // Strict: a present wrong-typed value is refused, not dropped
                 // (a dropped filter would widen the evidence read silently).
+                auto target_type_opt = param_string_strict(args, "target_type");
                 auto target_id_opt = param_string_strict(args, "target_id");
                 auto offset_opt = param_int_strict(args, "offset", 0);
+                auto since_opt = param_int_strict(args, "since", 0);
+                auto until_opt = param_int_strict(args, "until", 0);
+                if (!target_type_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "target_type must be a JSON string"),
+                        "application/json");
+                    return;
+                }
+                if (!since_opt || !until_opt || *since_opt < 0 || *until_opt < 0 ||
+                    (*since_opt > 0 && *until_opt > 0 && *since_opt > *until_opt)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "since/until must be non-negative integers with since <= until"),
+                        "application/json");
+                    return;
+                }
+                aq.target_type = *target_type_opt;
                 if (!target_id_opt) {
                     res.set_content(
                         error_response(id, kInvalidParams, "target_id must be a JSON string"),
@@ -8460,8 +8477,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                aq.since = param_int(args, "since");
-                aq.until = param_int(args, "until");
+                aq.since = *since_opt;
+                aq.until = *until_opt;
                 // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the
                 // query_responses idiom (`:3660`). Upper alone left a
                 // negative or zero `limit` reaching `AuditStore::query`,

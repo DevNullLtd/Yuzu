@@ -197,7 +197,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # the title-catalogue row gains its MCP twin query_software_catalogue and the versions row
 # get_software_versions (both already "twinned", count unchanged). The raw route's
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
-# same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
+# same data through the MCP cursor. get.api-audit flips "planned:#2146" -> "twinned" (GET
+# /api/v1/audit + MCP query_audit_log, now at filter/paging parity). Measured post-flip at 198
+# (199 - 1), not hand-picked.
 BASELINE_UNTWINNED = 198
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
