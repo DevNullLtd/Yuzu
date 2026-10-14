@@ -234,6 +234,15 @@ The Guardian dashboard guard list (`/guardian`) exposes a per-Guard **Enable / D
 
 The **+ New Guard** button (top of `/guardian`) opens a structured create form for the Windows registry types: name, severity, enforcement mode, the `registry-value-equals` assertion (hive / key / value name / value type / expected), the remediation action (`alert-only` or `enforce`), and the [resilience policy](#resilience-policy-enforce-retry-behaviour) fieldset (mode + the mode-relevant tuning params; blanks use defaults). Submitting builds the same structured Guard the REST `POST /rules` endpoint accepts and runs it through the **same validation** (so an invalid resilience policy is rejected with an inline banner naming exactly what to fix). On success the Guard is created **unscoped (draft)** — device targeting is set at the Baseline, not per-Guard — and the guard list refreshes in place. Requires `GuaranteedState:Write`; audited under `guaranteed_state.rule.create`.
 
+### 8. Edit or delete a Guard from the dashboard
+
+The Guard page (`/guardian/guard/<id>`) shows **Edit** and **Delete** buttons to a user who holds `GuaranteedState:Write` and `GuaranteedState:Delete` respectively (checked once when the page loads; the mutators re-check).
+
+- **Edit** changes name, severity and enabled state. **Mode is shown as read-only text** — it is fixed at creation, and a request carrying a different mode is a `400`. Saving bumps the Guard's version; the last write wins, there is no check for a concurrent edit. Audited under `guaranteed_state.rule.update`. A Guard's trigger and assertion are not editable here; use `PUT /api/v1/guaranteed-state/rules/<id>` or the MCP `update_guardian_rule` for a re-authored spec.
+- **Delete** asks you to type the Guard's name. It removes the Guard and its live compliance state; **agents already enforcing it keep enforcing until the next push (#4304)**. Audited under `guaranteed_state.rule.delete`.
+
+Both actions need a fresh MFA step-up for a signed-in user with MFA enrolled (the dialog asks for the authenticator or recovery code and replays the request), are refused for a service-scoped API token, and are refused when the request is not same-site (audited as a denied row with detail `csrf_denied`). Their routes are `POST /fragments/guardian/guard/<id>/update` and `/delete`, twinned to the REST `PUT` / `DELETE /api/v1/guaranteed-state/rules/<id>` and the MCP `update_guardian_rule` / `delete_guardian_rule`.
+
 ## Baselines — how Guards reach agents
 
 A **Baseline** is a named collection of Guards and is the **only deployable unit**. Authoring a Guard (REST or the dashboard form) creates it *unscoped and inert* — it enforces nothing until it is a member of a **deployed** Baseline. This mirrors a GPO / Intune configuration profile / Jamf profile: you assemble controls into a baseline and deploy the baseline.

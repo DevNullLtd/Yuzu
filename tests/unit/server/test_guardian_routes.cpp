@@ -1998,6 +1998,7 @@ TEST_CASE("guard page: Edit and Delete are drawn only when the Write / Delete pr
     h.denied = {"GuaranteedState:Write", "GuaranteedState:Delete"};
     auto ro = h.sink.Get(page);
     REQUIRE(ro);
+    CHECK(ro->status == 200);
     CHECK(ro->body.find("data-gp-act=") == std::string::npos);
 
     // Exactly Read + Write + Delete per page render; the polled events fragment adds none.
