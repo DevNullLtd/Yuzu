@@ -78,6 +78,13 @@ public:
     [[nodiscard]] virtual std::expected<FleetCompliance, PolicyReadError>
     fleet_compliance() const = 0;
 
+    /// Every policy's compliance breakdown in one cached read (the same
+    /// per-policy counts as `compliance_summary`, without the N+1). Fragment
+    /// consumers only: no REST/MCP twin. NOT CONFINED — fleet-wide counts, so a
+    /// caller must hold the fleet-read gate AND have `scope == nullopt`.
+    [[nodiscard]] virtual std::expected<std::vector<ComplianceSummary>, PolicyReadError>
+    compliance_by_policy() const = 0;
+
     /// Per-policy compliance breakdown — the shape
     /// `GET /api/v1/compliance/{id}`'s "summary" sub-object serves. This is
     /// the store's own UNFILTERED aggregate; a confined caller must instead
