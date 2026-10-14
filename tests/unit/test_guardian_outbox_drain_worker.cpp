@@ -1968,8 +1968,9 @@ TEST_CASE("#3972 stress: stop() raced against the loop-tail orphan reclaim never
 // #3972: the bounded SYMMETRIC seq-ordered cross-lane launch hold.
 //
 // Every test here runs the real worker against a real GuardianSparkRuntime with H = kHold
-// (600 ms) and N = 2 unless it names kRoomyHold / kUnreachedHold below (the production H is
-// 1 s / N 64; tests override), and a sink that RECORDS the order and time of every invocation.
+// (600 ms) and N = 2 unless it names kRoomyHold / kMidHold / kUnreachedHold below (the
+// production H is 1 s / N 64; tests override), and a sink that RECORDS the order and time of
+// every invocation.
 // Sends are CV-gated per lane, so "this entry has not been invoked" is an event, never a sleep.
 // The direct tests (no start()) drive wrapped_send_for_test() with hand-built entries: with no
 // drain thread there is no probe either, which is what lets them pin "running, not in_flight"
@@ -1981,14 +1982,18 @@ namespace {
 constexpr std::chrono::milliseconds kHold{600};
 constexpr std::size_t kAllowance = 2;
 // Holds for the tests whose setup must finish INSIDE the hold, on a wall clock: T2 (twenty 10 ms
-// sends), T3 (two 200 ms offer waits before the third denial) and CH-4 (four denied passes before
-// the swap). At kHold (600 ms) those have 200-400 ms of slack, which a CI runner sharing a machine
-// with another job does not provide: a run there got through about 13 of T2's 20 sends before
-// the hold expired (4-5x slower than idle). The assertions that compare against the hold are
-// written in terms of it, so what each test pins is the same; only the headroom changes.
-//   kRoomyHold   - T3 and CH-4 wait the hold out, so it costs that much wall time per test.
+// sends), T3 (two 200 ms offer waits before the third denial), T4 (the second launch within the
+// carried-over allowance) and CH-4 (four denied passes before the swap). At kHold (600 ms) those
+// have 200-400 ms of slack, which a CI runner sharing a machine with another job does not
+// provide: a run there got through about 13 of T2's 20 sends before the hold expired (4-5x
+// slower than idle). The assertions that compare against the hold are written in terms of it, so
+// what each test pins is the same; only the headroom changes.
+//   kRoomyHold     - T3 and CH-4 wait the hold out, so it costs that much wall time per test.
+//   kMidHold       - T4 waits out TWO holds (c1, then c3), so about 7-8 s of wall time; 3 s still
+//                    leaves its c2 - c1 check 2.5 s (about 5x its idle ~0.5 s) of headroom.
 //   kUnreachedHold - T2 never reaches the hold (it asserts no release), so it costs nothing.
 constexpr std::chrono::milliseconds kRoomyHold{5000};
+constexpr std::chrono::milliseconds kMidHold{3000};
 constexpr std::chrono::milliseconds kUnreachedHold{30000};
 constexpr std::size_t kLifecycleIdx = 0;
 constexpr std::size_t kComplianceIdx = 1;
@@ -2377,7 +2382,8 @@ TEST_CASE("#3972 T4: a release is an ALLOWANCE of N launches that persists acros
           "[spark][guardian][drain][order]") {
     // Lifecycle parked forever (the blocker). Three compliance verdicts whose sends take 300 ms
     // (> the 200 ms offer wait, so each spans pass boundaries). N = 2.
-    HoldRig f;
+    constexpr auto kWait = 3 * kMidHold; // liveness deadlines only, not timing assertions
+    HoldRig f(20, kMidHold);
     f.sink.set_permits(kLifecycleIdx, 0);
     f.sink.delay[kComplianceIdx] = 300ms;
     f.lifecycle_only("L");
@@ -2387,24 +2393,28 @@ TEST_CASE("#3972 T4: a release is an ALLOWANCE of N launches that persists acros
     const auto t0 = std::chrono::steady_clock::now();
     f.start();
 
-    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; }));
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; }, kWait));
     const auto c1 = f.sink.nth_start(OutboxDomain::Compliance, 0)->at;
-    CHECK(c1 - t0 >= kHold);
-    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 2; }));
+    CHECK(c1 - t0 >= kMidHold);
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 2; }, kWait));
     const auto c2 = f.sink.nth_start(OutboxDomain::Compliance, 1)->at;
-    // The allowance carried over: no second H. c2 starts about one 300 ms send plus a pass after
-    // c1; without the carry-over c2 would wait a further kHold after c1's send ends. A bound of
-    // the form kHold - x shrinks as kSpinScale grows, kHold + 200 ms does not.
-    CHECK(c2 - c1 < kHold + 200ms);
+    // The allowance carried over: no second H. c2 starts about one 300 ms send plus a pass
+    // (~0.5 s idle) after c1; without the carry-over c2 would wait a further H after c1's send
+    // ends, i.e. at least 300 ms + H after c1. A bound of exactly H separates the two by that
+    // fixed 300 ms send (the sink sleeps at least that long, so load cannot shrink it) and has
+    // H - 0.5 s of room on the passing side. A bound of the form H - x would shrink as
+    // kSpinScale grows; H does not.
+    CHECK(c2 - c1 < kMidHold);
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
 
-    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Compliance) >= 2; }));
+    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Compliance) >= 2; }, kWait));
     const auto c2_end = f.sink.nth_end(OutboxDomain::Compliance, 1)->at;
     const auto d0 = f.worker->denials_for_test(OutboxDomain::Compliance);
-    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) > d0; }));
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) > d0; },
+                       kWait));
     CHECK(f.sink.n_started(OutboxDomain::Compliance) == 2); // the third is held again
-    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 3; }));
-    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 2)->at - c2_end >= kHold);
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 3; }, kWait));
+    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 2)->at - c2_end >= kMidHold);
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 2);
 }
 
