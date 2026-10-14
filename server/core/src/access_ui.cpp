@@ -1,8 +1,9 @@
 // Access pages: the Users page template (see access_ui.hpp).
 //
 // The `data-denied` / `data-unavailable` sentences below are byte-equal to
-// access::kUsersDenied / kUsersUnavailable / kDetailUnavailable (access_render.hpp); a test
-// pins the equality so the two copies cannot drift.
+// the `access::k*Denied` / `k*Unavailable` / `kSelect*` constants of access_render.hpp (Users,
+// Roles, Role permissions, Role assignments, Enforcement); a test pins the equality so the two
+// copies cannot drift.
 
 #include "access_ui.hpp"
 

@@ -1,8 +1,10 @@
 #pragma once
 
 /// @file access_render.hpp
-/// Pure HTML renderers for the Access pages (Phase 2 UI). Today: the Users list and the
-/// selected-account panel of `/access/users`. No I/O, no logging, no store handles: the
+/// Pure HTML renderers for the Access pages (Phase 2 UI). The Users list, the
+/// selected-account panel, the Roles and Role permissions panels, Role assignments, RBAC
+/// enforcement and Your account of `/access/users` (the "Users and roles" page; the URL,
+/// template and `acc-*` ids keep their original names). No I/O, no logging, no store handles: the
 /// route reads the store and hands a finished value in.
 ///
 /// Three states are kept distinct everywhere, on purpose:

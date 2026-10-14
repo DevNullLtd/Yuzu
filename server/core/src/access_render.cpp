@@ -84,7 +84,7 @@ std::string account_noun(const auth::UserEntry& u) {
     return (label.empty() ? esc(u.identity_source) : std::string(label)) + " account";
 }
 
-// "A, B and C" style counts for the permissions header: "41 permissions across 20 areas".
+// "1 permission" / "41 permissions": the count and its singular or plural noun.
 std::string plural(std::size_t n, std::string_view one, std::string_view many) {
     return std::to_string(n) + " " + std::string(n == 1 ? one : many);
 }

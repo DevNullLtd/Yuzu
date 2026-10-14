@@ -442,8 +442,9 @@ Settings uses, so the two stay equivalent.
   apply once enforcement is on.
 - **Add user.** Asks for a username and a password. New accounts always start as `user`; set
   the account role afterwards. If the server refuses (name taken, password too short or too
-  long, reserved prefix) the dialog stays open and shows the server's message, so nothing has
-  to be retyped.
+  long, reserved prefix, or a username that still belongs to a removed account) the dialog
+  stays open and shows the server's message. The username is kept; the password field is
+  cleared on every refusal, so retype it.
 - **Change role.** Switches a local account between `admin` and `user` and signs the person
   out of the dashboard.
 - **Revoke sessions.** Ends the account's dashboard sessions at once. API tokens are not
@@ -689,6 +690,8 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/rbac/check \
   "meta": { "api_version": "v1" }
 }
 ```
+
+This reads the caller's role grants only. A denied answer is also what the server returns when the role store could not be read, so on **Access → Users and roles → Check your own permission** a "Denied" result asks you to check again if you expected access.
 
 A denied response (the `allowed` field is `false`; no reason string is returned):
 

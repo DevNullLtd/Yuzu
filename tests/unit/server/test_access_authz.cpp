@@ -1,0 +1,258 @@
+/**
+ * @file test_access_authz.cpp
+ * @brief [pg] persona matrix for the Users and roles fragments, driven through the REAL AuthRoutes
+ *        gates (require_auth / require_admin / require_permission) over a real RbacStore and
+ *        AuditStore. test_access_routes.cpp stubs the gates; this file proves the production
+ *        wiring admits and refuses the right callers, with RBAC off (the shipped default) and on.
+ *
+ * Personas (cookie sessions): Administrator and plain user with RBAC off; with RBAC on a user
+ * holding Viewer, one holding Reviewer, one holding nothing. For each: which fragments answer,
+ * whether the store behind a refused fragment was ever read, and the audit rows written.
+ *
+ * Needs YUZU_TEST_POSTGRES_DSN (SKIPs without it); run serially.
+ */
+
+#include "access_routes.hpp"
+#include "audit_store.hpp"
+#include "auth_routes.hpp"
+#include "management_group_store.hpp"
+#include "oidc_provider.hpp"
+#include "pg/pg_pool.hpp"
+#include "rbac_store.hpp"
+#include "test_api_token_pg_helper.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
+#include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
+
+#include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp>
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+
+#include <memory>
+#include <shared_mutex>
+#include <string>
+#include <vector>
+
+using Catch::Matchers::ContainsSubstring;
+using namespace yuzu::server;
+namespace pg = yuzu::server::pg;
+using pg::PgPool;
+
+namespace {
+
+yuzu::test::PgTestTemplate access_page_tpl{"rbacstore_accesspage", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    RbacStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("rbac (access page) template: store failed to migrate/seed");
+}};
+
+struct Rig {
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    PgPool pool;
+    RbacStore rbac;
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    PgPool audit_pool;
+    AuditStore audit_store;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    std::unique_ptr<AuthRoutes> ar;
+    int user_reads{0};
+    std::vector<std::string> route_audits; // "action/result" written by the fragments themselves
+    yuzu::server::test::TestRouteSink sink;  // LAST: handlers capture `this`
+
+    explicit Rig(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, audit_pool{{.conninfo = dsn, .size = 2}},
+          audit_store{audit_pool} {
+        REQUIRE(pool.valid());
+        REQUIRE(rbac.is_open());
+        REQUIRE(audit_store.is_open());
+        REQUIRE(auth_mgr.upsert_user("root", "correct-horse-battery-staple", auth::Role::admin));
+        REQUIRE(auth_mgr.upsert_user("alice", "correct-horse-battery-staple", auth::Role::user));
+        REQUIRE(auth_mgr.upsert_user("bob", "correct-horse-battery-staple", auth::Role::user));
+        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(), &audit_store,
+                                          &*mgmt_bundle, nullptr, nullptr, oidc_mu, oidc_provider);
+
+        access::Deps d;
+        d.auth_fn = [this](const httplib::Request& q, httplib::Response& r) {
+            return ar->require_auth(q, r);
+        };
+        d.admin_fn = [this](const httplib::Request& q, httplib::Response& r) {
+            return ar->require_admin(q, r);
+        };
+        d.perm_fn = [this](const httplib::Request& q, httplib::Response& r, const std::string& t,
+                           const std::string& o) { return ar->require_permission(q, r, t, o); };
+        d.audit_fn = [this](const httplib::Request&, const std::string& action, const std::string& result,
+                            const std::string&, const std::string&, const std::string&) {
+            route_audits.push_back(action + "/" + result);
+            return true;
+        };
+        d.list_users_fn = [this]() -> std::expected<std::vector<auth::UserEntry>, std::string> {
+            ++user_reads;
+            return auth_mgr.list_users();
+        };
+        d.list_roles_fn = [this]() { return rbac.list_roles_checked(); };
+        d.role_permissions_fn = [this](const std::string& r) { return rbac.get_role_permissions_checked(r); };
+        d.list_assignments_fn = [this]() { return rbac.list_all_principal_roles_checked(); };
+        d.enforcement_state_fn = [this]() -> std::expected<access::EnforcementView, std::string> {
+            access::EnforcementView v;
+            v.enabled = rbac.is_rbac_enabled();
+            v.degraded = rbac.rbac_enabled_view_degraded();
+            return v;
+        };
+        access::register_access_routes(sink, std::move(d));
+    }
+
+    std::unique_ptr<httplib::Response> get(const std::string& path, const std::string& token) {
+        return sink.dispatch("GET", path, {}, "application/json", {{"Cookie", "yuzu_session=" + token}});
+    }
+    std::string cookie(const std::string& user, auth::Role role) {
+        return auth_mgr.create_local_session_for_test(user, role, true);
+    }
+    int denied_rows() {
+        auto rows = audit_store.query({});
+        REQUIRE(rows.has_value());
+        int n = 0;
+        for (const auto& r : *rows)
+            if (r.result == "denied")
+                ++n;
+        return n;
+    }
+};
+
+constexpr const char* kUsers = "/fragments/access/users/list";
+constexpr const char* kRoles = "/fragments/access/roles/list";
+constexpr const char* kPerms = "/fragments/access/roles/permissions?role=Viewer";
+constexpr const char* kAssign = "/fragments/access/roles/assignments";
+constexpr const char* kEnforce = "/fragments/access/enforcement";
+
+} // namespace
+
+TEST_CASE("access authz: Administrator with RBAC off reads every panel and may attempt the writes",
+          "[pg][access][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
+    Rig r{db_.dsn()};
+    const auto c = r.cookie("root", auth::Role::admin);
+
+    for (const char* p : {kUsers, kRoles, kPerms, kAssign, kEnforce}) {
+        INFO(p);
+        const auto res = r.get(p, c);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    const auto assign = r.get(kAssign, c);
+    CHECK_THAT(assign->body, ContainsSubstring("data-act=\"assign\""));
+    CHECK_THAT(assign->body, !ContainsSubstring("ITServiceOwner\""));
+    CHECK_THAT(r.get(kEnforce, c)->body, ContainsSubstring("data-act=\"enforce\""));
+    CHECK(r.denied_rows() == 0);
+    // The grant-table read leaves its own audit row, exactly as its REST twin.
+    CHECK(r.route_audits == std::vector<std::string>{"rbac.assignments.list/success",
+                                                    "rbac.assignments.list/success"});
+}
+
+TEST_CASE("access authz: a plain user with RBAC off is refused every admin panel before any read",
+          "[pg][access][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
+    Rig r{db_.dsn()};
+    const auto c = r.cookie("alice", auth::Role::user);
+
+    // The page itself opens (each panel is gated on its own fragment).
+    const auto page = r.get("/access/users", c);
+    REQUIRE(page);
+    CHECK(page->status == 200);
+    CHECK_THAT(page->body, ContainsSubstring("alice"));
+
+    for (const char* p : {kUsers, kRoles, kPerms, kAssign}) {
+        INFO(p);
+        const auto res = r.get(p, c);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK_THAT(res->body, !ContainsSubstring("<table"));
+    }
+    CHECK(r.user_reads == 0);
+    CHECK(r.route_audits.empty()); // no success row for a refused caller
+    CHECK(r.denied_rows() == 4);   // one gate denial per refused fragment
+
+    // The enforcement state is session-only (its REST twin /api/v1/me), and the switch is not live.
+    const auto enf = r.get(kEnforce, c);
+    REQUIRE(enf);
+    CHECK(enf->status == 200);
+    CHECK_THAT(enf->body, !ContainsSubstring("data-act=\"enforce\""));
+}
+
+TEST_CASE("access authz: RBAC on, a user holding only Viewer reads the catalogue but not the grant table",
+          "[pg][access][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.assign_role({"user", "alice", "Viewer"}).has_value());
+    const auto c = r.cookie("alice", auth::Role::user);
+
+    CHECK(r.get(kRoles, c)->status == 200);
+    CHECK(r.get(kPerms, c)->status == 200);
+    // The grant table is authorization topology: AccessReview:Read, which Viewer does not hold.
+    const auto grants = r.get(kAssign, c);
+    REQUIRE(grants);
+    CHECK(grants->status == 403);
+    CHECK_THAT(grants->body, !ContainsSubstring("<table"));
+    CHECK(r.get(kUsers, c)->status == 403); // the account list is admin-only whatever the grants
+    CHECK(r.user_reads == 0);
+    CHECK(r.route_audits.empty());
+    // No Assign or enforcement control for anyone who is not an account admin.
+    CHECK_THAT(r.get(kEnforce, c)->body, !ContainsSubstring("data-act=\"enforce\""));
+}
+
+TEST_CASE("access authz: RBAC on, a Reviewer reads the grant table but is offered no write",
+          "[pg][access][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.assign_role({"user", "alice", "Reviewer"}).has_value());
+    const auto c = r.cookie("alice", auth::Role::user);
+
+    const auto grants = r.get(kAssign, c);
+    REQUIRE(grants);
+    CHECK(grants->status == 200);
+    CHECK_THAT(grants->body, ContainsSubstring("alice"));
+    CHECK_THAT(grants->body, !ContainsSubstring("data-act=\"assign\""));
+    CHECK_THAT(grants->body, !ContainsSubstring("data-act=\"unassign\""));
+    CHECK(r.route_audits == std::vector<std::string>{"rbac.assignments.list/success"});
+}
+
+TEST_CASE("access authz: RBAC on, a user with no role gets the loud denial on every gated panel",
+          "[pg][access][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    const auto c = r.cookie("bob", auth::Role::user);
+
+    for (const char* p : {kUsers, kRoles, kPerms, kAssign}) {
+        INFO(p);
+        const auto res = r.get(p, c);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(r.user_reads == 0);
+    CHECK(r.route_audits.empty());
+    CHECK(r.denied_rows() == 4);
+}
+
+TEST_CASE("access authz: a request with no session is refused by every fragment and reads nothing",
+          "[pg][access][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
+    Rig r{db_.dsn()};
+    for (const char* p : {kUsers, kRoles, kPerms, kAssign, kEnforce}) {
+        INFO(p);
+        const auto res = r.sink.dispatch("GET", p);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK_THAT(res->body, !ContainsSubstring("<table"));
+    }
+    CHECK(r.user_reads == 0);
+    CHECK(r.route_audits.empty());
+}

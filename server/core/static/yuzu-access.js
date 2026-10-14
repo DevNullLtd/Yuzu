@@ -212,7 +212,9 @@
     }).then(function (v) {
       if (!v) return;
       var d = created && created.data && created.data.data;
-      say('ok', 'Role assigned.' + (d && d.target_provisioned === 'false' ? ' The account has not signed in yet.' : '') +
+      var prov = d && d.target_provisioned === 'false' ? ' The account has not signed in yet.'
+        : d && d.target_provisioned === 'unknown' ? ' The server could not check that the account exists.' : '';
+      say('ok', 'Role assigned.' + prov +
                 ' It may take a moment to appear on other servers.');
       reload('acc-assignments');
     });
@@ -385,13 +387,13 @@
     sw.checked = !want; // the switch shows the server's state; a redraw is what changes it
     return window.YuzuDialog.confirm(want ? {
       title: 'Turn RBAC enforcement on?',
-      body: "From now on access follows each person's RBAC roles. Anyone without a role assignment loses access " +
-            'immediately, and a person with no management group role sees no devices.',
+      body: ["From now on access follows each person's RBAC roles. Anyone without a role assignment loses access " +
+             'immediately, and a person with no management group role sees no devices.', ENFORCE_NOTE],
       confirmLabel: 'Turn on enforcement', danger: true
     } : {
       title: 'Turn RBAC enforcement off?',
-      body: 'Access will follow the account role instead of RBAC roles. Admins can do everything; users can read ' +
-            'most things and change nothing.',
+      body: ['Access will follow the account role instead of RBAC roles. Admins can do everything; users can read ' +
+             'most things and change nothing.', ENFORCE_NOTE],
       confirmLabel: 'Turn off enforcement', danger: true
     }).then(function (ok) {
       if (!ok) return;
@@ -486,18 +488,27 @@
     if (p && p.catch) p.catch(function () {});
   });
 
+  // The role-permissions panel has no fixed source (its URL carries the chosen role): keep the
+  // failed request's own URL so Retry has something to re-fetch.
+  function keepPermsSrc(e, t) {
+    var rp = e.detail.pathInfo && e.detail.pathInfo.requestPath;
+    if (t.id === 'acc-role-perms' && typeof rp === 'string' &&
+        rp.indexOf('/fragments/access/roles/permissions?role=') === 0) t.dataset.src = rp;
+  }
+
   document.body.addEventListener('htmx:responseError', function (e) {
     var t = e.detail.target;
     if (!t || !t.hasAttribute('data-denied')) return;
     var s = e.detail.xhr.status;
     if (s === 401) { location.assign('/login'); return; }
+    keepPermsSrc(e, t);
     if (s === 403) denied(t); else unavailable(t);
     if (t.id === 'acc-assignments') derive();
   });
 
   document.body.addEventListener('htmx:sendError', function (e) {
     var t = e.detail.target;
-    if (t && t.hasAttribute('data-denied')) unavailable(t);
+    if (t && t.hasAttribute('data-denied')) { keepPermsSrc(e, t); unavailable(t); }
     if (t && t.id === 'acc-assignments') derive();
   });
 })();

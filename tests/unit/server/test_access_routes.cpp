@@ -345,6 +345,34 @@ TEST_CASE("access routes: an empty session username is refused, not rendered", "
     CHECK(h.list_calls == 0);
 }
 
+TEST_CASE("access routes: the assignments panel refuses an empty session username or a lost session "
+          "after the gate, with no read and no audit row",
+          "[access][routes]") {
+    {
+        Harness h;
+        h.session_username = "";
+        h.wire();
+        const auto res = h.sink.dispatch("GET", "/fragments/access/roles/assignments");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(res->get_header_value("Cache-Control") == "no-store");
+        CHECK_THAT(res->body, !ContainsSubstring("<table"));
+        CHECK(h.assigns_calls == 0);
+        CHECK(h.audits.empty());
+    }
+    {
+        // The permission gate admitted the request but the session cannot be resolved.
+        Harness h;
+        h.session_present = false;
+        h.wire();
+        const auto res = h.sink.dispatch("GET", "/fragments/access/roles/assignments");
+        REQUIRE(res);
+        CHECK(res->status != 200);
+        CHECK(h.assigns_calls == 0);
+        CHECK(h.audits.empty());
+    }
+}
+
 TEST_CASE("access routes: the static glue is served uncached", "[access][routes]") {
     Harness h;
     h.wire();

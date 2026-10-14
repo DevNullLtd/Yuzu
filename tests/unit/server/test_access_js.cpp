@@ -100,7 +100,12 @@ TEST_CASE("access glue: enforcement, elevation and the permission check keep the
           "'/api/v1/elevate'", "'/api/v1/elevate/revoke'", "justification", "duration_secs",
           "new TextEncoder().encode(j).length > 1024", "Enter a reason.", "r.auditFailed", "r.data.expires_at",
           "'/api/v1/rbac/check'", "securable_type", "typeof allowed === 'boolean'", "Enter an area and an operation.",
-          "the role store may not have answered: check again.", "data-slot=\"out\""}) {
+          "the role store may not have answered: check again.", "data-slot=\"out\"",
+          // Gate-fix round: Retry on the role-permissions panel, the unverified-account note, the
+          // enforcement warning inside both confirmations.
+          "function keepPermsSrc(e, t)", "t.dataset.src = rp", "target_provisioned === 'unknown'",
+          "'immediately, and a person with no management group role sees no devices.', ENFORCE_NOTE]",
+          "'most things and change nothing.', ENFORCE_NOTE]"}) {
         INFO(token);
         CHECK_THAT(js, ContainsSubstring(token));
     }
