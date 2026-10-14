@@ -155,7 +155,7 @@ const char* const kResultSetsPageTemplate = R"HTM(<!DOCTYPE html>
     button, input, textarea { font: inherit; color: inherit; }
     code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
     :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-    .rs-content { padding: 22px 28px 36px; min-height: calc(100vh - var(--shell-top-h, 72px)); }
+    .rs-content { padding: 22px 28px 36px; min-height: calc(100vh - var(--shell-top-h)); }
     .rs-content h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em;
                      line-height: 1.2; color: var(--ink); }
     .rs-subtitle { color: var(--mut); margin: 4px 0 22px 0; max-width: 70ch; }

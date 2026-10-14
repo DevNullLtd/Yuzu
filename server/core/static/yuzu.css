@@ -403,16 +403,11 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 :is(.data-table, .panel table, .tw table) :is(td, th).r { text-align: right; }
 :is(.data-table, .panel table, .tw table) td b { color: var(--ink); font-weight: 600; }
 .data-table th { position: sticky; top: 0; }
-/* Density toggle (.density-toggle) puts .compact or .comfortable on the results table */
+/* The dashboard's density toggle (its own button, styled in dashboard_ui.cpp) puts .compact or .comfortable on the results table */
 :is(.data-table, table).compact { --cell-y: 6px; }
 :is(.data-table, table):is(.compact, .comfortable) td { padding: var(--cell-y) 16px; font-size: var(--text-base); }
 :is(.data-table, table).compact td { font-size: var(--text-sm); }
 :is(.data-table, table):is(.compact, .comfortable) th { padding: 8px 16px; font-size: 12.5px; }
-.density-toggle { display: inline-flex; align-items: center; gap: var(--sp-1); background: transparent; border: 1px solid var(--line2);
-                  color: var(--mut); padding: 2px var(--sp-2); border-radius: var(--rad-ctl); cursor: pointer; font: inherit; font-size: var(--text-xs);
-                  transition: color .12s, border-color .12s; }
-.density-toggle:hover { color: var(--ink); border-color: var(--mut); }
-.density-toggle svg { width: 14px; height: 14px; }
 
 /* -- Forms -- */
 .input, .in, .fld select, .fld textarea { height: var(--ctl); padding: 0 10px; background: var(--bg); color: var(--ink);
@@ -492,31 +487,6 @@ td > .bar { min-width: 110px; }
         stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }
 .icon-lg { width: 20px; height: 20px; }
 .icon-xl { width: 24px; height: 24px; }
-
-/* Nav bar (to be used in Wave B) */
-.nav-bar { height: 40px; background: var(--surface); border-bottom: 1px solid var(--line);
-           display: flex; align-items: center; padding: 0 var(--sp-4); gap: var(--sp-4); }
-.nav-brand { color: var(--ink); text-decoration: none; font-weight: 600; font-size: var(--text-lg);
-             display: flex; align-items: center; gap: var(--sp-2); }
-.nav-link { color: var(--mut); text-decoration: none; font-size: var(--text-sm); padding: var(--sp-2) 0;
-            border-bottom: 2px solid transparent; transition: color .12s; }
-.nav-link:hover { color: var(--ink); }
-.nav-link.active { color: var(--ink); border-bottom-color: var(--hl); }
-.nav-spacer { flex: 1; }
-.nav-user { font-size: var(--text-sm); color: var(--mut); display: flex; align-items: center; gap: var(--sp-2); }
-.nav-logout { background: transparent; border: 1px solid var(--line2); color: var(--mut);
-              padding: var(--sp-1) var(--sp-3); border-radius: var(--rad-ctl); cursor: pointer;
-              font-size: var(--text-sm); }
-
-/* Context bar (to be used in Wave B) */
-.context-bar { height: 32px; background: var(--bg); border-bottom: 1px solid var(--line);
-               display: flex; align-items: center; padding: 0 var(--sp-4); gap: var(--sp-3); }
-.context-role-badge { font-size: var(--text-xs); font-weight: 600; padding: 1px var(--sp-2); border-radius: 3px;
-                      background: var(--surface2); color: var(--ink2); }
-.context-user { font-size: var(--text-sm); color: var(--mut); }
-.context-spacer { flex: 1; }
-.context-bell { background: transparent; border: none; color: var(--mut); cursor: pointer; padding: var(--sp-1); }
-.context-bell:hover { color: var(--ink); }
 
 /* Command palette - a pop-over on a scrim (no blur) */
 .cmd-palette-overlay {
@@ -641,7 +611,8 @@ td > .bar { min-width: 110px; }
 /* Row detail drawer */
 .result-row { cursor: pointer; }
 .result-row:hover td { background: var(--surface2); }
-.result-row.expanded td { background: var(--raise); }
+.result-row.expanded td { background: var(--mds-color-state-selected); }
+.result-row.expanded td:first-child { box-shadow: inset 3px 0 0 var(--hl); }
 .result-detail { display: none; }
 .result-detail.open { display: table-row; }
 .result-detail td { padding: var(--sp-3) var(--sp-4); background: var(--bg);

@@ -18,7 +18,7 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <style>
-    body { display: flex; flex-direction: column; min-height: calc(100vh - var(--shell-top-h, 0px)); }
+    body { display: flex; flex-direction: column; min-height: calc(100vh - var(--shell-top-h)); }
     .tar-content {
       width: 100%; flex: 1; padding: 22px 28px 36px;
       display: flex; flex-direction: column; gap: 22px;
@@ -228,7 +228,7 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     .tar-tree-layout { display: flex; gap: 16px; align-items: flex-start; margin-top: 12px; }
     .tar-tree-main { flex: 1 1 auto; min-width: 0; overflow-x: auto; }
     .tar-tree-side {
-      flex: 0 0 340px; position: sticky; top: 8px; max-height: calc(100vh - var(--shell-top-h, 72px) - 2rem); overflow: auto;
+      flex: 0 0 340px; position: sticky; top: 8px; max-height: calc(100vh - var(--shell-top-h) - 2rem); overflow: auto;
       border: 1px solid var(--line); border-radius: var(--rad-panel);
     }
     .tar-tree-side > div > .tar-tree-mute { padding: 14px 16px; font-size: 13px; }

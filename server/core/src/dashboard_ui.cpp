@@ -32,9 +32,9 @@ const char* const kDashboardIndexTemplate =
     }
 
     /* ── Page frame: title, console + results, scope/history rail ── */
-    /* Fills the viewport below the shell header (--shell-top-h; 72px = the current nav + context bar). */
+    /* Fills the viewport below the shell header (--shell-top-h, defined by the shell). */
     .dash-grid {
-      display: grid; gap: 22px; height: calc(100vh - var(--shell-top-h, 72px));
+      display: grid; gap: 22px; height: calc(100vh - var(--shell-top-h));
       padding: 22px 28px 14px;
       grid-template-columns: minmax(0, 1fr) 320px;
       grid-template-rows: auto auto minmax(0, 1fr) auto;
@@ -48,24 +48,22 @@ const char* const kDashboardIndexTemplate =
        the centre track compress instead of pushing the rail off-screen. */
     .dash-grid > * { min-width: 0; }
     .dash-head { grid-area: head; }
-    .dash-head h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; color: var(--ink); }
-    .dash-head p { margin-top: 4px; color: var(--mut); }
     .rail { grid-area: rail; display: flex; flex-direction: column; gap: 22px; min-height: 0; }
     .dash-grid :focus-visible, .modal :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
-    /* Panels are bordered regions, not floating cards. */
-    .instr-bar, .results, .scope-panel, .history-panel {
-      background: var(--surface); border: 1px solid var(--line);
-      border-radius: var(--rad-panel);
+    /* The console, scope and history regions are yuzu.css's .panel / .hd. The results region keeps its
+       own skin: .panel would also pull in look's .panel table rules (row hover, td b) onto #results-table. */
+    .results {
+      background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel);
     }
-    .results, .scope-panel, .history-panel { display: flex; flex-direction: column; }
-    .scope-panel, .history-panel { overflow: hidden; }
-    .panel-hd, .results-header, .scope-header, .history-header {
+    .results-header {
       display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
       padding: 12px 16px; border-bottom: 1px solid var(--line);
       font-size: 14px; font-weight: 600; color: var(--ink);
     }
-    .panel-hd h2, .results-header h2 { font-size: 14px; font-weight: 600; }
+    .results-header h2 { font-size: 14px; font-weight: 600; }
+    .results, .scope-panel, .history-panel { display: flex; flex-direction: column; }
+    .scope-panel, .history-panel { overflow: hidden; }
     .panel-hd #status-badge { margin-left: auto; }
 
     /* ── Console (instruction bar) ───────────────────────────── */
@@ -92,9 +90,9 @@ const char* const kDashboardIndexTemplate =
       font-size: 12.5px; font-weight: 500; white-space: nowrap; text-transform: lowercase;
     }
     #status-badge::first-letter { text-transform: uppercase; }
-    .badge-idle, .badge-done { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
-    .badge-running { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); }
-    .badge-error { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
+    .badge-idle, .badge-done { color: var(--ok); background: var(--mds-color-bg-success-tinted); }
+    .badge-running { color: var(--info); background: var(--mds-color-bg-info-tinted); }
+    .badge-error { color: var(--bad); background: var(--mds-color-bg-error-tinted); }
 
     /* Buttons: raised, 1px line, 3px radius; the primary action is the one solid blue. */
     .instr-bar button, .btn-page, .btn-create-group, .create-group-form button,
@@ -119,7 +117,7 @@ const char* const kDashboardIndexTemplate =
     }
     .density-toggle svg { width: 14px; height: 14px; }
 
-    /* Autocomplete: a pop-over (the only place a shadow is allowed). */
+    /* Autocomplete: a pop-over, so it carries the shadow. */
     .ac-list {
       display: none; position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 200;
       max-height: 280px; overflow-y: auto;
@@ -133,7 +131,7 @@ const char* const kDashboardIndexTemplate =
     }
     .ac-item:last-child { border-bottom: 0; }
     .ac-item:hover { background: var(--surface2); }
-    .ac-item.sel { background: color-mix(in srgb, var(--hl) 8%, transparent); box-shadow: inset 3px 0 0 var(--hl); }
+    .ac-item.sel { background: var(--mds-color-state-selected); box-shadow: inset 3px 0 0 var(--hl); }
     .ac-item .ac-desc { margin-left: 16px; text-align: right; font-family: var(--font); font-size: 12.5px; color: var(--mut); }
 )HTM"
     // Part 1a: CSS continued (split to stay under MSVC's 16380-byte string
@@ -177,7 +175,7 @@ const char* const kDashboardIndexTemplate =
       border: 1px solid var(--line2); border-radius: var(--rad-ctl);
     }
     /* #2691: a degraded facet-values() read disables the column filter — same
-       amber treatment as .result-degrade-banner, not a plain form quirk. */
+       warn treatment as .result-degrade-banner, not a plain form quirk. */
     .filter-bar select:disabled {
       color: var(--warn); opacity: 1; background: color-mix(in srgb, var(--warn) 12%, transparent);
       border-color: color-mix(in srgb, var(--warn) 50%, var(--line2));
@@ -203,9 +201,6 @@ const char* const kDashboardIndexTemplate =
       border-bottom: 1px solid var(--line); font-size: 13.5px; color: var(--ink2);
     }
     #results-table td.col-agent { width: 10rem; font-weight: 600; color: var(--ink); }
-    #results-table .result-row:hover td { background: var(--surface2); }
-    #results-table .result-row.expanded td { background: color-mix(in srgb, var(--hl) 8%, transparent); }
-    #results-table .result-row.expanded td:first-child { box-shadow: inset 3px 0 0 var(--hl); }
     #results-table .result-detail td { max-width: none; overflow: visible; white-space: normal; background: var(--bg); }
     #results-table td.empty-state {
       max-width: none; padding: 48px 16px; text-align: center; white-space: normal;
@@ -213,7 +208,7 @@ const char* const kDashboardIndexTemplate =
     }
     #results-table td.empty-state strong { color: var(--ink); }
     /* #2691 finding 7: an honest "store degraded, not zero matches" banner —
-       amber (temporarily unavailable, retrying), never alarm-red. The td form
+       warn-toned (temporarily unavailable, retrying), never alarm-red. The td form
        must outrank #results-table td.empty-state, which the banner row also is. */
     .result-degrade-banner, #results-table td.result-degrade-banner {
       padding: 8px 12px; font-size: 13.5px; color: var(--ink2); background: var(--surface2);
@@ -255,7 +250,7 @@ const char* const kDashboardIndexTemplate =
     .scope-item { display: flex; flex-direction: column; gap: 2px; }
     .scope-item:hover, .history-item:hover { background: var(--surface2); }
     .scope-item.selected, .history-item.active {
-      background: color-mix(in srgb, var(--hl) 8%, transparent); box-shadow: inset 3px 0 0 var(--hl);
+      background: var(--mds-color-state-selected); box-shadow: inset 3px 0 0 var(--hl);
     }
     .scope-item-name { font-size: 13.5px; font-weight: 500; color: var(--ink); }
     .scope-item-all { font-weight: 600; }
@@ -294,45 +289,18 @@ const char* const kDashboardIndexTemplate =
     .modal a:hover { text-decoration: underline; }
     .modal .btn-close { margin-top: 8px; }
 
-    /* ── Command palette (Ctrl+K): a pop-over, 8px radius, shadow allowed.
-       backdrop-filter / animation / text-transform: none switch off the older
-       .cmd-palette* rules still in yuzu.css (delete those there, then drop these). ── */
-    .cmd-palette-overlay {
-      position: fixed; inset: 0; z-index: 4000; display: flex; align-items: flex-start; justify-content: center;
-      padding-top: 15vh; background: var(--mds-color-state-overlay-scrim); backdrop-filter: none;
-    }
-    .cmd-palette {
-      width: 560px; max-width: calc(100vw - 32px); max-height: 60vh; overflow: hidden; animation: none;
-      background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-over); box-shadow: var(--shadow);
-    }
-    .cmd-palette-input-row {
-      display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line);
-    }
-    .cmd-palette-input-row svg { flex-shrink: 0; color: var(--mut); }
-    .cmd-palette-input-row input {
-      flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: var(--ink); font: inherit;
-    }
+    /* ── Command palette (Ctrl+K): yuzu.css supplies the pop-over, rows and footer;
+       only this page's deltas live here. ── */
+    .cmd-palette { max-width: calc(100vw - 32px); }
+    .cmd-palette-input-row input { min-width: 0; font: inherit; outline: 0; }
     .cmd-palette-input-row input:focus-visible { outline: 0; }
-    .cmd-palette-input-row input::placeholder { color: var(--faint); }
-    .cmd-palette-input-row .cmd-palette-hint { font-size: 12px; color: var(--faint); white-space: nowrap; }
-    .cmd-palette-results { max-height: 50vh; overflow-y: auto; }
-    .cmd-palette-results:empty::after {
-      content: "No results"; display: block; padding: 16px; text-align: center; font-size: 13px; color: var(--faint);
-    }
     .cmd-section-header {
       padding: 8px 16px; background: var(--surface2); font-size: 12.5px; font-weight: 500; color: var(--mut);
       text-transform: none; letter-spacing: 0;
     }
-    .cmd-result { display: flex; align-items: center; gap: 12px; padding: 8px 16px; cursor: pointer; }
-    .cmd-result:hover { background: var(--surface2); }
-    .cmd-result.active { background: color-mix(in srgb, var(--hl) 8%, transparent); box-shadow: inset 3px 0 0 var(--hl); }
-    .cmd-result-name { color: var(--ink); }
-    .cmd-result-desc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--mut); }
-    .cmd-result-type { margin-left: auto; flex-shrink: 0; height: auto; padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
-    .cmd-palette-footer {
-      display: flex; align-items: center; gap: 16px; padding: 8px 16px;
-      border-top: 1px solid var(--line); font-size: 12px; color: var(--faint);
-    }
+    .cmd-result.active { background: var(--mds-color-state-selected); box-shadow: inset 3px 0 0 var(--hl); }
+    .cmd-result-desc { min-width: 0; }
+    .cmd-result-type { height: auto; padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
     /* ── Narrow windows: one column, the page scrolls, the scope list stays reachable.
        1336px = 1100px of page + the 236px shell sidebar. ── */
     @media (max-width: 1336px) {
@@ -351,19 +319,20 @@ const char* const kDashboardIndexTemplate =
   </style>
 </head>
 )HTM"
-    // Split here: chunk 1 (head + <style>) was ~16 KB and bumped against
-    // the MSVC C2026 16380-byte raw-string-literal limit after the round-2
-    // visualization additions. Adjacent string literals concatenate at
-    // compile time, so the runtime HTML is byte-identical.
+    // Split here to keep each raw-string literal under the MSVC C2026
+    // 16380-byte limit. Adjacent string literals concatenate at compile
+    // time, so the runtime HTML is byte-identical.
     R"HTM(<body>
 
   <!--yuzu:shell--><!--/yuzu:shell-->
 
   <div class="dash-grid">
 
-  <header class="dash-head">
-    <h1>Dashboard</h1>
-    <p>Run an instruction against the fleet and watch responses arrive.</p>
+  <header class="page-header dash-head">
+    <div>
+      <h1>Dashboard</h1>
+      <p class="subtitle">Run an instruction against the fleet and watch responses arrive.</p>
+    </div>
   </header>
 
   <!-- ── Console: instruction bar ───────────────────────────── -->
@@ -372,10 +341,10 @@ const char* const kDashboardIndexTemplate =
        dispatch can't linger over the new query's results. The new
        deck is delivered later via the OOB swap from
        /fragments/results once execution has data to render. -->
-  <form class="instr-bar" id="instr-form"
+  <form class="instr-bar panel" id="instr-form"
         hx-post="/api/dashboard/execute" hx-swap="none"
         hx-on::before-request="clearChartDeck()">
-    <div class="panel-hd">
+    <div class="panel-hd hd">
       <h2>Console</h2>
       <span id="status-badge" class="badge-idle">IDLE</span>
     </div>
@@ -494,8 +463,8 @@ const char* const kDashboardIndexTemplate =
 
   <!-- ── Scope and history rail ─────────────────────────────── -->
   <div class="rail">
-    <div class="scope-panel">
-      <div class="scope-header">
+    <div class="scope-panel panel">
+      <div class="scope-header hd">
         Scope <span class="scope-count" id="agent-count">0 agents</span>
       </div>
       <div class="scope-list" id="scope-list"
@@ -504,8 +473,8 @@ const char* const kDashboardIndexTemplate =
            hx-swap="innerHTML">
       </div>
     </div>
-    <div class="history-panel">
-      <div class="history-header">
+    <div class="history-panel panel">
+      <div class="history-header hd">
         History
         <button onclick="clearHistory()" title="Clear history">&times; Clear</button>
       </div>

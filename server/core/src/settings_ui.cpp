@@ -17,7 +17,7 @@ const char* const kSettingsPageTemplate =
   <script src="/static/htmx.js"></script>
   <script src="/static/sse.js"></script>
   <style>
-    body { min-height: calc(100vh - var(--shell-top-h, 0px)); }
+    body { min-height: calc(100vh - var(--shell-top-h)); }
 
     /* ── Page frame ────────────────────────────────────────── */
     .content {

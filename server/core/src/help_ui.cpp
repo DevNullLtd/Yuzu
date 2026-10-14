@@ -11,8 +11,6 @@ const char* const kHelpPageTemplate = R"HTM(<!DOCTYPE html>
 <link rel="stylesheet" href="/static/yuzu.css">
 <style>
 .help-content{padding:22px 28px 36px}
-.help-content h1{font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
-.help-content p{max-width:70ch;margin-top:4px;color:var(--mut)}
 .help-content a{color:var(--primary);text-decoration:none}
 .help-content a:hover{text-decoration:underline}
 .help-content a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
@@ -22,8 +20,10 @@ const char* const kHelpPageTemplate = R"HTM(<!DOCTYPE html>
   <!--yuzu:shell--><!--/yuzu:shell-->
 
 <div class="help-content">
+<header class="page-header"><div>
 <h1>Help</h1>
-<p>Help page is under construction. See the <a href="/">dashboard</a>.</p>
+<p class="subtitle">Help page is under construction. See the <a href="/">dashboard</a>.</p>
+</div></header>
 </div>
 
 <div id="toast-container" class="toast-container"></div>
