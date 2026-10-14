@@ -2,6 +2,7 @@
 // the long raw string literal from MSVC's brace-matching in server.cpp.
 
 #include "app_shell.hpp"
+#include "operate_extras_ui.hpp"
 
 // NOLINTBEGIN(cert-err58-cpp)
 const char* const kDashboardIndexTemplate =
@@ -349,13 +350,17 @@ const char* const kDashboardIndexTemplate =
       .history-list { max-height: 240px; }
     }
   </style>
+  <style>
+)HTM" YUZU_OX_CSS R"HTM(  </style>
+  <script src="/static/yuzu-dialog.js" defer></script>
+  <script src="/static/yuzu-operate-extras.js" defer></script>
 </head>
 )HTM"
     // Split here: chunk 1 (head + <style>) was ~16 KB and bumped against
     // the MSVC C2026 16380-byte raw-string-literal limit after the round-2
     // visualization additions. Adjacent string literals concatenate at
     // compile time, so the runtime HTML is byte-identical.
-    R"HTM(<body>
+    R"HTM(<body data-page="dashboard" data-secret-params=")HTM" YUZU_OX_SECRET_PARAMS R"HTM(">
 
   <!--yuzu:shell--><!--/yuzu:shell-->
 
@@ -391,8 +396,10 @@ const char* const kDashboardIndexTemplate =
             <div class="ac-list" id="ac-list"></div>
           </div>
           <input type="hidden" name="scope" id="scope-input" value="__all__">
+          <input type="hidden" name="scope_expression" id="ox-scope-expression" value="" disabled>
           <button type="submit" id="btn-send">Send</button>
           <button type="button" class="btn-clear" onclick="clearResults()">Clear</button>
+          <button type="button" id="ox-tar-open" title="Run a read-only SQL query against the TAR warehouse on the selected target">Run on TAR history</button>
         </div>
       </div>
       <div class="stats">
@@ -493,6 +500,25 @@ const char* const kDashboardIndexTemplate =
 
   <!-- ── Scope and history rail ─────────────────────────────── -->
   <div class="rail">
+    <div class="ox-panel" id="ox-scope">
+      <h2>Target by scope expression</h2>
+      <div class="ox-pad">
+        <div class="ox-row">
+          <input type="text" id="ox-expr" class="ox-in" spellcheck="false" autocomplete="off"
+                 maxlength="8192" placeholder="ostype == &quot;windows&quot; AND tag:role == &quot;web&quot;"
+                 aria-label="Scope expression">
+        </div>
+        <div class="ox-row">
+          <button type="button" class="ox-btn" id="ox-validate" disabled>Validate</button>
+          <button type="button" class="ox-btn" id="ox-preview" disabled>Preview</button>
+        </div>
+        <div id="ox-expr-out" aria-live="polite"></div>
+      </div>
+      <details class="ox-det" id="ox-kinds">
+        <summary>Scope kinds</summary>
+        <div class="ox-pad"><ul class="ox-kinds" id="ox-kinds-list"></ul></div>
+      </details>
+    </div>
     <div class="scope-panel">
       <div class="scope-header">
         Scope <span class="scope-count" id="agent-count">0 agents</span>
@@ -746,10 +772,12 @@ const char* const kDashboardIndexTemplate =
     }
 
     /* ── Command history ─────────────────────────────────── */
-    function addHistory(cmd, scope) {
+    /* masked: the text shown had secret values replaced, so it is not the command that ran and
+       must never be sent again from History. */
+    function addHistory(cmd, scope, masked) {
       var now = new Date();
       var ts = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      commandHistory.unshift({ cmd: cmd, scope: scope, timestamp: ts });
+      commandHistory.unshift({ cmd: cmd, scope: scope, timestamp: ts, masked: !!masked });
       if (commandHistory.length > 50) commandHistory.length = 50;
       renderHistory();
     }
@@ -774,7 +802,18 @@ const char* const kDashboardIndexTemplate =
         div.innerHTML = '<div class="history-cmd">' + escapeHtml(h.cmd) + '</div>' +
           '<div class="history-meta">' + escapeHtml(h.timestamp) + ' &middot; ' + escapeHtml(h.scope) + '</div>';
         div.setAttribute('data-cmd', h.cmd);
+        if (h.masked) div.setAttribute('data-masked', '1');
         div.addEventListener('click', function() {
+          if (this.getAttribute('data-masked') === '1') {
+            /* The stored text has the secret values replaced; putting it in the box and
+               sending would send the placeholder as the value. Ask for it to be typed again. */
+            var rc = document.getElementById('result-context');
+            if (rc) {
+              rc.textContent = 'That command had secret values, which History does not keep. Type it again to send it.';
+              rc.className = 'result-context is-error';
+            }
+            return;
+          }
           document.getElementById('instr-input').value = this.getAttribute('data-cmd');
           sendInstruction();
         });
@@ -1162,9 +1201,13 @@ const char* const kDashboardIndexTemplate =
     document.addEventListener('keydown', function(e) {
       var tag = (e.target.tagName || '').toLowerCase();
       var isInput = (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable);
+      /* The scope expression field is text the operator is composing: neither chord may open the
+         palette or send the instruction from inside it. (The command line and the palette's own
+         input keep both: Ctrl+K closes the palette from its box, Ctrl+Enter sends from the line.) */
+      var inExpr = e.target.id === 'ox-expr';
 
       /* Ctrl+K / Cmd+K — open command palette */
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k' && !inExpr) {
         e.preventDefault();
         if (cmdPalette.isOpen) { cmdPalette.close(); } else { cmdPalette.open(); }
         return;
@@ -1186,7 +1229,7 @@ const char* const kDashboardIndexTemplate =
       }
 
       /* Ctrl+Enter — send current instruction */
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !inExpr) {
         e.preventDefault();
         sendInstruction();
         return;
@@ -1227,6 +1270,20 @@ const char* const kDashboardIndexTemplate =
        autocomplete input inside it fires bubbling beforeRequest events. */
     var instrForm = document.getElementById('instr-form');
     if (instrForm) {
+)HTM"
+    // Split here: the instr-form block below pushed this chunk past MSVC's C2026
+    // 16,380-byte raw-string-literal limit. Adjacent literals concatenate at compile time.
+    R"HTM(      /* Fail closed: the fan-out confirmation lives in yuzu-operate-extras.js (and needs
+         YuzuDialog). Until that script sets its ready flag, a Send is held, never sent. */
+      instrForm.addEventListener('htmx:confirm', function(e) {
+        if (e.target !== instrForm || window.__yuzuDashboardConfirmReady) return;
+        e.preventDefault();
+        var c = document.getElementById('result-context');
+        if (c) {
+          c.textContent = 'Send is unavailable: the confirmation dialog did not load. Reload the page.';
+          c.className = 'result-context is-error';
+        }
+      });
       instrForm.addEventListener('htmx:beforeRequest', function(e) {
         if (typeof closeAC === 'function') closeAC();
         if (e.target === instrForm) clearChartDeck();
