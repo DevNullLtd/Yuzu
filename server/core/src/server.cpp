@@ -18349,6 +18349,64 @@ private:
             },
             audit_fn);
 
+        // Hardware record, Installed software lens: click-to-load HTML twins of the two
+        // drills above. Same gates (sle_gate_usable / require_scoped_permission) and the
+        // same fail-closed audit verbs, probed against a throwaway Response so a denied or
+        // degraded gate renders a 200 note instead of a body htmx would drop.
+        {
+            HttplibRouteSink usage_sink{*web_server_};
+            auto usage_probe = [app_usage_scoped_perm_fn](const httplib::Request& req,
+                                                          const std::string& type,
+                                                          const std::string& op,
+                                                          const std::string& id)
+                -> yuzu::server::device_data::UsageDeps::Probe {
+                using P = yuzu::server::device_data::UsageDeps::Probe;
+                httplib::Response probe;
+                if (app_usage_scoped_perm_fn(req, probe, type, op, id))
+                    return P::Allowed;
+                return probe.status == 503 ? P::Unavailable : P::Denied;
+            };
+            yuzu::server::device_data::register_device_usage_routes(
+                usage_sink,
+                yuzu::server::device_data::UsageDeps{
+                    .auth_fn = auth_fn,
+                    .probe_fn = usage_probe,
+                    .audit_fn = audit_fn,
+                    .usage_fn =
+                        [this](const std::string& id)
+                            -> std::optional<yuzu::server::device_data::AppUsageData> {
+                            if (!app_usage_store_)
+                                return std::nullopt;
+                            auto r = app_usage_store_->get_agent_usage_snapshot(id);
+                            if (!r.has_value())
+                                return std::nullopt;
+                            yuzu::server::device_data::AppUsageData out;
+                            out.collected_at = r->collected_at;
+                            out.rows.reserve(r->rows.size());
+                            for (const auto& u : r->rows)
+                                out.rows.push_back({u.exe_key, u.first_seen, u.last_seen,
+                                                    u.run_count_30d, u.total_seconds_30d});
+                            return out;
+                        },
+                    .licences_fn =
+                        [this](const std::string& id)
+                            -> std::optional<std::vector<yuzu::server::device_data::LicenceRow>> {
+                            if (!software_licensing_store_)
+                                return std::nullopt;
+                            auto rows = software_licensing_store_->agent_licenses(id);
+                            if (!rows)
+                                return std::nullopt;
+                            std::vector<yuzu::server::device_data::LicenceRow> out;
+                            out.reserve(rows->size());
+                            for (const auto& l : *rows)
+                                out.push_back({l.product, l.vendor, l.version, l.license_type,
+                                               l.state, l.channel, l.confidence, l.key_hint,
+                                               l.detector, l.expiry_at});
+                            return out;
+                        },
+                });
+        }
+
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /
         // os_arch / free-disk / pending-reboot) across the operator-VISIBLE devices

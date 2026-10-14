@@ -164,3 +164,165 @@ TEST_CASE("device data routes: Deps with an unwired closure is refused at regist
     Deps d;
     CHECK_THROWS_AS(register_device_data_routes(sink, d), std::invalid_argument);
 }
+
+// ---- application usage and detected licences ---------------------------------------------
+
+namespace {
+
+struct UsageHarness {
+    using Probe = UsageDeps::Probe;
+    bool authed = true;
+    Probe probe = Probe::Allowed;
+    bool audit_persists = true;
+    bool store_degraded = false;
+    std::vector<std::string> events; // "probe:Sec:Op:id" "audit:verb:result" "read:app" "read:lic"
+    std::vector<AppUsageRow> usage{{"C:/tools/a.exe", 100, 200, 5, 7200}};
+    std::vector<LicenceRow> licences{{"Office", "Contoso", "16", "volume", "licensed", "KMS",
+                                      "authoritative", "", "slmgr", 0}};
+
+    yuzu::server::test::TestRouteSink sink; // LAST
+
+    UsageHarness() {
+        UsageDeps d;
+        d.auth_fn = [this](const httplib::Request&,
+                           httplib::Response& res) -> std::optional<auth::Session> {
+            if (!authed) {
+                res.status = 401;
+                return std::nullopt;
+            }
+            return auth::Session{};
+        };
+        d.probe_fn = [this](const httplib::Request&, const std::string& t, const std::string& o,
+                            const std::string& id) {
+            events.push_back("probe:" + t + ":" + o + ":" + id);
+            return probe;
+        };
+        d.audit_fn = [this](const httplib::Request&, const std::string& action,
+                            const std::string& result, const std::string&, const std::string&,
+                            const std::string&) {
+            events.push_back("audit:" + action + ":" + result);
+            return audit_persists;
+        };
+        d.usage_fn = [this](const std::string&) -> std::optional<AppUsageData> {
+            events.push_back("read:app");
+            if (store_degraded)
+                return std::nullopt;
+            return AppUsageData{usage, 1700000000};
+        };
+        d.licences_fn = [this](const std::string&) -> std::optional<std::vector<LicenceRow>> {
+            events.push_back("read:lic");
+            if (store_degraded)
+                return std::nullopt;
+            return licences;
+        };
+        register_device_usage_routes(sink, std::move(d));
+    }
+    bool saw(const std::string& e) const {
+        return std::find(events.begin(), events.end(), e) != events.end();
+    }
+};
+
+const char* kUsagePaths[] = {"/fragments/hardware/ci/app-usage?id=agent-1",
+                             "/fragments/hardware/ci/licences?id=agent-1"};
+
+} // namespace
+
+TEST_CASE("usage routes: gate allowed renders the data after the audit row",
+          "[device_data][routes][usage]") {
+    UsageHarness h;
+    auto a = h.sink.Get(kUsagePaths[0]);
+    REQUIRE(a);
+    CHECK(a->status == 200);
+    CHECK(contains(a->body, "C:/tools/a.exe"));
+    CHECK(contains(a->body, "2.0")); // 7200 s
+    auto l = h.sink.Get(kUsagePaths[1]);
+    REQUIRE(l);
+    CHECK(contains(l->body, "Office"));
+    // Order: probe, then the audit row, then the read (fail-closed audit-before-read).
+    const std::vector<std::string> want{
+        "probe:Forensics:Read:agent-1", "audit:app_usage.agent.view:success", "read:app",
+        "probe:SoftwareLicensing:Read:agent-1", "audit:sle.agent.view:success", "read:lic"};
+    CHECK(h.events == want);
+}
+
+// Kills: reading before the audit row, or serving after a known audit failure.
+TEST_CASE("usage routes: an audit row that cannot persist withholds the data and flags it",
+          "[device_data][routes][usage]") {
+    for (const char* path : kUsagePaths) {
+        UsageHarness h;
+        h.audit_persists = false;
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(contains(r->body, "withheld"));
+        CHECK_FALSE(contains(r->body, "C:/tools/a.exe"));
+        CHECK_FALSE(contains(r->body, "Office"));
+        CHECK_FALSE(h.saw("read:app"));
+        CHECK_FALSE(h.saw("read:lic"));
+    }
+}
+
+TEST_CASE("usage routes: a denied gate is a 200 note, no audit row, no read",
+          "[device_data][routes][usage]") {
+    UsageHarness h;
+    h.probe = UsageHarness::Probe::Denied;
+    auto a = h.sink.Get(kUsagePaths[0]);
+    REQUIRE(a);
+    CHECK(a->status == 200);
+    CHECK(contains(a->body, "Forensics:Read"));
+    auto l = h.sink.Get(kUsagePaths[1]);
+    REQUIRE(l);
+    CHECK(contains(l->body, "SoftwareLicensing:Read"));
+    CHECK(h.events.size() == 2); // the two probes only
+}
+
+TEST_CASE("usage routes: unauthenticated is 401 and an unavailable gate is a banner",
+          "[device_data][routes][usage]") {
+    {
+        UsageHarness h;
+        h.authed = false;
+        auto r = h.sink.Get(kUsagePaths[0]);
+        REQUIRE(r);
+        CHECK(r->status == 401);
+        CHECK(h.events.empty());
+    }
+    UsageHarness h;
+    h.probe = UsageHarness::Probe::Unavailable;
+    auto r = h.sink.Get(kUsagePaths[0]);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(contains(r->body, "could not be read"));
+    CHECK_FALSE(h.saw("read:app"));
+}
+
+TEST_CASE("usage routes: a degraded store audits the failure and never renders an empty list",
+          "[device_data][routes][usage]") {
+    UsageHarness h;
+    h.store_degraded = true;
+    auto r = h.sink.Get(kUsagePaths[0]);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(contains(r->body, "could not be read"));
+    CHECK_FALSE(contains(r->body, "reported no application usage"));
+    CHECK(h.saw("audit:app_usage.agent.view:failure"));
+}
+
+TEST_CASE("usage routes: a missing or oversized id is 400 before any probe",
+          "[device_data][routes][usage]") {
+    UsageHarness h;
+    auto r = h.sink.Get("/fragments/hardware/ci/licences");
+    REQUIRE(r);
+    CHECK(r->status == 400);
+    auto big = h.sink.Get("/fragments/hardware/ci/app-usage?id=" + std::string(300, 'a'));
+    REQUIRE(big);
+    CHECK(big->status == 400);
+    CHECK(h.events.empty());
+}
+
+TEST_CASE("usage routes: UsageDeps with an unwired gate is refused at registration",
+          "[device_data][routes][usage]") {
+    yuzu::server::test::TestRouteSink sink;
+    UsageDeps d;
+    CHECK_THROWS_AS(register_device_usage_routes(sink, d), std::invalid_argument);
+}

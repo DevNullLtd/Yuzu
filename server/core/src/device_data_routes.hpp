@@ -57,6 +57,37 @@ struct Deps {
     SchemasFn schemas_fn;
 };
 
+/// Dependencies of the two behavioural-data fragments (application usage and detected
+/// licences). They twin GET /api/v1/forensics/agents/{id}/app-usage and
+/// GET /api/v1/sle/agents/{id}: same per-device gate, same audit verb, same fail-closed
+/// order (audit row BEFORE the read; when it cannot persist, no data is returned).
+struct UsageDeps {
+    enum class Probe { Allowed, Denied, Unavailable };
+    using AuthFn = Deps::AuthFn;
+    /// Per-device gate probe against a throwaway Response. Unavailable = the
+    /// authorization subsystem is degraded (the REST twins answer 503 there).
+    using ProbeFn = std::function<Probe(const httplib::Request&, const std::string& securable,
+                                        const std::string& op, const std::string& agent_id)>;
+    /// Same shape as the REST routes' AuditFn: true = persisted (or audit is off).
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
+                                       const std::string& result, const std::string& target_type,
+                                       const std::string& target_id, const std::string& detail)>;
+    /// nullopt = store unwired or degraded.
+    using UsageFn = std::function<std::optional<AppUsageData>(const std::string& agent_id)>;
+    using LicencesFn =
+        std::function<std::optional<std::vector<LicenceRow>>(const std::string& agent_id)>;
+
+    AuthFn auth_fn;
+    ProbeFn probe_fn;
+    AuditFn audit_fn; // null = audit-off deployment (serves, per the AuditFn contract)
+    UsageFn usage_fn;
+    LicencesFn licences_fn;
+};
+
+/// GET /fragments/hardware/ci/app-usage?id= and /fragments/hardware/ci/licences?id=.
+/// Fails fast on an unwired gate or reader; the audit sink may be null.
+void register_device_usage_routes(HttpRouteSink& sink, UsageDeps deps);
+
 /// Registers the fragments on `sink`. Fails fast (std::invalid_argument) when a
 /// required closure is unwired, so a mis-wired server never serves an ungated read.
 void register_device_data_routes(HttpRouteSink& sink, Deps deps);

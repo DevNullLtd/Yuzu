@@ -145,5 +145,27 @@
     },
     "mcp_twin": "list_management_groups",
     "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/hardware/ci/app-usage",
+    "capability_id": "get.fragments-hardware-ci-app-usage",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/forensics/agents/{param}/app-usage"
+    },
+    "mcp_twin": "get_agent_app_usage",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/hardware/ci/licences",
+    "capability_id": "get.fragments-hardware-ci-licences",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/sle/agents/{param}"
+    },
+    "mcp_twin": "query_software_licenses",
+    "status": "twinned"
   }
 ]

@@ -130,3 +130,75 @@ TEST_CASE("device data js: one delegated listener, no markup or dynamic-code sin
     // These routes ignore the audit result (A2): no audit-failed banner here.
     CHECK_FALSE(contains(js, "auditFailed"));
 }
+
+// ---- application usage and detected licences ---------------------------------------------
+
+TEST_CASE("app usage render: hours, desc order, escaped keys, and the 200-row display cap",
+          "[device_data][render][usage]") {
+    AppUsageView v;
+    v.agent_id = "agent-1";
+    AppUsageData d;
+    d.collected_at = 1700000000;
+    for (int i = 0; i < 250; ++i)
+        d.rows.push_back({"exe" + std::to_string(i), 1, 2, 1, i * 3600});
+    d.rows.push_back({kPlanted, 1, 2, 3, 5400});
+    v.body = d;
+    const auto html = render_app_usage_panel(v);
+    CHECK(contains(html, "Hours, last 30 days"));
+    // Highest hours first; 249 h leads and the cap leaves 51 rows out.
+    CHECK(html.find("exe249") < html.find("exe248"));
+    CHECK(contains(html, "Showing 200 of 251"));
+    CHECK(contains(html, "most 20000"));
+    CHECK_FALSE(contains(html, "exe10<"));
+    // No raw key markup, and no user column of any kind.
+    CHECK_FALSE(contains(html, kPlanted));
+    CHECK_FALSE(contains(html, "user"));
+}
+
+TEST_CASE("app usage render: 5400 s is 1.5 hours and an empty window is explicit",
+          "[device_data][render][usage]") {
+    AppUsageView v;
+    v.agent_id = "a";
+    v.body = AppUsageData{{{"x.exe", 1, 2, 1, 5400}}, 1700000000};
+    CHECK(contains(render_app_usage_panel(v), ">1.5<"));
+    v.body = AppUsageData{{}, 1700000000};
+    CHECK(contains(render_app_usage_panel(v), "reported no application usage"));
+}
+
+TEST_CASE("usage render: withheld, denied and unavailable never carry a table",
+          "[device_data][render][usage]") {
+    AppUsageView a;
+    a.agent_id = "a";
+    a.body = Withheld{};
+    CHECK(contains(render_app_usage_panel(a), "withheld"));
+    CHECK_FALSE(contains(render_app_usage_panel(a), "<table"));
+    LicencesView l;
+    l.agent_id = "a";
+    l.body = Denied{};
+    CHECK(contains(render_licences_panel(l), "SoftwareLicensing:Read"));
+    l.body = Unavailable{};
+    CHECK(contains(render_licences_panel(l), "could not be read"));
+}
+
+TEST_CASE("licences render: escapes every cell and has no per-user column",
+          "[device_data][render][usage]") {
+    LicencesView v;
+    v.agent_id = "a";
+    v.body = std::vector<LicenceRow>{{kPlanted, kPlanted, "1", "t", "s", "c", "probable", "XXXXX-ABCDE", "slmgr", 1700000000}};
+    const auto html = render_licences_panel(v);
+    CHECK_FALSE(contains(html, kPlanted));
+    CHECK(contains(html, "&lt;img"));
+    CHECK_FALSE(contains(html, "user_ref"));
+    CHECK_FALSE(contains(html, "user_scope"));
+    CHECK(contains(html, "XXXXX-ABCDE"));
+    CHECK(contains(html, "slmgr"));
+}
+
+TEST_CASE("usage load hosts: click-to-load, never auto-load, id encoded",
+          "[device_data][render][usage]") {
+    const auto html = render_usage_load_hosts("a b/c");
+    CHECK(contains(html, "hx-trigger=\"click\""));
+    CHECK_FALSE(contains(html, "hx-trigger=\"load\""));
+    CHECK(contains(html, "/fragments/hardware/ci/app-usage?id=a%20b%2Fc"));
+    CHECK(contains(html, "/fragments/hardware/ci/licences?id=a%20b%2Fc"));
+}

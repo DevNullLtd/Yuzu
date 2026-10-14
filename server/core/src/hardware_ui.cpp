@@ -6,6 +6,7 @@
 /// and plugin scope"). Honesty: a degraded read renders a banner, never an empty
 /// table (ADR-0016 §7).
 
+#include "device_data_render.hpp"
 #include "hardware_routes.hpp"
 
 #include "web_utils.hpp"
@@ -795,6 +796,8 @@ std::string render_hardware_software_lens(const std::string& agent_id,
         h += "<div class=\"hw-page\">List truncated &mdash; showing the first " +
              std::to_string(kHwSoftwareCap) + " entries.</div>";
     h += "</div>";
+    // Application usage and detected licences are behavioural reads: click-to-load only.
+    h += device_data::render_usage_load_hosts(agent_id);
     return h;
 }
 

@@ -12,6 +12,7 @@
 /// (ADR-0016 section 7); a permission the caller lacks renders a note naming the
 /// permission, never a control that can only 403.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <variant>
@@ -49,5 +50,61 @@ struct PropertiesView {
 
 /// The Properties and Schemas panels of the "Tags and properties" lens.
 std::string render_properties_panels(const PropertiesView& v);
+
+/// The access-audit row for a behavioural read could not persist, so the data is not
+/// shown (the REST twins answer 503 + Sec-Audit-Failed; a fragment answers 200 with
+/// this note and the same header, because htmx drops a non-2xx body).
+struct Withheld {};
+
+/// Display cap on the app-usage table. The store itself is bounded at 20000 rows.
+inline constexpr std::size_t kAppUsageDisplayCap = 200;
+inline constexpr std::size_t kAppUsageStoreCap = 20000;
+
+struct AppUsageRow {
+    std::string exe_key;
+    std::int64_t first_seen{0};
+    std::int64_t last_seen{0};
+    std::int64_t run_count_30d{0};
+    std::int64_t total_seconds_30d{0};
+};
+
+struct AppUsageData {
+    std::vector<AppUsageRow> rows; // any order; the renderer sorts and caps
+    std::int64_t collected_at{0};
+};
+
+struct AppUsageView {
+    std::string agent_id;
+    std::variant<AppUsageData, Unavailable, Denied, Withheld> body;
+};
+
+/// Per-application usage for one device. `user_ref` and every other per-user value is
+/// absent from the input type, so nothing here can render it.
+std::string render_app_usage_panel(const AppUsageView& v);
+
+/// A detected licence. Deliberately has no user_scope / user_ref / key_hint field.
+struct LicenceRow {
+    std::string product;
+    std::string vendor;
+    std::string version;
+    std::string license_type;
+    std::string state;
+    std::string channel;
+    std::string confidence;
+    std::string key_hint; // OS-provided partial only, never key material
+    std::string detector;
+    std::int64_t expiry_at{0}; // 0 = none
+};
+
+struct LicencesView {
+    std::string agent_id;
+    std::variant<std::vector<LicenceRow>, Unavailable, Denied, Withheld> body;
+};
+
+std::string render_licences_panel(const LicencesView& v);
+
+/// The two click-to-load hosts shown under the installed-software table. Nothing is
+/// fetched (and nothing is audited) until an operator clicks.
+std::string render_usage_load_hosts(const std::string& agent_id);
 
 } // namespace yuzu::server::device_data
