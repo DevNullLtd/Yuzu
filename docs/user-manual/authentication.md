@@ -230,7 +230,7 @@ See [Server Administration — CLI flags](server-admin.md) for configuration and
 
 | Client type | Unauthenticated behavior |
 |---|---|
-| Page request (path does not start with `/api/` or `/events`) | 302 redirect to `/login` |
+| Page request (path does not start with `/api/` or `/events`) | 302 redirect to `/home` (the sign-in landing page), with `?next=<screen key>` when the path is one of its screens |
 | API request (path starts with `/api/` or is `/events`) | `401 Unauthorized` with JSON error body `{"error":"unauthorized"}` |
 
 The middleware distinguishes browser from API by request path, not by the `Accept` header.
@@ -597,7 +597,7 @@ regardless of flag values).
 
 ### SAML Login Flow
 
-1. The operator navigates directly to `GET /auth/saml/start`. There is no "Sign in with SAML" button on the login page in this release — the login-page SSO button for SAML is deferred.
+1. The operator clicks "Sign in with single sign-on" on the sign-in page (`/home`), which links to `GET /auth/saml/start` when SAML is enabled and no OIDC provider is (when both are enabled the button starts OIDC), or navigates directly to `GET /auth/saml/start`.
 2. The server generates a `<samlp:AuthnRequest>` and redirects the browser to the IdP via **HTTP-Redirect binding** (the request is deflate-compressed and URL-encoded in the `SAMLRequest` query parameter).
 3. The operator authenticates at the IdP.
 4. The IdP POSTs a `<samlp:Response>` containing a signed assertion to the ACS endpoint (`POST /saml/acs`) via **HTTP-POST binding**.

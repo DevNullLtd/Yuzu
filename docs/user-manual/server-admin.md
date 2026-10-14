@@ -2793,7 +2793,7 @@ unaffected and needs no change.
 
 The Settings page is the primary administrative interface. It is accessible only to users with the **admin** role and is rendered server-side using HTMX.
 
-**URL:** `/settings` (redirects to `/login` if unauthenticated or non-admin)
+**URL:** `/settings` (redirects to the sign-in page, `/home`, if unauthenticated or non-admin)
 
 The Settings page is organized into sections, each loaded as an HTMX fragment. Changes take effect immediately without a server restart unless otherwise noted.
 
@@ -3444,7 +3444,7 @@ identity by clicking the **Sign out everywhere** button on their own
 row in Settings → Users. Unlike the admin **Revoke sessions** button,
 this revokes BOTH cookie sessions AND every API token the user owns
 (the lost-laptop scenario must kill every credential, not just
-browser cookies). After the request the page redirects to `/login`
+browser cookies). After the request the page redirects to `/home`
 and the response clears the session cookie via `Set-Cookie: Max-Age=0`.
 
 > **MCP-tier and service-scoped tokens cannot self-revoke.** Those
@@ -4165,10 +4165,10 @@ the `openssl` keypair-generation and IdP-registration recipe.
 ### Known limitations in this release
 
 - **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
-- **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and there is no login-page SAML button — SAML operators go to `/auth/saml/start`.
+- **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and the sign-in page (`/home`) offers a SAML button only when no OIDC provider is enabled — SAML operators otherwise go to `/auth/saml/start`.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
 - **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.
-- **No login-page button:** Navigate directly to `GET /auth/saml/start`; there is no "Sign in with SAML" button on the login page.
+- **Login-page button:** The sign-in page (`/home`) shows "Sign in with single sign-on" for SAML when SAML is enabled and no OIDC provider is; with both enabled the button starts OIDC and SAML operators navigate to `GET /auth/saml/start`.
 
 See `docs/user-manual/authentication.md` "SAML 2.0 SSO" for the full login flow, capability table, and `docs/auth-architecture.md` "SAML 2.0 SP" for the implementation reference.
 
