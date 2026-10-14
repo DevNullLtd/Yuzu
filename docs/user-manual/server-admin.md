@@ -5091,7 +5091,7 @@ Every figure is a typed read of an existing source and keeps its own gate. A fig
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/home` | The Home page (signed-in session; otherwise redirects to `/login`). |
-| `GET` | `/fragments/home/summary` | The readout and Needs attention panels (HTMX). Per-figure gates: `Inventory:Read`, `Policy:Read`, `Execution:Read`, `Approval:Read`. Always answers `200`; a refusal becomes a panel note. A service-scoped token is refused first (audit action `home.fragment.access_denied`). Accounts limited to a group of devices see device figures narrowed to their group, read from the newest 100,000 devices and shown as "at least N" when that read is full, and a "limited" note for fleet-wide compliance and failed executions. |
+| `GET` | `/fragments/home/summary` | The readout and Needs attention panels (HTMX). Per-figure gates: `Inventory:Read`, `Policy:Read`, `Execution:Read`, `Approval:Read`. Answers `200` for every signed-in caller: a refused or degraded figure becomes a panel note, never an error body. A service-scoped token is refused first with `403` (audit action `home.fragment.access_denied`); a request with no session gets `401`. Accounts limited to a group of devices see device figures narrowed to their group, read from the newest 100,000 devices and shown as "at least N" when that read is full, and a "limited" note for fleet-wide compliance and failed executions. |
 
 ---
 

@@ -9,6 +9,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -469,4 +472,27 @@ TEST_CASE("tally_roster partitions state exactly", "[home][route]") {
     CHECK(c.online == 3);
     CHECK(c.not_seen == 2);
     CHECK(c.offline == 1);
+}
+
+// ── production wiring ─────────────────────────────────────────────────────
+
+// Kills: every case above passing while server.cpp drops the HomeRoutes registration or
+// one of its seams (the real server would 404 both routes, or render a figure Unwired).
+// Precedent: test_health_routes.cpp's wiring tripwire.
+TEST_CASE("home_routes: wiring -- server.cpp registers HomeRoutes and binds every seam",
+          "[home][route]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto at = src.find("home_routes_->register_routes(");
+    REQUIRE(at != std::string::npos);
+    const std::string block = src.substr(at, 6000);
+    for (const char* seam :
+         {".auth_fn", ".deny_service_scoped_fn", ".fleet_read_fn", ".perm_fn", ".now_fn",
+          ".roster_fn", ".fleet_estate_fn", ".compliance_fn", ".failed_fn", ".approvals_fn",
+          ".enrolment_fn"})
+        CHECK(has(block, seam));
 }
