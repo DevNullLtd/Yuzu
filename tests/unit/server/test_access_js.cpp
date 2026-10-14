@@ -95,7 +95,8 @@ TEST_CASE("access glue: enforcement, elevation and the permission check keep the
          {"ACTS.enforce", "ACTS.elevate", "ACTS.stepdown", "ACTS.check",
           "'/api/v1/rbac/enforcement'", "{ json: { enabled: want } }",
           // The switch is put back at once; only a redraw from the server changes it.
-          "sw.checked = !want;", "reloadPanels()",
+          "sw.checked = !want;", "reloadPanels()", "sayAfterSwap('acc-enforcement', 'ok', text)",
+          "if (pendingOut && id === pendingOut.panelId)",
           "'/api/v1/elevate'", "'/api/v1/elevate/revoke'", "justification", "duration_secs",
           "new TextEncoder().encode(j).length > 1024", "Enter a reason.", "r.auditFailed", "r.data.expires_at",
           "'/api/v1/rbac/check'", "securable_type", "typeof allowed === 'boolean'", "Enter an area and an operation.",

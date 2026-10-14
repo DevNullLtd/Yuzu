@@ -275,6 +275,12 @@
   document.body.addEventListener('htmx:afterSwap', function (e) {
     var id = e.detail.target && e.detail.target.id;
     if (id === 'acc-users' || id === 'acc-roles' || id === 'acc-assignments') derive();
+    // An outcome line for a panel that is being redrawn is written once its redraw has landed.
+    if (pendingOut && id === pendingOut.panelId) {
+      var p = pendingOut;
+      pendingOut = null;
+      sayIn(p.panelId, p.kind, p.text, p.more);
+    }
   });
 
   // ---- your account ----
@@ -335,6 +341,8 @@
   // These panels sit in the lower column, so their outcome goes in the panel's own
   // [data-slot=out] region, not the page-top message line.
 
+  var pendingOut = null;
+
   function sayIn(panelId, kind, text, more) {
     var slot = document.querySelector('#' + panelId + ' [data-slot="out"]');
     if (!slot) return;
@@ -360,6 +368,12 @@
       waits.push(Promise.resolve(htmx.ajax('GET', p.dataset.src, { target: '#' + p.id })).catch(function () {}));
     });
     return Promise.all(waits);
+  }
+
+  // sayIn after a redraw of the same panel: the redraw would otherwise wipe the line.
+  function sayAfterSwap(panelId, kind, text, more) {
+    pendingOut = { panelId: panelId, kind: kind, text: text, more: more };
+    return reloadPanels();
   }
 
   function remediation(r) {
@@ -393,13 +407,12 @@
                      ' Other servers may take a few seconds to follow.' +
                      (typeof d.post_transition_administrators === 'number'
                        ? ' Administrators who keep access: ' + d.post_transition_administrators + '.' : '');
-          return reloadPanels().then(function () { sayIn('acc-enforcement', 'ok', text); });
+          return sayAfterSwap('acc-enforcement', 'ok', text);
         }
         if (unknown(r)) {
           // The audit write can fail after the change took effect: the panel re-reads the real setting.
-          return reloadPanels().then(function () {
-            sayIn('acc-enforcement', 'bad', r.message || 'The request may not have applied.', 'The setting shown is the current one.');
-          });
+          return sayAfterSwap('acc-enforcement', 'bad', r.message || 'The request may not have applied.',
+                              'The setting shown is the current one.');
         }
         sw.disabled = false;
         sayIn('acc-enforcement', 'bad', r.message || ('The request was refused (HTTP ' + r.status + ').'),
