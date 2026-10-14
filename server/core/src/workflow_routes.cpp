@@ -193,6 +193,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // #1712 / #3290 Phase 2 — see WorkflowRoutes::FleetReadFn's doc comment.
     auto fleet_read_fn = std::move(deps.fleet_read_fn);
     auto audit_fn = std::move(deps.audit_fn);
+    auto probe_perm_fn = std::move(deps.probe_perm_fn);
     auto emit_fn = std::move(deps.emit_fn);
     auto scope_fn = std::move(deps.scope_fn);
     auto* workflow_engine = deps.workflow_engine;
@@ -613,7 +614,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // to exact `execution_id` correlation transparently).
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
-        [auth_fn, fleet_read_fn, audit_fn, execution_tracker, instruction_store,
+        [auth_fn, fleet_read_fn, audit_fn, probe_perm_fn, execution_tracker, instruction_store,
          response_store](const httplib::Request& req, httplib::Response& res) {
             // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
             // (fleet_read_fn), mirroring query_installed_software / the REST
@@ -781,6 +782,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 view.parameter_values =
                     gate.scope ? "(redacted - confined view)" : exec.parameter_values;
                 view.completed_at = exec.completed_at;
+                // Render hint for the Cancel button only (the cancel route re-gates on
+                // Execution:Execute + Execution:Read). One probe, only for a live row;
+                // unwired probe = not probed = attribute omitted.
+                if (probe_perm_fn && (exec.status == "running" || exec.status == "pending"))
+                    view.can_cancel = probe_perm_fn(req, "Execution", "Execute") ? 1 : 0;
                 // The "Device results" slot rides in the same response (one fetch, one audit
                 // row). `agents` is already scope-filtered above; a confined caller gets no
                 // dispatched-device count (it would subtract to an out-of-scope number).

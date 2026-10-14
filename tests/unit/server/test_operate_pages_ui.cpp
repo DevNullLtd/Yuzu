@@ -247,10 +247,17 @@ TEST_CASE("operate pages: Executions copy is exact and read-only", "[ui][operate
     const auto body_at = html.find("<!--/yuzu:shell-->");
     REQUIRE(body_at != std::string::npos);
     const auto body = html.substr(body_at);
+    // The page itself carries no controls or dialogs: Cancel is rendered per selection by the
+    // detail fragment and the dialog is built by yuzu-dialog.js.
     CHECK_FALSE(has(body, "<button"));
     CHECK_FALSE(has(body, "<dialog"));
     CHECK_FALSE(has(body, ">Cancel execution"));
     CHECK_FALSE(has(body, ">Re-run"));
+    const std::string js(yuzu::server::kYuzuOperateJs);
+    CHECK(has(js, "button[data-act=\"cancel\"]"));
+    CHECK(has(js, "var url = '/api/executions/' + encodeURIComponent(id) + '/cancel';"));
+    CHECK(has(js, "if (r.status === 409) return r.message ||"));
+    CHECK(has(js, "sel.getAttribute('data-can-cancel') === '0'"));
 }
 
 // -- Shared dialog module (static/yuzu-dialog.js + the Dialog block of yuzu.css) ---------

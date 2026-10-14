@@ -177,7 +177,10 @@ std::string render_exec_selected(const ExecSelectedView& v) {
            (v.confined ? "1" : "0") + "\" data-def-name=\"" + html_escape(e.definition_name) +
            "\" data-by=\"" + html_escape(e.dispatched_by) + "\" data-responded=\"" +
            std::to_string(e.agents_responded) + "\" data-targeted=\"" +
-           std::to_string(e.agents_targeted) + "\">";
+           std::to_string(e.agents_targeted) + "\"";
+    if (v.can_cancel >= 0)
+        out += std::string(" data-can-cancel=\"") + (v.can_cancel ? "1" : "0") + "\"";
+    out += ">";
     out += "<div class=\"hd\"><h2>Selected execution</h2>" + pill(st) + "</div>";
     out += "<div class=\"kvl\">";
     out += "<div class=\"stack\"><span>Instruction</span><b class=\"l\">" +
@@ -209,7 +212,10 @@ std::string render_exec_selected(const ExecSelectedView& v) {
                "%\"></i></div><span class=\"hint\">" + std::to_string(pct) +
                "% of targeted devices have responded</span></div>";
     }
-    out += "<div class=\"btns\"><a class=\"btn\" href=\"/api/v1/executions/" + html_escape(e.id) +
+    out += "<div class=\"btns\"><button type=\"button\" class=\"btn danger\" data-act=\"cancel\"";
+    if (!live)
+        out += " disabled";
+    out += ">Cancel execution</button><a class=\"btn\" href=\"/api/v1/executions/" + html_escape(e.id) +
            "/responses?limit=1000\" target=\"_blank\" rel=\"noopener\">Open responses "
            "(JSON)</a><span class=\"hint\">Needs Response:Read.</span></div>";
     out += "</div>";

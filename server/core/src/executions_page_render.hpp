@@ -74,6 +74,7 @@ struct ExecSelectedView {
     std::string parameter_values;  ///< ditto
     int64_t completed_at{0};
     bool confined{false};
+    int can_cancel{-1}; ///< -1 not probed (attribute omitted), 0 no grant, 1 holds Execute
 };
 
 /// The "Selected execution" panel body (see the contract above).

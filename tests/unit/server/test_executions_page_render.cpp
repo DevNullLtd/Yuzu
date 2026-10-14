@@ -244,6 +244,27 @@ TEST_CASE("executions_page_render: a confined panel prints only the redaction it
     CHECK(count_of(html, "(redacted - confined view)") == 2);
 }
 
+TEST_CASE("executions_page_render: Cancel is offered only for a live row, can-cancel is tri-state",
+          "[ui][executions][render]") {
+    const std::string btn = "<button type=\"button\" class=\"btn danger\" data-act=\"cancel\"";
+    for (const char* live : {"running", "pending"}) {
+        ExecSelectedView v;
+        v.row = make_row("e1", live);
+        auto html = render_exec_selected(v);
+        CHECK(has(html, btn + ">Cancel execution</button>"));
+        CHECK_FALSE(has(html, "data-can-cancel"));  // not probed: omitted
+        v.can_cancel = 1;
+        CHECK(has(render_exec_selected(v), "data-can-cancel=\"1\""));
+        v.can_cancel = 0;
+        CHECK(has(render_exec_selected(v), "data-can-cancel=\"0\""));
+    }
+    for (const char* done : {"completed", "cancelled"}) {
+        ExecSelectedView v;
+        v.row = make_row("e1", done);
+        CHECK(has(render_exec_selected(v), btn + " disabled>Cancel execution</button>"));
+    }
+}
+
 // -- Device results slot (render_exec_devices) --------------------------------------------
 
 namespace {

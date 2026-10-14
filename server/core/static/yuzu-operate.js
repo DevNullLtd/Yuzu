@@ -61,6 +61,17 @@
     setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 4000);
   }
 
+  function factRow(label, text, code) {
+    var r = doc.createElement('div');
+    var l = doc.createElement('span');
+    l.textContent = label;
+    var v = doc.createElement(code ? 'code' : 'b');
+    v.textContent = text;
+    r.appendChild(l);
+    r.appendChild(v);
+    return r;
+  }
+
   function setNote(host, text) {
     var n = doc.createElement('div');
     n.className = 'empty-state';
@@ -205,17 +216,6 @@
 
       field(detail, 'empty').hidden = true;
       field(detail, 'kv').hidden = false;
-    }
-
-    function factRow(label, text, code) {
-      var r = doc.createElement('div');
-      var l = doc.createElement('span');
-      l.textContent = label;
-      var v = doc.createElement(code ? 'code' : 'b');
-      v.textContent = text;
-      r.appendChild(l);
-      r.appendChild(v);
-      return r;
     }
 
     // Approve / reject dialog for the selected pending request. The facts are the row's
@@ -600,6 +600,11 @@
         if (res.status !== 200) { panelNote(detailCopy(res.status)); return; }
         applySlots(res.html); // server-rendered and escaped
         var sel = $('[data-slot="selected"]', panel);
+        var cb = sel ? $('button[data-act="cancel"]', sel) : null;
+        if (cb && sel.getAttribute('data-can-cancel') === '0') {
+          cb.disabled = true;
+          cb.title = 'You do not have permission to cancel executions.';
+        }
         var status = sel ? sel.getAttribute('data-execution-status') : '';
         var running = status === 'running' || status === 'pending';
         if (fromLive) {
@@ -610,6 +615,54 @@
         seatChip();
       });
     }
+
+    // Cancel: the facts come from the selected slot's own data-* attributes (no refetch);
+    // the decision is one POST through YuzuDialog. The server stays the gate (a render hint
+    // only decides whether the button is offered).
+    function cancelExecution() {
+      var sel = $('[data-slot="selected"]', panel);
+      if (!sel || !window.YuzuDialog) return;
+      var d = sel.dataset;
+      var id = d.executionId || '';
+      if (!id) return;
+      var facts = doc.createElement('div');
+      facts.className = 'kvl dlg-facts';
+      facts.appendChild(factRow('Instruction', d.defName || ''));
+      facts.appendChild(factRow('Started by', d.by || ''));
+      facts.appendChild(factRow('Devices', (d.targeted || '0') + (d.confined === '1' ? ' in your scope' : ' targeted')));
+      facts.appendChild(factRow('Execution id', id, true));
+      var url = '/api/executions/' + encodeURIComponent(id) + '/cancel';
+      YuzuDialog.form({
+        title: 'Cancel execution',
+        body: facts,
+        note: 'Devices that have not started will not run it. Work already running on a device ' +
+              'is not interrupted. Your action is recorded in the audit log.',
+        danger: true,
+        fields: [],
+        cancelLabel: 'Go back',
+        submitLabel: 'Cancel execution',
+        submit: function () {
+          return YuzuDialog.request('POST', url, { json: {} }).then(function (r) {
+            if (r.ok) return null;
+            if (r.status === 409) return r.message || 'This execution has already finished.';
+            if (r.status === 401) return 'Your session has expired. Sign in again.';
+            if (r.status === 403) return 'You do not have permission to cancel executions.';
+            if (r.status === 404) return 'This execution was not found, or is outside your scope.';
+            return 'Could not confirm the cancellation. Refresh to see the current state.';
+          });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast('Execution cancelled', 'success');
+        stopLive();
+        showDetail(id, true);
+        loadList();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+    panel.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-act="cancel"]') : null;
+      if (b && panel.contains(b) && !b.disabled) cancelExecution();
+    });
 
     function updateChrome(list) {
       var count = Number(list.getAttribute('data-count')) || 0;
