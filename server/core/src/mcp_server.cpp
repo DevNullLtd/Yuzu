@@ -21372,7 +21372,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const auto subnet = param_str(args, "subnet");
+                // Strict: a present non-string `subnet` must be refused, not read
+                // as "" (which the SQL treats as every subnet -- a dropped filter).
+                const auto subnet_opt = param_string_strict(args, "subnet");
+                if (!subnet_opt) {
+                    res.set_content(a4_error(kInvalidParams, "invalid subnet"),
+                                    "application/json");
+                    return;
+                }
+                const auto& subnet = *subnet_opt;
                 std::optional<int> limit = kDiscoveredDevicesMaxLimit;
                 if (args.contains("limit")) {
                     limit = args["limit"].is_number_integer()

@@ -17588,6 +17588,8 @@ private:
         // shared by the REST + fragment routes below and the MCP tool. A null
         // or unopened store yields a reader that errors, so a store fault is
         // never rendered as "no hosts".
+        // The reader captures the raw store pointer: `discovery_store_` outlives every
+        // handler because web_server_->stop() runs before members destruct.
         auto discovered_reader = make_discovered_devices_reader(discovery_store_.get());
 
         network_routes_ = std::make_unique<NetworkRoutes>();

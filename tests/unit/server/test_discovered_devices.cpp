@@ -219,6 +219,22 @@ TEST_CASE("discovered devices REST: limit is clamped at the cap and 0 or junk is
     CHECK(h.reads == 0); // validation precedes the read
 }
 
+TEST_CASE("discovered devices: a subnet of exactly the max length is accepted",
+          "[discovery][twin][routes]") {
+    Harness h;
+    const std::string edge(kDiscoveredSubnetMaxLen, '1');
+    auto rest = h.sink.Get("/api/v1/network/discovered-devices?subnet=" + edge);
+    REQUIRE(rest);
+    CHECK(rest->status == 200);
+    auto frag = h.sink.Get("/fragments/network/discovered?subnet=" + edge);
+    REQUIRE(frag);
+    CHECK(frag->status == 200);
+    CHECK(h.seen_subnet == edge);
+    auto over = h.sink.Get("/fragments/network/discovered?subnet=" + edge + "1");
+    REQUIRE(over);
+    CHECK(over->status == 400);
+}
+
 TEST_CASE("discovered devices REST: gates run before the read",
           "[discovery][twin][routes][security]") {
     SECTION("unauthenticated") {
@@ -291,6 +307,7 @@ TEST_CASE("discovered devices REST: no reader wired is a 503",
         auto res = sink.Get(path);
         REQUIRE(res);
         CHECK(res->status == 503);
+        CHECK(res->body.find("<table") == std::string::npos);
     }
 }
 
@@ -337,6 +354,14 @@ TEST_CASE("discovered devices fragment: shares the REST gates",
     REQUIRE(forbidden);
     CHECK(forbidden->status == 403);
     CHECK(g.reads == 0);
+
+    Harness u;
+    u.signed_in = false;
+    auto anon = u.sink.Get("/fragments/network/discovered");
+    REQUIRE(anon);
+    CHECK(anon->status == 401);
+    CHECK(u.reads == 0);
+    CHECK(u.audit.empty());
 
     Harness i;
     auto bad = i.sink.Get("/fragments/network/discovered?limit=0");

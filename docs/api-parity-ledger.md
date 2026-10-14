@@ -122,6 +122,15 @@ the paged shape and the export mode is recorded here rather than as a separate r
 `version`, `limit` and `cursor` only (an unknown argument name is ignored, as on the other read tools; only approval-gated tools validate argument names at dispatch). The row
 stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by `#5699` (revisit by 2026-11-07), with the same ADR-1005 exception entry.
 
+**Known asymmetry on the discovered-devices pair.** The legacy `GET /api/discovery/results` row is
+`twinned` to `GET /api/v1/network/discovered-devices` / `list_discovered_devices`, but the raw route is
+not retired and is not equivalent: it is unbounded (no `limit`, no `truncated`), returns the
+`managed` and `agent_id` columns (the new twin deliberately omits them: nothing maintains the
+flag yet), uses the `{devices,total}` shape, writes no `network.discovered.view` audit row and has
+no explicit service-scoped denial of its own (it relies on the `Infrastructure:Read` gate). The
+bounded, audited twin is the supported read for agents and integrations; hardening or retiring the
+raw route is tracked outside this change.
+
 ## Summary
 
 <!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; regenerate with `python3 scripts/ci/check-api-parity.py --render-doc` and splice between these markers -->

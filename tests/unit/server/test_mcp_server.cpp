@@ -34315,13 +34315,29 @@ TEST_CASE("MCP list_discovered_devices: invalid arguments are refused and an unw
             return discovered_fixture_page();
         };
         ts.start("readonly");
-        for (const char* args : {R"({"limit":0}}})", R"({"limit":-3}}})", R"({"limit":"5"}}})",
-                                 R"({"limit":2.5}}})"}) {
+        // A non-string subnet must be refused, never read as "" (every subnet).
+        const std::string long_subnet(65, 'x');
+        const std::string long_args = std::string(R"({"subnet":")") + long_subnet + R"("}}})";
+        for (const std::string args :
+             {std::string(R"({"limit":0}}})"), std::string(R"({"limit":-3}}})"),
+              std::string(R"({"limit":"5"}}})"), std::string(R"({"limit":2.5}}})"),
+              std::string(R"({"limit":null}}})"), std::string(R"({"subnet":123}}})"),
+              std::string(R"({"subnet":null}}})"), std::string(R"({"subnet":["x"]}}})"),
+              long_args}) {
             auto res = ts.call(std::string(kListDiscoveredCall) + args);
             REQUIRE(res);
-            CHECK(nlohmann::json::parse(res->body).contains("error"));
+            auto body = nlohmann::json::parse(res->body);
+            INFO(args);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == -32602); // kInvalidParams, not some other failure
         }
         CHECK_FALSE(reached);
+        // Exactly 64 bytes is accepted.
+        auto ok = ts.call(std::string(kListDiscoveredCall) + R"({"subnet":")" +
+                          std::string(64, 'x') + R"("}}})");
+        REQUIRE(ok);
+        CHECK(nlohmann::json::parse(ok->body).contains("result"));
+        CHECK(reached);
     }
     {
         McpTestServer ts; // no reader wired
