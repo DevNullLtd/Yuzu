@@ -31,9 +31,12 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstdio>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -469,4 +472,328 @@ TEST_CASE("deployment routes: GET /api/v1/deployments/preview 503s when the "
     auto res = sink.Get("/api/v1/deployments/preview?run=whatever");
     REQUIRE(res);
     CHECK(res->status == 503);
+}
+
+// ── Read-only list + detail twins (REST v1 + fragments) ──────────────────────
+
+namespace {
+
+// Ids are 16 lowercase hex like production (gen_id), which the detail route's id class needs.
+std::string hex_id(int n) {
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016x", n);
+    return buf;
+}
+
+struct ReadRig {
+    std::vector<std::string> audits;
+    int dispatches = 0;
+    int polls = 0;
+    std::string user = "alice";
+    std::string token_service; // non-empty => service-scoped session
+    bool authed = true;
+    bool perm_allow = true;
+    std::vector<std::pair<std::string, std::string>> perms;
+
+    DeploymentRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+
+    void wire(PreflightRunStore* pre, DeploymentRunStore* dep) {
+        routes.register_routes(
+            sink,
+            [this](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+                if (!authed)
+                    return std::nullopt;
+                auth::Session s;
+                s.username = user;
+                s.token_scope_service = token_service;
+                return s;
+            },
+            [this](const httplib::Request&, httplib::Response& res, const std::string& type,
+                   const std::string& op) {
+                perms.emplace_back(type, op);
+                if (!perm_allow) {
+                    res.status = 403;
+                    res.set_content(R"({"error":{"code":403}})", "application/json");
+                    return false;
+                }
+                return true;
+            },
+            /*devices_fn=*/{},
+            [this](auto&&...) -> yuzu::server::ConfinedDispatchOutcome {
+                ++dispatches;
+                return {};
+            },
+            [this](const std::string&) -> std::unordered_map<std::string, deployment::AgentResponse> {
+                ++polls;
+                return {};
+            },
+            [this](const httplib::Request&, const std::string& a, const std::string& r,
+                   const std::string&, const std::string&, const std::string&) -> bool {
+                audits.push_back(a + "|" + r);
+                return true;
+            },
+            pre, dep);
+    }
+};
+
+} // namespace
+
+TEST_CASE("deployment routes: GET /api/v1/deployments is owner-scoped, newest first, "
+          "clamped, and never carries the installer URL or arguments",
+          "[pg][deployment][routes][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
+    PgPool pool{{.conninfo = depdb.dsn(), .size = 4}};
+    DeploymentRunStore store(pool);
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    REQUIRE(store.create_deployment(make_dep(hex_id(1), "run-a", "alice", t - 3000), {tgt("a1")}));
+    REQUIRE(store.create_deployment(make_dep(hex_id(2), "run-b", "alice", t - 2000), {tgt("a2")}));
+    REQUIRE(store.create_deployment(make_dep(hex_id(3), "run-c", "alice", t - 1000), {tgt("a3")}));
+    REQUIRE(store.create_deployment(make_dep(hex_id(4), "run-d", "bob", t), {tgt("b1")}));
+
+    ReadRig rig;
+    rig.wire(nullptr, &store);
+
+    auto res = rig.sink.Get("/api/v1/deployments");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].size() == 3); // bob's row is not alice's
+    CHECK(body["data"][0]["deployment_id"] == hex_id(3)); // newest first
+    CHECK(body["data"][2]["deployment_id"] == hex_id(1));
+    CHECK(res->body.find("repo.lan") == std::string::npos); // artifact_url never shipped
+    CHECK(res->body.find("/qn") == std::string::npos);      // exec_args never shipped
+    CHECK(body["data"][0]["has_args"] == true);
+    CHECK(body["pagination"]["total"] == 3);
+    // Gate shape: SoftwareDeployment:Read, and unaudited on success.
+    REQUIRE_FALSE(rig.perms.empty());
+    CHECK(rig.perms.back() == std::make_pair(std::string("SoftwareDeployment"), std::string("Read")));
+    CHECK(rig.audits.empty());
+
+    // The shared builder is the shape: the route's row IS deployment_row_json.
+    auto direct = store.get_deployment(hex_id(3), "alice");
+    REQUIRE(direct);
+    CHECK(body["data"][0] == deployment_row_json(*direct));
+
+    // limit clamps to 1..100; garbage is a 400, not a silent default.
+    auto one = rig.sink.Get("/api/v1/deployments?limit=1");
+    REQUIRE(one);
+    CHECK(nlohmann::json::parse(one->body)["data"].size() == 1);
+    auto zero = rig.sink.Get("/api/v1/deployments?limit=0");
+    REQUIRE(zero);
+    CHECK(nlohmann::json::parse(zero->body)["data"].size() == 1);
+    auto huge = rig.sink.Get("/api/v1/deployments?limit=99999");
+    REQUIRE(huge);
+    CHECK(huge->status == 200);
+    auto bad = rig.sink.Get("/api/v1/deployments?limit=abc");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+}
+
+TEST_CASE("deployment routes: deployments list/detail gate matrix (401, service-scoped, RBAC)",
+          "[pg][deployment][routes][rest][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
+    PgPool pool{{.conninfo = depdb.dsn(), .size = 4}};
+    DeploymentRunStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_deployment(make_dep(hex_id(7), "run-g", "alice", now_ms()), {tgt("a1")}));
+
+    const std::string detail = "/api/v1/deployments/" + hex_id(7);
+    {
+        ReadRig rig;
+        rig.authed = false;
+        rig.wire(nullptr, &store);
+        CHECK(rig.sink.Get("/api/v1/deployments")->status == 401);
+        CHECK(rig.sink.Get(detail)->status == 401);
+        CHECK(rig.sink.Get("/fragments/auto/deployments")->status == 401);
+        CHECK(rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(7))->status == 401);
+    }
+    {
+        // A service-scoped token shares its creator's username: denied, with its OWN audited
+        // verbs, and nothing about the deployment leaks into the body.
+        ReadRig rig;
+        rig.token_service = "printers";
+        rig.wire(nullptr, &store);
+        auto l = rig.sink.Get("/api/v1/deployments");
+        auto d = rig.sink.Get(detail);
+        REQUIRE(l);
+        REQUIRE(d);
+        CHECK(l->status == 403);
+        CHECK(d->status == 403);
+        CHECK(d->body.find(hex_id(7)) == std::string::npos);
+        CHECK(rig.sink.Get("/fragments/auto/deployments")->status == 403);
+        CHECK(rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(7))->status == 403);
+        REQUIRE(rig.audits.size() == 4);
+        CHECK(rig.audits[0] == "deployment.list.view|denied");
+        CHECK(rig.audits[1] == "deployment.detail.view|denied");
+        CHECK(rig.perms.empty()); // refused before the RBAC gate was even consulted
+    }
+    {
+        // RBAC says no (e.g. PlatformEngineer holds no SoftwareDeployment grant).
+        ReadRig rig;
+        rig.perm_allow = false;
+        rig.wire(nullptr, &store);
+        CHECK(rig.sink.Get("/api/v1/deployments")->status == 403);
+        CHECK(rig.sink.Get(detail)->status == 403);
+        CHECK(rig.sink.Get("/fragments/auto/deployments")->status == 403);
+        CHECK(rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(7))->status == 403);
+        CHECK(rig.dispatches == 0);
+    }
+}
+
+TEST_CASE("deployment routes: GET /api/v1/deployments/{id} is owner-scoped, bounded, and "
+          "never advances the engine",
+          "[pg][deployment][routes][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
+    PgPool pool{{.conninfo = depdb.dsn(), .size = 4}};
+    DeploymentRunStore store(pool);
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    REQUIRE(store.create_deployment(make_dep(hex_id(10), "run-x", "alice", t),
+                                    {tgt("a1"), tgt("a2"), tgt("a3")}));
+    REQUIRE(store.create_deployment(make_dep(hex_id(11), "run-y", "bob", t), {tgt("b1")}));
+
+    ReadRig rig;
+    rig.wire(nullptr, &store);
+
+    auto res = rig.sink.Get("/api/v1/deployments/" + hex_id(10));
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["deployment_id"] == hex_id(10));
+    CHECK(body["data"]["total"] == 3);
+    CHECK(body["data"]["devices"].size() == 3);
+    CHECK(body["data"]["truncated"] == false);
+    CHECK(body["data"]["devices"][0]["hostname"] == "host-a1"); // ordered by hostname
+    CHECK(res->body.find("repo.lan") == std::string::npos);
+
+    // device limit: bounded read, exact counts, truncated flag.
+    auto cut = rig.sink.Get("/api/v1/deployments/" + hex_id(10) + "?limit=2");
+    REQUIRE(cut);
+    auto cj = nlohmann::json::parse(cut->body);
+    CHECK(cj["data"]["devices"].size() == 2);
+    CHECK(cj["data"]["truncated"] == true);
+    CHECK(cj["data"]["total"] == 3);
+
+    // Not-yours and not-found are the same 404 (no existence oracle).
+    auto theirs = rig.sink.Get("/api/v1/deployments/" + hex_id(11));
+    auto absent = rig.sink.Get("/api/v1/deployments/" + hex_id(99));
+    REQUIRE(theirs);
+    REQUIRE(absent);
+    CHECK(theirs->status == 404);
+    CHECK(absent->status == 404);
+    CHECK(theirs->body.find(hex_id(11)) == std::string::npos);
+
+    // The preview route (registered earlier, not hex) is not shadowed by the id class.
+    auto prev = rig.sink.Get("/api/v1/deployments/preview");
+    REQUIRE(prev);
+    CHECK(prev->status != 404);
+
+    // H3: reading never advances. No dispatch, no poll, no audit row, devices still pending.
+    CHECK(rig.dispatches == 0);
+    CHECK(rig.polls == 0);
+    CHECK(rig.audits.empty());
+    auto devs = store.get_devices(hex_id(10));
+    REQUIRE(devs.size() == 3);
+    for (const auto& d : devs)
+        CHECK(d.step == "pending");
+}
+
+TEST_CASE("deployment routes: a store fault is a 503 with a retry hint, never an empty list "
+          "or a 404",
+          "[pg][deployment][routes][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
+    PgPool pool{{.conninfo = depdb.dsn(), .size = 1}};
+    DeploymentRunStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_deployment(make_dep(hex_id(20), "run-f", "alice", now_ms()), {tgt("a1")}));
+
+    ReadRig rig;
+    rig.wire(nullptr, &store);
+
+    auto hog = pool.try_acquire_for(std::chrono::seconds{8}); // hold the only connection
+    REQUIRE(hog);
+
+    auto l = rig.sink.Get("/api/v1/deployments");
+    REQUIRE(l);
+    CHECK(l->status == 503);
+    auto lj = nlohmann::json::parse(l->body);
+    CHECK(lj["error"]["retry_after_ms"].get<int>() == 2000);
+    CHECK(l->body.find("\"data\"") == std::string::npos);
+
+    auto d = rig.sink.Get("/api/v1/deployments/" + hex_id(20));
+    REQUIRE(d);
+    CHECK(d->status == 503); // an EXISTING deployment must not read as not-found
+
+    // Fragments keep 200 (htmx does not swap a non-2xx) but say so, never "No deployments".
+    auto fl = rig.sink.Get("/fragments/auto/deployments");
+    REQUIRE(fl);
+    CHECK(fl->status == 200);
+    CHECK(fl->body.find("failbox") != std::string::npos);
+    CHECK(fl->body.find("No deployments") == std::string::npos);
+    auto fd = rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(20));
+    REQUIRE(fd);
+    CHECK(fd->body.find("failbox") != std::string::npos);
+    CHECK(fd->body.find("not found") == std::string::npos);
+}
+
+TEST_CASE("deployment routes: deployment twins answer 503 when the store is unwired",
+          "[deployment][routes][rest]") {
+    ReadRig rig;
+    rig.wire(nullptr, nullptr);
+    CHECK(rig.sink.Get("/api/v1/deployments")->status == 503);
+    CHECK(rig.sink.Get("/api/v1/deployments/" + hex_id(1))->status == 503);
+    auto f = rig.sink.Get("/fragments/auto/deployments");
+    REQUIRE(f);
+    CHECK(f->status == 200);
+    CHECK(f->body.find("failbox") != std::string::npos);
+}
+
+TEST_CASE("deployment routes: list fragment resolves the target label owner-scoped and says "
+          "so when the run aged out; detail fragment reads not-yours like not-found",
+          "[pg][deployment][routes][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(predb, preflight_routes_tpl);
+    PgPool dep_pool{{.conninfo = depdb.dsn(), .size = 4}};
+    PgPool pre_pool{{.conninfo = predb.dsn(), .size = 4}};
+    DeploymentRunStore store(dep_pool);
+    PreflightRunStore pre(pre_pool);
+    REQUIRE(store.is_open());
+    REQUIRE(pre.is_open());
+
+    const auto t = now_ms();
+    auto run = make_run("run-kept", "alice", t);
+    run.scope_label = "Finance <laptops>";
+    REQUIRE(pre.create_run(run, {{"a1", "host-a1", "windows"}}));
+    REQUIRE(store.create_deployment(make_dep(hex_id(30), "run-kept", "alice", t - 10),
+                                    {tgt("a1")}));
+    REQUIRE(store.create_deployment(make_dep(hex_id(31), "run-gone", "alice", t), {tgt("a2")}));
+    REQUIRE(store.create_deployment(make_dep(hex_id(32), "run-bob", "bob", t), {tgt("b1")}));
+
+    ReadRig rig;
+    rig.wire(&pre, &store);
+
+    auto l = rig.sink.Get("/fragments/auto/deployments");
+    REQUIRE(l);
+    CHECK(l->status == 200);
+    CHECK(l->body.find("Finance &lt;laptops&gt;") != std::string::npos);
+    CHECK(l->body.find("Run no longer kept") != std::string::npos);
+    CHECK(l->body.find(hex_id(32)) == std::string::npos); // bob's deployment is not listed
+    CHECK(l->body.find("repo.lan") == std::string::npos);
+
+    auto mine = rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(30));
+    auto theirs = rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(32));
+    auto absent = rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(99));
+    REQUIRE(mine);
+    REQUIRE(theirs);
+    REQUIRE(absent);
+    CHECK(mine->body.find("host-a1") != std::string::npos);
+    CHECK(theirs->body == absent->body); // byte-identical: no existence oracle
+    CHECK(theirs->body.find("aged out of retention") != std::string::npos);
+    CHECK(rig.dispatches == 0);
+    CHECK(rig.polls == 0);
+    CHECK(rig.audits.empty());
 }

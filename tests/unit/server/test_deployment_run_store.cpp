@@ -304,3 +304,62 @@ TEST_CASE("DeploymentRunStore reports !is_open on a migration failure",
     DeploymentRunStore store{pool};
     CHECK_FALSE(store.is_open());
 }
+
+TEST_CASE("DeploymentRunStore checked readers: a miss is not a fault, a fault is not a miss",
+          "[pg][deployment][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    REQUIRE(store.create_deployment(make_dep("cA", "alice", t), {tgt("a1"), tgt("a2"), tgt("a3")}));
+
+    SECTION("healthy store: hit, miss, not-yours, empty id") {
+        auto hit = store.get_deployment_checked("cA", "alice");
+        REQUIRE(hit);
+        REQUIRE(*hit);
+        CHECK((*hit)->deployment_id == "cA");
+        auto miss = store.get_deployment_checked("nope", "alice");
+        REQUIRE(miss); // engaged outer: "asked, no such row"
+        CHECK_FALSE(*miss);
+        auto theirs = store.get_deployment_checked("cA", "bob");
+        REQUIRE(theirs);
+        CHECK_FALSE(*theirs);
+        auto empty = store.get_deployment_checked("", "alice");
+        REQUIRE(empty);
+        CHECK_FALSE(*empty);
+
+        auto list = store.list_deployments_checked("alice", false, 10);
+        REQUIRE(list);
+        CHECK(list->size() == 1);
+        auto none = store.list_deployments_checked("nobody", false, 10);
+        REQUIRE(none); // zero rows is a successful read
+        CHECK(none->empty());
+    }
+
+    SECTION("device grid is ordered, bounded, and exact in the run row") {
+        auto all = store.get_devices_checked("cA");
+        REQUIRE(all);
+        CHECK(all->size() == 3);
+        CHECK((*all)[0].hostname == "host-a1");
+        auto two = store.get_devices_checked("cA", 2);
+        REQUIRE(two);
+        CHECK(two->size() == 2);
+        auto absent = store.get_devices_checked("nope");
+        REQUIRE(absent);
+        CHECK(absent->empty());
+    }
+
+    SECTION("pool exhaustion surfaces as an error, never an empty result") {
+        auto hog = pool.try_acquire_for(std::chrono::seconds{8});
+        REQUIRE(hog);
+        CHECK_FALSE(store.get_deployment_checked("cA", "alice").has_value());
+        CHECK_FALSE(store.list_deployments_checked("alice", false, 10).has_value());
+        CHECK_FALSE(store.get_devices_checked("cA").has_value());
+        // The fail-soft wrappers keep their old contract for the engine and fragments.
+        CHECK(store.list_deployments("alice", false, 10).empty());
+        CHECK_FALSE(store.get_deployment("cA", "alice").has_value());
+    }
+}

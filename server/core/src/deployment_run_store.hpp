@@ -28,6 +28,7 @@
 #include "preflight_parse.hpp" // preflight::PreflightTarget (frozen cohort identity)
 
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <vector>
@@ -99,10 +100,23 @@ public:
     [[nodiscard]] std::optional<DeploymentRow> get_deployment(const std::string& deployment_id,
                                                               const std::string& created_by = "");
 
+    /// Authoritative variant of `get_deployment`: a genuine miss (or not-yours) is an
+    /// engaged outer optional holding `nullopt`; a store fault (not open, pool timeout,
+    /// query error) is `std::unexpected`, so a machine reader never mistakes "could not
+    /// ask" for "not found" (same fix class as PreflightRunStore::get_run_checked).
+    [[nodiscard]] std::expected<std::optional<DeploymentRow>, std::string>
+    get_deployment_checked(const std::string& deployment_id, const std::string& created_by = "");
+
     /// A viewer's recent deployments (created_by = viewer, or all when is_admin),
-    /// newest first, capped at `limit`.
+    /// newest first, capped at `limit`. Fail-soft: a store fault reads as empty. REST/MCP
+    /// callers MUST use `list_deployments_checked`.
     [[nodiscard]] std::vector<DeploymentRow> list_deployments(const std::string& viewer,
                                                               bool is_admin, int limit);
+
+    /// Authoritative variant of `list_deployments` — `std::unexpected` on a store fault
+    /// rather than a silently-empty vector indistinguishable from "no deployments".
+    [[nodiscard]] std::expected<std::vector<DeploymentRow>, std::string>
+    list_deployments_checked(const std::string& viewer, bool is_admin, int limit);
 
     /// The owner's RUNNING deployment for a source pre-flight run, if any — the
     /// create-time guard against a duplicate run that would re-install the cohort
@@ -121,6 +135,12 @@ public:
 
     /// The device grid (frozen identity + current step), ordered by hostname.
     [[nodiscard]] std::vector<DeploymentDeviceRow> get_devices(const std::string& deployment_id);
+
+    /// Authoritative variant of `get_devices`: `std::unexpected` on a store fault, and
+    /// a bounded read (`limit` 1..kRowCap; <=0 means the full cap) so a detail view
+    /// never materialises a 20,000-row grid it will not render.
+    [[nodiscard]] std::expected<std::vector<DeploymentDeviceRow>, std::string>
+    get_devices_checked(const std::string& deployment_id, int limit = 0);
 
     /// Apply response-derived transitions in ONE batched, source-step-GUARDED
     /// UPDATE (a row already moved by a concurrent advance is skipped). Returns
