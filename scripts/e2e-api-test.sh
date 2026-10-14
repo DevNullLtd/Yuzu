@@ -331,6 +331,8 @@ if [[ "$SKIP_AUTH" == "false" ]]; then
     http_get "$SERVER_URL/api/v1/me"
     assert_eq "GET /api/v1/me with cookie returns 200" "200" "$HTTP_STATUS"
     assert_contains "GET /api/v1/me contains 'admin'" "admin" "$HTTP_BODY"
+    assert_contains "GET /api/v1/me reports effective_role" "effective_role" "$HTTP_BODY"
+    assert_contains "GET /api/v1/me reports can_access_settings" "can_access_settings" "$HTTP_BODY"
 
     # POST /logout
     http_post "$SERVER_URL/logout" "" "application/json"

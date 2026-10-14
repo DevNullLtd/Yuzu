@@ -17,8 +17,6 @@
 ///     round-trip, and the real `/api/analytics/{status,recent}` shapes are
 ///     `[pg]`, gated behind YUZU_TEST_POSTGRES_DSN.
 
-#include <chrono>
-
 #include "dashboard_api_routes.hpp"
 #include "test_route_sink.hpp"
 
@@ -35,7 +33,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <optional>
+#include <regex>
 #include <stdexcept>
 #include <string>
 
@@ -192,6 +192,11 @@ TEST_CASE("dashboard_api_routes: /api/me self-description per persona (#5779, #4
         CHECK(j["effective_role"] == row.effective);
         CHECK(j["elevated"] == row.elevated);
         CHECK(j.contains("elevated_until") == row.elevated);
+        if (row.elevated) {
+            REQUIRE(j["elevated_until"].is_string());
+            CHECK(std::regex_match(j["elevated_until"].get<std::string>(),
+                                   std::regex(R"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")));
+        }
         CHECK(j["can_access_settings"] == row.can_access);
         CHECK(r->get_header_value("Cache-Control") == "no-store, private");
         // Reporting is a pure read of the session: no gate is consulted.
@@ -494,6 +499,33 @@ TEST_CASE("dashboard_api_routes: /api/me reports the assigned RBAC role when rba
     auto j = json::parse(r->body);
     CHECK(j["rbac_enabled"] == true);
     CHECK(j["rbac_role"] == "PlatformEngineer");
+    // #5779: an RBAC role label never opens /settings (require_admin ignores RBAC
+    // grants); the link predicate must stay false for a non-admin session.
+    CHECK(j["can_access_settings"] == false);
+    CHECK(j["effective_role"] == "user");
+}
+
+TEST_CASE("dashboard_api_routes: /api/me can_access_settings stays false for an RBAC "
+          "Administrator grant on a legacy user session (#5779)",
+          "[pg][server][routes][dashboard_api_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dashapi_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.assign_role({"user", "alice", "Administrator"}).has_value());
+
+    Harness h;
+    h.rbac_store = &rbac;
+    h.wire();
+
+    auto r = h.sink.Get("/api/me");
+    REQUIRE(r);
+    auto j = json::parse(r->body);
+    CHECK(j["rbac_role"] == "Administrator");
+    CHECK(j["role"] == "user");
+    CHECK(j["can_access_settings"] == false);
 }
 
 TEST_CASE("dashboard_api_routes: /api/me falls back to the legacy-role mapping when rbac is "

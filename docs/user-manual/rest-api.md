@@ -10492,7 +10492,10 @@ exist. `POST /query` returns `400` on a malformed request body.
 
 #### `GET /api/me`
 
-Returns current user info (legacy version; prefer `/api/v1/me`).
+Returns current user info (legacy version; prefer `/api/v1/me`). The flat body carries
+`username`, `display_name`, `role`, `rbac_enabled`, `rbac_role`, `effective_role`, `elevated`,
+`elevated_until` (only while elevated) and `can_access_settings`, with the same meaning as the
+`data` object of [`GET /api/v1/me`](#get-apiv1me). Sent with `Cache-Control: no-store, private`.
 
 #### `GET /api/analytics/status`
 

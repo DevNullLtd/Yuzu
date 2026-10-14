@@ -203,6 +203,10 @@ TEST_CASE("app shell: keeps the identity hooks, Sign out and the admin-only Sett
     CHECK_THAT(html, !ContainsSubstring("d.role!=='admin'"));
     CHECK(html.find("settings(false);") < html.find("fetch('/api/me')"));
     CHECK_THAT(html, ContainsSubstring(".catch(function(){})"));
+    // No new injection surface and exactly one /api/me read per page.
+    CHECK_THAT(html, !ContainsSubstring("innerHTML"));
+    CHECK_THAT(html, !ContainsSubstring("hx-on"));
+    CHECK(html.find("fetch('/api/me')") == html.rfind("fetch('/api/me')"));
 }
 
 TEST_CASE("app shell: breadcrumb text is HTML-escaped", "[nav][shell]") {

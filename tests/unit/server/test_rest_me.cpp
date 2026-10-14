@@ -6,6 +6,7 @@
  * injected auth_fn, so a case runs in microseconds on any host.
  */
 #include "admin_gate.hpp"
+#include "dashboard_api_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 
@@ -113,4 +114,28 @@ TEST_CASE("GET /api/v1/me: MCP-tier and service-scoped tokens cannot access sett
           false);
     CHECK(get_me(make_session(auth::Role::user, false, "", "finance"))["can_access_settings"] ==
           false);
+}
+
+TEST_CASE("GET /api/me and GET /api/v1/me carry identical keys and values (the twin cannot drift)",
+          "[server][routes][rest_me]") {
+    const auto legacy = [](const auth::Session& session) {
+        yuzu::server::test::TestRouteSink sink;
+        yuzu::server::dashboard_api::register_dashboard_api_routes(
+            sink, yuzu::server::dashboard_api::Deps{
+                      .auth_fn = [&session](const httplib::Request&, httplib::Response&)
+                          -> std::optional<auth::Session> { return session; },
+                      .perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&) { return true; },
+                      .visible_agents_json_fn = [](const std::string&) { return json::array(); },
+                  });
+        auto r = sink.Get("/api/me");
+        REQUIRE(r);
+        return json::parse(r->body);
+    };
+    for (const auto& session :
+         {make_session(auth::Role::admin), make_session(auth::Role::user, true),
+          make_session(auth::Role::user), make_session(auth::Role::admin, false, "readonly"),
+          make_session(auth::Role::user, false, "", "finance")}) {
+        CHECK(legacy(session) == get_me(session));
+    }
 }
