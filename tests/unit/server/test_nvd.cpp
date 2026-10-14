@@ -2107,3 +2107,64 @@ TEST_CASE("NvdClient parse+append stays memory-clean across 2 synthetic 2000-CVE
     REQUIRE(combined.records[500].matches[0].cpe_vendor == "vendor500");
     REQUIRE(combined.records[3000].matches[1].cpe_product == "product3000b");
 }
+
+// ── parse_nvd_proxy_url: where the proxy points, and nothing of who configured it ──
+
+TEST_CASE("parse_nvd_proxy_url: scheme, port and no-scheme shapes", "[nvd][proxy]") {
+    struct Case {
+        const char* url;
+        const char* host;
+        int port;
+    };
+    const Case cases[] = {
+        {"http://proxy.lan:3128", "proxy.lan", 3128},
+        {"https://proxy.lan:8443", "proxy.lan", 8443},
+        {"HTTP://Proxy.LAN:3128", "Proxy.LAN", 3128}, // scheme is case-insensitive, host kept
+        {"proxy.lan:3128", "proxy.lan", 3128},         // no scheme
+        {"proxy.lan", "proxy.lan", 8080},              // no port: the long-standing default
+        {"http://proxy.lan:3128/", "proxy.lan", 3128}, // trailing slash
+        {"http://proxy.lan:3128/some/path?x=1#f", "proxy.lan", 3128}, // path/query/fragment dropped
+        {"http://proxy.lan:notaport", "proxy.lan", 8080},
+        {"http://proxy.lan:0", "proxy.lan", 8080},
+        {"http://proxy.lan:65536", "proxy.lan", 8080},
+        {"http://proxy.lan:80x", "proxy.lan", 8080},
+    };
+    for (const auto& c : cases) {
+        INFO("url: " << c.url);
+        const auto ep = parse_nvd_proxy_url(c.url);
+        CHECK(ep.host == c.host);
+        CHECK(ep.port == c.port);
+    }
+    CHECK(parse_nvd_proxy_url("").host.empty());
+}
+
+TEST_CASE("parse_nvd_proxy_url: userinfo never reaches the host or the port",
+          "[nvd][proxy][security]") {
+    struct Case {
+        const char* url;
+        const char* host;
+        int port;
+    };
+    const Case cases[] = {
+        {"http://svc:hunter2@proxy.lan:3128", "proxy.lan", 3128}, // the reported case
+        {"svc:hunter2@proxy.lan:3128", "proxy.lan", 3128},         // no scheme
+        {"http://svc@proxy.lan:3128", "proxy.lan", 3128},          // user only
+        {"http://svc:p@ss@proxy.lan:3128", "proxy.lan", 3128},     // '@' inside the password
+        {"http://svc:p%40ss%3A@proxy.lan:3128", "proxy.lan", 3128}, // percent-encoded password
+        {"http://svc:hunter2@proxy.lan", "proxy.lan", 8080},        // credentials, no port
+        {"http://svc:hunter2@[::1]:3128", "::1", 3128},             // IPv6 literal
+        {"http://svc:hunter2@[2001:db8::5]", "2001:db8::5", 8080},  // IPv6, no port
+        {"[::1]:3128", "::1", 3128},                                // IPv6, no scheme or userinfo
+        {"http://svc:hunter2@proxy.lan:3128/p@th", "proxy.lan", 3128}, // '@' in a path
+    };
+    for (const auto& c : cases) {
+        INFO("url: " << c.url);
+        const auto ep = parse_nvd_proxy_url(c.url);
+        CHECK(ep.host == c.host);
+        CHECK(ep.port == c.port);
+        // The credential text appears nowhere in the parsed endpoint.
+        CHECK(ep.host.find("hunter2") == std::string::npos);
+        CHECK(ep.host.find("svc") == std::string::npos);
+        CHECK(ep.host.find('@') == std::string::npos);
+    }
+}

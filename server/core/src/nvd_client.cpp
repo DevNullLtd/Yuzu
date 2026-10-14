@@ -5,6 +5,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -12,6 +14,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -59,33 +62,66 @@ std::string url_encode(const std::string& value) {
 
 } // namespace
 
+NvdProxyEndpoint parse_nvd_proxy_url(std::string_view url) {
+    NvdProxyEndpoint ep;
+    // Scheme: only http:// and https:// are recognised (case-insensitive); a proxy URL with
+    // no scheme is "host:port".
+    const auto ieq_prefix = [&](std::string_view prefix) {
+        return url.size() >= prefix.size() &&
+               std::equal(prefix.begin(), prefix.end(), url.begin(), [](char a, char b) {
+                   return a == std::tolower(static_cast<unsigned char>(b));
+               });
+    };
+    if (ieq_prefix("http://"))
+        url.remove_prefix(7);
+    else if (ieq_prefix("https://"))
+        url.remove_prefix(8);
+    // The authority ends at the first path, query or fragment delimiter.
+    if (const auto end = url.find_first_of("/?#"); end != std::string_view::npos)
+        url = url.substr(0, end);
+    // Userinfo is everything up to the LAST '@' in the authority, so a password may itself
+    // contain '@'. It is discarded, not parsed.
+    if (const auto at = url.rfind('@'); at != std::string_view::npos)
+        url.remove_prefix(at + 1);
+
+    std::string_view host = url;
+    std::string_view port_text;
+    if (!url.empty() && url.front() == '[') {
+        // Bracketed IPv6 literal: "[::1]:3128". The port, if any, follows the closing bracket.
+        const auto close = url.find(']');
+        if (close == std::string_view::npos) {
+            host = url.substr(1);
+        } else {
+            host = url.substr(1, close - 1);
+            const auto rest = url.substr(close + 1);
+            if (rest.starts_with(':'))
+                port_text = rest.substr(1);
+        }
+    } else if (const auto colon = url.rfind(':'); colon != std::string_view::npos) {
+        host = url.substr(0, colon);
+        port_text = url.substr(colon + 1);
+    }
+    ep.host = std::string(host);
+    if (!port_text.empty()) {
+        int port = 0;
+        const char* const first = port_text.data();
+        const char* const last = first + port_text.size();
+        const auto [p, ec] = std::from_chars(first, last, port);
+        if (ec == std::errc{} && p == last && port >= 1 && port <= 65535)
+            ep.port = port;
+        // else keep the 8080 default, as the previous parse did for a bad port
+    }
+    return ep;
+}
+
 NvdClient::NvdClient(std::string api_key, std::string proxy_url, std::string base_url)
     : api_key_(std::move(api_key)),
       base_url_(base_url.empty() ? (std::string("https://") + kNvdHost) : std::move(base_url)) {
-    // Parse proxy URL: "http://host:port" or "host:port"
     if (!proxy_url.empty()) {
-        auto url = proxy_url;
-        // Strip scheme
-        if (url.starts_with("http://"))
-            url = url.substr(7);
-        if (url.starts_with("https://"))
-            url = url.substr(8);
-        // Strip trailing slash
-        if (!url.empty() && url.back() == '/')
-            url.pop_back();
-
-        auto colon = url.rfind(':');
-        if (colon != std::string::npos) {
-            proxy_host_ = url.substr(0, colon);
-            try {
-                proxy_port_ = std::stoi(url.substr(colon + 1));
-            } catch (...) {
-                proxy_port_ = 8080;
-            }
-        } else {
-            proxy_host_ = url;
-            proxy_port_ = 8080;
-        }
+        const auto ep = parse_nvd_proxy_url(proxy_url);
+        proxy_host_ = ep.host;
+        proxy_port_ = ep.port;
+        // Host and port only: the parse has already dropped any userinfo.
         spdlog::info("NVD client using proxy {}:{}", proxy_host_, proxy_port_);
     }
 }

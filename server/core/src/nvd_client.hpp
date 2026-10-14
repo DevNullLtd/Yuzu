@@ -7,6 +7,7 @@
 #include <chrono>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -44,6 +45,16 @@ public:
     virtual NvdFetchResult fetch_modified_between(const std::string& mod_start,
                                                   const std::string& mod_end) = 0;
 };
+
+// Where an HTTP proxy URL points. `host` is empty when the input is empty. Any userinfo
+// (`user:password@`) is dropped here and never reaches the host, the port, or a log line:
+// the client does not authenticate to the proxy, so the credentials have no use past this
+// parse. Pure, so the shapes can be pinned without a socket.
+struct NvdProxyEndpoint {
+    std::string host;
+    int port = 8080;
+};
+[[nodiscard]] NvdProxyEndpoint parse_nvd_proxy_url(std::string_view url);
 
 class NvdClient : public INvdFetcher {
 public:
