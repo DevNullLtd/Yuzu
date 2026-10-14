@@ -648,6 +648,8 @@ TEST_CASE("access hint: may_attempt_rbac_admin follows the base role on a local 
     // A JIT elevation makes the EFFECTIVE role admin but not the base role: no hint.
     auto elevated = s(auth::Role::user);
     elevated.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
+    elevated.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    REQUIRE(auth::effective_role(elevated) == auth::Role::admin); // the fixture really is elevated
     CHECK_FALSE(may_attempt_rbac_admin(elevated));
 }
 
