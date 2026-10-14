@@ -69,7 +69,7 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
     std::vector<std::string_view> titles;
     for (const auto& g : nav_groups())
         titles.push_back(g.title);
-    CHECK(titles == std::vector<std::string_view>{"Operate", "Posture", "Estate", "System"});
+    CHECK(titles == std::vector<std::string_view>{"Operate", "Posture", "Estate", "Access", "System"});
 
     std::vector<std::string_view> labels;
     for (const auto& g : nav_groups())
@@ -77,7 +77,8 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
             labels.push_back(it.label);
     CHECK(labels == std::vector<std::string_view>{"Dashboard", "Instructions", "Result sets",
                                                   "Compliance", "Guardian", "DEX", "TAR",
-                                                  "Hardware", "Software", "Fleet", "Settings"});
+                                                  "Hardware", "Software", "Fleet",
+                                                  "Tokens and principals", "Settings"});
 }
 
 TEST_CASE("app shell: keys and hrefs are unique and every top-level entry has an icon",
@@ -109,6 +110,14 @@ TEST_CASE("app shell: only Software and Fleet have sub-items; Settings is one ad
     CHECK(with_children == std::vector<std::string>{"software>auto", "fleet>network"});
 
     const auto groups = nav_groups();
+    // Access is open to every signed-in user (own-token self-service): each panel is gated
+    // by its own fragment, so the entry is never admin_only.
+    REQUIRE(groups.size() == 5);
+    CHECK(groups[3].title == "Access");
+    REQUIRE(groups[3].items.size() == 1);
+    CHECK(groups[3].items[0].key == "tokens");
+    CHECK(groups[3].items[0].href == "/access/tokens");
+    CHECK_FALSE(groups[3].items[0].admin_only);
     REQUIRE(groups.back().title == "System");
     REQUIRE(groups.back().items.size() == 1);
     CHECK(groups.back().items[0].href == "/settings");
