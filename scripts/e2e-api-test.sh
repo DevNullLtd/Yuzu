@@ -125,6 +125,12 @@ assert_status_any() {
 # ── curl wrappers ────────────────────────────────────────────────────
 # Each sets HTTP_STATUS (3-digit code) and HTTP_BODY (response body).
 # Body is written to a temp file; status code is captured via -w.
+#
+# Cookie-session writes must behave like a same-site browser: the Instructions
+# write routes refuse a cookie-authorised POST/PUT/DELETE that carries neither
+# Origin nor Referer (browser_write_is_cross_site). SITE_ORIGIN is the
+# scheme://host:port of SERVER_URL, so it matches the Host curl sends.
+SITE_ORIGIN=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#' <<< "$SERVER_URL")
 
 http_get() {
     local url="$1"
@@ -139,7 +145,7 @@ http_post() {
     local url="$1" data="$2" content_type="${3:-application/json}"
     sleep 0.05
     HTTP_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" \
+        -b "$COOKIE_JAR" -H "Origin: $SITE_ORIGIN" \
         -X POST -H "Content-Type: $content_type" \
         -d "$data" \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
@@ -160,7 +166,7 @@ http_post_login() {
 http_put() {
     local url="$1" data="$2"
     HTTP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" \
+        -b "$COOKIE_JAR" -H "Origin: $SITE_ORIGIN" \
         -X PUT -H "Content-Type: application/json" \
         -d "$data" \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
@@ -170,7 +176,7 @@ http_put() {
 http_delete() {
     local url="$1"
     HTTP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" \
+        -b "$COOKIE_JAR" -H "Origin: $SITE_ORIGIN" \
         -X DELETE \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
     HTTP_BODY=$(cat "$RESP_BODY" 2>/dev/null || echo "")
@@ -639,6 +645,54 @@ if [[ -n "$INSTRUCTION_ID" ]]; then
 else
     log "  (Could not capture instruction ID — skipping GET/DELETE)"
     # Still count as tested via the POST above
+fi
+
+# Same-site gate (deliberate negative check): the helpers above send Origin, as a
+# browser does. A cookie-session write with NO Origin/Referer must be refused 403,
+# while a bearer-token write with none is exempt (a token is not an ambient
+# credential), so the exemption stays under test too.
+GATE_BODY="{\"name\":\"e2e-gate-instr-$(date +%s)\",\"plugin\":\"os_info\",\"action\":\"os_name\",\"type\":\"question\",\"description\":\"E2E gate\",\"category\":\"testing\"}"
+GATE_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
+    -b "$COOKIE_JAR" -X POST -H "Content-Type: application/json" \
+    -d "$GATE_BODY" "$SERVER_URL/api/instructions" 2>/dev/null) || GATE_STATUS="000"
+assert_eq "cookie-session POST /api/instructions without Origin returns 403" "403" "$GATE_STATUS"
+assert_contains "  ...refused as cross-site" "cross-site request refused" "$(cat "$RESP_BODY")"
+
+GATE_TOKEN_NAME="e2e-gate-token-$(date +%s)"
+http_post "$SERVER_URL/api/v1/tokens" "{\"name\":\"$GATE_TOKEN_NAME\"}"
+GATE_TOKEN=$(extract_json_field "token" "$HTTP_BODY")
+if [[ -n "$GATE_TOKEN" ]]; then
+    GATE_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
+        -X POST -H "Authorization: Bearer $GATE_TOKEN" -H "Content-Type: application/json" \
+        -d "$GATE_BODY" "$SERVER_URL/api/instructions" 2>/dev/null) || GATE_STATUS="000"
+    GATE_RESP=$(cat "$RESP_BODY")
+    assert_status_any "bearer-token POST /api/instructions without Origin is not refused" \
+        "$GATE_STATUS" 200 201 400 503
+    # A 403 here would be a permission denial, not the gate; say which.
+    TESTS=$((TESTS + 1))
+    if grep -qF -- "cross-site request refused" <<< "$GATE_RESP"; then
+        fail "bearer-token write was refused by the same-site gate"
+    else
+        pass "bearer-token write is exempt from the same-site gate"
+    fi
+    GATE_ID=$(extract_json_field "id" "$GATE_RESP")
+    if [[ -n "$GATE_ID" ]]; then
+        curl -s -m 10 -o /dev/null -X DELETE -H "Authorization: Bearer $GATE_TOKEN" \
+            "$SERVER_URL/api/instructions/$GATE_ID" 2>/dev/null || true
+    fi
+    # Revoke the throwaway token (deletion is by token_id, found via the list).
+    http_get "$SERVER_URL/api/v1/tokens"
+    GATE_TOKEN_ID=$(python3 -c "
+import json, sys
+try:
+    for t in json.load(sys.stdin).get('data', []):
+        if t.get('name') == '$GATE_TOKEN_NAME':
+            print(t['token_id']); break
+except Exception: pass
+" <<< "$HTTP_BODY" 2>/dev/null)
+    [[ -n "$GATE_TOKEN_ID" ]] && http_delete "$SERVER_URL/api/v1/tokens/$GATE_TOKEN_ID"
+else
+    fail "same-site gate token check: could not create an API token"
 fi
 
 log ""
