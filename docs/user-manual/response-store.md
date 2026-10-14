@@ -334,7 +334,8 @@ operator-visible notes:
     for an incompressible value, minus the instruction id length; a compressible value could be
     larger). Rows already stored by an older server stay readable until retention removes them.
     Values over 2048 bytes in newly ingested responses are not indexed, so the facet filter, the
-    dropdowns and the group-from-results count show nothing or "0 agents" for such a value.
+    dropdowns and the group-from-results count show nothing or "0 agents" for such a value; this
+    includes values between 2049 bytes and about 2.6 KB that older servers indexed.
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column
     index ascending, then value ascending, so the same output always keeps the same facets. A rare
     value (one line, such as a single package on one host) sorts late and is the first to be cut.
@@ -343,10 +344,14 @@ operator-visible notes:
     could be cut and the choice was not repeatable.
   - **Lost facets are not recoverable.** A response whose facets were lost (`batch_failed`, or cut
     by `cap`) has no facets re-derived afterwards, and nothing marks such a response as affected
-    (#5630). The workaround is to run the command again and to recreate any static group built from
-    the affected response from the NEW run, because running the command again does not repair a
-    group that already exists and recreating it from the old result set gives the same short
-    group.
+    (#5630). For `batch_failed` (a refused facet insert) run the command again and recreate any static
+    group built from the affected response from the NEW run, because running the command again does
+    not repair a group that already exists. For `cap` a re-run of the same output cuts the same
+    facets, so use a command or filter that returns fewer distinct values. For `value_too_long`
+    there is nothing to re-run. A `cap` or `batch_failed` response logs a warning naming its
+    `response_id` ("facet count (N) exceeds the per-response cap" and "facet batch insert failed");
+    a `value_too_long` exclusion logs only at debug level, so at the default level only the counter
+    shows it.
   - **Counting.** Every facet that did not persist is counted in
     `yuzu_server_response_facets_dropped_total{reason}` (`value_too_long`, `cap`, `batch_failed`);
     see [metrics.md](metrics.md).

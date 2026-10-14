@@ -2212,6 +2212,43 @@ TEST_CASE("ResponseStore: a failed COMMIT drops the response and publishes no fa
     exec_sql(db.dsn(), "DROP FUNCTION response_store.yuzu_test_commit_fail_fn()");
 }
 
+// #5623: `value_too_long` counts DISTINCT excluded (column, value) pairs, not occurrences: the
+// same over-long value on three lines of one response is one excluded facet, and the same value
+// in two different columns is two.
+TEST_CASE("ResponseStore: value_too_long counts distinct excluded pairs, not occurrences",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    // vuln_scan schema: severity|category|title|detail.
+    const std::string over_bound = incompressible_text(2049, 7);
+    const std::string output = "high|cat-a|" + over_bound + "|d1\n" + "low|cat-b|" + over_bound +
+                               "|d2\n" + "low|cat-c|" + over_bound + "|d3\n";
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facet-distinct";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = output;
+    store.store(resp);
+
+    // Three occurrences of one value in one column: one distinct excluded pair.
+    CHECK(dropped_count(metrics, "value_too_long") == 1.0);
+    CHECK(dropped_count(metrics, "cap") == 0.0);
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+
+    // The same value in a second column is a second distinct pair.
+    StoredResponse resp2 = resp;
+    resp2.instruction_id = "cmd-facet-distinct-2";
+    resp2.output = "high|" + over_bound + "|t|" + over_bound + "\n";
+    store.store(resp2);
+    CHECK(dropped_count(metrics, "value_too_long") == 3.0);
+}
+
 // #5623: the dropped-facets counter is described and pre-seeded at zero for every reason, so an
 // idle server exports the series, and the HELP text is plain ASCII.
 TEST_CASE("seed_response_facet_metrics: the dropped-facets counter is pre-seeded per reason",
@@ -2223,6 +2260,9 @@ TEST_CASE("seed_response_facet_metrics: the dropped-facets counter is pre-seeded
           std::string::npos);
     CHECK(text.find(std::string("# TYPE ") + kResponseFacetsDroppedMetric + " counter") !=
           std::string::npos);
+    // The literal name is what the docs and operators' queries use; pin it so a rename of the
+    // constant cannot leave them behind.
+    CHECK(std::string(kResponseFacetsDroppedMetric) == "yuzu_server_response_facets_dropped_total");
     for (const char* reason : {"value_too_long", "cap", "batch_failed"})
         CHECK(text.find(std::string(kResponseFacetsDroppedMetric) + "{reason=\"" + reason +
                         "\"} 0") != std::string::npos);

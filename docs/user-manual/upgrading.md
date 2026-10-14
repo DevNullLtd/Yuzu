@@ -124,18 +124,19 @@ published only after the response commits, is pre-seeded at 0 at boot, and a fai
 nothing. No alert rule ships or is owed: it is a data-completeness signal, and a per-response marker
 and alert are tracked in #5630. See [`metrics.md`](metrics.md).
 
-**Stored values.** Older servers indexed values that fit the database index limit: about 2.7 KB for an
-incompressible value (less the instruction id length), and more for a value that compresses well (a
-reviewer's probe on PostgreSQL 16 inserted 100,000 bytes of repeated text and rejected 500,000; this was
-not repeated here). Rows already stored by an older server stay readable until retention removes them.
+**Stored values.** Older servers indexed values that fit the database index limit: about 2.6 KB for an
+incompressible value (less the instruction id length), and far more for a value that compresses well
+(measured on PostgreSQL 18.4: 99,999 bytes of repeated text inserted, 499,998 were rejected). So values
+from 2049 bytes up to that limit were indexed before and are not now. Rows already stored by an older
+server stay readable until retention removes them.
 Facet rows are removed with their response by the existing reaper (`--response-retention-days`,
 default 90); nothing new is added.
 
 **Effect on the dashboard.** The dashboard is unchanged by this release. For newly ingested responses a
-value over 2048 bytes is no longer indexed, including compressible values larger than about 2.7 KB that
-older servers could index. The facet filter, the dropdowns and the group-from-results and create-group
+value over 2048 bytes is no longer indexed, including values between 2049 bytes and about 2.6 KB that
+older servers could index, and compressible values far larger than that. The facet filter, the dropdowns and the group-from-results and create-group
 counts therefore show nothing or "0 agents" for such a value, and a direct group-from-results submit
-answers `422` "No agents match"; it never creates an empty group.
+answers `422` "No agents match" and creates no group when no agent matches.
 
 **5,000-facet cap.** Above 5,000 distinct facets in one response, the facets kept are now chosen in a
 fixed order: most lines first, then column index ascending, then value ascending. Before, they were
@@ -144,8 +145,15 @@ repeatable. Different rare values may therefore survive or be lost compared with
 
 **Lost facets are not recoverable.** A response whose facets were lost (`batch_failed`, or cut by
 `cap`) has no facets re-derived later, and nothing marks the response as affected (#5630).
-**Workaround:** run the command again, and RECREATE any static group built from the affected response
-from the NEW run; running the command again does not repair an existing group.
+**What to do depends on the reason.** `batch_failed` (the facet insert was refused, for example by an
+unusually long echoed command id): run the command again; the new run gets a fresh response, and
+RECREATE any static group built from the affected response from the NEW run, because running the
+command again does not repair an existing group. `cap`: the same output keeps the same 5,000 facets,
+so a re-run cuts the same ones; use a command or filter that returns fewer distinct values, or accept the
+short result (#5630 tracks a marker). `value_too_long`: there is nothing to re-run, the value is never
+indexed. To find a response that lost facets, search the server log (a `cap` or `batch_failed` response
+logs a warning with its `response_id`); a `value_too_long` exclusion logs only at debug level, so at the
+default level only the counter shows it.
 
 **Rolling upgrade.** The change is server-only: there is no schema, configuration, agent or gateway step,
 the order in which replicas are upgraded does not matter, and rolling back is starting the previous

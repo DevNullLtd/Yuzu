@@ -72,8 +72,9 @@ namespace yuzu::server {
 /// about 2680 minus len(instruction_id) bytes (2644 at a 40 byte id, 2620 at 64, 2484 at
 /// 200). A value that compresses well gets past that, because the limit applies to the
 /// COMPRESSED index entry (the "index row requires N bytes, maximum size is 8191"
-/// error): a reviewer's probe on PostgreSQL 16 inserted 100,000 bytes of repeated text
-/// and rejected 500,000 (not repeated by the author).
+/// error): measured on PostgreSQL 18.4 against a copy of both indexes, 99,999 bytes of
+/// repeated text inserted and 499,998 were rejected, while 2,560 bytes of incompressible
+/// text inserted and 2,688 were rejected.
 /// The byte length alone therefore decides here. 2048 leaves about 630 bytes for the
 /// instruction_id, whose length the ingest path does not bound (it is the id the agent
 /// echoes; the longest the server mints is about 60 bytes); a longer id still fails the

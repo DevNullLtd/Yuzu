@@ -609,8 +609,11 @@ void ResponseStore::store(const StoredResponse& resp) {
             // the first to be cut, so a filter on a cut value finds no agent
             // for it. Nothing marks the response as capped to its readers
             // today (the `cap` counter and the warning are the only signals);
-            // a per-response marker is tracked in #5630. partial_sort keeps the cost at O(n log cap) for n
-            // distinct facets, and n is bounded only by the ingest byte cap.
+            // a per-response marker is tracked in #5630.
+            // partial_sort keeps the cost at O(n log cap) for n distinct facets. n is
+            // bounded by the ingest byte cap, but memory per input byte is large: a
+            // reviewer's standalone harness measured about 354 MB for a 2 MiB line of
+            // single-character columns (existing behaviour, not changed here; #5782).
             if (flat.size() > kMaxFacetsPerResponse) {
                 spdlog::warn("ResponseStore: response_id={} facet count ({}) exceeds the "
                             "per-response cap ({}); only the {} most frequent persist",
