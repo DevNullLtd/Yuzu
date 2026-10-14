@@ -62,6 +62,11 @@ TEST_CASE("operate pages: no inline handlers and no hx-on and htmx eval disabled
         CHECK_FALSE(has(p.html, "javascript:"));
         CHECK(has(p.html, "<meta name=\"htmx-config\" content='{\"allowEval\":false}'>"));
         CHECK(count_of(p.html, "src=\"/static/yuzu-operate.js\"") == 1);
+        // The dialog module loads first (deferred scripts run in order); toasts are polite.
+        const auto dlg = p.html.find("src=\"/static/yuzu-dialog.js\" defer");
+        REQUIRE(dlg != std::string::npos);
+        CHECK(dlg < p.html.find("src=\"/static/yuzu-operate.js\""));
+        CHECK(count_of(p.html, "id=\"toasts\" aria-live=\"polite\"") == 1);
         // Sign out is hx-post, so the page must load htmx for the shell.
         CHECK(has(p.html, "src=\"/static/htmx.js\""));
         CHECK(count_of(p.html, "<!--yuzu:shell-->") == 1);
@@ -158,21 +163,29 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK(has(html, "Dispatch requests waiting for a decision by a different user account."));
     CHECK_FALSE(has(html, "second person"));
     CHECK(has(html, "You submitted this — another reviewer must approve"));
-    CHECK(has(html, "Decisions are made from the Approvals tab on the Instructions page."));
+    CHECK_FALSE(has(html, "Decisions are made from the Approvals tab"));
     CHECK(has(html, "Pending requests are expired 7 days after submission, when the next request "
                     "is submitted; until then they stay listed."));
     CHECK(has(html, "The parameter values are not stored with this request."));
     CHECK(has(html, "The requesting agent must re-call the tool with this approval id for it to "
                     "run."));
-    // Read-only: no decision control exists in the page body (the shell's own Sign out and
-    // search buttons sit before the shell end marker).
+    // Decisions: one Approve and one Reject button, both inside a hidden container the
+    // controller reveals only for a pending, not-own row under data-can-decide="1".
     const auto body_at = html.find("<!--/yuzu:shell-->");
     REQUIRE(body_at != std::string::npos);
     const auto body = html.substr(body_at);
-    CHECK_FALSE(has(body, ">Approve<"));
-    CHECK_FALSE(has(body, ">Reject<"));
-    CHECK_FALSE(has(body, "<button"));
+    CHECK(count_of(body, "data-act=\"approve\"") == 1);
+    CHECK(count_of(body, "data-act=\"reject\"") == 1);
+    CHECK(has(body, "<div class=\"btns\" data-f=\"actions\" hidden>\n<button type=\"button\" "
+                    "class=\"btn btn-primary\" data-act=\"approve\">Approve</button>"));
     CHECK_FALSE(has(body, "<dialog"));
+    const auto& js = yuzu::server::kYuzuOperateJs;
+    CHECK(has(js, "'yuzu:approvals-changed'"));
+    CHECK(has(js, "'/' + kind"));
+    CHECK(has(js, "maxlength: 1000"));
+    CHECK(has(js, "list.getAttribute('data-can-decide') === '1'"));
+    CHECK(has(js, "!(pending && !mine && canDecide)"));
+    CHECK_FALSE(has(js, "onclick"));
 }
 
 TEST_CASE("operate pages: the Executions template carries every hook the controller binds",

@@ -1,9 +1,9 @@
 /* yuzu-operate.js -- page controllers for the Operate pages (Approvals, Executions).
  *
  * The server renders every list and panel as an HTML fragment (the fragment
- * routes' `view=page` branches); this file only fetches them, swaps them into their host
+ * routes' `view=page` branches); this file fetches them, swaps them into their host
  * and fills the single detail panel from the selected row's data-* attributes with
- * textContent. One controller per page, chosen by <body data-page>.
+ * textContent. The decision and cancel actions are dialogs from /static/yuzu-dialog.js. One controller per page, chosen by <body data-page>.
  *
  * Rules this file keeps (pinned by test_operate_pages_ui.cpp):
  *   - no dynamic-code or raw-markup sinks of any kind (the test pins the exact list);
@@ -48,6 +48,17 @@
     if (status === 403) return 'You do not have permission to view ' + what + '.';
     if (status >= 500) return 'Could not load ' + what + ': the server reported a problem. Retry shortly.';
     return 'Could not load ' + what + ' (HTTP ' + status + ').';
+  }
+
+  // Transient confirmation in #toasts (textContent only); removed after 4 s.
+  function showToast(msg, level) {
+    var host = $('#toasts');
+    if (!host) return;
+    var t = doc.createElement('div');
+    t.className = 'toast toast-' + (level || 'info');
+    t.textContent = msg;
+    host.appendChild(t);
+    setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 4000);
   }
 
   function setNote(host, text) {
@@ -184,9 +195,10 @@
       var pending = d.status === 'pending';
       var mine = d.mine === '1';
       var mcp = d.mcp === '1';
+      var list = $('.ops-list', host);
+      var canDecide = !!list && list.getAttribute('data-can-decide') === '1';
       field(detail, 'self').hidden = !(pending && mine);
-      field(detail, 'where').hidden = !(pending && !mine);
-      field(detail, 'actions').hidden = !pending;
+      field(detail, 'actions').hidden = !(pending && !mine && canDecide);
       field(detail, 'n-mcp').hidden = !mcp;
       field(detail, 'n-params').hidden = mcp;
       field(detail, 'notes').hidden = !pending;
@@ -194,6 +206,76 @@
       field(detail, 'empty').hidden = true;
       field(detail, 'kv').hidden = false;
     }
+
+    function factRow(label, text, code) {
+      var r = doc.createElement('div');
+      var l = doc.createElement('span');
+      l.textContent = label;
+      var v = doc.createElement(code ? 'code' : 'b');
+      v.textContent = text;
+      r.appendChild(l);
+      r.appendChild(v);
+      return r;
+    }
+
+    // Approve / reject dialog for the selected pending request. The facts are the row's
+    // own data-* attributes (no refetch); the decision is one POST through YuzuDialog.
+    function decide(kind) {
+      var row = $('tr.row.sel', host);
+      if (!row || !window.YuzuDialog) return;
+      var d = row.dataset;
+      var id = d.id || '';
+      var approve = kind === 'approve';
+      var facts = doc.createElement('div');
+      facts.className = 'kvl dlg-facts';
+      facts.appendChild(factRow('Request', (d.name || '') + (d.def ? ' (' + d.def + ')' : '')));
+      facts.appendChild(factRow('Requested by', d.by || ''));
+      facts.appendChild(factRow('Scope', d.scope || 'None recorded', true));
+      facts.appendChild(factRow('Requested', d.age || ''));
+      var note = approve ?
+        'Your decision is recorded in the audit log. Your comment is saved on the request and is ' +
+        'visible to anyone who can read approvals. Approving does not run the instruction itself. ' +
+        'You cannot approve your own request. ' +
+        (d.mcp === '1' ?
+          'The requesting agent must re-call the tool with this approval id for it to run.' :
+          'The parameter values are not stored with this request. You are deciding on the ' +
+          'instruction and scope only.') :
+        'Your decision and reason are recorded. The requester can read the reason on the request.';
+      var url = '/api/approvals/' + encodeURIComponent(id) + '/' + kind;
+      YuzuDialog.form({
+        title: approve ? 'Approve request' : 'Reject request',
+        body: facts,
+        note: note,
+        danger: !approve,
+        fields: [{ name: 'comment', type: 'textarea', maxlength: 1000, rows: 3,
+                   label: approve ? 'Comment (optional)' : 'Reason (saved with your decision)' }],
+        cancelLabel: 'Go back',
+        submitLabel: approve ? 'Approve request' : 'Reject request',
+        submit: function (v) {
+          var comment = v.comment.trim();
+          return YuzuDialog.request('POST', url, { json: comment ? { comment: comment } : {} })
+            .then(function (r) {
+              if (r.ok) return null;
+              if (r.status === 400) return r.message || 'The request was refused.';
+              if (r.status === 401) return 'Your session has expired. Sign in again.';
+              if (r.status === 403) return 'You do not have permission to decide approvals.';
+              return 'Could not confirm the decision. Refresh to see the current state.';
+            });
+        }
+      }).then(function (v) {
+        if (v === null) return;
+        showToast(approve ? 'Approved' : 'Rejected', 'success');
+        doc.dispatchEvent(new CustomEvent('yuzu:approvals-changed'));
+        load();
+      }, function () { /* another dialog is open: nothing to do */ });
+    }
+
+    detail.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-act]') : null;
+      if (!b || !detail.contains(b)) return;
+      var act = b.getAttribute('data-act');
+      if (act === 'approve' || act === 'reject') decide(act);
+    });
 
     function updateChip(list) {
       var status = currentStatus();

@@ -66,6 +66,8 @@ constexpr std::string_view kBody = R"HTM(</style>
 </aside>
 </div>
 </main>
+<div class="toast-container" id="toasts" aria-live="polite"></div>
+<script src="/static/yuzu-dialog.js" defer></script>
 <script src="/static/yuzu-operate.js" defer></script>
 </body></html>
 )HTM";
