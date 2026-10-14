@@ -155,7 +155,7 @@ TEST_CASE("OfflineEndpointStore fleet_state_counts tallies in SQL by window, sta
     // outside the window: must not be counted at all
     REQUIRE(store.upsert("gone", "h", "linux", kNow - 40 * kDay, 0));
 
-    auto c = store.fleet_state_counts(kNow, window, stale_after);
+    auto c = store.fleet_state_counts(kNow, window, stale_after, std::chrono::seconds{90});
     REQUIRE(c.has_value());
     CHECK(c->total == 7);
     CHECK(c->stale == 2);
@@ -164,6 +164,37 @@ TEST_CASE("OfflineEndpointStore fleet_state_counts tallies in SQL by window, sta
     CHECK(c->macos == 1);
     CHECK(c->other == 2);
     CHECK(c->windows + c->linux_os + c->macos + c->other == c->total);
+}
+
+TEST_CASE("OfflineEndpointStore fleet_state_counts live count matches query_live_ids, uncapped",
+          "[pg][offline][fleet]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    constexpr std::int64_t kNow = 1'800'000'000'000;
+    const std::chrono::seconds window{3600};
+    const std::chrono::milliseconds stale_after{1000};
+    REQUIRE(store.upsert("a", "h", "linux", kNow, 0, "", "", "s-a"));
+    REQUIRE(store.upsert("b", "h", "linux", kNow, 0, "", "", "s-b"));
+    REQUIRE(store.upsert("c", "h", "linux", kNow, 0, "", "", "s-c"));
+    REQUIRE(store.upsert("nosess", "h", "linux", kNow, 0)); // blank session: not live
+    REQUIRE(store.remove_if_session("c", "s-c"));           // departed: not live
+
+    auto c = store.fleet_state_counts(kNow, window, stale_after, std::chrono::seconds{3600});
+    REQUIRE(c.has_value());
+    CHECK(c->total == 4);
+    CHECK(c->live == 2);
+    auto ids = store.query_live_ids(std::chrono::seconds{3600});
+    REQUIRE(ids.has_value());
+    CHECK(static_cast<std::int64_t>(ids->size()) == c->live);
+
+    // A TTL no row can satisfy (last_seen_at is now(), strictly before the read).
+    auto none = store.fleet_state_counts(kNow, window, stale_after, std::chrono::seconds{0});
+    REQUIRE(none.has_value());
+    CHECK(none->live == 0);
 }
 
 TEST_CASE("OfflineEndpointStore fleet_state_counts is an error, never a zero struct, when the "
@@ -187,7 +218,7 @@ TEST_CASE("OfflineEndpointStore fleet_state_counts is an error, never a zero str
                 .status() == PGRES_COMMAND_OK);
 
     auto r = store.fleet_state_counts(1'800'000'000'000, std::chrono::hours(1),
-                                      std::chrono::milliseconds{1000});
+                                      std::chrono::milliseconds{1000}, std::chrono::seconds{90});
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == PresenceReadError::DbError);
 

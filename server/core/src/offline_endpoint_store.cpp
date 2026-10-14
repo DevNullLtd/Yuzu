@@ -426,7 +426,8 @@ OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
 
 std::expected<FleetStateCounts, PresenceReadError>
 OfflineEndpointStore::fleet_state_counts(std::int64_t now_ms, std::chrono::seconds window,
-                                         std::chrono::milliseconds stale_after) {
+                                         std::chrono::milliseconds stale_after,
+                                         std::chrono::seconds live_ttl) {
     if (!open_)
         return std::unexpected(PresenceReadError::StoreUnavailable);
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
@@ -444,9 +445,13 @@ OfflineEndpointStore::fleet_state_counts(std::int64_t now_ms, std::chrono::secon
     // spelling list. Same window predicate as query_stale_within.
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT lower(os), COUNT(*), COUNT(*) FILTER (WHERE last_heartbeat_ms < $2::bigint) "
+        "SELECT lower(os), COUNT(*), COUNT(*) FILTER (WHERE last_heartbeat_ms < $2::bigint), "
+        // Same liveness predicate as query_live_ids (DB clock, non-blank session).
+        "COUNT(*) FILTER (WHERE session_id <> '' "
+        "  AND last_seen_at >= now() - ($3::bigint * interval '1 second')) "
         "FROM endpoint_state.endpoints WHERE last_heartbeat_ms >= $1::bigint GROUP BY lower(os)",
-        std::vector<std::string>{std::to_string(since), std::to_string(stale_before)});
+        std::vector<std::string>{std::to_string(since), std::to_string(stale_before),
+                                 std::to_string(live_ttl.count())});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("OfflineEndpointStore: fleet_state_counts failed: {}",
                      PQerrorMessage(lease.get()));
@@ -458,6 +463,7 @@ OfflineEndpointStore::fleet_state_counts(std::int64_t now_ms, std::chrono::secon
         const std::int64_t n = to_i64(PQgetvalue(res.get(), i, 1));
         c.total += n;
         c.stale += to_i64(PQgetvalue(res.get(), i, 2));
+        c.live += to_i64(PQgetvalue(res.get(), i, 3));
         switch (fleet_platform_of(PQgetvalue(res.get(), i, 0))) {
             case FleetPlatform::Windows: c.windows += n; break;
             case FleetPlatform::Linux: c.linux_os += n; break;

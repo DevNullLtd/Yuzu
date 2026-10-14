@@ -116,6 +116,12 @@ using OfflineRosterRead = std::expected<std::vector<OfflineEndpoint>, PresenceRe
 struct FleetStateCounts {
     std::int64_t total{0};
     std::int64_t stale{0};
+    /// Rows `query_live_ids(live_ttl)` would return (non-blank session, DB-clock
+    /// `last_seen_at` inside the TTL) AND inside the roster window — counted in
+    /// SQL, so it stays exact past `kQueryRowCap` where `known_agent_count()`
+    /// is unavailable. Durable-presence only: it does not add local sessions
+    /// the store has not yet persisted.
+    std::int64_t live{0};
     std::int64_t windows{0};
     std::int64_t linux_os{0};
     std::int64_t macos{0};
@@ -234,7 +240,8 @@ public:
     /// Fleet tallies over the same roster window `query_stale_within` serves,
     /// computed in ONE `COUNT(*) [FILTER ...] ... GROUP BY lower(os)` statement
     /// on `endpoints_last_heartbeat_idx`'s range. `now_ms` is injected (the
-    /// caller's clock); `stale_after` is the "not seen" threshold. Typed like
+    /// caller's clock); `stale_after` is the "not seen" threshold; `live_ttl` is the presence TTL
+    /// for `FleetStateCounts::live`. Typed like
     /// `query_stale_within`: a failed read is `std::unexpected`
     /// (`StoreUnavailable` / `DbError`, counted on
     /// `yuzu_server_agent_presence_store_failed_total{op=fleet_state_counts}`),
@@ -246,7 +253,7 @@ public:
     /// `authz::in_scope` path.
     [[nodiscard]] std::expected<FleetStateCounts, PresenceReadError>
     fleet_state_counts(std::int64_t now_ms, std::chrono::seconds window,
-                       std::chrono::milliseconds stale_after);
+                       std::chrono::milliseconds stale_after, std::chrono::seconds live_ttl);
 
     /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
     /// DATABASE clock (`now()` in-SQL, never the replica's own
