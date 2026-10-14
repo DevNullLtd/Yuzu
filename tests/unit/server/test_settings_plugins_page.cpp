@@ -396,6 +396,18 @@ TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are
     // The all-OS layer alone would have read Enabled; both are shown.
     CHECK_THAT(r->body, ContainsSubstring(">Enabled</span>"));
     CHECK_FALSE(has(r->body, "has not seen plugin"));
+    // All four layers are read, in order: all-OS, Windows, Linux, macOS. A missing layer would
+    // hide a per-OS switch that withholds the command from that OS.
+    {
+        const auto all = r->body.find("<td>All operating systems</td>");
+        const auto win = r->body.find("<td>Windows</td>");
+        const auto lin = r->body.find("<td>Linux</td>");
+        const auto mac = r->body.find("<td>macOS</td>");
+        REQUIRE(all != std::string::npos);
+        CHECK(all < win);
+        CHECK(win < lin);
+        CHECK(lin < mac);
+    }
     // The datalist is the fleet-observed catalogue.
     CHECK_THAT(r->body, ContainsSubstring("<option value=\"quarantine\">"));
 
