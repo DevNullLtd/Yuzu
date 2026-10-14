@@ -667,6 +667,7 @@ yuzu_server_core_lib = static_library(
     'src/app_perf_cohort_reader.cpp',
     'src/app_perf_ingestion.cpp',
     'src/app_perf_rollup.cpp',
+    'src/dex_app_version_failures_owner.cpp',
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
     'src/data_inventory_routes.cpp',
