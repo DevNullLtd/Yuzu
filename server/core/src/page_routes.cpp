@@ -13,6 +13,9 @@ extern const char* const kDashboardIndexHtml;
 // Help and Instruction management pages (separate TUs).
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
+extern const char* const kApprovalsPageHtml; // server/core/src/approvals_ui.cpp (Operate O1)
+extern const char* const kExecutionsPageHtml; // server/core/src/executions_ui.cpp (Operate O1)
+extern const char* const kWorkflowsPageHtml; // server/core/src/workflows_ui.cpp (Operate WF-A)
 extern const char* const kTarPageHtml;
 extern const char* const kVizFleetPageHtml; // server/core/src/viz_page_ui.cpp (PR 5)
 extern const char* const kVizHostPageHtml;  // server/core/src/viz_host_page_ui.cpp (PR 9-pre)
@@ -31,6 +34,7 @@ extern const std::string
 extern const std::string
     kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
 extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
+extern const std::string kYuzuOperateJs; // server/core/src/yuzu_operate_js_bundle.cpp (Operate O1)
 extern const std::string kYuzuDialogJs;  // server/core/src/yuzu_dialog_js_bundle.cpp (shared dialog)
 extern const std::string kYuzuEstateJs;  // server/core/src/yuzu_estate_js_bundle.cpp (containment controls)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
@@ -132,7 +136,15 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuVizHostJs, "application/javascript; charset=utf-8");
     });
-    // Shared modal dialog + request helper, no-cache so page markup and module move together.
+    // Operate O1/WF-A: the Executions / Approvals / Workflows page controller. It is coupled to
+    // the fragment markup the same release serves, so it is never cached (a 24 h cache would
+    // skew a page against its fragment after an upgrade).
+    sink.Get("/static/yuzu-operate.js", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(yuzu::server::kYuzuOperateJs, "application/javascript; charset=utf-8");
+    });
+    // Shared modal dialog + request helper, loaded before the page controller that uses it.
+    // Same no-cache treatment as yuzu-operate.js: page markup and module move together.
     sink.Get("/static/yuzu-dialog.js", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuDialogJs, "application/javascript; charset=utf-8");
@@ -393,6 +405,36 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
                  }
                  res.set_content(kInstructionPageHtml, "text/html; charset=utf-8");
              });
+
+    // -- Approvals page (Operate O1; a child of Instructions in the shell) -----------------
+    sink.Get("/approvals", [deps](const httplib::Request& req, httplib::Response& res) {
+        auto session = deps.auth_fn(req, res);
+        if (!session) {
+            res.set_redirect("/login");
+            return;
+        }
+        res.set_content(kApprovalsPageHtml, "text/html; charset=utf-8");
+    });
+
+    // -- Executions page (Operate O1; the first child of Instructions in the shell) ---------
+    sink.Get("/executions", [deps](const httplib::Request& req, httplib::Response& res) {
+        auto session = deps.auth_fn(req, res);
+        if (!session) {
+            res.set_redirect("/login");
+            return;
+        }
+        res.set_content(kExecutionsPageHtml, "text/html; charset=utf-8");
+    });
+
+    // -- Workflows page (Operate WF-A; the third child of Instructions in the shell) -------
+    sink.Get("/workflows", [deps](const httplib::Request& req, httplib::Response& res) {
+        auto session = deps.auth_fn(req, res);
+        if (!session) {
+            res.set_redirect("/login");
+            return;
+        }
+        res.set_content(kWorkflowsPageHtml, "text/html; charset=utf-8");
+    });
 }
 
 } // namespace yuzu::server::page

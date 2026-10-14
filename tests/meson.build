@@ -1383,6 +1383,7 @@ if build_server
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
+      'unit/server/test_compliance_fragments.cpp', # pure renderers for the Compliance page fragments + tag table
       'unit/server/test_policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes
       'unit/server/test_compliance_model.cpp',
       'unit/server/test_verify_routes.cpp',
@@ -1435,6 +1436,7 @@ if build_server
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
       'unit/server/test_workflow_executions_list_authz.cpp', # #3526: /fragments/executions real fleet-read confinement
+      'unit/server/test_workflow_executions_real_gate_authz.cpp', # GET /api/v1/workflow-executions real fleet-read confinement
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
@@ -1562,6 +1564,9 @@ if build_server
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
       'unit/server/test_workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam (workflow read)
+      'unit/server/test_list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
+      'unit/server/test_workflow_execution_list_model.cpp', # pure shared REST+MCP list model (parse/rows/cursor)
+      'unit/server/test_workflow_execution_list_routes.cpp', # GET /api/v1/workflow-executions via TestRouteSink (no PG)
       'unit/server/test_guardian_api.cpp', # ADR-0031 WS-A4: the ninth per-family in-process API seam (Guardian read)
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
@@ -1679,11 +1684,18 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
-      'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 23 panels + static h1 on the /settings page
+      'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 22 panels + static h1 on the /settings page
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
       'unit/server/test_nav_shells.cpp',            # app shell: nav model, renderer, marker swap, per-page active item
+      'unit/server/test_name_lookup_memo.cpp',      # Operate O1: the per-render definition-name memo (stop on first read failure)
+      'unit/server/test_approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
+      'unit/server/test_executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
+      'unit/server/test_operate_pages_ui.cpp',      # Operate O1: CSP/token/literal-bound pins for the Operate page templates, CSS and controller
+      'unit/server/test_workflows_page_render.cpp', # Operate WF-A: the Workflows page's pure definitions/schedules renderers
+      'unit/server/test_workflows_page_routes.cpp', # Operate WF-A: the Workflows page fragments (fake gates, no PG)
+      'unit/server/test_workflows_page_authz.cpp',  # Operate WF-A: the Workflows page fragments over the real gates ([pg])
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',

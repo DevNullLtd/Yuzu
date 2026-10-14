@@ -572,15 +572,17 @@ TEST_CASE("execution_routes: cancel success audits + emits; an unconfined caller
     CHECK(h.emits[0].event_type == "execution.completed");
     CHECK(h.emits[0].attrs["status"] == "cancelled");
 
-    // Cancelling an already-terminal execution -- mark_cancelled returns
-    // false (PR #3842's RETURNING id + terminal-status guard) -> audited
-    // "failure", 503.
+    // Cancelling an already-terminal execution is a state-guard refusal, not a store
+    // failure: 409, audited "denied", no second execution.completed event.
     auto recancel = h.sink.Post("/api/executions/" + *id + "/cancel", "{}");
     REQUIRE(recancel);
-    CHECK(recancel->status == 503);
+    CHECK(recancel->status == 409);
+    CHECK(recancel->body.find("execution already finished") != std::string::npos);
     REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[1].action == "execution.cancel");
-    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].result == "denied");
+    CHECK(h.audits[1].detail.find("already finished") != std::string::npos);
+    CHECK(h.emits.size() == 1);
 
     // A genuinely unknown id, unconfined -- the defense-in-depth
     // `if (!exec_opt)` 404 fires and is NOT audited.

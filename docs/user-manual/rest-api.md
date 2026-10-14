@@ -5880,6 +5880,8 @@ surfaces admit the same **result set** for a given caller: `GET /api/v1/executio
 branch (below) is materially broader than the pre-existing MCP `list_executions` confinement
 (own-dispatches-only) — a disclosed, pre-#4030 difference, not a silent one (`docs/user-manual/mcp.md`).
 
+`GET /fragments/executions` also takes `view=page` (the Executions page list) and `status`, an allow-list of this fragment's own (`running`, `succeeded`, `completed`, `cancelled`, `pending`), not the v1 twin's enum. An empty `status` is no filter; an unknown `status` or a malformed `definition_id` answers `200` with a `data-invalid` note, never an empty list.
+
 **Prerequisite fix bundled with this PR:** `Workflow` was used as an RBAC securable throughout
 `workflow_routes.cpp` but was never seeded into `RbacStore`'s securable-types catalogue — meaning
 no role, including Administrator, could ever be granted `Workflow:Read` while RBAC was enabled.
@@ -5915,6 +5917,62 @@ you've already narrowed them.
 **Permission:** `Workflow:Read`. Fetch one workflow's full detail, including `yaml_source`. The v1
 twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
 soft-deleted id.
+
+#### `GET /api/v1/workflow-executions`
+
+**Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (ADR-0017), the same sole gate as
+the detail route below. Lists workflow **runs** (`WorkflowEngine`'s own multi-step run records, a
+different data model from the instruction `Execution`s `GET /api/v1/executions` lists; a workflow
+run never appears there). MCP twin `list_workflow_executions`; there is no legacy unversioned list.
+
+Rows carry metadata only: `id`, `workflow_id`, `workflow_name`, `workflow_deleted` (`true` when the
+workflow was soft-deleted; its history is kept), `status`, `current_step`, `started_at`,
+`completed_at`. Never agent ids, step results or `agents_reached` (use the detail route for those).
+Newest first by `(started_at, id)`.
+
+A confined caller (management-group or service-scoped) sees only runs with at least one agent in
+its scope. The scope is applied in the database **before** ordering and the page limit, so a run
+the caller cannot see never takes a page slot, `next_cursor` and the page length depend only on
+runs the caller may see, and a hand-made cursor naming a hidden run reveals nothing. A run whose
+stored agent list is malformed, empty or not an array is invisible to a confined caller.
+`pagination.total` is the number of rows **in this page**, never a fleet-wide count.
+
+| Parameter | Meaning |
+|---|---|
+| `workflow_id` | Exact workflow filter (1-128 characters of `A-Z a-z 0-9 _ -`). |
+| `status` | Exact filter: `pending`, `running`, `completed`, `failed`, `cancelled`. |
+| `since` / `until` | Epoch seconds, `started_at >= since` and `started_at < until`; `0` to `2^53`; `since` must not be after `until`. |
+| `limit` | Page size, default 50. Below 1 is a `400`; above 500 is clamped to 500. |
+| `cursor` | The previous page's `next_cursor`. A position only: it does not bind the other filters. |
+| `latest_per_workflow` | `true` returns at most one run per workflow: its newest run among those passing the other filters **and** the caller's visibility (so a confined caller gets its newest *visible* run, never a blanked newest one), ordered by `workflow_id`, with no cursor. `result_truncated_by_cap` is `true` when more workflows matched than `limit`. |
+
+Input is strict: an unknown or repeated parameter, a value outside the vocabulary or bounds above, or
+`cursor` together with `latest_per_workflow` is a `400` (A4 envelope) rather than being ignored, so a
+mistyped filter can never read as "all runs". No audit row is written for a successful list (run
+metadata, not operator-supplied step parameters); a refusal is audited by the gate as
+`auth.fleet_read_required`. A store failure or the 1.5 s statement timeout is a `503` with
+`retry_after_ms`, never an empty `200`.
+
+**Scale.** Only `workflow_id` is indexed (`idx_wf_exec_workflow`). `since`, `until` and `status`
+narrow the result but not the scan, and there is no `started_at` index, so a large run table is
+scanned and sorted on every call. A confined caller also pays to check the stored agent list of every
+candidate run, so a confined caller on a large table should always pass `workflow_id`. A read that
+does not finish inside the 1.5 s budget answers an honest `503` (never a short or empty page):
+narrow by `workflow_id` and retry.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "exec-wf-9", "workflow_id": "wf-1", "workflow_name": "Patch and Reboot",
+      "workflow_deleted": false, "status": "failed", "current_step": 1,
+      "started_at": 1735693200, "completed_at": 1735693260 }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50, "next_cursor": null },
+  "meta": { "api_version": "v1" }
+}
+```
 
 #### `GET /api/v1/workflow-executions/{id}`
 
@@ -6061,6 +6119,54 @@ confine against), then `Schedule:Read`. The v1 twin of `GET /fragments/schedules
 route's parsing, where any presence of `enabled_only` is treated as true regardless of value. This
 route remains a distinct, separately-ledgered twin of `GET /fragments/schedules`, not of `GET
 /api/schedules` documented above.
+
+`GET /fragments/schedules` also takes `view=page` (the Workflows page's Schedules panel) behind the
+same two-stage gate and the same read; a refused caller gets `200` with a `data-denied` note and a
+failed read `200` with `data-degraded` (the dashboard drops `4xx` bodies). The page view adds the
+cadence the scheduler really applies (the time-of-day, weekday and day-of-month fields are stored
+and ignored), Count and Last run, and an owner flag computed from the session. A schedule the
+caller did not create shows only All devices or Targeted: the scope expression, interval, approval
+flag, parameters and creator are in no read that carries another user's schedule (REST v1, MCP) and
+are not rendered for one. The default view is unchanged.
+
+#### `GET /fragments/workflows`
+
+HTML fragment behind the Workflows page (`/workflows`). Requires `Workflow:Read` through the same
+gate as `GET /api/v1/workflows` (a management-group-scoped-only caller is refused, as there). Lists
+the 100 newest definitions with their steps (label, instruction id, condition, retries, `foreach`,
+failure policy) and marks a cut list with `data-truncated="1"`. A refused caller gets `200` with
+`data-denied="true"`, a failed store read `200` with `data-degraded="true"`; neither is an empty
+list. Step rows carry the workflow's own labels and instruction ids; instruction names are not looked
+up (that read needs `InstructionDefinition:Read`). Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
+
+#### `GET /fragments/workflow-runs`
+
+HTML fragment of workflow run rows for the Workflows page: each workflow's newest run
+(`latest_per_workflow=true&limit=500`) or one workflow's recent runs (`workflow_id=<id>&limit=10`).
+The sole gate is the fleet-read gate for `Workflow:Read`, the one `GET /api/v1/workflow-executions`
+uses; its scope narrows the rows in the store before ordering and limiting, so a confined caller's
+rows are exactly the runs with a device in its scope. A `latest_per_workflow` list cut off by the
+`limit` is marked `data-truncated="1"`, and the page then shows Unknown rather than Not run for a
+workflow the list did not include. Only `workflow_id`, `status`, `limit` and
+`latest_per_workflow` are accepted; any other parameter, a repeated one or an out-of-vocabulary value
+answers `200` with `data-invalid="true"` and a fixed note (a mistyped filter never reads as all
+runs). A refused caller gets `200` with `data-denied="true"`, a failed read `200` with
+`data-degraded="true"`; an empty list says "No runs yet." or, for a confined caller, "No runs
+include devices in your scope." No audit row on a list. Twin: `GET /api/v1/workflow-executions`, MCP
+`list_workflow_executions`.
+
+#### `GET /fragments/workflow-runs/{id}`
+
+HTML fragment of one run: status, workflow, start, duration, device count (the count of the
+caller's in-scope target devices when confined) and one row per step. Same sole gate and same
+record-level visibility rule as `GET /api/v1/workflow-executions/{id}`. A run the caller may not see
+and an unknown id both answer `404` with the identical body, so the route is not an existence
+oracle. Step titles are the workflow definition's labels, falling back to the step's instruction id.
+Error text is rendered only when the stored error is a plain string (never a nested object), skipped
+steps only from the three reasons the engine writes, and a confined caller sees "Dispatched
+(run-wide)" with no per-step device count. Audited as `workflow_execution.detail.fetch`
+(`success`, or `denied` for a hidden run), like the v1 twin. Twin:
+`GET /api/v1/workflow-executions/{id}`, MCP `get_workflow_execution`.
 
 **Response:**
 
@@ -8198,7 +8304,7 @@ The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` 
 
 Browser-facing page that renders the 3D fleet topology. The page itself is auth-gated only; per-request RBAC enforcement happens when the page's JS hits `GET /api/v1/viz/fleet/topology` (see below).
 
-**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables only the API endpoint, not the page shell — the page continues to load and the `503` from the disabled API surfaces in the browser console.
+**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/login` first).
 
 **Browser requirements:** the dashboard stylesheet needs Chrome 111+, Edge 111+, Firefox 121+ or Safari 16.2+ (`color-mix()` and `:has()`), and this page also requires importmap support (Safari 16.4+; the other browsers already meet it). On a browser without importmap the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
 
@@ -10002,6 +10108,8 @@ complete-cohort admission check for a confined caller; a **global** grant is nev
 #### `POST /api/executions/{id}/cancel`
 
 **Permission:** `Execution:Execute` AND `Execution:Read`, same confinement rule as `rerun`.
+**Response (409):** the execution already finished (`succeeded`, `completed` or `cancelled`);
+nothing changed. Audited as `execution.cancel` / `denied`. A degraded execution store is a `503`.
 **Response (404):** unknown execution id (this route no longer reports a false success for a
 nonexistent id), outside-scope, or an incomplete/partial target cohort. **Escape hatch:** an
 execution whose targeted cohort never fully reports (an agent gone offline mid-run, for example)
@@ -10134,13 +10242,17 @@ Postgres failure this route silently returns `{"count": 0}` — indistinguishabl
 empty queue — rather than a `503`; prefer `GET /api/v1/approvals/pending/count` or MCP
 `get_pending_approval_count` for failure-honest polling.
 
+#### `GET /fragments/approvals`
+
+HTML fragment behind the Instructions Approvals tab and the Approvals page (`/approvals`). Requires `Approval:Read`. `view=page` renders the page list (pending by default); `status` is one of `pending`, `approved`, `rejected`, `expired`, and an empty value means every status. An unknown `status` answers `200` with a `data-invalid="status"` note, a failed store read answers `200` with `data-degraded="store"`, and a refused caller gets `200` with `data-denied="true"` (the dashboard drops `4xx` bodies). The page view lists the 100 most recent rows and marks a cut list with `data-truncated="1"`.
+
 #### `POST /api/approvals/{id}/approve`
 
-Approve a pending instruction execution.
+Approve a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
 
 #### `POST /api/approvals/{id}/reject`
 
-Reject a pending instruction execution.
+Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
 
 ---
 

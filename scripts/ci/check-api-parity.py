@@ -199,16 +199,20 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
 #
+# Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
+# is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
+# which counts as untwinned by design, so the count rises 199 -> 200.
+#
 # Device containment fragments (es-1): get.fragments-hardware-quarantine is "twinned" to GET
 # /api/v1/quarantine (no MCP list tool exists; the gap is recorded on the row), and
 # get.fragments-hardware-ci-containment is "composed-of:get.fragments-hardware-quarantine"
 # (a single-device read of the same active-record set; REST has no per-device GET). One
-# composed-of row, so 199 -> 200, measured by the checker, not hand-picked.
+# composed-of row, so 200 -> 201, measured by the checker, not hand-picked.
 #
 # Stored data panel (es-1): get.fragments-hardware-ci-stored-data is an "exception:" row (the
 # erase it fronts is DELETE /api/v1/sle/agents/{id}, which has no ledger row to compose), so
-# 200 -> 201, measured by the checker, not hand-picked.
-BASELINE_UNTWINNED = 201
+# 201 -> 202, measured by the checker, not hand-picked.
+BASELINE_UNTWINNED = 202
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

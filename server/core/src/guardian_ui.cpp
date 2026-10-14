@@ -680,12 +680,8 @@ const char* const kGuardianPageTemplate =
       guardianCloseModal();
     });
 
-    /* Ctrl+K / Cmd+K — navigate to dashboard command palette */
+    /* Escape closes the detail modal. (Ctrl+K is the app shell's: app_shell.cpp.) */
     document.addEventListener('keydown', function(e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        window.location.href = '/?palette=1';
-      }
       if (e.key === 'Escape') {
         var m = document.getElementById('guardian-modal');
         if (m && m.classList.contains('open')) guardianCloseModal();
