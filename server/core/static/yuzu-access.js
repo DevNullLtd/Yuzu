@@ -76,6 +76,8 @@
     var bad = document.getElementById('acc-alert');
     if (ok) ok.textContent = kind === 'ok' ? text : '';
     if (bad) bad.textContent = kind === 'bad' ? text : '';
+    // The line sits above the panels; a refusal from a panel further down must not stay off-screen.
+    if (kind === 'bad' && bad && bad.scrollIntoView) bad.scrollIntoView({ block: 'nearest' });
   }
 
   function audit(r) {
@@ -88,7 +90,13 @@
 
   function failure(r) {
     var text = r.message || ('The request was refused (HTTP ' + r.status + ').');
-    return unknown(r) ? text + ' The change may or may not have been applied; the lists have been reloaded.' : text;
+    if (!unknown(r)) return text;
+    // A server message that already states what happened ("... session cleanup failed ...") is
+    // kept as the definite part; only an unexplained 5xx or dropped connection is "may or may not".
+    var sep = /[.!?]$/.test(text) ? ' ' : '. ';
+    return text + sep + (/cleanup failed|took effect|may not have/i.test(text)
+      ? 'The lists have been reloaded.'
+      : 'The change may or may not have been applied; the lists have been reloaded.');
   }
 
   // ---- actions ----
@@ -156,6 +164,9 @@
     var sel = document.getElementById('acc-role');
     var role = sel ? sel.value : '';
     if (!s || (role !== 'admin' && role !== 'user')) return say('bad', 'Choose Admin or User.');
+    // The select starts on the account's current role: sending it again changes nothing.
+    if (sel.selectedOptions[0] && sel.selectedOptions[0].defaultSelected)
+      return say('bad', 'The account already has that role. Choose the other one.');
     return window.YuzuDialog.confirm({
       title: 'Change account role',
       body: ['Set the account role of "' + name + '" to ' + role + '?', 'They are signed out of the dashboard.'],
@@ -348,7 +359,8 @@
 
   function sayIn(panelId, kind, text, more) {
     var slot = document.querySelector('#' + panelId + ' [data-slot="out"]');
-    if (!slot) return;
+    // A panel drawn without an outcome slot (its read failed): the page-top line carries it.
+    if (!slot) { if (text) say(kind === 'bad' ? 'bad' : 'ok', more ? text + ' ' + more : text); return; }
     slot.replaceChildren();
     if (!text) return;
     if (kind === 'bad') {
@@ -384,7 +396,7 @@
   }
 
   var ENFORCE_NOTE = 'You must hold a fleet-wide Administrator grant and a local admin account, or the server refuses ' +
-                     'so you cannot lock yourself out. You will be asked for an MFA code.';
+                     'so you cannot lock yourself out. You may be asked for an MFA code.';
 
   ACTS.enforce = function (sw) {
     var want = sw.checked;

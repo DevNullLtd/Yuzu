@@ -802,11 +802,15 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: a dot-only username is refus
         CHECK(res->status == 400);
         CHECK_FALSE(h.has_user(name));
     }
-    // A name that merely contains a dot is fine.
-    auto ok = h.Post("/api/settings/users", "username=a.b&password=a-long-enough-password",
-                     "application/x-www-form-urlencoded");
-    REQUIRE(ok);
-    CHECK(ok->status == 200);
+    // A name that merely contains a dot is fine, at either end.
+    for (const char* name : {"a.b", ".hidden", "x.", "-x"}) {
+        INFO(name);
+        auto ok = h.Post("/api/settings/users",
+                         std::string("username=") + name + "&password=a-long-enough-password",
+                         "application/x-www-form-urlencoded");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
 }
 
 TEST_CASE("SettingsRoutes POST /api/settings/users: short password rejected with toast",

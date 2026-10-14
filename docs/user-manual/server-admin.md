@@ -2935,7 +2935,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Section | Fragment Route | Description |
 |---|---|---|
 | TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
-| User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The same actions are available on the **Users and roles** page (`/access/users`) in the Access section of the sidebar. |
+| User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The **Users and roles** page (`/access/users`) in the Access section of the sidebar offers add, remove, change role, revoke sessions, and your own password change and sign-out-everywhere; resetting another user's password stays here or on the REST route. |
 | Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
 | Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
@@ -3377,8 +3377,8 @@ The password is hashed with PBKDF2 before storage. Plaintext passwords are never
 ### Changing a User's Role
 
 The Settings → User Management table does **not** render a role button (the **Access → Users and roles** page does);
-change a role with the Settings endpoint from an admin session (it is
-MFA step-up gated):
+change a role with the Settings endpoint from an admin session whose own
+account role is `admin` (it is MFA step-up gated):
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \

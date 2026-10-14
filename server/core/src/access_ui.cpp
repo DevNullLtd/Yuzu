@@ -86,7 +86,7 @@ extern const char* const kAccessUsersTemplate =
           <button type="button" class="btn" data-act="stepdown">Step down</button></div>
         <div class="pb" data-slot="out" role="status" aria-live="polite"></div>
         <div class="pb"><p class="hint">This page cannot show whether your session is currently elevated. Step down is always safe.</p>
-          <p class="hint">While elevated you can use administrator features. Assigning roles and changing RBAC enforcement still need your own standing Administrator role.</p></div>
+          <p class="hint">While elevated you can use administrator features. Assigning roles, changing account roles and changing RBAC enforcement still need your own standing Administrator role.</p></div>
       </section>
       <section class="panel" id="acc-check">
         <div class="hd"><h2>Check your own permission</h2></div>

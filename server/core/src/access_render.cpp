@@ -393,7 +393,7 @@ std::string render_enforcement(const std::variant<EnforcementView, Unavailable>&
                "do everything and users can read most things and change nothing.";
     else
         text = "Off. Turning it on needs a fleet-wide Administrator grant for you and a current local admin "
-               "account, plus an MFA code.";
+               "account, plus an MFA code if your second-factor check is stale.";
     std::string sw = "<input class=\"sw\" type=\"checkbox\" role=\"switch\" aria-label=\"RBAC enforcement\"";
     if (v->enabled)
         sw += " checked";
