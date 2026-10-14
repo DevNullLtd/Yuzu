@@ -145,7 +145,7 @@ private:
 
     // -- Fragment renderers (called by route handlers) -------------------------
     std::string render_status_fragment(const std::string& view) const;
-    std::string render_guards_fragment(const std::string& status_filter) const;
+    std::string render_guards_fragment() const;
     std::string render_events_fragment(const std::string& type_filter,
                                        const std::string& severity_filter) const;
     std::string render_baselines_fragment() const;

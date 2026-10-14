@@ -45,6 +45,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <ctime>
 #include <memory>
 #include <optional>
 #include <set>
@@ -168,6 +169,9 @@ struct Harness {
 
     std::vector<AuditRecord> audit_log;
     std::vector<PushCall> pushes;
+    // Every perm_fn call, so a test can prove a polled fragment makes exactly
+    // its own one gate check and no extra capability probes (S2).
+    int perm_calls{0};
 
     // Real MetricsRegistry (#4252) so tests can assert on
     // yuzu_server_guardian_platform_matrix_stale_total{spark_type} — the
@@ -216,6 +220,7 @@ struct Harness {
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
                               const std::string& securable, const std::string& op) -> bool {
+            ++perm_calls;
             if (denied.count(securable + ":" + op)) {
                 res.status = 403; // mirror production: the perm_fn owns the 403.
                 return false;
@@ -1604,4 +1609,169 @@ TEST_CASE("#4252: GuardianRoutes with metrics=nullptr degrades cleanly (no crash
     // fold and renders as the sole, fully compliant pair.
     CHECK(res->body.find("100% compliant") != std::string::npos);
     CHECK(res->body.find("Not implemented") == std::string::npos);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// PR-C (posture): honest Guardian states. No example Guards or events, no
+// DEMO banner; absent, degraded and empty are three different texts; the
+// toggle and Deploy actions confirm before they post; the 24 h drift readout
+// reads a real 24 h window.
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// No store at all: the only harness that needs no Postgres. Proves the
+// formerly-mocked fragments render an explicit unavailable state.
+struct NoStoreHarness {
+    GuardianRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    NoStoreHarness() {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "alice";
+            s.role = auth::Role::admin;
+            return s;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) { return true; };
+        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                           const std::string&, const std::string&, const std::string&) {};
+        auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
+                          const nlohmann::json&) {};
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, nullptr, nullptr,
+                               [] { return std::string{"[]"}; },
+                               [](const std::string&, bool) { return 0; });
+    }
+};
+
+std::string iso_utc_ago(int seconds_ago) {
+    const std::time_t t = std::time(nullptr) - seconds_ago;
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
+}
+
+} // namespace
+
+TEST_CASE("guards and events fragments with no store render an unavailable state, "
+          "never example data",
+          "[guardian_routes][honest][mock_removed]") {
+    NoStoreHarness h;
+    for (const char* path : {"/fragments/guardian/guards", "/fragments/guardian/events",
+                             "/fragments/guardian/status"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("Guardian store unavailable") != std::string::npos);
+        CHECK(res->body.find("DEMO DATA") == std::string::npos);
+        CHECK(res->body.find("block-smb-445") == std::string::npos);
+        CHECK(res->body.find("DESKTOP-A3F") == std::string::npos);
+        CHECK(res->body.find("No Guards defined yet") == std::string::npos);
+        CHECK(res->body.find("No drift events yet") == std::string::npos);
+    }
+}
+
+TEST_CASE("guards fragment: a live empty store says no Guards, a degraded read says unavailable",
+          "[pg][guardian_routes][honest][degraded]") {
+    Harness h;
+    auto empty = h.sink.Get("/fragments/guardian/guards");
+    REQUIRE(empty != nullptr);
+    CHECK(empty->body.find("No Guards defined yet") != std::string::npos);
+    CHECK(empty->body.find("temporarily unavailable") == std::string::npos);
+    CHECK(empty->body.find("DEMO DATA") == std::string::npos);
+
+    h.seed_guard("g1", "GuardOne");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guaranteed_state_rules CASCADE")};
+        REQUIRE(d.ok());
+    }
+    auto degraded = h.sink.Get("/fragments/guardian/guards");
+    REQUIRE(degraded != nullptr);
+    CHECK(degraded->status == 200);
+    CHECK(degraded->body.find("Guards temporarily unavailable") != std::string::npos);
+    // A degraded read must never read as an empty list.
+    CHECK(degraded->body.find("No Guards defined yet") == std::string::npos);
+    CHECK(degraded->body.find("DEMO DATA") == std::string::npos);
+}
+
+TEST_CASE("events fragment: a live empty log is honest, and the polled route probes nothing "
+          "beyond its own gate",
+          "[pg][guardian_routes][honest][events]") {
+    Harness h;
+    h.perm_calls = 0;
+    auto res = h.sink.Get("/fragments/guardian/events");
+    REQUIRE(res != nullptr);
+    CHECK(res->body.find("No drift events yet") != std::string::npos);
+    CHECK(res->body.find("DEMO DATA") == std::string::npos);
+    CHECK(res->body.find("DESKTOP-A3F") == std::string::npos);
+    // S2: the 5 s poll makes exactly the route's own GuaranteedState:Read check;
+    // a render-time capability probe here would write an audit row per tick.
+    CHECK(h.perm_calls == 1);
+}
+
+TEST_CASE("guard toggle and baseline Deploy/Re-deploy ask for confirmation before posting",
+          "[pg][guardian_routes][confirm]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+
+    auto guards = h.sink.Get("/fragments/guardian/guards");
+    REQUIRE(guards != nullptr);
+    const auto toggle = guards->body.find("hx-post=\"/fragments/guardian/guard/g1/enabled?value=0\"");
+    REQUIRE(toggle != std::string::npos);
+    const auto toggle_end = guards->body.find("</button>", toggle);
+    const std::string toggle_tag = guards->body.substr(toggle, toggle_end - toggle);
+    CHECK(toggle_tag.find("hx-confirm=\"Disable this Guard?") != std::string::npos);
+    // The copy must say the change is state-only.
+    CHECK(toggle_tag.find("next Baseline deploy or reconcile") != std::string::npos);
+
+    // Draft Baseline: "Deploy" button on the list.
+    auto list = h.sink.Get(kBaselinesPath);
+    REQUIRE(list != nullptr);
+    const auto dep = list->body.find("hx-post=\"/fragments/guardian/baseline/bl1/deploy\"");
+    REQUIRE(dep != std::string::npos);
+    const std::string dep_tag = list->body.substr(dep, list->body.find("</button>", dep) - dep);
+    CHECK(dep_tag.find("hx-confirm=\"Deploy this Baseline?") != std::string::npos);
+    CHECK(dep_tag.find("every in-scope agent enforces") != std::string::npos);
+
+    // Deployed: "Re-deploy" on the list and on the Baseline page.
+    auto deployed = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                    "application/x-www-form-urlencoded");
+    REQUIRE(deployed != nullptr);
+    auto list2 = h.sink.Get(kBaselinesPath);
+    REQUIRE(list2 != nullptr);
+    CHECK(list2->body.find("hx-confirm=\"Re-deploy this Baseline?") != std::string::npos);
+
+    auto page = h.sink.Get("/fragments/guardian/baseline/bl1/page");
+    REQUIRE(page != nullptr);
+    CHECK(page->body.find("/deploy',{confirm:'Re-deploy this Baseline?") != std::string::npos);
+}
+
+TEST_CASE("fleet status shows a 24 h drift readout that excludes older events",
+          "[pg][guardian_routes][status][g3]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_status("e-new-det", "A1", "g1", "drift.detected", iso_utc_ago(600));
+    h.seed_status("e-new-det2", "A2", "g1", "drift.detected", iso_utc_ago(1200));
+    h.seed_status("e-new-rem", "A1", "g1", "drift.remediated", iso_utc_ago(300));
+    h.seed_status("e-old-det", "A3", "g1", "drift.detected", iso_utc_ago(3 * 86400));
+
+    auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+    REQUIRE(res != nullptr);
+    const auto sec = res->body.find("Drift activity (24h)");
+    REQUIRE(sec != std::string::npos);
+    const std::string win = res->body.substr(sec, 700);
+    // Two detections and one remediation in the window; the 3-day-old one is out.
+    CHECK(win.find("warn\">2</div><div class=\"stat-label\">Drift events") != std::string::npos);
+    CHECK(win.find("good\">1</div><div class=\"stat-label\">Auto-reverted") != std::string::npos);
+    // The 7-day card still counts all three detections.
+    CHECK(res->body.find("warn\">3</div><div class=\"stat-label\">Drift detected") !=
+          std::string::npos);
 }
