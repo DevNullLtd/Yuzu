@@ -96,6 +96,10 @@ constexpr NavItem kAccess[] = {
      .label = "Tokens and principals",
      .href = "/access/tokens",
      .icon = "M15 9a4 4 0 10-7 2.6L3 17v4h4v-2h2v-2h2l2.4-2.4A4 4 0 0015 9z"},
+    {.key = "audit",
+     .label = "Audit and reviews",
+     .href = "/access/audit",
+     .icon = "M6 3h9l4 4v14H6z M14 3v5h5 M9 13h7 M9 17h7"},
 };
 constexpr NavItem kSystem[] = {
     {.key = "settings",
