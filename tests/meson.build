@@ -2908,6 +2908,24 @@ test('gateway OTP pin resolution',
   timeout: 120,
 )
 
+# scripts/ensure-erlang.sh sourced under `set -euo pipefail`, as
+# release-preflight.sh and integration-test.sh do. POSIX bash; skips itself on
+# Windows.
+test('ensure-erlang strict-mode callers',
+  _python3_test,
+  args: [files('test_ensure_erlang.py')],
+  suite: 'docs',
+  timeout: 180,
+)
+
+# Every script target uses yuzu_python (no ad-hoc find_program for python).
+test('meson python lookup is yuzu_python',
+  _python3_test,
+  args: [files('test_meson_python_lookup.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Gateway image guards (#2150): the Dockerfile.gateway abi-guard's real text
 # run under sh against fake facts, and the gateway crash signatures in
 # scripts/ci/qa-stack.sh. Hermetic, no Docker; the cases that need a POSIX sh

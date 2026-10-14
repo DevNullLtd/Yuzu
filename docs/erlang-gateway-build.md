@@ -32,21 +32,27 @@ activation step is needed for a Meson/Ninja build: `meson setup` runs
 PATH, kerl (its installs are found whether or not the `kerl` command is on
 PATH), asdf, mise, Homebrew (`erlang@28` before `erlang`), common Linux
 prefixes and the Windows installer directories, and accepts an install only if
-its `releases/*/OTP_VERSION` passes the pin. The resolved `bin/` reaches the
+the OTP_VERSION of its LIVE release passes the pin (with several `releases/<n>/`
+left by installing one major over another, the live one is the release named in
+`releases/start_erl.data`). Selection: an explicit `YUZU_OTP_BIN` must itself
+match or configure reports it; otherwise the `erl` already on PATH wins when it
+matches (it is your active choice); otherwise the highest matching release
+found. `C:\Erlang` is never searched on Windows: any user can create it, and
+the CI runners build as SYSTEM. The resolved `bin/` reaches the
 gateway build and both gateway tests as `YUZU_OTP_BIN`, which the wrappers put
 first on PATH, so `ninja` alone builds with the right OTP even when a newer
 one (Homebrew `erlang` 29) is first in the shell. The configure summary names
-what it chose: `Erlang gateway: enabled, Erlang/OTP 28.4 (kerl) at ...`.
+what it chose: `Erlang gateway: enabled, Erlang/OTP 28.4 (kerl) at ...`, and
+the end-of-configure Components summary repeats it (or `SKIPPED (...)`).
 
 **The pin is a floor within the major: OTP 28.4 or any later 28.x.** It is
 `DEFAULT_OTP_VERSION` in `scripts/erlang_toolchain.py`, the single source
 for Meson, the wrappers and `ensure-erlang.sh`. It accepts every pinned
 toolchain today (the Windows runner contract's 28.4.2, the macOS CI download's
 28.5.0.7, setup-beam's latest 28.x) and refuses 28.3 and earlier and any 29.x:
-moving to a new major is a deliberate migration. `YUZU_OTP_VERSION=<v>`
-overrides it for one run; there is no Meson option for it, for the same
-branch-shared-build-dir reason as `require_gateway`. To see every install the
-resolver found and why it chose (or refused) each:
+moving to a new major is a deliberate migration. There is no Meson option for
+it, for the same branch-shared-build-dir reason as `require_gateway`. To see
+every install the resolver found and why it chose (or refused) each:
 
 ```bash
 python3 scripts/erlang_toolchain.py find-otp
@@ -54,22 +60,64 @@ python3 scripts/erlang_toolchain.py find-otp
 
 If `rebar3` is present but no install passes the pin, configure prints
 `WARNING: Erlang gateway: SKIPPED.` with that inventory and continues without
-the gateway; `-Drequire_gateway=true` turns that into a configure error. An
-OTP installed after configure is picked up on the next reconfigure.
+the gateway; `-Drequire_gateway=true` turns that into a configure error. A
+crash inside the resolver is always a configure error, never a skip. An OTP
+installed after configure is picked up on the next reconfigure; if the OTP
+Meson resolved is removed or replaced after configure, the gateway build stops
+with "...reconfigure the build" rather than falling back to another `erl`.
 
-**Shells:** for running rebar3 or `erl` by hand, the sourceable helper applies
-the same pin and the same search order to the current shell:
+**Overriding the choice.** Both overrides are read at **configure** time and
+baked into the build: set them on `meson setup` / `meson setup --reconfigure`,
+not on `ninja`. A value exported only when running `ninja` is ignored (Meson's
+target environment replaces it), and Ninja's automatic regeneration after a
+`meson.build` change reconfigures with the environment of THAT `ninja`
+invocation, so keep an override exported in the shell you build from, or
+reconfigure explicitly after changing it.
+
+- `YUZU_OTP_BIN=<install>/bin` picks one install. It must hold a matching
+  `erl`; a wrong version or a path with no `erl` is reported, never replaced.
+- `YUZU_OTP_VERSION=<digits.and.dots>` changes the floor for that configure
+  (same-major rule). Anything that is not digits and dots is rejected.
+
+### Changing the Erlang/OTP pin
+
+The floor is a repository toolchain contract, like the Windows SDK pin in
+`docs/windows-build.md`. A change to it is one PR that updates every copy
+together:
+
+- `DEFAULT_OTP_VERSION` in `scripts/erlang_toolchain.py` (Meson, the wrappers
+  and `ensure-erlang.sh` all read it);
+- every OTP the build actually installs: `ci.yml` (`setup-beam` `otp-version`
+  and the macOS `OTP_VERSION` + its sha256), `release.yml`, `nightly.yml`,
+  `deploy/windows/toolchain-contract.json` (and the runners' maintenance
+  record, `deploy/windows/README.md`), `runner-ops/upgrade-erlang-linux.sh`,
+  and the gateway image base tags (`Dockerfile.gateway` and siblings);
+- the user-facing statements: `docs/user-manual/gateway.md`,
+  `docs/build-guide.md`, `docs/darwin-compat.md`, `docs/rhel9-build-setup.md`.
+
+`tests/test_erlang_toolchain_otp.py` fails if the Windows contract's or the
+macOS CI download's version stops passing the pin. A move to a new MAJOR also
+needs the gateway dependency set (rebar.config) proven on it first, and on the
+Windows host the old and new OTP side by side until every active branch carries
+the bump, because branches not rebased onto it will refuse the new major.
+
+**Shells:** for running rebar3 or `erl` by hand, the sourceable helper asks the
+same resolver (`find-otp`) and activates what it picks in the current shell -
+on MSYS2 through a native Windows Python, converting the path with `cygpath`.
+Only when no suitable Python exists does it fall back to its own narrower
+search (kerl, asdf, Homebrew, the Windows installer).
 
 ```bash
 source scripts/ensure-erlang.sh           # the pin above: 28.4 or later 28.x
 source scripts/ensure-erlang.sh 28.4.2    # 28.4.2 or later 28.x
-command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
+erl -noshell -eval 'io:format("~s~n",[erlang:system_info(otp_release)]),halt().'   # check the version, not just presence
 ```
 
 A working `erl` of the wrong version on PATH is not success: the helper
 reports it, keeps searching, and if nothing passes the pin it says so and
-leaves PATH unchanged. It **always returns 0** so it can't trip the caller's
-`set -e`; callers verify. Native `cmd.exe`/PowerShell is out of scope; the
+leaves PATH unchanged - so `command -v erl` alone can pass with the wrong OTP.
+It **always returns 0**, including under a caller's `set -euo pipefail`, so it
+can't kill the caller; callers verify the version. Native `cmd.exe`/PowerShell is out of scope; the
 documented Windows build path is MSYS2 bash.
 
 OTP 28 is the only supported toolchain for the gateway test gates:
@@ -90,7 +138,7 @@ part that actually fixes this), and its stdin is null on a private hidden
 console (`CREATE_NO_WINDOW`) — those two shared through
 `scripts/erlang_toolchain.py`'s `windows_stdio_isolation()`.
 `build_gateway.py` relays the pipe to its own stdout and tees it to
-`<build dir>/meson-logs/yuzu_gateway_build.log`, which `ci.yml`'s Windows leg
+`<build dir>/meson-logs/yuzu_gateway_build.log`, which every `ci.yml` leg
 uploads with the rest of `meson-logs/` on failure. The pipe and the log are
 used on **every** platform (they were once Windows-only): the gateway target
 runs in Ninja's console pool, so a redirected or IDE build otherwise keeps only

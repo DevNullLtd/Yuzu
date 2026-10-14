@@ -30,11 +30,11 @@ Before *any* Erlang work in this repo — `rebar3`, `erlc`, standalone `erl` she
 
 ### The helper
 
-`scripts/ensure-erlang.sh` is the canonical toolchain activator. Source it at the start of any session that touches Erlang, and verify:
+A Meson build needs no activation: `meson setup` resolves the pinned OTP (28.4 or any later 28.x) itself via `scripts/erlang_toolchain.py find-otp` and hands it to the gateway targets. For running rebar3 / erl / dialyzer by hand, `scripts/ensure-erlang.sh` activates the same pinned OTP in your shell. It returns 0 even when nothing passes the pin, so verify the VERSION, not just that `erl` exists:
 
 ```bash
-source scripts/ensure-erlang.sh           # default: latest 28.x
-source scripts/ensure-erlang.sh 28.4.2    # exact pin
+source scripts/ensure-erlang.sh           # default: the pin (28.4 or any later 28.x)
+source scripts/ensure-erlang.sh 28.4.2    # 28.4.2 or any later 28.x
 command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
 ```
 
@@ -51,7 +51,8 @@ The helper detects the toolchain in this order: **kerl** (Linux/macOS dev boxes,
 | `rebar3: command not found` after sourcing helper | Toolchain dir not installed where helper probes | `kerl install 28.4.2` (or asdf/brew equivalent), rerun |
 | `Plugin gpb does not export init/1` | Benign — gpb is used via `grpc` config, not as a rebar3 plugin | Ignore |
 | `erl` is on PATH but `erl -version` hangs | Broken symlink or wrong-arch binary — helper probes with `erl -version` to catch this, but if you sourced manually it may still be stale | Delete the stale install and reinstall |
-| Meson custom_target `.gateway_built` fails while C++ targets succeed | Forgot to source `ensure-erlang.sh` before `meson compile` | Source it, rerun |
+| Configure prints `WARNING: Erlang gateway: SKIPPED.` | rebar3 is installed but no Erlang/OTP 28.4+ (same major) was found; the warning lists every install inspected | Install a matching OTP (or point `YUZU_OTP_BIN` at its `bin/`), then `meson setup --reconfigure` |
+| `.gateway_built` fails with "the configured Erlang/OTP ... is now ..." | The OTP Meson resolved was removed or replaced after configure | `meson setup --reconfigure <builddir>` |
 
 ## Build & Test Commands
 

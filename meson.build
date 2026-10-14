@@ -29,10 +29,11 @@ host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
 
 # ── Python for build/test helper scripts ─────────────────────────────────────
 # One interpreter for every custom_target, run_command and test that runs a
-# repo script; use `yuzu_python`, never a fresh yuzu_python.
+# repo script; use `yuzu_python`, never a fresh find_program for python
+# (tests/test_meson_python_lookup.py fails the build tests if one appears).
 # On Windows it is the interpreter running Meson itself (native CPython, per
-# the runner toolchain contract): under MSYS2 bash a bare yuzu_python
-# resolves MSYS2's /usr/bin/python3 first, which cannot open the C:/ paths
+# the runner toolchain contract): under MSYS2 bash a bare find_program for
+# python3 resolves MSYS2's /usr/bin/python3 first, which cannot open the C:/ paths
 # Meson passes it, so every script target fails in ~0.04s ("can't open file
 # '/c/.../C:/...'"). Elsewhere it is unchanged: the first python3 on PATH, which
 # carries the modules the scripts import (PyYAML etc.) where a pipx/venv Meson's
@@ -653,13 +654,20 @@ if _rebar3.found()
     yuzu_python, meson.project_source_root() / 'scripts' / 'erlang_toolchain.py', 'find-otp',
     check: false,
   )
+  # Exit codes (erlang_toolchain.main): 0 found, 1 no install passes the pin
+  # (a legitimate skip), anything else is a usage error or a resolver crash -
+  # never let that masquerade as "no matching OTP".
   if _gw_otp.returncode() == 0
     _gw_otp_out = _gw_otp.stdout().strip().split('\n')
     _gw_otp_bin = _gw_otp_out[0]
     _gw_otp_desc = 'Erlang/OTP ' + _gw_otp_out[1] + ' (' + _gw_otp_out[2] + ') at ' + _gw_otp_bin
-  else
-    _gw_skip_reason = ('rebar3 found, but not the pinned Erlang/OTP release:\n'
+  elif _gw_otp.returncode() == 1
+    _gw_skip_reason = ('rebar3 found, but no Erlang/OTP passes the pin:\n'
                        + _gw_otp.stderr().strip())
+  else
+    error('scripts/erlang_toolchain.py find-otp failed (exit '
+          + _gw_otp.returncode().to_string() + '); this is a resolver error, not a '
+          + 'missing Erlang/OTP:\n' + _gw_otp.stderr().strip())
   endif
 endif
 if _gw_otp_bin != ''
@@ -684,8 +692,8 @@ if _gw_otp_bin != ''
   # ── Gateway tests (EUnit + Common Test) ──────────────────────────────
   _gw_test_script = meson.project_source_root() / 'scripts' / 'test_gateway.py'
   _python3 = yuzu_python
-  # The test script prepends OTP 28 / rebar3 paths to PATH internally,
-  # handling the case where Meson inherits a system PATH with OTP 25.
+  # Both gateway tests run on the OTP resolved above: YUZU_OTP_BIN (set in
+  # each test's env) goes first on PATH via erlang_toolchain.base_env().
   #
   # Each suite gets its own REBAR_BASE_DIR so the eunit and ct tests
   # never share `_build/test/lib/<dep>/` on disk. Meson schedules
@@ -799,6 +807,8 @@ summary({
   'Examples':   build_examples,
   'Tests':      build_tests,
   'Enterprise': get_option('enable_enterprise'),
+  # The gateway is optional, so a skip is easy to miss mid-log: restate it here.
+  'Gateway':    _gw_otp_bin != '' ? _gw_otp_desc : 'SKIPPED (' + _gw_skip_reason.split('\n')[0] + ')',
 }, section: 'Components')
 
 summary({

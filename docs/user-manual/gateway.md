@@ -2702,7 +2702,7 @@ env keys with defaults, which a reverted build ignores.
 
 ### Prerequisites
 
-- Erlang/OTP 26 or later
+- Erlang/OTP 28.4 or any later 28.x (OTP 29 is not yet supported; `meson setup` skips the gateway with a warning on any other release)
 - rebar3
 
 ### Build

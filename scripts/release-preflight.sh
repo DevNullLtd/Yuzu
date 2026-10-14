@@ -158,13 +158,13 @@ if [ "$FULL" = "--full" ]; then
     # gateway custom_target inside meson, so it must be on PATH before the C++
     # compile too. ensure-erlang.sh probes kerl, asdf, Homebrew, and the MSYS2
     # installer paths in turn; it always returns 0, so we verify with command -v.
-    # The explicit "28" arg is load-bearing: a sourced script inherits the
+    # The explicit "" arg is load-bearing: a sourced script inherits the
     # caller's positional args, so without it the helper would receive "$1"
-    # from THIS script (e.g. "v0.10.0") and search for a kerl install with
-    # that name. Pass the major version explicitly to track release.yml's
-    # erlef/setup-beam otp-version.
+    # from THIS script (e.g. "v0.10.0") as its version. "" selects the pinned
+    # default (scripts/erlang_toolchain.py DEFAULT_OTP_VERSION, 28.4 or any
+    # later 28.x) - the same floor Meson enforces - not a looser "any 28.x".
     # shellcheck source=ensure-erlang.sh
-    source "$(dirname "$0")/ensure-erlang.sh" 28
+    source "$(dirname "$0")/ensure-erlang.sh" ""
     HAVE_ERL=0
     if command -v erl > /dev/null 2>&1; then
         HAVE_ERL=1
