@@ -102,7 +102,7 @@ was a parked final or an orphan. There is no `session_id` field on this row; if 
 time window rather than a principal, `GET /api/v1/audit` also takes `since`/`until`
 and `offset`. **A response at exactly `limit` rows is not proof you have everything** —
 its `total` describes the rows in the response, not what matched (`start`/`page_size`
-echo `offset`/`limit`); scope further with `&principal=`, or page with `offset`. There, `since`/`until` alone only bounds the time
+echo `offset`/`limit`); scope further with `&principal=`, or page with `offset`. `since`/`until` alone only bounds the time
 window — it does not by itself guarantee you retrieved everything inside that window if
 more rows matched than one call returns. The reliable recipe is both together: freeze a
 bounded window with `since`/`until` first, then page exhaustively through it with `offset`.

@@ -371,8 +371,9 @@ the MCP `query_audit_log` / `audit_engine_no_admin` tools and
 `yuzu://audit/recent` resource.
 
 - **RBAC disabled (the shipped default):** only an `admin`-role session may
-  read the trail (#5771). Any other authenticated session gets `403`, audited as
-  `topology floor: non-admin role denied AuditLog:Read`. Engine principals and
+  read the trail (#5771). Any other authenticated session gets `403`, audited with a `detail` beginning
+  `topology floor: non-admin role denied AuditLog:Read` (match on the prefix: an
+  MCP-tier token's row appends `(mcp_tier=<tier>)`). Engine principals and
   service-scoped tokens are refused as before.
 - **RBAC enabled:** `AuditLog:Read` is an ordinary grant. The seeded
   `Administrator`, `PlatformEngineer`, `Operator`, `ITServiceOwner` and `Viewer`

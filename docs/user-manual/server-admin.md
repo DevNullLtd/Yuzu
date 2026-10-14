@@ -1240,8 +1240,8 @@ legacy silent).
 
 ### vNEXT — the audit trail is admin-only while RBAC is disabled (#5771) (breaking)
 
-**Who this affects.** Deployments running with `[rbac] enabled = false` (the
-shipped default) where a non-admin, authenticated session or API token reads
+**Who this affects.** Deployments with RBAC enforcement off (the
+shipped default; see `GET /api/v1/rbac/enforcement`) where a non-admin, authenticated session or API token reads
 the audit trail — a SIEM export, an evidence-collection script or a
 dashboard user signed in as a plain `user`. RBAC-**enabled** deployments are
 unaffected.
@@ -1252,8 +1252,9 @@ requires the `admin` session role: `GET /api/audit`, `GET /api/v1/audit`,
 `GET /api/v1/audit/auth-sample`,
 `GET /api/v1/engine-principals/audit/no-admin`, the MCP `query_audit_log` and
 `audit_engine_no_admin` tools, and the `yuzu://audit/recent` resource. A
-non-admin gets `403`, audited as `topology floor: non-admin role denied
-AuditLog:Read` and counted in
+non-admin gets `403`, audited with a `detail` beginning `topology floor: non-admin role denied
+AuditLog:Read` (match on the prefix: an MCP-tier token's row appends
+`(mcp_tier=<tier>)`) and counted in
 `yuzu_auth_topology_floor_denied_total{permission="AuditLog:Read"}`. Why: the
 trail is the SOC 2 CC6.1/CC7.2 evidence chain, and the legacy route also
 returns each actor's role and source IP.
