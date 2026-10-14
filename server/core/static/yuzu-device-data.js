@@ -28,8 +28,8 @@
     if (typeof window.showToast === 'function') window.showToast(msg, kind);
   }
 
-  // The lens (tags, properties, schemas) is reloaded as a whole, the same call
-  // hwReloadCi makes after a tag change (htmx's default swap replaces the target's contents).
+  // The lens (tags, properties, schemas) is reloaded as a whole; htmx's default swap
+  // replaces the target's contents.
   function reload(agent) {
     var mount = document.getElementById('guardian-detail');
     if (mount && window.htmx) {

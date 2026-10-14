@@ -526,8 +526,7 @@ const char* const kGuardianDetailPageTemplate =
     //
     // hwSyncNow(btn, source): POST /api/v1/hardware/{id}/sync, then swap the
     // lens body for the 2s poll fragment (await_since = the SERVER's requested_at).
-    // hwTagSet / hwTagDelete: JSON to the EXISTING /api/tags/set and
-    // /api/tags/delete, then reload the whole CI record (header chips + lens).
+    // Tag add / remove on the record are static/yuzu-device-data.js controls.
     // hwFilterResult(el): free-text or regex filter over a result's table rows
     // / pre lines, with a hit counter; an invalid regex marks the box red and
     // filters nothing. hwExportCsv(btn): RFC 4180 CSV of the VISIBLE rows
@@ -535,10 +534,6 @@ const char* const kGuardianDetailPageTemplate =
     // hwCopyResult(btn): visible text to the clipboard.
     R"HTM(
   <script>
-    function hwReloadCi(agent, lens) {
-      var mount = document.getElementById('guardian-detail'); if (!mount || !window.htmx) return;
-      window.htmx.ajax('GET', '/fragments/hardware/ci?id=' + encodeURIComponent(agent) + '&lens=' + encodeURIComponent(lens || 'overview'), { target: '#guardian-detail', swap: 'innerHTML' });
-    }
     function hwSyncNow(btn, source) {
       var agent = btn.getAttribute('data-agent'), lens = btn.getAttribute('data-lens') || 'overview';
       btn.disabled = true;
@@ -565,37 +560,6 @@ const char* const kGuardianDetailPageTemplate =
           '" hx-trigger="load delay:1s" hx-swap="outerHTML"><span class="gp-mute">Sync requested \u2014 waiting for the device to report\u2026 usually a couple of seconds on Linux/Windows, up to ~15s on macOS the first time.</span></div>';
         if (window.htmx) window.htmx.process(lensDiv);
       }).catch(function () { btn.disabled = false; showToast('Sync request failed', 'error'); });
-    }
-    function hwPostJson(url, body, ok) {
-      return fetch(url, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-        .then(function (r) { return r.text().then(function (t) { return { status: r.status, text: t }; }); })
-        .then(function (resp) {
-          if (resp.status >= 400) {
-            var msg = 'Request failed (' + resp.status + ')';
-            try { var j = JSON.parse(resp.text); msg = (j.error && j.error.message) || j.error || msg; } catch (e) { if (resp.text && resp.text.length < 200) msg = resp.text; }
-            showToast(msg, 'error'); return;
-          }
-          ok();
-        }).catch(function () { showToast('Network error', 'error'); });
-    }
-    function hwTagSet(btn) {
-      var form = btn.closest('form'); if (!form) return;
-      var agent = form.getAttribute('data-agent');
-      var key = (form.querySelector('input[name="key"]').value || '').trim();
-      var value = (form.querySelector('input[name="value"]').value || '').trim();
-      if (!key) { showToast('Tag key is required', 'error'); return; }
-      if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) { showToast('Tag key: letters, digits, _ . : - (max 64)', 'error'); return; }
-      btn.disabled = true;
-      hwPostJson('/api/tags/set', { agent_id: agent, key: key, value: value }, function () {
-        showToast('Tag ' + key + ' set', 'success'); hwReloadCi(agent, 'tags');
-      }).then(function () { btn.disabled = false; });
-    }
-    function hwTagDelete(a) {
-      var agent = a.getAttribute('data-agent'), key = a.getAttribute('data-key');
-      if (!window.confirm('Remove tag ' + key + '?')) return;
-      hwPostJson('/api/tags/delete', { agent_id: agent, key: key }, function () {
-        showToast('Tag ' + key + ' removed', 'success'); hwReloadCi(agent, 'tags');
-      });
     }
     function hwFilterResult(el) {
       var tool = el.closest('.hw-rtool'); if (!tool) return;
@@ -667,7 +631,7 @@ const char* const kGuardianDetailPageTemplate =
     // re-render so a selection made on page 1 is still reflected if the operator
     // re-sorts without clearing it.
     //
-    // hwBulkTag(btn, mode): validates the key with the SAME regex hwTagSet uses,
+    // hwBulkTag(btn, mode): validates the key with the SAME regex the Add tag dialog uses,
     // then fans the selection out over the EXISTING single-agent /api/tags/set or
     // /api/tags/delete (never a new bulk route — each call still runs its own
     // per-target scoped Tag:Write gate + tag.set/.delete audit row, so a bulk
