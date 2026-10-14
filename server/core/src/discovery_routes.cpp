@@ -2,6 +2,7 @@
 
 #include "enrollment_directory_model.hpp" // #4031: shared row builders, REST/MCP parity (Rule 1)
 #include "http_route_sink.hpp"
+#include "integrations_sync_model.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -86,6 +87,9 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                      if (ec.tenant_id.empty() || ec.client_id.empty() ||
                          ec.client_secret.empty()) {
+                         if (auto session = auth_fn(req, res))
+                             audit_fn(req, "directory.sync", "failure", "Directory", "entra",
+                                      "missing_credentials");
                          res.status = 400;
                          res.set_content(
                              R"({"error":"tenant_id, client_id, and client_secret are required"})",
@@ -114,6 +118,12 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                                           std::string(yuzu::server::kEntraSyncAlreadyInProgress));
                              return;
                          }
+                         // Fixed detail: the upstream error text can carry
+                         // tenant and client identifiers and is already in the
+                         // status row's last_error.
+                         if (auto s500 = auth_fn(req, res))
+                             audit_fn(req, "directory.sync", "failure", "Directory", "entra",
+                                      "sync_failed");
                          res.status = 500;
                          res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                          "application/json");
@@ -262,6 +272,7 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 }
 
                 int count = 0;
+                std::vector<integrations::MappingChange> applied;
                 for (const auto& m : body["mappings"]) {
                     auto group_id = m.value("group_id", "");
                     auto role_name = m.value("role_name", "");
@@ -272,6 +283,7 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                         directory_sync->remove_group_role_mapping(group_id);
                     else
                         directory_sync->configure_group_role_mapping(group_id, role_name);
+                    applied.push_back({group_id, role_name});
                     ++count;
                 }
 
@@ -279,7 +291,7 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 if (session)
                     audit_fn(req, "directory.group_mapping.update", "success",
                              "Directory", "group-mappings",
-                             std::to_string(count) + " mappings updated");
+                             integrations::mapping_audit_detail(applied));
 
                 auto mappings = directory_sync->get_group_role_mappings();
                 nlohmann::json mappings_arr = nlohmann::json::array();

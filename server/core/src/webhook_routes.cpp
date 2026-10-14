@@ -1,5 +1,7 @@
 #include "webhook_routes.hpp"
 
+#include "outbound_url_policy.hpp"
+
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
 
 #include <nlohmann/json.hpp>
@@ -117,6 +119,8 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                      return;
                  }
                  const auto id = *result;
+                 // The analytics event carries scheme+host only: a Slack-style
+                 // URL path is a bearer secret and the stream can leave the host.
                  // gov Gate 2 security-guardian / Gate 4 consistency-auditor
                  // (PR #3563 full-PR review): record the URL in the audit
                  // detail, not just the id — a compromise-and-cleanup
@@ -127,7 +131,7 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  audit_fn(req, "webhook.create", "success", "webhook", std::to_string(id), url);
                  if (emit_event_fn)
                      emit_event_fn("webhook.created", req, {},
-                                   {{"webhook_id", id}, {"url", url}});
+                                   {{"webhook_id", id}, {"url", url_scheme_host(url)}});
                  res.set_content(
                      nlohmann::json({{"id", id}, {"status", "created"}}).dump(),
                      "application/json");

@@ -1,5 +1,7 @@
 #include "offload_target_store.hpp"
 
+#include "outbound_url_policy.hpp"
+
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -370,7 +372,7 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
         return std::unexpected(OffloadWriteError::invalid_input);
     }
     if (!url.starts_with("http://") && !url.starts_with("https://")) {
-        spdlog::warn("OffloadTargetStore: rejected target with invalid URL scheme: {}", url);
+        spdlog::warn("OffloadTargetStore: rejected target with invalid URL scheme");
         return std::unexpected(OffloadWriteError::invalid_input);
     }
     if (batch_size < 1) {
@@ -411,6 +413,11 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
         spdlog::warn(
             "OffloadTargetStore: rejected target with control bytes in url (target name: {})",
             name);
+        return std::unexpected(OffloadWriteError::invalid_input);
+    }
+    if (url_has_userinfo(url)) {
+        spdlog::warn("OffloadTargetStore: rejected target with userinfo in url (target name: {})",
+                     name);
         return std::unexpected(OffloadWriteError::invalid_input);
     }
     if (has_control_byte(event_types)) {
@@ -637,12 +644,17 @@ std::expected<bool, OffloadWriteError> OffloadTargetStore::delete_target(int64_t
 
 std::vector<OffloadDelivery> OffloadTargetStore::get_deliveries(int64_t target_id,
                                                                 int limit) const {
+    return get_deliveries_checked(target_id, limit).value_or(std::vector<OffloadDelivery>{});
+}
+
+std::optional<std::vector<OffloadDelivery>>
+OffloadTargetStore::get_deliveries_checked(int64_t target_id, int limit) const {
     std::vector<OffloadDelivery> results;
     if (!open_)
-        return results;
+        return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return results;
+        return std::nullopt;
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -653,7 +665,7 @@ std::vector<OffloadDelivery> OffloadTargetStore::get_deliveries(int64_t target_i
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("OffloadTargetStore::get_deliveries: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return results;
+        return std::nullopt;
     }
 
     const int rows = PQntuples(res.get());

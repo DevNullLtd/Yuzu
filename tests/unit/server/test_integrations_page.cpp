@@ -84,8 +84,9 @@ TEST_CASE("integrations page: structure, loaders at the existing ids, CSP-safe m
     CHECK(count_of(html, "<h1>") == 1);
     CHECK(count_of(html, "fetch('/api/me')") == 1);
 
-    // Two panels, at the ids and URLs the monolith and the ledger already use.
-    CHECK(count_of(html, "hx-get=\"/fragments/settings/") == 2);
+    // Five panels: MCP and Gateway at the ids the monolith and the ledger already use,
+    // plus the three sync panels (webhooks, offload targets, directory sync).
+    CHECK(count_of(html, "hx-get=\"/fragments/settings/") == 5);
     CHECK_THAT(html, ContainsSubstring("id=\"mcp-section\""));
     CHECK_THAT(html, ContainsSubstring("hx-get=\"/fragments/settings/mcp\""));
     CHECK_THAT(html, ContainsSubstring("id=\"gateway-section\""));
@@ -98,13 +99,19 @@ TEST_CASE("integrations page: structure, loaders at the existing ids, CSP-safe m
                                        "<b>Integrations</b>"));
 
     // The page names only what it hosts; nothing is promised that is not on it.
-    CHECK_THAT(html, ContainsSubstring("The MCP endpoint and the gateway."));
-    for (const char* absent : {"SIEM", "Syslog", "Healthy", "Gateway nodes", "Webhook", "Offload"})
+    CHECK_THAT(html, ContainsSubstring(
+                         "Directory sync, webhooks, offload targets, the MCP endpoint and the gateway."));
+    for (const char* absent : {"SIEM", "Syslog", "Healthy", "Gateway nodes"})
         CHECK_THAT(html, !ContainsSubstring(absent));
 
     // Toast host and the script tag.
     CHECK_THAT(html, ContainsSubstring("id=\"toast-container\""));
     CHECK_THAT(html, ContainsSubstring("<script src=\"/static/yuzu-integrations.js\" defer></script>"));
+    // Per-panel refresh events for the sync panels, then their controller.
+    CHECK_THAT(html, ContainsSubstring("refreshWebhooks from:body"));
+    CHECK_THAT(html, ContainsSubstring("refreshOffload from:body"));
+    CHECK_THAT(html, ContainsSubstring("refreshDirectory from:body"));
+    CHECK_THAT(html, ContainsSubstring("<script src=\"/static/yuzu-integrations-sync.js\" defer></script>"));
     // No inline script at all on this page: the script is the static file.
     CHECK(count_of(html, "<script>") == 1); // the shell's own identity/online script only
 

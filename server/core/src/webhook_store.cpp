@@ -1,5 +1,7 @@
 #include "webhook_store.hpp"
 
+#include "outbound_url_policy.hpp"
+
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -312,7 +314,14 @@ WebhookStore::create_webhook(const std::string& url, const std::string& event_ty
                              const std::string& secret, bool enabled) {
     // Validate URL scheme — only http:// and https:// are allowed.
     if (!url.starts_with("http://") && !url.starts_with("https://")) {
-        spdlog::warn("WebhookStore: rejected webhook with invalid URL scheme: {}", url);
+        spdlog::warn("WebhookStore: rejected webhook with invalid URL scheme");
+        return std::unexpected(WebhookWriteError::invalid_url);
+    }
+    // URL and event types reach the audit detail and the analytics stream
+    // verbatim: refuse embedded userinfo (a bearer secret) and control bytes
+    // (audit-row line splitting). The URL is never logged on this path.
+    if (url_has_userinfo(url) || url_has_control_bytes(url) || url_has_control_bytes(event_types)) {
+        spdlog::warn("WebhookStore: rejected webhook with userinfo or control bytes in url/event_types");
         return std::unexpected(WebhookWriteError::invalid_url);
     }
     if (!open_)
@@ -477,9 +486,14 @@ std::expected<bool, WebhookWriteError> WebhookStore::delete_webhook(int64_t id) 
 }
 
 std::vector<WebhookDelivery> WebhookStore::get_deliveries(int64_t webhook_id, int limit) const {
+    return get_deliveries_checked(webhook_id, limit).value_or(std::vector<WebhookDelivery>{});
+}
+
+std::optional<std::vector<WebhookDelivery>>
+WebhookStore::get_deliveries_checked(int64_t webhook_id, int limit) const {
     std::vector<WebhookDelivery> results;
     if (!open_)
-        return results;
+        return std::nullopt;
     if (limit <= 0)
         limit = 50;
     limit = std::min(limit, kListRowCap);
@@ -488,7 +502,7 @@ std::vector<WebhookDelivery> WebhookStore::get_deliveries(int64_t webhook_id, in
     if (!lease) {
         spdlog::debug("WebhookStore::get_deliveries: no connection in time ({})",
                       pool_.last_error());
-        return results;
+        return std::nullopt;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -498,7 +512,7 @@ std::vector<WebhookDelivery> WebhookStore::get_deliveries(int64_t webhook_id, in
         std::vector<std::string>{std::to_string(webhook_id), std::to_string(limit)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("WebhookStore::get_deliveries: query failed: {}", PQerrorMessage(lease.get()));
-        return results;
+        return std::nullopt;
     }
 
     const int rows = PQntuples(res.get());

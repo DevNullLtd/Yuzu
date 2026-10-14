@@ -997,11 +997,17 @@ std::expected<void, std::string> DirectorySync::sync_ldap(const LdapConfig& /*co
 
 std::vector<DirectoryUser> DirectorySync::get_synced_users(
     const std::string& group_filter) const {
+    return get_synced_users_checked(group_filter)
+        .value_or(std::vector<DirectoryUser>{});
+}
+
+std::expected<std::vector<DirectoryUser>, DirectoryReadError>
+DirectorySync::get_synced_users_checked(const std::string& group_filter) const {
     if (!open_)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
     PGconn* conn = lease.get();
 
     pg::PgResult res;
@@ -1021,7 +1027,7 @@ std::vector<DirectoryUser> DirectorySync::get_synced_users(
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("DirectorySync::get_synced_users: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return {};
+        return std::unexpected(DirectoryReadError::query_failed);
     }
 
     const int rows = PQntuples(res.get());
@@ -1102,11 +1108,16 @@ std::optional<DirectoryUser> DirectorySync::get_user(const std::string& id) cons
 }
 
 std::vector<DirectoryGroup> DirectorySync::get_synced_groups() const {
+    return get_synced_groups_checked().value_or(std::vector<DirectoryGroup>{});
+}
+
+std::expected<std::vector<DirectoryGroup>, DirectoryReadError>
+DirectorySync::get_synced_groups_checked() const {
     if (!open_)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return {};
+        return std::unexpected(DirectoryReadError::store_unavailable);
 
     // mapped_role is resolved via LEFT JOIN, not a column on directory_groups
     // — see store_group's comment for why a denormalized copy raced
@@ -1122,7 +1133,7 @@ std::vector<DirectoryGroup> DirectorySync::get_synced_groups() const {
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("DirectorySync::get_synced_groups: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return {};
+        return std::unexpected(DirectoryReadError::query_failed);
     }
 
     const int rows = PQntuples(res.get());
@@ -1133,15 +1144,42 @@ std::vector<DirectoryGroup> DirectorySync::get_synced_groups() const {
     return result;
 }
 
+std::expected<std::int64_t, DirectoryReadError> DirectorySync::get_synced_user_count_checked() const {
+    if (!open_)
+        return std::unexpected(DirectoryReadError::store_unavailable);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(DirectoryReadError::store_unavailable);
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT count(*) FROM directory_sync.directory_users",
+                                       std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+        spdlog::error("DirectorySync::get_synced_user_count_checked: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(DirectoryReadError::query_failed);
+    }
+    return to_i64(col(res.get(), 0, 0));
+}
+
 SyncStatus DirectorySync::get_status() const {
+    SyncStatus fallback;
+    fallback.provider = "entra";
+    fallback.status = "idle";
+    return get_status_checked().value_or(fallback);
+}
+
+std::expected<SyncStatus, DirectoryReadError> DirectorySync::get_status_checked() const {
+    // No stored row is a legitimate answer ("never synced": provider entra,
+    // status idle, last_sync_at 0). A closed store, a lease timeout and a
+    // failed query are errors, so a caller never renders them as never-synced.
     SyncStatus s;
     s.provider = "entra";
     s.status = "idle";
     if (!open_)
-        return s;
+        return std::unexpected(DirectoryReadError::store_unavailable);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return s;
+        return std::unexpected(DirectoryReadError::store_unavailable);
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -1151,7 +1189,7 @@ SyncStatus DirectorySync::get_status() const {
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("DirectorySync::get_status: query failed: {}",
                       PQresultErrorMessage(res.get()));
-        return s;
+        return std::unexpected(DirectoryReadError::query_failed);
     }
     if (PQntuples(res.get()) > 0) {
         s.provider = col_str(res.get(), 0, 0);

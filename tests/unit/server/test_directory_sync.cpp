@@ -390,6 +390,40 @@ TEST_CASE("DirectorySync[pg]: update_status is reflected by get_status", "[direc
     CHECK(failed.last_error == "graph unreachable");
 }
 
+TEST_CASE("DirectorySync[pg]: checked reads succeed on an open store, never-synced is a value",
+          "[directory_sync][pg]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    // No status row yet: a legitimate answer, not an error.
+    auto never = store->get_status_checked();
+    REQUIRE(never.has_value());
+    CHECK(never->status == "idle");
+    CHECK(never->last_sync_at == 0);
+    REQUIRE(store->get_synced_users_checked().has_value());
+    CHECK(store->get_synced_users_checked()->empty());
+    REQUIRE(store->get_synced_user_count_checked().has_value());
+    CHECK(*store->get_synced_user_count_checked() == 0);
+
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", "Alice"));
+    data.users.push_back(make_user("u2", "Bob"));
+    data.groups.push_back(make_group("g1", "Engineering"));
+    data.memberships["g1"] = {"u1"};
+    REQUIRE(acc.apply_entra_sync(data).has_value());
+
+    CHECK(*store->get_synced_user_count_checked() == 2);
+    REQUIRE(store->get_synced_groups_checked().has_value());
+    CHECK(store->get_synced_groups_checked()->size() == 1);
+    CHECK(store->get_synced_users_checked()->size() == 2);
+
+    // A failed sync's status row carries counts of a snapshot that was never
+    // stored; the snapshot count must not follow it.
+    acc.update_status("entra", "failed", 9999, 9999, "graph unreachable");
+    CHECK(store->get_status_checked()->user_count == 9999);
+    CHECK(*store->get_synced_user_count_checked() == 2);
+}
+
 // ── sync_entra / sync_ldap: pure-logic branches (no HTTP reached) ──────────
 
 TEST_CASE("DirectorySync[pg]: sync_entra rejects an incomplete Entra config",
@@ -680,6 +714,13 @@ TEST_CASE("DirectorySync[pg]: a closed store degrades to empty/default, never cr
     CHECK(status.provider == "entra");
     CHECK(status.status == "idle");
     CHECK(store.get_group_role_mappings().empty());
+
+    // The checked reads report the failure instead of the default value, so a
+    // page can tell "could not read" from "never synced" / "no users".
+    CHECK(store.get_status_checked().error() == DirectoryReadError::store_unavailable);
+    CHECK(store.get_synced_users_checked().error() == DirectoryReadError::store_unavailable);
+    CHECK(store.get_synced_groups_checked().error() == DirectoryReadError::store_unavailable);
+    CHECK(store.get_synced_user_count_checked().error() == DirectoryReadError::store_unavailable);
 
     // Void mutators must not crash on a closed store.
     store.configure_group_role_mapping("g1", "Operator");

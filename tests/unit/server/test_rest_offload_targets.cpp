@@ -135,7 +135,28 @@ TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload][pg
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "offload_target.create");
     CHECK(h.audit_log[0].result == "success");
-    CHECK(h.audit_log[0].detail == "siem-primary");
+    // The create row records where data goes (same shape as the delete row),
+    // so a create-then-delete cannot erase the only record of the destination.
+    CHECK(h.audit_log[0].detail == "name=siem-primary url=https://siem.example.com/ingest");
+}
+
+TEST_CASE("REST offload-targets: rejects userinfo in the URL, audited, nothing stored",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    nlohmann::json body = {{"name", "creds-in-url"},
+                           {"url", "https://user:hunter2@x.example.com/h"},
+                           {"auth_type", "none"}};
+    auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail == "validation_failed");
+    // The refused password never reaches the audit row.
+    CHECK(h.audit_log[0].detail.find("hunter2") == std::string::npos);
+    auto list = h.sink.Get("/api/v1/offload-targets");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["offload_targets"].empty());
 }
 
 TEST_CASE("REST offload-targets: list redacts auth_credential", "[rest][offload][pg][security]") {
