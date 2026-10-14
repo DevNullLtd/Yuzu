@@ -35,6 +35,7 @@ extern const char* const kComplianceHtml;
 extern const char* const kGuardianHtml;
 extern const char* const kGuardianDetailPageHtml;
 extern const char* const kSettingsHtml;
+extern const char* const kSettingsGeneralHtml;
 
 using Catch::Matchers::ContainsSubstring;
 using namespace yuzu::server::shell;
@@ -381,6 +382,8 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"guardian detail (shared shell default)", kGuardianDetailPageHtml, {"/guardian"}},
         {"tar", kTarPageHtml, {"/tar"}},
         {"settings", kSettingsHtml, {"/settings"}},
+        // A sub-item: its own link is the current page and the parent is lit as the family.
+        {"settings general", kSettingsGeneralHtml, {"/settings", "/settings/general"}},
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},

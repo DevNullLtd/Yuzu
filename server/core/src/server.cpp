@@ -164,6 +164,7 @@
 #include "tag_routes.hpp" // #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
 #include "data_inventory_routes.hpp" // #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
 #include "config_routes.hpp" // #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
+#include "settings_general_routes.hpp" // System "General and appearance" page + two UI fragments
 #include "diagnostics_routes.hpp" // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
 #include "legacy_events_routes.hpp" // #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
 #include "instruction_fragment_routes.hpp" // #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
@@ -15678,6 +15679,58 @@ private:
                              .auto_approve = &auto_approve_,
                              .runtime_config_store = runtime_config_store_.get(),
                          });
+
+        // System "General and appearance" page and its two UI-only fragments
+        // (settings_general_routes.*). All three are admin-gated (`require_admin`, the same
+        // gate `/settings` uses); the runtime form writes through the PUT above and nothing
+        // here adds a REST route or an MCP tool. The analytics store is held weakly and
+        // locked per call, like every other consumer of it (it is reset on shutdown).
+        yuzu::server::settings_general::register_settings_general_routes(
+            inline_sink,
+            yuzu::server::settings_general::Deps{
+                .admin_fn =
+                    [this](const httplib::Request& req, httplib::Response& res) {
+                        return require_admin(req, res);
+                    },
+                .runtime_fn =
+                    [this]() {
+                        yuzu::server::settings_general::RuntimeView v;
+                        v.heartbeat_seconds =
+                            static_cast<std::int64_t>(cfg_.session_timeout.count());
+                        const auto level =
+                            spdlog::level::to_string_view(spdlog::default_logger()->level());
+                        v.log_level.assign(level.data(), level.size());
+                        v.store_available =
+                            runtime_config_store_ && runtime_config_store_->is_open();
+                        return v;
+                    },
+                .events_fn =
+                    [this, weak_store = std::weak_ptr<AnalyticsEventStore>(analytics_store_)]() {
+                        yuzu::server::settings_general::EventsView v;
+                        v.collection_enabled = cfg_.analytics_enabled;
+                        v.sink_configured =
+                            !cfg_.clickhouse_url.empty() || !cfg_.analytics_jsonl_path.empty();
+                        if (auto store = weak_store.lock()) {
+                            v.store_present = true;
+                            v.store_open = store->is_open();
+                            v.emitted_by_this_server = store->total_emitted();
+                            if (v.store_open) {
+                                v.pending = store->pending_count();
+                                if (auto events = store->query_recent(
+                                        yuzu::server::settings_general::kRecentEventsLimit)) {
+                                    std::vector<yuzu::server::settings_general::EventRow> rows;
+                                    rows.reserve(events->size());
+                                    for (const auto& e : *events)
+                                        rows.push_back({e.event_type, e.source,
+                                                        severity_to_string(e.severity),
+                                                        e.event_time});
+                                    v.recent = std::move(rows);
+                                }
+                            }
+                        }
+                        return v;
+                    },
+            });
 
         // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API.
         // `forward_legacy_command_fn` wraps the ServerImpl-private
