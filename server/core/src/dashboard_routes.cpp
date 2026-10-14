@@ -2,6 +2,8 @@
 
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
+#include "scope_attribute_guard.hpp" // E-1: unknown-attribute refusal for expression sends
+#include "mcp_input_bounds.hpp"    // kExecInstrScopeMaxLen
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
 #include "tar_tree_routes.hpp" // TarRetentionPausedScan/TarPausedSourceRow/tar_retention_paused_json (#4027)
@@ -757,6 +759,69 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
+                 // E-1 (operate-extras 6.2): an OPTIONAL `scope_expression` targets the send
+                 // at a scope expression. Decoded param first, raw body second, for the same
+                 // percent-encoded-field-name reason as `scope` above. Absent = no change.
+                 std::string target_expression;
+                 const bool expression_supplied =
+                     req.has_param("scope_expression") ||
+                     form_value_supplied(req.body, "scope_expression");
+                 if (expression_supplied) {
+                     target_expression = req.get_param_value("scope_expression");
+                     if (target_expression.empty())
+                         target_expression = extract_form_value(req.body, "scope_expression");
+                     // A refusal is a 400 (htmx surfaces it through htmx:responseError) that
+                     // names its reason and writes one denied audit row. Nothing dispatches.
+                     auto refuse_expression = [&](const char* reason, const std::string& text) {
+                         audit_fn_(req, "command.dispatch", "denied", "command", "",
+                                   std::string("reason=") + reason);
+                         res.status = 400;
+                         res.set_content(
+                             "<span id=\"result-context\" hx-swap-oob=\"true\""
+                             " class=\"result-context is-error\" data-reason=\"" +
+                                 std::string(reason) + "\">" + html_escape(text) + "</span>",
+                             "text/html; charset=utf-8");
+                     };
+                     if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
+                         // Never pick one silently. The Console's hidden scope=__all__ is why
+                         // the page disables and omits it when the expression is chosen (S8).
+                         refuse_expression("target_conflict",
+                                           "Choose either a picked target or a scope "
+                                           "expression, not both.");
+                         return;
+                     }
+                     if (target_expression.empty()) {
+                         // CDX-R8-01 class: a supplied-but-empty value is never the fleet.
+                         refuse_expression("scope_expression_empty",
+                                           "The scope expression is empty. Nothing was sent.");
+                         return;
+                     }
+                     if (target_expression.size() > yuzu::server::mcp::kExecInstrScopeMaxLen) {
+                         refuse_expression("scope_expression_too_long",
+                                           "The scope expression is too long. Nothing was sent.");
+                         return;
+                     }
+                     auto parsed = yuzu::scope::parse(target_expression);
+                     if (!parsed) {
+                         refuse_expression("scope_expression_invalid",
+                                           "The scope expression is not valid, so nothing was "
+                                           "sent: " + parsed.error());
+                         return;
+                     }
+                     // G1/S4: the resolver answers "" for an unknown attribute and `!=`/NOT
+                     // invert that into "everyone", so a typo would fan out fleet-wide.
+                     std::vector<std::string> kinds;
+                     for (const auto& k : yuzu::server::detail::scope_kind_catalog())
+                         kinds.push_back(k.kind);
+                     if (auto bad = yuzu::server::first_unknown_scope_attribute(*parsed, kinds)) {
+                         refuse_expression("scope_unknown_attribute",
+                                           "Unknown attribute '" + *bad +
+                                               "'. Nothing was sent. Check the spelling "
+                                               "against Scope kinds.");
+                         return;
+                     }
+                 }
+
                  // Parse CLI-style key=value parameters from instruction text
                  auto [command_text, inline_params] = parse_instruction_params(instruction);
 
@@ -890,7 +955,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // the fleet is reached by NAME, never inferred from emptiness.
                  std::vector<std::string> agent_ids;
                  std::string scope_expr;
-                 if (!scope.empty() && scope.starts_with("group:")) {
+                 if (expression_supplied) {
+                     scope_expr = target_expression;
+                 } else if (!scope.empty() && scope.starts_with("group:")) {
                      scope_expr = scope;
                  } else if (!scope.empty() && scope != yuzu::server::kBroadcastScope) {
                      agent_ids.push_back(scope);
@@ -1269,6 +1336,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      plugin + ":" + action + " -> " + std::to_string(sent) + " agent(s)";
                  if (!def_id.empty())
                      detail += " definition_id=" + def_id;
+                 if (expression_supplied)
+                     detail += " scope_expression=" + onbehalf::sanitize_for_log(target_expression, 256);
                  audit_fn_(req, "command.dispatch", "success", "command", command_id, detail);
 
                  res.set_content(html, "text/html; charset=utf-8");

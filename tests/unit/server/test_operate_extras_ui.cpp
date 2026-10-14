@@ -111,7 +111,7 @@ TEST_CASE("operate extras: the scope helper uses the real routes and bounds its 
     // exist: the field is never read.
     CHECK_FALSE(has(js, "warning"));
     // Validate is syntax only.
-    CHECK(has(js, "This does not check that the attributes exist."));
+    CHECK(has(js, "Unknown attributes are refused on Send."));
 }
 
 TEST_CASE("operate extras: fan-out confirm, history masking and the 403 listener are wired",
@@ -129,4 +129,21 @@ TEST_CASE("operate extras: fan-out confirm, history masking and the 403 listener
     CHECK(has(js, "updated_at or created_by"));
     // The SQL is shown before it is sent.
     CHECK(has(js, "'Run this query?'"));
+}
+
+TEST_CASE("operate extras: an expression send omits scope-input and needs a preview or a retype",
+          "[ui][operate_extras][security]") {
+    const auto& js = yuzu::server::kYuzuOperateExtrasJs;
+    // S8: choosing the expression disables scope-input and enables scope_expression.
+    CHECK(has(js, "scopeField.disabled = !!e"));
+    CHECK(has(js, "exprField.disabled = !e"));
+    const std::string page = kDashboardIndexHtml;
+    CHECK(has(page.c_str(), "name=\"scope_expression\" id=\"ox-scope-expression\" value=\"\" disabled"));
+    // Rule 8: reaches the send only through a same-expression preview or a typed retype.
+    CHECK(has(js, "previewed.expression === expr"));
+    CHECK(has(js, "Retype the expression to confirm."));
+    CHECK(has(js, "v.typed.trim() === expr"));
+    // The route's 400 reason is shown, read as text.
+    CHECK(has(js, "DOMParser"));
+    CHECK(has(js, "[data-reason]"));
 }

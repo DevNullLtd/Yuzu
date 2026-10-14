@@ -125,10 +125,25 @@
       return t;
     }
 
+    /* E-1: a non-empty expression IS the Send target. Choosing it disables and omits
+       scope-input (the route answers 400 target_conflict when both arrive, S8) and
+       enables the scope_expression field. previewed is the expression whose Preview
+       succeeded in this page state, with its match count (rule 8). */
+    var exprField = $('ox-scope-expression');
+    var scopeField = $('scope-input');
+    var previewed = null;
+    function exprValue() { return exprIn ? exprIn.value.trim() : ''; }
+    function syncTarget() {
+      var e = exprValue();
+      if (exprField) { exprField.value = e; exprField.disabled = !e; }
+      if (scopeField) scopeField.disabled = !!e;
+      if (previewed && previewed.expression !== e) previewed = null;
+    }
     function syncButtons() {
-      var empty = !exprIn || !exprIn.value.trim();
+      var empty = !exprValue();
       if (btnValidate) btnValidate.disabled = empty;
       if (btnPreview) btnPreview.disabled = empty;
+      syncTarget();
     }
 
     /* ---- Validate: syntax only, never "will match" ---- */
@@ -141,7 +156,7 @@
         syncButtons();
         var d = r.data && r.data.data;
         if (r.status === 200 && d && d.valid === true) {
-          note('ok', 'Syntax is valid. This does not check that the attributes exist.');
+          note('ok', 'Syntax is valid. Unknown attributes are refused on Send.');
         } else if (r.status === 200 && d && d.valid === false) {
           note('bad', String(d.error || 'The expression is not valid.'));
         } else if (r.status === 0) {
@@ -165,6 +180,7 @@
         var d = r.data && r.data.data;
         if (r.status === 200 && d) {
           var n = Number(d.matched_count) || 0;
+          previewed = { expression: expression, count: n };
           if (n === 0) { note('', 'No devices match.'); return; }
           clear(out);
           out.appendChild(el('div', 'ox-note ok', n + (n === 1 ? ' device matches' : ' devices match')));
@@ -247,11 +263,35 @@
       var input = $('instr-input');
       var cmd = input ? input.value.trim() : '';
       if (!cmd || /^help(\s|$)/i.test(cmd)) return;
-      var t = sendTarget();
+      var expr = exprValue();
+      var t = expr ? { scope: '', single: false, label: 'Expression: ' + expr, count: '' } : sendTarget();
       if (t.single) return;
       evt.preventDefault();
       var facts = [['Command', maskSecrets(cmd)], ['Target', t.label]];
-      if (t.count) facts.push(['Reaches', t.count]);
+      if (expr) {
+        /* Rule 8: a Preview of this same expression gives a count; without one the
+           operator retypes the expression, since the count (and a typo) is unseen. */
+        if (previewed && previewed.expression === expr) {
+          facts.push(['Reaches', previewed.count + (previewed.count === 1 ? ' device' : ' devices')]);
+        } else {
+          window.YuzuDialog.form({
+            title: 'Send to an unpreviewed expression?',
+            body: ['This sends the command to every device the expression matches. The match ' +
+                   'count is unknown because the expression was not previewed.',
+                   'Command: ' + maskSecrets(cmd), 'Retype the expression to confirm.'],
+            fields: [{ name: 'typed', label: 'Expression', type: 'text', required: true,
+                       maxlength: 8192 }],
+            submitLabel: 'Send',
+            danger: true,
+            validate: function (v) {
+              return v.typed.trim() === expr ? null : 'That does not match the expression.';
+            }
+          }).then(function (v) { if (v) d.issueRequest(true); }, function () { /* dialog busy */ });
+          return;
+        }
+      } else if (t.count) {
+        facts.push(['Reaches', t.count]);
+      }
       oxConfirm({
         title: 'Send to more than one agent?',
         paragraphs: ['This sends the command to every agent in the target below.'],
@@ -269,7 +309,7 @@
         var input = $('instr-input');
         var cmd = input ? input.value.trim() : '';
         if (!cmd || typeof window.addHistory !== 'function') return;
-        window.addHistory(maskSecrets(cmd), sendTarget().label);
+        window.addHistory(maskSecrets(cmd), exprValue() ? 'Expression: ' + exprValue() : sendTarget().label);
       });
     }
 
@@ -278,12 +318,23 @@
     body.addEventListener('htmx:responseError', function (evt) {
       var d = evt.detail;
       var x = d && d.xhr;
-      if (!x || x.status !== 403) return;
+      if (!x) return;
       var path = (d.pathInfo && d.pathInfo.requestPath) ||
                  (d.requestConfig && d.requestConfig.path) || '';
       if (path.indexOf('/api/dashboard/execute') !== 0 &&
           path.indexOf('/api/dashboard/tar-execute') !== 0) return;
-      setContext('Your role may not run instructions. Ask an administrator for the Execution permission.', true);
+      if (x.status === 403) {
+        setContext('Your role may not run instructions. Ask an administrator for the Execution permission.', true);
+      } else if (x.status === 400 && path.indexOf('/api/dashboard/execute') === 0) {
+        /* The route's refusal reason rides in an OOB span; read its text, never its markup. */
+        var msg = '';
+        try {
+          var span = new DOMParser().parseFromString(x.responseText || '', 'text/html')
+            .querySelector('[data-reason]');
+          msg = span ? span.textContent : '';
+        } catch (e) { msg = ''; }
+        setContext(msg || 'The request was refused. Nothing was sent.', true);
+      }
     });
 
     /* ---- Run on TAR history (D9): form, then a confirm that shows the SQL. ---- */

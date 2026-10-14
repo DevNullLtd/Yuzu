@@ -396,6 +396,7 @@ const char* const kDashboardIndexTemplate =
             <div class="ac-list" id="ac-list"></div>
           </div>
           <input type="hidden" name="scope" id="scope-input" value="__all__">
+          <input type="hidden" name="scope_expression" id="ox-scope-expression" value="" disabled>
           <button type="submit" id="btn-send">Send</button>
           <button type="button" class="btn-clear" onclick="clearResults()">Clear</button>
           <button type="button" id="ox-tar-open" title="Run a read-only SQL query against the TAR warehouse on the selected target">Run on TAR history</button>
@@ -500,7 +501,7 @@ const char* const kDashboardIndexTemplate =
   <!-- ── Scope and history rail ─────────────────────────────── -->
   <div class="rail">
     <div class="ox-panel" id="ox-scope">
-      <h2>Check a scope expression</h2>
+      <h2>Target by scope expression</h2>
       <div class="ox-pad">
         <div class="ox-row">
           <input type="text" id="ox-expr" class="ox-in" spellcheck="false" autocomplete="off"
