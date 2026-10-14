@@ -80,7 +80,7 @@ struct Harness {
 
 } // namespace
 
-// ── Static assets (16) + / (1): no gate, pure constant-serving ───────────
+// ── Static assets + /: no gate, pure constant-serving ───────────
 
 namespace {
 struct AssetExpectation {
@@ -516,14 +516,22 @@ TEST_CASE("page_routes: /viz/host/:id rejects a malformed agent id with 400",
 
 // ── Registration order / shape ────────────────────────────────────────────
 
-TEST_CASE("page_routes: registers exactly 34 routes, with /viz/fleet reachable independently "
+// Routes that are not a kStaticAssets row: "/", the pages, /viz/*, the help API, the fragments.
+// A new static asset is one kStaticAssets row and leaves this alone, so two PRs that each add
+// an asset no longer collide on a hand-kept total. Add or remove any other route and this moves.
+constexpr std::size_t kNonAssetRoutes = 16;
+
+TEST_CASE("page_routes: route count is assets + pages, with /viz/fleet reachable independently "
           "of /viz/host/:id (the documented registration order — /viz/fleet before the "
           "per-host regex — never lets one swallow the other)",
           "[server][routes][page_routes]") {
     Harness h;
     h.wire();
 
-    CHECK(h.sink.route_count() == 34);
+    INFO("kStaticAssets has " << kStaticAssets.size() << " rows, kNonAssetRoutes is "
+                              << kNonAssetRoutes << "; a route was added or removed without "
+                              << "updating one of them");
+    CHECK(h.sink.route_count() == kStaticAssets.size() + kNonAssetRoutes);
 
     auto fleet = h.sink.Get("/viz/fleet");
     REQUIRE(fleet);
