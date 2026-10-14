@@ -81,6 +81,23 @@ Lists devices worst-by-metric (RTT, retransmit, or throughput), or filtered to a
 co-occurrence band or to not-reporting devices, with the co-occurring
 device/app facts flagged inline. Each row links to the device drill-down.
 
+## Discovered hosts
+
+Hosts found by network discovery scans (including hosts with no agent) are
+readable through `GET /api/v1/network/discovered-devices`, the MCP tool
+`list_discovered_devices` and the `/fragments/network/discovered` fragment.
+Permission required: **`Infrastructure:Read`**. Each read is audited as
+`network.discovered.view`, and a service-scoped API token is refused.
+
+- Results are newest last-seen first, at most 500 rows, filterable by exact
+  subnet. The summary counts (hosts and distinct subnets) cover every matching
+  row; `truncated` says when the list was cut.
+- Hostnames and MAC addresses are reported by agents and shown as received
+  (escaped); a failed reverse lookup reads `unknown`.
+- There is no "managed" column: discovery does not yet match found hosts to
+  enrolled agents, so a managed flag would be wrong for enrolled hosts.
+- A store fault is reported as unavailable, never as an empty list.
+
 ## Platform coverage (v1)
 
 This table is the **device-level heartbeat** sampler (the fleet gauges). The

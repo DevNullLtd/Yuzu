@@ -9111,6 +9111,17 @@ The one device list behind every network-quality drill: worst devices by a metri
 - **Response:** `data[]` of `{agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?}`, worst-first by the sort metric (`under_pressure` / `app_unstable` are the co-occurring facts shown inline for correlation, never a verdict; `fleet_pctile` is the device's nearest-rank position, omitted when it did not report the metric). `400` on an invalid `limit`. `403` if a service-scoped API token queries this route (fleet-wide `agent_id` rows, no single agent to confine against — same rationale as `dex/signals/{obs_type}` above).
 - **Audit (behavioral PII):** each row is an `agent_id` + its network perf/correlation facts, individual-identifying, fleet-wide — emits **`network.device.view`** (`target_type=GuaranteedState`, `target_id=` empty) before serving. A denied service-scoped token also emits this verb (`result=denied`). **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no device list.
 
+#### `GET /api/v1/network/discovered-devices`
+
+Hosts found by network discovery scans, including hosts with no agent. The REST/MCP twin of the `/fragments/network/discovered` dashboard fragment; all three call one builder, so they cannot drift. The older unbounded `GET /api/discovery/results` is unchanged.
+
+- **Permission:** `Infrastructure:Read`
+- **Query parameters:** `subnet` (only hosts found on exactly this subnet string, at most 64 bytes); `limit` (1 to 500, default and cap 500).
+- **Response:** `{data[], summary, truncated, meta}`. `data[]` rows are `{id, ip_address, mac_address, hostname, subnet, discovered_by, discovered_at, last_seen}` (epoch seconds), newest last-seen first. `summary` is `{total, subnets}` over every row matching the filter, not just the returned page; `truncated` is `true` when more rows matched than were returned. `hostname` is `unknown` when a reverse lookup failed, and `hostname` and `mac_address` are agent-reported free text.
+- **No `managed` flag:** discovery does not yet match hosts to enrolled agents, so no managed or agent field is returned rather than a value that would read "unmanaged" for an enrolled host.
+- **Errors:** `400` invalid `limit` or `subnet`; `403` a service-scoped API token (denied outright and audited as `result=denied`) or missing permission; `503` the discovery store is unavailable or degraded. A store fault is never rendered as an empty list.
+- **Audit (behavioral PII):** each row names a host fleet-wide, so a served read emits **`network.discovered.view`** (`target_type=Infrastructure`, `target_id=` empty). **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no rows. MCP twin: `list_discovered_devices` (set-and-proceed, reports `audit_persisted: false` instead of refusing).
+
 ---
 
 ### Patch Management

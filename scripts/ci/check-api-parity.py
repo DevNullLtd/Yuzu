@@ -198,7 +198,12 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get_software_versions (both already "twinned", count unchanged). The raw route's
 # format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
-BASELINE_UNTWINNED = 199
+#
+# Network discovery read twin (Estate E-2): the unbounded legacy GET /api/discovery/results
+# row flips "planned:#2146" -> "twinned" (GET /api/v1/network/discovered-devices + MCP
+# list_discovered_devices); the new GET /fragments/network/discovered row is born "twinned"
+# (count unchanged). 199 - 1 = 198, the value the checker itself reported.
+BASELINE_UNTWINNED = 198
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
