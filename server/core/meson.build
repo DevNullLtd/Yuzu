@@ -181,21 +181,6 @@ yuzu_viz_host_js_embed = custom_target(
   ],
 )
 
-# Operate O1: the Executions / Approvals page controller (read-only). Symbol:
-# kYuzuOperateJs (std::string).
-yuzu_operate_js_embed = custom_target(
-  'yuzu_operate_js_bundle',
-  input: 'static/yuzu-operate.js',
-  output: 'yuzu_operate_js_bundle.cpp',
-  command: [
-    find_program('python3', 'python'),
-    files('scripts/embed_js.py'),
-    '@INPUT@',
-    '@OUTPUT@',
-    'YuzuOperateJs',
-  ],
-)
-
 # Shared modal dialog + request helper (window.YuzuDialog). Symbol: kYuzuDialogJs
 # (std::string). First consumer: the Operate action dialogs.
 yuzu_dialog_js_embed = custom_target(
@@ -208,6 +193,21 @@ yuzu_dialog_js_embed = custom_target(
     '@INPUT@',
     '@OUTPUT@',
     'YuzuDialogJs',
+  ],
+)
+
+# Operate O1: the Executions / Approvals page controller (read-only). Symbol:
+# kYuzuOperateJs (std::string).
+yuzu_operate_js_embed = custom_target(
+  'yuzu_operate_js_bundle',
+  input: 'static/yuzu-operate.js',
+  output: 'yuzu_operate_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuOperateJs',
   ],
 )
 

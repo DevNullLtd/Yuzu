@@ -20,9 +20,10 @@
  * call rejects Error('dialog busy')); the one exception is the MFA step-up prompt that
  * request() raises while a dialog's own submit() is in flight. Focus returns to the opener.
  *
- * request() is a same-origin fetch with a 15 s timeout. A 401 carrying
+ * request() is a same-origin fetch with a 15 s timeout: a url that resolves to another
+ * origin is refused without a request. The body is serialised once, so a 401 carrying
  * meta.mfa_step_up_required prompts for the code (POST /login/mfa/stepup) and replays the
- * original request once; any other 401 goes to /login.
+ * original request once with byte-identical content; any other 401 goes to /login.
  */
 (function () {
   'use strict';
@@ -65,21 +66,42 @@
     };
   }
 
-  function rawRequest(method, url, opts) {
+  // Serialise once. The MFA replay re-sends these exact bytes, so a caller mutating
+  // opts while the step-up dialog is open cannot authorise one body and replay another.
+  function prepare(opts) {
     opts = opts || {};
     var headers = {};
     if (opts.headers) Object.keys(opts.headers).forEach(function (k) { headers[k] = opts.headers[k]; });
-    var init = { method: method, credentials: 'same-origin', cache: 'no-store', headers: headers };
+    var body;
     if (opts.json !== undefined) {
       headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(opts.json);
+      body = JSON.stringify(opts.json);
     } else if (opts.form) {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
-      init.body = new URLSearchParams(opts.form).toString();
+      body = new URLSearchParams(opts.form).toString();
     }
+    return { headers: headers, body: body };
+  }
+
+  function send(method, url, prep) {
+    // Resolved against the page, then required to be same-origin, so credentials: 'same-origin'
+    // is not the only thing standing between a caller-supplied url and another host.
+    var target;
+    try {
+      var u = new URL(String(url), location.href);
+      if (u.origin !== location.origin) throw new Error('cross-origin');
+      target = u.href;
+    } catch (e) {
+      return Promise.resolve({ ok: false, status: 0, data: null, auditFailed: false, warning: '',
+                               message: 'Only same-origin requests are allowed.' });
+    }
+    var headers = {};
+    Object.keys(prep.headers).forEach(function (k) { headers[k] = prep.headers[k]; });
+    var init = { method: method, credentials: 'same-origin', cache: 'no-store', headers: headers };
+    if (prep.body !== undefined) init.body = prep.body;
     // Built inside try/catch: an old browser degrades to no timeout, not a throw.
     try { init.signal = AbortSignal.timeout(15000); } catch (e) { /* no timeout available */ }
-    return fetch(url, init).then(function (r) {
+    return fetch(target, init).then(function (r) {
       var ct = r.headers.get('Content-Type') || '';
       var audit = r.headers.get('Sec-Audit-Failed') === 'true';
       var parsed = ct.indexOf('application/json') >= 0 ?
@@ -91,8 +113,13 @@
     });
   }
 
+  function rawRequest(method, url, opts) {
+    return send(method, url, prepare(opts));
+  }
+
   function request(method, url, opts) {
-    return rawRequest(method, url, opts).then(function (res) {
+    var prep = prepare(opts);
+    return send(method, url, prep).then(function (res) {
       if (res.status !== 401) return res;
       var meta = res.data && res.data.meta;
       if (!(meta && meta.mfa_step_up_required === true)) {
@@ -116,7 +143,7 @@
         }
       }).then(function (ok) {
         if (!ok) return res;
-        return rawRequest(method, url, opts);
+        return send(method, url, prep);
       });
     });
   }
