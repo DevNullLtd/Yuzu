@@ -23,8 +23,7 @@
 
 namespace yuzu::server::developer {
 
-inline constexpr std::size_t kRoutesCap = 300;
-inline constexpr std::size_t kPermissionsCap = 300;
+inline constexpr std::size_t kRoutesCap = 300; // also the Permissions row cap
 inline constexpr std::size_t kPluginsCap = 200;
 inline constexpr std::size_t kFilterMaxLen = 128;
 

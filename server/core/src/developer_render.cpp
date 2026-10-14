@@ -209,7 +209,7 @@ std::string render_permissions_table(const json& doc, std::string_view q_raw) {
     if (rows.empty())
         return h + render_state("empty", "No permission matches \"" + clean_filter(q_raw) + "\".");
 
-    const std::size_t shown = std::min(rows.size(), kPermissionsCap);
+    const std::size_t shown = std::min(rows.size(), kRoutesCap);
     h += table_open("Permission", "Used by");
     for (std::size_t i = 0; i < shown; ++i) {
         h += "<tr><td class=\"mono\">" + esc(rows[i].first) + "</td><td>";
