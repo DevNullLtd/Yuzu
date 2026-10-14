@@ -27,6 +27,7 @@ const char* const kGuardianDetailPageTemplate =
   <link rel="stylesheet" href="/static/yuzu.css">
   <meta name="htmx-config" content='{"allowEval":false}'>
   <script src="/static/htmx.js"></script>
+  <script src="/static/yuzu-dialog.js"></script>
   <style>
     .gp-wrap { padding: 22px 28px 36px; }
     :where(.gp-wrap) a { color: var(--primary); }  /* bare links; any class rule wins (zero specificity) */
@@ -754,6 +755,70 @@ const char* const kGuardianDetailPageTemplate =
         body: body, confirmLabel: mode === 'set' ? 'Set tag' : 'Remove tag', danger: mode !== 'set' })
         .then(function (ok) { if (ok) apply(); });
     }
+  </script>
+)HTM"
+    // Guard edit / delete controller. Own literal (MSVC 16 KiB cap); no inline
+    // handlers: one delegated listener on the buttons the guard fragment draws
+    // (data-gp-act). Without window.YuzuDialog the buttons are hidden, not dead.
+    R"HTM(
+  <script>
+    (function () {
+      'use strict';
+      var D = window.YuzuDialog;
+      if (!D) {
+        var st = document.createElement('style');
+        st.textContent = '[data-gp-act]{display:none}';
+        document.head.appendChild(st);
+        return;
+      }
+      function base(b) { return '/fragments/guardian/guard/' + encodeURIComponent(b.getAttribute('data-gp-id')); }
+      function edit(b) {
+        var mode = b.getAttribute('data-gp-mode') || '';
+        D.form({
+          title: 'Edit Guard',
+          body: ['Mode: ' + mode + ' (read-only). A Guard’s mode is fixed at creation; '
+                 + 'create a new Guard for a different posture.'],
+          note: 'Saving bumps the version. Last write wins: there is no check for a concurrent edit.',
+          fields: [
+            { name: 'name', label: 'Name', type: 'text', required: true, maxlength: 128,
+              value: b.getAttribute('data-gp-name') },
+            { name: 'severity', label: 'Severity', type: 'select',
+              value: b.getAttribute('data-gp-severity') || 'medium',
+              options: ['critical', 'high', 'medium', 'low'].map(function (s) { return { value: s, label: s }; }) },
+            { name: 'enabled', label: 'State', type: 'select', value: b.getAttribute('data-gp-enabled'),
+              options: [{ value: '1', label: 'Enabled' }, { value: '0', label: 'Disabled' }] }
+          ],
+          submitLabel: 'Save',
+          submit: function (v) {
+            return D.request('POST', base(b) + '/update',
+                             { form: { name: v.name.trim(), severity: v.severity, enabled: v.enabled } })
+              .then(function (r) { return r.ok ? null : (r.message || ('Save failed (' + r.status + ')')); });
+          }
+        }).then(function (v) { if (v) location.reload(); });
+      }
+      function del(b) {
+        var name = b.getAttribute('data-gp-name');
+        D.form({
+          title: 'Delete Guard',
+          danger: true,
+          body: ['Deletes the Guard and its live compliance state; agents already enforcing it keep enforcing until the next push (#4304).',
+                 'Type the Guard name to confirm: ' + name],
+          fields: [{ name: 'confirm', label: 'Guard name', type: 'text', required: true, maxlength: 128 }],
+          submitLabel: 'Delete Guard',
+          validate: function (v) { return v.confirm === name ? null : 'The name does not match.'; },
+          submit: function (v) {
+            return D.request('POST', base(b) + '/delete', { form: { confirm_name: v.confirm } })
+              .then(function (r) { return r.ok ? null : (r.message || ('Delete failed (' + r.status + ')')); });
+          }
+        }).then(function (v) { if (v) window.location = '/guardian'; });
+      }
+      document.addEventListener('click', function (e) {
+        var b = e.target && e.target.closest ? e.target.closest('[data-gp-act]') : null;
+        if (!b) return;
+        e.preventDefault();
+        if (b.getAttribute('data-gp-act') === 'edit') edit(b); else del(b);
+      });
+    })();
   </script>
 )HTM"
     R"HTM(
