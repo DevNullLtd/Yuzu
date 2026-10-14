@@ -3,7 +3,8 @@
 #include "http_route_sink.hpp"
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
-#include "rest_audit.hpp" // detail::try_persist_audit
+#include "rest_a4_envelope_http.hpp" // detail::a4_error
+#include "rest_audit.hpp" // detail::try_persist_audit, emit_behavioral_audit
 #include "web_utils.hpp"  // html_escape
 
 #include <nlohmann/json.hpp>
@@ -94,12 +95,15 @@ void register_nvd_routes(HttpRouteSink& sink, Deps deps) {
         // A privileged outbound action: the request is recorded BEFORE it is made, and an
         // unrecorded request is refused (ADR-1005, mutations fail closed on audit failure).
         // Nothing has been started yet, so there is nothing to reconcile.
-        if (!detail::try_persist_audit(deps.audit_fn, req, "nvd.sync.request", "success", "NvdSync",
-                                       "nvd", "")) {
+        // emit_behavioral_audit also sets `Sec-Audit-Failed: true`, which is how a client tells
+        // "not recorded, so not started" from any other 503.
+        if (!detail::emit_behavioral_audit(deps.audit_fn, req, res, "nvd.sync.request", "success",
+                                           "NvdSync", "nvd", "")) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"audit unavailable; sync not requested"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "audit unavailable; sync not requested",
+                                             {.retry_after_ms = 5000,
+                                              .remediation = "retry the request"}),
+                            "application/json");
             return;
         }
         // Ask the background loop to sync at its next wake and return at once.

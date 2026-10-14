@@ -353,6 +353,14 @@ TEST_CASE("nvd_routes: an unrecorded sync request is refused and nothing is star
     CHECK(r->status == 503);
     CHECK(r->body.find("sync_started") == std::string::npos);
     CHECK_FALSE(sync.status().syncing);
+    // A4 envelope with an honest retry hint, and the audit-failure header that tells a client
+    // "not recorded, so not started" apart from any other 503.
+    CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    const auto body = nlohmann::json::parse(r->body);
+    CHECK(body["error"]["code"] == 503);
+    CHECK(body["error"]["message"] == "audit unavailable; sync not requested");
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
 }
 
 TEST_CASE("nvd_routes: a denied sync request writes no audit row",
