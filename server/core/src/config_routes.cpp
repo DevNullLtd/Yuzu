@@ -151,14 +151,18 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
 
         // The oidc_* keys decide who becomes an administrator at an SSO login (oidc_admin_group
         // is read from the stored value at the next start). perm_fn admits a JIT-elevated
-        // session, so require the caller's own administrator role, as POST /api/settings/oidc
-        // does. Every other key stays writable under Infrastructure:Write.
-        if (key.starts_with("oidc_") && session->role != auth::Role::admin) {
+        // session and an MCP-tier token, so require the caller's own administrator role from an
+        // interactive session, as POST /api/settings/oidc does (require_admin). Every other key
+        // stays writable under Infrastructure:Write.
+        if (key.starts_with("oidc_") &&
+            (session->role != auth::Role::admin || !session->mcp_tier.empty())) {
             (void)deps.audit_fn(req, "config.update", "denied", "RuntimeConfig", key,
-                                "elevated_session_oidc_setting_blocked");
+                                auth::is_elevated(*session)
+                                    ? "elevated_session_oidc_setting_blocked"
+                                    : "admin_role_required_oidc_setting_blocked");
             res.status = 403;
             res.set_content(
-                R"({"error":{"code":403,"message":"changing sign-in provider settings needs your own administrator role, not a temporary elevation"},"meta":{"api_version":"v1"}})",
+                R"({"error":{"code":403,"message":"changing sign-in provider settings needs your own administrator role"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }

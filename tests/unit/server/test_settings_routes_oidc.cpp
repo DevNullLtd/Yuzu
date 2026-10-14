@@ -353,7 +353,7 @@ TEST_CASE("Settings OIDC: an EXACT placeholder still means unchanged, and report
 // handler therefore requires the caller's OWN role: the harness models an elevated `user` as
 // is_admin=true (gate admits) with session_role=user (own role).
 
-TEST_CASE("Settings OIDC: an elevated-only session is refused, audited, and changes nothing",
+TEST_CASE("Settings OIDC: an elevated-only session is refused and audited; nothing changes",
           "[settings][oidc][elevation]") {
     OidcHarness h{"", /*open_store=*/false};
     h.session_user = "mallory";
@@ -367,6 +367,8 @@ TEST_CASE("Settings OIDC: an elevated-only session is refused, audited, and chan
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+    CHECK(res->body.find("own administrator role") != std::string::npos);
     REQUIRE(h.audited.size() == 1);
     CHECK(h.audited[0] == "oidc.configure|denied||elevated_session_oidc_change_blocked");
     CHECK(h.cfg.oidc_admin_group == "orig-group");

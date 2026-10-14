@@ -75,6 +75,8 @@ struct MockHarness {
     // The session's OWN role. perm_fn admits a JIT-elevated session on its own, so an
     // "elevated" caller is perm_allow=true with session_role=user.
     auth::Role session_role{auth::Role::admin};
+    bool session_elevated{false};  // a real, active JIT elevation on the session
+    std::string session_mcp_tier;  // non-empty models an MCP-tier bearer token
 
     bool perm_allow{true};
     std::vector<std::pair<std::string, std::string>> perm_calls;
@@ -100,6 +102,9 @@ struct MockHarness {
             auth::Session s;
             s.username = auth_username;
             s.role = session_role;
+            s.mcp_tier = session_mcp_tier;
+            if (session_elevated)
+                s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
             return s;
         };
         deps.perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -434,23 +439,32 @@ TEST_CASE("config_routes: PUT a secret key never leaks the raw value into the au
 // start), so those keys need the caller's OWN administrator role; every other key stays
 // writable under Infrastructure:Write.
 
-TEST_CASE("config_routes: an elevated-only session cannot write any oidc_* key, and nothing "
-          "is stored",
+TEST_CASE("config_routes: an elevated-only session cannot write any oidc_* key; "
+          "nothing is stored",
           "[pg][server][routes][config_routes][elevation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
     PgWired w{db.dsn()};
     MockHarness h;
     h.runtime_config_store = &w.store;
     h.session_role = auth::Role::user; // admitted by perm_fn only through the elevation
+    h.session_elevated = true;
     h.wire();
 
-    for (const char* key : {"oidc_issuer", "oidc_client_id", "oidc_client_secret",
-                            "oidc_redirect_uri", "oidc_admin_group", "oidc_skip_tls_verify"}) {
+    // The guard is a prefix match; build the key list from the store's allow-list so a new
+    // oidc_* key is exercised too (and the count pins that the list did not silently shrink).
+    std::vector<std::string> keys;
+    for (const auto& k : RuntimeConfigStore::allowed_keys())
+        if (k.starts_with("oidc_"))
+            keys.push_back(k);
+    REQUIRE(keys.size() == 6);
+
+    for (const auto& key : keys) {
         INFO(key);
         h.audits.clear();
-        auto res = h.sink.Put(std::string("/api/config/") + key, R"({"value":"x"})");
+        auto res = h.sink.Put("/api/config/" + key, R"({"value":"x"})");
         REQUIRE(res);
         CHECK(res->status == 403);
+        CHECK(res->body.find("own administrator role") != std::string::npos);
         REQUIRE(h.audits.size() == 1);
         CHECK(h.audits[0].action == "config.update");
         CHECK(h.audits[0].result == "denied");
@@ -458,6 +472,34 @@ TEST_CASE("config_routes: an elevated-only session cannot write any oidc_* key, 
         CHECK(h.audits[0].detail == "elevated_session_oidc_setting_blocked");
         CHECK(w.store.get_value(key).empty()); // nothing persisted
     }
+}
+
+TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder and an admin-minted "
+          "MCP token are refused for oidc_* keys with a distinct audit detail",
+          "[pg][server][routes][config_routes][elevation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    // A custom/service role holding Infrastructure:Write: perm_fn admits, own role is user.
+    h.session_role = auth::Role::user;
+    auto res = h.sink.Put("/api/config/oidc_admin_group", R"({"value":"g"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].detail == "admin_role_required_oidc_setting_blocked");
+
+    // A supervised MCP token minted by an administrator carries the creator's role (admin);
+    // the settings route refuses it through require_admin, so this route must too.
+    h.audits.clear();
+    h.session_role = auth::Role::admin;
+    h.session_mcp_tier = "supervised";
+    res = h.sink.Put("/api/config/oidc_admin_group", R"({"value":"g"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(w.store.get_value("oidc_admin_group").empty());
 }
 
 TEST_CASE("config_routes: an elevated-only session can still write non-oidc keys; an "
@@ -468,6 +510,7 @@ TEST_CASE("config_routes: an elevated-only session can still write non-oidc keys
     MockHarness h;
     h.runtime_config_store = &w.store;
     h.session_role = auth::Role::user;
+    h.session_elevated = true;
     h.wire();
 
     auto res = h.sink.Put("/api/config/response_retention_days", R"({"value":"120"})");
@@ -480,6 +523,7 @@ TEST_CASE("config_routes: an elevated-only session can still write non-oidc keys
 
     // The caller's own role is admin (a local account, or an IdP-mapped SSO session).
     h.session_role = auth::Role::admin;
+    h.session_elevated = false;
     for (const auto& [key, value] :
          std::vector<std::pair<std::string, std::string>>{{"oidc_issuer", "https://idp.example"},
                                                           {"oidc_client_id", "cid"},
