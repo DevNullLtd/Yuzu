@@ -18,6 +18,7 @@ namespace yuzu::server {
 
 // server/core/src/yuzu_tokens_js_bundle.cpp (embed_js.py, see server/core/meson.build)
 extern const std::string kYuzuTokensJs;
+extern const std::string kYuzuTokensActionsJs;
 
 namespace access_tokens {
 
@@ -35,9 +36,29 @@ bool may_read(const Deps& d, const httplib::Request& req, const char* securable)
 constexpr const char* kHtml = "text/html; charset=utf-8";
 
 void respond_fragment(httplib::Response& res, const std::string& body) {
-    // Principal and token metadata: never cached, never shared.
+    // Principal and token metadata: never cached, never shared, and a cache that ignores
+    // `no-store` still keys on the cookie.
     res.set_header("Cache-Control", "no-store, private");
+    res.set_header("Vary", "Cookie");
     res.set_content(body, kHtml);
+}
+
+// The page's controls follow what the server will allow. RBAC off: the account role decides
+// (`sees_all_owners`), except the one self-service action. RBAC on: one gate probe per permission.
+// The probe is the quiet gate run against a scratch response, so a refusal writes no denial row
+// for a cookie session and never reaches the real response (htmx would drop a 4xx body). It
+// runs once per full render of a panel, never per row and never on a timer.
+bool allowed(const Deps& d, const httplib::Request& req, const char* type, const char* op) {
+    httplib::Response scratch;
+    return d.perm_fn(req, scratch, type, op);
+}
+
+TokenCaps token_caps(const Deps& d, const httplib::Request& req, bool rbac_enforced, bool admin) {
+    if (!rbac_enforced)
+        return {.create = admin, .revoke = admin, .rotate = true};  // rotate: ApiToken:Rotate is self-service
+    return {.create = allowed(d, req, "ApiToken", "Write"),
+            .revoke = allowed(d, req, "ApiToken", "Delete"),
+            .rotate = allowed(d, req, "ApiToken", "Rotate")};
 }
 
 // Engine credentials (the REST lifecycle routes' belt) and MCP-tier bearers never read the
@@ -108,7 +129,9 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                      res.set_content("Session has no username.", "text/plain; charset=utf-8");
                      return;
                  }
-                 const PageFlags flags{deps.now_fn(), all_owners, deps.rbac_enforced_fn()};
+                 const bool rbac = deps.rbac_enforced_fn();
+                 PageFlags flags{deps.now_fn(), all_owners, rbac, session->username, {}};
+                 flags.caps = token_caps(deps, req, rbac, all_owners);
                  auto rows = deps.list_tokens_fn(all_owners ? std::string{} : session->username);
                  if (!rows) {
                      spdlog::warn("/fragments/access/tokens/list: {}", rows.error());
@@ -212,6 +235,11 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                                                          "EnginePrincipal", id, "");
                  respond_fragment(res, render_principal_detail(d, id));
              });
+
+    sink.Get("/static/yuzu-tokens-actions.js", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(kYuzuTokensActionsJs, "application/javascript; charset=utf-8");
+    });
 
     sink.Get("/static/yuzu-tokens.js", [](const httplib::Request&, httplib::Response& res) {
         // The script binds to fragment markup, so a long max-age would skew after an upgrade.

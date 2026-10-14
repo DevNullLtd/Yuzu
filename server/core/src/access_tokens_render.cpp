@@ -98,6 +98,89 @@ std::string tokens_root(const PageFlags& f) {
            "\">";
 }
 
+// One row-action button. Every value rides in an html_escape'd data attribute; the page script
+// reads it back with dataset (never innerHTML) and percent-encodes it for any path.
+struct Attr {
+    const char* name;
+    std::string value;
+};
+
+std::string act(const char* tk, const std::vector<Attr>& attrs, const char* label, bool danger = false,
+                const char* disabled_reason = nullptr) {
+    std::string out = std::string("<button type=\"button\" class=\"btn link") + (danger ? " danger" : "") +
+                      "\" data-tk=\"" + tk + "\"";
+    for (const auto& a : attrs)
+        out += std::string(" ") + a.name + "=\"" + html_escape(a.value) + "\"";
+    if (disabled_reason)
+        out += std::string(" disabled title=\"") + disabled_reason + "\"";
+    return out + ">" + label + "</button>";
+}
+
+std::string primary_btn(const char* tk, const char* label) {
+    return std::string("<button type=\"button\" class=\"btn btn-primary btn-sm\" data-tk=\"") + tk + "\">" +
+           label + "</button>";
+}
+
+// Fixed sentence for a control the caller cannot use. RBAC off: the account role decides;
+// RBAC on: the named permission does.
+std::string need_note(bool rbac_enforced, const char* what, const char* perm) {
+    return std::string("<p class=\"hint\">") + what + " needs " +
+           (rbac_enforced ? std::string("the ") + perm + " permission."
+                          : std::string("the Administrator account role.")) +
+           "</p>";
+}
+
+bool any_action(const TokenCaps& c) { return c.rotate || c.revoke; }
+
+// Rotation grace window: a second rotate by the same operator inside it returns the same
+// successor secret (ApiTokenStore::kRotationGraceSecs). The server stays authoritative.
+constexpr std::int64_t kRotationGraceSecs = 120;
+constexpr std::int64_t kRotateMinRemainingSecs = 24 * 3600;
+
+const ApiToken* find_by_id(const std::vector<ApiToken>& rows, const std::string& id) {
+    for (const auto& r : rows)
+        if (r.token_id == id)
+            return &r;
+    return nullptr;
+}
+
+std::string token_actions(const ApiToken& t, const std::vector<ApiToken>& all, const PageFlags& f) {
+    // A row whose id could not safely sit in a request path gets no controls at all.
+    if (!safe_token_id(t.token_id))
+        return {};
+    const bool mine = !f.caller.empty() && t.principal_id == f.caller;
+    const bool human = t.principal_kind == "human";  // engine credentials: Revoke only
+    const bool expired = t.expires_at > 0 && t.expires_at <= f.now;
+    std::string out;
+    if (f.caps.rotate && mine && human && !t.revoked && !expired) {
+        if (!t.supersedes_token_id.empty()) {
+            // A pending successor: Confirm retires its predecessor.
+            const ApiToken* pred = find_by_id(all, t.supersedes_token_id);
+            out += act("token-confirm",
+                       {{"data-token-id", t.token_id},
+                        {"data-predecessor", pred && !pred->name.empty() ? pred->name : t.supersedes_token_id}},
+                       "Confirm rotation");
+        } else if (t.rotation_group.empty()) {
+            if (t.expires_at == 0 || t.expires_at - f.now > kRotateMinRemainingSecs)
+                out += act("token-rotate", {{"data-token-id", t.token_id}, {"data-name", t.name}}, "Rotate");
+            else
+                out += act("token-rotate", {{"data-token-id", t.token_id}}, "Rotate", false,
+                           "A token within 24 hours of expiry cannot be rotated. Create a new one.");
+        } else if (t.overlap_expires_at > 0) {
+            // The predecessor of a pair: offer Rotate only while the successor is inside the
+            // grace window, which is the one way to get its secret again (never earlier or later).
+            for (const auto& succ : all)
+                if (succ.supersedes_token_id == t.token_id && f.now - succ.created_at < kRotationGraceSecs) {
+                    out += act("token-rotate", {{"data-token-id", t.token_id}, {"data-name", t.name}}, "Rotate");
+                    break;
+                }
+        }
+    }
+    if (f.caps.revoke && !t.revoked && (mine || f.effective_admin))
+        out += act("token-revoke", {{"data-token-id", t.token_id}, {"data-name", t.name}}, "Revoke", true);
+    return out;
+}
+
 const std::string kRetryTokens = "data-tk=\"reload\" data-target=\"tokens-body\"";
 const std::string kRetryPrincipals = "data-tk=\"reload\" data-target=\"principals-body\"";
 
@@ -127,6 +210,15 @@ RevokeDetail revoke_detail_from(std::vector<AuditEvent> newest_first) {
         newest_first.erase(newest_first.begin() + static_cast<std::ptrdiff_t>(window), newest_first.end());
     out.text = committed_revoke_detail(newest_first);
     return out;
+}
+
+bool safe_token_id(std::string_view id) {
+    if (id.empty() || id.size() > 128)
+        return false;
+    const auto alnum = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); };
+    if (!alnum(id.front()))
+        return false;  // also rules out "." and ".."
+    return std::ranges::all_of(id, [&](char c) { return alnum(c) || c == '.' || c == '_' || c == '-'; });
 }
 
 bool valid_principal_id(std::string_view id) {
@@ -160,7 +252,11 @@ std::string render_tokens_list(const std::variant<TokensView, Unavailable>& v, c
 
     out += "<div class=\"hd\"><h2>API tokens</h2><span class=\"sub\">" +
            std::string(view->all_owners ? "All owners" : "Your tokens") + "</span><div class=\"end\">" +
+           (flags.caps.create ? primary_btn("token-new", "New API token") + " " : std::string{}) +
            seg(view->show_all) + "</div></div>";
+    // Say what is missing instead of leaving a silent gap.
+    if (!flags.caps.create)
+        out += "<div class=\"pb\">" + need_note(flags.rbac_enforced, "Creating tokens", "ApiToken:Write") + "</div>";
 
     if (rows.empty()) {
         if (!view->show_all && !view->rows.empty()) {
@@ -169,13 +265,16 @@ std::string render_tokens_list(const std::variant<TokensView, Unavailable>& v, c
                              "data-state=\"all\">Show all</button>");
         } else {
             out += empty_box(view->all_owners ? "No API tokens." : "You have no API tokens.",
-                             "Tokens are created in Settings.");
+                             flags.caps.create ? "Use New API token to create one." : "Tokens are created by an administrator.");
         }
         return out + "</div>";
     }
 
+    const bool actions = any_action(flags.caps);
     out += "<div class=\"tw\"><table><thead><tr><th>Token</th><th>Type</th><th>Owner</th><th>Created</th>"
-           "<th>Expires</th><th>Last used</th><th>Status</th></tr></thead><tbody>";
+           "<th>Expires</th><th>Last used</th><th>Status</th>" +
+           std::string(actions ? "<th><span class=\"sr\">Actions</span></th>" : "") +
+           "</tr></thead><tbody>";
     for (std::size_t i = 0; i < shown; ++i) {
         const ApiToken& t = *rows[i];
         const Status st = token_status(t, flags.now);
@@ -183,7 +282,8 @@ std::string render_tokens_list(const std::variant<TokensView, Unavailable>& v, c
                "</span></td><td>" + type_pill(t) + "</td><td>" + esc(t.principal_id) + "</td><td>" +
                date_cell(t.created_at, "Unknown") + "</td><td>" + date_cell(t.expires_at, "Never") +
                "</td><td>" + date_cell(t.last_used_at, "Never") + "</td><td>" + pill(st.cls, st.text) +
-               "</td></tr>";
+               "</td>" + (actions ? "<td class=\"acts\">" + token_actions(t, view->rows, flags) + "</td>" : std::string{}) +
+               "</tr>";
     }
     out += "</tbody></table></div>" + cap_banner(shown, rows.size(), "tokens");
     return out + "</div>";

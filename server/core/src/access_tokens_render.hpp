@@ -6,7 +6,10 @@
 ///
 /// Rules every renderer follows:
 ///   - every store-sourced string goes through `html_escape`; ids ride in `data-*` attributes
-///     and are percent-encoded by the page script (`encodeURIComponent`), never here;
+///     and are percent-encoded by the page script (`encodeURIComponent`), never here. A row
+///     whose id is outside the charset its route accepts gets NO action control at all;
+///   - a control is rendered only when the caller can use it (`TokenCaps` and friends are
+///     decided by the route, never guessed here); a fixed sentence says what is missing;
 ///   - a read that did not answer is `Unavailable` and renders a fixed sentence. The store's
 ///     own error text is never rendered (#5063);
 ///   - a read that answered with nothing is an honest empty state, never a bare `0`.
@@ -49,12 +52,27 @@ inline constexpr const char* kPrincipalsUnavailable =
     "The principal store did not answer, so the list is unknown. This is not an empty list.";
 inline constexpr const char* kDetailUnavailable = "This principal could not be read.";
 
+/// What the caller can do to API tokens. Decided by the route (RBAC off: the account role;
+/// RBAC on: one gate probe per permission), so a control is never drawn that the server
+/// would refuse. The server stays authoritative either way.
+struct TokenCaps {
+    bool create{false};  ///< ApiToken:Write
+    bool revoke{false};  ///< ApiToken:Delete (and the row is the caller's, or the caller is admin)
+    bool rotate{false};  ///< ApiToken:Rotate (rotate and confirm; owner-only on the server)
+};
+
 /// Facts about the caller that the page script needs without a probe request.
 struct PageFlags {
     std::int64_t now{0};          ///< server epoch seconds (`data-now`)
     bool effective_admin{false};  ///< cookie session holding the admin role (account or JIT)
     bool rbac_enforced{false};
+    std::string caller;           ///< session username; rotate and confirm are owner-only
+    TokenCaps caps;               ///< default: read-only
 };
+
+/// Ids that may reach a request path. Each matches (or is narrower than) the charset of the
+/// route that receives it; anything else renders without action controls.
+[[nodiscard]] bool safe_token_id(std::string_view id);  ///< `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`
 
 /// True only for a cookie session whose effective role is admin. Any bearer (API, MCP,
 /// engine) or service-scoped session gets its own tokens only, as the REST twin does.

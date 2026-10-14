@@ -363,3 +363,81 @@ TEST_CASE("principals authz: a plain API-token bearer is refused by the real gat
     CHECK(r.principal_reads == 0);
     CHECK(r.denied_rows() == 1);
 }
+
+// ---- write controls: what each persona is shown, through the real gates ---------------------
+
+namespace {
+bool has(const std::string& body, const char* needle) { return body.find(needle) != std::string::npos; }
+} // namespace
+
+TEST_CASE("tokens page authz: Administrator with RBAC off is shown every write control",
+          "[pg][access-tokens][authz][writes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    const auto cookie = r.auth_mgr.create_local_session_for_test("root", auth::Role::admin, true);
+
+    auto res = r.get_cookie(kTokens, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-tk=\"token-new\""));
+    CHECK(has(res->body, "data-tk=\"token-revoke\""));
+    CHECK(has(res->body, "data-tk=\"token-rotate\""));
+
+    res = r.get_cookie("/fragments/access/principals/detail?id=engine:bot", cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("tokens page authz: a plain user with RBAC off may rotate their own tokens and nothing else",
+          "[pg][access-tokens][authz][writes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    const auto cookie = r.auth_mgr.create_local_session_for_test("alice", auth::Role::user, true);
+
+    auto res = r.get_cookie(kTokens, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-tk=\"token-rotate\""));
+    CHECK_FALSE(has(res->body, "token-new"));
+    CHECK_FALSE(has(res->body, "token-revoke"));
+    CHECK(has(res->body, "Creating tokens needs the Administrator account role."));
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("tokens page authz: RBAC on, ApiTokenManager is shown the token controls with no denied row",
+          "[pg][access-tokens][authz][writes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.assign_role({"user", "alice", "ApiTokenManager"}).has_value());
+    const auto cookie = r.auth_mgr.create_local_session_for_test("alice", auth::Role::user, true);
+
+    auto res = r.get_cookie(kTokens, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-tk=\"token-new\""));
+    CHECK(has(res->body, "data-tk=\"token-rotate\""));
+    CHECK(has(res->body, "data-tk=\"token-revoke\""));  // own row: owner-or-admin and ApiToken:Delete
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("tokens page authz: RBAC on, Viewer sees the list with no write control and leaves no denial row",
+          "[pg][access-tokens][authz][writes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.assign_role({"user", "bob", "Viewer"}).has_value());
+    const auto cookie = r.auth_mgr.create_local_session_for_test("bob", auth::Role::user, true);
+
+    const auto res = r.get_cookie(kTokens, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);  // the probes ran against a scratch response, not this one
+    CHECK(has(res->body, "bob-ci"));
+    CHECK_FALSE(has(res->body, "token-new"));
+    CHECK_FALSE(has(res->body, "token-rotate"));
+    CHECK_FALSE(has(res->body, "token-revoke"));
+    CHECK(has(res->body, "Creating tokens needs the ApiToken:Write permission."));
+    // The capability probes are quiet for a cookie session: a refused permission leaves no row.
+    CHECK(r.denied_rows() == 0);
+}

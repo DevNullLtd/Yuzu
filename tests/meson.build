@@ -1419,6 +1419,8 @@ if build_server
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+      'unit/server/test_access_tokens_writes_render.cpp', # Tokens and principals page: write controls per caller and row, hostile ids
+      'unit/server/test_access_tokens_actions_js.cpp', # Tokens and principals page: string pins on the write glue and reveal strip
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
