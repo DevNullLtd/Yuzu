@@ -21552,6 +21552,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // as "" (which the SQL treats as every subnet -- a dropped filter).
                 const auto subnet_opt = param_string_strict(args, "subnet");
                 if (!subnet_opt) {
+                    // retry-hint-exempt: input-parse failure, retrying the same call cannot succeed
                     res.set_content(a4_error(kInvalidParams, "invalid subnet"),
                                     "application/json");
                     return;
