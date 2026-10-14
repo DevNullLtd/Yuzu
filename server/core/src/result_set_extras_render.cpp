@@ -2,9 +2,32 @@
 
 #include "web_utils.hpp"
 
+#include <cctype>
+
 namespace yuzu::server {
 
 using yuzu::server::html_escape;
+
+namespace {
+// RFC 3986 unreserved characters pass; everything else is %XX. A device id is operator-supplied
+// text and the cursor is the last id of a page, so html_escape alone leaves `& # + =` and
+// spaces to break the query string it is spliced into.
+std::string url_encode(const std::string& s) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0x0F];
+        }
+    }
+    return out;
+}
+} // namespace
 
 std::string render_result_set_members(const std::string& set_id,
                                       const std::vector<std::string>& device_ids,
@@ -29,7 +52,7 @@ std::string render_result_set_members(const std::string& set_id,
     if (!next_cursor.empty()) {
         // Replaces this whole fragment's trailing control with the next page, so the list grows.
         h += "<button type=\"button\" class=\"rs-btn\" hx-get=\"/fragments/result-sets/" +
-             html_escape(set_id) + "/members?cursor=" + html_escape(next_cursor) +
+             html_escape(set_id) + "/members?cursor=" + html_escape(url_encode(next_cursor)) +
              "\" hx-swap=\"outerHTML\">Show more</button>";
     }
     return h;

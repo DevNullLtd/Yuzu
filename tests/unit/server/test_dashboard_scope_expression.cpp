@@ -387,6 +387,26 @@ TEST_CASE("scope_expression audit: a send that reaches no agent records a failur
     CHECK(failure);
 }
 
+TEST_CASE("scope_expression: a zero-match answer does not claim no agents are connected "
+          "(mutation: revert the expression branch and the message blames connectivity)",
+          "[server][dashboard][execute][scope_expression]") {
+    SECTION("an expression that matches nothing says so") {
+        Harness h;
+        h.sent = 0;
+        auto res = h.post("instruction=version&scope_expression=" + enc(R"(ostype == "windows")"));
+        CHECK(contains(res->body, "The expression matched no connected agent. Nothing was sent."));
+        CHECK_FALSE(contains(res->body, "No agents connected"));
+    }
+    SECTION("a named or broadcast send that reaches nobody still says no agents are connected") {
+        Harness h;
+        h.sent = 0;
+        auto res = h.post("instruction=version&scope=__all__");
+        CHECK(contains(res->body, "No agents connected. Cannot dispatch command."));
+    }
+}
+
+// ── History marker (PR #5846 review): the route answers 200 for refusals too ───────────────
+
 TEST_CASE("dashboard execute: only a dispatched send carries X-Yuzu-Dispatched, the marker the "
           "History list waits for (mutation: set it before the refusals and a refused send is "
           "logged as sent)",

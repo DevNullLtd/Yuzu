@@ -158,13 +158,33 @@ TEST_CASE("result_sets_ui: Re-evaluate needs a supported kind, a verdict, and a 
     CHECK(render_result_set_detail(pend, {}, yes).find("data-ox-reeval") == std::string::npos);
 }
 
+TEST_CASE("result_set_extras_render: the Show more cursor survives ids made of query-string "
+          "characters (mutation: drop url_encode and the & # + = and space cases split the URL)",
+          "[result_set][ui][security]") {
+    const struct {
+        const char* cursor;
+        const char* encoded;
+    } cases[] = {{"a&b", "a%26b"},     {"a#b", "a%23b"},   {"a+b", "a%2Bb"},
+                 {"a=b", "a%3Db"},     {"a b", "a%20b"},   {"a%b", "a%25b"},
+                 {"dev-01_x.y~z", "dev-01_x.y~z"}};
+    for (const auto& c : cases) {
+        INFO(c.cursor);
+        auto html = render_result_set_members("rs_a", {"d"}, c.cursor, false);
+        const std::string want = std::string("members?cursor=") + c.encoded + "\"";
+        CHECK(html.find(want) != std::string::npos);
+    }
+}
+
 TEST_CASE("result_set_extras_render: members escape ids, page with a cursor, and a failed read "
           "is not an empty set", "[result_set][ui][security]") {
     auto m = render_result_set_members("rs_a", {"dev-1", "<img src=x onerror=1>"}, "cur&1", false);
     CHECK(m.find("<code>dev-1</code>") != std::string::npos);
     CHECK(m.find("&lt;img") != std::string::npos);
     CHECK(m.find("<img") == std::string::npos);
-    CHECK(m.find("/fragments/result-sets/rs_a/members?cursor=cur&amp;1") != std::string::npos);
+    // The cursor is percent-encoded into the URL (then HTML-escaped for the attribute), so an
+    // id holding & # + = or a space pages by its own bytes, not as a different query string.
+    CHECK(m.find("/fragments/result-sets/rs_a/members?cursor=cur%261") != std::string::npos);
+    CHECK(m.find("cursor=cur&amp;1") == std::string::npos);
 
     CHECK(render_result_set_members("rs_a", {"dev-1"}, "", false).find("Show more") ==
           std::string::npos);

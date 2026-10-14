@@ -174,6 +174,19 @@ TEST_CASE("operate extras: History is fed only by a dispatched send and never re
     CHECK(has(page, "which History does not keep. Type it again to send it."));
 }
 
+TEST_CASE("operate extras: Ctrl+K and Ctrl+Enter do nothing from the scope expression field, "
+          "and still work from the command line and the palette box",
+          "[ui][operate_extras]") {
+    const std::string page = kDashboardIndexHtml;
+    CHECK(has(page, "var inExpr = e.target.id === 'ox-expr';"));
+    CHECK(has(page, "e.key === 'k' && !inExpr"));
+    CHECK(has(page, "e.key === 'Enter' && !inExpr"));
+    // Not the blanket typing test: that would also disable both chords in #instr-input and
+    // #cmd-input, which depend on them.
+    CHECK_FALSE(has(page, "e.key === 'k' && !isInput"));
+    CHECK_FALSE(has(page, "e.key === 'Enter' && !isInput"));
+}
+
 TEST_CASE("operate extras: an expression send omits scope-input and needs a preview or a retype",
           "[ui][operate_extras][security]") {
     const auto& js = yuzu::server::kYuzuOperateExtrasJs;

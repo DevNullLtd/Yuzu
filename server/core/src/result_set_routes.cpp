@@ -281,15 +281,21 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
             constexpr int kProducerLimit = 200;
             InstructionQuery q;
             q.enabled_only = true;
-            q.limit = kProducerLimit;
+            // One more than is shown: exactly kProducerLimit definitions is a complete list, and
+            // only a (kProducerLimit + 1)th row proves the picker is cut.
+            q.limit = kProducerLimit + 1;
             auto defs = deps.instruction_store->query_definitions(q);
             if (!defs) {
                 res.set_content(render_result_set_producers_degraded(),
                                 "text/html; charset=utf-8");
                 return;
             }
+            const bool truncated = defs->size() > static_cast<std::size_t>(kProducerLimit);
             std::vector<ResultSetProducer> out;
+            std::size_t considered = 0;
             for (const auto& d : *defs) {
+                if (++considered > static_cast<std::size_t>(kProducerLimit))
+                    break;
                 if (d.approval_mode != "auto" || !deps.classify_fn)
                     continue;
                 auto cap = deps.classify_fn(d.plugin, d.action);
@@ -297,8 +303,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                     continue;
                 out.push_back({d.id, d.name, d.plugin, d.action});
             }
-            res.set_content(render_result_set_producers(
-                                out, static_cast<int>(defs->size()) >= kProducerLimit),
+            res.set_content(render_result_set_producers(out, truncated),
                             "text/html; charset=utf-8");
         });
 

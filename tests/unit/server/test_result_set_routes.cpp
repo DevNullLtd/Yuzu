@@ -1349,6 +1349,45 @@ TEST_CASE("result_set_routes: [pg] producers lists only enabled, read-only, auto
     }
 }
 
+TEST_CASE("result_set_routes: [pg] the producers note says cut only when MORE than the limit "
+          "exists: exactly 200 definitions is a complete list "
+          "(mutation: flip > back to >= and the 200-definition case claims it is cut)",
+          "[pg][server][routes][result_set_routes][extras]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rs_extras_instr_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
+    auto add = [&](int from, int to) {
+        for (int i = from; i < to; ++i)
+            REQUIRE(is.create_definition(
+                def_for(std::format("Reader {:03d}", i), "os_info", "os_version", "auto")));
+    };
+    Harness h;
+    h.instruction_store = &is;
+    h.wire();
+    auto options = [](const std::string& body) {
+        std::size_t n = 0;
+        for (auto at = body.find("<option"); at != std::string::npos;
+             at = body.find("<option", at + 1))
+            ++n;
+        return n;
+    };
+
+    add(0, 200);
+    auto exactly = h.sink.Get("/fragments/result-sets/producers");
+    REQUIRE(exactly);
+    CHECK(options(exactly->body) == 200);
+    CHECK(exactly->body.find("data-truncated") == std::string::npos);
+    CHECK(exactly->body.find("Showing the first definitions only") == std::string::npos);
+
+    add(200, 201);
+    auto over = h.sink.Get("/fragments/result-sets/producers");
+    REQUIRE(over);
+    CHECK(options(over->body) == 200); // still the first 200, not 201
+    CHECK(over->body.find("data-truncated=\"1\"") != std::string::npos);
+    CHECK(over->body.find("Showing the first definitions only") != std::string::npos);
+}
+
 TEST_CASE("result_set_routes: [pg] members is owner-checked, paged, ids only; a stranger "
           "gets the empty pane, never another owner's ids",
           "[pg][server][routes][result_set_routes][extras][security]") {
@@ -1626,6 +1665,9 @@ TEST_CASE("result_set_routes: [pg] Re-evaluate is drawn only while the stored so
         d.perm_ok = false;
         d.wire();
         CHECK_FALSE(shows_button(d, ok_id));
+        CHECK(d.audits.empty());
+        REQUIRE_FALSE(d.perms_asked.empty());
+        CHECK(d.perms_asked[0] == "Execution:Execute");
     }
     SECTION("an unwired probe or classifier fails closed") {
         Harness np;
@@ -1665,9 +1707,6 @@ TEST_CASE("result_set_routes: [pg] the create route's re-rendered list is also d
         REQUIRE(r.ok());
     }
     // An empty create body is refused, and the refusal re-renders the owner's list.
-        CHECK(d.audits.empty());
-        REQUIRE_FALSE(d.perms_asked.empty());
-        CHECK(d.perms_asked[0] == "Execution:Execute");
     auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=",
                          "application/x-www-form-urlencoded");
     REQUIRE(r);

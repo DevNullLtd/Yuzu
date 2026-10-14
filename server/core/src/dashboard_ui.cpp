@@ -1201,9 +1201,13 @@ const char* const kDashboardIndexTemplate =
     document.addEventListener('keydown', function(e) {
       var tag = (e.target.tagName || '').toLowerCase();
       var isInput = (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable);
+      /* The scope expression field is text the operator is composing: neither chord may open the
+         palette or send the instruction from inside it. (The command line and the palette's own
+         input keep both: Ctrl+K closes the palette from its box, Ctrl+Enter sends from the line.) */
+      var inExpr = e.target.id === 'ox-expr';
 
       /* Ctrl+K / Cmd+K — open command palette */
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k' && !inExpr) {
         e.preventDefault();
         if (cmdPalette.isOpen) { cmdPalette.close(); } else { cmdPalette.open(); }
         return;
@@ -1225,7 +1229,7 @@ const char* const kDashboardIndexTemplate =
       }
 
       /* Ctrl+Enter — send current instruction */
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !inExpr) {
         e.preventDefault();
         sendInstruction();
         return;
