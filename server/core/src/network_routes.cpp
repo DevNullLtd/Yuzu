@@ -194,7 +194,7 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
                                                         not_reporting, cooc, cohort_filter, limit),
                         "text/html; charset=utf-8");
     });
-    // -- Discovered hosts (EB-5 read twin). One builder family
+    // -- Discovered hosts (Estate E-2 read twin). One builder family
     // (discovered_devices_model.hpp) behind REST, MCP and this fragment. The
     // store is authoritative: a fault is a 503, never an empty list. --
 
