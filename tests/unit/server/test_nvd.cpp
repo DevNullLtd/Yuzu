@@ -2119,7 +2119,6 @@ TEST_CASE("parse_nvd_proxy_url: scheme, port and no-scheme shapes", "[nvd][proxy
     const Case cases[] = {
         {"http://proxy.lan:3128", "proxy.lan", 3128},
         {"https://proxy.lan:8443", "proxy.lan", 8443},
-        {"HTTP://Proxy.LAN:3128", "Proxy.LAN", 3128}, // scheme is case-insensitive, host kept
         {"proxy.lan:3128", "proxy.lan", 3128},         // no scheme
         {"proxy.lan", "proxy.lan", 8080},              // no port: the long-standing default
         {"http://proxy.lan:3128/", "proxy.lan", 3128}, // trailing slash

@@ -5,7 +5,6 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -64,17 +63,11 @@ std::string url_encode(const std::string& value) {
 
 NvdProxyEndpoint parse_nvd_proxy_url(std::string_view url) {
     NvdProxyEndpoint ep;
-    // Scheme: only http:// and https:// are recognised (case-insensitive); a proxy URL with
-    // no scheme is "host:port".
-    const auto ieq_prefix = [&](std::string_view prefix) {
-        return url.size() >= prefix.size() &&
-               std::equal(prefix.begin(), prefix.end(), url.begin(), [](char a, char b) {
-                   return a == std::tolower(static_cast<unsigned char>(b));
-               });
-    };
-    if (ieq_prefix("http://"))
+    // Scheme: only http:// and https:// are recognised; a proxy URL with no scheme is
+    // "host:port".
+    if (url.starts_with("http://"))
         url.remove_prefix(7);
-    else if (ieq_prefix("https://"))
+    else if (url.starts_with("https://"))
         url.remove_prefix(8);
     // The authority ends at the first path, query or fragment delimiter.
     if (const auto end = url.find_first_of("/?#"); end != std::string_view::npos)
