@@ -294,7 +294,7 @@ private:
     // Same TTL and the same invalidation hook, guarded by cache_mtx_.
     mutable std::vector<ComplianceSummary> cached_by_policy_;
     mutable std::chrono::steady_clock::time_point by_policy_last_computed_{};
-    CacheClock cache_clock_;
+    CacheClock cache_clock_; // test seam: set before first use, single-threaded; NOT under cache_mtx_
 
     // ADR-0012 §4 rule 2: invalidate synchronously on the store's OWN writes,
     // after the write lands. Called by every mutator of policy_status

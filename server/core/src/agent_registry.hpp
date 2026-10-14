@@ -1018,7 +1018,8 @@ public:
     // a smaller number. For an exact online count past the cap use
     // `OfflineEndpointStore::fleet_state_counts().live` (SQL COUNT). NOTE: a presence set past
     // `OfflineEndpointStore::kQueryRowCap` is `Truncated` and therefore
-    // unavailable here; not measured at fleet scale.
+    // unavailable here; not measured at fleet scale. NOT CONFINED: a fleet-wide
+    // count — callers must hold the fleet-read gate AND have `scope == nullopt`.
     [[nodiscard]] std::expected<std::size_t, PresenceReadError> known_agent_count() const;
 
     // Local-only agent count, under the SAME lock all_ids() uses — never

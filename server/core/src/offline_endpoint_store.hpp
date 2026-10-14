@@ -147,7 +147,9 @@ struct FleetStatePartition {
 /// two overlap on online-and-stale rows. Online wins, `not_seen` is capped at
 /// the rows left over, `offline` takes the remainder; nothing is negative and
 /// the sum is always `max(total, 0)`. Over-states `not_seen` by the number of
-/// online-and-stale rows (a connected agent whose heartbeat row lags).
+/// online-and-stale rows (a connected agent whose heartbeat row lags). An
+/// `online` above `total` is clamped, which hides agents the store holds no
+/// row for (failed presence upserts, or rows outside the roster window).
 [[nodiscard]] FleetStatePartition partition_fleet_state(std::int64_t total, std::int64_t online,
                                                         std::int64_t stale) noexcept;
 
@@ -238,10 +240,14 @@ public:
     [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window);
 
     /// Fleet tallies over the same roster window `query_stale_within` serves,
-    /// computed in ONE `COUNT(*) [FILTER ...] ... GROUP BY lower(os)` statement
-    /// on `endpoints_last_heartbeat_idx`'s range. `now_ms` is injected (the
-    /// caller's clock); `stale_after` is the "not seen" threshold; `live_ttl` is the presence TTL
-    /// for `FleetStateCounts::live`. Typed like
+    /// computed in ONE `COUNT(*) [FILTER ...] ... GROUP BY lower(os)` statement.
+    /// `now_ms` is injected (the caller's clock); `stale_after` is the "not seen"
+    /// threshold; `live_ttl` is the presence TTL for `FleetStateCounts::live`
+    /// (judged on the DATABASE clock, unlike `total`/`stale`, which use `now_ms`).
+    ///
+    /// UNCACHED, and it costs seconds at fleet scale (a parallel seq scan holding
+    /// one pool lease; 1-3 s measured at 2M rows on one noisy host): the consumer
+    /// MUST cache it (~60 s) rather than call it per view. Typed like
     /// `query_stale_within`: a failed read is `std::unexpected`
     /// (`StoreUnavailable` / `DbError`, counted on
     /// `yuzu_server_agent_presence_store_failed_total{op=fleet_state_counts}`),
