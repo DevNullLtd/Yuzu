@@ -4,7 +4,7 @@
 // The page is a chain of NAMED parts. Each is one raw-string literal pinned
 // under kPartCap by a static_assert (MSVC C2026 caps a literal at 16,380
 // bytes; 15,000 leaves room for a fix-up without a re-split) and the parts
-// are joined once at static init (the home_ui.cpp precedent). Add markup to
+// are joined once at static init. Add markup to
 // the part it belongs to; when a part nears the cap, cut a new named part
 // rather than growing it.
 

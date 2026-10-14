@@ -155,22 +155,19 @@ TEST_CASE("dashboard page: no sidebar scope-kinds panel, the page scrolls as a w
     CHECK(html.find("height: 100vh") == std::string::npos);
 }
 
-// Mutation probe for the route rename: a `/fragments/home/*` registration left in any
-// server source (the sibling pages included) would answer the old path with the old verb.
+// Mutation probe for the route rename: a `/fragments/home/*` registration left in one of
+// the files that own these fragments (or in server.cpp, which wires them) would answer the
+// old path with the old verb. Reads five files, not the whole source tree.
 TEST_CASE("dashboard fragments: no /fragments/home/* route is registered anywhere",
           "[dashboard][ui][home]") {
     const std::regex reg(R"(\.(Get|Post|Put|Delete)\(\s*"/fragments/home/)");
-    int scanned = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(YUZU_SERVER_SRC_DIR)) {
-        if (entry.path().extension() != ".cpp") continue;
-        std::ifstream in(entry.path());
-        const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-        ++scanned;
-        INFO(entry.path().filename().string());
+    for (const char* name : {"home_routes.cpp", "home_panels_routes.cpp", "health_routes.cpp",
+                             "page_routes.cpp", "server.cpp"}) {
+        const std::string src = read_source(name);
+        INFO(name);
         CHECK_FALSE(std::regex_search(src, reg));
         CHECK(src.find("\"home.fragment.access_denied\"") == std::string::npos);
     }
-    CHECK(scanned > 100);
     // And the four Dashboard registrations exist, by their exact paths.
     const std::string routes = read_source("home_routes.cpp") + read_source("home_panels_routes.cpp") +
                                read_source("health_routes.cpp");

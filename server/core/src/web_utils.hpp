@@ -737,8 +737,9 @@ template <typename Req>
 /// handler (H1, 2026-07-08 SCIM review) — extracted from `server.cpp`'s
 /// `set_pre_routing_handler` lambda so the login/SSO/health/PKI/SCIM
 /// exemption list has direct unit coverage instead of only being exercised
-/// by booting a real server. Every existing exempt path is unchanged; the
-/// only addition is the `/scim/v2/` prefix (see below).
+/// by booting a real server. Additions since: the `/scim/v2/` prefix (see
+/// below) and `/home`, the landing and sign-in page a signed-out request is
+/// redirected to.
 ///
 /// Caller contract: this MUST be consulted AFTER the rate limiter and
 /// (once it lands) any on-behalf-of/ADR-1005 rejection in the pre-routing

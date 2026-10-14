@@ -94,7 +94,7 @@
 ///   GET /readyz                     (no gate — draining_, runtime pg_reachable, boot-latched store checks)
 ///   GET /fragments/health/summary   (deny_service_scoped_fn THEN auth_fn)
 
-#include "authz_gates.hpp" // authz::FleetReadGate (Home health panel)
+#include "authz_gates.hpp" // authz::FleetReadGate (Dashboard health panel)
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>

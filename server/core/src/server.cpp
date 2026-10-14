@@ -383,8 +383,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
 
-// Login and Settings pages (separate TUs).
-extern const char* const kLoginHtml;
+// Settings page (separate TU). The sign-in page is rendered by home_ui::render_landing.
 extern const char* const kSettingsHtml;
 
 // Help and Instruction management pages (separate TUs).
@@ -14849,8 +14848,8 @@ private:
             // the only credential the caller has at this point — they have no
             // session cookie yet. Hermes Agent's red-team review (2026-05-29)
             // caught the omission; without it, MFA-enrolled users are locked
-            // out because every POST /login/mfa redirects to /login before the
-            // route handler runs.
+            // out because every POST /login/mfa is redirected to the landing
+            // page (/home) before the route handler runs.
             // `/login/mfa/enroll` (PR3) is also pre-session: it completes
             // an enforced login for an un-enrolled user who has only the
             // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
@@ -14858,7 +14857,7 @@ private:
             // SAML 2.0 auth-flow routes are pre-session by design (identical
             // rationale to /auth/oidc/start + /auth/callback).  Without these
             // exemptions, a non-authenticated user trying to start SSO would be
-            // redirected to /login before the SAML flow handler runs.
+            // redirected to /home before the SAML flow handler runs.
             // The exact exempt-path decision lives in `is_login_exempt_path`
             // (web_utils.hpp) so it has direct unit coverage (H1, 2026-07-08
             // SCIM review) — this call site runs AFTER the rate limiter
