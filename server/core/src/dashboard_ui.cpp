@@ -1253,7 +1253,10 @@ const char* const kDashboardIndexTemplate =
        autocomplete input inside it fires bubbling beforeRequest events. */
     var instrForm = document.getElementById('instr-form');
     if (instrForm) {
-      /* Fail closed: the fan-out confirmation lives in yuzu-operate-extras.js (and needs
+)HTM"
+    // Split here: the instr-form block below pushed this chunk past MSVC's C2026
+    // 16,380-byte raw-string-literal limit. Adjacent literals concatenate at compile time.
+    R"HTM(      /* Fail closed: the fan-out confirmation lives in yuzu-operate-extras.js (and needs
          YuzuDialog). Until that script sets its ready flag, a Send is held, never sent. */
       instrForm.addEventListener('htmx:confirm', function(e) {
         if (e.target !== instrForm || window.__yuzuDashboardConfirmReady) return;
