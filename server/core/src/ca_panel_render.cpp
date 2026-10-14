@@ -16,9 +16,11 @@ std::string utc(std::int64_t epoch, const char* fmt) {
     auto tt = static_cast<std::time_t>(epoch);
     std::tm tm_buf{};
 #ifdef _WIN32
-    gmtime_s(&tm_buf, &tt);
+    if (gmtime_s(&tm_buf, &tt) != 0)
+        return "\xE2\x80\x94";
 #else
-    gmtime_r(&tt, &tm_buf);
+    if (gmtime_r(&tt, &tm_buf) == nullptr)
+        return "\xE2\x80\x94";
 #endif
     char buf[32]{};
     std::strftime(buf, sizeof(buf), fmt, &tm_buf);
@@ -67,7 +69,7 @@ std::string ca_panel(const Model& m) {
     h += "<div><span>Valid to</span><b>" + format_utc_date(r.not_after) + " UTC";
     if (is_expired(r.not_after, m.now))
         h += " " + pill("bad", "Expired",
-                        "not_after has passed: certificates cannot be issued from this CA");
+                        "not_after has passed");
     h += "</b></div>";
     h += "<div class=\"fp\"><span>SHA-256</span><b class=\"mono\" title=\"" +
          esc(r.fingerprint_sha256) + "\">" + esc(r.fingerprint_sha256) + "</b></div>";

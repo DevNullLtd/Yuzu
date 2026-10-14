@@ -1100,8 +1100,10 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                             "text/html; charset=utf-8");
             return;
         }
-        if (!perm_fn(req, res, "Security", "Delete"))
+        if (!perm_fn(req, res, "Security", "Delete")) {
+            set_error_toast(res, "You do not have permission to revoke certificates.");
             return;
+        }
         // Error branches re-render the FULL fragment with an inline banner rather
         // than swapping a bare <span> into #ca-section (which blanked the whole
         // panel until reload — #1241 happy/UP-6).
@@ -1170,8 +1172,10 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                           "text/html; charset=utf-8");
                       return;
                   }
-                  if (!perm_fn(req, res, "Security", "Write"))
+                  if (!perm_fn(req, res, "Security", "Write")) {
+                      set_error_toast(res, "You do not have permission to import a CA chain.");
                       return;
+                  }
                   const bool pki_view = wants_pki_view(req);
                   auto error_panel = [&](int status, const std::string& msg) {
                       res.status = status;

@@ -112,13 +112,6 @@ constexpr char kPart1[] = R"HTM(<!DOCTYPE html>
       b.addEventListener('click', function () { a.remove(); });
       a.appendChild(s); a.appendChild(b); n.appendChild(a);
     });
-
-    document.addEventListener('keydown', function (e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        window.location.href = '/?palette=1';
-      }
-    });
   </script>
 </body>
 </html>

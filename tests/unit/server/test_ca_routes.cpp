@@ -1403,6 +1403,48 @@ TEST_CASE("ca_routes: a successful revoke in view=pki re-renders the pki shape w
     CHECK(h.store->is_revoked("DEAD"));
 }
 
+TEST_CASE("ca_routes: a permission refusal on a wrapper carries a toast; a form body selects the pki shape",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.wire();
+    const std::unordered_map<std::string, std::string> same_origin = {
+        {"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}};
+
+    // htmx drops a 4xx body, so the permission refusal must reach the operator as a toast.
+    h.perm_allow = false;
+    auto denied = h.sink.dispatch("POST", "/api/settings/ca/revoke", "serial_hex=DEAD&view=pki",
+                                  "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+    CHECK_FALSE(denied->get_header_value("HX-Trigger").empty());
+    CHECK_FALSE(h.store->is_revoked("DEAD"));
+    auto denied_imp = h.sink.dispatch("POST", "/api/settings/ca/import-chain",
+                                      "intermediate_pem=X&chain_pem=Y&view=pki",
+                                      "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(denied_imp);
+    CHECK(denied_imp->status == 403);
+    CHECK_FALSE(denied_imp->get_header_value("HX-Trigger").empty());
+    CHECK(h.import_calls == 0);
+
+    // The forms POST their fields in the body, not the query string.
+    h.perm_allow = true;
+    auto rv = h.sink.dispatch("POST", "/api/settings/ca/revoke", "serial_hex=DEAD&view=pki",
+                              "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(rv);
+    CHECK(rv->status == 200);
+    CHECK(rv->body.find("grid2") != std::string::npos);
+    CHECK(h.store->is_revoked("DEAD"));
+    auto imp = h.sink.dispatch("POST", "/api/settings/ca/import-chain",
+                               "intermediate_pem=X&chain_pem=Y&view=pki",
+                               "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(imp);
+    CHECK(imp->status == 200);
+    CHECK(imp->body.find("grid2") != std::string::npos);
+    CHECK(h.import_calls == 1);
+}
+
 TEST_CASE("ca_routes: the cross-origin refusal keeps its bare body and never re-renders",
           "[ca_routes][pki][security][pg]") {
     // Re-rendering the inventory here would hand a cross-site probe a view of it before the

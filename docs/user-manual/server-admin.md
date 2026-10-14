@@ -2965,6 +2965,7 @@ Settings panel and REST routes it sits over (no new write route):
   key-encryption-key status panel (active key version, re-wrap state, live key
   versions, operation lock; `Security:Read`). Key rotation and re-wrap stay on
   `POST /api/v1/secrets/kek/rotate` and `/rewrap`.
+
 The panels apply the page's admin gate and the matching REST route's own
 permission, and show a note (not an empty list) when denied or when the store
 could not be read.
