@@ -30,6 +30,7 @@ constexpr NavItem kFleetSub[] = {
 // (General, Security, Integrations, PKI, Plugins, Data, Licence, Developer).
 constexpr NavItem kSettingsSub[] = {
     {.key = "settings-data", .label = "Data and retention", .href = "/settings/data"},
+    {.key = "settings-developer", .label = "Developer and API", .href = "/settings/developer"},
 };
 
 constexpr NavItem kOperate[] = {

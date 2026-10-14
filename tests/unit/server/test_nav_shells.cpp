@@ -36,6 +36,7 @@ extern const char* const kGuardianHtml;
 extern const char* const kGuardianDetailPageHtml;
 extern const char* const kSettingsHtml;
 extern const char* const kSettingsDataHtml;
+extern const char* const kSettingsDeveloperHtml;
 
 using Catch::Matchers::ContainsSubstring;
 using namespace yuzu::server::shell;
@@ -374,6 +375,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"tar", kTarPageHtml, {"/tar"}},
         {"settings", kSettingsHtml, {"/settings"}},
         {"settings data", kSettingsDataHtml, {"/settings", "/settings/data"}},
+        {"settings developer", kSettingsDeveloperHtml, {"/settings", "/settings/developer"}},
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},

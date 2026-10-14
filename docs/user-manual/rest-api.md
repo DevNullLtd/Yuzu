@@ -6659,6 +6659,17 @@ Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` con
 
 ---
 
+#### Developer and API page
+
+Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a read-only front for the discovery routes above. It adds no REST route and no MCP tool: its four panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process and take the same `Infrastructure:Read` gate as the REST twins.
+
+- **API:** the OpenAPI document link and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes.
+- **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown.
+- **Permissions:** each `Securable:Operation` pair with the roles that allow it. The role grid needs `UserManagement:Read`, as on `/discover/permissions`; without it the page says so instead of listing nothing.
+- **Plugins:** the build-embedded manifests with per-OS support. The list of plugins connected devices currently report is a separate, on-request list: no connected device is not the same as no plugins.
+
+The load generator and process data fetch controls are not part of this page.
+
 ### Inventory
 
 Inventory data is structured per-plugin telemetry collected from agents and stored server-side. The generic store (`InventoryStore`, ADR-0037) is Postgres-backed with an AUTHORITATIVE read posture — a store/pool/query degrade returns **503**, never a silent empty result.

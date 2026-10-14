@@ -79,6 +79,7 @@
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
 #include "deployment_store.hpp"
+#include "developer_routes.hpp" // System > Developer and API page + fragments (read-only)
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovery_store.hpp"
 #include "engine_principal_store.hpp"
@@ -19508,6 +19509,24 @@ private:
         discover_routes_ = std::make_unique<DiscoverRoutes>();
         discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
                                           instruction_store_.get(), &registry_);
+
+        // System > Developer and API (read-only): page + four fragments over the
+        // shared discovery builders above. Each fragment takes its twin's own
+        // Infrastructure:Read gate; the page is admin-only like /settings.
+        {
+            HttplibRouteSink developer_sink{*web_server_};
+            yuzu::server::developer::register_developer_routes(
+                developer_sink,
+                yuzu::server::developer::Deps{
+                    .admin_fn =
+                        [this](const httplib::Request& req, httplib::Response& res) {
+                            return require_admin(req, res);
+                        },
+                    .perm_fn = perm_fn,
+                    .rbac_store = rbac_store_.get(),
+                    .registry = &registry_,
+                });
+        }
 
         // DEX app-perf-over-time read providers (slice 2). `dex_perf_api`
         // (built once ABOVE, before the DexRoutes registration) is the ONE
