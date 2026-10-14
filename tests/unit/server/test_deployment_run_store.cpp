@@ -305,7 +305,7 @@ TEST_CASE("DeploymentRunStore reports !is_open on a migration failure",
     CHECK_FALSE(store.is_open());
 }
 
-TEST_CASE("DeploymentRunStore list reports truncation exactly, never a short page as the whole",
+TEST_CASE("DeploymentRunStore list reports truncation exactly and never shows a short page as the whole",
           "[pg][deployment][store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -346,6 +346,29 @@ TEST_CASE("DeploymentRunStore list reports truncation exactly, never a short pag
     REQUIRE(admin);
     CHECK(admin->rows.size() == 3);
     CHECK(admin->truncated);
+}
+
+TEST_CASE("DeploymentRunStore list order is deterministic across rows sharing a millisecond",
+          "[pg][deployment][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    for (const char* id : {"e1", "e3", "e2"}) // inserted out of order, all the same millisecond
+        REQUIRE(store.create_deployment(make_dep(id, "erin", t), {tgt("a1")}));
+
+    // The tie breaks on id, descending, so the page and the truncation cut never flip between reads.
+    for (int i = 0; i < 3; ++i) {
+        auto two = store.list_deployments_checked("erin", false, 2);
+        REQUIRE(two);
+        REQUIRE(two->rows.size() == 2);
+        CHECK(two->rows[0].deployment_id == "e3");
+        CHECK(two->rows[1].deployment_id == "e2");
+        CHECK(two->truncated);
+    }
 }
 
 TEST_CASE("DeploymentRunStore checked readers: a miss is not a fault, a fault is not a miss",

@@ -253,6 +253,9 @@ TEST_CASE("nvd_routes: /api/nvd/match 503s when the db is null or closed",
     auto r = h.sink.Post("/api/nvd/match", R"({"inventory":[]})");
     REQUIRE(r);
     CHECK(r->status == 503);
+    const auto body = json::parse(r->body);
+    CHECK(body["error"]["message"] == "NVD database not available");
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
 }
 
 TEST_CASE("nvd_routes: /api/nvd/match rejects invalid JSON with 400",
@@ -265,6 +268,9 @@ TEST_CASE("nvd_routes: /api/nvd/match rejects invalid JSON with 400",
     auto r = h.sink.Post("/api/nvd/match", "not json");
     REQUIRE(r);
     CHECK(r->status == 400);
+    const auto body = json::parse(r->body);
+    CHECK(body["error"]["message"] == "invalid JSON body");
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
 }
 
 TEST_CASE("nvd_routes: /api/nvd/match finds a vulnerable inventory item and reports the CveMatch "

@@ -34,8 +34,11 @@ DeploymentState deployment_state(const std::string& status, int failed, int skip
 /// The list table. `target_labels` is parallel to `rows` (the source pre-flight
 /// run's scope label); an empty entry means the run aged out of retention and
 /// reads "Run no longer kept", never blank. Empty `rows` renders the empty copy.
+/// `truncated` says the reader had more rows than it returned; the list then notes that it
+/// shows only the newest ones, so a cut list is never presented as the whole.
 std::string render_deployments_list(const std::vector<DeploymentRow>& rows,
-                                    const std::vector<std::string>& target_labels);
+                                    const std::vector<std::string>& target_labels,
+                                    bool truncated = false);
 
 /// The read-only detail for one deployment: summary, exact counts from the run row,
 /// and the device grid (a note says so when it shows fewer rows than `dep.total`).

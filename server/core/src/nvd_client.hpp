@@ -46,7 +46,10 @@ public:
                                                   const std::string& mod_end) = 0;
 };
 
-// Where an HTTP proxy URL points. `host` is empty when the input is empty. Any userinfo
+// Where an HTTP proxy URL points. `host` is empty when the input is empty OR the URL has no usable
+// host (an ambiguous URL is dropped whole; so is a scheme other than http/https, or a host holding
+// whitespace or control characters). A caller that was given a non-empty URL and gets an empty host
+// must treat the proxy as unusable, never as "no proxy". Any userinfo
 // (`user:password@`) is dropped here and never reaches the host, the port, or a log line:
 // the client does not authenticate to the proxy, so the credentials have no use past this
 // parse. Pure, so the shapes can be pinned without a socket.
@@ -82,6 +85,9 @@ private:
     std::string api_key_;
     std::string proxy_host_;
     int proxy_port_ = 0;
+    // A proxy URL was configured but has no usable host: fetches are refused (fail closed), not
+    // sent direct, because the operator asked for the proxy.
+    bool proxy_unusable_ = false;
     std::string base_url_; // NVD API root; set in the ctor (prod default or a test override)
     // std::nullopt until the first request — a sentinel time_point overflowed
     // the rate-limit subtraction and slept ~forever on the first call (#1867).

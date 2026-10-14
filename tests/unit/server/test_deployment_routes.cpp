@@ -628,7 +628,8 @@ TEST_CASE("deployment routes: an auth seam that answers nothing still gets an A4
     rig.auth_writes_401 = false; // auth_fn_ returns no session and leaves the response untouched
     rig.wire(nullptr, nullptr);
     for (const std::string path :
-         {std::string("/api/v1/deployments"), "/api/v1/deployments/" + hex_id(1)}) {
+         {std::string("/api/v1/deployments"), "/api/v1/deployments/" + hex_id(1),
+          std::string("/api/v1/deployments/preview")}) {
         INFO(path);
         auto r = rig.sink.Get(path);
         REQUIRE(r);
@@ -657,6 +658,8 @@ TEST_CASE("deployment routes: deployments list/detail gate matrix (401, service-
         // The REST pair keeps the 401 body auth_fn_ wrote (A4 envelope), not a plain-text one.
         CHECK(rig.sink.Get("/api/v1/deployments")->body.find("from auth_fn") != std::string::npos);
         CHECK(rig.sink.Get(detail)->body.find("from auth_fn") != std::string::npos);
+        CHECK(rig.sink.Get("/api/v1/deployments/preview")->body.find("from auth_fn") !=
+              std::string::npos);
         CHECK(rig.sink.Get("/fragments/auto/deployments")->status == 401);
         CHECK(rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(7))->status == 401);
     }

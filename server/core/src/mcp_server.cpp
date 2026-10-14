@@ -2067,8 +2067,8 @@ static const ToolDef kTools[] = {
      "and MACs are agent-reported free text. A host is not necessarily unmanaged: discovery does "
      "not yet match hosts to enrolled agents, so no managed flag is returned. Each row names a "
      "host fleet-wide, so every call is audit-logged (network.discovered.view); a service-scoped "
-     "API token is denied, and an operator confined to a management group is refused (the read "
-     "does not yet narrow by the discovering agent). Mirrors GET "
+     "API token is denied, and, when RBAC is enforced, an operator confined to a management group "
+     "is refused (the read does not yet narrow by the discovering agent). Mirrors GET "
      "/api/v1/network/discovered-devices. Requires Infrastructure:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("subnet":{"type":"string","maxLength":64,"description":"Only hosts found on this exact subnet string"},)j"
@@ -21524,11 +21524,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // The published schema bounds the id; enforce it, so an oversized value is
-                // refused here instead of reaching the store as a query parameter.
+                // refused here instead of reaching the store as a query parameter. Ids are
+                // lowercase hexadecimal (gen_id), so anything else cannot exist: refuse it too,
+                // which also keeps an embedded NUL from being truncated by the query layer.
                 if (deployment_id.size() > kDeploymentIdMaxLen) {
                     res.set_content(a4_error(kInvalidParams,
-                                             "deployment_id is longer than 64 characters"),
+                                             "deployment_id is longer than " +
+                                                 std::to_string(kDeploymentIdMaxLen) +
+                                                 " characters"),
                                     "application/json");
+                    return;
+                }
+                if (deployment_id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "deployment_id must be lowercase hexadecimal"),
+                        "application/json");
                     return;
                 }
                 int64_t limit = param_int(args, "limit", kDeploymentDeviceDefault);

@@ -263,11 +263,12 @@ DeploymentRunStore::list_deployments_checked(const std::string& viewer, bool is_
     const int fetch = cap + 1; // one past the cap, so truncation is observed rather than guessed
     const std::string sql_admin =
         std::string("SELECT ") + kDeploymentCols +
-        " FROM deployment_run_store.deployments ORDER BY created_at_ms DESC LIMIT $1::bigint";
+        " FROM deployment_run_store.deployments ORDER BY created_at_ms DESC, deployment_id DESC "
+        "LIMIT $1::bigint";
     const std::string sql_owner =
         std::string("SELECT ") + kDeploymentCols +
-        " FROM deployment_run_store.deployments WHERE created_by = $1 ORDER BY created_at_ms DESC "
-        "LIMIT $2::bigint";
+        " FROM deployment_run_store.deployments WHERE created_by = $1 "
+        "ORDER BY created_at_ms DESC, deployment_id DESC LIMIT $2::bigint";
     pg::PgResult res =
         is_admin ? pg::exec_params(lease.get(), sql_admin.c_str(),
                                    std::vector<std::string>{std::to_string(fetch)})

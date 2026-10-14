@@ -574,8 +574,7 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
                                                    httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
-            res.status = 401;
-            res.set_content("auth required", "text/plain");
+            reject_unauthenticated(res);
             return;
         }
         // SEC-2/SEC-3 confinement gap, same rationale + same call as the
@@ -805,7 +804,8 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
             }
             targets.push_back(std::move(label));
         }
-        res.set_content(render_deployments_list(rows, targets), "text/html; charset=utf-8");
+        res.set_content(render_deployments_list(rows, targets, page->truncated),
+                        "text/html; charset=utf-8");
     });
 
     sink.Get("/fragments/auto/deployments/detail", [this](const httplib::Request& req,

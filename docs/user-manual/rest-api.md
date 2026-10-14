@@ -9305,7 +9305,7 @@ Hosts found by network discovery scans, including hosts with no agent. The REST/
 - **Permission:** `Infrastructure:Read`
 - **Query parameters:** `subnet` (only hosts found on exactly this subnet string, at most 64 bytes); `limit` (1 to 500, default and cap 500).
 - **Response:** `{data[], summary, truncated, meta}`. `data[]` rows are `{id, ip_address, mac_address, hostname, subnet, discovered_by, discovered_at, last_seen}` (epoch seconds), newest last-seen first. `summary` is `{total, subnets}` over every row matching the filter, not just the returned page; `truncated` is `true` when more rows matched than were returned. `hostname` is `unknown` when a reverse lookup failed, and `hostname` and `mac_address` are agent-reported free text.
-- **Management-group confinement:** the read is gated by the flat `Infrastructure:Read`, like the sibling `GET /api/v1/network/devices`, and is not narrowed by the admit-then-filter list chokepoint. An operator confined to a management group is refused with `403` rather than shown a narrowed list; a holder of the global grant sees every discovered host. Narrowing rows by `discovered_by` is tracked by `#5855`.
+- **Management-group confinement:** the read is gated by a flat `Infrastructure:Read` check and is not narrowed by the admit-then-filter list chokepoint (the sibling `GET /api/v1/network/devices` is flat too, on `GuaranteedState:Read`). When RBAC is enforced, an operator confined to a management group is refused with `403` rather than shown a narrowed list; a holder of the global grant sees every discovered host. With RBAC off, any authenticated non-service session is admitted. Narrowing rows by `discovered_by` is tracked by `#5855` (revisit by 2026-11-14).
 - **No `managed` flag:** discovery does not yet match hosts to enrolled agents, so no managed or agent field is returned rather than a value that would read "unmanaged" for an enrolled host.
 - **Errors:** `400` invalid `limit` or `subnet`; `403` a service-scoped API token (denied outright and audited as `result=denied`) or missing permission; `503` the discovery store is unavailable or degraded. A store fault is never rendered as an empty list.
 - **Audit (behavioral PII):** each row names a host fleet-wide, so a served read emits **`network.discovered.view`** (`target_type=Infrastructure`, `target_id=` empty). **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no rows. MCP twin: `list_discovered_devices` (set-and-proceed, reports `audit_persisted: false` instead of refusing).
@@ -10780,7 +10780,7 @@ and ITServiceOwner, not Administrator alone). Runs asynchronously and returns im
 
 The request is **audited before it is made** as `nvd.sync.request` (`result=success`, or
 `result=disabled` when sync is off on this server and the call answers `503`). If the audit row
-cannot be persisted the request is refused with `503` and no sync is started.
+cannot be persisted the request is refused with `503` (an A4 error envelope with `retry_after_ms: 5000`) and `Sec-Audit-Failed: true`, and no sync is started. The `503` for sync-off is an A4 error envelope too, and so are the `503` and `400` of `POST /api/nvd/match`.
 
 The same status JSON drives the dashboard card `GET /fragments/auto/nvd` (gated
 `Infrastructure:Read`), which shows the CVE count, last sync, whether a sync is running, and the

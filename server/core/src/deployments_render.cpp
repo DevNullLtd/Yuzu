@@ -43,7 +43,8 @@ DeploymentState deployment_state(const std::string& status, int failed, int skip
 }
 
 std::string render_deployments_list(const std::vector<DeploymentRow>& rows,
-                                    const std::vector<std::string>& target_labels) {
+                                    const std::vector<std::string>& target_labels,
+                                    bool truncated) {
     if (rows.empty())
         return "<div class=\"gp-placeholder\" data-empty=\"deployments\">No deployments in the last "
                "14 days. A deployment starts from a pre-flight run.</div>";
@@ -64,6 +65,9 @@ std::string render_deployments_list(const std::vector<DeploymentRow>& rows,
              when(d.created_at_ms) + "</td></tr>";
     }
     h += "</tbody></table>";
+    if (truncated)
+        h += "<div class=\"hint\" data-truncated=\"1\">Showing the newest " +
+             std::to_string(rows.size()) + " deployments. Older ones are not listed here.</div>";
     return h;
 }
 

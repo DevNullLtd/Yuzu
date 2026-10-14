@@ -117,9 +117,8 @@ void register_nvd_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!deps.nvd_db || !deps.nvd_db->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"NVD database not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "NVD database not available"),
+                            "application/json");
             return;
         }
         // Parse inventory: JSON body with an "inventory" array of {name, version}.
@@ -137,9 +136,7 @@ void register_nvd_routes(HttpRouteSink& sink, Deps deps) {
             }
         } catch (...) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid JSON body"), "application/json");
             return;
         }
 

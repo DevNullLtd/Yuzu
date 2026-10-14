@@ -20526,8 +20526,11 @@ TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders,
             std::sort(k.begin(), k.end());
             return k;
         };
+        int visited = 0;
         for (const auto& tool : tools) {
             const auto name = tool["name"].get<std::string>();
+            if (name == "get_deployment" || name == "list_deployments")
+                ++visited;
             if (name == "get_deployment") {
                 INFO("get_deployment data keys");
                 CHECK(keys_of(tool["outputSchema"]["properties"]["data"]["properties"]) ==
@@ -20539,6 +20542,9 @@ TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders,
                       keys_of(lp["data"][0]));
             }
         }
+        // Both tools must have been compared: a tools/list without them would otherwise pass here
+        // with no assertion made.
+        REQUIRE(visited == 2);
     }
 
     // Not-yours reads exactly like not-found: kInvalidParams, no oracle.
@@ -20563,6 +20569,24 @@ TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders,
     REQUIRE(longid);
     CHECK(nlohmann::json::parse(longid->body)["error"]["code"] ==
           yuzu::server::mcp::kInvalidParams);
+    // The MESSAGE is what tells the bound from the store's not-found answer (both use
+    // kInvalidParams): reverting the check would turn this into "deployment not found".
+    CHECK(nlohmann::json::parse(longid->body)["error"]["message"] ==
+          "deployment_id is longer than 64 characters");
+    // A well-formed 64-character id passes the bound and reaches the store (a miss, not a refusal).
+    auto atbound = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"get_deployment",)") +
+        R"("arguments":{"deployment_id":")" + std::string(64, 'a') + R"("}}})");
+    REQUIRE(atbound);
+    CHECK(nlohmann::json::parse(atbound->body)["error"]["message"] == "deployment not found");
+    // An id that cannot exist (not lowercase hex, here with an embedded NUL) is refused before
+    // the query layer can truncate it.
+    auto nulid = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":"get_deployment",)"
+        R"("arguments":{"deployment_id":"00000000000000a1\u0000junk"}}})");
+    REQUIRE(nulid);
+    CHECK(nlohmann::json::parse(nulid->body)["error"]["message"] ==
+          "deployment_id must be lowercase hexadecimal");
 
     auto noid = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"get_deployment",)"

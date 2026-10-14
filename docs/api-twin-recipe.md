@@ -183,7 +183,8 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
 ```
 
 Use `ok_json` for a single object/scalar result, `list_json` for anything returning an array with a
-total count. Both wrap the shared builder's output (§1) — they never build the `data` payload
+total count. A checked list reader that caps its page reads one row past the cap and exposes
+`truncated`; it never reports the page size as a `total` (see `GET /api/v1/deployments`). Both wrap the shared builder's output (§1) — they never build the `data` payload
 themselves.
 
 ### OpenAPI entry

@@ -106,6 +106,20 @@ TEST_CASE("deployment_detail_json: truncated reflects the exact run total",
     CHECK(j["truncated"] == true);
 }
 
+TEST_CASE("render_deployments_list: a cut list says so, a whole list does not",
+          "[deployment][render]") {
+    DeploymentRow d;
+    d.deployment_id = "00000000000000a1";
+    d.name = "n";
+    const std::string cut = render_deployments_list({d, d}, {"", ""}, /*truncated=*/true);
+    CHECK(cut.find("data-truncated=\"1\"") != std::string::npos);
+    CHECK(cut.find("Showing the newest 2 deployments") != std::string::npos);
+    const std::string whole = render_deployments_list({d, d}, {"", ""});
+    CHECK(whole.find("data-truncated") == std::string::npos);
+    // An empty list shows the empty copy and no cut note, even if asked.
+    CHECK(render_deployments_list({}, {}, true).find("data-truncated") == std::string::npos);
+}
+
 TEST_CASE("render_deployments_list: empty copy, escaping, aged-out target",
           "[deployment][render]") {
     const std::string empty = render_deployments_list({}, {});
