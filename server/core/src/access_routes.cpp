@@ -26,7 +26,16 @@ namespace {
 
 constexpr const char* kHtml = "text/html; charset=utf-8";
 
-// Gate order matters: the admin gate runs BEFORE the store is read, so a denied caller
+// An empty username would match no row, so the "your own account" protections would
+// silently not apply. Refuse rather than render a wrong page.
+void refuse_empty_username(httplib::Response& res) {
+    spdlog::error("access: authenticated session has an empty username; refusing");
+    res.status = 500;
+    res.set_header("Cache-Control", "no-store");
+    res.set_content("Session has no username.", "text/plain; charset=utf-8");
+}
+
+// Gate order matters: the loud admin gate runs BEFORE the store is read, so a denied caller
 // never causes a read. Returns the caller's username, or nullopt after writing the response.
 std::optional<std::string> gate(const Deps& d, const httplib::Request& req, httplib::Response& res) {
     if (!d.admin_fn(req, res))
@@ -35,13 +44,8 @@ std::optional<std::string> gate(const Deps& d, const httplib::Request& req, http
     const auto session = d.auth_fn(req, res);
     if (!session)
         return std::nullopt;
-    // An empty username would match no row, so the "your own account" protections would
-    // silently not apply. Refuse rather than render a wrong page.
     if (session->username.empty()) {
-        spdlog::error("access: authenticated session has an empty username; refusing");
-        res.status = 500;
-        res.set_header("Cache-Control", "no-store");
-        res.set_content("Session has no username.", "text/plain; charset=utf-8");
+        refuse_empty_username(res);
         return std::nullopt;
     }
     return session->username;
@@ -193,10 +197,7 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
                  if (session->username.empty()) {
-                     spdlog::error("access: authenticated session has an empty username; refusing");
-                     res.status = 500;
-                     res.set_header("Cache-Control", "no-store");
-                     res.set_content("Session has no username.", "text/plain; charset=utf-8");
+                     refuse_empty_username(res);
                      return;
                  }
                  auto grants = deps.list_assignments_fn();

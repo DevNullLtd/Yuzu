@@ -305,8 +305,6 @@
     }).then(function (v) { if (v) location.assign('/login'); });
   };
 
-  ACTS['goto-login'] = function () { location.assign('/login'); };
-
   ACTS['signout-all'] = function () {
     return window.YuzuDialog.confirm({
       title: 'Sign out everywhere',
@@ -328,9 +326,8 @@
         say('bad', notes.join(' '));
         var msg = document.getElementById('acc-msg');
         if (msg) {
-          var go = el('button', 'btn sm', 'Go to sign in');
-          go.type = 'button';
-          go.dataset.act = 'goto-login';
+          var go = el('a', 'btn sm', 'Go to sign in');
+          go.href = '/login';
           msg.replaceChildren(go);
         }
       });
