@@ -305,15 +305,16 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                 auto session = auth_fn(req, res);
                 if (session) {
+                    // Every pair reaches the trail: a long list is split over several rows.
                     if (!outcome.confirmed.empty() || outcome.unconfirmed.empty())
-                        audit_fn(req, "directory.group_mapping.update", "success",
-                                 "Directory", "group-mappings",
-                                 integrations::mapping_audit_detail(outcome.confirmed));
+                        for (const auto& d : integrations::mapping_audit_chunks(outcome.confirmed))
+                            audit_fn(req, "directory.group_mapping.update", "success",
+                                     "Directory", "group-mappings", d);
                     if (!outcome.unconfirmed.empty())
-                        audit_fn(req, "directory.group_mapping.update", "failure",
-                                 "Directory", "group-mappings",
-                                 integrations::mapping_audit_detail(outcome.unconfirmed, 1000,
-                                                                    "not confirmed by read-back"));
+                        for (const auto& d : integrations::mapping_audit_chunks(
+                                 outcome.unconfirmed, "not confirmed by read-back"))
+                            audit_fn(req, "directory.group_mapping.update", "failure",
+                                     "Directory", "group-mappings", d);
                 }
                 auto mappings = stored ? *stored : std::map<std::string, std::string>{};
 

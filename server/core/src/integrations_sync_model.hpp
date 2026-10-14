@@ -20,15 +20,18 @@ struct MappingChange {
     std::string role_name;
 };
 
-/// Audit detail for `directory.group_mapping.update`: the count plus the
-/// group-to-role pairs, so the row records WHAT was configured, not just how
-/// many. Free text is operator- and directory-supplied, so control bytes are
-/// replaced (an audit row must not line-split) and the whole detail is bounded.
-[[nodiscard]] inline std::string
-mapping_audit_detail(const std::vector<MappingChange>& changes, std::size_t cap = 1000,
-                     std::string_view verb = "updated") {
+/// Audit details for `directory.group_mapping.update`: the group-to-role pairs,
+/// so a row records WHAT was configured, not just how many. Free text is
+/// operator- and directory-supplied, so control bytes are replaced (an audit
+/// row must not line-split) and each value is clipped. Every pair is recorded:
+/// a long list is split across several details, each at most `cap` bytes, so
+/// padding a request can never push an applied pair out of the trail. An empty
+/// list yields one detail ("0 mappings <verb>:").
+[[nodiscard]] inline std::vector<std::string>
+mapping_audit_chunks(const std::vector<MappingChange>& changes, std::string_view verb = "updated",
+                     std::size_t cap = 1000) {
     auto clean = [](const std::string& s) {
-        std::string out = s;
+        std::string out = s.size() > 256 ? s.substr(0, 256) + "..." : s;
         for (auto& c : out) {
             const auto u = static_cast<unsigned char>(c);
             if (u < 0x20 || u == 0x7f)
@@ -36,18 +39,26 @@ mapping_audit_detail(const std::vector<MappingChange>& changes, std::size_t cap 
         }
         return out;
     };
-    std::string out = std::to_string(changes.size()) + " mappings " + std::string(verb) + ":";
-    bool first = true;
+    std::vector<std::string> out;
+    std::string body;
+    std::size_t in_chunk = 0;
+    auto flush = [&] {
+        out.push_back(std::to_string(in_chunk) + " mappings " + std::string(verb) + ":" + body);
+        body.clear();
+        in_chunk = 0;
+    };
     for (const auto& ch : changes) {
-        std::string piece = std::string(first ? " " : ", ") + clean(ch.group_id) + "=" +
-                            (ch.role_name.empty() ? std::string("(removed)") : clean(ch.role_name));
-        first = false;
-        if (out.size() + piece.size() > cap) {
-            out += " ...";
-            break;
-        }
-        out += piece;
+        const std::string piece = std::string(in_chunk ? ", " : " ") + clean(ch.group_id) + "=" +
+                                  (ch.role_name.empty() ? std::string("(removed)")
+                                                         : clean(ch.role_name));
+        // 24 bytes of headroom for the "<n> mappings <verb>:" prefix.
+        if (in_chunk && body.size() + piece.size() + 24 + verb.size() > cap)
+            flush();
+        body += piece;
+        ++in_chunk;
     }
+    if (in_chunk || out.empty())
+        flush();
     return out;
 }
 

@@ -5586,7 +5586,7 @@ Record group-to-role mappings (the RBAC role intended for a synced group's membe
 
 **Response (503):** `directory_sync` unavailable.
 
-**Audit:** `directory.group_mapping.update` records the pairs (`N mappings updated: <group_id>=<role>, <group_id>=(removed)`), bounded and with control bytes replaced. Mappings are recorded for reference; nothing reads them at sign-in. The write helpers swallow store failures and the route still answers `200`, so a client that needs certainty compares the echoed set with what it sent (the Integrations page does). The route reads the stored set back before auditing: stored pairs get a `result=success` row and pairs the store did not take get a `result=failure` row (`N mappings not confirmed by read-back: ...`); a failed read-back confirms nothing, removals included.
+**Audit:** `directory.group_mapping.update` records the pairs (`N mappings updated: <group_id>=<role>, <group_id>=(removed)`), with control bytes replaced; a long list is split across several rows so every pair is recorded. Mappings are recorded for reference; nothing reads them at sign-in. The write helpers swallow store failures and the route still answers `200`, so a client that needs certainty compares the echoed set with what it sent (the Integrations page does). The route reads the stored set back before auditing: stored pairs get a `result=success` row and pairs the store did not take get a `result=failure` row (`N mappings not confirmed by read-back: ...`); a failed read-back confirms nothing, removals included.
 
 #### `GET /api/v1/directory/users`
 

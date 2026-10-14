@@ -44,10 +44,12 @@ TEST_CASE("url policy: scheme+host drops userinfo path query and fragment", "[in
 }
 
 TEST_CASE("mapping audit detail: pairs, removal marker, count", "[integrations][audit]") {
-    using integrations::MappingChange;
-    const auto d = integrations::mapping_audit_detail(
-        {{"g-1", "Operator"}, {"g-2", ""}});
-    CHECK(d == "2 mappings updated: g-1=Operator, g-2=(removed)");
+    const auto d = integrations::mapping_audit_chunks({{"g-1", "Operator"}, {"g-2", ""}});
+    REQUIRE(d.size() == 1);
+    CHECK(d[0] == "2 mappings updated: g-1=Operator, g-2=(removed)");
+    const auto e = integrations::mapping_audit_chunks({});
+    REQUIRE(e.size() == 1);
+    CHECK(e[0] == "0 mappings updated:");
 }
 
 TEST_CASE("mapping read-back: only pairs the store shows are confirmed", "[integrations][audit]") {
@@ -65,8 +67,9 @@ TEST_CASE("mapping read-back: only pairs the store shows are confirmed", "[integ
     REQUIRE(out.unconfirmed.size() == 2);
     CHECK(out.unconfirmed[0].group_id == "g-2");
     CHECK(out.unconfirmed[1].group_id == "g-3");
-    CHECK(integrations::mapping_audit_detail(out.unconfirmed, 1000, "not confirmed by read-back") ==
-          "2 mappings not confirmed by read-back: g-2=Operator, g-3=(removed)");
+    const auto d = integrations::mapping_audit_chunks(out.unconfirmed, "not confirmed by read-back");
+    REQUIRE(d.size() == 1);
+    CHECK(d[0] == "2 mappings not confirmed by read-back: g-2=Operator, g-3=(removed)");
 }
 
 TEST_CASE("mapping read-back: a group named twice counts as its last entry", "[integrations][audit]") {
@@ -104,18 +107,35 @@ TEST_CASE("mapping read-back: a failed read confirms nothing, removals included"
 }
 
 TEST_CASE("mapping audit detail: control bytes cannot split the row", "[integrations][audit]") {
-    const auto d = integrations::mapping_audit_detail({{"g\r\n1", "Ro\nle"}});
-    CHECK(d.find('\n') == std::string::npos);
-    CHECK(d.find('\r') == std::string::npos);
-    CHECK(d == "1 mappings updated: g??1=Ro?le");
+    const auto d = integrations::mapping_audit_chunks({{"g\r\n1", "Ro\nle"}});
+    REQUIRE(d.size() == 1);
+    CHECK(d[0].find('\n') == std::string::npos);
+    CHECK(d[0].find('\r') == std::string::npos);
+    CHECK(d[0] == "1 mappings updated: g??1=Ro?le");
 }
 
-TEST_CASE("mapping audit detail: bounded", "[integrations][audit]") {
+TEST_CASE("mapping audit detail: a long list is split, never truncated", "[integrations][audit]") {
+    // Padding a request must not push an applied pair out of the trail.
     std::vector<integrations::MappingChange> many;
-    for (int i = 0; i < 500; ++i)
-        many.push_back({"group-" + std::to_string(i), "Operator"});
-    const auto d = integrations::mapping_audit_detail(many, 1000);
-    CHECK(d.size() <= 1000 + 4);
-    CHECK(d.starts_with("500 mappings updated:"));
-    CHECK(d.ends_with(" ..."));
+    for (int i = 0; i < 300; ++i)
+        many.push_back({"decoy-group-" + std::to_string(i), "Operator"});
+    many.push_back({"the-real-group", "Administrator"});
+    const auto chunks = integrations::mapping_audit_chunks(many);
+    REQUIRE(chunks.size() > 1);
+    std::size_t pairs = 0;
+    bool found = false;
+    for (const auto& c : chunks) {
+        CHECK(c.size() <= 1000);
+        CHECK(c.find("...") == std::string::npos);
+        found = found || c.find("the-real-group=Administrator") != std::string::npos;
+        for (std::size_t at = 0; (at = c.find('=', at)) != std::string::npos; ++at)
+            ++pairs;
+    }
+    CHECK(found);
+    CHECK(pairs == 301);
+
+    // One oversized value is clipped, not allowed to blow a row past the bound.
+    const auto big = integrations::mapping_audit_chunks({{std::string(5000, 'g'), "Operator"}});
+    REQUIRE(big.size() == 1);
+    CHECK(big[0].size() < 400);
 }

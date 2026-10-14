@@ -886,3 +886,31 @@ TEST_CASE("DiscoveryRoutes[pg]: group mapping audit records what is stored, not 
     CHECK(h.audits[0].result == "failure");
     CHECK(h.audits[0].detail == "1 mappings not confirmed by read-back: g2=(removed)");
 }
+
+TEST_CASE("DiscoveryRoutes[pg]: a large mapping request is audited in full, over several rows",
+          "[directory_sync][pg][routes]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+
+    // Decoys ahead of the pair that matters must not push it out of the trail.
+    nlohmann::json body = {{"mappings", nlohmann::json::array()}};
+    for (int i = 0; i < 120; ++i)
+        body["mappings"].push_back({{"group_id", "decoy-group-" + std::to_string(i)},
+                                    {"role_name", "Operator"}});
+    body["mappings"].push_back({{"group_id", "the-real-group"}, {"role_name", "Administrator"}});
+    REQUIRE(h.put_mappings(body.dump()));
+
+    REQUIRE(h.audits.size() > 1);
+    bool found = false;
+    std::size_t pairs = 0;
+    for (const auto& a : h.audits) {
+        CHECK(a.action == "directory.group_mapping.update");
+        CHECK(a.result == "success");
+        CHECK(a.detail.size() <= 1000);
+        found = found || a.detail.find("the-real-group=Administrator") != std::string::npos;
+        for (std::size_t at = 0; (at = a.detail.find('=', at)) != std::string::npos; ++at)
+            ++pairs;
+    }
+    CHECK(found);
+    CHECK(pairs == 121);
+}
