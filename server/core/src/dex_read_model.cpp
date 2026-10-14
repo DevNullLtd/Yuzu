@@ -181,26 +181,19 @@ namespace {
 
 DexStabilityFigures apps_figures(int64_t crashes, int64_t hangs, int64_t affected, int64_t capped_crashes,
                                  int64_t capped_hangs, const std::string& last_seen,
-                                 std::optional<int64_t> population, const DexEffectivePolicy& eff,
-                                 int& stat_failures) {
+                                 std::optional<int64_t> population, const DexEffectivePolicy& eff) {
     DexStabilityFigures f;
     f.crashes = crashes;
     f.hangs = hangs;
     f.distinct_devices = affected;
     f.last_seen = last_seen;
-    // A refusal (unknown or zero population, affected > population) is not a
-    // failure; only a nullopt on input that met the preconditions is.
+    // An unknown or zero population, or affected > population, is a refusal
+    // (null share / rate), not a failure.
     if (population && *population > 0) {
-        if (affected >= 0 && affected <= *population) {
+        if (affected >= 0 && affected <= *population)
             f.share_affected = dex_proportion(affected, *population);
-            if (!f.share_affected)
-                ++stat_failures;
-        }
-        if (crashes + hangs >= 0) {
+        if (crashes + hangs >= 0)
             f.rate_per_1000 = dex_rate(crashes + hangs, static_cast<double>(*population) / 1000.0);
-            if (!f.rate_per_1000)
-                ++stat_failures;
-        }
     }
     StabilityInputs in;
     in.reporting_devices = population.value_or(0);
@@ -253,7 +246,7 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
         DexAppStability a;
         a.subject = r.subject;
         a.figures = apps_figures(r.crashes, r.hangs, r.affected_devices, r.capped_crashes,
-                                 r.capped_hangs, r.last_seen, population, eff, m.stat_failures);
+                                 r.capped_hangs, r.last_seen, population, eff);
         a.version_count = r.version_count;
         a.versions_truncated = r.version_count > kDexAppsVersionCap;
         index[a.subject] = m.apps.size();
@@ -269,7 +262,7 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
         DexAppVersionStability v;
         v.version = *r.version;
         v.figures = apps_figures(r.crashes, r.hangs, r.affected_devices, r.capped_crashes,
-                                 r.capped_hangs, r.last_seen, population, eff, m.stat_failures);
+                                 r.capped_hangs, r.last_seen, population, eff);
         m.apps[it->second].versions.push_back(std::move(v));
     }
     std::stable_sort(m.apps.begin(), m.apps.end(), [](const DexAppStability& x, const DexAppStability& y) {
@@ -336,7 +329,6 @@ std::string dex_apps_json(const DexAppsModel& model) {
     out["apps"] = std::move(arr);
     out["population"] = model.population ? json(*model.population) : json(nullptr);
     out["population_basis"] = kDexAppsPopulationBasis;
-    out["stat_failures"] = model.stat_failures;
     return out.dump();
 }
 

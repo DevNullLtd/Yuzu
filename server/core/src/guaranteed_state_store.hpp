@@ -285,8 +285,8 @@ public:
     /// device's events in the `capped_*` sums (the stability score's caller
     /// duty). `std::nullopt` on a degraded read (store-not-open / pool-timeout /
     /// query-error), never collapsed into an empty vector, same contract as
-    /// `dex_signal_summary_checked`. The row order is a GROUPING order only:
-    /// the published ranking is restored by `dex_apps_model_from_rows`.
+    /// `dex_signal_summary_checked`. Row order is unspecified (no ORDER BY):
+    /// `dex_apps_model_from_rows` owns the published ranking.
     std::optional<std::vector<DexAppStabilityRow>>
     dex_app_stability_checked(const std::string& since, const std::string& platform, int app_limit,
                               int version_limit, std::int64_t per_device_cap) const;

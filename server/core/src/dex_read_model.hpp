@@ -149,7 +149,6 @@ struct DexAppsModel {
     std::string window;
     std::optional<int64_t> population; ///< Windows devices online now; nullopt = unknown (never 0)
     std::vector<DexAppStability> apps;
-    int stat_failures{0};
     bool degraded{false};
 };
 

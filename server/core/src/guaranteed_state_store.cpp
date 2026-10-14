@@ -1289,8 +1289,7 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 "FROM ad JOIN vc USING (subject) GROUP BY ad.subject "
                 "UNION ALL "
                 "SELECT subject, version, c::bigint, h::bigint, a::bigint, cc::bigint, ch::bigint,"
-                " ls, 0::bigint FROM ranked WHERE rn <= $4::bigint "
-                "ORDER BY subject, version NULLS FIRST",
+                " ls, 0::bigint FROM ranked WHERE rn <= $4::bigint",
                 std::vector<std::string>{since, platform,
                                          std::to_string(std::clamp(app_limit, 0, kMaxEventsLimit)),
                                          std::to_string(std::clamp(version_limit, 0, kMaxEventsLimit)),

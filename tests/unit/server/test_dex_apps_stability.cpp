@@ -78,7 +78,6 @@ TEST_CASE("apps model: known-answer figures for one application", "[dex][apps_mo
     CHECK(*f.score.band == StabilityBand::Excellent);
     REQUIRE(f.score.deductions.size() == 4);
     CHECK_FALSE(f.score.deductions[3].assessed); // regression: no sampled exposure here
-    CHECK(m.stat_failures == 0);
     CHECK(m.population == std::optional<int64_t>{50});
 }
 
@@ -131,7 +130,6 @@ TEST_CASE("apps model: unknown or zero population gives no share, no rate, no sc
         CHECK_FALSE(f.score.score);
         CHECK(std::string(f.score.withheld) == "no_population");
         CHECK(f.score.deductions.empty());
-        CHECK(m.stat_failures == 0);
     }
 }
 
@@ -141,7 +139,6 @@ TEST_CASE("apps model: more devices affected than online is a refusal, not a cla
     const auto& f = m.apps[0].figures;
     CHECK_FALSE(f.share_affected);
     CHECK(std::string(f.score.withheld) == "inconsistent");
-    CHECK(m.stat_failures == 0);
 }
 
 TEST_CASE("apps model: a one-device application is published with no floor", "[dex][apps_model]") {
@@ -201,7 +198,7 @@ TEST_CASE("apps json: exact golden for the unknown-population model", "[dex][app
     const std::string expect =
         R"({"apps":[{)" + fig + R"(,"subject":"a.exe","version_count":1,"versions":[{)" + fig +
         R"(,"version":"1.0"}],"versions_truncated":false}],"population":null,)"
-        R"("population_basis":"windows_online","stat_failures":0,"window":"7d"})";
+        R"("population_basis":"windows_online","window":"7d"})";
     CHECK(dex_apps_json(m) == expect);
 }
 
@@ -240,5 +237,5 @@ TEST_CASE("apps json: an empty model", "[dex][apps_model]") {
     DexAppsModel m;
     m.window = "7d";
     CHECK(dex_apps_json(m) ==
-          R"({"apps":[],"population":null,"population_basis":"windows_online","stat_failures":0,"window":"7d"})");
+          R"({"apps":[],"population":null,"population_basis":"windows_online","window":"7d"})");
 }

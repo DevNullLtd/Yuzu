@@ -2608,7 +2608,7 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
     // Additive per-application and per-version figures.
     CHECK(j["data"]["population"].is_number_integer());
     CHECK(j["data"]["population_basis"] == "windows_online");
-    CHECK(j["data"].contains("stat_failures"));
+    CHECK_FALSE(j["data"].contains("stat_failures"));
     const auto& first = j["data"]["apps"][0];
     for (const char* k : {"share_affected", "rate_per_1000", "score", "version_count", "versions_truncated"})
         CHECK(first.contains(k));
