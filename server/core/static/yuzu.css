@@ -299,21 +299,6 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 :is(.panel > .hd, .card-header) .end { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .panel > .pb, .card-body { padding: 16px; }
 
-/* -- Readout: one panel, figures separated by rules (replaces a row of KPI tiles) -- */
-.readout { display: flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: var(--rad-panel); background: var(--surface); }
-.readout > .ro { flex: 1 1 170px; padding: 14px 18px; border-left: 1px solid var(--line); min-width: 0; }
-.readout > .ro:first-child { border-left: 0; }
-.readout .v { font-size: 26px; font-weight: 500; letter-spacing: -.02em; line-height: 1.15; }
-.readout .v small { font-size: 14px; color: var(--mut); font-weight: 400; letter-spacing: 0; }
-.readout .l { color: var(--mut); font-size: 13px; margin-top: 2px; }
-.readout .d { font-size: 12.5px; margin-top: 4px; color: var(--mut); }
-.readout .d.up { color: var(--ok); }
-.readout .d.dn { color: var(--bad); }
-.readout .d.wn { color: var(--warn); }
-.readout > .ro.ok .v { color: var(--ok); }
-.readout > .ro.warn .v { color: var(--warn); }
-.readout > .ro.bad .v { color: var(--bad); }
-
 /* -- Buttons -------------------------------------------------------------
    .btn is the neutral button; .btn-secondary is that same look. The product
    writes variants both ways (`btn btn-danger` and a bare `btn-danger`), so
@@ -346,7 +331,6 @@ a:where(:not([class])):hover { color: var(--primary-h); }
    state - no pulse. The doubled class lets the hover rule outrank the
    -primary / -danger hover rules the armed button also carries. */
 .btn-confirming, .btn-confirming.btn-confirming:hover:not(:disabled) { background: var(--bad); border-color: var(--bad); color: var(--on-primary); filter: none; }
-.rowact { display: flex; gap: 4px; justify-content: flex-end; }
 
 /* -- Segmented control: <div class="seg"> of buttons (.on) or radio labels -- */
 .seg { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px; background: var(--bg);
@@ -368,8 +352,6 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 .pill.bad, .badge-danger { color: var(--bad); background: var(--mds-color-bg-error-tinted); }
 .pill.info, .badge-info { color: var(--info); background: var(--mds-color-bg-info-tinted); }
 .pill.idle, .badge-neutral { color: var(--mut); background: var(--surface2); }
-.chip { font-size: 13px; color: var(--mut); }
-.chip b { color: var(--ink); font-weight: 600; margin-left: 3px; }
 /* OS name tag: a hairline-boxed mono label */
 .os-tag { padding: 0 5px; white-space: nowrap; border: 1px solid var(--line2); border-radius: 3px; color: var(--mut);
           font-family: var(--mds-font-family-mono); font-size: 11.5px; }
@@ -377,8 +359,6 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 .sd { width: 8px; height: 8px; display: inline-block; margin-right: 8px; }
 .s-on { background: var(--ok); }
 .s-off { background: var(--faint); }
-.s-bad { background: var(--bad); }
-.s-w { background: var(--warn); }
 
 /* -- Notes and alerts: bordered, never a coloured slab -- */
 .note, .alert { padding: 12px 14px; border: 1px solid var(--line2); border-radius: var(--rad-panel);
@@ -412,40 +392,14 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 :is(.data-table, table).compact td { font-size: var(--text-sm); }
 :is(.data-table, table):is(.compact, .comfortable) th { padding: 8px 16px; font-size: 12.5px; }
 
-/* -- Forms -- */
-.input, .in, .fld select, .fld textarea { height: var(--ctl); padding: 0 10px; background: var(--bg); color: var(--ink);
-                                         border: 1px solid var(--line2); border-radius: var(--rad-ctl); font: inherit; min-width: 0;
-                                         transition: border-color .12s; }
-.in, .fld select, .fld textarea { width: 100%; }
-.input:focus-visible, .in:focus-visible, .fld select:focus-visible, .fld textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; border-color: var(--focus); }
-.input::placeholder, .in::placeholder { color: var(--faint); }
-.input:disabled, .in:disabled { opacity: 0.5; cursor: not-allowed; }
-.in.mono, .input.mono { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
-.fld textarea { height: auto; padding: 8px 10px; min-height: 84px; resize: vertical; font-family: var(--mds-font-family-mono); font-size: 12.5px; }
-.form { display: grid; gap: 16px; padding: 16px; }
-.fld { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
-.fld > label, .fld > .lb { font-size: 13px; font-weight: 500; color: var(--ink2); }
-.fld .hint { color: var(--mut); font-size: 12.5px; }
-.fld .seg { align-self: flex-start; }
-.row2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; }
-.btns { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 16px; }
-/* Toggle row: label + hint on the left, .sw on the right */
-.tog { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--line); }
-.tog:last-child { border-bottom: 0; }
-.tog .t b { display: block; font-weight: 500; color: var(--ink); }
-.tog .t span { color: var(--mut); font-size: 13px; }
-.sw { appearance: none; -webkit-appearance: none; width: 36px; height: 20px; flex: 0 0 36px; margin: 2px 0 0; position: relative;
-      background: var(--line2); border: 0; border-radius: 3px; cursor: pointer; transition: background-color .12s; }
-.sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 2px; background: var(--raise); transition: left .12s; }
-.sw:checked { background: var(--primary); }
-.sw:checked::after { left: 18px; background: var(--on-primary); }
-.sw:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-.chk { accent-color: var(--primary); width: 16px; height: 16px; }
-/* Key-value list inside a panel */
-.kvl > div { display: flex; justify-content: space-between; gap: 16px; padding: 9px 16px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
-.kvl > div:last-child { border-bottom: 0; }
-.kvl span { color: var(--mut); }
-.kvl b { font-weight: 500; color: var(--ink); text-align: right; }
+/* -- Forms: .input is the text control -- */
+.input { height: var(--ctl); padding: 0 10px; background: var(--bg); color: var(--ink);
+         border: 1px solid var(--line2); border-radius: var(--rad-ctl); font: inherit; min-width: 0;
+         transition: border-color .12s; }
+.input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; border-color: var(--focus); }
+.input::placeholder { color: var(--faint); }
+.input:disabled { opacity: 0.5; cursor: not-allowed; }
+.input.mono { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
 
 /* -- Progress bar (.compliance-bar is the product's older name) -- */
 .bar, .compliance-bar { height: 6px; border-radius: 2px; background: var(--line); overflow: hidden; }
@@ -454,11 +408,6 @@ td > .bar { min-width: 110px; }
 .bar.w > i, .compliance-fill.warn { background: var(--warn); }
 .bar.b > i, .compliance-fill.bad { background: var(--bad); }
 .compliance-fill.good { background: var(--ok); }
-
-/* -- Chart legend -- */
-.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 10px 16px 0; font-size: 13px; color: var(--mut); }
-.legend i { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 2px; }
-.legend b { color: var(--ink); font-weight: 600; margin-left: 4px; }
 
 /* -- Tabs: .tabs of links (.on) - or the product's .tab (.active). The active
    tab takes the yellow underline. -- */
@@ -488,8 +437,6 @@ td > .bar { min-width: 110px; }
 /* Icons (inline SVG via sprite) */
 .icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2;
         stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }
-.icon-lg { width: 20px; height: 20px; }
-.icon-xl { width: 24px; height: 24px; }
 
 /* Command palette - a pop-over on a scrim (no blur) */
 .cmd-palette-overlay {
