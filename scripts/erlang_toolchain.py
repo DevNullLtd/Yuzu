@@ -55,6 +55,206 @@ import sys
 import tempfile
 
 
+# ── OTP version pin ─────────────────────────────────────────────────────────
+# The oldest OTP release the gateway is built and tested against, as a floor
+# WITHIN its major: "28.4" accepts 28.4, 28.4.2, 28.5.0.7 and any later 28.x,
+# never 28.3 or 29.x (a new major is a deliberate migration, not a drift).
+# That one rule covers every pinned toolchain today - the Windows runner
+# contract (28.4.2, deploy/windows/toolchain-contract.json), the macOS CI
+# download (28.5.0.7, ci.yml) and setup-beam's otp-version '28' (latest 28.x,
+# ci.yml and release.yml) - while refusing the Homebrew `erlang` 29 that a
+# shell can put first on PATH. YUZU_OTP_VERSION overrides it for a one-off;
+# there is deliberately no Meson option, because a non-default option stored
+# in a branch-shared CI build dir breaks every older branch's --reconfigure
+# (see require_gateway in meson.build).
+DEFAULT_OTP_VERSION = "28.4"
+
+
+def wanted_otp_version():
+    """The pinned OTP version: YUZU_OTP_VERSION if set, else the default."""
+    return os.environ.get("YUZU_OTP_VERSION") or DEFAULT_OTP_VERSION
+
+
+def _exe(name):
+    return name + ".exe" if sys.platform == "win32" else name
+
+
+def probe_install(bin_dir):
+    """(canonical_bin, version) of the OTP install that bin_dir's erl runs.
+
+    Reads <root>/releases/<major>/OTP_VERSION, which every OTP install ships
+    (kerl, asdf, mise, Homebrew, distro packages, the Windows installer), so
+    usually no VM is started. The root is two levels above the real erl
+    binary: Homebrew's bin/erl is a symlink into lib/erlang/bin/, kerl's is a
+    script beside its releases/.
+
+    A launcher SHIM directory (Chocolatey's C:\\ProgramData\\chocolatey\\bin,
+    Scoop's shims) has no releases/ beside it, so the erl there is asked for
+    code:root_dir() and the install's own <root>/bin is returned instead of the
+    shim dir. That matters: rebar3 must never run through the Chocolatey
+    escript shim (the launcher-stub segfault this module's rebar3_prefix
+    exists to avoid), and YUZU_OTP_BIN goes first on PATH. (None, None) if
+    bin_dir has no working erl.
+    """
+    erl = os.path.join(bin_dir, _exe("erl"))
+    if not os.path.isfile(erl):
+        return None, None
+    roots = [os.path.dirname(os.path.dirname(os.path.realpath(erl))),
+             os.path.dirname(os.path.abspath(bin_dir))]
+    for root in roots:
+        for path in sorted(glob.glob(os.path.join(root, "releases", "*", "OTP_VERSION"))):
+            try:
+                with open(path, encoding="ascii", errors="replace") as f:
+                    v = f.read().strip()
+            except OSError:
+                continue
+            if v:
+                return bin_dir, v
+    try:
+        out = subprocess.run(
+            [erl, "-noshell", "-eval",
+             'R=code:root_dir(),'
+             'F=filename:join([R,"releases",erlang:system_info(otp_release),"OTP_VERSION"]),'
+             '{ok,B}=file:read_file(F),io:format("~s~n~s",[R,B]),halt().'],
+            capture_output=True, text=True, timeout=60,
+            **windows_stdio_isolation(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    lines = out.stdout.strip().splitlines()
+    if out.returncode != 0 or len(lines) < 2 or not lines[1].strip():
+        return None, None
+    real_bin = os.path.join(lines[0].strip(), "bin")
+    canonical = real_bin if os.path.isfile(os.path.join(real_bin, _exe("erl"))) else bin_dir
+    return canonical, lines[1].strip()
+
+
+def otp_version(bin_dir):
+    """The full OTP version ("28.4.2") that bin_dir's erl runs, or None."""
+    return probe_install(bin_dir)[1]
+
+
+def _version_key(v):
+    return tuple(int(p) if p.isdigit() else 0 for p in v.split("."))
+
+
+def version_matches(found, wanted):
+    """True when found is wanted or later, within wanted's major.
+
+    "28.4" accepts "28.4", "28.4.2", "28.5.0.7", "28.40"; rejects "28.3.9",
+    "29.1.1". "28" accepts any 28.x. Components compare numerically.
+    """
+    if not found or not wanted:
+        return False
+    f, w = _version_key(found), _version_key(wanted)
+    return f[0] == w[0] and f >= w
+
+
+def _kerl_installations():
+    """Install dirs from `kerl list installations` plus kerl's own dirs.
+
+    kerl need not be on PATH for its installs to be usable, so the default
+    locations are scanned too (KERL_BASE_DIR, ~/.kerl).
+    """
+    dirs = []
+    if shutil.which("kerl"):
+        try:
+            out = subprocess.run(["kerl", "list", "installations"],
+                                 capture_output=True, text=True, timeout=30)
+            for line in out.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    dirs.append(parts[1])
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for base in (os.environ.get("KERL_DEFAULT_INSTALL_DIR"),
+                 os.environ.get("KERL_BASE_DIR"),
+                 os.path.expanduser("~/.kerl")):
+        if base:
+            dirs += glob.glob(os.path.join(base, "*"))
+            dirs += glob.glob(os.path.join(base, "installs", "*"))
+    return dirs
+
+
+def otp_candidates():
+    """(source, bin_dir) for every OTP install found, in precedence order.
+
+    YUZU_OTP_BIN (explicit) first, then the erl already on PATH, then version
+    managers and well-known install locations. Duplicates (same real erl) are
+    dropped, keeping the first.
+    """
+    found = []
+
+    def add(source, bin_dir):
+        if bin_dir and os.path.isfile(os.path.join(bin_dir, _exe("erl"))):
+            found.append((source, os.path.abspath(bin_dir)))
+
+    add("YUZU_OTP_BIN", os.environ.get("YUZU_OTP_BIN"))
+    on_path = shutil.which("erl")
+    if on_path:
+        add("PATH", os.path.dirname(on_path))
+    for d in _kerl_installations():
+        add("kerl", os.path.join(d, "bin"))
+    asdf = os.environ.get("ASDF_DATA_DIR") or os.path.expanduser("~/.asdf")
+    for d in sorted(glob.glob(os.path.join(asdf, "installs", "erlang", "*"))):
+        add("asdf", os.path.join(d, "bin"))
+    mise = os.environ.get("MISE_DATA_DIR") or os.path.expanduser("~/.local/share/mise")
+    for d in sorted(glob.glob(os.path.join(mise, "installs", "erlang", "*"))):
+        add("mise", os.path.join(d, "bin"))
+    if sys.platform == "win32":
+        if os.environ.get("ERLANG_HOME"):
+            add("ERLANG_HOME", os.path.join(os.environ["ERLANG_HOME"], "bin"))
+        for root in ([r"C:\Erlang"] + glob.glob(r"C:\Program Files\Erlang*")
+                     + glob.glob(r"C:\Program Files\erl*")):
+            add("windows-install", os.path.join(root, "bin"))
+    else:
+        for prefix in ("/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"):
+            for d in sorted(glob.glob(os.path.join(prefix, "opt", "erlang@*"))):
+                add("homebrew", os.path.join(d, "bin"))
+            add("homebrew", os.path.join(prefix, "opt", "erlang", "bin"))
+        for d in (["/usr/local/lib/erlang/bin"] + sorted(glob.glob("/opt/erlang*/bin"))
+                  + ["/usr/lib64/erlang/bin", "/usr/lib/erlang/bin"]):
+            add("system", d)
+
+    seen, unique = set(), []
+    for source, bin_dir in found:
+        key = os.path.realpath(os.path.join(bin_dir, _exe("erl")))
+        if key not in seen:
+            seen.add(key)
+            unique.append((source, bin_dir))
+    return unique
+
+
+def find_otp(wanted=None):
+    """Resolve the pinned OTP. Returns (bin_dir, version, source, report).
+
+    bin_dir is None when nothing matches; report is a list of
+    "source: bin_dir -> version" lines describing every install inspected, for
+    the caller's error message. An explicit YUZU_OTP_BIN must itself match: a
+    wrong explicit choice is an error, never silently replaced. Otherwise the
+    erl already on PATH wins when it matches (it is the operator's active
+    choice); failing that, the highest matching release among the rest.
+    """
+    wanted = wanted or wanted_otp_version()
+    report, matches = [], []
+    for source, found_dir in otp_candidates():
+        bin_dir, v = probe_install(found_dir)
+        via = f" (shim for {bin_dir})" if bin_dir and bin_dir != found_dir else ""
+        report.append(f"{source}: {found_dir}{via} -> {v or 'no working erl'}")
+        bin_dir = bin_dir or found_dir
+        ok = version_matches(v, wanted)
+        if source == "YUZU_OTP_BIN":
+            return (bin_dir, v, source, report) if ok else (None, None, None, report)
+        if ok:
+            if source == "PATH":
+                return bin_dir, v, source, report
+            matches.append((_version_key(v), bin_dir, v, source))
+    if not matches:
+        return None, None, None, report
+    _, bin_dir, v, source = max(matches, key=lambda m: m[0])
+    return bin_dir, v, source, report
+
+
 def rebar3_prefix():
     """Return the argv prefix that runs rebar3 portably.
 
@@ -76,6 +276,23 @@ def rebar3_prefix():
         return None
 
     escript = _env_file("YUZU_ESCRIPT", "ESCRIPT")
+    if not escript:
+        # The pinned OTP (resolved by Meson, or here) before any other install,
+        # so rebar3 runs on the same release the build was configured against.
+        # Same preference as the install-root scan below (the real
+        # erts-*/bin/escript.exe first), but inside the pinned install; its
+        # bin/escript.exe only when bin/ really is an install's (releases/
+        # beside it), never a launcher-shim directory.
+        otp_bin = os.environ.get("YUZU_OTP_BIN") or find_otp()[0]
+        if otp_bin:
+            otp_root = os.path.dirname(os.path.abspath(otp_bin))
+            pinned = sorted(
+                glob.glob(os.path.join(otp_root, "erts-*", "bin", "escript.exe")),
+                reverse=True,
+            )
+            if os.path.isdir(os.path.join(otp_root, "releases")):
+                pinned.append(os.path.join(otp_bin, "escript.exe"))
+            escript = next((c for c in pinned if os.path.isfile(c)), None)
     if not escript:
         roots = [r"C:\Erlang"]
         roots += glob.glob(r"C:\Program Files\Erlang*")
@@ -131,10 +348,19 @@ def base_env():
     Prefer RUNNER_TEMP (guaranteed-native, per-runner, e.g. D:\\ci\\work-N\\
     _temp); validate it's a real drive-letter dir (never trust a "/tmp" that
     tempfile.gettempdir() may echo back); set TEMP/TMP/TMPDIR. Also turns
-    off interactive git credential prompts (hazard 4 above). No-op off
-    Windows (returns a plain os.environ copy).
+    off interactive git credential prompts (hazard 4 above).
+
+    On every platform, puts the pinned OTP's bin/ first on PATH: the one Meson
+    resolved at configure time (YUZU_OTP_BIN, passed through the target's
+    env), or one resolved here when the wrapper is run by hand. rebar3 is an
+    escript (`#!/usr/bin/env escript`), so this is what decides which OTP it
+    runs on; without it a newer OTP earlier on PATH (Homebrew `erlang`) wins.
     """
     env = os.environ.copy()
+    otp_bin = env.get("YUZU_OTP_BIN") or find_otp()[0]
+    if otp_bin:
+        env["YUZU_OTP_BIN"] = otp_bin
+        env["PATH"] = otp_bin + os.pathsep + env.get("PATH", "")
     if sys.platform == "win32":
         real_temp = os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()
         if not (len(real_temp) >= 2 and real_temp[1] == ":" and os.path.isdir(real_temp)):
@@ -226,3 +452,37 @@ def kill_tree(proc, timeout=30):
     if interrupted:
         raise KeyboardInterrupt
     return ok
+
+
+def main(argv=None):
+    """`erlang_toolchain.py find-otp [--version V]`
+
+    On success prints three lines (bin dir, full version, where it was found)
+    and exits 0. Meson runs this at configure time; ensure-erlang.sh runs it to
+    activate the same OTP in a shell. On failure exits 1 and lists every
+    install it inspected on stderr, so the operator sees why (e.g. "PATH:
+    /opt/homebrew/bin -> 29.1.1") rather than a silent wrong-version build.
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] != "find-otp":
+        sys.stderr.write("usage: erlang_toolchain.py find-otp [--version V]\n")
+        return 2
+    wanted = wanted_otp_version()
+    if len(argv) >= 3 and argv[1] == "--version" and argv[2]:
+        wanted = argv[2]
+    bin_dir, version, source, report = find_otp(wanted)
+    if bin_dir:
+        print(bin_dir)
+        print(version)
+        print(source)
+        return 0
+    sys.stderr.write(f"erlang_toolchain: no Erlang/OTP {wanted} found.\n")
+    sys.stderr.write("  inspected:\n" + "".join(f"    {r}\n" for r in report) if report
+                     else "  no Erlang/OTP install found at all.\n")
+    sys.stderr.write(f"  Install OTP {wanted} (e.g. `kerl build-install {wanted} "
+                     f"~/.kerl/{wanted}`), or point YUZU_OTP_BIN at its bin/.\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

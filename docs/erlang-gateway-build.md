@@ -26,15 +26,56 @@ bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl i
 
 ## Toolchain activation (Erlang on PATH)
 
-`rebar3` and the meson custom_target that wraps it both need `erl` on PATH. Forgetting to activate is the usual cause of phantom `.gateway_built` failures while the C++ targets succeed. Source the cross-platform helper before any gateway work and verify:
+**Meson resolves the gateway's Erlang/OTP itself, at configure time.** No
+activation step is needed for a Meson/Ninja build: `meson setup` runs
+`scripts/erlang_toolchain.py find-otp`, which searches the `erl` already on
+PATH, kerl (its installs are found whether or not the `kerl` command is on
+PATH), asdf, mise, Homebrew (`erlang@28` before `erlang`), common Linux
+prefixes and the Windows installer directories, and accepts an install only if
+its `releases/*/OTP_VERSION` passes the pin. The resolved `bin/` reaches the
+gateway build and both gateway tests as `YUZU_OTP_BIN`, which the wrappers put
+first on PATH, so `ninja` alone builds with the right OTP even when a newer
+one (Homebrew `erlang` 29) is first in the shell. The configure summary names
+what it chose: `Erlang gateway: enabled, Erlang/OTP 28.4 (kerl) at ...`.
+
+**The pin is a floor within the major: OTP 28.4 or any later 28.x.** It is
+`DEFAULT_OTP_VERSION` in `scripts/erlang_toolchain.py`, the single source
+for Meson, the wrappers and `ensure-erlang.sh`. It accepts every pinned
+toolchain today (the Windows runner contract's 28.4.2, the macOS CI download's
+28.5.0.7, setup-beam's latest 28.x) and refuses 28.3 and earlier and any 29.x:
+moving to a new major is a deliberate migration. `YUZU_OTP_VERSION=<v>`
+overrides it for one run; there is no Meson option for it, for the same
+branch-shared-build-dir reason as `require_gateway`. To see every install the
+resolver found and why it chose (or refused) each:
 
 ```bash
-source scripts/ensure-erlang.sh           # default: latest 28.x
-source scripts/ensure-erlang.sh 28.4.2    # exact pin
+python3 scripts/erlang_toolchain.py find-otp
+```
+
+If `rebar3` is present but no install passes the pin, configure prints
+`WARNING: Erlang gateway: SKIPPED.` with that inventory and continues without
+the gateway; `-Drequire_gateway=true` turns that into a configure error. An
+OTP installed after configure is picked up on the next reconfigure.
+
+**Shells:** for running rebar3 or `erl` by hand, the sourceable helper applies
+the same pin and the same search order to the current shell:
+
+```bash
+source scripts/ensure-erlang.sh           # the pin above: 28.4 or later 28.x
+source scripts/ensure-erlang.sh 28.4.2    # 28.4.2 or later 28.x
 command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
 ```
 
-OTP 28 is the only supported toolchain for the gateway test gates: `scripts/test_gateway.py` no longer carries the old OTP-25 CT teardown-race override (removed in #4800 because it could pass a run with an auto-skipped suite), so an OTP 25 run that hits that race now fails closed. The helper probes kerl → asdf → Homebrew (macOS) → MSYS2 installer (Windows) and **always returns 0** so it can't trip the caller's `set -e`. Callers MUST verify `command -v erl` themselves. Default version tracks `release.yml`'s `erlef/setup-beam` `otp-version` — bump both together. Native `cmd.exe`/PowerShell is out of scope; documented Windows build path is MSYS2 bash.
+A working `erl` of the wrong version on PATH is not success: the helper
+reports it, keeps searching, and if nothing passes the pin it says so and
+leaves PATH unchanged. It **always returns 0** so it can't trip the caller's
+`set -e`; callers verify. Native `cmd.exe`/PowerShell is out of scope; the
+documented Windows build path is MSYS2 bash.
+
+OTP 28 is the only supported toolchain for the gateway test gates:
+`scripts/test_gateway.py` no longer carries the old OTP-25 CT teardown-race
+override (removed in #4800 because it could pass a run with an auto-skipped
+suite), so an OTP 25 run that hits that race fails closed.
 
 ## Standing Erlang pitfalls
 
@@ -50,7 +91,12 @@ console (`CREATE_NO_WINDOW`) — those two shared through
 `scripts/erlang_toolchain.py`'s `windows_stdio_isolation()`.
 `build_gateway.py` relays the pipe to its own stdout and tees it to
 `<build dir>/meson-logs/yuzu_gateway_build.log`, which `ci.yml`'s Windows leg
-uploads with the rest of `meson-logs/` on failure. (If that file is held open
+uploads with the rest of `meson-logs/` on failure. The pipe and the log are
+used on **every** platform (they were once Windows-only): the gateway target
+runs in Ninja's console pool, so a redirected or IDE build otherwise keeps only
+the command line, and `meson-log.txt` is rewritten by every configure, so it
+cannot hold build output. The log starts with the time, the command and the
+OTP release and `bin/` it ran on. (If that file is held open
 by something that blocks deleting it, the run logs to a fresh
 `yuzu_gateway_build.<random>.log` beside it instead; the failure message
 always names the file actually written.) On a nonzero exit or a timeout

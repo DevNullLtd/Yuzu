@@ -26,6 +26,22 @@ project(
 cxx = meson.get_compiler('cpp')
 host_os  = host_machine.system()   # 'linux', 'windows', 'darwin'
 host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
+
+# ── Python for build/test helper scripts ─────────────────────────────────────
+# One interpreter for every custom_target, run_command and test that runs a
+# repo script; use `yuzu_python`, never a fresh yuzu_python.
+# On Windows it is the interpreter running Meson itself (native CPython, per
+# the runner toolchain contract): under MSYS2 bash a bare yuzu_python
+# resolves MSYS2's /usr/bin/python3 first, which cannot open the C:/ paths
+# Meson passes it, so every script target fails in ~0.04s ("can't open file
+# '/c/.../C:/...'"). Elsewhere it is unchanged: the first python3 on PATH, which
+# carries the modules the scripts import (PyYAML etc.) where a pipx/venv Meson's
+# own interpreter may not.
+if build_machine.system() == 'windows'
+  yuzu_python = import('python').find_installation()
+else
+  yuzu_python = find_program('python3', 'python')
+endif
 if cxx.get_id() == 'msvc'
   add_project_arguments(
     '/std:c++latest',           # meson's cpp_std has no MSVC c++23 option
@@ -162,7 +178,7 @@ if host_os == 'windows'
   # absl dep closure of protobuf+grpc is ~40 libs and shifts between
   # abseil versions; hand-listing would be a maintenance burden. Enumerating
   # here means a vcpkg abseil bump doesn't need a parallel meson.build edit.
-  _py = find_program('python3')
+  _py = yuzu_python
   _absl_enum = run_command(
     _py, '-c',
     'import glob, os, sys\n' +
@@ -612,7 +628,7 @@ endif
 # rather than a custom_target and never enters the default build graph.
 run_target('docs-regen',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('tools/plugin-doc-gen/plugin_doc_gen.py'),
     '--all', '--repo-root', meson.project_source_root(),
   ],
@@ -620,7 +636,33 @@ run_target('docs-regen',
 
 # ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────
 _rebar3 = find_program('rebar3', required: false)
+# The gateway builds and tests on ONE pinned OTP release, resolved here at
+# configure time so `ninja` alone uses it: no `source scripts/ensure-erlang.sh`
+# first, and no dependence on which `erl` the shell happens to put first (a
+# Homebrew `erlang` 29 ahead of kerl's 28.4 compiled chatterbox under 29 and
+# failed). The pin and the search (PATH, kerl, asdf, mise, Homebrew,
+# well-known prefixes, the Windows installers) live in one place,
+# scripts/erlang_toolchain.py, shared with the build/test wrappers and
+# ensure-erlang.sh. The resolved bin/ reaches them through YUZU_OTP_BIN, which
+# base_env() puts first on PATH. A new OTP install after configure needs a
+# reconfigure to be picked up.
+_gw_otp_bin = ''
+_gw_skip_reason = 'rebar3 not found'
 if _rebar3.found()
+  _gw_otp = run_command(
+    yuzu_python, meson.project_source_root() / 'scripts' / 'erlang_toolchain.py', 'find-otp',
+    check: false,
+  )
+  if _gw_otp.returncode() == 0
+    _gw_otp_out = _gw_otp.stdout().strip().split('\n')
+    _gw_otp_bin = _gw_otp_out[0]
+    _gw_otp_desc = 'Erlang/OTP ' + _gw_otp_out[1] + ' (' + _gw_otp_out[2] + ') at ' + _gw_otp_bin
+  else
+    _gw_skip_reason = ('rebar3 found, but not the pinned Erlang/OTP release:\n'
+                       + _gw_otp.stderr().strip())
+  endif
+endif
+if _gw_otp_bin != ''
   _gw_src = meson.project_source_root() / 'gateway'
   _gw_build_script = meson.project_source_root() / 'scripts' / 'build_gateway.py'
   # rebar3 must run from inside the gateway/ directory.
@@ -628,7 +670,8 @@ if _rebar3.found()
   # because Ninja quotes compound commands as a single argument, which
   # breaks cmd.exe on Windows.
   custom_target('gateway',
-    command: [find_program('python3'), _gw_build_script, _gw_src],
+    command: [yuzu_python, _gw_build_script, _gw_src],
+    env: {'YUZU_OTP_BIN': _gw_otp_bin},
     output: '.gateway_built',
     build_always_stale: true,
     build_by_default: true,
@@ -640,7 +683,7 @@ if _rebar3.found()
   )
   # ── Gateway tests (EUnit + Common Test) ──────────────────────────────
   _gw_test_script = meson.project_source_root() / 'scripts' / 'test_gateway.py'
-  _python3 = find_program('python3')
+  _python3 = yuzu_python
   # The test script prepends OTP 28 / rebar3 paths to PATH internally,
   # handling the case where Meson inherits a system PATH with OTP 25.
   #
@@ -669,7 +712,7 @@ if _rebar3.found()
     args: [_gw_test_script, _gw_src, 'eunit'],
     suite: 'gateway',
     timeout: 600,
-    env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit'},
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit', 'YUZU_OTP_BIN': _gw_otp_bin},
   )
   # Timeout 600s — must stay ABOVE test_gateway.py's per-suite
   # `_SUITE_DEADLINE_SECS['ct']` (540) so the wrapper's process-tree dump
@@ -683,9 +726,9 @@ if _rebar3.found()
     args: [_gw_test_script, _gw_src, 'ct'],
     suite: 'gateway',
     timeout: 600,
-    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct'},
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct', 'YUZU_OTP_BIN': _gw_otp_bin},
   )
-  message('Erlang gateway: enabled (rebar3 found)')
+  message('Erlang gateway: enabled, ' + _gw_otp_desc)
 else
   if get_option('require_gateway')
     # A skipped gateway is invisible: the build and every test leg stay green
@@ -694,17 +737,24 @@ else
     # CI legs use scripts/ci/assert-gateway-tests.py after configure instead,
     # because a non-default option stored in a persistent, branch-shared CI build
     # dir makes every older branch's --reconfigure fail ("Unknown options").
-    error('Erlang gateway required (-Drequire_gateway=true) but rebar3 was not '
-          + 'found on PATH. Install Erlang/OTP 28 + rebar3 (CI: see this leg\'s Erlang install step in ci.yml).')
+    error('Erlang gateway required (-Drequire_gateway=true) but it cannot be built: '
+          + _gw_skip_reason + '\nInstall the pinned Erlang/OTP + rebar3 '
+          + '(CI: see this leg\'s Erlang install step in ci.yml).')
   endif
-  message('Erlang gateway: skipped (rebar3 not found)')
+  if _rebar3.found()
+    # rebar3 is present, so a gateway build was evidently intended: say so
+    # loudly rather than skip as quietly as a machine with no Erlang at all.
+    warning('Erlang gateway: SKIPPED. ' + _gw_skip_reason)
+  else
+    message('Erlang gateway: skipped (rebar3 not found)')
+  endif
 endif
 
 # ── Deploy DLLs (Windows) ────────────────────────────────────────────────
 # Copies vcpkg dependency DLLs alongside executables and gathers plugin
 # DLLs into builddir/plugins/ so the agent can find them at runtime.
 if host_machine.system() == 'windows'
-  _python3 = find_program('python3')
+  _python3 = yuzu_python
   _deploy_script = meson.project_source_root() / 'scripts' / 'deploy_build_dlls.py'
   _build_root = meson.project_build_root()
 

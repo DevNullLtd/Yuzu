@@ -1078,7 +1078,7 @@ endforeach
 # assert-suite-cover.py and `--suite agent` select it. Needs no fixtures: --list-tests
 # never runs a test body. It tolerates the `--test-args '[tag]'` that meson appends to
 # every test in the suite (the script ignores trailing extras in the agent family).
-_agent_shard_python3 = find_program('python3', 'python')
+_agent_shard_python3 = yuzu_python
 test('agent shard partition invariant',
   _agent_shard_python3,
   args: [files('../scripts/ci/check-pg-shard-partition.py'),
@@ -2781,7 +2781,7 @@ if build_server
   # 'server-pg-smoke') is a genuine subset: exactly one entry, the expected
   # name, the expected exact case count, --allow-running-no-tests present,
   # and every matched case also carries [pg] (script's check_smoke()).
-  _pg_shard_python3 = find_program('python3', 'python')
+  _pg_shard_python3 = yuzu_python
   test('server pg shard partition invariant',
     _pg_shard_python3,
     args: [files('../scripts/ci/check-pg-shard-partition.py'),
@@ -2877,7 +2877,7 @@ if build_server
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
-_python3_test = find_program('python3', 'python')
+_python3_test = yuzu_python
 test('proto gen_proto version check',
   _python3_test,
   args: [files('test_gen_proto_version.py')],
@@ -2897,6 +2897,15 @@ test('gateway build wrapper',
   args: [files('test_build_gateway.py')],
   suite: 'docs',
   timeout: 180,
+)
+
+# OTP pin resolution (scripts/erlang_toolchain.py find-otp): the selection
+# rules Meson relies on at configure time, against fake installs. Hermetic.
+test('gateway OTP pin resolution',
+  _python3_test,
+  args: [files('test_erlang_toolchain_otp.py')],
+  suite: 'docs',
+  timeout: 120,
 )
 
 # Gateway image guards (#2150): the Dockerfile.gateway abi-guard's real text
