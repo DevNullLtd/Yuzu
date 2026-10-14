@@ -531,6 +531,9 @@ struct ExecHarness {
         wf_deps.capability_registry = &capability_registry; // BR-001 targeting gate
         wf_deps.param_validators = std::move(param_validators_override);
         routes.register_routes(sink, std::move(wf_deps));
+        // A browser sends these on every same-origin write; execute refuses a cookie-session
+        // dispatch without them (the cross-site tests clear or override them).
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     }
 
     ~ExecHarness() {
@@ -5494,4 +5497,28 @@ TEST_CASE("GET /api/v1/schedules: an unrecognized enabled_only value answers 400
     auto res = h.sink.Get("/api/v1/schedules?enabled_only=maybe");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+TEST_CASE("instruction execute: a cookie-session dispatch that is cross-site or header-less is "
+          "refused with 403 before anything is dispatched",
+          "[pg][workflow][executions][execute][csrf]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-CSRF", "CSRF");
+    const std::unordered_map<std::string, std::string> hostile[] = {
+        {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+        {{"Host", "yuzu.test"}}, // neither Origin nor Referer
+    };
+    for (const auto& hdrs : hostile) {
+        h.sink.default_headers = hdrs;
+        auto res = h.sink.Post("/api/instructions/def-CSRF/execute", R"({"agent_ids":["agent-1"]})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    // ... and the same-site request is not refused for that reason.
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+    auto ok = h.sink.Post("/api/instructions/def-CSRF/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(ok);
+    CHECK(ok->status != 403);
 }

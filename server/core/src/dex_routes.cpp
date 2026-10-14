@@ -2971,6 +2971,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // honest wording per scope, not the old two-message "not wired" vs
         // "degraded" split.
         std::optional<std::vector<AppPerfTrendPoint>> trend;
+        std::optional<AppPerfFleetReport> report; // whole-fleet scope only
+        DexVersionFailureView failure_view;       // NotShown for a group / model cohort
         std::vector<AppPerfVersionSummary> versions;
         if (!group.empty()) {
             trend = dex_perf_api_ ? dex_perf_api_->group_trend(group, app, version) : std::nullopt;
@@ -2997,15 +2999,27 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             }
             versions = app_perf_version_summaries(*trend);
         } else {
-            trend = dex_perf_api_ ? dex_perf_api_->app_fleet_trend(app, version) : std::nullopt;
-            if (!trend) {
-                res.set_content(placeholder("Application performance unavailable",
-                                            "App performance data unavailable (not configured "
-                                            "or degraded) — retry shortly."),
-                                "text/html; charset=utf-8");
-                return;
+            // Whole fleet: app_fleet_report is the REST/MCP projection of the same
+            // resource, the SAME B2 points plus the per-version crash and hang join,
+            // so the table below the trend cannot disagree with GET /dex/perf/app.
+            // The join degrading must not blank the performance table: fall back to
+            // the points alone and render the failure section as a failed read.
+            report = dex_perf_api_ ? dex_perf_api_->app_fleet_report(app, version) : std::nullopt;
+            if (report) {
+                failure_view = {DexVersionFailureView::State::Ready, &*report};
+                versions = app_perf_version_summaries(report->points);
+            } else {
+                failure_view.state = DexVersionFailureView::State::ReadFailed;
+                trend = dex_perf_api_ ? dex_perf_api_->app_fleet_trend(app, version) : std::nullopt;
+                if (!trend) {
+                    res.set_content(placeholder("Application performance unavailable",
+                                                "App performance data unavailable (not configured "
+                                                "or degraded) — retry shortly."),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                versions = app_perf_version_summaries(*trend);
             }
-            versions = app_perf_version_summaries(*trend);
         }
         // GAP-1 CLOSED (#4857, architect D1 ruling): model-selector values now
         // come from THIS seam's own `fleet_snapshot(kDexDefaultCohortKey)`,
@@ -3028,7 +3042,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (!c.cohort.empty())
                 model_values.push_back(c.cohort);
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
-                                                  window_days, version, model_values, model),
+                                                  window_days, version, model_values, model,
+                                                  failure_view),
                         "text/html; charset=utf-8");
     });
 

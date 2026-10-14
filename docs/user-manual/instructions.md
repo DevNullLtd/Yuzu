@@ -101,6 +101,53 @@ The Instruction Management page provides two authoring modes:
 
 Both modes are served as HTMX fragments.
 
+**Saving keeps what the YAML does not carry.** The editor's Save writes only the
+fields the YAML expresses (name, plugin, action, description, and the optional
+`type`, `version`, `concurrency` and `approval`). Everything else stored on the
+definition -- its instruction set, enabled flag, TTLs, result schema,
+visualization, response templates, platforms, minimum agent version, required
+plugins and readable payload -- is kept. When the YAML omits `type`, `version`,
+`concurrency` or `approval`, the stored value is kept as well; a value that
+differs from the stored one is an intentional edit and is written, and a change
+of `approval` is recorded in the audit detail as `approval_mode: <old> -> <new>`.
+
+**Library list.** The Definitions tab lists up to 100 definitions by default.
+`GET /fragments/instructions` takes `name`, `plugin`, `type` and `limit` (maximum
+500); a cut list says "Showing the first N. Narrow the filter." The "Needs
+approval" column and the instruction sets panel appear for callers who hold
+`InstructionDefinition:Read` and `InstructionSet:Read` respectively.
+
+**Page controls follow permissions.** New, Edit, Import, Delete and the set
+controls appear for callers who hold `InstructionDefinition:Write`,
+`InstructionDefinition:Delete`, `InstructionSet:Write` and `InstructionSet:Delete`
+respectively, not for a role. Each capability is probed once per page render, and
+a denied probe is audited as a denial, so loading the page as a caller who lacks
+a capability writes one denial row for it.
+
+**Sets.** The sets panel lists each set with the number of definitions in it.
+New set asks for a name and description. Delete set states that its definitions
+stay and become unassigned. Each library row has a set select that assigns the
+definition to a set or clears it.
+
+**Response templates.** Templates on a library row loads that definition's
+templates: the built-in default (never editable) first, then the authored ones.
+New, Edit and Delete open dialogs that call
+`/api/v1/definitions/{id}/response-templates`. Filters are written one per line as
+`column | op | value`.
+
+**Import and export.** Import definition takes the JSON document that Export
+produces (Ed25519-signed or not); unsigned documents can be refused by policy and
+a duplicate id is refused. When the audit record could not be written the page
+says so. Export saves the definition as `<id>.json`.
+
+**Dispatch.** Selecting a definition on the Executions tab reads its parameters
+from `GET /api/v1/instructions/{id}`; `grant_secret` and `grant_id` are write-only
+password inputs. The Target select offers a scope expression with Validate
+(syntax only) and Preview (needs `Infrastructure:Read`). Dispatch always
+confirms, naming the instruction, `plugin:action`, type and target; a definition
+whose approval mode is not `auto` says it will be submitted for approval and not
+run, and an expression that was not previewed needs `DISPATCH` typed to send.
+
 ---
 
 ## 3. InstructionDefinition Reference
@@ -434,7 +481,7 @@ corrected `parameter_schema`:
 2. Edit its `parameter_schema` (a string holding the schema JSON). Unless the server runs with
    `--allow-unsigned-definitions`, the edited document must also be signed before import, or the import
    answers `400` as unsigned: add a hex `signature` and `publicKey` (an Ed25519 signature over the exact
-   bytes of `yaml_source`, 128 and 64 hex characters). A definition whose `yaml_source` is empty cannot be
+   bytes of `yaml_source`, 128 and 64 hex characters). The signature covers `yaml_source` only, so `plugin`, `action`, `type`, `approval_mode` and `concurrency_mode` are read from it and must agree with the envelope. A definition whose `yaml_source` is empty cannot be
    signed (import answers an error about a signature without `yaml_source`), so only the unsigned flag
    works for it.
 3. Rehearse the import, because step 5 cannot be rehearsed (an existing id answers `409`) and a refused

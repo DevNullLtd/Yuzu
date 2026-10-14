@@ -180,6 +180,12 @@ enabling the SLE sources — deny-override wins).
   Because each sync **full-replaces** the device's rows, the identifier is purged
   **within one 24 h cycle** for a syncing agent (an offline agent purges on reconnect).
   This knob-flip full-replace is the erasure path available today.
+- **Stored data panel on the Hardware record.** The bottom of a device's Overview tab has a
+  **Stored data** control (loaded on click) that drives the same route. It needs
+  `Decommission:Delete` for the device, asks you to type the hostname (the agent id when none is
+  known) exactly, then confirms. It does not unenrol the device and does not remove tags,
+  custom properties, quarantine records or property schemas. A partial failure lists each
+  store's outcome and can be re-issued; a failed audit write refuses the erase.
 - **Decommission cascade — live via `DELETE /api/v1/sle/agents/{id}`.** This release wires
   the agent-decommission cascade to an audited REST route that clears the seven stores in
   the cascade for a removed device (inventory, installed-software, device-CI, app-perf,

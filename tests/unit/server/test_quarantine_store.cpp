@@ -186,6 +186,50 @@ TEST_CASE("QuarantineStore: non-quarantined device has no active status", "[pg][
     CHECK_FALSE(empty_id->has_value());
 }
 
+TEST_CASE("QuarantineStore: list_quarantined_in pushes the id restriction and the limit into the query",
+          "[pg][quarantine][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* id : {"s-a", "s-b", "s-c", "s-d"})
+        REQUIRE(store.quarantine_device(id, "admin", "r", "").has_value());
+
+    {   // nullptr = every agent, newest first
+        auto all = store.list_quarantined_in(nullptr, 0);
+        REQUIRE(all.has_value());
+        REQUIRE(all->size() == 4);
+        CHECK((*all)[0].agent_id == "s-d"); // newest first
+    }
+    {   // restricted to ids: only those come back
+        const std::vector<std::string> ids{"s-b", "s-d", "not-quarantined"};
+        auto r = store.list_quarantined_in(&ids, 0);
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == 2);
+        CHECK((*r)[0].agent_id == "s-d");
+        CHECK((*r)[1].agent_id == "s-b");
+    }
+    {   // the LIMIT applies to the restricted set (an excluded record cannot displace one)
+        const std::vector<std::string> ids{"s-a", "s-b"};
+        auto r = store.list_quarantined_in(&ids, 1);
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == 1);
+        CHECK((*r)[0].agent_id == "s-b"); // newest of the two, not s-d
+    }
+    {   // present-but-empty = deny-all, no matter the limit
+        const std::vector<std::string> none;
+        auto r = store.list_quarantined_in(&none, 0);
+        REQUIRE(r.has_value());
+        CHECK(r->empty());
+    }
+    {   // a released record is not active
+        REQUIRE(store.release_device("s-d").has_value());
+        auto r = store.list_quarantined_in(nullptr, 0);
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 3);
+    }
+}
+
 TEST_CASE("QuarantineStore: list quarantined devices", "[pg][quarantine][list]") {
     YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

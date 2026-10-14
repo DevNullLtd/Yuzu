@@ -205,22 +205,37 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
 # which counts as untwinned by design, so the count rises 199 -> 200.
 #
-# Both of the two changes above landed on 199; merged together the count is 201
-# (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
+# Device containment fragments (es-1): get.fragments-hardware-quarantine is "twinned" to GET
+# /api/v1/quarantine (no MCP list tool exists; the gap is recorded on the row), and
+# get.fragments-hardware-ci-containment is "composed-of:get.fragments-hardware-quarantine"
+# (a single-device read of the same active-record set; REST has no per-device GET). One
+# composed-of row, so 200 -> 201, measured by the checker, not hand-picked.
+#
+# Stored data panel (es-1): get.fragments-hardware-ci-stored-data is an "exception:" row (the
+# erase it fronts is DELETE /api/v1/sle/agents/{id}, which has no ledger row to compose), so
+# 201 -> 202, measured by the checker, not hand-picked.
+#
+# The DEX Alerts and policy-fragments changes above landed on 199 and merged together to 201
+# (199 + 1 + 1). The two containment rows above landed on that, so merged with them the count
+# is 203 (201 + 1 composed-of + 1 exception), the value the checker reports on the merged tree.
+#
+# Hardware record properties panel (device data, merged from dev): GET /fragments/hardware/ci/properties
+# is "planned:#2146" (its data routes, /api/agents/{id}/properties*, are dashboard-only with no REST v1
+# or MCP twin), so it deepens an untwinned surface by one row. Merged with the containment rows above
+# the count is 204 (203 + 1), the value the checker reports on the merged tree.
 #
 # Access Users page (PR X-1): re-surfaces the untwinned Settings users list as two read-only
 # fragments, GET /fragments/access/users/list (planned:#2146) and .../detail (composed-of the
 # list), +2. A GET /api/v1/users twin is not built here; the Settings rows and these two
-# are retired together when that twin lands. On top of the 201 above this is 203, the value the
-# checker reported on the merged tree, not hand-picked.
+# are retired together when that twin lands.
 #
 # Tokens and principals page (PR TGN-1): re-surfaces the untwinned Settings token and principal
 # lists as three read-only fragments, GET /fragments/access/tokens/list, .../principals/list
 # and .../principals/detail (each planned:#2146: the REST token twin is self-scope only and the
 # principal twins sit behind EnginePrincipal:Read, where the page keeps the stricter admin gate),
-# +3. With the Users page above, the count on the merged tree is 206 (203 + 3): the value the
-# checker reported, not hand-picked.
-BASELINE_UNTWINNED = 206
+# +3. Merged with the 204 above, the two Access pages make 209 (204 + 2 + 3), the value the
+# checker reports on the merged tree, not hand-picked.
+BASELINE_UNTWINNED = 209
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
