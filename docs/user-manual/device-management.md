@@ -22,7 +22,7 @@ yuzu-agent --server server.example.com:50051
 
 The agent will attempt registration, receive a "pending" status, and retry periodically until approved.
 
-**Server side (dashboard):** Navigate to **Settings > Pending Agents** to see the queue. Each entry shows the agent's hostname, OS, architecture, and the time it first connected. Click **Approve** or **Deny**.
+**Server side (dashboard):** Navigate to **Estate > Groups and enrolment** (or **Settings > Pending Agents**; both show the same queue). Each entry shows the agent's hostname, OS, architecture, version and the time it first asked to join (UTC). Click **Approve**, **Deny**, or **Forget** (removes a waiting request; the agent is queued again the next time it asks to join). **Approve all** and **Deny all** act on every waiting agent, including any that arrive after the page loaded, and are disabled when the list shows only part of the queue.
 
 **Server side (API):**
 
@@ -140,7 +140,7 @@ Reserved for future implementation. Proto fields exist for `machine_certificate`
 
 Administrators can configure rules that automatically approve agents matching specific criteria, reducing manual toil for large deployments.
 
-**View current auto-approval policies (dashboard):** Navigate to **Settings > Auto-Approve**.
+**View current auto-approval policies (dashboard):** Navigate to **Estate > Groups and enrolment** (or **Settings > Auto-Approve**). Each rule is described by what it matches: a hostname rule matches the hostname the agent reports (not verified), an address rule matches the address the server sees (IPv4 only). A rule that matches every agent is flagged.
 
 **Add an auto-approval rule:**
 
@@ -506,9 +506,9 @@ Most enrollment and device management operations are performed through the HTMX 
 
 | Route | Description |
 |---|---|
-| `GET /fragments/settings/pending` | Pending agents queue |
-| `GET /fragments/settings/tokens` | Enrollment tokens list |
-| `GET /fragments/settings/auto-approve` | Auto-approval policies |
+| `GET /fragments/settings/pending` | Pending agents queue (also hosted by `/groups`) |
+| `GET /fragments/settings/tokens` | Enrollment tokens list (also hosted by `/groups`) |
+| `GET /fragments/settings/auto-approve` | Auto-approval policies (also hosted by `/groups`) |
 | `GET /fragments/settings/updates` | OTA agent updates |
 
 ### Action Endpoints

@@ -2803,9 +2803,9 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
 | User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. |
 | Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
-| Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
-| Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
-| Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). |
+| Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. Also shown on the **Groups and enrolment** page (`/groups`, **Estate** group), from the same fragment. |
+| Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. Also shown on **Groups and enrolment**. |
+| Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). Also shown on **Groups and enrolment**. |
 | API Tokens | `/fragments/settings/api-tokens` | Create and revoke bearer tokens for REST API automation. |
 | Plugin Code Signing | `/fragments/settings/plugin-signing` | Upload a PEM trust bundle for agent plugin CMS signature verification, toggle the require-signed-plugins flag, and remove the bundle. The trust bundle persists at `<cert-dir>/plugin-trust-bundle.pem`; the require flag persists in `runtime_config` under key `plugin_signing_required`. Distribution to agents is operator-driven today (curl into a local file referenced by `--plugin-trust-bundle`); automatic agent-side fetch is a forthcoming change. See the user-manual *Agent Plugins → Plugin Code Signing* section. |
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
@@ -3466,7 +3466,7 @@ The default enrollment method. No pre-shared token is required.
 
 1. The agent starts and sends a `RegisterRequest` to the server.
 2. The server places the agent in the **pending queue**.
-3. An admin reviews pending agents in **Settings > Pending Agents**.
+3. An admin reviews pending agents in **Estate > Groups and enrolment** (or **Settings > Pending Agents**; both show the same queue).
 4. The admin approves or denies each agent.
 5. Approved agents complete registration on their next heartbeat.
 6. Denied agents are removed from the queue. They can re-register if restarted.
@@ -3476,12 +3476,12 @@ The default enrollment method. No pre-shared token is required.
 For automated or bulk deployment. Agents present a token at startup for instant enrollment.
 
 **Server side:**
-1. Navigate to **Settings > Enrollment Tokens**.
-2. Click **Generate Token**.
-3. Configure token properties:
-   - **Expiry** -- time limit (e.g., 24 hours, 7 days).
-   - **Max uses** -- how many agents can use this token (1 for single-device, unlimited for bulk).
-4. Copy the generated token string.
+1. Navigate to **Estate > Groups and enrolment** (or **Settings > Enrollment Tokens**; both show the same tokens).
+2. Fill in the **Generate token** form:
+   - **Label** -- free text shown in the list.
+   - **Max uses** -- how many agents can use this token (`0` = unlimited). The default `0` with no expiry makes a token that never stops working; the form warns while both limits are empty or zero.
+   - **Expires after (hours)** -- time limit (`0` = never).
+3. Click **Generate token** and copy the string shown. It is displayed once, stays on screen until you click **Done** or leave the page, and is sent with `Cache-Control: no-store, private`.
 
 **Agent side:**
 ```bash
@@ -5004,8 +5004,8 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX). |
-| `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Body: `{ "expiry", "max_uses" }`. |
-| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. |
+| `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Form fields: `label`, `max_uses` (`0` = unlimited), `ttl_hours` (`0` = never). The response is the token-list fragment with the raw token shown once; it carries `Cache-Control: no-store, private`. |
+| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. JSON body, every value a JSON **string**: `{ "label", "count", "max_uses", "ttl_hours" }` (a numeric value is ignored and the default applies). The response carries `Cache-Control: no-store, private`. |
 | `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. |
 
 ### Pending Agents
