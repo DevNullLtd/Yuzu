@@ -292,6 +292,49 @@ TEST_CASE("dashboard_api_routes: /api/export/json-to-csv rejects a non-array JSO
     CHECK(r->status == 400);
 }
 
+TEST_CASE("dashboard_api_routes: /api/export/json-to-csv rejects a body nested deeper than 32 "
+          "with 400 and still accepts a legitimate nested row",
+          "[server][routes][dashboard_api_routes][export]") {
+    Harness h;
+    h.wire();
+
+    // Deeper than kMcpMaxJsonDepth: dump() of this cell would recurse 40 deep
+    // per row; at depth ~100k it kills the process. Must be refused pre-parse.
+    std::string deep = R"([{"a":)" + std::string(40, '[') + std::string(40, ']') + "}]";
+    auto bad = h.sink.Post("/api/export/json-to-csv", deep);
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK(bad->body.find("request body nests too deeply") != std::string::npos);
+
+    // Depth 3 (array, object, array, array) is a legitimate row.
+    auto ok = h.sink.Post("/api/export/json-to-csv", R"([{"a":[[1,2]]}])");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->body == "a\r\n\"[[1,2]]\"\r\n");
+}
+
+TEST_CASE("dashboard_api_routes: /api/export/json-to-csv quotes non-string cells without "
+          "formula-neutralising them",
+          "[server][routes][dashboard_api_routes][export]") {
+    Harness h;
+    h.wire();
+
+    // A negative number stays a number: neutralize_formula would make it '-5.
+    auto num = h.sink.Post("/api/export/json-to-csv", R"([{"n":-5,"f":-1.5,"b":true}])");
+    REQUIRE(num);
+    CHECK(num->body == "b,f,n\r\ntrue,-1.5,-5\r\n"); // keys sort; -5 untouched
+
+    // A nested object with commas stays in ONE cell (RFC 4180 quoted).
+    auto obj = h.sink.Post("/api/export/json-to-csv", R"([{"o":{"a":1,"b":2},"z":"x"}])");
+    REQUIRE(obj);
+    CHECK(obj->body == "o,z\r\n\"{\"\"a\"\":1,\"\"b\"\":2}\",x\r\n");
+
+    // A free-text string starting with '=' is still neutralised.
+    auto str = h.sink.Post("/api/export/json-to-csv", R"([{"s":"=1+1"}])");
+    REQUIRE(str);
+    CHECK(str->body == "s\r\n'=1+1\r\n");
+}
+
 // ── POST /api/scope/validate: auth_fn only; pure, no store ─────────────────
 
 TEST_CASE("dashboard_api_routes: /api/scope/validate denies without auth",

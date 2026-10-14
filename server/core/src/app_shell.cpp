@@ -30,11 +30,15 @@ constexpr NavItem kSoftwareSub[] = {
 constexpr NavItem kFleetSub[] = {
     {.key = "network", .label = "Network", .href = "/network"},
 };
-// System pages, in the design's artboard order. Own entries only, and only for pages that
-// exist: each System page adds its line here when it lands. The parent keeps `/settings`
-// (the monolith), so no child repeats the parent's href.
+// System pages under Settings, in the design's artboard order. ORDER CONTRACT: the full
+// sequence is General, Security, Integrations, PKI, Plugins, Data, Licence, Developer
+// (test_nav_shells pins it as a sub-sequence). Own entries only, and only for pages that
+// exist: each System page adds its line here, at its artboard position, when it lands. The
+// parent keeps `/settings` (the monolith), so no child repeats the parent's href.
 constexpr NavItem kSettingsSub[] = {
     {.key = "settings-general", .label = "General", .href = "/settings/general"},
+    {.key = "settings-data", .label = "Data and retention", .href = "/settings/data"},
+    {.key = "settings-developer", .label = "Developer and API", .href = "/settings/developer"},
 };
 
 constexpr NavItem kOperate[] = {

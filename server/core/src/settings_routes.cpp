@@ -78,6 +78,7 @@ template <typename Req> auto settings_req_get_file(const Req& req, const std::st
 
 // Settings page HTML template (defined in settings_ui.cpp).
 extern const char* const kSettingsHtml;
+extern const char* const kSettingsDataHtml; // settings_data_ui.cpp (SYS-4)
 
 // GatewayUpstreamServiceImpl and AgentRegistry are inner classes of server.cpp.
 // We use callbacks (AgentsJsonFn, GatewaySessionCountFn) to avoid depending on
@@ -2719,28 +2720,16 @@ std::string SettingsRoutes::render_analytics_fragment() {
     return html;
 }
 
+nlohmann::json SettingsRoutes::retention_view() const {
+    return settings_model::build_data_retention_settings(
+        *cfg_, retention_enforced_fn_ ? retention_enforced_fn_()
+                                      : settings_model::RetentionEnforced{});
+}
+
 std::string SettingsRoutes::render_data_retention_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/data-retention formats
     // the SAME JSON as its response body instead of re-deriving these fields.
-    const auto v = settings_model::build_data_retention_settings(*cfg_);
-
-    std::string html;
-
-    html += "<div class=\"form-row\">"
-            "  <label>Response Data</label>"
-            "  <code>" +
-            std::to_string(v.at("response_retention_days").get<int>()) +
-            " days</code>"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Audit Logs</label>"
-            "  <code>" +
-            std::to_string(v.at("audit_retention_days").get<int>()) +
-            " days</code>"
-            "</div>";
-
-    return html;
+    return settings_model::render_retention_table(retention_view());
 }
 
 namespace {
@@ -3709,15 +3698,24 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_data_retention_fragment(), "text/html; charset=utf-8");
              });
 
+    // System > Data and retention page (SYS-4): same admin gate and redirect as
+    // GET /settings. A page route, not ledgered (the parity check covers only
+    // /fragments/* and /api/*).
+    sink.Get("/settings/data", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!admin_fn_(req, res)) {
+            res.set_redirect("/");
+            return;
+        }
+        res.set_content(kSettingsDataHtml, "text/html; charset=utf-8");
+    });
+
     // #4028 — REST v1 read-twin. ServerConfig:Read. NOT audited — "lowest
     // sensitivity of the eight" per #4028's Evidence section.
     sink.Get("/api/v1/settings/data-retention",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ServerConfig", "Read"))
                      return;
-                 res.set_content(settings_ok_envelope(
-                                     settings_model::build_data_retention_settings(*cfg_))
-                                     .dump(),
+                 res.set_content(settings_ok_envelope(retention_view()).dump(),
                                  "application/json");
              });
 

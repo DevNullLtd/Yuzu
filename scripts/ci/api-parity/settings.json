@@ -87,6 +87,61 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/settings/developer/api",
+    "capability_id": "get.fragments-settings-developer-api",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/routes"
+    },
+    "mcp_twin": "discover_routes",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/permissions",
+    "capability_id": "get.fragments-settings-developer-permissions",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/permissions"
+    },
+    "mcp_twin": "discover_permissions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/plugins",
+    "capability_id": "get.fragments-settings-developer-plugins",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/plugin-docs"
+    },
+    "mcp_twin": null,
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/plugins/observed",
+    "capability_id": "get.fragments-settings-developer-plugins-observed",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/plugins"
+    },
+    "mcp_twin": "discover_plugins",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/developer/routes",
+    "capability_id": "get.fragments-settings-developer-routes",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/discover/routes"
+    },
+    "mcp_twin": "discover_routes",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/settings/gateway",
     "capability_id": "get.fragments-settings-gateway",
     "rest_v1_twin": {

@@ -4699,9 +4699,9 @@ Update a single runtime configuration value. The key must be one of the allowed 
 | Key | Type | Takes effect | Description |
 |---|---|---|---|
 | `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline |
-| `response_retention_days` | integer | **stored only, applied at next restart** | Days to retain command response data |
-| `audit_retention_days` | integer | **stored only, applied at next restart** | Days to retain audit log entries |
-| `guardian_event_retention_days` | integer | **stored only, applied at next restart** | Days to retain guaranteed-state events |
+| `response_retention_days` | integer | **stored only, not enforced - see note** | Days to retain command response data |
+| `audit_retention_days` | integer | **stored only, not enforced - see note** | Days to retain audit log entries |
+| `guardian_event_retention_days` | integer | **stored only, not enforced - see note** | Days to retain guaranteed-state events |
 | `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
 | `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
 | `plugin_signing_required` | boolean | **records intent only - see note** | Server-side record of the Settings "Require signed plugins" toggle |
@@ -4725,12 +4725,14 @@ most keys:
 - **immediately** - only two keys. `heartbeat_timeout` is assigned into the live server config and
   re-read on every stale-session sweep; `log_level` is applied by `RuntimeConfigStore::set()` itself
   via `spdlog::set_level`.
-- **stored only, applied at next restart** - `response_retention_days`, `audit_retention_days`,
+- **stored only, not enforced** - `response_retention_days`, `audit_retention_days`,
   `guardian_event_retention_days`. The handler updates the in-memory config, so `GET /api/config`
-  and the Settings page immediately report the NEW value - but each store captured its retention
-  window when it was constructed and exposes no setter, so the store still enforcing retention keeps
-  the old value until the server restarts. **The API reports the stored value, not the value being
-  enforced.** Restart after changing a retention window.
+  reports the NEW value - but each store copied its retention window when it was constructed and
+  exposes no setter, so the stores keep enforcing the window they were built with. **The API
+  reports the stored value, not the value being enforced.** `GET /api/v1/settings/data-retention`
+  and the Data and retention page show the enforced value under `enforced`. To change a window, set
+  `--response-retention-days`, `--audit-retention-days`, `--guardian-event-retention-days` (or the
+  matching `YUZU_*` environment variable) and restart. No route removes a stored override.
 - **records intent only** - `plugin_signing_required` is read in exactly two places, both of which
   render the Settings status badge. **No server or agent code consumes it to require signatures**,
   and it is not carried in any proto field, so it never reaches an agent. Agent-side enforcement is
@@ -5056,14 +5058,29 @@ REST-only — see the #520 note above.
 
 #### `GET /api/v1/settings/data-retention`
 
-Response/audit data retention windows, in days.
+Response, audit and Guardian-event data retention windows, in days.
 
-**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (two
+**Permission:** `ServerConfig:Read`. **Audit:** none — lowest sensitivity of the eight (a few
 integers).
+
+The top-level fields are the configured/stored values. `enforced` holds the window each store is
+actually applying, in days (`0` or less means rows never expire); a value is `null` when the store
+is absent or not open, which is "unknown", not zero. The two differ after a runtime
+`PUT /api/config/<key>`, which is stored but not applied (see
+[When a change takes effect](#when-a-change-takes-effect)).
 
 ```json
 {
-  "data": { "response_retention_days": 90, "audit_retention_days": 365 },
+  "data": {
+    "response_retention_days": 90,
+    "audit_retention_days": 365,
+    "guardian_event_retention_days": 30,
+    "enforced": {
+      "response_retention_days": 90,
+      "audit_retention_days": 365,
+      "guardian_event_retention_days": 30
+    }
+  },
   "meta": { "api_version": "v1" }
 }
 ```
@@ -6711,6 +6728,17 @@ One plugin's manifest, narrower than the whole-catalog route above (#4108) — t
 Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as the catalog route.
 
 ---
+
+#### Developer and API page
+
+Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a read-only front for the discovery routes above. It adds no REST route and no MCP tool: its four panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process and take the same `Infrastructure:Read` gate as the REST twins.
+
+- **API:** the OpenAPI document link and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes.
+- **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown.
+- **Permissions:** each `Securable:Operation` pair with the roles that allow it. The role grid needs `UserManagement:Read`, as on `/discover/permissions`; without it the page says so instead of listing nothing.
+- **Plugins:** the build-embedded manifests with per-OS support. The list of plugins connected devices currently report is a separate, on-request list: no connected device is not the same as no plugins.
+
+The load generator and process data fetch controls are not part of this page.
 
 ### Inventory
 

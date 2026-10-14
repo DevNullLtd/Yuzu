@@ -4970,7 +4970,7 @@ the audit log. Each stamps `ttl_expires_at` once, at INSERT, from the retention
 setting in force at the time (`AuditStore::log`, `ResponseStore::store`,
 `GuaranteedStateStore::compute_ttl_epoch`), and nothing ever rewrites it, so
 existing rows always age out on their original TTLs. Only rows written after the
-change (and, per the #483 note below, after a restart) get the shorter window.
+change get the shorter window.
 
 What is specific to the audit log is *how* the expired rows then leave: see the
 note below.
@@ -4986,7 +4986,7 @@ note below.
 > single declined pass more likely right after the change. It is self-healing --
 > see [The retention clock guard](audit-log.md#the-retention-clock-guard).
 
-> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and can be updated at runtime via `PUT /api/config/<key>` with an `Infrastructure:Write` permission. Runtime updates are persisted via `RuntimeConfigStore` and reflected immediately in the `/api/config` GET response — **but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.** This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.
+> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`). `PUT /api/config/<key>` (with `Infrastructure:Write`) persists a value via `RuntimeConfigStore` and `/api/config` then reports it — **but each running store copied its retention value at construction and does not re-read it, so a stored value is not the window being enforced.** Change a window with the startup option or environment variable and restart. This limitation is shared across all three retention keys and is tracked as issue #483. The **Data and retention** page (Settings, System group) shows the enforced value and flags a stored value that is not in force.
 
 ---
 

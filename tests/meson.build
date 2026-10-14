@@ -1392,6 +1392,8 @@ if build_server
       'unit/server/test_page_routes.cpp',
       'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
+      'unit/server/test_developer_render.cpp', # System > Developer and API: pure renderers
+      'unit/server/test_developer_routes.cpp', # System > Developer and API: page + fragment gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam

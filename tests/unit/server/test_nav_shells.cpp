@@ -39,6 +39,8 @@ extern const char* const kGuardianHtml;
 extern const char* const kGuardianDetailPageHtml;
 extern const char* const kSettingsHtml;
 extern const char* const kSettingsGeneralHtml;
+extern const char* const kSettingsDataHtml;
+extern const char* const kSettingsDeveloperHtml;
 
 using Catch::Matchers::ContainsSubstring;
 using namespace yuzu::server::shell;
@@ -101,7 +103,7 @@ TEST_CASE("app shell: keys and hrefs are unique and every top-level entry has an
         }
 }
 
-TEST_CASE("app shell: only Instructions Software and Fleet have sub-items; Settings is one "
+TEST_CASE("app shell: only Instructions, Software, Fleet and Settings have sub-items; Settings is one "
           "admin-only entry",
           "[nav][shell]") {
     // Parent keys only: a System page adds its own child line to kSettingsSub without
@@ -427,6 +429,8 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"settings", kSettingsHtml, {"/settings"}},
         // A sub-item: its own link is the current page and the parent is lit as the family.
         {"settings general", kSettingsGeneralHtml, {"/settings", "/settings/general"}},
+        {"settings data", kSettingsDataHtml, {"/settings", "/settings/data"}},
+        {"settings developer", kSettingsDeveloperHtml, {"/settings", "/settings/developer"}},
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},
