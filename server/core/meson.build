@@ -217,12 +217,18 @@ yuzu_operate_extras_js_embed = custom_target(
   'yuzu_operate_extras_js_bundle',
   input: 'static/yuzu-operate-extras.js',
   output: 'yuzu_operate_extras_js_bundle.cpp',
+# Hardware record "Tags and properties" lens controls. Symbol: kYuzuDeviceDataJs.
+yuzu_device_data_js_embed = custom_target(
+  'yuzu_device_data_js_bundle',
+  input: 'static/yuzu-device-data.js',
+  output: 'yuzu_device_data_js_bundle.cpp',
   command: [
     find_program('python3', 'python'),
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
     'YuzuOperateExtrasJs',
+    'YuzuDeviceDataJs',
   ],
 )
 
@@ -422,6 +428,8 @@ yuzu_server_core_lib = static_library(
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
    yuzu_dialog_js_embed, yuzu_operate_extras_js_embed,
+   yuzu_dialog_js_embed,
+   yuzu_device_data_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -559,6 +567,8 @@ yuzu_server_core_lib = static_library(
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
     'src/custom_properties_routes.cpp',
+    'src/device_data_render.cpp',
+    'src/device_data_routes.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
     'src/instruction_param_schema.cpp',

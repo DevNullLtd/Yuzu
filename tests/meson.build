@@ -1534,6 +1534,8 @@ if build_server
       'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
+      'unit/server/test_device_data_render.cpp',  # Hardware record: custom properties + schemas panels
+      'unit/server/test_device_data_routes.cpp',  # Hardware record: properties fragment gates and states
       'unit/server/test_inventory_routes.cpp',
       'unit/server/test_software_page_ui.cpp',
       'unit/server/test_auto_fragments_ui.cpp',

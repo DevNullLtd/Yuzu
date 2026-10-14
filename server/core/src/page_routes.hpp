@@ -31,6 +31,7 @@
 ///   GET /static/yuzu-operate.js             -                      (Operate pages' controller)
 ///   GET /static/yuzu-dialog.js              -                      (shared modal dialog + request helper)
 ///   GET /static/yuzu-operate-extras.js      -                      (Operate extras page controllers)
+///   GET /static/yuzu-device-data.js         -                      (Hardware record tag/property controls)
 ///   GET /static/cytoscape.min.js            -
 ///   GET /static/fonts/ibm-plex-sans-latin-400-normal.woff2   -
 ///   GET /static/fonts/ibm-plex-sans-latin-500-normal.woff2   -
