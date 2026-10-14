@@ -225,6 +225,10 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[pg][dex][rout
     // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
     CHECK(html.find("/fragments/dex/overview") != std::string::npos);
     CHECK(html.find("gp-subnav") != std::string::npos);
+    // The Alerts tab is static chrome: present for every viewer, no capability probe
+    // behind it (the Alerts fragment itself shows the role note).
+    CHECK(html.find("hx-get=\"/fragments/dex/alerts?window=7d\"") != std::string::npos);
+    CHECK(html.find(">Alerts</a>") != std::string::npos);
     CHECK(html.find("actively monitored") != std::string::npos);
     CHECK(html.find("of 114 signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)

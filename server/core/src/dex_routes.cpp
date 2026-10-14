@@ -451,7 +451,7 @@ std::string dex_fragment_style() {
 }
 
 // Shared DEX sub-nav (Overview · Apps · Catalogue · Health score · Trends ·
-// Performance · App Performance · Network). htmx core attrs into the page mount —
+// Performance · App Performance · Network · Alerts). htmx core attrs into the page mount —
 // CSP-safe (no hx-on). The Network tab loads the /fragments/network/* renderers
 // (network_ui.cpp), which render this same sub-nav with "network" active — so
 // Network sits UNDER DEX rather than as its own top-level nav item. The network
@@ -475,7 +475,11 @@ std::string dex_subnav(const std::string& active, int window_days) {
            tab("trends", "Trends", "/fragments/dex/trends") +
            tab("perf", "Performance", "/fragments/dex/perf") +
            tab("app_perf", "App Performance", "/fragments/dex/perf/apps") +
-           tab("network", "Network", "/fragments/network/overview") + "</div>";
+           tab("network", "Network", "/fragments/network/overview") +
+           // Rendered statically for every viewer: no capability probe here (each
+           // failed probe would write a denied audit row per sub-nav render). The
+           // Alerts fragment itself shows the Administrator-role note.
+           tab("alerts", "Alerts", "/fragments/dex/alerts") + "</div>";
 }
 
 // Window chips for a given fragment path (reuses the overview pattern).
