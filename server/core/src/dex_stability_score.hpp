@@ -75,14 +75,15 @@
  *   computed double lands on either side of the tie; band and display always
  *   agree with each other, and two such apps can display one tenth apart.
  * - `floor` is the reporting-device minimum: fewer devices withholds the score
- *   as below_floor, so that no small cohort reads as an individual device's
- *   behaviour. Callers pass kDexCohortFloor literally; the module enforces
- *   whatever floor it is handed. `reporting_devices` is the distinct devices
- *   that reported THIS application/version in the window, never fleet size.
- *   Exception (maintainer ruling, 2026-10-14): the Apps list read
- *   (DexApi::apps) passes floor 0, and N is the fleet reporting population
- *   (Windows devices online now), since a per-application reporting count is
- *   not available there.
+ *   as below_floor. Callers pass kDexCohortFloor literally; the module enforces
+ *   whatever floor it is handed. kDexCohortFloor is one device (maintainer
+ *   ruling, 2026-10-14), and no_population is checked first, so a caller
+ *   passing it never sees below_floor: the token stays in the vocabulary for a
+ *   caller handing in a larger floor. `reporting_devices` is the distinct
+ *   devices that reported THIS application/version in the window; the Apps list
+ *   read (DexApi::apps) is the one caller for which it is the fleet reporting
+ *   population (Windows devices online now), since a per-application reporting
+ *   count is not available there.
  * - Missing or contradictory population data is withheld (score and band
  *   empty, `withheld` names why), never shown as 0 or 100. A missing or
  *   unusable rate_ratio is NOT withheld: the result is scored with an

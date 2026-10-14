@@ -9381,7 +9381,8 @@ TEST_CASE("MCP: query_installed_software no longer blanket-denies a "
 // ── F2a: DEX fleet-perf tools ────────────────────────────────────────────────
 
 namespace {
-/// Two cohorts: "a" above the 10-device floor (12 devices), "b" below (4).
+/// Two cohorts: "a" with 12 devices, "b" with 4 — both above the one-device floor
+/// ("b" was below the old floor of 10).
 yuzu::server::DexPerfSnapshot mcp_perf_snapshot(const std::string& key) {
     yuzu::server::DexPerfSnapshot snap;
     snap.cohort_key = key;
@@ -9438,22 +9439,22 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
         ts.call(
               R"({"jsonrpc":"2.0","method":"tools/call","id":51,"params":{"name":"get_dex_perf_cohorts","arguments":{"key":"model"}}})")
             ->body);
-    CHECK(cohorts["floor"] == 10);
+    CHECK(cohorts["floor"] == 1);
     REQUIRE(cohorts["cohorts"].size() == 2);
     CHECK(cohorts["cohorts"][0]["cohort"] == "a");
     CHECK(cohorts["cohorts"][0]["suppressed"] == false);
-    CHECK(cohorts["cohorts"][1]["suppressed"] == true); // sub-floor: population only
-    CHECK_FALSE(cohorts["cohorts"][1].contains("cpu_pct"));
+    CHECK(cohorts["cohorts"][1]["suppressed"] == false); // 4 devices: published
+    CHECK(cohorts["cohorts"][1].contains("cpu_pct"));
 }
 
 // #2712 batch 2: get_dex_perf_fleet's payload is already object-shaped (no
 // array wrap needed - the shared block still routes it through
 // tool_result_split() with structured_payload==payload, same as content);
-// get_dex_perf_cohorts needs the suppressed cohort's stat fields OMITTED
-// from structuredContent too, not just from content[0].text - the
-// anonymization floor must hold in both.
+// get_dex_perf_cohorts must carry the same per-cohort stat fields in
+// structuredContent as in content[0].text - both cohorts are published at the
+// one-device floor.
 TEST_CASE("MCP DEX perf: structuredContent mirrors content for fleet + cohorts, "
-          "suppression omits stats in both",
+          "both cohorts published in both",
           "[mcp][integration][dex][perf]") {
     McpTestServer ts;
     ts.dex_perf_fn_for_test = mcp_perf_snapshot;
@@ -9477,8 +9478,8 @@ TEST_CASE("MCP DEX perf: structuredContent mirrors content for fleet + cohorts, 
     auto& sc = cohorts_body["result"]["structuredContent"];
     CHECK(sc["cohorts"][0]["suppressed"] == false);
     CHECK(sc["cohorts"][0].contains("cpu_pct")); // unsuppressed cohort keeps its stats
-    CHECK(sc["cohorts"][1]["suppressed"] == true);
-    CHECK_FALSE(sc["cohorts"][1].contains("cpu_pct")); // floor holds in structuredContent too
+    CHECK(sc["cohorts"][1]["suppressed"] == false);
+    CHECK(sc["cohorts"][1].contains("cpu_pct")); // the 4-device cohort is published too
 }
 
 TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required params)",
@@ -9487,8 +9488,8 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
     ts.dex_perf_fn_for_test = mcp_perf_snapshot;
     ts.start("readonly");
 
-    // a (12 devices, >= floor) vs b (4, sub-floor): both found; b suppressed,
-    // so no metric can be diffed (delta null).
+    // a (12 devices) vs b (4): both found and both published at the one-device
+    // floor, so every metric is diffed (b was suppressed at the old floor of 10).
     auto diff = mcp_tool_payload(
         ts.call(
               R"({"jsonrpc":"2.0","method":"tools/call","id":57,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"model","a":"a","b":"b"}}})")
@@ -9497,8 +9498,8 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
     CHECK(diff["found_b"] == true);
     CHECK(diff["a"]["cohort"] == "a");
     CHECK(diff["a"]["suppressed"] == false);
-    CHECK(diff["b"]["suppressed"] == true);
-    CHECK(diff["delta_pct"]["cpu_pct"].is_null()); // b suppressed → no comparison
+    CHECK(diff["b"]["suppressed"] == false);
+    CHECK_FALSE(diff["delta_pct"]["cpu_pct"].is_null()); // both published → compared
 
     // #2712 batch 2: this tool's payload is always object-shaped, so
     // structuredContent is the SAME string as content[0].text - pin that
@@ -10159,7 +10160,7 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
                 ->body);
         CHECK(p["paired"] == 2);
         CHECK(p["cohort_size"] == 2);
-        CHECK(p["small_cohort"] == true);
+        CHECK(p["small_cohort"] == false); // 2 >= kDexCohortFloor (1); the flag stays on the wire
         CHECK(p["insufficient"] == false);
         CHECK(p["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));
         CHECK(p["distribution"]["up"] == 2);
@@ -10345,11 +10346,11 @@ TEST_CASE("MCP compare_app_perf_versions: provider-absent and degrade → kInter
     }
 }
 
-TEST_CASE("MCP app-perf: sub-floor FLEET point serializes suppressed (stats omitted)",
+TEST_CASE("MCP app-perf: three-device FLEET point serializes published at the one-device floor",
           "[mcp][integration][dex][app_perf]") {
-    // The fleet path floors too now — a sub-floor (version,day) point must serialize
-    // suppressed=true with device_count only, NOT zeroed stats that read as
-    // "3 devices @ 0% CPU" (security re-review of 5ebde07f).
+    // The fleet path floors through the ONE constant, one device since the
+    // 2026-10-14 ruling: a three-device (version,day) point serializes
+    // suppressed=false with its exact stats (suppressed at the old floor of 10).
     McpTestServer ts;
     ts.app_perf_providers_for_test.fleet =
         [](std::string_view, std::string_view)
@@ -10358,7 +10359,7 @@ TEST_CASE("MCP app-perf: sub-floor FLEET point serializes suppressed (stats omit
         r.app_name = "niche.exe";
         r.version = "1.0";
         r.day = 1'700'000'000;
-        r.device_count = 3; // < kDexCohortFloor
+        r.device_count = 3; // >= kDexCohortFloor (1)
         r.cpu_sum = 30.0;
         r.cpu_max = 10.0;
         r.ws_sum = 300;
@@ -10374,9 +10375,9 @@ TEST_CASE("MCP app-perf: sub-floor FLEET point serializes suppressed (stats omit
               R"({"jsonrpc":"2.0","method":"tools/call","id":85,"params":{"name":"get_dex_app_perf","arguments":{"app":"niche.exe"}}})")
             ->body);
     REQUIRE(p["points"].size() == 1);
-    CHECK(p["points"][0]["suppressed"] == true);
+    CHECK(p["points"][0]["suppressed"] == false);
     CHECK(p["points"][0]["device_count"] == 3);
-    CHECK_FALSE(p["points"][0].contains("cpu_mean")); // stats omitted when suppressed
+    CHECK(p["points"][0]["cpu_mean"].get<double>() == Catch::Approx(10.0)); // 30.0 / 3
 }
 
 TEST_CASE("MCP app-perf: unavailable provider + missing arg degrade",

@@ -207,10 +207,11 @@ DexStabilityFigures apps_figures(int64_t crashes, int64_t hangs, int64_t affecte
     in.devices_affected = affected;
     in.crash_events = capped_crashes;
     in.hang_events = capped_hangs;
-    // Floor 0: no device floor applies to the Apps list (maintainer ruling
-    // 2026-10-14); reporting <= 0 still withholds no_population. The regression
-    // term is not assessed here (no sampled exposure per version).
-    f.score = dex_score_under_policy(in, /*floor=*/0, eff);
+    // The one cohort floor (one device, maintainer ruling 2026-10-14): every
+    // figure is published at any device count; reporting <= 0 withholds
+    // no_population. The regression term is not assessed here (no sampled
+    // exposure per version).
+    f.score = dex_score_under_policy(in, kDexCohortFloor, eff);
     return f;
 }
 

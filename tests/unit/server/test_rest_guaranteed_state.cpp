@@ -3491,16 +3491,16 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         auto j = nlohmann::json::parse(res->body);
         CHECK(j["error"]["code"].get<int>() == 503);
     }
-    SECTION("sub-floor fleet point serializes suppressed, stats omitted") {
-        // The fleet path floors too now — a sub-floor (version,day) point must carry
-        // suppressed=true with device_count only, never zeroed stats that read as
-        // "3 devices @ 0% CPU" (security re-review of the suppressed-flag fix).
+    SECTION("three-device fleet point serializes published at the one-device floor") {
+        // The fleet path floors through the ONE constant, which is one device
+        // (maintainer ruling 2026-10-14): a three-device point carries its exact
+        // stats with suppressed=false (it was suppressed at the old floor of 10).
         RestGsHarness h;
         yuzu::server::AppPerfFleetRow r;
         r.app_name = "niche.exe";
         r.version = "1.0";
         r.day = 1'700'000'000;
-        r.device_count = 3; // < kDexCohortFloor (10)
+        r.device_count = 3; // >= kDexCohortFloor (1)
         r.cpu_sum = 30.0;
         r.cpu_max = 10.0;
         r.ws_sum = 300;
@@ -3515,9 +3515,10 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         auto j = nlohmann::json::parse(res->body);
         REQUIRE(j["data"]["points"].size() == 1);
         const auto& pt = j["data"]["points"][0];
-        CHECK(pt["suppressed"] == true);
+        CHECK(pt["suppressed"] == false);
         CHECK(pt["device_count"] == 3);
-        CHECK_FALSE(pt.contains("cpu_mean")); // stats omitted when suppressed
+        REQUIRE(pt.contains("cpu_mean"));
+        CHECK(pt["cpu_mean"].get<double>() == Catch::Approx(10.0)); // 30.0 / 3
     }
 }
 
@@ -3634,7 +3635,7 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         r.app_name = "niche.exe";
         r.version = "1.0";
         r.day = 1'700'000'000;
-        r.device_count = 3; // < kDexCohortFloor (10)
+        r.device_count = 3; // >= kDexCohortFloor (1); was sub-floor at 10
         r.cpu_sum = 30.0;
         r.cpu_max = 10.0;
         r.ws_sum = 300;
@@ -3650,9 +3651,10 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         auto j = nlohmann::json::parse(res->body);
         REQUIRE(j["data"]["points"].size() == 1);
         const auto& pt = j["data"]["points"][0];
-        CHECK(pt["suppressed"] == true);
+        CHECK(pt["suppressed"] == false);
         CHECK(pt["device_count"] == 3);
-        CHECK_FALSE(pt.contains("cpu_mean"));
+        REQUIRE(pt.contains("cpu_mean"));
+        CHECK(pt["cpu_mean"].get<double>() == Catch::Approx(10.0));
     }
 }
 
@@ -3756,7 +3758,7 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
         auto j = nlohmann::json::parse(res->body);
         CHECK(j["data"]["paired"].get<int64_t>() == 2);
         CHECK(j["data"]["cohort_size"].get<int64_t>() == 2);
-        CHECK(j["data"]["small_cohort"].get<bool>() == true); // 2 < kDexCohortFloor
+        CHECK(j["data"]["small_cohort"].get<bool>() == false); // 2 >= kDexCohortFloor (1)
         CHECK(j["data"]["insufficient"].get<bool>() == false);
         CHECK(j["data"]["cpu"]["before_mean"].get<double>() == Catch::Approx(2.5));
         CHECK(j["data"]["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));

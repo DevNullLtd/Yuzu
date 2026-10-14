@@ -11,7 +11,8 @@
  *   - dex_rate_ratio      rate A / rate B with the exact conditional (binomial,
  *                         Clopper-Pearson) interval and a minimum-exposure guard
  *   - dex_floored_*       the same for a proportion and a rate, but below the
- *                         cohort floor (kDexCohortFloor devices) only the DEVICE
+ *                         cohort floor (kDexCohortFloor devices, one since the
+ *                         2026-10-14 ruling: an empty cohort) only the DEVICE
  *                         count and a below-floor flag are returned
  *
  * Honesty rules:
@@ -25,29 +26,19 @@
  *     numerator saw fewer than kDexStatsReliableMinEvents (20) events (for a
  *     rate ratio, either arm falling short) -- the NCHS small-count convention --
  *     is still printed, marked indicative.
- *   - Below the cohort floor the number of devices is honest but their events
- *     and rates single people out, so the floored helpers return only the device
- *     count and a below_floor flag, and withhold events and statistics.
+ *   - Below the cohort floor only the device count and a below_floor flag are
+ *     returned. The floor is one device (maintainer ruling, 2026-10-14, named in
+ *     the routed Guardian/DEX row): a figure is published whenever at least one
+ *     device contributed, so below_floor marks an empty cohort, nothing else.
  *
  * Consumer duties (this header does not enforce them; a surface must):
- *   - The floor is per cohort. Floor every cohort a surface shows, complements
- *     and nested or overlapping cohorts included. Flooring each shown cohort is
- *     not enough: where one cohort contains others (a total and its parts, a
- *     fleet and a group), the remainder (the total minus the parts shown) is a
- *     cohort too, and a surface must not show a total with parts whose remainder
- *     holds 1 to kDexCohortFloor - 1 devices; withhold or merge a part into the
- *     remainder. The floor applies per cohort AND per time point (every point of
- *     a trend is floored on its own). `devices` is the number of distinct
- *     devices that contributed THE events and exposure passed alongside it,
- *     counted in the same window: a count from another window or population
- *     passes the floor and misstates the cohort. dex_proportion, dex_rate and
- *     dex_rate_ratio are unfloored primitives; there is no floored ratio helper,
- *     so floor each rate-ratio arm by DEVICES before calling (the ratio's own
- *     guard is on exposure, and one device over ten days passes it).
- *     Exception (maintainer ruling, 2026-10-14): the per-version crash/hang
- *     join of the fleet app-perf report (dex_app_perf_pure.hpp) and the Apps
- *     list read (dex_app_stability_checked / DexApi::apps) carry no device
- *     floor; both are named in the routed Guardian/DEX row.
+ *   - The floor is per cohort AND per time point (every point of a trend is
+ *     floored on its own). `devices` is the number of distinct devices that
+ *     contributed THE events and exposure passed alongside it, counted in the
+ *     same window: a count from another window or population misstates the
+ *     cohort. dex_proportion, dex_rate and dex_rate_ratio are unfloored
+ *     primitives; there is no floored ratio helper (the ratio's own guard is on
+ *     exposure, not devices).
  *   - `reliable` means "not flagged as small-count", never "precise":
  *     dex_rate(20, 1.0) is [12.2, 30.9]. A ratio with a zero-event denominator
  *     is always unreliable. Print the interval beside the flag, and send an
@@ -71,8 +62,9 @@
  *     result, inside the cap.
  *   - dex_rate has no minimum exposure: an exposure in the wrong unit yields a
  *     confident finite number. Only dex_rate_ratio guards, at
- *     kDexRateRatioMinExposure by default; a caller whose exposure is already
- *     a device count it does not floor may pass 1.0.
+ *     kDexRateRatioMinExposure by default (one exposure unit, derived from the
+ *     cohort floor); a zero or negative exposure is refused whatever the
+ *     minimum.
  *   - Counts are assumed to stay below 2^53; above it the int64-to-double
  *     conversion rounds and an interval can collapse to zero width.
  *
@@ -128,7 +120,11 @@ inline constexpr double kDexStatsZ = 1.959963984540054;
 inline constexpr std::int64_t kDexStatsReliableMinEvents = 20;
 
 /// Both arms of a rate ratio need at least this much exposure (the caller's
-/// unit, device-days for the views) or no ratio is produced.
+/// unit, device-days for the views) or no ratio is produced. Derived from the
+/// cohort floor on purpose (one constant, no second threshold): one device-unit
+/// of exposure since the 2026-10-14 ruling. The guard protects the division
+/// (dex_rate_ratio refuses zero or negative exposure whatever the minimum); the
+/// exact conditional interval and `reliable` carry the uncertainty of a thin arm.
 inline constexpr double kDexRateRatioMinExposure = static_cast<double>(kDexCohortFloor);
 
 /// Largest event count dex_rate serves with the exact Poisson kernels. They need
@@ -453,11 +449,11 @@ struct DexInterval {
 /// representable. events_b == 0 with events_a > 0 gives ratio and upper of
 /// +infinity (the data are valid; the lower bound is finite). A reliable ==
 /// false ratio is printed as indicative, never hidden. The exposure guard is on
-/// exposure, not devices, and there is no floored ratio helper: a surface that
-/// floors applies its device floor to each arm before calling. `min_exposure`
-/// lowers the guard for a caller that does not floor (the fleet app-perf
-/// per-version join passes 1.0); an exposure that is zero or negative is
-/// refused whatever the minimum, so a lowered guard never divides by zero.
+/// exposure, not devices, and there is no floored ratio helper. `min_exposure`
+/// overrides the default guard (the fleet app-perf per-version join passes 1.0
+/// explicitly, equal to the default since the 2026-10-14 ruling); an exposure
+/// that is zero or negative is refused whatever the minimum, so a lowered guard
+/// never divides by zero.
 [[nodiscard]] inline std::optional<DexInterval>
 dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, double exposure_b,
                double min_exposure = kDexRateRatioMinExposure) {
@@ -491,8 +487,8 @@ dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, 
                            events_b >= kDexStatsReliableMinEvents};
 }
 
-/// A statistic withheld below the cohort floor. Only the device count is carried:
-/// events are the behaviour the floor withholds. `below_floor` says why `stats`
+/// A statistic withheld below the cohort floor (one device: an empty cohort).
+/// Only the device count is carried. `below_floor` says why `stats`
 /// is absent; `stats` absent with `below_floor` false means invalid input or an
 /// unrepresentable result, which a consumer counts as a computation failure.
 /// The floor is checked before the inputs: an invalid pair below the floor, and
@@ -509,9 +505,8 @@ struct DexFloored {
 
 /// The floor is on the DEVICE population (the cohort floor constant of the
 /// per-version trend reads), not on exposure: below kDexCohortFloor devices
-/// the events and the proportion single people out, so only the device count and
-/// below_floor are returned. A negative device count is invalid input, not a
-/// small cohort: below_floor is false.
+/// only the device count and below_floor are returned. A negative device count
+/// is invalid input, not a small cohort: below_floor is false.
 [[nodiscard]] inline DexFloored dex_floored_proportion(std::int64_t events,
                                                        std::int64_t devices) {
     return {devices, devices >= 0 && devices < kDexCohortFloor,

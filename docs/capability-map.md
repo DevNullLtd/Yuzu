@@ -1383,11 +1383,11 @@ Server-side N-distinct-device incident detector (`server/core/src/dex_blast_radi
 
 ### 32.5 Upgrade Evidence — Cohort-Paired Before/After Comparison :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`/auto` Verify (§36.3): pure compare engine (`server/core/src/app_perf_compare.{hpp,cpp}`), cohort reader (`app_perf_cohort_reader.hpp`, `app_perf_group_reader.{hpp,cpp}`), REST `/dex/perf/compare` surface confirmed present. Evidential — no verdict/threshold, per `verify_routes.cpp` (§36.3). Deliberately **no floor suppression here**, unlike the fleet/group reads in §32.6: `kDexCohortFloor` only sets the honest `small_cohort` flag (`app_perf_compare.cpp:190`; "NOT suppressed" per `app_perf_compare.hpp:34`), and the audited `dex.app_perf.compare` read replaces suppression (audit verb documented in `docs/user-manual/rest-api.md`; `verify_routes.cpp:132`).
+`/auto` Verify (§36.3): pure compare engine (`server/core/src/app_perf_compare.{hpp,cpp}`), cohort reader (`app_perf_cohort_reader.hpp`, `app_perf_group_reader.{hpp,cpp}`), REST `/dex/perf/compare` surface confirmed present. Evidential — no verdict/threshold, per `verify_routes.cpp` (§36.3). Deliberately **no floor suppression here**: `kDexCohortFloor` only sets the `small_cohort` flag (`app_perf_compare.cpp:190`; "NOT suppressed" per `app_perf_compare.hpp:34`), which stays on the wire but is never true now that the floor is one device (maintainer ruling 2026-10-14), and the audited `dex.app_perf.compare` read is the control (audit verb documented in `docs/user-manual/rest-api.md`; `verify_routes.cpp:132`).
 
 ### 32.6 Behavioral-PII Privacy Engineering :white_check_mark: `T2` *(verified 2026-09-07)*
 
-Cohort-floor suppression on fleet/group app-perf reads (no singling-out below the floor) and audit-on-open per-device lenses (§21.6). *(Referenced from `docs/yuzu-guardian-design-v1.1.md` §24 invariants cited in `CLAUDE.md`; not independently re-derived this session.)*
+Cohort-floor suppression on fleet/group app-perf reads (the floor is one device since the maintainer ruling of 2026-10-14: a single-device point is published as a fleet-wide aggregate by application and version with no `agent_id`; only an empty point is suppressed) and audit-on-open per-device lenses (§21.6). *(Referenced from `docs/yuzu-guardian-design-v1.1.md` §24 invariants cited in `CLAUDE.md`; not independently re-derived this session.)*
 
 ### 32.7 Experience Scoring and Sentiment :x: `T3` *(verified 2026-09-07)*
 

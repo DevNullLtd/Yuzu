@@ -155,9 +155,10 @@ struct DexAppsModel {
 
 /// PURE assembly of the Apps model from grouped store rows. OWNS the published
 /// order: applications by crashes+hangs DESC then subject ASC; each
-/// application's versions by devices affected DESC then version ASC. No device
-/// floor applies (maintainer ruling 2026-10-14): scores use floor 0, so an
-/// unknown or zero population still withholds `no_population`.
+/// application's versions by devices affected DESC then version ASC. Scores use
+/// kDexCohortFloor (one device, maintainer ruling 2026-10-14): every figure is
+/// published at any device count; an unknown or zero population withholds
+/// `no_population`.
 DexAppsModel dex_apps_model_from_rows(const std::string& window,
                                       const std::vector<DexAppStabilityRow>& rows,
                                       std::optional<int64_t> population,

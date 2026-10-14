@@ -209,9 +209,9 @@ numbers match.
   gets its own row with avg/p95 CPU, a CPU sparkline, avg working set, and the
   reporting device count, over the retained fleet window (≤180 days) or, when a
   management group **or a device model** is selected, that cohort's on-the-fly
-  aggregate (≤31 days, sub-10-device points suppressed to a count only — the
-  same floor either way, since a named tag-value cohort is a set of specific
-  devices exactly like a management group). The two cohort selectors
+  aggregate (≤31 days; the cohort floor is one device, so only an empty point
+  is suppressed to a count — the same floor either way, since a named tag-value
+  cohort is a set of specific devices exactly like a management group). The two cohort selectors
   (**Scope**, by management group, and **Model**, by device-tag value) are
   **mutually exclusive**: picking one clears the other, and a management
   group takes precedence if a URL somehow names both. Choosing a model calls
@@ -333,8 +333,8 @@ numbers match.
   heartbeat values against the current fleet p50–p90 band (the marker turns
   red above the fleet p90) and show its percentile position in the fleet and
   in its cohort — rendered live from registry state, no query dispatched, and
-  the cohort comparison is withheld below the 10-device floor with an honest
-  caption.
+  the cohort comparison is withheld only when the cohort has no reporting
+  devices (the floor is one device), with an honest caption.
 
   A separate **Top applications** panel queries the device's opt-in per-app
   tier (`$ProcPerf_Hourly`, process **names only** — never command lines)
@@ -424,7 +424,7 @@ does (agentic-first parity):
   point per `(version, day)` over the retained B2 window (≤180 days), plus a
   per-version `versions[]` join of crash and hang counts, exposure and the
   exposed-device failure rate and rate ratio (no device floor on the join; the
-  point floor is unchanged — see the REST reference).
+  point floor is one device — see the REST reference).
 - **`GET /api/v1/dex/perf/app/devices?app=&version=`** — the version-row "which
   devices" drill: devices reporting one EXACT `(app, version)` among their
   retained top-N daily summaries (B1, ≤31 days), one row per device (`agent_id`,
@@ -461,10 +461,10 @@ view; the rollup, scope, and true aggregate perf endpoints (`/perf/fleet`,
 `/perf/cohorts`, `/perf/cohort-diff`, `/perf/apps`, `/perf/app`, `/perf/group`,
 `/perf/tag`)
 are machine-health telemetry / fleet metadata and are not audited — and the
-app-perf aggregates suppress any sub-floor `(version, day)` point (fewer than
-10 devices) to a count only; the per-version crash and hang join on
-`/perf/app` carries no device floor (maintainer ruling, 2026-10-14 — see the
-REST reference). **`/perf/devices` and `/perf/app/devices` are the
+app-perf aggregates publish every `(version, day)` point with at least one
+device (the cohort floor is one device — maintainer ruling, 2026-10-14; only an
+empty point is reduced to a count), and the per-version crash and hang join on
+`/perf/app` carries no device floor (see the REST reference). **`/perf/devices` and `/perf/app/devices` are the
 exceptions**: each row names an `agent_id` fleet-wide (or, for `/perf/app/
 devices`, the caller's visible subset), so unlike their aggregate siblings
 they ARE audited — `/perf/devices` as `dex.perf.device.view` (fail-closed,

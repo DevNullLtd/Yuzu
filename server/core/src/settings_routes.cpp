@@ -2818,7 +2818,7 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
             (export_key.empty() ? "Export off" : "Export on") + "</span></div></div>"
             "<div class=\"pb\"><p>When a tag key is set, per-cohort fleet performance gauges "
             "(<code>yuzu_fleet_perf_cohort_*</code>) are exported on /metrics for that key's "
-            "cohorts: top 50 by population, a 10-device statistical floor, and a "
+            "cohorts: top 50 by population, the one-device statistical floor (an empty cohort is withheld), and a "
             "<code>_clipped</code> gauge that makes any capping visible. Empty disables the "
             "export (the default). Fleet-level gauges are always exported.</p>"
             "<p><b>The key's tag values become Prometheus labels</b> visible to whatever scrapes "
