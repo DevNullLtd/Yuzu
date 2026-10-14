@@ -137,8 +137,8 @@ raw route is tracked outside this change.
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 14 | 9 | 5 |
-| inventory | 3 | 3 | 0 |
+| devices | 20 | 12 | 8 |
+| inventory | 4 | 4 | 0 |
 | dex | 27 | 18 | 9 |
 | guardian | 18 | 8 | 10 |
 | tar | 12 | 4 | 8 |
@@ -159,12 +159,12 @@ raw route is tracked outside this change.
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 1 | 14 |
 | enrollment | 19 | 5 | 14 |
-| other | 74 | 13 | 61 |
-| **Total** | **293** | **92** | **201** |
+| other | 75 | 14 | 61 |
+| **Total** | **301** | **97** | **204** |
 
 Registered `/api/vN/*` routes: 250. OpenAPI `paths` entries: 249. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 190.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 201.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 204.
 
 <!-- END GENERATED -->
 

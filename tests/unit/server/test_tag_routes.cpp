@@ -392,6 +392,49 @@ TEST_CASE("POST /api/tags/set: key=\"service\" triggers ensure_service_managemen
     CHECK(h.ensure_calls[0] == "printers");
 }
 
+TEST_CASE("POST /api/tags/set: an out-of-set value for a closed category is a 400, audited "
+          "as a failure, and nothing is stored or pushed (B1: set_tag_checked)",
+          "[server][routes][tag_routes][rest][pg]") {
+    PgHarness h;
+    auto r = h.sink.Post("/api/tags/set",
+                         R"({"agent_id":"agent-1","key":"environment","value":"foo"})");
+    REQUIRE(r);
+    CHECK(r->status == 400);
+    CHECK(r->body.find("allowed values are") != std::string::npos);
+    auto tags = h.tag_store->get_all_tags("agent-1");
+    REQUIRE(tags.has_value());
+    CHECK(tags->empty());
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "tag.set");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.push_calls.empty());
+}
+
+TEST_CASE("POST /api/tags/set: an in-set environment value is stored; a value already stored "
+          "out of set (agent-synced) still lists and can be deleted",
+          "[server][routes][tag_routes][rest][pg]") {
+    PgHarness h;
+    auto ok = h.sink.Post("/api/tags/set",
+                          R"({"agent_id":"agent-1","key":"environment","value":"UAT"})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+
+    // The unchecked setter is what agent-synced tags use, so an out-of-set
+    // value can legitimately already be stored.
+    REQUIRE(h.tag_store->set_tag("agent-2", "environment", "foo", "agent"));
+    auto tags = h.tag_store->get_all_tags("agent-2");
+    REQUIRE(tags.has_value());
+    REQUIRE(tags->size() == 1);
+    CHECK((*tags)[0].value == "foo");
+
+    auto del = h.sink.Post("/api/tags/delete", R"({"agent_id":"agent-2","key":"environment"})");
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    auto after = h.tag_store->get_all_tags("agent-2");
+    REQUIRE(after.has_value());
+    CHECK(after->empty());
+}
+
 TEST_CASE("POST /api/tags/set: a non-category free-form key does NOT trigger "
           "push_asset_tags_to_agent_fn",
           "[server][routes][tag_routes][rest][pg]") {

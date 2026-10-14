@@ -26,6 +26,7 @@
 #include "hardware_action_form.hpp"  // ActionFormSpec
 #include "hardware_list_model.hpp"
 #include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
+#include "quarantine_visible.hpp"    // QuarantineListFn (list pill)
 
 #include <expected>
 #include <unordered_map>
@@ -36,6 +37,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -63,7 +65,10 @@ struct HwSyncAffordance {
 };
 struct HwCiAffordances {
     HwSyncAffordance sync;
-    bool can_write_tags{false}; // Tag:Write probe passed → Add/remove tag controls render
+    bool can_write_tags{false}; // Tag:Write probe passed → Add tag control renders
+    // Tag:Delete is a different permission from Tag:Write; probed only when the Tags
+    // lens is the active one (so a record view on another lens pays no extra probe).
+    bool can_delete_tags{false};
     // Round-3 merge: the DEX/Guardian/Live lenses reuse device_routes.cpp's existing
     // fragments verbatim, which gate on scoped GuaranteedState:Read — a STRICTER
     // check than the Inventory:Read the CI record itself already passed. htmx does
@@ -104,11 +109,23 @@ std::string render_hardware_sync_terminal(const std::string& agent_id, const std
 
 std::string render_hardware_software_lens(const std::string& agent_id,
                                           const std::optional<std::vector<SoftwareEntry>>& software,
-                                          bool truncated, bool online, const HwSyncAffordance& sync);
+                                          bool truncated, bool online, const HwSyncAffordance& sync,
+                                          std::optional<std::int64_t> software_last_seen = std::nullopt);
+
+/// Tag dialog wording, shared by the tags lens, the bulk bar and their tests.
+/// The environment value set is closed and exact-case (TagStore::set_tag_checked).
+inline constexpr std::string_view kHwTagKeyHint =
+    "Common keys: role, environment (Dev, UAT or Production, exact case), location, service.";
+inline constexpr std::string_view kHwServiceTagSetNote =
+    "Setting it also creates the service's management group if it does not exist. The service "
+    "tag decides which service-scoped API tokens can reach this device.";
+inline constexpr std::string_view kHwServiceTagRemoveNote =
+    "The service tag decides which service-scoped API tokens can reach this device. Removing it "
+    "takes the device out of that service's scope.";
 
 std::string render_hardware_tags_lens(const std::string& agent_id,
                                       const std::optional<std::vector<DeviceTag>>& tags,
-                                      bool can_write);
+                                      bool can_write, bool can_delete = false);
 
 std::string render_hardware_not_found(const std::string& agent_id);
 
@@ -275,6 +292,9 @@ public:
         SyncDispatchFn sync_dispatch_fn;  // Sync now (R2.3)
         AgentVersionFn agent_version_fn;  // Sync now version floor (R2.3)
         DexScoreFn dex_score_fn;          // Devices-page merge (round 3)
+        /// The authoritative active-quarantine read, for the list's Quarantined pill. Empty
+        /// = no pill and no banner (the panel and lens have their own routes).
+        QuarantineListFn quarantine_list_fn;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);
