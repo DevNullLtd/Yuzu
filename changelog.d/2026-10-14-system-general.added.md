@@ -8,4 +8,4 @@
   Timeout" row "Agent heartbeat timeout" (it is the agent liveness window, not the dashboard
   sign-in expiry) and gains read-only "Dashboard idle timeout" and "Dashboard session lifetime"
   rows; `GET /api/v1/settings/server-config` gains `session_inactivity_seconds` and
-  `session_absolute_lifetime_seconds`.
+  `session_absolute_lifetime_seconds`. `PUT /api/config/{key}` now sets `Sec-Audit-Failed: true` when its audit row is dropped, so the page can warn.

@@ -4691,6 +4691,8 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Permission:** `Infrastructure:Write`
 
+**Audit:** the change is applied before it is audited and is never rolled back. When the `config.update` audit row could not be written the response stays `200` and carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)).
+
 **Allowed keys** (the full set; source of truth is `kAllowedKeys` in
 `server/core/src/runtime_config_store.cpp`):
 
