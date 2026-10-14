@@ -242,13 +242,39 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
 
 /// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
 /// `, protective_exempt=true` when the row covers a protective action (stored
-/// but never gating dispatch). One definition for the REST and MCP write
-/// surfaces so the documented evidence format cannot drift between them.
-[[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope,
-                                                        bool enabled) {
+/// but never gating dispatch), plus `, reason="<text>"` when the operator gave
+/// one. The reason survives on the live row only until the next flip, so without
+/// it here the audit trail cannot answer "why was this switched off". It is
+/// already validated (<= 512 bytes, no control characters but tab) by
+/// `is_valid_reason`; this re-bounds it anyway so the evidence format never
+/// depends on a caller having validated, flattens tab to a space and backslash-
+/// escapes `\` and `"` so the quoted value cannot be confused with the fields
+/// around it. One definition for the REST and MCP write surfaces so the
+/// documented evidence format cannot drift between them.
+[[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope, bool enabled,
+                                                        std::string_view reason = {}) {
     std::string detail = enabled ? "enabled=true" : "enabled=false";
     if (kill_switch_row_covers_protective(scope))
         detail += ", protective_exempt=true";
+    if (!reason.empty()) {
+        constexpr std::size_t kMaxAuditReasonBytes = 512;
+        detail += ", reason=\"";
+        std::size_t n = 0;
+        for (const char c : reason) {
+            if (n++ == kMaxAuditReasonBytes)
+                break;
+            const auto u = static_cast<unsigned char>(c);
+            if (c == '\\' || c == '"') {
+                detail += '\\';
+                detail += c;
+            } else if (u < 0x20 || u == 0x7F) {
+                detail += ' ';
+            } else {
+                detail += c;
+            }
+        }
+        detail += '"';
+    }
     return detail;
 }
 

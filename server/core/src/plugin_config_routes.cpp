@@ -349,7 +349,7 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 // A row on a protective pair is stored but never gates dispatch;
                 // the detail labels it so the evidence is never read as proof of a stop.
                 const std::string detail_str =
-                    plugin_config::kill_switch_set_detail(*scope, enabled);
+                    plugin_config::kill_switch_set_detail(*scope, enabled, reason);
                 if (!audit_or_503(deps.audit_fn, req, res, "plugin_config.kill_switch.set",
                                   "PluginConfig", target_id, detail_str))
                     return;
