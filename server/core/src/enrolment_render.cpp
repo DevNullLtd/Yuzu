@@ -17,7 +17,7 @@ std::string esc(const std::string& s) {
     return html_escape(s);
 }
 
-constexpr const char* kFailbox =
+constexpr std::string_view kFailboxSv =
     "<div class=\"failbox\" role=\"alert\"><div><b>Enrolment store unavailable.</b> "
     "State unknown. This is not an empty list. Retry shortly.</div></div>";
 
@@ -48,20 +48,6 @@ bool is_ipv4_literal(std::string_view s) {
         ++i;
     }
     return octets == 4;
-}
-
-const char* type_label(AutoApproveRuleType t) {
-    switch (t) {
-    case AutoApproveRuleType::trusted_ca:
-        return "Trusted CA";
-    case AutoApproveRuleType::hostname_glob:
-        return "Hostname";
-    case AutoApproveRuleType::ip_subnet:
-        return "Address";
-    case AutoApproveRuleType::cloud_provider:
-        return "Cloud provider";
-    }
-    return "Unknown";
 }
 
 // Honest about what is matched: hostnames are agent-reported, addresses are what the server saw.
@@ -105,7 +91,6 @@ std::string attr_confirm(const std::string& question) {
 
 } // namespace
 
-const std::string_view kStoreUnavailableHtml = kFailbox;
 
 std::string utc_stamp(std::chrono::system_clock::time_point tp) {
     const auto tt = std::chrono::system_clock::to_time_t(tp);
@@ -165,7 +150,7 @@ std::string render_tokens(const std::vector<auth::EnrollmentToken>* tokens,
     }
 
     if (!tokens) {
-        html += kFailbox;
+        html += std::string(kFailboxSv);
         return html;
     }
 
@@ -265,7 +250,7 @@ std::string render_tokens(const std::vector<auth::EnrollmentToken>* tokens,
 
 std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
     if (!agents)
-        return kFailbox;
+        return std::string(kFailboxSv);
 
     std::vector<const auth::PendingAgent*> waiting, denied;
     for (const auto& a : *agents) {
