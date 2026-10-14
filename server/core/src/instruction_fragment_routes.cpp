@@ -273,7 +273,9 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                         html += std::string("<td>") +
                                 instruction_extras::approval_label(d.approval_mode) + "</td>";
                     html += "<td>" + std::string(d.enabled ? "Yes" : "No") + "</td><td>";
-                    if (set_write && sets_read) {
+                    // Assignment is PUT /api/instructions/:id, gated on InstructionDefinition:Write, so the
+                    // select needs that, not just InstructionSet:Write.
+                    if (set_write && def_write && sets_read) {
                         html += instruction_extras::render_set_select(d.id, d.instruction_set_id,
                                                                       *sets_read);
                     } else {

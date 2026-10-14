@@ -534,6 +534,15 @@ TEST_CASE("instruction_fragment_routes: probe-stamped controls follow the permis
         CHECK(r->body.find("hx-delete=") != std::string::npos);
     }
 
+    SECTION("set write without definition write: no set select (the PUT would be refused)") {
+        h.probe_allow = {"InstructionDefinition:Read", "InstructionSet:Read",
+                         "InstructionSet:Write"};
+        auto r = h.sink.Get("/fragments/instructions");
+        REQUIRE(r);
+        CHECK(r->body.find("data-ox=\"set-assign\"") == std::string::npos);
+        CHECK(r->body.find("data-ox=\"set-new\"") != std::string::npos);
+    }
+
     SECTION("delete denied: the row Delete button is not rendered") {
         h.probe_allow = {"InstructionDefinition:Read", "InstructionDefinition:Write"};
         auto r = h.sink.Get("/fragments/instructions");
