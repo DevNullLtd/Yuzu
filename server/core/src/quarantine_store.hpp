@@ -149,6 +149,14 @@ public:
     /// NEVER a silent empty (an empty *value* is a genuinely empty result).
     [[nodiscard]] std::optional<std::vector<QuarantineRecord>> list_quarantined();
 
+    /// The active records, newest first, restricted to `visible_ids` IN the query (never
+    /// post-fetch) so a LIMIT applies to the caller's own records and an invisible record can
+    /// never displace a visible one out of the window. `visible_ids == nullptr` = every
+    /// agent; a present-but-empty vector matches nothing (deny-all) without a round trip.
+    /// `limit == 0` = no limit. `std::nullopt` = degraded, NEVER an empty list.
+    [[nodiscard]] std::optional<std::vector<QuarantineRecord>>
+    list_quarantined_in(const std::vector<std::string>* visible_ids, std::size_t limit);
+
     /// #3425: record that a system-initiated re-dispatch of the STORED
     /// whitelist was accepted by the plugin registry (agents_reached > 0) —
     /// NOT proof of endpoint containment, see `mark_endpoint_confirmed`.

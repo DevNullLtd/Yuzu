@@ -211,6 +211,20 @@ yuzu_operate_js_embed = custom_target(
   ],
 )
 
+# Device containment / estate controls (window-level delegated listener). Symbol: kYuzuEstateJs.
+yuzu_estate_js_embed = custom_target(
+  'yuzu_estate_js_bundle',
+  input: 'static/yuzu-estate.js',
+  output: 'yuzu_estate_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuEstateJs',
+  ],
+)
+
 # Hardware record "Tags and properties" lens controls. Symbol: kYuzuDeviceDataJs.
 yuzu_device_data_js_embed = custom_target(
   'yuzu_device_data_js_bundle',
@@ -420,7 +434,7 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
-   yuzu_dialog_js_embed,
+   yuzu_dialog_js_embed, yuzu_estate_js_embed,
    yuzu_device_data_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
@@ -602,6 +616,10 @@ yuzu_server_core_lib = static_library(
     'src/inventory_ui.cpp',
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
+    'src/device_containment_render.cpp',
+    'src/device_containment_routes.cpp',
+    'src/device_estate_render.cpp',
+    'src/device_estate_routes.cpp',
     'src/hardware_routes.cpp',
     'src/hardware_ui.cpp',
     'src/hardware_actions_ui.cpp',

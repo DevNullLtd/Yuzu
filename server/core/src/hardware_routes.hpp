@@ -26,6 +26,7 @@
 #include "hardware_action_form.hpp"  // ActionFormSpec
 #include "hardware_list_model.hpp"
 #include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
+#include "quarantine_visible.hpp"    // QuarantineListFn (list pill)
 
 #include <expected>
 #include <unordered_map>
@@ -291,6 +292,9 @@ public:
         SyncDispatchFn sync_dispatch_fn;  // Sync now (R2.3)
         AgentVersionFn agent_version_fn;  // Sync now version floor (R2.3)
         DexScoreFn dex_score_fn;          // Devices-page merge (round 3)
+        /// The authoritative active-quarantine read, for the list's Quarantined pill. Empty
+        /// = no pill and no banner (the panel and lens have their own routes).
+        QuarantineListFn quarantine_list_fn;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);
