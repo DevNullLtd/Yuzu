@@ -57,9 +57,10 @@ struct Harness {
     int reads{0};
     std::string seen_subnet;
     int seen_limit{-1};
+    std::vector<std::string> perms; ///< "securable:operation" per perm_fn call
     std::expected<DiscoveredDevicesPage, std::string> result{one_page()};
+    NetworkRoutes routes; // owner first: the sink's handlers capture it (conventions)
     yuzu::server::test::TestRouteSink sink;
-    NetworkRoutes routes;
 
     Harness() {
         routes.register_routes(
@@ -73,8 +74,9 @@ struct Harness {
                 s.token_scope_service = token_scope;
                 return std::optional<auth::Session>(s);
             },
-            [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                   const std::string&) {
+            [this](const httplib::Request&, httplib::Response& res, const std::string& securable,
+                   const std::string& op) {
+                perms.push_back(securable + ":" + op);
                 if (!perm_ok)
                     res.status = 403;
                 return perm_ok;
@@ -273,8 +275,8 @@ TEST_CASE("discovered devices REST: fails closed when the audit row cannot persi
 
 TEST_CASE("discovered devices REST: no reader wired is a 503",
           "[discovery][twin][routes]") {
-    yuzu::server::test::TestRouteSink sink;
     NetworkRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
     routes.register_routes(
         sink,
         [](const httplib::Request&, httplib::Response&) {
@@ -305,6 +307,8 @@ TEST_CASE("discovered devices fragment: renders rows, set-and-proceed audit",
     CHECK(res->body.find("10.0.0.5") != std::string::npos);
     REQUIRE(h.audit.size() == 1);
     CHECK(h.audit[0] == "network.discovered.view:success");
+    REQUIRE(h.perms.size() == 1);
+    CHECK(h.perms[0] == "Infrastructure:Read");
 }
 
 TEST_CASE("discovered devices fragment: store fault shows a failbox, not an empty table",

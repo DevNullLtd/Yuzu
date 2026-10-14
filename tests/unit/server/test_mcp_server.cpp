@@ -34242,6 +34242,27 @@ TEST_CASE("MCP list_discovered_devices: returns the shared builder shape, audite
     CHECK(saw_generic);
 }
 
+TEST_CASE("MCP list_discovered_devices: a failed domain audit proceeds and flags audit_persisted",
+          "[mcp][integration][network][discovery][security]") {
+    McpTestServer ts;
+    ts.discovered_devices_reader_for_test =
+        [](const std::string&, int) -> std::expected<yuzu::server::DiscoveredDevicesPage, std::string> {
+        return discovered_fixture_page();
+    };
+    ts.audit_fail_result_ = "success"; // the access-audit row cannot persist
+    ts.start("readonly");
+
+    auto res = ts.call(std::string(kListDiscoveredCall) + R"({}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload =
+        nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["data"].size() == 1); // MCP convention: set-and-proceed, data still served
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload["audit_persisted"] == false);
+}
+
 TEST_CASE("MCP list_discovered_devices: a service-scoped token is denied before the seam",
           "[mcp][integration][network][discovery][security]") {
     McpTestServer ts;
