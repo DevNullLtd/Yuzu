@@ -388,6 +388,10 @@ TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executio
     CHECK(tar->status == 200);
     CHECK(tar->get_header_value("Content-Type") == "text/html; charset=utf-8");
     CHECK_FALSE(tar->body.empty());
+    // Title, heading and breadcrumb all read "TAR"; the long form is the subtitle only.
+    CHECK(tar->body.find("<title>Yuzu \xE2\x80\x94 TAR</title>") != std::string::npos);
+    CHECK(tar->body.find("<h1>TAR</h1>") != std::string::npos);
+    CHECK(tar->body.find("Timeline Activity Record:") != std::string::npos);
 
     auto rs = h.sink.Get("/result-sets");
     REQUIRE(rs);
