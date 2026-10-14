@@ -6128,7 +6128,11 @@ cadence the scheduler really applies (the time-of-day, weekday and day-of-month 
 and ignored), Count and Last run, and an owner flag computed from the session. A schedule the
 caller did not create shows only All devices or Targeted: the scope expression, interval, approval
 flag, parameters and creator are in no read that carries another user's schedule (REST v1, MCP) and
-are not rendered for one. The default view is unchanged.
+are not rendered for one. The page view also carries `data-can-write`, `data-can-enable` and
+`data-can-delete` on its list root (render hints probed once per render from `Schedule:Write`,
+`Execution:Execute` and `Schedule:Delete`, never a gate; each probe refused writes one
+`auth.permission_required` audit row) and per-row Enable/Disable and Delete buttons, disabled for
+a row the caller did not create. The default view is unchanged.
 
 #### `GET /fragments/workflows`
 
@@ -6137,8 +6141,13 @@ gate as `GET /api/v1/workflows` (a management-group-scoped-only caller is refuse
 the 100 newest definitions with their steps (label, instruction id, condition, retries, `foreach`,
 failure policy) and marks a cut list with `data-truncated="1"`. A refused caller gets `200` with
 `data-denied="true"`, a failed store read `200` with `data-degraded="true"`; neither is an empty
-list. Step rows carry the workflow's own labels and instruction ids; instruction names are not looked
-up (that read needs `InstructionDefinition:Read`). Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
+list. Step rows carry the workflow's own labels and instruction ids; an instruction's name is looked
+up and shown only when the caller also holds `InstructionDefinition:Read` (a separate securable that
+`Workflow:Read` does not imply). The list root carries `data-can-run`, `data-can-write` and
+`data-can-delete` (`0` or `1`): render hints probed once per render from `Workflow:Execute`,
+`Workflow:Write` and `Workflow:Delete`, deciding which controls the page offers. They are not an
+authorization decision; the run, create and delete routes check their own grant. Each refused probe
+writes one `auth.permission_required` audit row. Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
 
 #### `GET /fragments/workflow-runs`
 

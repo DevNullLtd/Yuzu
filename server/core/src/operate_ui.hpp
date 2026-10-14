@@ -70,6 +70,11 @@ td .by{max-width:140px}
 .held{margin:0 16px 16px;padding:10px 12px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:12.5px;display:flex;flex-direction:column;gap:4px}
 .ops-sel>.btns+.held{margin-top:0}
 .ops-sel>.kvl+.held{margin-top:16px}
+[data-page="workflows"] .panel>.hd{display:flex;align-items:center;gap:8px}
+[data-page="workflows"] .hd .end{margin-left:auto}
+.ops-list td.act{text-align:right;white-space:nowrap}
+.devs{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto;margin-top:8px}
+.dev{display:flex;align-items:center;gap:8px;font-size:13px}
 .ops-dev [data-slot]>.hd{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
 .ops-dev .hd h2{font-size:14px;font-weight:600}
 .ops-dev .hd .sub{display:inline;max-width:none}
