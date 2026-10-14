@@ -935,6 +935,8 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 .guard { color: var(--mut); font-size: 12.5px; }
 #acc-alert:not(:empty) { color: var(--bad); font-size: 13.5px; }
 #acc-alert:empty, #acc-msg:empty { display: none; }
+.panel table td.wrap { white-space: normal; overflow-wrap: anywhere; }
+.tw.scroll { max-height: 320px; overflow: auto; }
 .acts { display: grid; border-top: 1px solid var(--line); }
 .acts > div { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); }
 .acts > div:last-child { border-bottom: 0; }

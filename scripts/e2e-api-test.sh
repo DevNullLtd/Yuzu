@@ -1147,6 +1147,8 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/users"
     "/fragments/access/users/list"
     "/fragments/access/users/detail"
+    "/fragments/access/roles/list"
+    "/fragments/access/roles/permissions?role=Viewer"
     "/fragments/settings/tokens"
     "/fragments/settings/pending"
     "/fragments/settings/auto-approve"

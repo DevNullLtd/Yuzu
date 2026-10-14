@@ -154,7 +154,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | instructions | 27 | 14 | 13 |
 | compliance-policy | 22 | 6 | 16 |
 | settings | 26 | 7 | 19 |
-| rbac | 13 | 0 | 13 |
+| rbac | 15 | 2 | 13 |
 | auth-mfa | 7 | 0 | 7 |
 | engine-principals | 3 | 0 | 3 |
 | access-reviews | 2 | 0 | 2 |
@@ -162,7 +162,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 7 | 14 |
 | other | 79 | 17 | 62 |
-| **Total** | **325** | **109** | **216** |
+| **Total** | **327** | **111** | **216** |
 
 Registered `/api/vN/*` routes: 251. OpenAPI `paths` entries: 250. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 191.
 

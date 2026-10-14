@@ -41,6 +41,19 @@ extern const char* const kAccessUsersTemplate =
         <div class="hd"><h2>Users</h2></div>
         <div class="pb"><p class="hint">Loading...</p></div>
       </section>
+      <section class="panel" id="acc-roles" hx-get="/fragments/access/roles/list" hx-trigger="load" hx-swap="innerHTML"
+               data-src="/fragments/access/roles/list"
+               data-denied="The role catalogue needs UserManagement:Read (the Administrator and Viewer roles)."
+               data-unavailable="The role store did not answer, so the roles are unknown. This is not an empty list.">
+        <div class="hd"><h2>Roles</h2></div>
+        <div class="pb"><p class="hint">Loading...</p></div>
+      </section>
+      <section class="panel" id="acc-role-perms"
+               data-denied="The role catalogue needs UserManagement:Read (the Administrator and Viewer roles)."
+               data-unavailable="The role store did not answer, so the permissions of this role are unknown. This is not an empty list.">
+        <div class="hd"><h2>Role permissions</h2></div>
+        <div class="empty"><span>Select a role to see what it allows.</span></div>
+      </section>
     </div>
     <div class="side2">
       <section class="panel" id="acc-detail"

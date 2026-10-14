@@ -61,6 +61,26 @@ std::string detail_html(auth::UserEntry u, bool is_self = false) {
     return render_user_detail(UserDetail{std::move(u), is_self});
 }
 
+RbacRole role(std::string name, std::string description, bool is_system = true) {
+    RbacRole r;
+    r.name = std::move(name);
+    r.description = std::move(description);
+    r.is_system = is_system;
+    return r;
+}
+
+Permission perm(std::string type, std::string op, std::string effect = "allow") {
+    Permission p;
+    p.securable_type = std::move(type);
+    p.operation = std::move(op);
+    p.effect = std::move(effect);
+    return p;
+}
+
+std::string roles_html(std::vector<RbacRole> roles) {
+    return render_roles_list(RolesList{std::move(roles)});
+}
+
 /// Every rendered state of both panels, for the corpus-wide hygiene cases.
 std::vector<std::string> every_output() {
     return {
@@ -73,6 +93,13 @@ std::vector<std::string> every_output() {
         render_user_detail(NotFound{}),
         render_user_detail(Unavailable{}, "/fragments/access/users/detail?username=bob"),
         render_select_user(),
+        roles_html({role("Operator", "Run things"), role("Op/erator", "x")}),
+        render_roles_list(Unavailable{}),
+        render_role_permissions(RolePerms{"Operator", {perm("Tag", "Read"), perm("Tag", "Write", "deny")}}),
+        render_role_permissions(RolePerms{"Operator", {}}),
+        render_role_permissions(NotFound{}),
+        render_role_permissions(Unavailable{}, "/fragments/access/roles/permissions?role=Operator"),
+        render_select_role(),
     };
 }
 
@@ -337,4 +364,111 @@ TEST_CASE("access source_label: the five known sources, empty for anything else"
     CHECK(source_label("").empty());
     CHECK(source_label("OIDC").empty()); // tokens are lower-case in the store
     CHECK(source_label("ldap").empty());
+}
+
+// ── Roles and role permissions ───────────────────────────────────────────────
+
+TEST_CASE("access roles: one row per role, a View button only for an addressable name",
+          "[access][render]") {
+    const auto html = roles_html({role("Operator", "Execute and manage"), role("Custom", "mine", false)});
+    CHECK(count_of(html, "<tr data-role=") == 2);
+    CHECK_THAT(html, ContainsSubstring("<span class=\"sub\">2 roles</span>"));
+    CHECK_THAT(html, ContainsSubstring(
+                         "hx-get=\"/fragments/access/roles/permissions?role=Operator\" "
+                         "hx-target=\"#acc-role-perms\""));
+    // Only the seeded roles are "Built-in".
+    CHECK(count_of(html, "Built-in") == 1);
+    CHECK_THAT(roles_html({role("Solo", "d")}), ContainsSubstring("<span class=\"sub\">1 role</span>"));
+}
+
+TEST_CASE("access roles: a name that is not a plain segment gets no request URL, ever",
+          "[access][render]") {
+    // Path and query metacharacters, dot segments, over-long, embedded NUL, SQL/HTML noise.
+    const std::string long_name(65, 'a');
+    for (const std::string& name :
+         {std::string("Op/erator"), std::string(".."), std::string("."), std::string("./x?"),
+          std::string("../y"), std::string("a b"), std::string("a&b=c"), std::string("a#b"),
+          long_name, std::string("a\0b", 3), std::string("<script>")}) {
+        INFO(name);
+        const auto html = roles_html({role(name, "d")});
+        CHECK_THAT(html, !ContainsSubstring("hx-get"));
+        CHECK_THAT(html, ContainsSubstring("Name not addressable"));
+        CHECK_THAT(html, !ContainsSubstring("<script>"));
+    }
+    // And a plain one is encoded as a query value, not merely escaped.
+    CHECK_THAT(roles_html({role("A.b-c_1", "d")}), ContainsSubstring("?role=A.b-c_1\""));
+}
+
+TEST_CASE("access roles: is_addressable_name is the REST route's charset minus dot-only names",
+          "[access][render]") {
+    for (const char* ok : {"a", "Administrator", "A.b-c_9", "...x", "x...", "a..b"})
+        CHECK(is_addressable_name(ok));
+    for (const char* bad : {"", ".", "..", "...", "a/b", "a b", "a%2e", "a?b", "a#b", "\xC3\xA9"})
+        CHECK_FALSE(is_addressable_name(bad));
+    CHECK(is_addressable_name(std::string(64, 'a')));
+    CHECK_FALSE(is_addressable_name(std::string(65, 'a')));
+    CHECK_FALSE(is_addressable_name(std::string("a\0b", 3)));
+}
+
+TEST_CASE("access roles: descriptions and names are escaped; an unreadable catalogue is not a table",
+          "[access][render]") {
+    const std::string nasty = "<script>alert(1)</script>\"'&";
+    const std::string nasty_esc = "&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&amp;";
+    const auto html = roles_html({role(nasty, nasty)});
+    CHECK_THAT(html, ContainsSubstring(nasty_esc));
+    CHECK_THAT(html, !ContainsSubstring("<script>"));
+    CHECK_THAT(html, ContainsSubstring("<tr data-role=\"" + nasty_esc + "\">"));
+    // A 10 KB description does not truncate the document.
+    CHECK_THAT(roles_html({role("R", std::string(10 * 1024, 'x'))}), ContainsSubstring("</table>"));
+
+    // An unanswered store and an empty answer (the store seeds seven roles) are both the red
+    // box: an empty role list reads as "nobody has any access".
+    for (const auto& bad : {render_roles_list(Unavailable{}), roles_html({})}) {
+        CHECK_THAT(bad, ContainsSubstring("role=\"alert\""));
+        CHECK_THAT(bad, ContainsSubstring(std::string(kRolesUnavailable)));
+        CHECK_THAT(bad, ContainsSubstring("data-act=\"reload\" data-target=\"acc-roles\""));
+        CHECK_THAT(bad, !ContainsSubstring("<table"));
+    }
+}
+
+TEST_CASE("access role permissions: grouped by area, counts computed, a deny row says so",
+          "[access][render]") {
+    const auto html = render_role_permissions(RolePerms{
+        "Operator",
+        {perm("Tag", "Read"), perm("Tag", "Write"), perm("Execution", "Execute"),
+         perm("Tag", "Delete", "deny")}});
+    CHECK_THAT(html, ContainsSubstring("Operator permissions"));
+    CHECK_THAT(html, ContainsSubstring("4 permissions across 2 areas"));
+    CHECK_THAT(html, ContainsSubstring("<td class=\"mono\">Tag</td><td>Read, Write, Delete (deny)</td>"));
+    CHECK_THAT(html, ContainsSubstring("<td class=\"mono\">Execution</td><td>Execute</td>"));
+    // A different fixture gives different numbers: the line is computed, not fixed text.
+    CHECK_THAT(render_role_permissions(RolePerms{"R", {perm("A", "Read")}}),
+               ContainsSubstring("1 permission across 1 area"));
+}
+
+TEST_CASE("access role permissions: unknown, empty, unreadable and unselected are four panels",
+          "[access][render]") {
+    const auto nf = render_role_permissions(NotFound{});
+    const auto empty = render_role_permissions(RolePerms{"R", {}});
+    const auto un = render_role_permissions(Unavailable{}, "/fragments/access/roles/permissions?role=R");
+    const auto sel = render_select_role();
+    CHECK_THAT(nf, ContainsSubstring("No such role"));
+    CHECK_THAT(empty, ContainsSubstring("This role holds no permissions."));
+    CHECK_THAT(un, ContainsSubstring("role=\"alert\""));
+    CHECK_THAT(un, ContainsSubstring(std::string(kRolePermsUnavailable)));
+    CHECK_THAT(un, ContainsSubstring("hx-get=\"/fragments/access/roles/permissions?role=R\""));
+    CHECK_THAT(sel, ContainsSubstring(std::string(kSelectRole)));
+    for (const auto& h : {nf, empty, sel})
+        CHECK_THAT(h, !ContainsSubstring("<table"));
+    CHECK_THAT(un, !ContainsSubstring("<table"));
+    CHECK(nf != empty);
+    CHECK(nf != un);
+    // No retry URL: no Retry button.
+    CHECK_THAT(render_role_permissions(Unavailable{}), !ContainsSubstring("<button"));
+    // Escaping of store-sourced area and operation strings.
+    const auto x = render_role_permissions(RolePerms{"<b>", {perm("<i>", "\"op\"")}});
+    CHECK_THAT(x, ContainsSubstring("&lt;b&gt; permissions"));
+    CHECK_THAT(x, ContainsSubstring("&lt;i&gt;"));
+    CHECK_THAT(x, ContainsSubstring("&quot;op&quot;"));
+    CHECK_THAT(x, !ContainsSubstring("<i>"));
 }

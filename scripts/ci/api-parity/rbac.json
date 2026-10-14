@@ -102,5 +102,27 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/roles/list",
+    "capability_id": "get.fragments-access-roles-list",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/rbac/roles"
+    },
+    "mcp_twin": "discover_permissions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/roles/permissions",
+    "capability_id": "get.fragments-access-roles-permissions",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/rbac/roles/{param}/permissions"
+    },
+    "mcp_twin": "discover_permissions",
+    "status": "twinned"
   }
 ]

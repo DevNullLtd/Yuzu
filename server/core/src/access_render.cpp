@@ -11,6 +11,7 @@ namespace yuzu::server::access {
 namespace {
 
 constexpr std::string_view kDetailUrl = "/fragments/access/users/detail?username=";
+constexpr std::string_view kPermsUrl = "/fragments/access/roles/permissions?role=";
 
 std::string esc(std::string_view s) {
     return html_escape(std::string(s));
@@ -80,6 +81,11 @@ std::string hint(std::string_view text) {
 std::string account_noun(const auth::UserEntry& u) {
     const auto label = source_label(u.identity_source);
     return (label.empty() ? esc(u.identity_source) : std::string(label)) + " account";
+}
+
+// "A, B and C" style counts for the permissions header: "41 permissions across 20 areas".
+std::string plural(std::size_t n, std::string_view one, std::string_view many) {
+    return std::to_string(n) + " " + std::string(n == 1 ? one : many);
 }
 
 std::string detail_panel(const UserDetail& d) {
@@ -174,6 +180,98 @@ std::string render_user_detail(const std::variant<UserDetail, NotFound, Unavaila
                 "\" hx-target=\"#acc-detail\" hx-swap=\"innerHTML\">Retry</button>";
     return "<div class=\"hd\"><h2>Account</h2></div><div class=\"pb\">" +
            failbox("This account could not be read.", kDetailUnavailable, retry) + "</div>";
+}
+
+bool is_addressable_name(std::string_view name) {
+    if (name.empty() || name.size() > 64)
+        return false;
+    bool all_dots = true;
+    for (const unsigned char c : name) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                        c == '.' || c == '_' || c == '-';
+        if (!ok)
+            return false;
+        if (c != '.')
+            all_dots = false;
+    }
+    return !all_dots;
+}
+
+std::string render_roles_list(const std::variant<RolesList, Unavailable>& state) {
+    const auto* list = std::get_if<RolesList>(&state);
+    if (!list || list->roles.empty()) {
+        const std::string retry = "<button type=\"button\" class=\"btn sm\" data-act=\"reload\" "
+                                  "data-target=\"acc-roles\">Retry</button>";
+        return "<div class=\"hd\"><h2>Roles</h2></div><div class=\"pb\">" +
+               failbox("Roles could not be read.", kRolesUnavailable, retry) + "</div>";
+    }
+    std::string out = "<div class=\"hd\"><h2>Roles</h2><span class=\"sub\">" +
+                      plural(list->roles.size(), "role", "roles") +
+                      "</span></div><div class=\"tw\"><table><thead><tr><th>Role</th>"
+                      "<th>What it allows</th><th></th></tr></thead><tbody>";
+    for (const auto& r : list->roles) {
+        out += "<tr data-role=\"" + esc(r.name) + "\"><td><b>" + esc(r.name) + "</b>";
+        if (r.is_system)
+            out += " <span class=\"pill idle\">Built-in</span>";
+        out += "</td><td class=\"wrap\">" + esc(r.description) + "</td><td><div class=\"rowact\">";
+        if (is_addressable_name(r.name))
+            out += "<button type=\"button\" class=\"btn link sm\" hx-get=\"" +
+                   std::string(kPermsUrl) + esc(url_q(r.name)) +
+                   "\" hx-target=\"#acc-role-perms\" hx-swap=\"innerHTML\">View permissions</button>";
+        else
+            out += hint("Name not addressable");
+        out += "</div></td></tr>";
+    }
+    return out + "</tbody></table></div>";
+}
+
+std::string render_role_permissions(const std::variant<RolePerms, NotFound, Unavailable>& state,
+                                    const std::string& retry_url) {
+    if (std::holds_alternative<NotFound>(state))
+        return "<div class=\"hd\"><h2>Role permissions</h2></div><div class=\"empty\"><b>No such role</b>"
+               "<span>The catalogue holds no role with that name.</span></div>";
+    const auto* p = std::get_if<RolePerms>(&state);
+    if (!p) {
+        std::string retry;
+        if (!retry_url.empty())
+            retry = "<button type=\"button\" class=\"btn sm\" hx-get=\"" + esc(retry_url) +
+                    "\" hx-target=\"#acc-role-perms\" hx-swap=\"innerHTML\">Retry</button>";
+        return "<div class=\"hd\"><h2>Role permissions</h2></div><div class=\"pb\">" +
+               failbox("Permissions could not be read.", kRolePermsUnavailable, retry) + "</div>";
+    }
+    if (p->rows.empty())
+        return "<div class=\"hd\"><h2 class=\"long\">" + esc(p->role) + " permissions</h2></div>"
+               "<div class=\"empty\"><b>No permissions</b><span>This role holds no permissions.</span></div>";
+
+    // Grouped by securable type in the order the store returned them. A deny row is shown as such.
+    std::vector<std::string> areas;
+    std::vector<std::string> ops;
+    for (const auto& r : p->rows) {
+        std::size_t i = 0;
+        while (i < areas.size() && areas[i] != r.securable_type)
+            ++i;
+        if (i == areas.size()) {
+            areas.push_back(r.securable_type);
+            ops.emplace_back();
+        }
+        if (!ops[i].empty())
+            ops[i] += ", ";
+        ops[i] += esc(r.operation) + (r.effect == "deny" ? " (deny)" : "");
+    }
+    std::string out = "<div class=\"hd\"><h2 class=\"long\">" + esc(p->role) +
+                      " permissions</h2><span class=\"sub\">" +
+                      plural(p->rows.size(), "permission", "permissions") + " across " +
+                      plural(areas.size(), "area", "areas") +
+                      "</span></div><div class=\"tw scroll\"><table class=\"compact\"><thead><tr><th>Area</th>"
+                      "<th>Allowed</th></tr></thead><tbody>";
+    for (std::size_t i = 0; i < areas.size(); ++i)
+        out += "<tr><td class=\"mono\">" + esc(areas[i]) + "</td><td>" + ops[i] + "</td></tr>";
+    return out + "</tbody></table></div>";
+}
+
+std::string render_select_role() {
+    return "<div class=\"hd\"><h2>Role permissions</h2></div><div class=\"empty\"><span>" +
+           esc(kSelectRole) + "</span></div>";
 }
 
 std::string render_select_user() {

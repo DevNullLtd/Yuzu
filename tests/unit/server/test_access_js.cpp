@@ -93,6 +93,12 @@ TEST_CASE("access page: the template's sentences are byte-equal to the renderer'
     CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kUsersUnavailable) + "\""));
     CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kDetailUnavailable) + "\""));
     CHECK_THAT(t, ContainsSubstring(std::string(kSelectUser)));
+    CHECK_THAT(t, ContainsSubstring("data-denied=\"" + std::string(kRolesDenied) + "\""));
+    CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kRolesUnavailable) + "\""));
+    CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kRolePermsUnavailable) + "\""));
+    CHECK_THAT(t, ContainsSubstring(std::string(kSelectRole)));
+    // The roles panel refetches itself; the permissions panel is filled by its View buttons.
+    CHECK_THAT(t, ContainsSubstring("data-src=\"/fragments/access/roles/list\""));
     // Both panels name their own refetch source for the Retry button.
     CHECK_THAT(t, ContainsSubstring("data-src=\"/fragments/access/users/list\""));
 }

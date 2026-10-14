@@ -15635,6 +15635,19 @@ private:
                                                std::to_string(static_cast<int>(r.error())) + ")");
                     return std::move(*r);
                 },
+                // The checked reads the REST twins use: a closed store, a pool timeout or a
+                // query error is `unexpected`, never an empty list.
+                .list_roles_fn = [this]() -> std::expected<std::vector<RbacRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_roles_checked();
+                },
+                .role_permissions_fn =
+                    [this](const std::string& role) -> std::expected<std::vector<Permission>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->get_role_permissions_checked(role);
+                },
             });
 
         // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three

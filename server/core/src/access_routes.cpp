@@ -8,6 +8,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <variant>
 
@@ -51,7 +52,8 @@ void respond_fragment(httplib::Response& res, const std::string& body) {
 } // namespace
 
 void register_access_routes(HttpRouteSink& sink, Deps deps) {
-    if (!deps.auth_fn || !deps.admin_fn || !deps.perm_fn || !deps.audit_fn || !deps.list_users_fn)
+    if (!deps.auth_fn || !deps.admin_fn || !deps.perm_fn || !deps.audit_fn || !deps.list_users_fn ||
+        !deps.list_roles_fn || !deps.role_permissions_fn)
         throw std::invalid_argument("access::register_access_routes: every Deps member is required");
 
     sink.Get("/access/users", [deps](const httplib::Request& req, httplib::Response& res) {
@@ -108,6 +110,58 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
                      }
                  }
                  respond_fragment(res, render_user_detail(NotFound{}));
+             });
+
+    // Roles: the SAME securable as GET /api/v1/rbac/roles (floored: admin only while RBAC is
+    // off), so the fragment cannot read the catalogue a refused caller could not read over REST.
+    sink.Get("/fragments/access/roles/list",
+             [deps](const httplib::Request& req, httplib::Response& res) {
+                 if (!deps.perm_fn(req, res, "UserManagement", "Read"))
+                     return;
+                 auto roles = deps.list_roles_fn();
+                 if (!roles) {
+                     spdlog::warn("/fragments/access/roles/list: {}", roles.error());
+                     respond_fragment(res, render_roles_list(Unavailable{}));
+                     return;
+                 }
+                 respond_fragment(res, render_roles_list(RolesList{std::move(*roles)}));
+             });
+
+    sink.Get("/fragments/access/roles/permissions",
+             [deps](const httplib::Request& req, httplib::Response& res) {
+                 // Shape first, before any gate or read: only a hand-built request carries a
+                 // name the Roles panel would never have offered.
+                 const std::string role = req.get_param_value("role");
+                 if (!is_addressable_name(role)) {
+                     res.status = 400;
+                     res.set_header("Cache-Control", "no-store");
+                     res.set_content("Invalid role name.", "text/plain; charset=utf-8");
+                     return;
+                 }
+                 if (!deps.perm_fn(req, res, "UserManagement", "Read"))
+                     return;
+                 const std::string retry = "/fragments/access/roles/permissions?role=" + url_q(role);
+                 // Existence comes from the catalogue, never from an empty permission set: a
+                 // store fault at either read is "unavailable", and an unknown name is "no such role".
+                 auto roles = deps.list_roles_fn();
+                 if (!roles) {
+                     spdlog::warn("/fragments/access/roles/permissions: {}", roles.error());
+                     respond_fragment(res, render_role_permissions(Unavailable{}, retry));
+                     return;
+                 }
+                 const bool known = std::any_of(roles->begin(), roles->end(),
+                                                [&](const RbacRole& r) { return r.name == role; });
+                 if (!known) {
+                     respond_fragment(res, render_role_permissions(NotFound{}));
+                     return;
+                 }
+                 auto perms = deps.role_permissions_fn(role);
+                 if (!perms) {
+                     spdlog::warn("/fragments/access/roles/permissions: {}", perms.error());
+                     respond_fragment(res, render_role_permissions(Unavailable{}, retry));
+                     return;
+                 }
+                 respond_fragment(res, render_role_permissions(RolePerms{role, std::move(*perms)}));
              });
 
     sink.Get("/static/yuzu-access.js", [](const httplib::Request&, httplib::Response& res) {

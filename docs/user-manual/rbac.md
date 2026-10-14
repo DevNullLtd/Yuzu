@@ -435,6 +435,8 @@ Settings uses, so the two stay equivalent.
   account. A refused browser session writes no audit row (the panels load automatically, so
   a row per page view would fill the log with denials); a refused API or MCP token that
   reaches the panel URL is recorded as an administrator-required denial.
+  The Roles panels need the `UserManagement:Read` permission and record each refused load as a
+  permission-required denial, so a person without it leaves one denial row per refused Roles panel.
 - **Account role versus RBAC role.** The account role (`admin` or `user`) is the legacy role:
   it decides who can open Settings and what applies while RBAC enforcement is off. RBAC roles
   apply once enforcement is on.
@@ -460,6 +462,13 @@ Settings uses, so the two stay equivalent.
   change may or may not have been applied and reloads both panels, so what is shown is what the
   store holds. Only Revoke sessions can report that the action succeeded but its audit record
   could not be written; Add, Change role and Remove cannot raise that banner.
+- **Roles and what they allow.** The **Roles** panel lists every role in the catalogue with its
+  description, and **View permissions** shows one role's permissions grouped by area (a deny row
+  says so). Both need `UserManagement:Read` (the Administrator and Viewer roles; an administrator
+  account while RBAC is off) and use the same read as `GET /api/v1/rbac/roles` and
+  `GET /api/v1/rbac/roles/{role}/permissions`. A store that does not answer is a red message,
+  never an empty list; a role the catalogue does not hold is "No such role", which is different
+  from a role that holds no permissions.
 - **Unreadable store.** If the account store does not answer, the Users panel shows a red
   message with a Retry button. It never shows an empty list in that case, so a degraded store
   cannot be mistaken for "nobody is here".
