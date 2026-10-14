@@ -200,7 +200,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
 #
 # 2026-10-14 (Home page, HM-1): +1 `composed-of:` row, GET /fragments/home/summary (readout,
-# estate donut, needs attention) over the existing hardware roster, approvals count,
+# needs attention) over the existing hardware roster, approvals count,
 # executions and fleet-compliance reads; a UI fragment, no machine twin owed (ADR-1005).
 # Measured with the checker at 200 (199 + 1), not hand-picked; whoever lands second re-reads it.
 BASELINE_UNTWINNED = 200

@@ -261,7 +261,8 @@ TEST_CASE("summary: an engaged scope narrows devices and limits fleet aggregates
     CHECK_FALSE(has(out->body, "Nothing needs attention"));
 }
 
-TEST_CASE("summary: TOP uses the SQL estate seam and never loads the roster", "[home][route]") {
+// A TOP (unconfined) caller over fakes; the tests set only the closures they probe.
+Deps top_deps() {
     Deps d;
     d.auth_fn = [](const httplib::Request&, httplib::Response&) { return std::optional<auth::Session>(auth::Session{}); };
     d.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&) {
@@ -272,6 +273,11 @@ TEST_CASE("summary: TOP uses the SQL estate seam and never loads the roster", "[
     };
     d.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&, const std::string&) { return true; };
     d.now_fn = [] { return std::int64_t{1'760'000'000}; };
+    return d;
+}
+
+TEST_CASE("summary: TOP uses the SQL estate seam and never loads the roster", "[home][route]") {
+    Deps d = top_deps();
     int roster_calls = 0, estate_calls = 0;
     d.roster_fn = [&]() { ++roster_calls; return InventoryDevicesResult{}; };
     d.fleet_estate_fn = [&](std::int64_t now_ms) -> std::optional<EstateCounts> {
@@ -288,6 +294,54 @@ TEST_CASE("summary: TOP uses the SQL estate seam and never loads the roster", "[
     CHECK(roster_calls == 0);
     CHECK(has(out->body, "240,000"));
     CHECK(has(out->body, "of 250,000 seen in the last 30 days"));
+}
+
+// Kills: a failed SQL estate read rendered as an empty or zero fleet, or silently
+// falling back to the roster (the 100k-capped path TOP callers must never take).
+TEST_CASE("summary: a failed TOP estate read is Unavailable, never zero, and never the roster",
+          "[home][route]") {
+    Deps d = top_deps();
+    int roster_calls = 0, estate_calls = 0;
+    d.roster_fn = [&]() { ++roster_calls; return InventoryDevicesResult{}; };
+    d.fleet_estate_fn = [&](std::int64_t) -> std::optional<EstateCounts> {
+        ++estate_calls;
+        return std::nullopt;
+    };
+    test::TestRouteSink sink;
+    HomeRoutes r;
+    r.register_routes(sink, std::move(d));
+    auto out = sink.Get("/fragments/home/summary");
+    REQUIRE(out);
+    CHECK(out->status == 200);
+    CHECK(estate_calls == 1);
+    CHECK(roster_calls == 0);
+    CHECK(has(out->body, "Could not read The device roster. This is not zero."));
+    CHECK_FALSE(has(out->body, "No devices have reported"));
+    CHECK_FALSE(has(out->body, "<div class=\"v\">0</div>"));
+    CHECK_FALSE(has(out->body, "Nothing needs attention"));
+}
+
+// Kills: a scoped caller's capped roster presented as an exact count (PLAN section 2:
+// "bounded at 100k and labelled"). Below the cap the figure stays exact.
+TEST_CASE("summary: a scoped roster read at the row cap is labelled a lower bound",
+          "[home][route]") {
+    auto render = [](std::size_t n) {
+        HomeHarness h;
+        h.scope = std::unordered_set<std::string>{"a", "b"};
+        h.roster.rows.assign(n, row("z", "linux", true));
+        h.roster.rows[0] = row("a", "windows", true);
+        h.roster.rows[1] = row("b", "linux", false, true);
+        auto out = h.sink.Get("/fragments/home/summary");
+        REQUIRE(out);
+        return out->body;
+    };
+    const std::string capped = render(kRosterReadCap);
+    CHECK(has(capped, "<div class=\"v\">at least 1</div>"));
+    CHECK(has(capped, "of at least 2 seen in the last 30 days"));
+    CHECK(has(capped, "At least 1 device has not reported for 2 days or more"));
+    const std::string exact = render(kRosterReadCap - 1);
+    CHECK(has(exact, "of 2 seen in the last 30 days"));
+    CHECK_FALSE(has(exact, "at least"));
 }
 
 // ── degrade ───────────────────────────────────────────────────────────────
@@ -378,11 +432,26 @@ TEST_CASE("summary: the enrolment scan runs only for an effective admin", "[home
 
 TEST_CASE("resolve_links falls back to today's pages and follows the nav when a key exists",
           "[home][route]") {
-    const auto links = resolve_links(shell::nav_groups());
-    // Targets must always be an absolute path or a fragment of one.
-    for (const auto* l : {&links.approvals, &links.executions, &links.devices, &links.enrolment})
-        CHECK(l->starts_with("/"));
-    CHECK(links.devices == "/hardware");
+    // Kills: a swapped or mistyped fallback, a dropped failed-status suffix, and a lookup
+    // that ignores the nav (every target asserted exactly, in both directions).
+    const auto fallback = resolve_links({});
+    CHECK(fallback.approvals == "/instructions");
+    CHECK(fallback.executions == "/instructions");
+    CHECK(fallback.devices == "/hardware");
+    CHECK(fallback.enrolment == "/settings#pending-section");
+
+    static const shell::NavItem items[] = {
+        {"approvals", "Approvals", "/ap", ""},
+        {"executions", "Executions", "/ex", ""},
+        {"hardware", "Hardware", "/hw", ""},
+        {"groups", "Groups", "/gr", ""},
+    };
+    static const shell::NavGroup groups[] = {{"All", items}};
+    const auto followed = resolve_links(groups);
+    CHECK(followed.approvals == "/ap");
+    CHECK(followed.executions == "/ex?status=failed");
+    CHECK(followed.devices == "/hw");
+    CHECK(followed.enrolment == "/gr");
 }
 
 // ── pure roster tally ─────────────────────────────────────────────────────

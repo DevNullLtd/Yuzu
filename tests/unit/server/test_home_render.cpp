@@ -178,6 +178,20 @@ TEST_CASE("devices cell: empty fleet and each failure state read differently", "
 
 // ── needs attention ───────────────────────────────────────────────────────
 
+// Kills: the response losing its out-of-band target. htmx swaps the first section in
+// place (the page's hx-swap=outerHTML) and routes the second by id via hx-swap-oob.
+TEST_CASE("summary: the readout swaps in place and Needs attention is the one OOB target",
+          "[home][render]") {
+    const std::string html = render_summary(all_ok());
+    const auto ro = html.find("<section id=\"home-readout\"");
+    const auto att = html.find("<section id=\"home-attention\"");
+    REQUIRE(ro == 0);
+    REQUIRE(att != std::string::npos);
+    CHECK(ro < att);
+    CHECK(html.find("hx-swap-oob=\"outerHTML\"") > att);
+    CHECK(html.find("hx-swap-oob") == html.rfind("hx-swap-oob"));
+}
+
 TEST_CASE("attention: rows for every contributing figure, with resolved links", "[home][render]") {
     SummaryView v = all_ok();
     v.show_enrolment = true;

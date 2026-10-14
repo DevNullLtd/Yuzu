@@ -18195,6 +18195,8 @@ private:
         // Every figure arrives through a closure over an existing typed read; the
         // gates are the SAME fleet_read_fn / perm_fn the sibling pages receive.
         // `build_hw_roster` is UNFILTERED: HomeRoutes narrows it by the gate's scope.
+        static_assert(static_cast<int>(home::kRosterReadCap) == OfflineEndpointStore::kQueryRowCap,
+                      "Home labels a roster read as a lower bound at the store's row cap");
         home_routes_ = std::make_unique<home::HomeRoutes>();
         home_routes_->register_routes(
             *web_server_,

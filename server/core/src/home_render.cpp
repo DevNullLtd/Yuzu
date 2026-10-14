@@ -110,11 +110,12 @@ std::string devices_cell(const SummaryView& v) {
     const auto& c = f.value;
     if (c.total == 0)
         return cell("", "0", "No devices have reported in the last 30 days.", "");
-    std::string label = "of " + fmt_int(c.total) + " seen in the last 30 days";
+    const std::string lb = c.at_least ? "at least " : "";
+    std::string label = "of " + lb + fmt_int(c.total) + " seen in the last 30 days";
     std::string d;
     if (c.not_seen > 0)
-        d = fmt_int(c.not_seen) + " not seen for 2 days or more";
-    return cell("", fmt_int(c.online), label, d, "wn");
+        d = lb + fmt_int(c.not_seen) + " not seen for 2 days or more";
+    return cell("", lb + fmt_int(c.online), label, d, "wn");
 }
 
 std::string compliance_cell(const SummaryView& v) {
@@ -308,9 +309,10 @@ std::string render_attention(const SummaryView& v) {
     if (v.devices.ok()) {
         const auto n = v.devices.value.not_seen;
         if (n > 0) {
+            const std::string lead = v.devices.value.at_least ? "At least " : "";
             out += att_row("s-w",
-                           fmt_int(n) + plural(n, " device has not reported for 2 days or more",
-                                               " devices have not reported for 2 days or more"),
+                           lead + fmt_int(n) + plural(n, " device has not reported for 2 days or more",
+                                                      " devices have not reported for 2 days or more"),
                            "", v.links.devices, "Show devices");
             ++rows;
         }

@@ -45,6 +45,8 @@ struct EstateCounts {
     std::int64_t online{0};
     std::int64_t not_seen{0}; ///< not online, heartbeat older than the stale threshold
     std::int64_t offline{0};  ///< not online, heartbeat inside the stale threshold
+    /// The roster read hit its row cap, so every figure is a lower bound ("at least N").
+    bool at_least{false};
 };
 
 struct ComplianceFigure {

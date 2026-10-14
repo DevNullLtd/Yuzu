@@ -38,6 +38,10 @@ namespace yuzu::server::home {
 /// Newest-first `failed` executions read size (the executions list cap).
 inline constexpr std::size_t kFailedReadCap = 100;
 
+/// Row cap of the roster read behind `Deps::roster_fn`. A full read is a lower bound,
+/// not the fleet. server.cpp pins this to `OfflineEndpointStore::kQueryRowCap`.
+inline constexpr std::size_t kRosterReadCap = 100000;
+
 struct Deps {
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;

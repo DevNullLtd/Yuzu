@@ -145,7 +145,11 @@ SummaryView HomeRoutes::build_summary(const httplib::Request& req,
                 for (const auto& r : all.rows)
                     if (authz::in_scope(g.scope, r.agent_id))
                         scoped.push_back(r);
-                v.devices = Fact<EstateCounts>::make_ok(tally_roster(scoped));
+                EstateCounts tally = tally_roster(scoped);
+                // The roster read is newest-first and capped before scope filtering, so a
+                // full read says nothing about what lies past the cap.
+                tally.at_least = all.rows.size() >= kRosterReadCap;
+                v.devices = Fact<EstateCounts>::make_ok(tally);
             }
         }
     }

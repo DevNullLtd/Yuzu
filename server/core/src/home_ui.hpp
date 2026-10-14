@@ -6,7 +6,7 @@
 /// CSS and the body template are exposed so the page pins can size-check each
 /// literal against the MSVC string-literal cap without parsing the baked page.
 
-/// Scoped `home-` rules for what yuzu.css does not carry (grid, donut, stacked bar,
+/// Scoped `home-` rules for what yuzu.css does not carry (readout grid and
 /// attention rows). Colours are tokens only, never hex literals.
 extern const char* const kHomeCss;
 /// Page body template (shell marker pair still unbaked).
