@@ -21,6 +21,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 using json = nlohmann::json;
@@ -65,6 +66,9 @@ CveRecord make_cve(std::string id, std::string product, std::string end_excludin
 struct Harness {
     bool perm_allow{true};
     std::string last_perm_type, last_perm_op;
+    bool audit_persists{true};
+    bool wire_audit{true};
+    std::vector<std::string> audits; // "action|result|target_type|target_id"
 
     NvdDatabase* nvd_db{nullptr};
     NvdSyncManager* nvd_sync{nullptr};
@@ -85,6 +89,13 @@ struct Harness {
             }
             return true;
         };
+        if (wire_audit)
+            deps.audit_fn = [this](const httplib::Request&, const std::string& action,
+                                   const std::string& result, const std::string& target_type,
+                                   const std::string& target_id, const std::string&) {
+                audits.push_back(action + "|" + result + "|" + target_type + "|" + target_id);
+                return audit_persists;
+            };
         deps.nvd_db = nvd_db;
         deps.nvd_sync = nvd_sync;
         nvd::register_nvd_routes(sink, deps);
@@ -95,10 +106,10 @@ struct Harness {
 
 // ── Registration shape ────────────────────────────────────────────────────
 
-TEST_CASE("nvd_routes: registers exactly 3 routes", "[server][routes][nvd_routes]") {
+TEST_CASE("nvd_routes: registers exactly 4 routes", "[server][routes][nvd_routes]") {
     Harness h;
     h.wire();
-    CHECK(h.sink.route_count() == 3);
+    CHECK(h.sink.route_count() == 4);
 }
 
 // ── GET /api/nvd/status: perm_fn(Infrastructure, Read) ────────────────────
@@ -296,4 +307,129 @@ TEST_CASE("nvd_routes: /api/nvd/match reports zero findings for a non-vulnerable
     auto j = json::parse(r->body);
     CHECK(j["count"] == 0);
     CHECK(j["findings"].empty());
+}
+
+// ── POST /api/nvd/sync is audited (nvd.sync.request) ───────────────────────
+
+TEST_CASE("nvd_routes: /api/nvd/sync records the request before it is made",
+          "[server][routes][nvd_routes][audit]") {
+    auto shared_db = std::make_shared<NvdDatabase>(":memory:");
+    NvdSyncManager sync{shared_db, std::make_unique<NullFetcher>(), std::chrono::seconds(3600), 8};
+
+    Harness h;
+    h.nvd_sync = &sync;
+    h.wire();
+
+    auto r = h.sink.Post("/api/nvd/sync", "");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0] == "nvd.sync.request|success|NvdSync|nvd");
+}
+
+TEST_CASE("nvd_routes: a disabled sync is audited as such and still 503s",
+          "[server][routes][nvd_routes][audit]") {
+    Harness h; // nvd_sync null
+    h.wire();
+    auto r = h.sink.Post("/api/nvd/sync", "");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0] == "nvd.sync.request|disabled|NvdSync|nvd");
+}
+
+TEST_CASE("nvd_routes: an unrecorded sync request is refused and nothing is started",
+          "[server][routes][nvd_routes][audit]") {
+    auto shared_db = std::make_shared<NvdDatabase>(":memory:");
+    NvdSyncManager sync{shared_db, std::make_unique<NullFetcher>(), std::chrono::seconds(3600), 8};
+
+    Harness h;
+    h.nvd_sync = &sync;
+    h.audit_persists = false;
+    h.wire();
+
+    auto r = h.sink.Post("/api/nvd/sync", "");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(r->body.find("sync_started") == std::string::npos);
+    CHECK_FALSE(sync.status().syncing);
+}
+
+TEST_CASE("nvd_routes: a denied sync request writes no audit row",
+          "[server][routes][nvd_routes][audit]") {
+    Harness h;
+    h.perm_allow = false;
+    h.wire();
+    auto r = h.sink.Post("/api/nvd/sync", "");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+    CHECK(h.audits.empty()); // the permission gate audits its own denial
+}
+
+// ── GET /fragments/auto/nvd: the status card ────────────────────────────────
+
+TEST_CASE("nvd_routes: the status fragment gates on Infrastructure:Read",
+          "[server][routes][nvd_routes]") {
+    Harness h;
+    h.perm_allow = false;
+    h.wire();
+    auto r = h.sink.Get("/fragments/auto/nvd");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+    CHECK(h.last_perm_type == "Infrastructure");
+    CHECK(h.last_perm_op == "Read");
+}
+
+TEST_CASE("nvd_routes: the status fragment states the off state plainly",
+          "[server][routes][nvd_routes]") {
+    Harness h; // no db: enabled=false, same truth as /api/nvd/status
+    h.wire();
+    auto r = h.sink.Get("/fragments/auto/nvd");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("NVD sync is off on this server.") != std::string::npos);
+}
+
+TEST_CASE("render_nvd_status: counts, never-synced, in-progress, and an escaped bounded error",
+          "[server][routes][nvd_routes]") {
+    json st = {{"enabled", true},           {"total_cves", 1234},
+               {"syncing", true},           {"last_sync_time", ""},
+               {"last_error", std::string(400, 'e') + "<script>"},
+               {"backfill_complete", false}, {"backfill_oldest_published", ""}};
+    const std::string h = nvd::render_nvd_status(st);
+    CHECK(h.find("1234") != std::string::npos);
+    CHECK(h.find("Never") != std::string::npos);
+    CHECK(h.find("Sync in progress") != std::string::npos);
+    CHECK(h.find("<script>") == std::string::npos);
+    CHECK(h.find(std::string(350, 'e')) == std::string::npos); // truncated
+
+    st["last_error"] = "";
+    st["syncing"] = false;
+    st["last_sync_time"] = "2026-10-13T01:02:03Z";
+    st["backfill_complete"] = true;
+    const std::string ok = nvd::render_nvd_status(st);
+    CHECK(ok.find("2026-10-13T01:02:03Z") != std::string::npos);
+    CHECK(ok.find("Last error") == std::string::npos);
+    CHECK(ok.find("Sync in progress") == std::string::npos);
+}
+
+TEST_CASE("nvd_routes: the status fragment and /api/nvd/status share one truth",
+          "[server][routes][nvd_routes]") {
+    auto shared_db = std::make_shared<NvdDatabase>(":memory:");
+    shared_db->upsert_cve(make_cve("CVE-2024-0100", "widget", "2.0.0"));
+    shared_db->upsert_cve(make_cve("CVE-2024-0101", "gadget", "2.0.0"));
+    NvdSyncManager sync{shared_db, std::make_unique<NullFetcher>(), std::chrono::seconds(3600), 8};
+
+    Harness h;
+    h.nvd_db = shared_db.get();
+    h.nvd_sync = &sync;
+    h.wire();
+
+    auto api = h.sink.Get("/api/nvd/status");
+    auto frag = h.sink.Get("/fragments/auto/nvd");
+    REQUIRE(api);
+    REQUIRE(frag);
+    // The card is rendered from exactly the JSON the API serves.
+    CHECK(frag->body == nvd::render_nvd_status(json::parse(api->body)));
+    CHECK(frag->body.find("<dd>2</dd>") != std::string::npos); // the two seeded CVEs
 }

@@ -15239,15 +15239,6 @@ private:
                              .analytics_store = analytics_store_.get(),
                          });
 
-        // #2542 follow-up: the 3 NVD CVE-feed routes (/api/nvd/status,
-        // /api/nvd/sync, /api/nvd/match), extracted onto the same inline_sink
-        // seam.
-        yuzu::server::nvd::register_nvd_routes(inline_sink, yuzu::server::nvd::Deps{
-                                                                 .perm_fn = perm_fn,
-                                                                 .nvd_db = nvd_db_.get(),
-                                                                 .nvd_sync = nvd_sync_.get(),
-                                                             });
-
         // Per-device tier + management-group scope gate (wraps
         // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
         // operator can only open / read / live-query a device inside their scope,
@@ -15364,6 +15355,16 @@ private:
                                const std::string& target_id, const std::string& detail) -> bool {
             return audit_log(req, action, result, target_type, target_id, detail);
         };
+
+        // #2542 follow-up: the NVD CVE-feed routes (/api/nvd/status, /api/nvd/sync,
+        // /api/nvd/match, plus the /fragments/auto/nvd status card), on the same
+        // inline_sink seam. Placed after audit_fn (the sync request is audited).
+        yuzu::server::nvd::register_nvd_routes(inline_sink, yuzu::server::nvd::Deps{
+                                                                 .perm_fn = perm_fn,
+                                                                 .audit_fn = audit_fn,
+                                                                 .nvd_db = nvd_db_.get(),
+                                                                 .nvd_sync = nvd_sync_.get(),
+                                                             });
 
         // #2542 PR-4: the 5-route Custom Properties API (7.6)
         // (/api/agents/:id/properties[/:key], /api/property-schemas),
