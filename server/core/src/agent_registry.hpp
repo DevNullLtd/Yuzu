@@ -1015,7 +1015,8 @@ public:
     // without materialising the id list. Unlike `all_ids()`, a degraded
     // presence read is a typed `std::unexpected` — never a silently
     // local-only count — because the Home readout renders "unavailable", not
-    // a smaller number. NOTE: a presence set past
+    // a smaller number. For an exact online count past the cap use
+    // `OfflineEndpointStore::fleet_state_counts().live` (SQL COUNT). NOTE: a presence set past
     // `OfflineEndpointStore::kQueryRowCap` is `Truncated` and therefore
     // unavailable here; not measured at fleet scale.
     [[nodiscard]] std::expected<std::size_t, PresenceReadError> known_agent_count() const;

@@ -197,6 +197,52 @@ TEST_CASE("OfflineEndpointStore fleet_state_counts live count matches query_live
     CHECK(none->live == 0);
 }
 
+TEST_CASE("OfflineEndpointStore fleet_state_counts stays exact past kQueryRowCap",
+          "[pg][offline][fleet]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    constexpr std::int64_t kNow = 1'800'000'000'000;
+    const int rows = OfflineEndpointStore::kQueryRowCap + 1;
+    {
+        auto lease = pool.acquire();
+        REQUIRE(static_cast<bool>(lease));
+        PgResult r{PQexec(lease.get(),
+                          ("INSERT INTO endpoint_state.endpoints "
+                           "(agent_id, hostname, os, last_heartbeat_ms, agent_ts, session_id) "
+                           "SELECT 'cap-' || g, 'h', 'linux', " +
+                           std::to_string(kNow) + ", 0, 's-' || g FROM generate_series(1, " +
+                           std::to_string(rows) + ") g")
+                              .c_str())};
+        REQUIRE(r.ok());
+    }
+    // query_live_ids refuses past the cap; the SQL tally does not.
+    auto ids = store.query_live_ids(std::chrono::hours(1));
+    REQUIRE_FALSE(ids.has_value());
+    CHECK(ids.error() == PresenceReadError::Truncated);
+
+    auto c = store.fleet_state_counts(kNow, std::chrono::hours(1), std::chrono::milliseconds{1000},
+                                      std::chrono::hours(1));
+    REQUIRE(c.has_value());
+    CHECK(c->total == rows);
+    CHECK(c->live == rows);
+    CHECK(c->linux_os == rows);
+}
+
+TEST_CASE("OfflineEndpointStore fleet_state_counts is StoreUnavailable on a store that never opened",
+          "[offline][fleet]") {
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    OfflineEndpointStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    auto r = store.fleet_state_counts(1'800'000'000'000, std::chrono::hours(1),
+                                      std::chrono::milliseconds{1000}, std::chrono::seconds{90});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == PresenceReadError::StoreUnavailable);
+}
+
 TEST_CASE("OfflineEndpointStore fleet_state_counts is an error, never a zero struct, when the "
           "store cannot answer",
           "[pg][offline][fleet]") {

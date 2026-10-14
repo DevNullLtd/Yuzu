@@ -1220,6 +1220,9 @@ std::expected<FleetCompliance, PolicyReadError> PolicyStore::get_fleet_complianc
 
 std::expected<std::vector<ComplianceSummary>, PolicyReadError>
 PolicyStore::compliance_by_policy_checked() const {
+    auto cache_now = [this] {
+        return cache_clock_ ? cache_clock_() : std::chrono::steady_clock::now();
+    };
     if (!open_) {
         spdlog::warn("PolicyStore::compliance_by_policy_checked: store not open");
         return std::unexpected(PolicyReadError::kDegraded);
@@ -1227,7 +1230,7 @@ PolicyStore::compliance_by_policy_checked() const {
     {
         std::lock_guard<std::mutex> lock(cache_mtx_);
         if (by_policy_last_computed_.time_since_epoch().count() > 0 &&
-            (std::chrono::steady_clock::now() - by_policy_last_computed_) <
+            (cache_now() - by_policy_last_computed_) <
                 kFleetComplianceCacheTtl)
             return cached_by_policy_;
     }
@@ -1272,7 +1275,7 @@ PolicyStore::compliance_by_policy_checked() const {
     {
         std::lock_guard<std::mutex> lock(cache_mtx_);
         cached_by_policy_ = out;
-        by_policy_last_computed_ = std::chrono::steady_clock::now();
+        by_policy_last_computed_ = cache_now();
     }
     return out;
 }
