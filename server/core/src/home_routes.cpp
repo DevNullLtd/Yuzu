@@ -133,6 +133,8 @@ std::optional<EstateCounts> HomeRoutes::cached_estate() const {
     } else {
         // Stamped AFTER the read: viewers queued behind a slow failure see it as fresh.
         estate_failed_at_ = deps_.now_fn();
+        // An expired entry must not come back as fresh if the clock later steps back.
+        estate_cache_.reset();
     }
     return c;
 }

@@ -18222,10 +18222,11 @@ private:
                 .roster_fn = build_hw_roster,
                 // TOP callers: one SQL statement instead of the 100k-row-capped roster.
                 // Online is the registry's union count (local sessions + durable
-                // presence); past the presence row cap that is typed-unavailable, so
-                // the SQL durable-live count stands in. That count is durable presence
-                // only (local sessions not yet persisted are not in it) and uses the
-                // same TTL as the registry's presence read (cfg_.session_timeout).
+                // presence); when that is typed-unavailable (past the presence row cap,
+                // or a presence-store error) the SQL durable-live count stands in. That
+                // count is durable presence only (local sessions not yet persisted are
+                // not in it) and uses the same TTL as the registry's presence read
+                // (cfg_.session_timeout).
                 // NOT confined: HomeRoutes only calls this when the gate returned
                 // `scope == nullopt`, and caches a successful answer for 60 s.
                 .fleet_estate_fn =
