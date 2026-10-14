@@ -274,8 +274,12 @@ class OtpPinTests(unittest.TestCase):
             et.rebar3_prefix()
 
     def test_a_candidate_path_with_a_line_break_is_refused(self):
-        evil = make_install(os.path.join(self.home, ".kerl", "a\nb"), "77.4.1")
-        bin_dir, _, _, report = et.find_otp("77.4")
+        # Injected, not created: Windows cannot name a directory with a line
+        # break. The probe reports a match, so only the refusal stops it.
+        evil = os.path.join(self.home, ".kerl", "a\nb", "bin")
+        with mock.patch.object(et, "otp_candidates", return_value=[("kerl", evil)]), \
+                mock.patch.object(et, "probe_install", return_value=(evil, "77.4.1")):
+            bin_dir, _, _, report = et.find_otp("77.4")
         self.assertIsNone(bin_dir)
         self.assertTrue(any("refused (line break in path)" in r for r in report), report)
 
