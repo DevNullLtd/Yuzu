@@ -320,6 +320,29 @@ TEST_CASE("config_routes: PUT an integer key round-trips into cfg AND the store,
     CHECK(get_b["overrides"]["response_retention_days"]["value"] == "120");
 }
 
+TEST_CASE("config_routes: PUT surfaces a dropped audit row as Sec-Audit-Failed and keeps the "
+          "applied change",
+          "[pg][server][routes][config_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    auto ok = h.sink.Put("/api/config/response_retention_days", R"({"value":"120"})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK_FALSE(ok->has_header("Sec-Audit-Failed"));
+
+    h.audit_succeeds = false;
+    auto res = h.sink.Put("/api/config/response_retention_days", R"({"value":"121"})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // applied, not rolled back
+    CHECK(body(res->body)["applied"] == true);
+    CHECK(h.cfg.response_retention_days == 121);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
 TEST_CASE("config_routes: PUT a non-numeric value for an integer key is a 400, cfg untouched, "
           "no audit (UP-R5 ghost-write guard)",
           "[pg][server][routes][config_routes]") {

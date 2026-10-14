@@ -201,13 +201,22 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # DEX Alerts tab (posture PR-E): GET /fragments/dex/alerts is "composed-of" the legacy
 # settings fragment (+1, 199 -> 200); the fragment's three POSTs stay planned:#2146.
 #
+# System "General and appearance" page: two UI-only fragments, GET
+# /fragments/settings/general-runtime (composed-of:get.api-config) and GET
+# /fragments/settings/analytics-events (composed-of:get.api-analytics-recent). Each composes an
+# existing JSON route that is itself `planned:#2146` with no REST v1 or MCP twin (the legacy
+# runtime-config and analytics routes), so there is no twin to point at and each counts as
+# untwinned. Reviewed: a fragment is UI, not a machine surface (ADR-1005 Decision 4), and the
+# routes they compose are the ledgered gap.
+#
 # Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
 # is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
 # which counts as untwinned by design, so the count rises 199 -> 200.
 #
-# Both of the two changes above landed on 199; merged together the count is 201
+# The two changes above landed on 199; merged together the count is 201
 # (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
-BASELINE_UNTWINNED = 201
+# The System General page adds 2 more (the two composed-of fragments above): 201 + 2 = 203.
+BASELINE_UNTWINNED = 203
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

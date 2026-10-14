@@ -645,3 +645,17 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }
 }
+
+/* System: general ---------------------------------------------------------
+   Appearance card and the table-density preview on /settings/general. Token
+   colours only. */
+.pals { display: grid; grid-template-columns: minmax(0, 340px); gap: 12px; }
+.pal { display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--line2);
+       border-radius: var(--rad-panel); background: var(--bg); }
+.pal b { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.pal small { color: var(--mut); font-size: 12.5px; }
+.sw-row { display: flex; gap: 6px; }
+.swatch { width: 28px; height: 28px; border-radius: 3px; border: 1px solid var(--line2); }
+.s-bg { background: var(--bg); } .s-surface { background: var(--surface); } .s-raise { background: var(--raise); }
+.s-primary { background: var(--primary); } .s-hl { background: var(--hl); } .s-ok { background: var(--ok); }
+.prev { border: 1px solid var(--line2); border-radius: var(--rad-panel); overflow: hidden; margin-bottom: 8px; }

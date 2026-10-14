@@ -31,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
@@ -128,7 +129,16 @@ namespace yuzu::server::settings_model {
 /// ServerConfig:Read. Nothing secret (#4028 Evidence) — gRPC/web
 /// addresses+ports, session timeout, max agents, rate limits, OTA/gRPC
 /// tuning knobs.
-[[nodiscard]] nlohmann::json build_server_config_settings(const Config& cfg);
+///
+/// `session_timeout_seconds` is the AGENT heartbeat timeout (`Config::session_timeout`:
+/// seconds without a heartbeat before the server drops a directly connected agent). It is
+/// not the dashboard sign-in expiry; that is the two additive fields below:
+///   `session_inactivity_seconds`        `Config::session_inactivity_secs` (0 = idle timeout off)
+///   `session_absolute_lifetime_seconds` the fixed sign-in lifetime. A caller input, not a
+///       `Config` field (`AuthManager::kSessionDuration`), passed in so this header keeps
+///       its "Config only, no auth dependency" contract (cf. `build_gateway_settings`).
+[[nodiscard]] nlohmann::json build_server_config_settings(const Config& cfg,
+                                                          std::int64_t session_absolute_lifetime_seconds);
 
 /// `GET /fragments/settings/mcp` + `GET /api/v1/settings/mcp`. ServerConfig:Read.
 /// {enabled, read_only, endpoint_url} — `endpoint_url` is computed the same

@@ -436,6 +436,8 @@ yuzu_server_core_lib = static_library(
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
     'src/settings_model.cpp', # #4028 — shared REST/fragment Settings read-twin builders
+    'src/settings_general_routes.cpp', # System "General and appearance": page + 2 UI fragments
+    'src/settings_general_ui.cpp',
     'src/plugin_signing_helpers.cpp',
     'src/nvd_db.cpp',
     'src/nvd_version.cpp',

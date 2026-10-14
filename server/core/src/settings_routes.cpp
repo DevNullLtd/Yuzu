@@ -296,6 +296,15 @@ nlohmann::json settings_ok_envelope(nlohmann::json data) {
     return out;
 }
 
+/// The server-config builder input shared by the fragment and its REST twin: the fixed
+/// sign-in lifetime is `AuthManager::kSessionDuration`, passed in so settings_model.hpp
+/// stays free of the auth dependency (main.cpp derives its warn threshold the same way).
+nlohmann::json server_config_view(const Config& cfg) {
+    return settings_model::build_server_config_settings(
+        cfg, std::chrono::duration_cast<std::chrono::seconds>(auth::AuthManager::kSessionDuration)
+                 .count());
+}
+
 } // anonymous namespace
 
 // ── Fragment renderers ──────────────────────────────────────────────────────
@@ -304,7 +313,7 @@ std::string SettingsRoutes::render_server_config_fragment() {
     // #4028 — shared builder (settings_model.hpp); the REST twin
     // GET /api/v1/settings/server-config formats the SAME JSON as its
     // response body instead of re-deriving these fields from cfg_.
-    const auto v = settings_model::build_server_config_settings(*cfg_);
+    const auto v = server_config_view(*cfg_);
 
     std::string html;
 
@@ -321,8 +330,20 @@ std::string SettingsRoutes::render_server_config_fragment() {
     html += "<tr><td>Web UI Port</td><td><code>" + std::to_string(v.at("web_port").get<int>()) +
             "</code></td></tr>";
 
-    html += "<tr><td>Session Timeout</td><td><code>" +
+    // This is the AGENT heartbeat window (agents silent for longer are dropped), not the
+    // dashboard sign-in expiry; the two rows after it are the sign-in limits.
+    html += "<tr><td>Agent heartbeat timeout</td><td><code>" +
             std::to_string(v.at("session_timeout_seconds").get<std::int64_t>()) +
+            "s</code></td></tr>";
+    {
+        const auto idle = v.at("session_inactivity_seconds").get<std::int64_t>();
+        html += "<tr><td>Dashboard idle timeout</td><td>" +
+                (idle > 0 ? "<code>" + std::to_string(idle) + "s</code>"
+                          : std::string("Off")) +
+                "</td></tr>";
+    }
+    html += "<tr><td>Dashboard session lifetime</td><td><code>" +
+            std::to_string(v.at("session_absolute_lifetime_seconds").get<std::int64_t>()) +
             "s</code></td></tr>";
     html += "<tr><td>Max Agents</td><td><code>" +
             std::to_string(v.at("max_agents").get<std::int64_t>()) + "</code></td></tr>";
@@ -3609,9 +3630,8 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ServerConfig", "Read"))
                      return;
-                 res.set_content(
-                     settings_ok_envelope(settings_model::build_server_config_settings(*cfg_)).dump(),
-                     "application/json");
+                 res.set_content(settings_ok_envelope(server_config_view(*cfg_)).dump(),
+                                 "application/json");
              });
 
     sink.Get("/fragments/settings/https",

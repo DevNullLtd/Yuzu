@@ -4691,6 +4691,8 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Permission:** `Infrastructure:Write`
 
+**Audit:** the change is applied before it is audited and is never rolled back. When the `config.update` audit row could not be written the response stays `200` and carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)).
+
 **Allowed keys** (the full set; source of truth is `kAllowedKeys` in
 `server/core/src/runtime_config_store.cpp`):
 
@@ -4999,6 +5001,13 @@ Erlang gateway upstream status: enabled state, listen address, gateway mode, liv
 Core server configuration: gRPC/web addresses and ports, session timeout, max agents, rate limits,
 OTA/gRPC tuning knobs. Nothing secret.
 
+`session_timeout_seconds` is the **agent heartbeat timeout**: the number of seconds without a
+heartbeat after which this server drops a directly connected agent. It is not the dashboard sign-in
+expiry. The sign-in limits are `session_inactivity_seconds` (the `--session-inactivity-secs` idle
+timeout; `0` means off) and `session_absolute_lifetime_seconds` (the fixed sign-in lifetime, 8 hours).
+The heartbeat timeout can be changed at runtime with `PUT /api/config/heartbeat_timeout`; the two
+sign-in limits cannot.
+
 **Permission:** `ServerConfig:Read`. **Audit:** none.
 
 ```json
@@ -5008,7 +5017,9 @@ OTA/gRPC tuning knobs. Nothing secret.
     "management_grpc_address": "0.0.0.0:50052",
     "web_address": "127.0.0.1",
     "web_port": 8080,
-    "session_timeout_seconds": 3600,
+    "session_timeout_seconds": 90,
+    "session_inactivity_seconds": 0,
+    "session_absolute_lifetime_seconds": 28800,
     "max_agents": 10000,
     "auth_config_path": "/etc/yuzu/yuzu-server.cfg",
     "rate_limit_per_ip": 100,
