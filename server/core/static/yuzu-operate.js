@@ -1,4 +1,4 @@
-/* yuzu-operate.js -- page controllers for the Operate pages (Approvals, Executions).
+/* yuzu-operate.js -- page controllers for the Operate pages (Approvals, Executions, Workflows).
  *
  * Read-only: the server renders every list and panel as an HTML fragment (the fragment
  * routes' `view=page` branches); this file only fetches them, swaps them into their host
@@ -8,7 +8,7 @@
  * Rules this file keeps (pinned by test_operate_pages_ui.cpp):
  *   - no dynamic-code or raw-markup sinks of any kind (the test pins the exact list);
  *   - innerHTML is assigned ONLY from a 200 fragment the server rendered (and escaped), to
- *     the three fragment hosts (#ap-list, #exec-list, #exec-selected); a non-200 body is
+ *     the fragment hosts (#ap-list, #exec-list, #exec-selected, #wf-list, #sc-list); a non-200 body is
  *     never written anywhere;
  *   - every fetch has a bounded timeout, and a late response never overwrites a newer one
  *     (request token).
@@ -441,7 +441,124 @@
     });
   }
 
-  var controllers = { approvals: approvalsController, executions: executionsController };
+  function workflowsController() {
+    var wfHost = $('#wf-list');
+    var scHost = $('#sc-list');
+    var stepsTitle = $('#wf-steps-title');
+    var stepsBody = $('#wf-steps-body');
+    if (!wfHost || !scHost || !stepsTitle || !stepsBody) return;
+
+    var wseq = 0;          // request tokens: only the newest definitions / schedules answer lands
+    var sseq = 0;
+    var loadedAt = 0;
+    var selectedId = '';
+
+    function stepsEmpty(text) {
+      stepsTitle.textContent = 'Steps';
+      setNote(stepsBody, text);
+    }
+
+    function markSelected() {
+      $$('tr.row', wfHost).forEach(function (r) {
+        var on = !!selectedId && r.getAttribute('data-workflow-id') === selectedId;
+        r.classList.toggle('sel', on);
+        r.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+
+    // The step list of every listed workflow rides in the definitions fragment (a hidden
+    // store), so a selection is a clone of server-rendered, escaped nodes: no request, no
+    // markup assignment. Compared by attribute value, never interpolated into a selector.
+    function stepsFor(id) {
+      var found = null;
+      $$('[data-steps-for]', wfHost).forEach(function (b) {
+        if (b.getAttribute('data-steps-for') === id) found = b;
+      });
+      return found;
+    }
+
+    function showSteps(id) {
+      var block = id ? stepsFor(id) : null;
+      if (!block) { selectedId = ''; markSelected(); return false; }
+      selectedId = id;
+      markSelected();
+      stepsTitle.textContent = (block.getAttribute('data-name') || id) + ': steps';
+      stepsBody.replaceChildren(block.cloneNode(true));
+      return true;
+    }
+
+    function select(row) {
+      var id = row.getAttribute('data-workflow-id') || '';
+      if (!id) return;
+      showSteps(id);
+      writeQs(function (p) { p.set('wf', id); });
+    }
+
+    function loadWorkflows() {
+      var mine = ++wseq;
+      return fetchFragment('/fragments/workflows').then(function (res) {
+        if (mine !== wseq) return;
+        loadedAt = Date.now();
+        if (res.status !== 200) {
+          setNote(wfHost, failureCopy(res.status, 'workflows'));
+          selectedId = '';
+          stepsEmpty('Select a workflow to see its steps.');
+          return;
+        }
+        wfHost.innerHTML = res.html; // server-rendered and escaped
+        // Re-apply the selection without a refetch; a workflow that left the list
+        // (deleted, or a product pack was uninstalled) clears it and says so.
+        if (selectedId && !showSteps(selectedId))
+          stepsEmpty('That workflow is no longer listed.');
+      });
+    }
+
+    function loadSchedules() {
+      var mine = ++sseq;
+      return fetchFragment('/fragments/schedules?view=page').then(function (res) {
+        if (mine !== sseq) return;
+        if (res.status !== 200) {
+          setNote(scHost, failureCopy(res.status, 'schedules'));
+          return;
+        }
+        scHost.innerHTML = res.html; // server-rendered and escaped
+        renderLocalTimes(scHost);
+      });
+    }
+
+    wfHost.addEventListener('click', function (e) {
+      var row = e.target.closest ? e.target.closest('tr.row') : null;
+      if (row && wfHost.contains(row)) select(row);
+    });
+    wfHost.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      var row = e.target.closest ? e.target.closest('tr.row') : null;
+      if (!row || !wfHost.contains(row)) return;
+      e.preventDefault();
+      select(row);
+    });
+    // A denied or degraded panel is not polled: each refresh of one writes a denial audit
+    // row server-side, so a returning tab reloads only what answered with a list.
+    doc.addEventListener('visibilitychange', function () {
+      if (doc.hidden || !loadedAt || Date.now() - loadedAt <= RELOAD_AFTER_MS) return;
+      if ($('.ops-list', wfHost)) loadWorkflows();
+      if ($('.ops-list', scHost)) loadSchedules();
+    });
+
+    var qs = readQs();
+    var wantId = qs ? (qs.get('wf') || '') : '';
+    loadSchedules();
+    loadWorkflows().then(function () {
+      if (wantId && !showSteps(wantId))
+        stepsEmpty('That workflow is not listed, or you may not see it.');
+    });
+  }
+
+  var controllers = {
+    approvals: approvalsController,
+    executions: executionsController,
+    workflows: workflowsController
+  };
   var page = doc.body ? doc.body.getAttribute('data-page') : '';
   if (controllers[page]) controllers[page]();
 })();

@@ -2,7 +2,7 @@
 /// HTTP-level coverage for the page-shell/static-asset route module (#2542)
 /// — driven in-process through TestRouteSink (no httplib acceptor, #438),
 /// mirroring test_plugin_config_routes.cpp's Harness shape. None of these
-/// 32 routes touches Postgres (no store), so every case here runs without
+/// 33 routes touches Postgres (no store), so every case here runs without
 /// YUZU_TEST_POSTGRES_DSN.
 
 #include "page_routes.hpp"
@@ -332,7 +332,7 @@ TEST_CASE("page_routes: /api/help* serves real registry output when perm allows 
     CHECK(palette->get_header_value("Content-Type") == "text/html");
 }
 
-// ── /help, /tar, /result-sets, /instructions, /approvals, /executions ──
+// ── /help, /tar, /result-sets, /instructions, /approvals, /executions, /workflows ──
 
 TEST_CASE("page_routes: /help serves the help page, ungated", "[server][routes][page_routes]") {
     Harness h;
@@ -345,7 +345,8 @@ TEST_CASE("page_routes: /help serves the help page, ungated", "[server][routes][
     CHECK_FALSE(r->body.empty());
 }
 
-TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executions deny without auth "
+TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executions, /workflows deny "
+          "without auth "
           "(redirect to /login)",
           "[server][routes][page_routes]") {
     Harness h;
@@ -353,7 +354,7 @@ TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executio
     h.wire();
 
     for (const std::string path : {"/tar", "/result-sets", "/instructions", "/approvals",
-                                   "/executions"}) {
+                                   "/executions", "/workflows"}) {
         INFO("path: " << path);
         auto r = h.sink.Get(path);
         REQUIRE(r);
@@ -362,7 +363,8 @@ TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executio
     }
 }
 
-TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executions serve 200 when authed",
+TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executions, /workflows serve "
+          "200 when authed",
           "[server][routes][page_routes]") {
     Harness h;
     h.wire();
@@ -396,6 +398,12 @@ TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executio
     CHECK(executions->status == 200);
     CHECK(executions->get_header_value("Content-Type") == "text/html; charset=utf-8");
     CHECK(executions->body.find("data-page=\"executions\"") != std::string::npos);
+
+    auto workflows = h.sink.Get("/workflows");
+    REQUIRE(workflows);
+    CHECK(workflows->status == 200);
+    CHECK(workflows->get_header_value("Content-Type") == "text/html; charset=utf-8");
+    CHECK(workflows->body.find("data-page=\"workflows\"") != std::string::npos);
 }
 
 // ── /viz/fleet + /viz/host/:id (auth + kill switch) ───────────────────────
@@ -507,14 +515,14 @@ TEST_CASE("page_routes: /viz/host/:id rejects a malformed agent id with 400",
 
 // ── Registration order / shape ────────────────────────────────────────────
 
-TEST_CASE("page_routes: registers exactly 32 routes, with /viz/fleet reachable independently "
+TEST_CASE("page_routes: registers exactly 33 routes, with /viz/fleet reachable independently "
           "of /viz/host/:id (the documented registration order — /viz/fleet before the "
           "per-host regex — never lets one swallow the other)",
           "[server][routes][page_routes]") {
     Harness h;
     h.wire();
 
-    CHECK(h.sink.route_count() == 32);
+    CHECK(h.sink.route_count() == 33);
 
     auto fleet = h.sink.Get("/viz/fleet");
     REQUIRE(fleet);

@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file operate_ui.hpp
-/// Page-local CSS shared by the two Operate pages (Approvals, Executions).
+/// Page-local CSS shared by the Operate pages (Approvals, Executions, Workflows).
 ///
 /// Why not `yuzu.css`: these rules are page layout, not design primitives, and Phase 1's
 /// convention is page-local CSS built from the design tokens; keeping `yuzu.css` untouched
@@ -69,6 +69,12 @@ td .by{max-width:140px}
 .held{margin:0 16px 16px;padding:10px 12px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:12.5px;display:flex;flex-direction:column;gap:4px}
 .ops-sel>.btns+.held{margin-top:0}
 .ops-sel>.kvl+.held{margin-top:16px}
+.ops-steps{list-style:none;margin:0;padding:0}
+.ops-steps li{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.ops-steps li:last-child{border-bottom:0}
+.ops-steps .st{min-width:0}
+.ops-steps .nm,.ops-steps .sub{max-width:none;white-space:normal;overflow-wrap:anywhere}
+.ops-sc td .sub{max-width:240px}
 @media (max-width:820px){
 .pg{padding:16px}
 .nm,.sub{max-width:200px}

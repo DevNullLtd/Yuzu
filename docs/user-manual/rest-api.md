@@ -6120,6 +6120,25 @@ route's parsing, where any presence of `enabled_only` is treated as true regardl
 route remains a distinct, separately-ledgered twin of `GET /fragments/schedules`, not of `GET
 /api/schedules` documented above.
 
+`GET /fragments/schedules` also takes `view=page` (the Workflows page's Schedules panel) behind the
+same two-stage gate and the same read; a refused caller gets `200` with a `data-denied` note and a
+failed read `200` with `data-degraded` (the dashboard drops `4xx` bodies). The page view adds the
+cadence the scheduler really applies (the time-of-day, weekday and day-of-month fields are stored
+and ignored), Count and Last run, and an owner flag computed from the session. A schedule the
+caller did not create shows only All devices or Targeted: the scope expression, interval, approval
+flag, parameters and creator are in no read that carries another user's schedule (REST v1, MCP) and
+are not rendered for one. The default view is unchanged.
+
+#### `GET /fragments/workflows`
+
+HTML fragment behind the Workflows page (`/workflows`). Requires `Workflow:Read` through the same
+gate as `GET /api/v1/workflows` (a management-group-scoped-only caller is refused, as there). Lists
+the 100 newest definitions with their steps (label, instruction id, condition, retries, `foreach`,
+failure policy) and marks a cut list with `data-truncated="1"`. A refused caller gets `200` with
+`data-denied="true"`, a failed store read `200` with `data-degraded="true"`; neither is an empty
+list. Step rows carry the workflow's own labels and instruction ids; instruction names are not looked
+up (that read needs `InstructionDefinition:Read`). Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
+
 **Response:**
 
 ```json

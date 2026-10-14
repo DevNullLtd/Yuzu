@@ -21,6 +21,7 @@
 
 extern const char* const kApprovalsPageHtml;
 extern const char* const kExecutionsPageHtml;
+extern const char* const kWorkflowsPageHtml;
 namespace yuzu::server {
 extern const std::string kYuzuOperateJs;
 } // namespace yuzu::server
@@ -44,7 +45,9 @@ struct Page {
 };
 
 std::vector<Page> pages() {
-    return {{"approvals", kApprovalsPageHtml}, {"executions", kExecutionsPageHtml}};
+    return {{"approvals", kApprovalsPageHtml},
+            {"executions", kExecutionsPageHtml},
+            {"workflows", kWorkflowsPageHtml}};
 }
 
 } // namespace
@@ -91,12 +94,16 @@ TEST_CASE("operate pages: the embedded controller is CSP-clean and bounded",
     for (const char* sink : {"eval(", "new Function(", "document.write", "javascript:",
                              "insertAdjacentHTML", "outerHTML", "setTimeout(\"", "setInterval(\""})
         CHECK_FALSE(has(js, sink));
-    // The only innerHTML sinks are the three server-rendered fragment hosts (the Approvals
-    // list, the Executions list and the Selected execution panel); nothing else assigns
-    // markup. Each is written from a 200 body only.
-    CHECK(count_of(js, ".innerHTML") == 3);
+    // The only innerHTML sinks are the five server-rendered fragment hosts (the Approvals
+    // list, the Executions list, the Selected execution panel, the Workflows list and the
+    // Schedules list); nothing else assigns markup (the workflow steps panel is filled by
+    // cloning nodes). Each is written from a 200 body only.
+    CHECK(count_of(js, ".innerHTML") == 5);
     CHECK(count_of(js, "host.innerHTML = res.html;") == 2);
     CHECK(count_of(js, "panel.innerHTML = res.html;") == 1);
+    CHECK(count_of(js, "wfHost.innerHTML = res.html;") == 1);
+    CHECK(count_of(js, "scHost.innerHTML = res.html;") == 1);
+    CHECK(count_of(js, "stepsBody.replaceChildren(block.cloneNode(true));") == 1);
     CHECK(has(js, "if (res.status !== 200) {"));
     // Bounded fetch, built inside try/catch so an old browser degrades to no timeout.
     CHECK(has(js, "var FETCH_TIMEOUT_MS = 15000;"));
@@ -107,6 +114,10 @@ TEST_CASE("operate pages: the embedded controller is CSP-clean and bounded",
     CHECK(has(js, "if (mine !== seq) return;"));
     CHECK(has(js, "var mine = ++lseq;"));
     CHECK(has(js, "if (mine !== lseq) return;"));
+    CHECK(has(js, "var mine = ++wseq;"));
+    CHECK(has(js, "if (mine !== wseq) return;"));
+    CHECK(has(js, "var mine = ++sseq;"));
+    CHECK(has(js, "if (mine !== sseq) return;"));
     CHECK(has(js, "var mine = ++dseq;"));
     CHECK(has(js, "if (mine !== dseq) return;"));
     // Every non-200 list answer maps to fixed copy; the body is never shown.
@@ -220,4 +231,43 @@ TEST_CASE("operate pages: Executions copy is exact and read-only", "[ui][operate
     CHECK_FALSE(has(body, "<dialog"));
     CHECK_FALSE(has(body, ">Cancel execution"));
     CHECK_FALSE(has(body, ">Re-run"));
+}
+
+TEST_CASE("operate pages: the Workflows template carries every hook the controller binds",
+          "[ui][operate][pages]") {
+    const std::string html(kWorkflowsPageHtml);
+    const auto& js = yuzu::server::kYuzuOperateJs;
+
+    for (const char* id : {"id=\"wf-list\"", "id=\"sc-list\"", "id=\"wf-steps\"",
+                           "id=\"wf-steps-title\"", "id=\"wf-steps-body\""})
+        CHECK(has(html, id));
+    CHECK(has(html, "<body data-page=\"workflows\">"));
+    // The controller asks exactly the fragment contract's URLs.
+    CHECK(has(js, "'/fragments/workflows'"));
+    CHECK(has(js, "'/fragments/schedules?view=page'"));
+    CHECK(has(js, "workflows: workflowsController"));
+    // A selection is a clone of the hidden step store, compared by attribute, never by selector.
+    CHECK(has(js, "b.getAttribute('data-steps-for') === id"));
+    // A denied panel is not polled on return: each refresh would be a denial audit row.
+    CHECK(has(js, "if ($('.ops-list', wfHost)) loadWorkflows();"));
+    CHECK(has(js, "if ($('.ops-list', scHost)) loadSchedules();"));
+    CHECK_FALSE(has(js, "setInterval("));
+}
+
+TEST_CASE("operate pages: Workflows copy is exact and read-only", "[ui][operate][pages]") {
+    const std::string html(kWorkflowsPageHtml);
+    CHECK(has(html, "<title>Yuzu — Workflows</title>"));
+    CHECK(has(html, "<h1>Workflows</h1>"));
+    // Schedules do not start workflows: the subtitle must not say they do.
+    CHECK(has(html, "Multi-step workflows and their runs. Schedules below run a single "
+                    "instruction on a repeat."));
+    CHECK(has(html, "Select a workflow to see its steps."));
+    const auto body_at = html.find("<!--/yuzu:shell-->");
+    REQUIRE(body_at != std::string::npos);
+    const auto body = html.substr(body_at);
+    CHECK_FALSE(has(body, "<button"));
+    CHECK_FALSE(has(body, "<dialog"));
+    // Nothing the code cannot do is drawn.
+    for (const char* never : {"Run now", "New workflow", "Second Tuesday", "2 failed", "Wait "})
+        CHECK_FALSE(has(body, never));
 }

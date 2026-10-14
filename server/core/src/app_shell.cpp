@@ -21,6 +21,7 @@ namespace {
 
 constexpr NavItem kInstructionsSub[] = {
     {.key = "executions", .label = "Executions", .href = "/executions"},
+    {.key = "workflows", .label = "Workflows", .href = "/workflows"},
     {.key = "approvals", .label = "Approvals", .href = "/approvals", .badge = true},
 };
 constexpr NavItem kSoftwareSub[] = {

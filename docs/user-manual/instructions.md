@@ -1398,6 +1398,8 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 
 **Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Approving, rejecting and executing stay on the Instructions tabs.
 
+**Workflows page.** `/workflows` is a read-only page in the sidebar under Instructions: the workflow definitions (name, description, step count; selecting one lists its steps with each step's failure policy) and the recurring schedules. Schedules run a single instruction on the cadence the scheduler really applies (once, every N minutes, daily, weekly or monthly; time of day, weekday and day of month are stored but not used) and are not linked to workflows. A schedule you did not create shows only whether it targets all devices or a subset. Creating, running and deleting workflows and schedules are not on this page yet.
+
 ### YAML Editor
 
 The definition editor supports two modes:

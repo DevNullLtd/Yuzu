@@ -15,6 +15,7 @@ extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kApprovalsPageHtml; // server/core/src/approvals_ui.cpp (Operate O1)
 extern const char* const kExecutionsPageHtml; // server/core/src/executions_ui.cpp (Operate O1)
+extern const char* const kWorkflowsPageHtml; // server/core/src/workflows_ui.cpp (Operate WF-A)
 extern const char* const kTarPageHtml;
 extern const char* const kVizFleetPageHtml; // server/core/src/viz_page_ui.cpp (PR 5)
 extern const char* const kVizHostPageHtml;  // server/core/src/viz_host_page_ui.cpp (PR 9-pre)
@@ -133,7 +134,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuVizHostJs, "application/javascript; charset=utf-8");
     });
-    // Operate O1: the Executions / Approvals page controller. It is coupled to the fragment
+    // Operate O1/WF-A: the Executions / Approvals / Workflows page controller. It is coupled to the fragment
     // markup the same release serves, so it is never cached (a 24 h cache would skew a page
     // against its fragment after an upgrade).
     sink.Get("/static/yuzu-operate.js", [](const httplib::Request&, httplib::Response& res) {
@@ -411,6 +412,16 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         res.set_content(kExecutionsPageHtml, "text/html; charset=utf-8");
+    });
+
+    // -- Workflows page (Operate WF-A; the third child of Instructions in the shell) -------
+    sink.Get("/workflows", [deps](const httplib::Request& req, httplib::Response& res) {
+        auto session = deps.auth_fn(req, res);
+        if (!session) {
+            res.set_redirect("/login");
+            return;
+        }
+        res.set_content(kWorkflowsPageHtml, "text/html; charset=utf-8");
     });
 }
 

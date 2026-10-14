@@ -30,6 +30,7 @@ extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kApprovalsPageHtml;
 extern const char* const kExecutionsPageHtml;
+extern const char* const kWorkflowsPageHtml;
 extern const char* const kTarPageHtml;
 extern const char* const kVizFleetPageHtml;
 extern const char* const kVizHostPageHtml;
@@ -132,6 +133,8 @@ TEST_CASE("app shell: breadcrumb is group / page, and a sub-item skips its paren
           std::vector<std::string>{"Operate", "Approvals"});
     CHECK(breadcrumb_trail({.active_key = "executions"}) ==
           std::vector<std::string>{"Operate", "Executions"});
+    CHECK(breadcrumb_trail({.active_key = "workflows"}) ==
+          std::vector<std::string>{"Operate", "Workflows"});
 }
 
 TEST_CASE("app shell: a title extends the trail, a repeated label does not", "[nav][shell]") {
@@ -196,6 +199,18 @@ TEST_CASE("app shell: sub-items show only for the active family and light their 
     CHECK(count_of(on_instructions, "class=\"shell-sub\"") == 1);
     CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/executions\">Executions</a>"));
     CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/approvals\">Approvals<span class=\"shell-badge\""));
+    CHECK_THAT(on_instructions, ContainsSubstring("<a href=\"/workflows\">Workflows</a>"));
+    CHECK(count_of(on_instructions, "class=\"shell-sub\"") == 1);
+    // Order: Executions, Workflows, Approvals.
+    const auto pe = on_instructions.find("href=\"/executions\"");
+    const auto pw = on_instructions.find("href=\"/workflows\"");
+    const auto pa = on_instructions.find("href=\"/approvals\"");
+    CHECK((pe < pw && pw < pa));
+    const auto on_workflows = render_shell({.active_key = "workflows"});
+    CHECK_THAT(on_workflows,
+               ContainsSubstring("<a href=\"/workflows\" class=\"on\" aria-current=\"page\">"));
+    CHECK(highlighted_hrefs(on_workflows) ==
+          std::vector<std::string>{"/instructions", "/workflows"});
     const auto on_executions = render_shell({.active_key = "executions"});
     CHECK(highlighted_hrefs(on_executions) ==
           std::vector<std::string>{"/instructions", "/executions"});
@@ -375,6 +390,7 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"instructions", kInstructionPageHtml, {"/instructions"}},
         {"approvals", kApprovalsPageHtml, {"/instructions", "/approvals"}},
         {"executions", kExecutionsPageHtml, {"/instructions", "/executions"}},
+        {"workflows", kWorkflowsPageHtml, {"/instructions", "/workflows"}},
         {"result sets", yuzu::server::kResultSetsPageHtml, {"/result-sets"}},
         {"compliance", kComplianceHtml, {"/compliance"}},
         {"guardian", kGuardianHtml, {"/guardian"}},
@@ -418,7 +434,7 @@ TEST_CASE("app shell: approvals badge is hidden until the count answers, polls e
     const std::string_view badge =
         R"(<span class="shell-badge" id="nav-approvals-badge" hidden><span id="nav-approvals-n"></span>)"
         R"(<span class="shell-sr"> pending</span></span>)";
-    for (const char* key : {"approvals", "executions", "instructions"})
+    for (const char* key : {"approvals", "executions", "workflows", "instructions"})
         CHECK(count_of(render_shell({.active_key = key}), badge) == 1);
     CHECK(count_of(render_shell({.active_key = "dashboard"}), badge) == 0);
 
