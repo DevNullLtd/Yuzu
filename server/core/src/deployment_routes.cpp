@@ -65,15 +65,20 @@ std::string gen_id() {
 }
 
 // Parse an optional integer query parameter clamped to [lo, hi]. Returns false on a
-// non-numeric value (the caller answers 400); absent means `dflt`.
+// non-numeric value, including trailing junk such as `20junk` (the caller answers 400);
+// absent means `dflt`.
 bool parse_clamped(const httplib::Request& req, const char* key, int dflt, int lo, int hi,
                    int& out) {
     out = dflt;
     if (!req.has_param(key))
         return true;
+    const std::string raw = req.get_param_value(key);
     try {
-        out = static_cast<int>(
-            std::clamp<long long>(std::stoll(req.get_param_value(key)), lo, hi));
+        std::size_t consumed = 0;
+        const long long v = std::stoll(raw, &consumed);
+        if (consumed != raw.size())
+            return false;
+        out = static_cast<int>(std::clamp<long long>(v, lo, hi));
     } catch (...) {
         return false;
     }
@@ -81,6 +86,15 @@ bool parse_clamped(const httplib::Request& req, const char* key, int dflt, int l
 }
 
 constexpr const char* kStoreDown = "deployment run store is unavailable on this server";
+
+// `auth_fn_` writes its own 401 (A4 envelope) when it refuses a request, so a REST read keeps
+// that body. Only an unwired seam leaves the response untouched; answer it the same way.
+void reject_unauthenticated(httplib::Response& res) {
+    if (res.status >= 400)
+        return;
+    res.status = 401;
+    res.set_content(detail::a4_error(res, "auth required"), "application/json");
+}
 
 deployment::DeploymentConfig config_from_req(const httplib::Request& req) {
     deployment::DeploymentConfig c;
@@ -648,8 +662,7 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
     sink.Get("/api/v1/deployments", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
-            res.status = 401;
-            res.set_content("auth required", "text/plain");
+            reject_unauthenticated(res);
             return;
         }
         // Owner-scoped by username, which a service-scoped token shares with its
@@ -670,24 +683,26 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
             res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
             return;
         }
-        auto rows = deploy_store_->list_deployments_checked(session->username,
+        auto page = deploy_store_->list_deployments_checked(session->username,
                                                             /*is_admin=*/false, limit);
-        if (!rows) {
+        if (!page) {
             res.status = 503;
             res.set_content(detail::a4_error(res, kStoreDown, {.retry_after_ms = 2000}),
                             "application/json");
             return;
         }
         nlohmann::json arr = nlohmann::json::array();
-        for (const auto& d : *rows)
+        for (const auto& d : page->rows)
             arr.push_back(deployment_row_json(d));
         // Unaudited on success: run lifecycle metadata, not per-agent behavioural PII
         // (same posture as /api/v1/preflight/runs). The denial path audits.
         nlohmann::json out = {
             {"data", arr},
-            {"pagination", {{"total", static_cast<int64_t>(rows->size())},
-                            {"start", 0},
-                            {"page_size", limit}}},
+            // No `total`: the store reads one row past the cap, so the only honest signal
+            // about the rest of the list is whether more exist, not a count of this page.
+            {"pagination", {{"start", 0},
+                            {"page_size", limit},
+                            {"truncated", page->truncated}}},
             {"meta", {{"api_version", "v1"}}},
         };
         res.set_content(out.dump(), "application/json");
@@ -699,8 +714,7 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
              [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
-            res.status = 401;
-            res.set_content("auth required", "text/plain");
+            reject_unauthenticated(res);
             return;
         }
         if (deny_service_scoped_(req, res, "deployment.detail.view",
@@ -767,9 +781,9 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
                             "text/html; charset=utf-8");
             return;
         }
-        auto rows = deploy_store_->list_deployments_checked(session->username,
+        auto page = deploy_store_->list_deployments_checked(session->username,
                                                             /*is_admin=*/false, limit);
-        if (!rows) {
+        if (!page) {
             res.set_content(render_deployments_failbox("Deployments could not be read just now. "
                                                        "Try again in a moment."),
                             "text/html; charset=utf-8");
@@ -777,9 +791,10 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
         }
         // Target = the source pre-flight run's scope label, owner-scoped. A miss means
         // the run aged out of retention (renderer copy); a store fault is its own word.
+        const auto& rows = page->rows;
         std::vector<std::string> targets;
-        targets.reserve(rows->size());
-        for (const auto& d : *rows) {
+        targets.reserve(rows.size());
+        for (const auto& d : rows) {
             std::string label = preflight_store_ ? std::string{} : std::string("Unavailable");
             if (preflight_store_) {
                 auto run = preflight_store_->get_run_checked(d.source_run_id, session->username);
@@ -790,7 +805,7 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
             }
             targets.push_back(std::move(label));
         }
-        res.set_content(render_deployments_list(*rows, targets), "text/html; charset=utf-8");
+        res.set_content(render_deployments_list(rows, targets), "text/html; charset=utf-8");
     });
 
     sink.Get("/fragments/auto/deployments/detail", [this](const httplib::Request& req,

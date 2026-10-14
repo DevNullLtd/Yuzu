@@ -501,9 +501,15 @@ struct ReadRig {
     void wire(PreflightRunStore* pre, DeploymentRunStore* dep) {
         routes.register_routes(
             sink,
-            [this](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
-                if (!authed)
+            [this](const httplib::Request&,
+                   httplib::Response& res) -> std::optional<auth::Session> {
+                if (!authed) {
+                    // The real auth_fn writes its own 401 (A4 envelope) before returning nullopt.
+                    res.status = 401;
+                    res.set_content(R"({"error":{"code":401,"message":"from auth_fn"}})",
+                                    "application/json");
                     return std::nullopt;
+                }
                 auth::Session s;
                 s.username = user;
                 s.token_scope_service = token_service;
@@ -566,7 +572,9 @@ TEST_CASE("deployment routes: GET /api/v1/deployments is owner-scoped, newest fi
     CHECK(res->body.find("repo.lan") == std::string::npos); // artifact_url never shipped
     CHECK(res->body.find("/qn") == std::string::npos);      // exec_args never shipped
     CHECK(body["data"][0]["has_args"] == true);
-    CHECK(body["pagination"]["total"] == 3);
+    // No `total`: it used to be rows.size(), which read as the owner's count and was not.
+    CHECK_FALSE(body["pagination"].contains("total"));
+    CHECK(body["pagination"]["truncated"] == false); // 3 rows, default limit 20
     // Gate shape: SoftwareDeployment:Read, and unaudited on success.
     REQUIRE_FALSE(rig.perms.empty());
     CHECK(rig.perms.back() == std::make_pair(std::string("SoftwareDeployment"), std::string("Read")));
@@ -581,6 +589,12 @@ TEST_CASE("deployment routes: GET /api/v1/deployments is owner-scoped, newest fi
     auto one = rig.sink.Get("/api/v1/deployments?limit=1");
     REQUIRE(one);
     CHECK(nlohmann::json::parse(one->body)["data"].size() == 1);
+    // Alice owns 3, so a page of 1 must say more exist (the old `total` said 1).
+    CHECK(nlohmann::json::parse(one->body)["pagination"]["truncated"] == true);
+    auto three = rig.sink.Get("/api/v1/deployments?limit=3");
+    REQUIRE(three);
+    CHECK(nlohmann::json::parse(three->body)["data"].size() == 3);
+    CHECK(nlohmann::json::parse(three->body)["pagination"]["truncated"] == false); // exactly full
     auto zero = rig.sink.Get("/api/v1/deployments?limit=0");
     REQUIRE(zero);
     CHECK(nlohmann::json::parse(zero->body)["data"].size() == 1);
@@ -592,6 +606,16 @@ TEST_CASE("deployment routes: GET /api/v1/deployments is owner-scoped, newest fi
     auto bad = rig.sink.Get("/api/v1/deployments?limit=abc");
     REQUIRE(bad);
     CHECK(bad->status == 400);
+    // Trailing junk is rejected, not read as its numeric prefix (`20junk` used to mean 20).
+    for (const char* junk : {"20junk", "5%20", "1e2", "2.5", "+", ""}) {
+        auto r = rig.sink.Get(std::string("/api/v1/deployments?limit=") + junk);
+        REQUIRE(r);
+        INFO("limit=" << junk);
+        CHECK(r->status == 400);
+    }
+    auto ok = rig.sink.Get("/api/v1/deployments?limit=2");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
 
 TEST_CASE("deployment routes: deployments list/detail gate matrix (401, service-scoped, RBAC)",
@@ -609,6 +633,9 @@ TEST_CASE("deployment routes: deployments list/detail gate matrix (401, service-
         rig.wire(nullptr, &store);
         CHECK(rig.sink.Get("/api/v1/deployments")->status == 401);
         CHECK(rig.sink.Get(detail)->status == 401);
+        // The REST pair keeps the 401 body auth_fn_ wrote (A4 envelope), not a plain-text one.
+        CHECK(rig.sink.Get("/api/v1/deployments")->body.find("from auth_fn") != std::string::npos);
+        CHECK(rig.sink.Get(detail)->body.find("from auth_fn") != std::string::npos);
         CHECK(rig.sink.Get("/fragments/auto/deployments")->status == 401);
         CHECK(rig.sink.Get("/fragments/auto/deployments/detail?dep=" + hex_id(7))->status == 401);
     }

@@ -305,6 +305,49 @@ TEST_CASE("DeploymentRunStore reports !is_open on a migration failure",
     CHECK_FALSE(store.is_open());
 }
 
+TEST_CASE("DeploymentRunStore list reports truncation exactly, never a short page as the whole",
+          "[pg][deployment][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(store.create_deployment(make_dep("t" + std::to_string(i), "carol", t + i),
+                                        {tgt("a1")}));
+    REQUIRE(store.create_deployment(make_dep("other", "dave", t), {tgt("d1")}));
+
+    auto two = store.list_deployments_checked("carol", false, 2);
+    REQUIRE(two);
+    CHECK(two->rows.size() == 2);
+    CHECK(two->truncated); // a third exists
+    CHECK(two->rows[0].deployment_id == "t2"); // newest first survives the trim
+
+    auto three = store.list_deployments_checked("carol", false, 3);
+    REQUIRE(three);
+    CHECK(three->rows.size() == 3);
+    CHECK_FALSE(three->truncated); // exactly full is not truncated
+
+    auto many = store.list_deployments_checked("carol", false, 50);
+    REQUIRE(many);
+    CHECK(many->rows.size() == 3);
+    CHECK_FALSE(many->truncated);
+
+    // Another owner's row never counts toward carol's truncation.
+    auto dave = store.list_deployments_checked("dave", false, 1);
+    REQUIRE(dave);
+    CHECK(dave->rows.size() == 1);
+    CHECK_FALSE(dave->truncated);
+
+    // The admin read sees everything: 4 rows, limit 3 is truncated.
+    auto admin = store.list_deployments_checked("anyone", /*is_admin=*/true, 3);
+    REQUIRE(admin);
+    CHECK(admin->rows.size() == 3);
+    CHECK(admin->truncated);
+}
+
 TEST_CASE("DeploymentRunStore checked readers: a miss is not a fault, a fault is not a miss",
           "[pg][deployment][store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
@@ -333,10 +376,12 @@ TEST_CASE("DeploymentRunStore checked readers: a miss is not a fault, a fault is
 
         auto list = store.list_deployments_checked("alice", false, 10);
         REQUIRE(list);
-        CHECK(list->size() == 1);
+        CHECK(list->rows.size() == 1);
+        CHECK_FALSE(list->truncated);
         auto none = store.list_deployments_checked("nobody", false, 10);
         REQUIRE(none); // zero rows is a successful read
-        CHECK(none->empty());
+        CHECK(none->rows.empty());
+        CHECK_FALSE(none->truncated);
     }
 
     SECTION("device grid is ordered, bounded, and exact in the run row") {

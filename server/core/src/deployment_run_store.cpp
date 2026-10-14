@@ -248,10 +248,11 @@ DeploymentRunStore::get_deployment_checked(const std::string& deployment_id,
 
 std::vector<DeploymentRow> DeploymentRunStore::list_deployments(const std::string& viewer,
                                                                 bool is_admin, int limit) {
-    return list_deployments_checked(viewer, is_admin, limit).value_or(std::vector<DeploymentRow>{});
+    auto page = list_deployments_checked(viewer, is_admin, limit);
+    return page ? std::move(page->rows) : std::vector<DeploymentRow>{};
 }
 
-std::expected<std::vector<DeploymentRow>, std::string>
+std::expected<DeploymentListPage, std::string>
 DeploymentRunStore::list_deployments_checked(const std::string& viewer, bool is_admin, int limit) {
     if (!open_)
         return std::unexpected("deployment run store not open");
@@ -259,6 +260,7 @@ DeploymentRunStore::list_deployments_checked(const std::string& viewer, bool is_
     if (!lease)
         return std::unexpected("pool acquire timeout");
     const int cap = (limit > 0 && limit < kListCap) ? limit : kListCap;
+    const int fetch = cap + 1; // one past the cap, so truncation is observed rather than guessed
     const std::string sql_admin =
         std::string("SELECT ") + kDeploymentCols +
         " FROM deployment_run_store.deployments ORDER BY created_at_ms DESC LIMIT $1::bigint";
@@ -268,17 +270,19 @@ DeploymentRunStore::list_deployments_checked(const std::string& viewer, bool is_
         "LIMIT $2::bigint";
     pg::PgResult res =
         is_admin ? pg::exec_params(lease.get(), sql_admin.c_str(),
-                                   std::vector<std::string>{std::to_string(cap)})
+                                   std::vector<std::string>{std::to_string(fetch)})
                  : pg::exec_params(lease.get(), sql_owner.c_str(),
-                                   std::vector<std::string>{viewer, std::to_string(cap)});
+                                   std::vector<std::string>{viewer, std::to_string(fetch)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
-    std::vector<DeploymentRow> out;
+    DeploymentListPage page;
     const int rows = PQntuples(res.get());
-    out.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
-        out.push_back(read_deployment(res.get(), i));
-    return out;
+    page.truncated = rows > cap;
+    const int keep = page.truncated ? cap : rows;
+    page.rows.reserve(static_cast<std::size_t>(keep));
+    for (int i = 0; i < keep; ++i)
+        page.rows.push_back(read_deployment(res.get(), i));
+    return page;
 }
 
 std::optional<std::string>

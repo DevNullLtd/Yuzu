@@ -59,6 +59,14 @@ struct DeploymentRow {
     int active = 0; ///< pending+staging+staged+executing (in-flight)
 };
 
+/// One page of a viewer's deployments. `truncated` is true when more rows exist than were
+/// returned (the reader asks for one past the cap), so a caller can say so instead of
+/// presenting a short page as the whole list.
+struct DeploymentListPage {
+    std::vector<DeploymentRow> rows;
+    bool truncated = false;
+};
+
 /// One device row of a deployment (frozen identity + the current step cell).
 struct DeploymentDeviceRow {
     std::string agent_id;
@@ -114,8 +122,9 @@ public:
                                                               bool is_admin, int limit);
 
     /// Authoritative variant of `list_deployments` — `std::unexpected` on a store fault
-    /// rather than a silently-empty vector indistinguishable from "no deployments".
-    [[nodiscard]] std::expected<std::vector<DeploymentRow>, std::string>
+    /// rather than a silently-empty vector indistinguishable from "no deployments". Asks the
+    /// store for one row past the cap and trims it, so `truncated` is exact.
+    [[nodiscard]] std::expected<DeploymentListPage, std::string>
     list_deployments_checked(const std::string& viewer, bool is_admin, int limit);
 
     /// The owner's RUNNING deployment for a source pre-flight run, if any — the
