@@ -33,7 +33,7 @@ bool has(const std::string& hay, const char* needle) {
 std::string scope_panel_markup() {
     const std::string page = kDashboardIndexHtml;
     const auto a = page.find("id=\"ox-scope\"");
-    const auto b = page.find("class=\"scope-panel\"", a);
+    const auto b = page.find("class=\"scope-list\"", a); // the scope bar's picker follows the helper block
     REQUIRE(a != std::string::npos);
     REQUIRE(b != std::string::npos);
     return page.substr(a, b - a);
