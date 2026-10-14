@@ -43,7 +43,7 @@
 /// is likewise called from its existing free-function home in
 /// `web_utils.hpp`, unchanged.
 ///
-/// Routes (2) — gate in parens:
+/// Routes (3) — gate in parens:
 ///   GET  /fragments/instructions               (deny_service_scoped_fn
 ///                                                 "instructions.fragment.access_denied",
 ///                                                 THEN auth_fn — the role
@@ -51,6 +51,11 @@
 ///                                                 body gates only the
 ///                                                 New/Edit buttons, not the
 ///                                                 list itself)
+///   GET  /fragments/instructions/templates     (probe_perm_fn
+///                                                 InstructionDefinition:Read,
+///                                                 a denial answers HTTP 200
+///                                                 with a data-denied note;
+///                                                 perm_fn when no probe is wired)
 ///   POST /fragments/instructions/yaml-preview   (perm_fn
 ///                                                 InstructionDefinition:Read)
 ///

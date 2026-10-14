@@ -18,7 +18,7 @@
 /// per-request logic, so a null registry now 503s even a request that would
 /// not have touched the registry (e.g. an empty `?q=`).
 ///
-/// Routes (33) — gate in parens, `-` = no gate:
+/// Routes (34) — gate in parens, `-` = no gate:
 ///   GET /static/yuzu.css                    -
 ///   GET /static/icons.svg                   -
 ///   GET /static/htmx.js                     -
@@ -30,6 +30,7 @@
 ///   GET /static/yuzu-viz-host.js            -
 ///   GET /static/yuzu-operate.js             -                      (Operate pages' controller)
 ///   GET /static/yuzu-dialog.js              -                      (shared modal dialog + request helper)
+///   GET /static/yuzu-operate-extras.js      -                      (Operate extras page controllers)
 ///   GET /static/cytoscape.min.js            -
 ///   GET /static/fonts/ibm-plex-sans-latin-400-normal.woff2   -
 ///   GET /static/fonts/ibm-plex-sans-latin-500-normal.woff2   -

@@ -1399,6 +1399,7 @@ if build_server
       'unit/server/test_legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
       'unit/server/test_instruction_fragment_routes.cpp', # #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
       'unit/server/test_instruction_extras_render.cpp', # Instructions extras: pure merge + fragment helpers
+      'unit/server/test_instruction_extras_ui.cpp', # Instructions extras UI: nothing-lost pins, controller CSP pins, sets/templates renderers
       'unit/server/test_approvals_fragment_routes.cpp', # #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
       'unit/server/test_mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
       'unit/server/test_agent_service_impl.cpp',

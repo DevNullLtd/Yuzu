@@ -8,6 +8,7 @@
 
 #include "instruction_store.hpp"
 #include "instruction_yaml.hpp"
+#include "response_templates_engine.hpp"
 
 #include <cstddef>
 #include <string>
@@ -49,9 +50,34 @@ struct SetRow {
     std::size_t members{0};
 };
 
-/// Read-only sets panel. `counts_partial` marks counts computed from a
-/// capped definition read.
-std::string render_instruction_sets_panel(const std::vector<SetRow>& rows, bool counts_partial);
+/// Sets panel. `counts_partial` marks counts computed from a capped definition
+/// read. `can_write` / `can_delete` stamp the New set button and the per-row
+/// Delete button (permission probes, never a role test); with both false the
+/// panel is read-only. The controller (`yuzu-operate-extras.js`) binds the
+/// `data-ox` hooks.
+std::string render_instruction_sets_panel(const std::vector<SetRow>& rows, bool counts_partial,
+                                          bool can_write = false, bool can_delete = false);
+
+/// Filter form for the library. Plain htmx (`hx-get`, no inline handler);
+/// the fields repeat the current filter so a reload keeps it.
+std::string render_library_filter_form(const std::string& name, const std::string& plugin,
+                                       const std::string& type);
+
+/// `<select>` that assigns a definition to a set (controller PUTs
+/// `instruction_set_id`). Option values are set ids; "" means unassigned.
+std::string render_set_select(const std::string& definition_id, const std::string& current_set_id,
+                              const std::vector<InstructionSet>& sets);
+
+/// Response-templates panel for one definition. `templates` is the stored
+/// list only; the built-in default is always shown first as a fixed row with
+/// no Edit or Delete (it is synthesised, and the routes refuse its id).
+/// `can_write` stamps New / Edit / Delete.
+std::string render_templates_panel(const std::string& definition_id,
+                                   const std::string& definition_name,
+                                   const std::vector<ResponseTemplate>& templates, bool can_write);
+std::string render_templates_denied();
+std::string render_templates_degraded();
+std::string render_templates_not_found();
 
 /// Panel-level denied / degraded notes (HTTP 200 bodies, see SPEC 5.3).
 std::string render_sets_denied();

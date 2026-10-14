@@ -211,6 +211,21 @@ yuzu_dialog_js_embed = custom_target(
   ],
 )
 
+# Operate extras page controllers (Instructions, Dashboard, Result sets). Served at
+# /static/yuzu-operate-extras.js with no-cache, like the other operate scripts.
+yuzu_operate_extras_js_embed = custom_target(
+  'yuzu_operate_extras_js_bundle',
+  input: 'static/yuzu-operate-extras.js',
+  output: 'yuzu_operate_extras_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuOperateExtrasJs',
+  ],
+)
+
 cytoscape_js_embed = custom_target(
   'cytoscape_js_bundle',
   input: 'static/cytoscape.min.js',
@@ -406,7 +421,7 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
-   yuzu_dialog_js_embed,
+   yuzu_dialog_js_embed, yuzu_operate_extras_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
