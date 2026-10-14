@@ -354,7 +354,9 @@ for o in d['outcomes']:
   <summary>Probe a single failing instruction against the live agent</summary>
 <pre><code>curl -s -c /tmp/cookies.txt -X POST http://localhost:8080/login \
     -d 'username=admin&password=YuzuUatAdmin1!' >/dev/null
+# Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
 RESP=$(curl -s -b /tmp/cookies.txt -X POST \
+    -H 'Origin: http://localhost:8080' \
     'http://localhost:8080/api/instructions/&lt;DEF_ID&gt;/execute' \
     -H 'Content-Type: application/json' -d '{}')
 echo "$RESP"

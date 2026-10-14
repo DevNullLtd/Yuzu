@@ -2802,6 +2802,7 @@
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
     "changelog": [
+      "changelog.d/2026-10-14-dex-tar-titles.changed.md",
       "changelog.d/20261014-tar-adhoc-sql-moved.changed.md"
     ],
     "definitions": [

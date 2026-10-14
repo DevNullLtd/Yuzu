@@ -125,6 +125,15 @@ assert_status_any() {
 # ── curl wrappers ────────────────────────────────────────────────────
 # Each sets HTTP_STATUS (3-digit code) and HTTP_BODY (response body).
 # Body is written to a temp file; status code is captured via -w.
+#
+# Cookie-session writes must behave like a same-site browser: the Instructions
+# write routes refuse a cookie-authorised POST/PUT/DELETE that carries neither
+# Origin nor Referer (browser_write_is_cross_site). SITE_ORIGIN is the
+# scheme://host:port of SERVER_URL, so it matches the Host curl sends. The MCP
+# transport is the opposite: it rejects any Origin outside its DNS-rebinding
+# allowlist and accepts an absent one, so it gets none.
+SITE_ORIGIN=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#' <<< "$SERVER_URL")
+origin_for() { case "$1" in */mcp/*) ;; *) printf '%s' "$SITE_ORIGIN" ;; esac; }
 
 http_get() {
     local url="$1"
@@ -137,9 +146,10 @@ http_get() {
 
 http_post() {
     local url="$1" data="$2" content_type="${3:-application/json}"
+    local origin; origin=$(origin_for "$url")
     sleep 0.05
     HTTP_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" \
+        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} \
         -X POST -H "Content-Type: $content_type" \
         -d "$data" \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
@@ -159,8 +169,9 @@ http_post_login() {
 
 http_put() {
     local url="$1" data="$2"
+    local origin; origin=$(origin_for "$url")
     HTTP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" \
+        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} \
         -X PUT -H "Content-Type: application/json" \
         -d "$data" \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
@@ -169,8 +180,9 @@ http_put() {
 
 http_delete() {
     local url="$1"
+    local origin; origin=$(origin_for "$url")
     HTTP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" \
+        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} \
         -X DELETE \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
     HTTP_BODY=$(cat "$RESP_BODY" 2>/dev/null || echo "")
@@ -428,6 +440,20 @@ else
     fail "API token creation did not return a token"
 fi
 
+# Same-site gate exemption: a bearer-token write with no Origin/Referer is not
+# refused by the gate (a token is not an ambient credential). The cookie-session
+# counterpart, which must be refused, is in section 10.
+if [[ -n "$API_TOKEN" ]]; then
+    GATE_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" -X POST \
+        -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
+        -d "{\"name\":\"e2e-gate-token-instr\",\"plugin\":\"os_info\",\"action\":\"os_name\",\"type\":\"question\"}" \
+        "$SERVER_URL/api/instructions" 2>/dev/null) || GATE_STATUS="000"
+    assert_status_any "bearer-token POST /api/instructions without Origin is not refused by the same-site gate" \
+        "$GATE_STATUS" 200 201 400 503
+    GATE_ID=$(extract_json_field "id" "$(cat "$RESP_BODY")")
+    [[ -n "$GATE_ID" ]] && http_delete "$SERVER_URL/api/instructions/$GATE_ID"
+fi
+
 # GET /api/v1/tokens -> 200, contains label
 http_get "$SERVER_URL/api/v1/tokens"
 assert_eq "GET /api/v1/tokens returns 200" "200" "$HTTP_STATUS"
@@ -646,6 +672,16 @@ else
     log "  (Could not capture instruction ID — skipping GET/DELETE)"
     # Still count as tested via the POST above
 fi
+
+# Same-site gate (deliberate negative check): the helpers above send Origin, as a
+# browser does. A cookie-session write with NO Origin/Referer must be refused 403
+# (the bearer-token exemption is checked in section 4).
+GATE_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
+    -b "$COOKIE_JAR" -X POST -H "Content-Type: application/json" \
+    -d "{\"name\":\"e2e-gate-instr\",\"plugin\":\"os_info\",\"action\":\"os_name\",\"type\":\"question\"}" \
+    "$SERVER_URL/api/instructions" 2>/dev/null) || GATE_STATUS="000"
+assert_eq "cookie-session POST /api/instructions without Origin returns 403" "403" "$GATE_STATUS"
+assert_contains "  ...refused as cross-site" "cross-site request refused" "$(cat "$RESP_BODY")"
 
 log ""
 
