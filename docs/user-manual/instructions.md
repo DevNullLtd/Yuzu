@@ -79,10 +79,13 @@ spec:
 
 ### Saving YAML via API
 
+Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
+
 ```bash
 # Save a definition from a YAML file (form-encoded; the yaml_source field
 # carries the document verbatim)
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/yaml \
   --data-urlencode "yaml_source@definitions/process-list.yaml"
 
@@ -351,6 +354,7 @@ metadata:
 ```bash
 # Create an instruction set
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instruction-sets \
   -H "Content-Type: application/json" \
   -d '{
@@ -360,6 +364,7 @@ curl -s -b cookies.txt \
 
 # Delete a set (cascades to contained definitions)
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instruction-sets/abc123
 ```
 
@@ -1021,6 +1026,7 @@ POST /api/instructions
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions \
   -H "Content-Type: application/json" \
   -d '{
@@ -1047,6 +1053,7 @@ PUT /api/instructions/{id}
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X PUT http://localhost:8080/api/instructions/crossplatform.service.inspect \
   -H "Content-Type: application/json" \
   -d '{
@@ -1064,6 +1071,7 @@ DELETE /api/instructions/{id}
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instructions/crossplatform.service.inspect
 ```
 
@@ -1077,6 +1085,7 @@ Accepts `Content-Type: application/x-yaml`. Parses the YAML, extracts metadata a
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/yaml \
   -H "Content-Type: application/x-yaml" \
   --data-binary @my-definition.yaml
@@ -1105,6 +1114,7 @@ POST /api/instructions/import
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/import \
   -H "Content-Type: application/json" \
   -d @exported-definition.json
@@ -1162,6 +1172,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/filesystem.exists/execute \
   -H "Content-Type: application/json" \
   -d '{"params":{"path":"C:\\Windows"}}'
@@ -1201,6 +1212,7 @@ POST /api/instruction-sets
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instruction-sets \
   -H "Content-Type: application/json" \
   -d '{
@@ -1219,6 +1231,7 @@ Cascade-deletes all definitions in the set.
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instruction-sets/SET-001
 ```
 
