@@ -5328,6 +5328,22 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // admin_fn_ admits a JIT-elevated session (effective_role). An elevation is temporary
+        // authority, and an account role is a STANDING grant: letting an elevated `user`
+        // change an account's role would turn the elevation into a durable administrator that
+        // outlives the window (rbac_admin_predicate.hpp, decision 1). Require the caller's
+        // own durable role (a local account's role, or the IdP-mapped role of an SSO session).
+        if (session->role != auth::Role::admin) {
+            audit_fn_(req, "user.role_change", "denied", "User", req.matches[1].str(),
+                      "elevated_session_role_change_blocked");
+            res.status = 403;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Changing an account role needs your own administrator role, not an elevation","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Changing an account role needs your own "
+                                                  "administrator role, not a temporary elevation"),
+                            "application/json");
+            return;
+        }
         // PR2 — MFA step-up gate. Role changes promote/demote a
         // principal's authority; require fresh MFA proof.
         if (step_up_fn_ &&
