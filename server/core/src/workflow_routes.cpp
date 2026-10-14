@@ -47,6 +47,59 @@ namespace yuzu::server {
 namespace {
 constexpr const char* kParamRejectRoute = "instruction_execute";
 constexpr const char* kParamRejectReasons[] = {"shape", "violation", "schema_invalid"};
+
+// Operate Executions page (`detail?view=page`): the collapsed responses list of the devices
+// slot. The drawer keeps its own inline copy of this lookup in the detail route; the two
+// must stay in step (primary query by execution id, legacy window fallback for rows
+// without one, then the caller's scope filter once over the merged set). Returns at most
+// `kDeviceResponsesCap` rows plus the pre-cap total, so a large run does not re-send every
+// output on each live refresh.
+struct PageResponses {
+    std::vector<operate_pages::DeviceResponse> rows;
+    std::size_t total{0};
+    operate_pages::ResponsesState state{operate_pages::ResponsesState::kOk};
+};
+
+PageResponses collect_page_responses(ResponseStore* store, const Execution& exec,
+                                     const std::vector<AgentExecStatus>& visible_agents,
+                                     const authz::VisibleSet& scope) {
+    PageResponses out;
+    if (!store || !store->is_open()) {
+        out.state = operate_pages::ResponsesState::kUnavailable;
+        return out;
+    }
+    ResponseQuery rq;
+    rq.since = exec.dispatched_at;
+    rq.until = exec.completed_at > 0 ? exec.completed_at : now_epoch_seconds();
+    rq.limit = 500;
+    auto primary = store->query_by_execution(exec.id, rq);
+    bool degraded = !primary.has_value();
+    auto responses = primary.value_or(std::vector<StoredResponse>{});
+    if (responses.empty()) {
+        auto legacy = store->query(exec.definition_id, rq);
+        degraded = degraded || !legacy.has_value();
+        std::unordered_map<std::string, bool> in_set;
+        for (const auto& a : visible_agents)
+            in_set[a.agent_id] = true;
+        for (auto& r : legacy.value_or(std::vector<StoredResponse>{})) {
+            if (r.execution_id.empty() && in_set.count(r.agent_id))
+                responses.push_back(std::move(r));
+        }
+    }
+    if (degraded)
+        out.state = operate_pages::ResponsesState::kDegraded;
+    std::vector<operate_pages::DeviceResponse> rows;
+    for (auto& r : responses) {
+        if (scope && !authz::in_scope(scope, r.agent_id))
+            continue;
+        ++out.total;
+        if (out.rows.size() < operate_pages::kDeviceResponsesCap)
+            out.rows.push_back({std::move(r.agent_id), std::move(r.output),
+                                std::move(r.error_detail), static_cast<int>(r.status), r.timestamp,
+                                r.received_at_ms});
+    }
+    return out;
+}
 } // namespace
 
 void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
@@ -140,6 +193,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // #1712 / #3290 Phase 2 — see WorkflowRoutes::FleetReadFn's doc comment.
     auto fleet_read_fn = std::move(deps.fleet_read_fn);
     auto audit_fn = std::move(deps.audit_fn);
+    auto probe_perm_fn = std::move(deps.probe_perm_fn);
     auto emit_fn = std::move(deps.emit_fn);
     auto scope_fn = std::move(deps.scope_fn);
     auto* workflow_engine = deps.workflow_engine;
@@ -398,7 +452,18 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 row.dispatched_at = e.dispatched_at;
                 view.rows.push_back(std::move(row));
             }
-            res.set_content(operate_pages::render_exec_list(view), "text/html; charset=utf-8");
+            // Fleet-wide figures never reach a confined view; a store failure omits the strip
+            // rather than printing zeros. The list route does not audit, so neither does this.
+            std::string strip;
+            if (!gate.scope && execution_tracker) {
+                if (auto fs = execution_tracker->get_fleet_summary_checked(0, false)) {
+                    strip = operate_pages::render_stats_strip(
+                        {fs->executions_today, fs->total_executions, fs->overall_success_rate,
+                         fs->avg_duration_seconds});
+                }
+            }
+            res.set_content(strip + operate_pages::render_exec_list(view),
+                            "text/html; charset=utf-8");
             return;
         }
         std::string html;
@@ -560,7 +625,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // to exact `execution_id` correlation transparently).
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
-        [auth_fn, fleet_read_fn, audit_fn, execution_tracker, instruction_store,
+        [auth_fn, fleet_read_fn, audit_fn, probe_perm_fn, execution_tracker, instruction_store,
          response_store](const httplib::Request& req, httplib::Response& res) {
             // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
             // (fleet_read_fn), mirroring query_installed_software / the REST
@@ -728,7 +793,29 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 view.parameter_values =
                     gate.scope ? "(redacted - confined view)" : exec.parameter_values;
                 view.completed_at = exec.completed_at;
-                res.set_content(operate_pages::render_exec_selected(view),
+                // Render hint for the Cancel button only (the cancel route re-gates on
+                // Execution:Execute + Execution:Read). One probe, only for a live row;
+                // unwired probe = not probed = attribute omitted.
+                if (probe_perm_fn && (exec.status == "running" || exec.status == "pending"))
+                    view.can_cancel = probe_perm_fn(req, "Execution", "Execute") ? 1 : 0;
+                // The "Device results" slot rides in the same response (one fetch, one audit
+                // row). `agents` is already scope-filtered above; a confined caller gets no
+                // dispatched-device count (it would subtract to an out-of-scope number).
+                operate_pages::ExecDevicesView devs;
+                devs.execution_id = exec.id;
+                devs.definition_name = def_name;
+                if (!gate.scope)
+                    devs.targeted = exec.agents_targeted;
+                devs.rows.reserve(agents.size());
+                for (const auto& a : agents)
+                    devs.rows.push_back({a.agent_id, a.status, a.error_detail, a.exit_code,
+                                         a.dispatched_at, a.completed_at});
+                auto pr = collect_page_responses(response_store, exec, agents, gate.scope);
+                devs.responses = std::move(pr.rows);
+                devs.responses_total = pr.total;
+                devs.responses_state = pr.state;
+                res.set_content(operate_pages::render_exec_selected(view) +
+                                    operate_pages::render_exec_devices(devs),
                                 "text/html; charset=utf-8");
                 // Same forensic-read audit row as the drawer below: one per selection.
                 audit_fn(req, "execution.detail.view", "success", "Execution", exec.id, "");

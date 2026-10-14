@@ -76,8 +76,18 @@ struct Deps {
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                        const std::string&, const std::string&)>;
 
+    /// Side-effect-free permission probe for RENDERING decisions only (never a gate): bound in
+    /// server.cpp to `perm_fn` with a throwaway Response, so the denial's response body is
+    /// discarded (the gate still writes one `auth.permission_required` audit row per probe
+    /// for a caller without the grant). The fragment keeps gating on `perm_fn`; the probe
+    /// only decides whether to RENDER a decision control. Unwired = cannot decide: no
+    /// control is rendered (the server still refuses the POST).
+    using ProbePermFn = std::function<bool(const httplib::Request&, const std::string&,
+                                           const std::string&)>;
+
     AuthFn auth_fn;
     PermFn perm_fn;
+    ProbePermFn probe_perm_fn;
     /// `ServerImpl::approval_manager_`. Null -> the fragment renders "Not
     /// available" without touching it. No `is_open()` check — matches the
     /// original inline code exactly (unlike `approval_routes.cpp`'s JSON

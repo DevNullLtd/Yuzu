@@ -124,7 +124,8 @@ std::string render_approvals_page(const ApprovalListView& v) {
     out.reserve(256 + v.rows.size() * 900);
     out += std::string(R"(<div class="ops-list" data-state=")") + (v.rows.empty() ? "empty" : "ok") +
            R"(" data-count=")" + std::to_string(v.rows.size()) + R"(" data-pending=")" +
-           pending_attr + R"(" data-truncated=")" + (v.truncated ? "1" : "0") + "\">";
+           pending_attr + R"(" data-truncated=")" + (v.truncated ? "1" : "0") +
+           R"(" data-can-decide=")" + (v.can_decide ? "1" : "0") + "\">";
 
     if (v.rows.empty()) {
         out += R"(<div class="empty-state">)" + html_escape(empty_note(v.status_filter)) +
