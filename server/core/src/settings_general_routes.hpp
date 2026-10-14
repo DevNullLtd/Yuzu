@@ -75,10 +75,6 @@ std::string render_general_runtime(const RuntimeView& v);
 /// for a failure.
 std::string render_analytics_events(const EventsView& v);
 
-/// `YYYY-MM-DD HH:MM:SS` in UTC from epoch milliseconds, locale-independent.
-/// `-` for a non-positive value.
-std::string format_utc_ms(std::int64_t epoch_ms);
-
 struct Deps {
     using AdminFn = std::function<bool(const httplib::Request&, httplib::Response&)>;
     AdminFn admin_fn;

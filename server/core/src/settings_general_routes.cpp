@@ -3,7 +3,6 @@
 #include "web_utils.hpp" // html_escape
 
 #include <array>
-#include <cstdio>
 #include <string_view>
 #include <utility>
 
@@ -94,30 +93,6 @@ std::string render_general_runtime(const RuntimeView& v) {
 
 // ── Recent events ───────────────────────────────────────────────────────
 
-std::string format_utc_ms(std::int64_t epoch_ms) {
-    if (epoch_ms <= 0)
-        return "-";
-    const std::int64_t secs = epoch_ms / 1000;
-    std::int64_t days = secs / 86400;
-    const std::int64_t rem = secs % 86400;
-    // Civil-from-days (H. Hinnant): proleptic Gregorian, no locale and no gmtime.
-    days += 719468;
-    const std::int64_t era = (days >= 0 ? days : days - 146096) / 146097;
-    const std::int64_t doe = days - era * 146097;
-    const std::int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    const std::int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const std::int64_t mp = (5 * doy + 2) / 153;
-    const std::int64_t d = doy - (153 * mp + 2) / 5 + 1;
-    const std::int64_t m = mp < 10 ? mp + 3 : mp - 9;
-    const std::int64_t y = yoe + era * 400 + (m <= 2 ? 1 : 0);
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%04lld-%02lld-%02lld %02lld:%02lld:%02lld",
-                  static_cast<long long>(y), static_cast<long long>(m), static_cast<long long>(d),
-                  static_cast<long long>(rem / 3600), static_cast<long long>(rem % 3600 / 60),
-                  static_cast<long long>(rem % 60));
-    return buf;
-}
-
 std::string render_analytics_events(const EventsView& v) {
     // Off by configuration: the store was never constructed.
     if (!v.collection_enabled)
@@ -159,7 +134,7 @@ std::string render_analytics_events(const EventsView& v) {
     for (const auto& e : *v.recent) {
         html += "<tr><td class=\"et\"><code>" + html_escape(e.event_type) + "</code></td><td>" +
                 html_escape(e.source) + "</td><td>" + html_escape(e.severity) +
-                "</td><td class=\"tm\">" + format_utc_ms(e.event_time_ms) + "</td></tr>";
+                "</td><td class=\"tm\">" + format_iso_utc(e.event_time_ms / 1000) + "</td></tr>";
     }
     html += "</tbody></table></div>";
     html += "<p class=\"hint evt-foot\">Newest " + std::to_string(kRecentEventsLimit) +

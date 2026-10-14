@@ -53,18 +53,6 @@ EventsView open_view() {
 
 } // namespace
 
-// ── format_utc_ms ───────────────────────────────────────────────────────
-
-TEST_CASE("general: format_utc_ms is UTC, zero-padded and locale-free", "[general][settings]") {
-    CHECK(format_utc_ms(0) == "-");
-    CHECK(format_utc_ms(-5) == "-");
-    CHECK(format_utc_ms(1700000000000) == "2023-11-14 22:13:20");
-    // A leap day and a pre-epoch-adjacent boundary exercise the civil-date arithmetic.
-    CHECK(format_utc_ms(951782400000) == "2000-02-29 00:00:00");
-    CHECK(format_utc_ms(1000) == "1970-01-01 00:00:01");
-    CHECK(format_utc_ms(86399999) == "1970-01-01 23:59:59"); // sub-second part is dropped
-}
-
 // ── Runtime form ────────────────────────────────────────────────────────
 
 TEST_CASE("general: runtime form shows the live values and enables Save only via script",
@@ -209,8 +197,8 @@ TEST_CASE("general: events - populated shows four columns, newest-first order is
     const auto html = render_analytics_events(v);
     for (const char* h : {"Event type", "Source", "Severity", "Time (UTC)"})
         CHECK_THAT(html, ContainsSubstring(std::string("<th>") + h + "</th>"));
-    CHECK_THAT(html, ContainsSubstring("2023-11-14 22:13:25"));
-    CHECK_THAT(html, ContainsSubstring("2023-11-14 22:13:20"));
+    CHECK_THAT(html, ContainsSubstring("2023-11-14T22:13:25Z"));
+    CHECK_THAT(html, ContainsSubstring("2023-11-14T22:13:20Z"));
     CHECK(html.find("command.completed") < html.find("auth.login")); // order is the store's
     CHECK_THAT(html, ContainsSubstring("Pending<b>3</b>"));
     // No host, user or payload columns (PII-adjacent): four headers only.
