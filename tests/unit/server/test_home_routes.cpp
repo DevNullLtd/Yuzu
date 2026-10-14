@@ -342,8 +342,8 @@ TEST_CASE("summary: the TOP estate read is cached 60 s on the server clock", "[h
         CHECK(now_ms == now * 1000);
         return EstateCounts{100 + estate_calls, 90, 5, 5};
     };
-    test::TestRouteSink sink;
     HomeRoutes r;
+    test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
 
     REQUIRE(sink.Get("/fragments/home/summary"));
@@ -383,8 +383,8 @@ TEST_CASE("summary: a failed TOP estate read is never a figure and backs off bri
             return std::nullopt;
         return EstateCounts{200, 190, 5, 5};
     };
-    test::TestRouteSink sink;
     HomeRoutes r;
+    test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
 
     auto down = sink.Get("/fragments/home/summary");
@@ -408,11 +408,16 @@ TEST_CASE("summary: a failed TOP estate read is never a figure and backs off bri
     CHECK(estate_calls == 3);
     CHECK(has(again->body, "Could not read The device roster. This is not zero."));
     CHECK_FALSE(has(again->body, "of 200 seen"));
+    now = start + 30; // stepped back into the old entry's 60 s window: still not the old figure
+    auto stepped = sink.Get("/fragments/home/summary");
+    REQUIRE(stepped);
+    CHECK(has(stepped->body, "Could not read The device roster. This is not zero."));
+    CHECK_FALSE(has(stepped->body, "of 200 seen"));
     fail = false;
     now += kEstateFailBackoffSecs; // backoff over: the next view reads again and recovers
     auto recovered = sink.Get("/fragments/home/summary");
     REQUIRE(recovered);
-    CHECK(estate_calls == 4);
+    CHECK(estate_calls == 5);
     CHECK(has(recovered->body, "of 200 seen in the last 30 days"));
 }
 
@@ -522,8 +527,8 @@ TEST_CASE("summary: without a server clock the TOP estate read is not cached", "
         ++estate_calls;
         return EstateCounts{10, 9, 0, 1};
     };
-    test::TestRouteSink sink;
     HomeRoutes r;
+    test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
     REQUIRE(sink.Get("/fragments/home/summary"));
     REQUIRE(sink.Get("/fragments/home/summary"));
@@ -554,8 +559,8 @@ TEST_CASE("summary: a scoped caller is never served a TOP caller's cached estate
         res.rows = {row("a", "linux", true), row("b", "linux", true)};
         return res;
     };
-    test::TestRouteSink sink;
     HomeRoutes r;
+    test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
 
     auto top = sink.Get("/fragments/home/summary");
@@ -590,8 +595,8 @@ TEST_CASE("summary: a scoped caller never touches the estate seam", "[home][rout
         return EstateCounts{999999, 999999, 0, 0};
     };
     d.roster_fn = [] { return InventoryDevicesResult{}; };
-    test::TestRouteSink sink;
     HomeRoutes r;
+    test::TestRouteSink sink;
     r.register_routes(sink, std::move(d));
     for (int i = 0; i < 3; ++i) {
         auto out = sink.Get("/fragments/home/summary");
