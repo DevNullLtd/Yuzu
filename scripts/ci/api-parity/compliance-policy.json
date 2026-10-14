@@ -152,6 +152,14 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/policy-fragments",
+    "capability_id": "get.fragments-policy-fragments",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-policy-fragments"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/settings/nvd",
     "capability_id": "get.fragments-settings-nvd",
     "rest_v1_twin": null,
