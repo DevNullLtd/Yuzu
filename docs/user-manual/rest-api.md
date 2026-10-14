@@ -3247,7 +3247,7 @@ List all instruction definitions.
 
 #### `GET /api/v1/instructions/{id}`
 
-(#4029) Single-definition detail — the RECONCILED SUPERSET of the legacy `GET /api/instructions/{id}` fragment's fields (`gather_ttl_seconds`/`response_ttl_days`/`created_by`/timestamps) and MCP `get_definition`'s pre-existing fields (`approval_mode`/`parameter_schema`/`result_schema`/`yaml_source`) — both surfaces call the same builder (`instruction_definition_detail_json`) now, closing the field-set drift that existed between them before this issue.
+(#4029) Single-definition detail — the RECONCILED SUPERSET of the legacy `GET /api/instructions/{id}` fragment's fields (`gather_ttl_seconds`/`response_ttl_days`/`created_by`/timestamps) and MCP `get_definition`'s pre-existing fields (`approval_mode`/`parameter_schema`/`result_schema`/`yaml_source`) — both surfaces call the same builder (`instruction_definition_detail_json`) now, closing the field-set drift that existed between them before this issue. The detail also carries `secret_params`, the parameter names a client must render as write-only inputs (today `grant_secret` and `grant_id`, the server's one shared list); it is a client hint and is not part of the export.
 
 **Permission:** `InstructionDefinition:Read`
 
@@ -3408,7 +3408,7 @@ Fetch a single template. The reserved id `__default__` always returns the synthe
 
 #### `POST /api/v1/definitions/{id}/response-templates`
 
-Create a new template. Returns the canonicalised template (with auto-assigned `id` when omitted) and 201.
+Create a new template. Like `PUT`/`DELETE` below, it is applied only to the definition version it read: a concurrent edit of the definition returns `409`. A browser (session-cookie) caller must send a same-site `Origin` or `Referer` (`403` otherwise); token callers are exempt. Returns the canonicalised template (with auto-assigned `id` when omitted) and 201.
 
 **Permission:** `InstructionDefinition:Write`
 
@@ -3652,7 +3652,8 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058) — distinct from `denied`, since an infra degrade is not an operator denial. |
 | `instruction.update` | Instruction definition updated via `PUT /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A plain 400 validation error is not audited (matches `instruction.create`'s equivalent branch). |
 | `instruction.delete` | Instruction definition deleted via `DELETE /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). |
-| `instruction_set.delete` | Instruction set deleted via `DELETE /api/instruction-sets/{id}`. `result` ∈ {`denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). Success is not audited (`create_set`/`delete_set` predate any audit coverage on this pair — tracked separately, #3598 — the 404/503 denial branches above are new with ADR-0058 and audited from the start rather than shipped asymmetrically). |
+| `instruction_set.create` | Instruction set created via `POST /api/instruction-sets`. Every create first writes `result=attempted` (before the change; if that row cannot be stored the request is refused with 503 and `Sec-Audit-Failed: true` and no set is created), then the outcome. `result` ∈ {`attempted`, `success`, `denied`, `error`}. `success` carries `target_id=<set id>` and the set name as detail. Denied detail values: `conflict` (409, duplicate id), `invalid` (400, rejected input). `error` detail `db_error` on a genuine DB/lease failure (503). A failed audit write sets `Sec-Audit-Failed: true` on the response. |
+| `instruction_set.delete` | Instruction set deleted via `DELETE /api/instruction-sets/{id}`. Every delete first writes `result=attempted` (target_id = the set id) and is refused with 503 and `Sec-Audit-Failed: true`, with nothing deleted, when that row cannot be stored. `result` ∈ {`attempted`, `success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A failed audit write on `success` sets `Sec-Audit-Failed: true`. |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
 | `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>`/`tag:<key>` bulk preload against the custom-properties/tag store could not answer — ADR-0045; all abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows; as of #4981 PR-1 this ALSO fires, with its own paired per-ref row, when the set was deleted in the window between the pre-dispatch owner-check gate and the registry's own later membership read — a TOCTOU case the pre-#4981 code could not detect at all, see ADR-0036's 2026-09-26 Update), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator), `presence_degraded` (#4981 PR-1 — the cross-replica presence read backing fleet-wide scope evaluation could not answer), `unresolvable` (a `from_result_set:`/`props.<key>` atom referenced a store that was never wired at this call site — unreachable on the real production dispatch ladder, both stores are always wired there, but a defensively-labelled case rather than a misleading `db_degraded`). `target_type` on the audit row is `result_set` for `owner_check_failed` (the only reason actually about a specific result set) and `scope` for every other reason. Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
@@ -9879,7 +9880,7 @@ Import an InstructionDefinition (JSON envelope). Requires `InstructionDefinition
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `id`, `name`, `type`, `plugin`, `action`, etc. | various | yes | Standard `InstructionDefinition` fields. |
-| `yaml_source` | string | yes (when signed) | The verbatim YAML source — this is the signed-content carrier. Every persisted column is derived from it on the canonical path; signing `yaml_source` transitively covers the dispatch. |
+| `yaml_source` | string | yes (when signed) | The verbatim YAML source — this is the signed-content carrier. The signature covers these bytes only. `plugin`, `action`, `type`, `approval_mode` and `concurrency_mode` are taken from the verified YAML (an envelope value that disagrees is refused with `400`, and a signed YAML must declare `plugin` and `action`). `enabled`, `instruction_set_id`, TTLs, schemas, templates and the other columns are **not** expressible in YAML and are not signed. |
 | `signature` | string | optional | Hex-encoded Ed25519 signature over `yaml_source`'s bytes. |
 | `publicKey` | string | optional | Hex-encoded Ed25519 public key (64 hex chars). |
 
@@ -10036,13 +10037,16 @@ server-generated (this route does not accept a caller-supplied `id`), so the `40
 is not reachable via normal use of this endpoint today — documented for API-contract
 consistency with the sibling `POST /api/instructions` route, not because it fires in practice.
 
-**Response (400):** Validation error.
+**Response (400):** Validation error, including a `name` over 128 characters or a `description` over 512.
 
 **Response (409):** A set with that id already exists (gov Gate 4/6, fixed to match
 `POST /api/instructions`'s equivalent branch — the response no longer leaks the raw internal
 `conflict:` prefix).
 
-**Response (503):** A genuine database/lease failure (ADR-0058).
+**Response (503):** A genuine database/lease failure (ADR-0058), or the `attempted` audit row could not be stored (`Sec-Audit-Failed: true`; no set created).
+
+**Audit:** `instruction_set.create` writes `attempted` first, then an outcome on every path (`success`, `denied` detail `conflict` or
+`invalid`, `error` detail `db_error`); see the audit table entry above.
 
 #### `DELETE /api/instruction-sets/{id}`
 
@@ -10056,11 +10060,11 @@ Delete an instruction set. Definitions that referenced the deleted set have thei
 **Response (404):** Unknown id. **Breaking change (ADR-0058):** prior to this store's
 PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404.
 
-**Response (503):** A genuine database/lease failure (ADR-0058).
+**Response (503):** A genuine database/lease failure (ADR-0058), or the `attempted` audit row could not be stored (`Sec-Audit-Failed: true`; nothing deleted).
 
-**Audit:** `instruction_set.delete` on the 404 (`result=denied` detail `not_found`) and 503
-(`result=error` detail `db_error`) branches; the 200 success path is not audited (see the audit
-table entry above).
+**Audit:** `instruction_set.delete` writes `attempted` first, then an outcome: the 200 success (`result=success`), the 404
+(`result=denied` detail `not_found`) and 503 (`result=error` detail `db_error`) branches (see the
+audit table entry above).
 
 ---
 

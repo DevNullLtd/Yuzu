@@ -7659,7 +7659,8 @@ void RestApiV1::register_routes(
         // Only the templates change: blank the schema so update_definition keeps the stored
         // column (an empty parameter_schema means "keep") instead of writing the loaded copy back.
         def.parameter_schema.clear();
-        auto upd = instruction_store->update_definition(def);
+        // Only apply if the row is still the one read above (a concurrent edit is a 409).
+        auto upd = instruction_store->update_definition(def, def.updated_at);
         if (!upd)
             return upd.error();
         return std::nullopt;
@@ -7672,6 +7673,8 @@ void RestApiV1::register_routes(
             return 503;
         if (err.rfind("not_found:", 0) == 0)
             return 404;
+        if (is_conflict_error(err))
+            return 409;
         return 500;
     };
 
@@ -7791,11 +7794,32 @@ void RestApiV1::register_routes(
                  res.set_content(detail::a4_error(res, "template not found"), "application/json");
              });
 
+    // Same-site gate for the cookie-authorised template mutations the Instructions page calls
+    // (token callers are exempt). Runs after the permission gate; auth_fn writes its own 401.
+    auto rt_refuse_cross_site = [auth_fn, audit_fn, trusted = csrf_trusted_origins_](
+                                    const httplib::Request& req, httplib::Response& res) -> bool {
+        auto sess = auth_fn(req, res);
+        if (!sess)
+            return true;
+        if (!browser_write_is_cross_site(sess->auth_source, req.get_header_value("Host"),
+                                         req.get_header_value("Origin"),
+                                         req.get_header_value("Referer"), trusted))
+            return false;
+        audit_fn(req, "csrf.denied", "denied", "Endpoint", "response_template",
+                 "cross-site or header-less browser write refused");
+        res.status = 403;
+        res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+        return true;
+    };
+
     // POST /api/v1/definitions/{id}/response-templates ─ create
     sink.Post(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates)",
-              [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
+              [perm_fn, audit_fn, instruction_store, persist_templates, persist_status,
+                  rt_refuse_cross_site](const httplib::Request& req,
                                                                         httplib::Response& res) {
                   if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                      return;
+                  if (rt_refuse_cross_site(req, res))
                       return;
                   if (!instruction_store || !instruction_store->is_open()) {
                       res.status = 503;
@@ -7867,8 +7891,9 @@ void RestApiV1::register_routes(
                       spdlog::error("response_template.create persist failed: def={} err={}",
                                     def_id, *err);
                       res.status = persist_status(*err);
-                      res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
-                                                                              : "persist failure"),
+                      res.set_content(detail::a4_error(res, res.status == 404   ? "definition not found"
+                                                : res.status == 409 ? "definition was modified concurrently; reload and retry"
+                                                                    : "persist failure"),
                                       "application/json");
                       audit_fn(req, "response_template.create", "failure", "InstructionDefinition",
                                def_id, "reason=persist_failure");
@@ -7882,9 +7907,12 @@ void RestApiV1::register_routes(
 
     // PUT /api/v1/definitions/{id}/response-templates/{tid} ─ replace
     sink.Put(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-             [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
+             [perm_fn, audit_fn, instruction_store, persist_templates, persist_status,
+                  rt_refuse_cross_site](const httplib::Request& req,
                                                                        httplib::Response& res) {
                  if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                     return;
+                 if (rt_refuse_cross_site(req, res))
                      return;
                  if (!instruction_store || !instruction_store->is_open()) {
                      res.status = 503;
@@ -7983,8 +8011,9 @@ void RestApiV1::register_routes(
                      spdlog::error("response_template.update persist failed: def={} tid={} err={}",
                                    def_id, tid, *err);
                      res.status = persist_status(*err);
-                     res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
-                                                                             : "persist failure"),
+                     res.set_content(detail::a4_error(res, res.status == 404   ? "definition not found"
+                                                : res.status == 409 ? "definition was modified concurrently; reload and retry"
+                                                                    : "persist failure"),
                                      "application/json");
                      audit_fn(req, "response_template.update", "failure", "InstructionDefinition",
                               def_id, "reason=persist_failure");
@@ -7998,9 +8027,12 @@ void RestApiV1::register_routes(
     // DELETE /api/v1/definitions/{id}/response-templates/{tid}
     sink.Delete(
         R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-        [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
+        [perm_fn, audit_fn, instruction_store, persist_templates, persist_status,
+                  rt_refuse_cross_site](const httplib::Request& req,
                                                                   httplib::Response& res) {
             if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                return;
+            if (rt_refuse_cross_site(req, res))
                 return;
             if (!instruction_store || !instruction_store->is_open()) {
                 res.status = 503;
@@ -8065,8 +8097,9 @@ void RestApiV1::register_routes(
                 spdlog::error("response_template.delete persist failed: def={} tid={} err={}",
                               def_id, tid, *err);
                 res.status = persist_status(*err);
-                res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
-                                                                        : "persist failure"),
+                res.set_content(detail::a4_error(res, res.status == 404   ? "definition not found"
+                                                : res.status == 409 ? "definition was modified concurrently; reload and retry"
+                                                                    : "persist failure"),
                                 "application/json");
                 audit_fn(req, "response_template.delete", "failure", "InstructionDefinition",
                          def_id, "reason=persist_failure");
