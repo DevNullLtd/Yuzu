@@ -1573,6 +1573,47 @@ TEST_CASE("ca_routes: no key path, key material or PEM reaches the pki fragment,
     }
 }
 
+TEST_CASE("ca_routes: the revocation pill follows the revoked set and the list's own expiry",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    REQUIRE(h.store->revoke("DEAD", "test"));
+    h.wire();
+
+    CrlVersionRecord crl;
+    crl.version = 1;
+    crl.der = {0x30, 0x03, 0x01, 0x02, 0x03};
+    crl.this_update = 1000;
+    crl.next_update = 9'999'999'999; // far future
+    crl.published_at = 1000;
+    crl.revoked_count = 0; // built before the revocation: it is not on the list
+    REQUIRE(h.store->record_crl_for_test(crl));
+    auto stale = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(stale);
+    CHECK(stale->body.find("Out of date") != std::string::npos);
+    CHECK(stale->body.find(">Current</span>") == std::string::npos);
+    CHECK(json::parse(h.sink.Get("/api/v1/ca/issued")->body)["meta"]["crl_stale"] == true);
+
+    // A list covering the revoked set is Current while it is within its validity...
+    crl.version = 2;
+    crl.revoked_count = 1;
+    REQUIRE(h.store->record_crl_for_test(crl));
+    auto current = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(current);
+    CHECK(current->body.find(">Current</span>") != std::string::npos);
+    CHECK(json::parse(h.sink.Get("/api/v1/ca/issued")->body)["meta"]["crl_stale"] == false);
+
+    // ...and never once its next update has passed, even with matching counts.
+    crl.version = 3;
+    crl.next_update = 2000;
+    REQUIRE(h.store->record_crl_for_test(crl));
+    auto lapsed = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(lapsed);
+    CHECK(lapsed->body.find("Expired list") != std::string::npos);
+    CHECK(lapsed->body.find(">Current</span>") == std::string::npos);
+}
+
 TEST_CASE("ca_routes: a pre-count CRL row reports a null revoked count, not 0",
           "[ca_routes][pki][pg]") {
     Harness h;

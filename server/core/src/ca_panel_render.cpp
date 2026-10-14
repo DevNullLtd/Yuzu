@@ -2,7 +2,6 @@
 
 #include "web_utils.hpp"
 
-#include <algorithm>
 #include <cctype>
 #include <ctime>
 
@@ -121,7 +120,7 @@ std::string crl_panel(const Crl& c) {
         h += "<div><span>Revocation list</span><b>None published, or the store could not be "
              "read</b></div>";
         h += "<div><span>Status</span><b>" +
-             pill("warn", "Not yet published", "No revocation list exists yet") + "</b></div>";
+             pill("warn", "Not yet published", "No revocation list was found, or the store could not be read") + "</b></div>";
         return h + "</div></section>";
     }
     h += "<div><span>Revocation list</span><b>" + format_utc_minute(c.published_at) +
@@ -147,6 +146,12 @@ std::string crl_panel(const Crl& c) {
         break;
     case CrlState::NotPublished:
         h += pill("warn", "Not yet published");
+        break;
+    case CrlState::Expired:
+        h += pill("bad", "Expired list: the next update has passed",
+                  "The published revocation list is past its next-update time, so clients may "
+                  "reject it. The server republishes on its periodic freshness pass; if this "
+                  "persists, check the server log.");
         break;
     }
     h += "</b></div></div>";
@@ -220,7 +225,8 @@ std::string revoke_confirm_text(std::string_view purpose, std::string_view subje
     const std::string s(subject);
     if (purpose == "agent")
         return "Revoke certificate for \"" + s +
-               "\"? The agent is refused on its next connection. This cannot be undone.";
+               "\"? The agent is refused on its next direct connection. An agent connected through a "
+               "gateway must also be disconnected at the gateway. This cannot be undone.";
     if (purpose == "code-signing")
         return "Revoke \"" + s +
                "\"? It is recorded on the revocation list. This does not stop it signing new "

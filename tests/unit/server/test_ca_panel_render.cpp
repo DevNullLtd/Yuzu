@@ -114,6 +114,19 @@ TEST_CASE("ca panel: revocation panel states", "[ca_panel][pki][ui]") {
     CHECK_THAT(h, ContainsSubstring("Not recorded"));
     CHECK_THAT(h, ContainsSubstring("Not confirmed current"));
     CHECK_FALSE(has(h, ">0</b>"));
+
+    // Counts can match while the list itself has lapsed: never "Current".
+    m = ready();
+    m.crl.next_update = kNow - 86400;
+    m.crl.state = CrlState::Expired;
+    h = render(m);
+    CHECK_THAT(h, ContainsSubstring("Expired list: the next update has passed"));
+    CHECK_FALSE(has(h, ">Current</span>"));
+}
+
+TEST_CASE("ca panel: an out-of-range epoch renders a dash, never garbage", "[ca_panel][pki][ui]") {
+    CHECK(format_utc_date(INT64_MAX) == "\xE2\x80\x94");
+    CHECK(format_utc_minute(INT64_MAX) == "\xE2\x80\x94");
 }
 
 TEST_CASE("ca panel: no CRL published omits the download link", "[ca_panel][pki][ui]") {
@@ -166,7 +179,10 @@ TEST_CASE("ca panel: revoke and import post to the wrappers with the pki view fi
 
 TEST_CASE("ca panel: revoke confirm wording follows the purpose", "[ca_panel][pki][ui]") {
     CHECK_THAT(revoke_confirm_text("agent", "host-1"),
-               ContainsSubstring("The agent is refused on its next connection."));
+               ContainsSubstring("The agent is refused on its next direct connection."));
+    // Revocation is authoritative on direct connect only (auth-architecture.md).
+    CHECK_THAT(revoke_confirm_text("agent", "host-1"),
+               ContainsSubstring("must also be disconnected at the gateway"));
     const auto cs = revoke_confirm_text("code-signing", "release-2026");
     CHECK_THAT(cs, ContainsSubstring("agents do not yet check the list when loading plugins"));
     CHECK_FALSE(has(cs, "refused on its next connection"));

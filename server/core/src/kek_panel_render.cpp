@@ -23,7 +23,7 @@ std::string render(const Model& m) {
     case Availability::Unavailable:
         return failbox("Key management is not available (secrets store not ready).");
     case Availability::QueryCanceled:
-        return failbox("Key status could not be read: the query was cancelled or timed out.");
+        return failbox("Key status could not be read: the query was canceled or timed out.");
     case Availability::Internal:
         return failbox("Key status could not be read (internal error).");
     case Availability::Ready:
@@ -43,7 +43,8 @@ std::string render(const Model& m) {
             h += "oldest key still in use is v" + std::to_string(oldest) + ", active is v" +
                  std::to_string(m.active_version) +
                  ". Re-wrap the secrets to finish. If the operation lock shows Held, a "
-                 "rotation or re-wrap is running; wait for it.";
+                 "rotation or re-wrap may be running; if it stays Held for a long time, see "
+                 "\"Diagnosing a stuck KEK op lock\" in the server administration guide.";
         h += "</span></div></div>";
     }
 

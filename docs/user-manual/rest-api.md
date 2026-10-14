@@ -2223,10 +2223,13 @@ the CA store is unavailable.
 `meta` also carries the revocation-list figures, so a client can judge
 revocation freshness without downloading the DER list: `crl_version`,
 `crl_published_at` and `crl_next_update` (epoch seconds), `crl_revoked_count`
-and `crl_stale` (`true` when a revocation is not on the published list). Each is
-`null` when it could not be determined, never `0`/`false`: no list published,
-a list published before entry counts were recorded (`crl_revoked_count` null), or
-a failed comparison read (`crl_stale` null). The MCP `list_issued_certs` tool
+and `crl_stale`. The first four are `null` when no list is published, and
+`crl_revoked_count` is also `null` for a list published before entry counts were
+recorded; they are never `0`. `crl_stale` is `true` when the latest list was not
+built from the current revoked set (a revocation is missing from it, no list is
+published, or its entry count was not recorded), `false` when it covers every
+revocation, and `null` when the comparison read failed. It does not reflect
+expiry: compare `crl_next_update` with the current time. The MCP `list_issued_certs` tool
 returns the same five fields at the top level of its result.
 
 ```json

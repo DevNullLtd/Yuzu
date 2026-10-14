@@ -71,7 +71,7 @@ constexpr char kPart1[] = R"HTM(<!DOCTYPE html>
     </div>
   </main>
 
-  <div id="toast-container" class="toast-container"></div>
+  <div id="toast-container" class="toast-container" role="status" aria-live="polite"></div>
 
   <script>
     /* Toast host: the revoke/import wrappers answer an error with an HX-Trigger showToast. */
@@ -82,19 +82,24 @@ constexpr char kPart1[] = R"HTM(<!DOCTYPE html>
       t.className = 'toast toast-' + (level || 'info');
       t.textContent = message;
       c.appendChild(t);
-      if (level !== 'error') setTimeout(function () { t.remove(); }, 4000);
+      setTimeout(function () { t.remove(); }, level === 'error' ? 10000 : 4000);
     }
     document.body.addEventListener('showToast', function (e) {
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
     });
 
-    /* htmx drops 4xx/5xx bodies, so a panel the principal may not read would sit on
-       "Loading..." forever. Say why instead (textContent only). */
+    /* htmx drops 4xx/5xx bodies, so a panel that cannot load would sit on "Loading..."
+       forever. Say why instead (textContent only). */
     document.body.addEventListener('htmx:responseError', function (e) {
       var d = e.detail || {}, el = d.elt, x = d.xhr;
-      if (el && x && x.status === 403 && (el.id === 'ca-section' || el.id === 'kek-section'))
+      if (!el || !x || (el.id !== 'ca-section' && el.id !== 'kek-section')) return;
+      if (x.status === 403)
         el.textContent = 'You do not have permission to view this panel. It needs the Security:Read permission.';
+      else if (x.status === 401)
+        el.textContent = 'Your session has expired. Sign in again to view this panel.';
+      else
+        el.textContent = 'This panel could not be loaded (HTTP ' + x.status + '). Reload the page to try again.';
     });
 
     /* Any response carrying Sec-Audit-Failed: the action completed, its audit row did not. */

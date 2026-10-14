@@ -330,8 +330,12 @@ ca_panel::Model build_pki_model(CaStore* ca_store) {
         auto stale = ca_store->has_unpublished_revocations();
         if (!crl->revoked_count || !stale)
             m.crl.state = ca_panel::CrlState::Unconfirmed;
+        else if (*stale)
+            m.crl.state = ca_panel::CrlState::OutOfDate;
+        else if (crl->next_update > 0 && crl->next_update < m.now)
+            m.crl.state = ca_panel::CrlState::Expired; // counts match but the list has lapsed
         else
-            m.crl.state = *stale ? ca_panel::CrlState::OutOfDate : ca_panel::CrlState::Current;
+            m.crl.state = ca_panel::CrlState::Current;
     }
 
     auto issued_or_err = ca_store->list_issued(static_cast<int>(kPkiPanelLimit), 0);
@@ -1101,7 +1105,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             return;
         }
         if (!perm_fn(req, res, "Security", "Delete")) {
-            set_error_toast(res, "You do not have permission to revoke certificates.");
+            set_error_toast(res, "Revoke refused: not permitted, or your session has expired.");
             return;
         }
         // Error branches re-render the FULL fragment with an inline banner rather
@@ -1173,7 +1177,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                       return;
                   }
                   if (!perm_fn(req, res, "Security", "Write")) {
-                      set_error_toast(res, "You do not have permission to import a CA chain.");
+                      set_error_toast(res, "Import refused: not permitted, or your session has expired.");
                       return;
                   }
                   const bool pki_view = wants_pki_view(req);

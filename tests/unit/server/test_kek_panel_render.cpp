@@ -95,7 +95,7 @@ TEST_CASE("kek panel: failure states are fixed sentences with no status rows",
     CHECK_THAT(h, ContainsSubstring("Key management is not available (secrets store not ready)."));
     CHECK_FALSE(has(h, "secrets-kek-v"));
     m.availability = Availability::QueryCanceled;
-    CHECK_THAT(render(m), ContainsSubstring("the query was cancelled or timed out"));
+    CHECK_THAT(render(m), ContainsSubstring("the query was canceled or timed out"));
     m.availability = Availability::Internal;
     CHECK_THAT(render(m), ContainsSubstring("internal error"));
 }

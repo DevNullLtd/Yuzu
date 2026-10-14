@@ -226,7 +226,7 @@ TEST_CASE("kek fragment: a degraded read answers 200 with a fixed sentence, not 
     h.wire();
     for (auto [failure, text] :
          {std::pair{KekOpResult::Failure::Unavailable, "not available (secrets store not ready)"},
-          std::pair{KekOpResult::Failure::QueryCanceled, "cancelled or timed out"},
+          std::pair{KekOpResult::Failure::QueryCanceled, "canceled or timed out"},
           std::pair{KekOpResult::Failure::Internal, "internal error"},
           std::pair{KekOpResult::Failure::ClockAnomaly, "internal error"}}) {
         h.status = {};

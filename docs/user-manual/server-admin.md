@@ -2966,9 +2966,11 @@ Settings panel and REST routes it sits over (no new write route):
   versions, operation lock; `Security:Read`). Key rotation and re-wrap stay on
   `POST /api/v1/secrets/kek/rotate` and `/rewrap`.
 
-The panels apply the page's admin gate and the matching REST route's own
-permission, and show a note (not an empty list) when denied or when the store
-could not be read.
+The page itself requires an administrator. Each panel is loaded from its own
+route, which enforces the matching REST permission (`Security:Read`), and the
+page shows a note (not an empty list) when a panel is denied or cannot be read.
+A revocation list whose next-update time has passed shows *Expired list* rather
+than *Current*.
 
 ### Revoking an agent certificate from the dashboard
 
@@ -2982,7 +2984,8 @@ issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
    stored on the revocation record and audited.
 3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
    *Revoked* and the public CRL is republished automatically. If that publish
-   fails (the panel does not show this; the REST/MCP revoke response returns
+   fails (the Settings panel does not show this, while Certificates and secrets
+   shows *Out of date*; the REST/MCP revoke response returns
    `crl_republished:false` and a `ca.crl.published` failure is audited), the
    server republishes it on its own: on the next
    15-second freshness tick once the cause clears, or up to about 5 minutes later

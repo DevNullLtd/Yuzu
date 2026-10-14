@@ -40,6 +40,7 @@ enum class CrlState {
     OutOfDate,    ///< a CRL exists but a revocation is not on it
     NotPublished, ///< no CRL exists yet (or the store could not be read)
     Unconfirmed,  ///< a CRL exists but cannot be compared with the revoked set
+    Expired,      ///< the latest CRL's next_update has passed (counts may still match)
 };
 
 struct Crl {
