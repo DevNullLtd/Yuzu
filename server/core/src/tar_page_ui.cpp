@@ -296,10 +296,8 @@ R"HTM(
     .pending-txt { color: var(--warn); font-weight: 500; }
     #capTable tr.pending td { background: color-mix(in srgb, var(--warn) 10%, transparent); }
     #capTable tr.pending td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
-    .apply-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 16px;
-      padding: 12px 14px; background: var(--surface2); border-radius: var(--rad-panel);
-      border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line2));
-      font-size: 13.5px; color: var(--ink2); }
+    /* Notes and warning frame come from yuzu.css (.note.warn); only the flex row and margin are local */
+    .apply-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 16px; }
     .apply-bar[hidden] { display: none; }
     .apply-icon { color: var(--warn); }
     .apply-spacer { flex: 1; }
