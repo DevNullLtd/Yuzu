@@ -189,10 +189,13 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         // readable by every role seeded AuditLog:Read (Operator among them) -- so
         // writing a credential here is a worse sink than the log and the API this
         // branch already fixed, and it is not rotatable away afterwards.
-        (void)deps.audit_fn(req, "config.update", "success", "RuntimeConfig", key,
-                            "value=" + (RuntimeConfigStore::is_secret_key(key)
-                                            ? std::string(RuntimeConfigStore::redacted_placeholder())
-                                            : value));
+        // The change is already applied and is not rolled back: a dropped audit row is surfaced
+        // the way the other audited routes do (Sec-Audit-Failed), so a caller can show it.
+        if (!deps.audit_fn(req, "config.update", "success", "RuntimeConfig", key,
+                           "value=" + (RuntimeConfigStore::is_secret_key(key)
+                                           ? std::string(RuntimeConfigStore::redacted_placeholder())
+                                           : value)))
+            res.set_header("Sec-Audit-Failed", "true");
 
         res.set_content(
             nlohmann::json(RuntimeConfigStore::is_secret_key(key)
