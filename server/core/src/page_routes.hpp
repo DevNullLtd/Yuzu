@@ -52,6 +52,7 @@
 ///   GET /instructions                       (auth_fn)
 ///   GET /approvals                          (auth_fn)
 ///   GET /executions                         (auth_fn)
+///   GET /workflows                          (auth_fn)
 ///
 /// ORDERING: `/viz/fleet` is registered before `/viz/host/([^/]+)` — see the
 /// comment carried over onto that registration in page_routes.cpp. Today's
