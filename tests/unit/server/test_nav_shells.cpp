@@ -341,8 +341,13 @@ TEST_CASE("app shell: the bell is one hidden <details> before the account block"
         CHECK_THAT(html, ContainsSubstring("<summary id=\"shell-bell-sum\" aria-label=\"Notifications\">"));
         CHECK_THAT(html, ContainsSubstring("Shared by all operators"));
         // Approvals are not drawn here: no feed rows, no link until the page exists.
-        CHECK_THAT(html, !ContainsSubstring("Open approvals"));
-        CHECK_THAT(html, !ContainsSubstring("/approvals"));
+        // (the sidebar's own Approvals link is outside the bell, so scope to the <details>.)
+        const auto b0 = html.find("id=\"shell-bell\"");
+        const auto b1 = html.find("</details>", b0);
+        REQUIRE(b1 != std::string::npos);
+        const auto bell = html.substr(b0, b1 - b0);
+        CHECK_THAT(bell, !ContainsSubstring("Open approvals"));
+        CHECK_THAT(bell, !ContainsSubstring("/approvals"));
     }
 }
 
@@ -525,12 +530,14 @@ TEST_CASE("app shell: approvals badge is hidden until the count answers, polls e
     CHECK(count_of(html, "if(typeof n!=='number')throw new Error('payload');") == 2);
     CHECK(count_of(html, ".catch(function(){badge.hidden=true;})") == 1);
     CHECK(count_of(html, "badge.hidden=n<=0;") == 1);
-    CHECK(count_of(html, "n>99?'99+'") == 1);
+    // The bell script (a separate <script>, emitted after this one) also caps its chip at 99+.
+    const auto shell_js = html.substr(0, html.rfind("<script>"));
+    CHECK(count_of(shell_js, "n>99?'99+'") == 1);
     // Only the health poll omits credentials; the badge fetch rides the session cookie.
     CHECK(count_of(html, "credentials:'omit'") == 1);
     // No aria-label on the span (A18) and no event dispatch (O7).
-    CHECK_THAT(html, !ContainsSubstring("setAttribute('aria-label'"));
-    CHECK_THAT(html, !ContainsSubstring("yuzu:approvals-count"));
+    CHECK_THAT(shell_js, !ContainsSubstring("setAttribute('aria-label'"));
+    CHECK_THAT(shell_js, !ContainsSubstring("yuzu:approvals-count"));
 }
 
 TEST_CASE("the shared detail shell re-targets to every route that reuses it", "[nav][shell][pages]") {
