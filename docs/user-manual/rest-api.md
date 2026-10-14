@@ -1758,7 +1758,7 @@ curl -s -X POST \
 
 Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activate a time-boxed admin elevation via `POST /api/v1/elevate` (SOC 2 CC6.3/CC6.6). This is the per-user `users.elevation_eligible` flag, distinct from holding standing admin and enumerable for access reviews. See [JIT Admin Elevation](#jit-admin-elevation) below and `docs/auth-architecture.md` "JIT admin elevation".
 
-**Permission:** admin (or an active elevation) **+ MFA step-up**. **Self-grant is blocked** — an operator cannot set their own eligibility (another admin must).
+**Permission:** admin (or an active elevation) **+ MFA step-up**. **Self-grant is blocked** — an operator cannot set their own eligibility (another admin must). **Granting** (`eligible=true`) needs the caller's own administrator role: a session that is administrator only through an elevation gets `403` (audit `user.elevation_eligibility.set / denied / elevated_session_eligibility_grant_blocked`). Revoking is still open to an elevated session.
 
 **Body:** `{"eligible": <bool>}`.
 
@@ -9523,6 +9523,8 @@ The `role` field must be exactly `admin` or `user`.
   Each branch emits `user.role_change / denied / <reason>`.
 
 - **Response (403):** Self-target rejected. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Cannot change your own role","level":"error"}}`. Audit `user.role_change / denied / self_role_change_blocked`. To demote yourself, create a second admin, log out, log in as the second admin, and use this endpoint to demote the first.
+
+- **Response (403):** The caller is an administrator only through a temporary elevation (their own account role is not `admin`). Audit `user.role_change / denied / elevated_session_role_change_blocked`. Changing an account role needs the caller's own administrator role.
 
 - **Response (404):** `:username` does not match any persisted user. Audit `user.role_change / denied / user_not_found`.
 

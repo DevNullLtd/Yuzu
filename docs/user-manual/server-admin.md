@@ -3259,6 +3259,7 @@ The server emits an audit event on every branch:
 | Role changed | `success` | `old_role=user,new_role=admin` (or vice versa) |
 | Same role requested | `no_op` | `same_role=admin` (or `user`) |
 | Self-target rejected | `denied` | `self_role_change_blocked` |
+| Caller is an administrator only through a temporary elevation | `denied` | `elevated_session_role_change_blocked` (HTTP 403) |
 | Invalid username | `denied` | `invalid_username` |
 | Invalid JSON body | `denied` | `invalid_json` |
 | Missing `role` field | `denied` | `missing_role` |
@@ -3268,6 +3269,10 @@ The server emits an audit event on every branch:
 | Account deactivated between the route's lookup and the write, `admin` requested | `denied` | `inactive_promotion_refused` (HTTP 409; an account already inactive when the request arrives is `user_not_found`, HTTP 404) |
 | Role store unavailable, or the guard is not wired | `failure` | `store_failure` (HTTP 503, no retry hint: the change may or may not have been applied, so check the user's role and revoke the user's sessions) |
 | Role changed but session cleanup failed | `partial` | `role_changed session_wipe_failed=true old_role=<r> new_role=<r>` (HTTP 503, no retry hint: revoke the user's sessions) |
+
+> **Changing a role needs your own administrator role.** A session that is
+> administrator only through a temporary elevation (`POST /api/v1/elevate`) is
+> refused with HTTP 403: an account role is a standing grant, an elevation is not.
 
 > **You cannot change your own role.** The endpoint rejects self-target
 > with HTTP 403, audited as `denied:self_role_change_blocked`. The same
