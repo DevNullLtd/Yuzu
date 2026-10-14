@@ -429,3 +429,25 @@ TEST_CASE("instruction_yaml: block-scalar indicators and comment-only openers ar
     CHECK(f.approval == "role-gated"); // comment-only opener fell through to mode
     CHECK(f.plugin == "p");
 }
+
+TEST_CASE("parse_definition_yaml: has_description tells an omitted description from an empty one",
+          "[instruction_yaml]") {
+    const std::string base =
+        "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: a.b\n"
+        "  displayName: A\nspec:\n  plugin: p\n  action: q\n";
+    const auto omitted = parse_definition_yaml(base);
+    CHECK_FALSE(omitted.has_description);
+    CHECK(omitted.description.empty());
+
+    const auto empty = parse_definition_yaml(
+        "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: a.b\n"
+        "  displayName: A\n  description: \"\"\nspec:\n  plugin: p\n  action: q\n");
+    CHECK(empty.has_description);
+    CHECK(empty.description.empty());
+
+    const auto set = parse_definition_yaml(
+        "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: a.b\n"
+        "  displayName: A\n  description: hello\nspec:\n  plugin: p\n  action: q\n");
+    CHECK(set.has_description);
+    CHECK(set.description == "hello");
+}

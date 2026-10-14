@@ -282,9 +282,12 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 breakdown += to_string(s.outcome);
                 breakdown += ' ';
             }
-            (void)detail::try_persist_audit(
-                audit_fn_, req, "sle.agent.decommission", r.ok() ? "success" : "partial", "Agent",
-                agent_id,
+            // The attempt row above is the fail-closed evidence; a lost OUTCOME row is
+            // signalled by Sec-Audit-Failed (set on the 200 and the partial 500 alike), which
+            // the page's client reads to warn that the per-store outcome is unrecorded.
+            (void)detail::emit_behavioral_audit(
+                audit_fn_, req, res, "sle.agent.decommission", r.ok() ? "success" : "partial",
+                "Agent", agent_id,
                 breakdown + "deleted=" + std::to_string(r.deleted) +
                     " skipped=" + std::to_string(r.skipped) +
                     " failed=" + std::to_string(r.failed) + " cid=" + cid);

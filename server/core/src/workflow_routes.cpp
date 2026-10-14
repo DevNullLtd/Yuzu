@@ -3228,6 +3228,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
     sink.Post(R"(/api/instructions/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
+                                                       csrf_trusted = deps.csrf_trusted_origins,
                                                        instruction_store, cmd_dispatch,
                                                        cmd_dispatch_concurrency, caller_fn,
                                                        execution_tracker, approval_manager,
@@ -3359,6 +3360,18 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
+        // A dispatch authorised by a session cookie must come from this site (token callers
+        // are exempt): the dashboard is the only cookie caller, and it always sends Origin.
+        if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"), csrf_trusted)) {
+            (void)audit_fn(req, "csrf.denied", "denied", "Endpoint", "instruction.execute",
+                           "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"),
+                            "application/json");
+            return;
+        }
 
         // -- Stored parameter_schema enforcement (strict) ---------------------------
         // Validates the RAW typed `params` against the definition's stored schema

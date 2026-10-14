@@ -6001,61 +6001,232 @@ void SettingsRoutes::register_routes(
                     res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
                 });
 
+    auto sanitise = [](std::string_view in, std::size_t max_len = 128) -> std::string {
+        std::string out;
+        out.reserve(std::min(in.size(), max_len));
+        for (char c : in) {
+            if (out.size() >= max_len)
+                break;
+            unsigned char u = static_cast<unsigned char>(c);
+            // Strip C0 controls, DEL, and high-bit bytes — exact policy
+            // from fleet_topology_store.cpp::sanitise_for_audit.
+            if (u < 0x20 || u == 0x7f || u >= 0x80) {
+                out.push_back(' ');
+            } else {
+                out.push_back(static_cast<char>(u));
+            }
+        }
+        return out;
+    };
+    auto origin_safe = [this, sanitise](const httplib::Request& req, httplib::Response& res,
+                                        const std::string& action_for_audit) -> bool {
+        auto host = req.get_header_value("Host");
+        auto origin = req.get_header_value("Origin");
+        auto referer = req.get_header_value("Referer");
+
+        // Shared same-site comparison (web_utils) — one implementation across
+        // settings + ca_routes (#1241 H-1). This site keeps the 403 + csrf.denied
+        // audit; ca_routes' dashboard revoke calls the same helper.
+        //
+        // The operator-declared external-origin allowlist (#2537) comes straight
+        // from Config here, because this owner already holds one. CaRoutes and
+        // DashboardRoutes take theirs via set_csrf_trusted_origins() rather than
+        // acquire a Config dependency they otherwise have no use for. A null
+        // cfg_ yields an empty span — same-host only, fail-closed, never open.
+        if (origin_is_same_site(host, origin, referer,
+                                cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
+                                     : std::span<const std::string>{})) {
+            return true;
+        }
+        res.status = 403;
+        res.set_content(detail::a4_error(res, "cross-origin POST refused"), "application/json");
+        audit_fn_(req, "csrf.denied", "error", "Endpoint", action_for_audit,
+                  "Origin/Referer host mismatch (Origin=" + sanitise(origin) +
+                      " Referer=" + sanitise(referer) + " Host=" + sanitise(host) + ")");
+        return false;
+    };
+
     // -- Settings API: Auto-approve rules (HTMX) ------------------------------
 
+    // Enrollment policy admits machines to the fleet, so every write here FAILS CLOSED on
+    // audit (ADR-0033 section 9: no audit row -> no mutation). Order, per request:
+    // authorize -> same-site check -> validate -> `attempt` row (refuse 503 if it is not
+    // persisted) -> mutate + persist -> `success` / `error` outcome row. Rejected input is
+    // never echoed. The 4xx/5xx body is the A4 envelope; the dashboard reads the toast.
+    auto aa_refuse = [](httplib::Response& res, int status, const char* message,
+                        const char* toast) {
+        res.status = status;
+        res.set_header("HX-Trigger",
+                       std::string(R"({"showToast":{"message":")") + toast +
+                           R"(","level":"error"}})");
+        res.set_content(detail::a4_error(res, message), "application/json");
+    };
+    auto aa_attempt = [this, aa_refuse](const httplib::Request& req, httplib::Response& res,
+                                        const char* action, const std::string& target_id,
+                                        const std::string& detail_text) -> bool {
+        if (detail::emit_behavioral_audit(audit_read_fn_, req, res, action, "attempt",
+                                          "AutoApproveRule", target_id, detail_text))
+            return true;
+        spdlog::warn("{} audit fail-closed (503, no change)", action);
+        aa_refuse(res, 503, "audit subsystem unavailable; refusing to change enrollment policy "
+                            "without durable evidence",
+                  "Audit unavailable - change not applied");
+        return false;
+    };
+    auto aa_persist_failed = [this, aa_refuse](const httplib::Request& req, httplib::Response& res,
+                                               const char* action, const std::string& target_id,
+                                               const std::string& by) {
+        audit_fn_(req, action, "error", "AutoApproveRule", target_id,
+                  "persist_failed by=" + by);
+        aa_refuse(res, 500, "could not persist the auto-approve policy; nothing was changed",
+                  "Could not save - change not applied");
+    };
+    // Parse the {index} path capture; npos = unparseable (treated as "no such rule").
+    auto aa_index = [](const std::string& idx_s) -> size_t {
+        // stoul throws on overflow
+        return idx_s.size() <= 9 ? static_cast<size_t>(std::stoul(idx_s)) : std::string::npos;
+    };
+
     sink.Post("/api/settings/auto-approve",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, origin_safe, aa_refuse, aa_attempt,
+               aa_persist_failed](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
+                  auto session = auth_fn_(req, res);
+                  if (!session)
+                      return;
+                  if (!origin_safe(req, res, "/api/settings/auto-approve"))
+                      return;
+                  const auto by = audit_token(session->username);
                   auto type_s = extract_form_value(req.body, "type");
                   auto value = extract_form_value(req.body, "value");
                   auto label = extract_form_value(req.body, "label");
 
-                  auth::AutoApproveRuleType type;
-                  if (type_s == "trusted_ca")
-                      type = auth::AutoApproveRuleType::trusted_ca;
-                  else if (type_s == "ip_subnet")
-                      type = auth::AutoApproveRuleType::ip_subnet;
-                  else if (type_s == "cloud_provider")
-                      type = auth::AutoApproveRuleType::cloud_provider;
-                  else
-                      type = auth::AutoApproveRuleType::hostname_glob;
+                  const auto type = auth::parse_auto_approve_rule_type(type_s);
+                  std::string err = type ? auth::validate_auto_approve_rule(*type, value, label)
+                                         : "unknown rule type";
+                  if (!err.empty()) {
+                      audit_fn_(req, "enrollment.auto_approve.rule_add", "denied", "AutoApproveRule",
+                                "", "rejected=" + audit_token(err) + " by=" + by);
+                      aa_refuse(res, 400, "rule rejected: invalid type, value or label",
+                                "Rule rejected: invalid type, value or label");
+                      return;
+                  }
 
-                  auto_approve_->add_rule({type, value, label, true});
-                  spdlog::info("Auto-approve rule added: {}:{} ({})", type_s, value, label);
+                  const std::string detail_text = "type=" + audit_token(type_s) +
+                                                  " value=" + audit_token(value) +
+                                                  " label=" + audit_token(label) + " by=" + by;
+                  if (!aa_attempt(req, res, "enrollment.auto_approve.rule_add", "", detail_text))
+                      return;
+                  if (!auto_approve_->add_rule({*type, value, label, true})) {
+                      aa_persist_failed(req, res, "enrollment.auto_approve.rule_add", "", by);
+                      return;
+                  }
+                  audit_fn_(req, "enrollment.auto_approve.rule_add", "success", "AutoApproveRule",
+                            "", detail_text);
+                  spdlog::info("Auto-approve rule added: {}:{} ({}) by {}", audit_token(type_s),
+                               audit_token(value), audit_token(label), by);
                   res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
               });
 
     sink.Post("/api/settings/auto-approve/mode",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, origin_safe, aa_refuse, aa_attempt,
+               aa_persist_failed](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
+                  auto session = auth_fn_(req, res);
+                  if (!session)
+                      return;
+                  if (!origin_safe(req, res, "/api/settings/auto-approve/mode"))
+                      return;
+                  const auto by = audit_token(session->username);
                   auto mode = extract_form_value(req.body, "mode");
-                  auto_approve_->set_require_all(mode == "all");
-                  auto_approve_->save();
-                  spdlog::info("Auto-approve mode changed to {}", mode);
+                  if (mode != "any" && mode != "all") {
+                      audit_fn_(req, "enrollment.auto_approve.mode", "denied", "AutoApproveRule",
+                                "", "rejected=unknown_mode by=" + by);
+                      aa_refuse(res, 400, "mode must be 'any' or 'all'", "Mode rejected");
+                      return;
+                  }
+                  const std::string detail_text = "mode=" + mode + " by=" + by;
+                  if (!aa_attempt(req, res, "enrollment.auto_approve.mode", "", detail_text))
+                      return;
+                  if (!auto_approve_->set_require_all(mode == "all")) {
+                      aa_persist_failed(req, res, "enrollment.auto_approve.mode", "", by);
+                      return;
+                  }
+                  audit_fn_(req, "enrollment.auto_approve.mode", "success", "AutoApproveRule", "",
+                            detail_text);
+                  spdlog::info("Auto-approve mode changed to {} by {}", mode, by);
                   res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
               });
 
     sink.Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, origin_safe, aa_attempt, aa_persist_failed, aa_index](
+                  const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
-                  auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
-                  auto rules = auto_approve_->list_rules();
-                  if (idx < rules.size()) {
-                      auto_approve_->set_enabled(idx, !rules[idx].enabled);
+                  auto session = auth_fn_(req, res);
+                  if (!session)
+                      return;
+                  if (!origin_safe(req, res, "/api/settings/auto-approve/toggle"))
+                      return;
+                  const auto by = audit_token(session->username);
+                  const auto idx_s = req.matches[1].str();
+                  if (!aa_attempt(req, res, "enrollment.auto_approve.rule_toggle", idx_s,
+                                  "by=" + by))
+                      return;
+                  // The engine toggles and reports the rule it acted on under ONE lock, so the
+                  // audit row can never name a different rule than the one that changed.
+                  const auto edit = auto_approve_->toggle_rule(aa_index(idx_s));
+                  using Status = auth::RuleEdit::Status;
+                  if (edit.status == Status::persist_failed) {
+                      aa_persist_failed(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
+                      return;
+                  }
+                  if (edit.status == Status::ok) {
+                      audit_fn_(req, "enrollment.auto_approve.rule_toggle", "success",
+                                "AutoApproveRule", idx_s,
+                                std::string("enabled=") + (edit.rule.enabled ? "1" : "0") +
+                                    " by=" + by);
+                  } else {
+                      audit_fn_(req, "enrollment.auto_approve.rule_toggle", "denied",
+                                "AutoApproveRule", idx_s, "rule_not_found by=" + by);
                   }
                   res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
               });
 
     sink.Delete(R"(/api/settings/auto-approve/(\d+))",
-                [this](const httplib::Request& req, httplib::Response& res) {
+                [this, origin_safe, aa_attempt, aa_persist_failed, aa_index](
+                    const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
-                    auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
-                    auto_approve_->remove_rule(idx);
-                    spdlog::info("Auto-approve rule {} removed", idx);
+                    auto session = auth_fn_(req, res);
+                    if (!session)
+                        return;
+                    if (!origin_safe(req, res, "/api/settings/auto-approve/delete"))
+                        return;
+                    const auto by = audit_token(session->username);
+                    const auto idx_s = req.matches[1].str();
+                    if (!aa_attempt(req, res, "enrollment.auto_approve.rule_remove", idx_s,
+                                    "by=" + by))
+                        return;
+                    const auto edit = auto_approve_->remove_rule(aa_index(idx_s));
+                    using Status = auth::RuleEdit::Status;
+                    if (edit.status == Status::persist_failed) {
+                        aa_persist_failed(req, res, "enrollment.auto_approve.rule_remove", idx_s,
+                                          by);
+                        return;
+                    }
+                    if (edit.status == Status::ok) {
+                        audit_fn_(req, "enrollment.auto_approve.rule_remove", "success",
+                                  "AutoApproveRule", idx_s,
+                                  "value=" + audit_token(edit.rule.value) +
+                                      " label=" + audit_token(edit.rule.label) + " by=" + by);
+                        spdlog::info("Auto-approve rule {} removed by {}", idx_s, by);
+                    } else {
+                        audit_fn_(req, "enrollment.auto_approve.rule_remove", "denied",
+                                  "AutoApproveRule", idx_s, "rule_not_found by=" + by);
+                    }
                     res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
                 });
 
@@ -6695,57 +6866,13 @@ void SettingsRoutes::register_routes(
     //    is treated as a fail-closed mismatch.
     //
     // Scoping note (Gate 4 SHOULD S2 — known follow-up): origin_safe is
-    // wired into the 4 mutating MFA POSTs only. 11 sibling state-
-    // changing Settings POSTs (/api/settings/users/*, plugin-signing,
-    // OIDC, cert, enrollment-tokens, tls) remain CSRF-unprotected
+    // wired into the 4 mutating MFA POSTs and the 4 auto-approve writes
+    // only. 11 sibling state-changing Settings POSTs (/api/settings/users/*,
+    // plugin-signing, OIDC, cert, enrollment-tokens, tls) remain CSRF-unprotected
     // pending a follow-up PR that wraps every admin HTMX mutation. The
     // asymmetric defence is documented in CHANGELOG and is NOT a
     // regression introduced by this PR — those sites were unprotected
     // before PR1 too.
-    auto sanitise = [](std::string_view in, std::size_t max_len = 128) -> std::string {
-        std::string out;
-        out.reserve(std::min(in.size(), max_len));
-        for (char c : in) {
-            if (out.size() >= max_len)
-                break;
-            unsigned char u = static_cast<unsigned char>(c);
-            // Strip C0 controls, DEL, and high-bit bytes — exact policy
-            // from fleet_topology_store.cpp::sanitise_for_audit.
-            if (u < 0x20 || u == 0x7f || u >= 0x80) {
-                out.push_back(' ');
-            } else {
-                out.push_back(static_cast<char>(u));
-            }
-        }
-        return out;
-    };
-    auto origin_safe = [this, sanitise](const httplib::Request& req, httplib::Response& res,
-                                        const std::string& action_for_audit) -> bool {
-        auto host = req.get_header_value("Host");
-        auto origin = req.get_header_value("Origin");
-        auto referer = req.get_header_value("Referer");
-
-        // Shared same-site comparison (web_utils) — one implementation across
-        // settings + ca_routes (#1241 H-1). This site keeps the 403 + csrf.denied
-        // audit; ca_routes' dashboard revoke calls the same helper.
-        //
-        // The operator-declared external-origin allowlist (#2537) comes straight
-        // from Config here, because this owner already holds one. CaRoutes and
-        // DashboardRoutes take theirs via set_csrf_trusted_origins() rather than
-        // acquire a Config dependency they otherwise have no use for. A null
-        // cfg_ yields an empty span — same-host only, fail-closed, never open.
-        if (origin_is_same_site(host, origin, referer,
-                                cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
-                                     : std::span<const std::string>{})) {
-            return true;
-        }
-        res.status = 403;
-        res.set_content(detail::a4_error(res, "cross-origin POST refused"), "application/json");
-        audit_fn_(req, "csrf.denied", "error", "Endpoint", action_for_audit,
-                  "Origin/Referer host mismatch (Origin=" + sanitise(origin) +
-                      " Referer=" + sanitise(referer) + " Host=" + sanitise(host) + ")");
-        return false;
-    };
 
     sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))

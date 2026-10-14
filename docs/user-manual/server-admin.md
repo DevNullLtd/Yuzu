@@ -5076,8 +5076,8 @@ The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin r
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/settings/auto-approve` | Render the auto-approval policies fragment (HTMX). |
-| `POST` | `/api/settings/auto-approve` | Create a new auto-approval rule. |
-| `POST` | `/api/settings/auto-approve/mode` | Set the auto-approval mode (manual, policy-based). |
+| `POST` | `/api/settings/auto-approve` | Create a new auto-approval rule. Returns `400` and saves nothing for an unknown type, an empty value, a value over 253 or a label over 128 characters, a `:` or control character in value or label, a malformed `ip_subnet`, a `trusted_ca` that is not 64 hex characters, or a match-everything rule (`*`, `/0`). The four rule writes are refused with `403` when `Origin`/`Referer` names another site, and are refused with `503` if their audit row cannot be stored. |
+| `POST` | `/api/settings/auto-approve/mode` | Set the match mode (`any` or `all`); any other value returns `400`. |
 | `POST` | `/api/settings/auto-approve/{index}/toggle` | Toggle an auto-approval rule on or off. |
 | `DELETE` | `/api/settings/auto-approve/{index}` | Delete an auto-approval rule. |
 
