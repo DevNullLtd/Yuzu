@@ -586,7 +586,7 @@ admission verifies by key+DN (`is_yuzu_issued`→`verify_chain`), revocation by 
 root (empty in Builtin → M1 single-cert behaviour unchanged).
 
 **Surfaces:** REST `GET /api/v1/ca/root-csr` (`Security:Read`) + `POST
-/api/v1/ca/import-chain` (`Security:Write`); the **Settings → Internal CA** panel
+/api/v1/ca/import-chain` (`Security:Write`); the **Settings → Certificates and secrets** page (or the **Settings → Internal CA** panel)
 shows a Trust-mode badge + the CSR download + an import form (the dashboard
 wrapper `/api/settings/ca/import-chain` is CSRF-gated like revoke). Audit:
 `ca.root_csr.exported`, `ca.subordinate.imported`.

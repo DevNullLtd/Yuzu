@@ -2951,9 +2951,28 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
 | Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). A view over the same `AuditLog:Read`/`AuditLog:Attest`-gated `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. See `docs/auth-architecture.md` "Periodic access reviews". |
 
+### Certificates and secrets (System page)
+
+An admin-only page under **Settings** in the sidebar reads the same data as the
+Settings panel and REST routes it sits over (no new write route):
+
+- **Certificates and secrets** (`/settings/pki`): the certificate authority
+  (trust mode, algorithm, validity, SHA-256, CA and CSR downloads, enterprise
+  chain import), the revocation list (published time, next update, revoked
+  count, and *Out of date* when a revocation is not on the published list), the
+  issued-certificate inventory with *Active*, *Expired* and *Revoked* states and
+  a revoke confirmation worded for the certificate's purpose, and a read-only
+  key-encryption-key status panel (active key version, re-wrap state, live key
+  versions, operation lock; `Security:Read`). Key rotation and re-wrap stay on
+  `POST /api/v1/secrets/kek/rotate` and `/rewrap`.
+The panels apply the page's admin gate and the matching REST route's own
+permission, and show a note (not an empty list) when denied or when the store
+could not be read.
+
 ### Revoking an agent certificate from the dashboard
 
-When the server runs its built-in CA, **Settings → Internal CA** lists every
+When the server runs its built-in CA, **Settings → Certificates and secrets**
+(or **Settings → Internal CA** on the Settings page) lists every
 issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
