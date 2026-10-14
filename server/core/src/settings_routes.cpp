@@ -13,6 +13,7 @@
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "enrolment_render.hpp" // enrolment token / pending / auto-approve fragment markup (pure)
 #include "config_secret_keys.hpp" // is_exactly_redaction_placeholder in the OIDC handler
 #include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
 #include "dex_blast_radius.hpp" // F1: BlastRadiusConfig defaults for the threshold form
@@ -776,12 +777,12 @@ namespace {
 constexpr const char* kMfaCredentialChangedMsg =
     "Your password changed during enrolment — sign in again";
 
-// Shown INSTEAD of a table when the enrollment store cannot be read (WS-6 6.2):
-// an outage must never render as an empty list ("No tokens created") — that
-// would tell an operator there is nothing to act on when the truth is unknown.
-constexpr const char* kEnrollmentStoreUnavailableHtml =
-    "<div class=\"feedback-error\">Enrollment store unavailable - state unknown. "
-    "Retry shortly.</div>";
+/// B5: an enrolment secret, or a list that sits next to one, must not be stored by a cache
+/// or replayed from history. `Vary: Cookie` keeps a shared cache from crossing operators.
+void no_store_private(httplib::Response& res) {
+    res.set_header("Cache-Control", "no-store, private");
+    res.set_header("Vary", "Cookie");
+}
 
 /// `count=N ids=a,b,c` for a bulk enrollment audit row: the count is the size of
 /// the RETURNING set (authoritative), the id list is capped so a fleet-wide bulk
@@ -804,117 +805,11 @@ std::string bulk_audit_detail(const std::vector<std::string>& ids) {
 } // namespace
 
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
-    // The reveal block is built first: a freshly minted raw token is shown ONCE, so
-    // it must survive even when the follow-up list read fails.
-    std::string reveal;
-    if (!new_raw_token.empty()) {
-        reveal = "<div class=\"token-reveal\">"
-                 "  <div class=\"token-reveal-header\">"
-                 "    COPY THIS TOKEN NOW — it will not be shown again"
-                 "  </div>"
-                 "  <code>" +
-                 html_escape(new_raw_token) +
-                 "</code><br>"
-                 "  <button class=\"btn btn-secondary btn-sm\" "
-                 "style=\"margin-top:0.5rem\" "
-                 "          data-copy-token>Copy to Clipboard</button>"
-                 "</div>";
-    }
+    // Markup is a pure function (enrolment_render.cpp). A freshly minted raw token is shown
+    // ONCE, so it is passed through even when the list read failed.
     auto tokens_result = auth_mgr_->list_enrollment_tokens();
-    if (!tokens_result)
-        return std::string(kEnrollmentStoreUnavailableHtml) + reveal;
-    const auto& tokens = *tokens_result;
-    std::string html = "<table class=\"user-table\">"
-                       "  <thead><tr><th>ID</th><th>Label</th><th>Uses</th>"
-                       "  <th>Expires</th><th>Status</th><th></th></tr></thead>"
-                       "  <tbody>";
-
-    if (tokens.empty()) {
-        html += "<tr><td colspan=\"6\" class=\"muted\">No tokens created</td></tr>";
-    } else {
-        for (const auto& t : tokens) {
-            auto uses = t.max_uses == 0
-                            ? std::to_string(t.use_count) + " / \xe2\x88\x9e"
-                            : std::to_string(t.use_count) + " / " + std::to_string(t.max_uses);
-
-            std::string exp;
-            if (t.expires_at == (std::chrono::system_clock::time_point::max)()) {
-                exp = "Never";
-            } else {
-                auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                                 t.expires_at.time_since_epoch())
-                                 .count();
-                exp = std::to_string(epoch);
-            }
-
-            std::string status_cls, status_txt;
-            if (t.revoked) {
-                status_cls = "role-user";
-                status_txt = "Revoked";
-            } else if (t.max_uses > 0 && t.use_count >= t.max_uses) {
-                status_cls = "role-user";
-                status_txt = "Exhausted";
-            } else {
-                status_cls = "role-admin";
-                status_txt = "Active";
-            }
-
-            html += "<tr><td><code>" + html_escape(t.token_id) +
-                    "</code></td>"
-                    "<td>" +
-                    html_escape(t.label) +
-                    "</td>"
-                    "<td>" +
-                    uses +
-                    "</td>"
-                    "<td>" +
-                    exp +
-                    "</td>"
-                    "<td><span class=\"role-badge " +
-                    status_cls + "\">" + status_txt +
-                    "</span></td>"
-                    "<td>";
-            if (!t.revoked) {
-                html += "<button class=\"btn btn-danger\" "
-                        "hx-delete=\"/api/settings/enrollment-tokens/" +
-                        html_escape(t.token_id) +
-                        "\" "
-                        "hx-target=\"#token-section\" hx-swap=\"innerHTML\" "
-                        "hx-confirm=\"Revoke token &quot;" +
-                        html_escape(t.token_id) +
-                        "&quot;? Agents using this token will no longer be able to enroll.\""
-                        ">Revoke</button>";
-            }
-            html += "</td></tr>";
-        }
-    }
-
-    html += "  </tbody>"
-            "</table>"
-            "<form class=\"add-user-form\" hx-post=\"/api/settings/enrollment-tokens\" "
-            "      hx-target=\"#token-section\" hx-swap=\"innerHTML\">"
-            "  <div class=\"mini-field\">"
-            "    <label>Label</label>"
-            "    <input type=\"text\" name=\"label\" placeholder=\"e.g. NYC rollout\" "
-            "style=\"width:160px\">"
-            "  </div>"
-            "  <div class=\"mini-field\">"
-            "    <label>Max Uses</label>"
-            "    <input type=\"text\" name=\"max_uses\" placeholder=\"0 = unlimited\" "
-            "style=\"width:120px\">"
-            "  </div>"
-            "  <div class=\"mini-field\">"
-            "    <label>TTL (hours)</label>"
-            "    <input type=\"text\" name=\"ttl_hours\" placeholder=\"0 = never\" "
-            "style=\"width:120px\">"
-            "  </div>"
-            "  <button class=\"btn btn-primary\" type=\"submit\">Generate Token</button>"
-            "</form>"
-            "<div class=\"feedback\" id=\"token-feedback\"></div>";
-
-    html += reveal;
-
-    return html;
+    return enrolment::render_tokens(tokens_result ? &*tokens_result : nullptr, new_raw_token,
+                                    std::chrono::system_clock::now());
 }
 
 std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_raw_token,
@@ -1849,216 +1744,13 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
 }
 
 std::string SettingsRoutes::render_pending_fragment() {
-    auto all_agents_result = auth_mgr_->list_pending_agents();
-    if (!all_agents_result)
-        return kEnrollmentStoreUnavailableHtml;
-    auto all_agents = std::move(*all_agents_result);
-    // Filter out enrolled (approved) agents — they don't need admin attention.
-    // Only show pending and denied entries in the approval queue.
-    std::vector<auth::PendingAgent> agents;
-    for (auto& a : all_agents) {
-        if (a.status != auth::PendingStatus::approved) {
-            agents.push_back(std::move(a));
-        }
-    }
-    std::string html = "<table class=\"user-table\">"
-                       "  <thead><tr><th>Agent ID</th><th>Hostname</th><th>OS</th>"
-                       "  <th>Version</th><th>Status</th><th></th></tr></thead>"
-                       "  <tbody>";
-
-    if (agents.empty()) {
-        html += "<tr><td colspan=\"6\" class=\"muted\">No pending agents</td></tr>";
-    } else {
-        for (const auto& a : agents) {
-            auto status_str = auth::pending_status_to_string(a.status);
-            std::string status_cls;
-            if (a.status == auth::PendingStatus::approved) {
-                status_cls = "role-ok";
-            } else if (a.status == auth::PendingStatus::denied) {
-                status_cls = "role-bad";
-            } else {
-                status_cls = "role-warn";
-            }
-
-            auto short_id = a.agent_id.size() > 12 ? a.agent_id.substr(0, 12) + "..." : a.agent_id;
-
-            html += "<tr>"
-                    "<td><code>" +
-                    html_escape(short_id) +
-                    "</code></td>"
-                    "<td>" +
-                    html_escape(a.hostname) +
-                    "</td>"
-                    "<td>" +
-                    html_escape(a.os) + " " + html_escape(a.arch) +
-                    "</td>"
-                    "<td>" +
-                    html_escape(a.agent_version) +
-                    "</td>"
-                    "<td><span class=\"role-badge " +
-                    status_cls + "\">" + html_escape(status_str) +
-                    "</span></td>"
-                    "<td>";
-
-            if (a.status == auth::PendingStatus::pending) {
-                html += "<button class=\"btn btn-primary\" "
-                        "style=\"margin-right:0.3rem\" "
-                        "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
-                        "/approve\" "
-                        "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
-                        ">Approve</button>"
-                        "<button class=\"btn btn-danger\" "
-                        "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
-                        "/deny\" "
-                        "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
-                        "hx-confirm=\"Deny agent enrollment?\""
-                        ">Deny</button>";
-            } else {
-                // This branch only ever reaches a `denied` row (approved rows are
-                // filtered out above, line ~1764). WS-6 6.2 (governance Finding 1)
-                // made removal of a denied row permanently refused (409) — the
-                // denial is a durable record and removing it would silently
-                // reverse the decision with no audit trail. There is no other
-                // action to offer here, so no button renders; the row stays
-                // visible in the queue as the durable evidence of the denial.
-                html += "<span class=\"muted\">denial recorded</span>";
-            }
-
-            html += "</td></tr>";
-        }
-    }
-
-    html += "  </tbody>"
-            "</table>";
-
-    auto pending_count = std::count_if(agents.begin(), agents.end(), [](const auto& a) {
-        return a.status == auth::PendingStatus::pending;
-    });
-    if (pending_count > 1) {
-        html += "<div style=\"margin-top:0.75rem;display:flex;gap:0.5rem\">"
-                "<button class=\"btn btn-primary\" "
-                "onclick=\"twoClickConfirm(this, function() { "
-                "htmx.ajax('POST','/api/settings/pending-agents/bulk-approve',"
-                "{target:'#pending-section',swap:'innerHTML'}); })\">"
-                "Approve All (" +
-                std::to_string(pending_count) +
-                ")</button>"
-                "<button class=\"btn btn-danger\" "
-                "onclick=\"twoClickConfirm(this, function() { "
-                "htmx.ajax('POST','/api/settings/pending-agents/bulk-deny',"
-                "{target:'#pending-section',swap:'innerHTML'}); })\">"
-                "Deny All (" +
-                std::to_string(pending_count) +
-                ")</button>"
-                "</div>";
-    }
-
-    html += "<div class=\"feedback\" id=\"pending-feedback\"></div>";
-
-    return html;
+    auto agents = auth_mgr_->list_pending_agents();
+    return enrolment::render_pending(agents ? &*agents : nullptr);
 }
 
 std::string SettingsRoutes::render_auto_approve_fragment() {
-    auto rules = auto_approve_->list_rules();
-    std::string html;
-
-    html += "<div class=\"form-row\" style=\"margin-bottom:1rem\">"
-            "<label>Match mode</label>"
-            "<select name=\"mode\" "
-            "hx-post=\"/api/settings/auto-approve/mode\" "
-            "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
-            "style=\"flex:0 0 auto;width:180px\">"
-            "<option value=\"any\"" +
-            std::string(auto_approve_->require_all() ? "" : " selected") +
-            ">Any rule (first match)</option>"
-            "<option value=\"all\"" +
-            std::string(auto_approve_->require_all() ? " selected" : "") +
-            ">All rules must match</option>"
-            "</select>"
-            "</div>";
-
-    html += "<table class=\"user-table\">"
-            "<thead><tr><th>Type</th><th>Value</th><th>Label</th>"
-            "<th>Enabled</th><th></th></tr></thead><tbody>";
-
-    if (rules.empty()) {
-        html += "<tr><td colspan=\"5\" class=\"muted\">No auto-approve rules "
-                "configured</td></tr>";
-    } else {
-        auto type_str = [](auth::AutoApproveRuleType t) -> std::string {
-            switch (t) {
-            case auth::AutoApproveRuleType::trusted_ca:
-                return "Trusted CA";
-            case auth::AutoApproveRuleType::hostname_glob:
-                return "Hostname Glob";
-            case auth::AutoApproveRuleType::ip_subnet:
-                return "IP Subnet";
-            case auth::AutoApproveRuleType::cloud_provider:
-                return "Cloud Provider";
-            }
-            return "Unknown";
-        };
-
-        for (size_t i = 0; i < rules.size(); ++i) {
-            const auto& r = rules[i];
-            auto idx = std::to_string(i);
-            html += "<tr>"
-                    "<td>" +
-                    html_escape(type_str(r.type)) +
-                    "</td>"
-                    "<td><code>" +
-                    html_escape(r.value) +
-                    "</code></td>"
-                    "<td>" +
-                    html_escape(r.label) +
-                    "</td>"
-                    "<td>"
-                    "<label class=\"toggle\">"
-                    "<input type=\"checkbox\"" +
-                    std::string(r.enabled ? " checked" : "") +
-                    " hx-post=\"/api/settings/auto-approve/" + idx +
-                    "/toggle\" "
-                    "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\">"
-                    "<span class=\"slider\"></span></label></td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "hx-delete=\"/api/settings/auto-approve/" +
-                    idx +
-                    "\" "
-                    "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Remove this auto-approve rule?\" "
-                    ">Remove</button></td></tr>";
-        }
-    }
-
-    html += "</tbody></table>";
-
-    html += "<div class=\"add-user-form\">"
-            "<form hx-post=\"/api/settings/auto-approve\" "
-            "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
-            "style=\"display:flex;gap:0.5rem;align-items:flex-end;width:100%\">"
-            "<div class=\"mini-field\">"
-            "<label>Type</label>"
-            "<select name=\"type\" style=\"width:140px\">"
-            "<option value=\"hostname_glob\">Hostname Glob</option>"
-            "<option value=\"ip_subnet\">IP Subnet</option>"
-            "<option value=\"trusted_ca\">Trusted CA</option>"
-            "<option value=\"cloud_provider\">Cloud Provider</option>"
-            "</select></div>"
-            "<div class=\"mini-field\" style=\"flex:1\">"
-            "<label>Value</label>"
-            "<input type=\"text\" name=\"value\" placeholder=\"*.prod.example.com\" required>"
-            "</div>"
-            "<div class=\"mini-field\" style=\"flex:1\">"
-            "<label>Label</label>"
-            "<input type=\"text\" name=\"label\" placeholder=\"Production servers\">"
-            "</div>"
-            "<button class=\"btn btn-primary\" type=\"submit\">Add Rule</button>"
-            "</form></div>"
-            "<div class=\"feedback\" id=\"auto-approve-feedback\"></div>";
-
-    return html;
+    return enrolment::render_auto_approve(auto_approve_->list_rules(),
+                                          auto_approve_->require_all());
 }
 
 std::string SettingsRoutes::render_tag_compliance_fragment() {
@@ -3452,6 +3144,7 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
+                 no_store_private(res);
                  res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
              });
 
@@ -3459,6 +3152,7 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
+                 no_store_private(res);
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
@@ -5515,6 +5209,7 @@ void SettingsRoutes::register_routes(
                       " ttl_s=" + std::to_string(ttl.count()) + " label=" + label);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
+        no_store_private(res); // the raw token is in this body
         res.set_content(render_tokens_fragment(created->raw_token), "text/html; charset=utf-8");
     });
 
@@ -5616,6 +5311,7 @@ void SettingsRoutes::register_routes(
                     body = nlohmann::json::object();
                 body["count"] = tokens.size();
                 body["tokens"] = tokens;
+                no_store_private(res);
                 res.set_content(body.dump(), "application/json");
                 return;
             }
@@ -5628,6 +5324,7 @@ void SettingsRoutes::register_routes(
                       " ttl_s=" + std::to_string(ttl.count()) + " label=" + label + " " +
                       bulk_audit_detail(token_ids));
 
+        no_store_private(res); // N raw tokens are in this body
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),
                         "application/json");
     });

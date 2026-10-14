@@ -415,6 +415,7 @@ yuzu_server_core_lib = static_library(
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
+    'src/enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
     'src/groups_ui.cpp', # Groups and enrolment page: the page template
     'src/groups_routes.cpp', # Groups and enrolment page: /groups + static glue
     'src/login_ui.cpp',

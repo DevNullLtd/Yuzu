@@ -390,9 +390,9 @@ TEST_CASE("settings enrollment: bulk approve/deny with the store down are 503 + 
     CHECK(h.only("enrollment.bulk_deny").result == "failure");
 }
 
-// The table has no Expired state, so an Active pill is shown for a lapsed token too; it must
-// never wear the green OK colour (role-ok), which would assert health for a dead credential.
-// A lapsed token cannot be minted without a clock wait, so this pins the shared Active branch.
+// An Active token is mild information, never the green OK colour: a credential that may be
+// lapsed or spent must not look healthy. The Expired state itself is pinned against an injected
+// clock in test_groups_enrolment_render.cpp (a lapsed token cannot be minted here without a wait).
 TEST_CASE("settings enrollment: the Active token pill is not the green OK pill",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
@@ -401,6 +401,33 @@ TEST_CASE("settings enrollment: the Active token pill is not the green OK pill",
 
     auto res = h.sink.Get("/fragments/settings/tokens");
     REQUIRE(res);
-    CHECK(res->body.find("role-badge role-admin\">Active") != std::string::npos);
-    CHECK(res->body.find("role-ok\">Active") == std::string::npos);
+    CHECK(res->body.find("<span class=\"pill info\">Active</span>") != std::string::npos);
+    CHECK(res->body.find("pill ok") == std::string::npos);
+}
+
+// B5: the raw token is in the create response (and the batch response), so neither may be
+// cached or replayed from history; the list fragments sit next to a secret and follow suit.
+TEST_CASE("settings enrollment: token responses are no-store and private",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    auto created = h.sink.Post("/api/settings/enrollment-tokens", "label=x&max_uses=1&ttl_hours=1",
+                               kForm);
+    REQUIRE(created);
+    CHECK(created->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(created->get_header_value("Vary") == "Cookie");
+
+    auto batch = h.sink.Post("/api/settings/enrollment-tokens/batch",
+                             R"({"label":"b","count":"2","max_uses":"1","ttl_hours":"0"})",
+                             "application/json");
+    REQUIRE(batch);
+    CHECK(batch->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(batch->get_header_value("Vary") == "Cookie");
+
+    for (const char* path : {"/fragments/settings/tokens", "/fragments/settings/pending"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+        CHECK(res->get_header_value("Vary") == "Cookie");
+    }
 }
