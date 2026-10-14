@@ -38,6 +38,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 <header class="page-header"><div><h1>Executions</h1>
 <p class="subtitle">Instruction dispatches and their per-device results.</p></div></header>
 <div class="note" id="exec-confined" hidden><b>Confined view.</b> You can see executions you dispatched and executions that reached devices in your scope. Counts cover your devices only; scope and parameters are redacted.</div>
+<div id="exec-stats"></div>
 <div class="ops-grid">
 <div class="ops-main">
 <section class="panel ops-listbox">
@@ -56,6 +57,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 </div></div>
 <div id="exec-list"><div class="empty-state">Loading…</div></div>
 </section>
+<section class="panel ops-dev" id="exec-devices" hidden></section>
 </div>
 <aside class="ops-side">
 <section class="panel ops-sel" id="exec-selected">
@@ -65,6 +67,8 @@ constexpr std::string_view kBody = R"HTM(</style>
 </aside>
 </div>
 </main>
+<div class="toast-container" id="toasts" aria-live="polite"></div>
+<script src="/static/yuzu-dialog.js" defer></script>
 <script src="/static/yuzu-operate.js" defer></script>
 </body></html>
 )HTM";

@@ -206,6 +206,37 @@ TEST_CASE("ApprovalManager: approve with empty comment", "[pg][approval_manager]
     REQUIRE(approve_result.has_value());
 }
 
+TEST_CASE("ApprovalManager: the review comment cap counts bytes and leaves the row pending",
+          "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto id = mgr.submit("def-cap", "operator1", "scope", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    // 1334 x U+20AC is 1334 characters but 4002 bytes: refused on bytes, not characters.
+    std::string euros;
+    for (int i = 0; i < 1334; ++i)
+        euros += "\xE2\x82\xAC";
+    REQUIRE(euros.size() == kMaxReviewCommentBytes + 2);
+    for (auto refuse : {mgr.approve(*id, "admin_user", euros),
+                        mgr.reject(*id, "admin_user", std::string(kMaxReviewCommentBytes + 1, 'a'))}) {
+        REQUIRE_FALSE(refuse.has_value());
+        CHECK(refuse.error() == "comment too long (max 4000 bytes)");
+    }
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "pending");
+
+    // Exactly the cap is stored whole.
+    const std::string at_cap(kMaxReviewCommentBytes, 'b');
+    REQUIRE(mgr.approve(*id, "admin_user", at_cap).has_value());
+    row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "approved");
+    CHECK(row->review_comment == at_cap);
+}
+
 // ── Reject ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("ApprovalManager: reject sets status, reviewer, comment", "[pg][approval_manager]") {

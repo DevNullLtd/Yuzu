@@ -187,7 +187,9 @@ TEST_CASE("executions_page_render: the selected panel lays out the execution",
     v.parameter_values = "{\"a\":1}";
     const auto html = render_exec_selected(v);
     CHECK(has(html, "<div data-slot=\"selected\" data-execution-id=\"0123456789abcdef0123\" "
-                    "data-execution-status=\"running\" data-confined=\"0\">"));
+                    "data-execution-status=\"running\" data-confined=\"0\" "
+                    "data-def-name=\"Name 0123456789abcdef0123\" data-by=\"alice\" "
+                    "data-responded=\"2\" data-targeted=\"5\">"));
     CHECK(has(html, "<h2>Selected execution</h2>"));
     CHECK(has(html, "<span>Devices</span><b>2 of 5 responded</b>"));
     // Lineage links to the page's own deep link, showing 12 characters.
@@ -240,4 +242,169 @@ TEST_CASE("executions_page_render: a confined panel prints only the redaction it
     CHECK(has(html, "data-confined=\"1\""));
     CHECK(has(html, "<span>Scope (confined)</span>"));
     CHECK(count_of(html, "(redacted - confined view)") == 2);
+}
+
+TEST_CASE("executions_page_render: Cancel is offered only for a live row, can-cancel is tri-state",
+          "[ui][executions][render]") {
+    const std::string btn = "<button type=\"button\" class=\"btn danger\" data-act=\"cancel\"";
+    for (const char* live : {"running", "pending"}) {
+        ExecSelectedView v;
+        v.row = make_row("e1", live);
+        auto html = render_exec_selected(v);
+        CHECK(has(html, btn + ">Cancel execution</button>"));
+        CHECK_FALSE(has(html, "data-can-cancel"));  // not probed: omitted
+        v.can_cancel = 1;
+        CHECK(has(render_exec_selected(v), "data-can-cancel=\"1\""));
+        v.can_cancel = 0;
+        CHECK(has(render_exec_selected(v), "data-can-cancel=\"0\""));
+    }
+    for (const char* done : {"completed", "cancelled"}) {
+        ExecSelectedView v;
+        v.row = make_row("e1", done);
+        CHECK(has(render_exec_selected(v), btn + " disabled>Cancel execution</button>"));
+    }
+}
+
+TEST_CASE("executions_page_render: the stats strip prints the figures with no tone classes",
+          "[ui][executions][render]") {
+    const auto html = render_stats_strip({3, 120, 97.5, 12.4});
+    CHECK(has(html, "<section class=\"readout stats\" data-slot=\"stats\" "
+                    "aria-label=\"Fleet execution statistics\">"));
+    CHECK(has(html, "<div class=\"ro\"><div class=\"v\">3</div><div class=\"l\">Executions "
+                    "today</div><div class=\"d\">UTC day</div></div>"));
+    CHECK(has(html, "<div class=\"v\">120</div><div class=\"l\">Finished, all time</div>"));
+    CHECK(has(html, "<div class=\"v\">97.5<small>%</small></div><div class=\"l\">Device success "
+                    "rate</div>"));
+    CHECK(has(html, "<div class=\"v\">12.4<small> s</small></div><div class=\"l\">Average "
+                    "duration</div>"));
+    // Yuzu states figures; it never decides whether a rate is good.
+    for (double pct : {97.5, 85.0, 40.0}) {
+        const auto h = render_stats_strip({1, 1, pct, 1.0});
+        CHECK_FALSE(has(h, "class=\"ro ok\""));
+        CHECK_FALSE(has(h, "class=\"ro warn\""));
+        CHECK_FALSE(has(h, "class=\"ro bad\""));
+    }
+    CHECK(has(render_stats_strip({0, 0, 0, 0}), "<div class=\"v\">0.0<small>%</small></div>"));
+}
+
+// -- Device results slot (render_exec_devices) --------------------------------------------
+
+namespace {
+
+DeviceRow make_device(const std::string& agent, const std::string& status, int64_t secs = 2) {
+    DeviceRow d;
+    d.agent_id = agent;
+    d.status = status;
+    d.exit_code = status == "success" ? 0 : 1;
+    d.dispatched_at = kAt;
+    d.completed_at = status == "running" || status == "pending" ? 0 : kAt + secs;
+    return d;
+}
+
+ExecDevicesView make_devices(std::size_t n, const std::string& status = "success") {
+    ExecDevicesView v;
+    v.execution_id = "exec-1";
+    v.definition_name = "Netstat";
+    for (std::size_t i = 0; i < n; ++i)
+        v.rows.push_back(make_device("agent-" + std::to_string(i), status));
+    v.targeted = static_cast<int>(n);
+    return v;
+}
+
+} // namespace
+
+TEST_CASE("executions_page_render: devices header says how many reported and how many have not",
+          "[ui][executions][render][devices]") {
+    auto v = make_devices(12);
+    v.targeted = 15;
+    const auto with = render_exec_devices(v);
+    CHECK(has(with, "12 reported, <b>3</b> not yet"));
+    CHECK(has(with, "<div data-slot=\"devices\" data-execution-id=\"exec-1\">"));
+
+    v.targeted = 12;
+    CHECK_FALSE(has(render_exec_devices(v), "not yet"));
+    CHECK(has(render_exec_devices(v), "12 reported</span>"));
+
+    // A confined caller is handed no dispatched count: no subtraction, total = visible rows.
+    v.targeted.reset();
+    const auto confined = render_exec_devices(v);
+    CHECK_FALSE(has(confined, "not yet"));
+    CHECK(has(confined, "<div class=\"v exec-kpi-value\">12</div><div class=\"l\">Total</div>"));
+}
+
+TEST_CASE("executions_page_render: devices keep the live-update stamps the controller patches",
+          "[ui][executions][render][devices]") {
+    auto v = make_devices(0);
+    v.rows.push_back(make_device("a-ok", "success"));
+    v.rows.push_back(make_device("a-bad", "timeout", 9));
+    v.rows.push_back(make_device("a-run", "running"));
+    v.targeted = 3;
+    const auto html = render_exec_devices(v);
+
+    CHECK(has(html, "id=\"exec-kpi-exec-1\""));
+    CHECK(count_of(html, "exec-kpi-value") == 5);
+    CHECK(has(html, "data-agent-id=\"a-bad\" data-exec-id=\"exec-1\""));
+    CHECK(has(html, "id=\"per-agent-row-exec-1-a-bad\""));
+    CHECK(count_of(html, "per-agent-status") == 3);
+    CHECK(count_of(html, "per-agent-exit-code") == 3);
+    CHECK(has(html, "agent-cell--failed"));
+    // Failures first, then running, then success.
+    const auto bad = html.find("per-agent-row-exec-1-a-bad");
+    const auto run = html.find("per-agent-row-exec-1-a-run");
+    const auto ok = html.find("per-agent-row-exec-1-a-ok");
+    REQUIRE((bad != std::string::npos && run != std::string::npos && ok != std::string::npos));
+    CHECK(bad < run);
+    CHECK(run < ok);
+    // Something is running, so the percentiles stay a dash rather than read as final.
+    CHECK(count_of(html, "&mdash;") >= 2);
+}
+
+TEST_CASE("executions_page_render: the per-device table is capped and the grid buckets",
+          "[ui][executions][render][devices]") {
+    const auto at_cap = render_exec_devices(make_devices(kDeviceTableCap));
+    CHECK(count_of(at_cap, "id=\"per-agent-row-") == kDeviceTableCap);
+    CHECK_FALSE(has(at_cap, "ops-cap-note"));
+
+    const auto over = render_exec_devices(make_devices(kDeviceGridBucketThreshold + 1));
+    CHECK(count_of(over, "id=\"per-agent-row-") == kDeviceTableCap);
+    CHECK(has(over, "Showing 500 of 1025 reporting devices, failures first."));
+    CHECK(count_of(over, "agent-cell--bucket") == 10);
+    // Bucketed cells carry no per-agent id; unbucketed cells do.
+    CHECK_FALSE(has(over, "data-agent-id=\"agent-0\" data-exec-id"));
+    CHECK(has(render_exec_devices(make_devices(3)), "data-agent-id=\"agent-0\" data-exec-id"));
+}
+
+TEST_CASE("executions_page_render: devices escape every server string",
+          "[ui][executions][render][devices]") {
+    auto v = make_devices(1);
+    v.definition_name = "<img src=x onerror=1>";
+    v.rows[0].agent_id = "a\"><script>";
+    v.rows[0].error_detail = "<b>boom</b>";
+    v.responses.push_back({"a<i>", "<script>alert(1)</script>", "<u>e</u>", 0, kAt, 0});
+    v.responses_total = 1;
+    const auto html = render_exec_devices(v);
+    CHECK_FALSE(has(html, "<img src=x"));
+    CHECK_FALSE(has(html, "<script>"));
+    CHECK_FALSE(has(html, "<b>boom"));
+    CHECK_FALSE(has(html, "<u>e"));
+    CHECK(has(html, "&lt;img src=x onerror=1&gt;"));
+}
+
+TEST_CASE("executions_page_render: collapsed responses say capped, degraded or unavailable",
+          "[ui][executions][render][devices]") {
+    auto v = make_devices(1);
+    for (std::size_t i = 0; i < kDeviceResponsesCap; ++i)
+        v.responses.push_back({"agent-0", "out", "", 0, kAt, kAt * 1000});
+    v.responses_total = 120;
+    auto html = render_exec_devices(v);
+    CHECK(has(html, "Show responses (120)"));
+    CHECK(has(html, "Showing 50 of 120. Open responses (JSON) for all of them."));
+
+    v.responses.clear();
+    v.responses_total = 0;
+    CHECK(has(render_exec_devices(v), "No responses recorded."));
+    v.responses_state = ResponsesState::kDegraded;
+    CHECK(has(render_exec_devices(v), "Responses unavailable."));
+    v.responses_state = ResponsesState::kUnavailable;
+    CHECK(has(render_exec_devices(v), "Response store not available."));
 }
