@@ -19,6 +19,7 @@
 /// not have touched the registry (e.g. an empty `?q=`).
 ///
 /// Routes (35) — gate in parens, `-` = no gate:
+/// Routes — gate in parens, `-` = no gate:
 ///   GET /static/yuzu.css                    -
 ///   GET /static/icons.svg                   -
 ///   GET /static/htmx.js                     -
@@ -106,6 +107,7 @@ struct Deps {
 };
 
 /// Register all 35 page-shell / static-asset routes against `sink`.
+/// Register all the page-shell / static-asset routes against `sink`.
 void register_page_routes(HttpRouteSink& sink, Deps deps);
 
 } // namespace page
