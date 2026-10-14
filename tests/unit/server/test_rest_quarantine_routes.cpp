@@ -485,12 +485,13 @@ TEST_CASE("REST GET /api/v1/quarantine resolves ONE list-gate decision and pushe
         for (int status : {401, 403, 503}) {
             CAPTURE(status);
             QuarantineRouteHarness h(qpool);
-            REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
+            const std::string id = "agent-visible-" + std::to_string(status);
+            REQUIRE(h.quarantine_store.quarantine_device(id, "seed", "r1", ""));
             h.gate_status = status;
             auto res = h.get();
             REQUIRE(res);
             CHECK(res->status == status);
-            CHECK(res->body.find("agent-visible") == std::string::npos);
+            CHECK(res->body.find(id) == std::string::npos);
         }
     }
     SECTION("no session is refused before any gate or store work") {
@@ -564,10 +565,11 @@ TEST_CASE("REST routes answer 503 (not 400) on a genuine store failure, and audi
         auto res = h.post(R"({"agent_id":"agent-new","reason":"test"})");
         REQUIRE(res);
         CHECK(res->status == 503);
-        REQUIRE(h.audit_calls.size() == 1);
-        CHECK(h.audit_calls[0].action == "quarantine.enable");
-        CHECK(h.audit_calls[0].result == "failure");
-        CHECK(h.audit_calls[0].detail.starts_with("db_error: "));
+        REQUIRE(h.audit_calls.size() == 2); // attempt (before the write), then the failure
+        CHECK(h.audit_calls[0].result == "attempt");
+        CHECK(h.audit_calls[1].action == "quarantine.enable");
+        CHECK(h.audit_calls[1].result == "failure");
+        CHECK(h.audit_calls[1].detail.starts_with("db_error: "));
         // gov-fix(consistency-auditor, Gate 8.2): the retry_after_ms:5000
         // addition itself had zero wire-level assertions, even though this
         // SECTION already forces the exact failure it targets.
@@ -577,10 +579,11 @@ TEST_CASE("REST routes answer 503 (not 400) on a genuine store failure, and audi
         auto res = h.del("agent-B");
         REQUIRE(res);
         CHECK(res->status == 503);
-        REQUIRE(h.audit_calls.size() == 1);
-        CHECK(h.audit_calls[0].action == "quarantine.disable");
-        CHECK(h.audit_calls[0].result == "failure");
-        CHECK(h.audit_calls[0].detail.starts_with("db_error: "));
+        REQUIRE(h.audit_calls.size() == 2); // attempt (before the write), then the failure
+        CHECK(h.audit_calls[0].result == "attempt");
+        CHECK(h.audit_calls[1].action == "quarantine.disable");
+        CHECK(h.audit_calls[1].result == "failure");
+        CHECK(h.audit_calls[1].detail.starts_with("db_error: "));
         CHECK(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
     }
     SECTION("GET") {
@@ -605,10 +608,11 @@ TEST_CASE("REST POST/DELETE audit a business-error (400) failure, not just succe
         auto res = h.post(kBody);
         REQUIRE(res);
         CHECK(res->status == 400);
-        REQUIRE(h.audit_calls.size() == 2); // first success, then this failure
-        CHECK(h.audit_calls[1].action == "quarantine.enable");
-        CHECK(h.audit_calls[1].result == "failure");
-        CHECK(h.audit_calls[1].detail == "device is already quarantined");
+        // first request: attempt + success; this one: attempt + failure
+        REQUIRE(h.audit_calls.size() == 4);
+        CHECK(h.audit_calls[3].action == "quarantine.enable");
+        CHECK(h.audit_calls[3].result == "failure");
+        CHECK(h.audit_calls[3].detail == "device is already quarantined");
         // gov-fix(consistency-auditor, Gate 8.2): a business/state error is
         // non-retryable — must stay null, never a fabricated retry hint.
         CHECK(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
@@ -618,10 +622,10 @@ TEST_CASE("REST POST/DELETE audit a business-error (400) failure, not just succe
         auto res = h.del("agent-never-quarantined");
         REQUIRE(res);
         CHECK(res->status == 400);
-        REQUIRE(h.audit_calls.size() == 1);
-        CHECK(h.audit_calls[0].action == "quarantine.disable");
-        CHECK(h.audit_calls[0].result == "failure");
-        CHECK(h.audit_calls[0].detail == "device is not quarantined");
+        REQUIRE(h.audit_calls.size() == 2); // attempt, then the failure
+        CHECK(h.audit_calls[1].action == "quarantine.disable");
+        CHECK(h.audit_calls[1].result == "failure");
+        CHECK(h.audit_calls[1].detail == "device is not quarantined");
         CHECK(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
     }
 }
