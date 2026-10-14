@@ -1,7 +1,7 @@
 /* yuzu-operate-extras.js: page controllers for the Operate extras, one per page, keyed on
    document.body.dataset.page. This file carries the `instructions` controller.
 
-   Rules this file keeps (pinned by test_operate_extras_ui.cpp):
+   Rules this file keeps (pinned by test_instruction_extras_ui.cpp):
    - server data reaches the DOM through textContent only, with no markup or
      dynamic-code sink of any kind;
    - every request is same-origin and goes through YuzuDialog.request (15 s timeout);
