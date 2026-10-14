@@ -27,9 +27,14 @@ struct ResultSetProducer {
 
 /// One page of a set's member device ids, with a "Show more" control when a
 /// cursor remains. `degraded` = the read failed (never rendered as empty).
+/// `none_visible` = the set has devices but this caller's current scope covers none of them:
+/// said as such (data-hidden), never as "This set has no devices".
 std::string render_result_set_members(const std::string& set_id,
                                       const std::vector<std::string>& device_ids,
-                                      const std::string& next_cursor, bool degraded);
+                                      const std::string& next_cursor, bool degraded,
+                                      bool none_visible = false);
+/// The caller may not read devices (the fleet-read gate refused): HTTP 200, data-denied.
+std::string render_result_set_members_denied();
 
 /// The producer picker for From instruction: `<option>` rows the controller
 /// reads, plus the approval-rules note. `truncated` = the definition read hit

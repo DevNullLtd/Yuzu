@@ -136,7 +136,9 @@
 /// Operate extras added two read-only routes (8 in all), each gated like the rest on
 /// deny_service_scoped THEN auth (owner scope), with the producer picker additionally gated on
 /// `Execution:Execute` and `InstructionDefinition:Read` (denied is a 200 note):
-///   GET  /fragments/result-sets/(rs_[0-9a-f]+)/members (B-5; owner-checked, ids only)
+///   GET  /fragments/result-sets/(rs_[0-9a-f]+)/members (B-5; owner-checked, ids only, confined to
+///                                                       the owner's CURRENT Infrastructure:Read
+///                                                       scope via fleet_read_fn, before LIMIT)
 ///   GET  /fragments/result-sets/producers              (B-6)
 ///
 /// Routes (6) — every route gates on `deps.deny_service_scoped_fn` (target
@@ -255,9 +257,10 @@ struct Deps {
     AuthFn auth_fn;
     DenyServiceScopedFn deny_service_scoped_fn;
     AuditFn audit_fn;
-    /// #4983 — see `FleetReadFn`'s doc comment above. Consulted ONLY by
-    /// `POST /fragments/result-sets/create`, and only when its `device_ids`
-    /// is non-empty.
+    /// #4983 — see `FleetReadFn`'s doc comment above. Consulted by
+    /// `POST /fragments/result-sets/create` (only when its `device_ids` is
+    /// non-empty) and by `GET /fragments/result-sets/{id}/members`, whose scope
+    /// reaches the SQL before LIMIT. Unwired fails the members read closed.
     FleetReadFn fleet_read_fn;
     /// #4983 — see `AllAgentIdsFn`'s doc comment above. Same consultation
     /// scope as `fleet_read_fn` above.

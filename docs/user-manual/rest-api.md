@@ -7298,7 +7298,7 @@ Delete a result set.
 
 Page through a result set's member device ids.
 
-**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+**Permission:** Session-authenticated (owner-scoped, `load_owned`), and `Infrastructure:Read` through the admit-then-filter fleet-read gate. Ownership says whose set it is, not which devices the owner can still see: the owner's *current* management-group scope is applied in the query before the page limit, so a device they can no longer see is not listed, does not use up a page slot, and is never reached by the cursor. A set whose devices have all left the caller's scope answers `{"device_ids": [], "next_cursor": ""}`. The dashboard fragment `GET /fragments/result-sets/{id}/members` and the MCP tool `get_result_set_members` apply the same gate.
 
 **Query parameters:**
 

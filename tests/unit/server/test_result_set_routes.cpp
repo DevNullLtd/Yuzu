@@ -57,10 +57,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <format>
 #include <fstream>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -117,8 +119,11 @@ struct Harness {
     bool wire_fleet_read_fn{true};
     bool wire_all_agent_ids_fn{true};
     bool fleet_read_admit{true};
+    /// The status the gate writes when it does NOT admit (403, or 503 for a degraded read).
+    int fleet_read_deny_status{403};
     yuzu::server::authz::VisibleSet fleet_read_scope{std::nullopt};
     bool fleet_read_fn_reached{false};
+    std::string fleet_read_securable, fleet_read_operation;
     std::vector<std::string> all_agent_ids_override{"dev-1", "dev-2", "dev-3"};
 
     /// Operate extras: the producer picker and the re-evaluate verdict. `perm_ok` drives the
@@ -219,11 +224,16 @@ struct Harness {
         };
         if (wire_fleet_read_fn) {
             deps.fleet_read_fn =
-                [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                       const std::string&) -> yuzu::server::authz::FleetReadGate {
+                [this](const httplib::Request&, httplib::Response& res,
+                       const std::string& securable,
+                       const std::string& operation) -> yuzu::server::authz::FleetReadGate {
                 fleet_read_fn_reached = true;
+                fleet_read_securable = securable;
+                fleet_read_operation = operation;
                 if (!fleet_read_admit) {
-                    res.status = 403;
+                    res.status = fleet_read_deny_status;
+                    if (fleet_read_deny_status == 503)
+                        res.set_header("Retry-After", "5");
                     return {};
                 }
                 return {.admitted = true, .scope = fleet_read_scope};
@@ -1356,6 +1366,10 @@ TEST_CASE("result_set_routes: [pg] members is owner-checked, paged, ids only; a 
     CHECK(r->body.find("<code>dev-1</code>") != std::string::npos);
     CHECK(r->body.find("<code>dev-2</code>") != std::string::npos);
     CHECK(r->body.find("data-degraded") == std::string::npos);
+    // The read is gated on the owner's current list-read scope, not on ownership alone.
+    CHECK(h.fleet_read_fn_reached);
+    CHECK(h.fleet_read_securable == "Infrastructure");
+    CHECK(h.fleet_read_operation == "Read");
 
     Harness stranger;
     stranger.store = &w.store;
@@ -1365,6 +1379,158 @@ TEST_CASE("result_set_routes: [pg] members is owner-checked, paged, ids only; a 
     REQUIRE(s);
     CHECK(s->body.find("dev-1") == std::string::npos);
     CHECK(s->body.find("Select a result set") != std::string::npos);
+}
+
+// A set of `n` devices named dev-001..dev-NNN, so the store's text ordering is the numeric one.
+static std::vector<std::string> numbered_devices(int n) {
+    std::vector<std::string> ids;
+    for (int i = 1; i <= n; ++i)
+        ids.push_back(std::format("dev-{:03d}", i));
+    return ids;
+}
+
+static std::size_t count_of_substr(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
+TEST_CASE("result_set_routes: [pg] members applies the owner's CURRENT scope in the SQL before "
+          "the page limit: hidden ids are not listed and take no page slot "
+          "(mutation: drop gate.scope from the members_checked call and these fail)",
+          "[pg][server][routes][result_set_routes][extras][security][members]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    // 250 devices, so the fragment's page of 100 is the real boundary.
+    auto rs = w.store.create_materialized(simple_req("alice"), numbered_devices(250));
+    REQUIRE(rs.has_value());
+    const std::string base = "/fragments/result-sets/" + rs->id + "/members";
+
+    SECTION("the first 200 ids are hidden: the page is the 50 visible ones, not an empty page "
+            "with a Show more") {
+        Harness h;
+        h.store = &w.store;
+        std::unordered_set<std::string> visible;
+        for (int i = 201; i <= 250; ++i)
+            visible.insert(std::format("dev-{:03d}", i));
+        h.fleet_read_scope = visible;
+        h.wire();
+        auto r = h.sink.Get(base);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(count_of_substr(r->body, "<code>") == 50);
+        CHECK(r->body.find("<code>dev-201</code>") != std::string::npos);
+        CHECK(r->body.find("<code>dev-250</code>") != std::string::npos);
+        CHECK(r->body.find("dev-001") == std::string::npos);
+        CHECK(r->body.find("dev-200") == std::string::npos);
+        CHECK(r->body.find("Show more") == std::string::npos);
+    }
+
+    SECTION("every other id visible: pages hold 100 visible ids, the cursor walks only visible "
+            "ids, and no hidden id appears") {
+        Harness h;
+        h.store = &w.store;
+        std::unordered_set<std::string> visible;
+        for (int i = 2; i <= 250; i += 2)
+            visible.insert(std::format("dev-{:03d}", i)); // 125 visible
+        h.fleet_read_scope = visible;
+        h.wire();
+        auto p1 = h.sink.Get(base);
+        REQUIRE(p1);
+        CHECK(count_of_substr(p1->body, "<code>") == 100);
+        CHECK(p1->body.find("<code>dev-200</code>") != std::string::npos);
+        CHECK(p1->body.find("<code>dev-001</code>") == std::string::npos);
+        CHECK(p1->body.find("<code>dev-201</code>") == std::string::npos);
+        CHECK(p1->body.find("cursor=dev-200") != std::string::npos);
+        auto p2 = h.sink.Get(base + "?cursor=dev-200");
+        REQUIRE(p2);
+        CHECK(count_of_substr(p2->body, "<code>") == 25);
+        CHECK(p2->body.find("<code>dev-202</code>") != std::string::npos);
+        CHECK(p2->body.find("<code>dev-250</code>") != std::string::npos);
+        CHECK(p2->body.find("<code>dev-201</code>") == std::string::npos);
+        CHECK(p2->body.find("Show more") == std::string::npos);
+    }
+
+    SECTION("an owner who now sees none of them is told so, not that the set is empty") {
+        Harness h;
+        h.store = &w.store;
+        h.fleet_read_scope = yuzu::server::authz::deny_all();
+        h.wire();
+        auto r = h.sink.Get(base);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("<code>") == std::string::npos);
+        CHECK(r->body.find("data-hidden=\"1\"") != std::string::npos);
+        CHECK(r->body.find("This set has no devices.") == std::string::npos);
+        CHECK(r->body.find("Show more") == std::string::npos);
+    }
+
+    SECTION("a global reader (unrestricted scope) sees the first page of the whole set") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto r = h.sink.Get(base);
+        REQUIRE(r);
+        CHECK(count_of_substr(r->body, "<code>") == 100);
+        CHECK(r->body.find("cursor=dev-100") != std::string::npos);
+    }
+}
+
+TEST_CASE("result_set_routes: [pg] members: the gate's refusal and an unwired gate are 200 notes "
+          "that disclose no id, and a stranger never reaches the gate",
+          "[pg][server][routes][result_set_routes][extras][security][members]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    auto rs = w.store.create_materialized(simple_req("alice"), {"dev-1", "dev-2"});
+    REQUIRE(rs.has_value());
+    const std::string path = "/fragments/result-sets/" + rs->id + "/members";
+
+    SECTION("403 from the gate becomes a denied note at HTTP 200") {
+        Harness h;
+        h.store = &w.store;
+        h.fleet_read_admit = false;
+        h.wire();
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("data-denied=\"true\"") != std::string::npos);
+        CHECK(r->body.find("dev-1") == std::string::npos);
+    }
+    SECTION("503 from the gate becomes a degraded note at HTTP 200, without its Retry-After") {
+        Harness h;
+        h.store = &w.store;
+        h.fleet_read_admit = false;
+        h.fleet_read_deny_status = 503;
+        h.wire();
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("data-degraded=\"1\"") != std::string::npos);
+        CHECK(r->body.find("dev-1") == std::string::npos);
+        CHECK_FALSE(r->has_header("Retry-After"));
+    }
+    SECTION("an unwired gate fails closed to the degraded note") {
+        Harness h;
+        h.store = &w.store;
+        h.wire_fleet_read_fn = false;
+        h.wire();
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("data-degraded=\"1\"") != std::string::npos);
+        CHECK(r->body.find("dev-1") == std::string::npos);
+    }
+    SECTION("a non-owner gets the empty pane and the gate is never consulted") {
+        Harness h;
+        h.store = &w.store;
+        h.session_username = "mallory";
+        h.wire();
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->body.find("dev-1") == std::string::npos);
+        CHECK_FALSE(h.fleet_read_fn_reached);
+    }
 }
 
 TEST_CASE("result_set_routes: [pg] a list read that fails renders the degraded note, never "

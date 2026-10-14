@@ -8,13 +8,19 @@ using yuzu::server::html_escape;
 
 std::string render_result_set_members(const std::string& set_id,
                                       const std::vector<std::string>& device_ids,
-                                      const std::string& next_cursor, bool degraded) {
+                                      const std::string& next_cursor, bool degraded,
+                                      bool none_visible) {
     if (degraded) {
         return R"(<div class="rs-note" data-degraded="1">Members could not be read. )"
                R"(This is not an empty set.</div>)";
     }
-    if (device_ids.empty() && next_cursor.empty())
+    if (device_ids.empty() && next_cursor.empty()) {
+        if (none_visible) {
+            return R"(<div class="rs-note" data-hidden="1">None of the devices in this set )"
+                   R"(are visible to you.</div>)";
+        }
         return R"(<div class="rs-note" data-empty="1">This set has no devices.</div>)";
+    }
     std::string h = "<ul class=\"rs-members\" data-count=\"" + std::to_string(device_ids.size()) +
                     "\">";
     for (const auto& id : device_ids)
@@ -55,6 +61,11 @@ std::string render_result_set_producers(const std::vector<ResultSetProducer>& pr
         h += "<p class=\"rs-note\">Showing the first definitions only. Narrow the library.</p>";
     h += "</div>";
     return h;
+}
+
+std::string render_result_set_members_denied() {
+    return R"(<div class="empty-state" data-denied="true">You do not have permission to )"
+           R"(view devices.</div>)";
 }
 
 std::string render_result_set_producers_denied() {

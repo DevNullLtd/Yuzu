@@ -185,6 +185,14 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
     // Members of one set (B-5): ids only, owner-checked, paged. The REST twin is
     // GET /api/v1/result-sets/{id}/members and MCP get_result_set_members; this fragment
     // reads the same store call (members_checked), so a failed read is a note, not "empty".
+    //
+    // Ownership says whose set it is, not which devices that person may still see: membership
+    // was confined to the owner's visibility at creation and their management-group authority
+    // can narrow later. So the owner's CURRENT list-read scope (fleet_read_fn,
+    // Infrastructure:Read, the gate the create route uses for device_ids) is resolved here and
+    // pushed into the SQL before ORDER BY/LIMIT (ADR-0017 INV-3): a device they can no longer
+    // see is neither listed nor counted against a page. The gate's own 403/503 are rewritten to
+    // 200 notes because htmx drops a 4xx/5xx body; its audit row is written before the rewrite.
     sink.Get(
         R"(/fragments/result-sets/(rs_[0-9a-f]+)/members)",
         [deps, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
@@ -202,17 +210,45 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                 res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
                 return;
             }
+            if (!deps.fleet_read_fn) {
+                spdlog::error("/fragments/result-sets/.../members: fleet_read_fn unwired -- "
+                              "misconfigured call site; failing closed");
+                res.set_content(render_result_set_members(id, {}, "", /*degraded=*/true),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            auto gate = deps.fleet_read_fn(req, res, "Infrastructure", "Read");
+            if (!gate.admitted) {
+                // The gate already wrote its A4 body + status and its audit row. A 401 is left
+                // exactly as written; the 503 and 403 become 200 notes (generic: nothing from
+                // the gate's body may reach the fragment).
+                if (res.status == 503) {
+                    res.headers.erase("Retry-After");
+                    res.status = 200;
+                    res.set_content(render_result_set_members(id, {}, "", /*degraded=*/true),
+                                    "text/html; charset=utf-8");
+                } else if (res.status == 403) {
+                    res.status = 200;
+                    res.set_content(render_result_set_members_denied(),
+                                    "text/html; charset=utf-8");
+                }
+                return;
+            }
             constexpr int kMembersPage = 100;
             const std::string cursor =
                 req.has_param("cursor") ? req.get_param_value("cursor") : "";
-            auto page = deps.store->members_checked(id, cursor, kMembersPage);
+            auto page = deps.store->members_checked(id, cursor, kMembersPage, gate.scope);
             if (!page) {
                 res.set_content(render_result_set_members(id, {}, "", /*degraded=*/true),
                                 "text/html; charset=utf-8");
                 return;
             }
+            // A set that holds devices but whose first visible page is empty: none of them are
+            // in this caller's scope now. Say so rather than "This set has no devices".
+            const bool none_visible = cursor.empty() && page->device_ids.empty() &&
+                                      page->next_cursor.empty() && row->device_count > 0;
             res.set_content(render_result_set_members(id, page->device_ids, page->next_cursor,
-                                                      /*degraded=*/false),
+                                                      /*degraded=*/false, none_visible),
                             "text/html; charset=utf-8");
         });
 
