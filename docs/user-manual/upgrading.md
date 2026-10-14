@@ -649,6 +649,12 @@ plus one new prerequisite.**
   rows (`auth.fleet_read_required` with `result=denied`), the panel text, and, for the ceiling case,
   `yuzu_server_rbac_read_degrade_total`. `GET /api/v1/executions` is unchanged and keeps its real
   `403`/`503`.
+- **Approvals fragment and Executions filters answer 200 with a note.** `GET /fragments/approvals` now
+  answers a `403` as `200` with `data-denied="true"`, a store failure as `200` with
+  `data-degraded="store"` and an unknown `status` as `200` with `data-invalid="status"`; the
+  executions fragment answers a malformed `definition_id` (default view too) or an unknown `status`
+  with `200` and `data-invalid`. **Monitoring blind spot:** an HTTP-status monitor of these fragments
+  sees `200` for those cases; detect the attributes instead.
 - **Runbook, degrade note on the Executions panel.** `data-degraded="tracker"` means the execution
   tracker or its agent-status read failed: check `ExecutionTracker` warnings in the server log and
   PostgreSQL availability. `data-degraded="unavailable"` is a misconfiguration or bug branch (the
