@@ -17,6 +17,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <regex>
 #include <string>
@@ -77,6 +78,38 @@ Permission perm(std::string type, std::string op, std::string effect = "allow") 
     return p;
 }
 
+PrincipalRole grant(std::string type, std::string id, std::string role) {
+    PrincipalRole g;
+    g.principal_type = std::move(type);
+    g.principal_id = std::move(id);
+    g.role_name = std::move(role);
+    return g;
+}
+
+AssignmentsView view_of(std::vector<PrincipalRole> rows, std::string self = "alice", bool can_assign = true,
+                        std::vector<std::string> assignable = {"Operator", "Viewer"}) {
+    AssignmentsView v;
+    v.rows = std::move(rows);
+    v.self = std::move(self);
+    v.can_assign = can_assign;
+    v.assignable = std::move(assignable);
+    return v;
+}
+
+std::string assign_html(AssignmentsView v, std::size_t cap = kAssignmentsRenderCap) {
+    return render_assignments(std::move(v), cap);
+}
+
+/// The `<tr ...>...</tr>` of the Nth data row.
+std::string nth_row(const std::string& html, std::size_t n) {
+    std::size_t at = 0;
+    for (std::size_t i = 0; i <= n; ++i) {
+        at = html.find("<tr data-principal-type=", i == 0 ? 0 : at + 1);
+        REQUIRE(at != std::string::npos);
+    }
+    return html.substr(at, html.find("</tr>", at) - at);
+}
+
 std::string roles_html(std::vector<RbacRole> roles) {
     return render_roles_list(RolesList{std::move(roles)});
 }
@@ -100,6 +133,11 @@ std::vector<std::string> every_output() {
         render_role_permissions(NotFound{}),
         render_role_permissions(Unavailable{}, "/fragments/access/roles/permissions?role=Operator"),
         render_select_role(),
+        assign_html(view_of({grant("user", "bob", "Viewer"), grant("group", "ops", "Operator")})),
+        assign_html(view_of({})),
+        render_assignments(Unavailable{}),
+        render_your_account("alice", "local"),
+        render_your_account("oidc:https://x/y#sub", "oidc"),
     };
 }
 
@@ -111,7 +149,7 @@ TEST_CASE("access list: one row per user, four columns, Manage encodes the usern
           "[access][render]") {
     const auto html = list_html({user("alice", auth::Role::admin), user("bob"),
                                  user("oidc:https://x/y#sub", auth::Role::user, "oidc")});
-    CHECK(count_of(html, "<th>") == 4); // User, Source, Account role, actions
+    CHECK(count_of(html, "<th>") == 5); // User, Source, Account role, RBAC roles, actions
     CHECK(count_of(html, "<tr data-username=") == 3);
     CHECK_THAT(html, ContainsSubstring("<span class=\"sub\">3 accounts</span>"));
     CHECK_THAT(html, ContainsSubstring("hx-get=\"/fragments/access/users/detail?username=bob\""));
@@ -341,8 +379,9 @@ TEST_CASE("access render: hostile usernames and sources are escaped in text and 
     CHECK_THAT(with_nul, ContainsSubstring("username=a%00b\""));
     const auto big = list_html({user(std::string(10 * 1024, 'x'))});
     CHECK_THAT(big, ContainsSubstring("</table>"));
-    // Cell text, the row's data attribute, the Manage URL and the Remove button's data attribute.
-    CHECK(count_of(big, std::string(10 * 1024, 'x')) == 4);
+    // Cell text, the row's data attribute, the Manage URL, the Remove button's data attribute and
+    // the derived RBAC-roles cell's data attribute.
+    CHECK(count_of(big, std::string(10 * 1024, 'x')) == 5);
 }
 
 TEST_CASE("access url_q: RFC 3986 unreserved kept, everything else uppercase %XX",
@@ -471,4 +510,165 @@ TEST_CASE("access role permissions: unknown, empty, unreadable and unselected ar
     CHECK_THAT(x, ContainsSubstring("&lt;i&gt;"));
     CHECK_THAT(x, ContainsSubstring("&quot;op&quot;"));
     CHECK_THAT(x, !ContainsSubstring("<i>"));
+}
+
+// ── Role assignments ─────────────────────────────────────────────────────────
+
+TEST_CASE("access assignments: Remove is drawn only for a plain user grant the server would accept",
+          "[access][render]") {
+    const std::vector<PrincipalRole> rows = {
+        grant("user", "bob", "Viewer"),                      // 0 removable
+        grant("user", "oidc:https://x/y#sub", "Viewer"),     // 1 not a plain segment
+        grant("group", "it-ops", "Operator"),                // 2 group
+        grant("engine", "engine:ci", "Operator"),            // 3 engine
+        grant("user", "alice", "Administrator"),             // 4 own Administrator
+        grant("user", "alice", "Viewer"),                    // 5 own non-admin grant
+        grant("user", "..", "Viewer"),                       // 6 dot segment
+        grant("user", "./x?", "Viewer"),                     // 7 hostile
+        grant("user", "../y", "Viewer"),                     // 8 hostile
+        grant("user", "bob", "Op/erator"),                   // 9 role not a segment
+    };
+    const auto html = assign_html(view_of(rows, "alice"));
+    CHECK_THAT(nth_row(html, 0), ContainsSubstring("data-act=\"unassign\""));
+    CHECK_THAT(nth_row(html, 5), ContainsSubstring("data-act=\"unassign\""));
+    for (const std::size_t i : {1u, 2u, 3u, 6u, 7u, 8u, 9u}) {
+        INFO("row " << i);
+        CHECK_THAT(nth_row(html, i), !ContainsSubstring("data-act="));
+        CHECK_THAT(nth_row(html, i), ContainsSubstring("Not removable here"));
+    }
+    CHECK_THAT(nth_row(html, 2), ContainsSubstring("Group grants are not removable"));
+    // The caller's own Administrator grant is shown, disabled, with the reason.
+    const auto own = nth_row(html, 4);
+    CHECK_THAT(own, ContainsSubstring("disabled title=\"You cannot remove your own Administrator assignment"));
+    CHECK_THAT(own, !ContainsSubstring("data-act="));
+    CHECK(count_of(html, "data-act=\"unassign\"") == 2);
+}
+
+TEST_CASE("access assignments: a viewer who cannot administer sees the table and no controls",
+          "[access][render]") {
+    const auto html = assign_html(view_of({grant("user", "bob", "Viewer")}, "carol", /*can_assign=*/false));
+    CHECK_THAT(html, !ContainsSubstring("data-act="));
+    CHECK_THAT(html, !ContainsSubstring("Assign role"));
+    CHECK_THAT(html, ContainsSubstring("<td class=\"long\">bob</td>"));
+}
+
+TEST_CASE("access assignments: the Assign button carries exactly the offered roles, or is disabled",
+          "[access][render]") {
+    const auto with = assign_html(view_of({}, "alice", true, {"Operator", "Viewer"}));
+    CHECK_THAT(with, ContainsSubstring("data-act=\"assign\" data-roles=\"Operator,Viewer\""));
+    const auto none = assign_html(view_of({}, "alice", true, {}));
+    CHECK_THAT(none, ContainsSubstring("disabled title=\"The role list could not be read"));
+    CHECK_THAT(none, !ContainsSubstring("data-act=\"assign\""));
+}
+
+TEST_CASE("access assignments: past the cap the table is cut, the banner states the true count, data-capped says so",
+          "[access][render]") {
+    std::vector<PrincipalRole> rows;
+    for (int i = 0; i < 4; ++i)
+        rows.push_back(grant("user", "u" + std::to_string(i), "Viewer"));
+    const auto capped = assign_html(view_of(rows), 3);
+    CHECK(count_of(capped, "<tr data-principal-type=") == 3);
+    CHECK_THAT(capped, ContainsSubstring("Showing the first 3 of 4 grants."));
+    CHECK_THAT(capped, ContainsSubstring("data-total=\"4\" data-capped=\"1\""));
+    CHECK_THAT(capped, !ContainsSubstring("u3\""));
+    // At the cap exactly: not capped, no banner.
+    const auto exact = assign_html(view_of(rows), 4);
+    CHECK(count_of(exact, "<tr data-principal-type=") == 4);
+    CHECK_THAT(exact, ContainsSubstring("data-total=\"4\" data-capped=\"0\""));
+    CHECK_THAT(exact, !ContainsSubstring("Showing the first"));
+}
+
+TEST_CASE("access assignments: a true empty is a table that says so; an unread table is a red box",
+          "[access][render]") {
+    const auto empty = assign_html(view_of({}));
+    CHECK_THAT(empty, ContainsSubstring("data-total=\"0\" data-capped=\"0\""));
+    CHECK_THAT(empty, ContainsSubstring("No role assignments yet."));
+    CHECK_THAT(empty, !ContainsSubstring("role=\"alert\""));
+    const auto un = render_assignments(Unavailable{});
+    CHECK_THAT(un, ContainsSubstring("role=\"alert\""));
+    CHECK_THAT(un, ContainsSubstring(std::string(kAssignmentsUnavailable)));
+    CHECK_THAT(un, ContainsSubstring("data-act=\"reload\" data-target=\"acc-assignments\""));
+    // No table at all: the page script reads "no table" as "do not derive any count".
+    CHECK_THAT(un, !ContainsSubstring("<table"));
+    CHECK_THAT(un, !ContainsSubstring("data-assignments"));
+}
+
+TEST_CASE("access assignments: principals, ids and roles are escaped in text and every data attribute",
+          "[access][render]") {
+    const std::string nasty = "<script>alert(1)</script>\"'&";
+    const std::string nasty_esc = "&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&amp;";
+    const auto html = assign_html(view_of({grant(nasty, nasty, nasty)}));
+    CHECK_THAT(html, !ContainsSubstring("<script>"));
+    CHECK_THAT(nth_row(html, 0), ContainsSubstring("data-principal-type=\"" + nasty_esc + "\" data-principal-id=\"" +
+                                                   nasty_esc + "\" data-role=\"" + nasty_esc + "\""));
+    // An SSO principal: '#' and '/' are left alone by HTML escaping, and the id never reaches a URL here.
+    const auto sso = assign_html(view_of({grant("user", "oidc:https://x/y#sub", "Viewer")}));
+    CHECK_THAT(sso, ContainsSubstring("data-principal-id=\"oidc:https://x/y#sub\""));
+    CHECK_THAT(sso, !ContainsSubstring("href="));
+    CHECK_THAT(sso, !ContainsSubstring("hx-"));
+}
+
+TEST_CASE("access derived cells: the Users and Roles tables ship 'Not shown' hooks, never a count",
+          "[access][render]") {
+    const auto users = list_html({user("bob"), user("oidc:https://x/y#sub", auth::Role::user, "oidc")});
+    CHECK_THAT(users, ContainsSubstring("<td class=\"wrap\" data-rbac-for=\"bob\">Not shown</td>"));
+    CHECK_THAT(users, ContainsSubstring("data-rbac-for=\"oidc:https://x/y#sub\">Not shown</td>"));
+    CHECK_THAT(users, ContainsSubstring("<th>RBAC roles</th>"));
+    const auto roles = roles_html({role("Operator", "d")});
+    CHECK_THAT(roles, ContainsSubstring("<td class=\"r\" data-assigned-for=\"Operator\">Not shown</td>"));
+    CHECK_THAT(roles, ContainsSubstring("<th class=\"r\">Assigned</th>"));
+}
+
+TEST_CASE("access hint: may_attempt_rbac_admin follows the base role on a local cookie session only",
+          "[access][render]") {
+    auto s = [](auth::Role role, std::string source = "local") {
+        auth::Session x;
+        x.role = role;
+        x.auth_source = std::move(source);
+        return x;
+    };
+    CHECK(may_attempt_rbac_admin(s(auth::Role::admin)));
+    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::user)));
+    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::admin, "oidc")));
+    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::admin, "saml")));
+    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::admin, "api_token")));
+    auto scoped = s(auth::Role::admin);
+    scoped.token_scope_service = "payments";
+    CHECK_FALSE(may_attempt_rbac_admin(scoped));
+    auto mcp = s(auth::Role::admin);
+    mcp.mcp_tier = "operator";
+    CHECK_FALSE(may_attempt_rbac_admin(mcp));
+    auto engine = s(auth::Role::admin);
+    engine.principal_kind = "engine";
+    CHECK_FALSE(may_attempt_rbac_admin(engine));
+    // A JIT elevation makes the EFFECTIVE role admin but not the base role: no hint.
+    auto elevated = s(auth::Role::user);
+    elevated.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
+    CHECK_FALSE(may_attempt_rbac_admin(elevated));
+}
+
+// ── Your account ─────────────────────────────────────────────────────────────
+
+TEST_CASE("access account: Change password only for a local account; the disabled control carries a reason",
+          "[access][render]") {
+    const auto local = render_your_account("alice", "local");
+    CHECK_THAT(local, ContainsSubstring("data-act=\"pw-change\""));
+    CHECK_THAT(local, ContainsSubstring("data-act=\"signout-all\""));
+    CHECK_THAT(local, ContainsSubstring("<span class=\"sub\">alice</span>"));
+    for (const char* source : {"oidc", "saml", "api_token", "mcp_token", "engine_token", ""}) {
+        INFO(source);
+        const auto other = render_your_account("alice", source);
+        CHECK_THAT(other, !ContainsSubstring("pw-change"));
+        CHECK_THAT(other, ContainsSubstring("managed by your identity provider"));
+        CHECK_THAT(other, ContainsSubstring("data-act=\"signout-all\""));
+    }
+    // The unbuilt control has no action, only a reason.
+    CHECK_THAT(local, ContainsSubstring("disabled title=\"Not available yet\">Sign out all other sessions"));
+    CHECK(count_of(local, "data-act=") == 2);
+}
+
+TEST_CASE("access account: the username is escaped", "[access][render]") {
+    const auto html = render_your_account("<b>\"x\"</b>", "local");
+    CHECK_THAT(html, ContainsSubstring("&lt;b&gt;&quot;x&quot;&lt;/b&gt;"));
+    CHECK_THAT(html, !ContainsSubstring("<b>"));
 }

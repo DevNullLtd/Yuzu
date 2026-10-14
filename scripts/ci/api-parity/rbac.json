@@ -124,5 +124,16 @@
     },
     "mcp_twin": "discover_permissions",
     "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/access/roles/assignments",
+    "capability_id": "get.fragments-access-roles-assignments",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/rbac/roles/assignments"
+    },
+    "mcp_twin": "list_rbac_role_assignments",
+    "status": "twinned"
   }
 ]

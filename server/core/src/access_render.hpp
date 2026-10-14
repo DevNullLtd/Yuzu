@@ -108,6 +108,48 @@ std::string render_select_role();
 /// by a browser even when percent-encoded). The same charset the REST routes' own regexes use.
 bool is_addressable_name(std::string_view name);
 
+// ---- Role assignments --------------------------------------------------------------------
+
+/// `list_all_principal_roles_checked()` rows plus what the caller may do with them.
+struct AssignmentsView {
+    std::vector<PrincipalRole> rows; ///< every grant the store returned (the render caps the table)
+    std::string self;                ///< the caller's username; never empty (the route refuses)
+    bool can_assign = false;         ///< UI hint only: `may_attempt_rbac_admin(session)`; the server decides
+    /// Role names the Assign dialog offers (already filtered through `is_rbac_assignable_role`).
+    /// Empty with `can_assign` means the catalogue could not be read: the button is drawn disabled.
+    std::vector<std::string> assignable;
+};
+
+/// The table is drawn up to this many grants; a banner states the true count past it, and the
+/// derived cells on the page then say "Not shown" instead of a count that would be wrong.
+inline constexpr std::size_t kAssignmentsRenderCap = 2000;
+
+inline constexpr std::string_view kAssignmentsDenied =
+    "The grant table needs AccessReview:Read (the Administrator and Reviewer roles).";
+inline constexpr std::string_view kAssignmentsUnavailable =
+    "The grant table could not be read, so who holds which role is unknown. This is not an empty list.";
+
+/// The whole Role assignments panel interior. `cap` is a parameter so a test can use a small one.
+std::string render_assignments(const std::variant<AssignmentsView, Unavailable>& state,
+                               std::size_t cap = kAssignmentsRenderCap);
+
+/// UI hint: may this session even try the RBAC administration routes (assign/unassign role,
+/// enforcement switch)? Both need a durable Administrator, which needs the caller's own LOCAL
+/// account to hold the admin role, so the base role on a local cookie session is a NECESSARY
+/// condition: the hint may overstate, never understate. It reads the base role, never the
+/// effective one (a JIT elevation does not satisfy the server's predicate). The server re-checks
+/// on every call and its refusal is shown as it came.
+bool may_attempt_rbac_admin(const auth::Session& s);
+
+// ---- Your account -------------------------------------------------------------------------
+
+/// Where the page route puts `render_your_account(...)` in the baked template.
+inline constexpr std::string_view kAccountMarker = "<!--yuzu:account-->";
+
+/// The "Your account" panel for the signed-in session. Change password is offered only to a
+/// local account (the route refuses everyone else with 409).
+std::string render_your_account(const std::string& username, const std::string& auth_source);
+
 /// RFC 3986 percent-encoding of one query value: `A-Za-z0-9-._~` kept, every other byte as
 /// uppercase `%XX`. (A durable SSO principal is `oidc:<iss>#<sub>`; an unencoded `#` is a
 /// URL fragment separator and would silently truncate the request.)

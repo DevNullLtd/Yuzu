@@ -118,3 +118,28 @@ TEST_CASE("access golden: role permissions", "[access][golden]") {
     check_golden("role-permissions__unavailable",
                  render_role_permissions(Unavailable{}, "/fragments/access/roles/permissions?role=Operator"));
 }
+
+TEST_CASE("access golden: role assignments", "[access][golden]") {
+    auto grant = [](const char* type, const char* id, const char* role) {
+        PrincipalRole g;
+        g.principal_type = type;
+        g.principal_id = id;
+        g.role_name = role;
+        return g;
+    };
+    AssignmentsView v;
+    v.self = "alice";
+    v.can_assign = true;
+    v.assignable = {"Operator", "Viewer"};
+    v.rows = {grant("user", "alice", "Administrator"), grant("user", "bob", "Viewer"),
+              grant("user", "oidc:https://idp.example/realm#7f3a", "Viewer"), grant("group", "it-ops", "Operator")};
+    check_golden("assignments__populated", render_assignments(v));
+    v.rows.clear();
+    check_golden("assignments__empty", render_assignments(v));
+    check_golden("assignments__unavailable", render_assignments(Unavailable{}));
+}
+
+TEST_CASE("access golden: your account", "[access][golden]") {
+    check_golden("your-account__local", render_your_account("alice", "local"));
+    check_golden("your-account__sso", render_your_account("oidc:https://idp.example/realm#7f3a", "oidc"));
+}

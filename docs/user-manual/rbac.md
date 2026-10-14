@@ -469,6 +469,31 @@ Settings uses, so the two stay equivalent.
   `GET /api/v1/rbac/roles/{role}/permissions`. A store that does not answer is a red message,
   never an empty list; a role the catalogue does not hold is "No such role", which is different
   from a role that holds no permissions.
+- **Who holds which role.** The **Role assignments** panel lists every fleet-wide grant (type,
+  principal, role). It needs `AccessReview:Read` (the Administrator and Reviewer roles; an
+  administrator account while RBAC is off) and uses the same read as
+  `GET /api/v1/rbac/roles/assignments`. Each view writes an `rbac.assignments.list` audit row
+  with the number of grants on record (before the 2000-row display cap), exactly as the REST call
+  does; if that row cannot be saved the panel is still drawn and the response carries
+  `Sec-Audit-Failed`. A grant table that cannot be read is a red message, never an empty table.
+- **Assign and remove a role.** On an administrator account the panel offers **Assign role** (a
+  username and one of the six fleet-wide roles; ITServiceOwner needs a management group and is not
+  offered; the account does not have to exist yet) and **Remove** on a grant. These call
+  `POST` and `DELETE /api/v1/rbac/roles/{name}/assignments`, which need a durable Administrator
+  and a fresh MFA check; the page only shows or hides the controls from your account role, and the
+  server's refusal (last administrator, your own Administrator grant, the enforcement-regime
+  guard) is shown as it came. Only a plain local username can be removed here; a group, SSO or
+  engine grant reads "Not removable here". After a server error the panel reloads, because the
+  change may have taken effect. The change can take a moment to appear on other servers.
+- **RBAC roles and Assigned counts.** The Users table's **RBAC roles** column and the Roles
+  table's **Assigned** column are filled from the Role assignments panel. They read "Not shown"
+  whenever that panel was not read in full (refused, unreadable, or over the 2000-row cap); a
+  count of 0 appears only when the grant table was read and the role holds none.
+- **Your account.** For the signed-in user: **Change password** (local accounts only, ends every
+  session, same route as Settings) and **Sign out everywhere** (ends every session and revokes
+  every API token you own). If the server reports that a token revoke or a session end did not
+  persist, the page says so and waits for you to choose to continue instead of redirecting at once.
+  "Sign out all other sessions" is shown as not available yet.
 - **Unreadable store.** If the account store does not answer, the Users panel shows a red
   message with a Retry button. It never shows an empty list in that case, so a degraded store
   cannot be mistaken for "nobody is here".

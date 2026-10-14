@@ -9,11 +9,13 @@
 ///   /fragments/access/users/detail      Account panel (?username=); same gate and read
 ///   /fragments/access/roles/list        Roles panel; loud UserManagement:Read, 200 always
 ///   /fragments/access/roles/permissions Role permissions panel (?role=); same gate
+///   /fragments/access/roles/assignments Role assignments panel; loud AccessReview:Read, audited
 ///   /static/yuzu-access.js              the page's client glue
 ///
 /// No mutating route is added. The write controls call routes that already exist (the
 /// Settings user routes and REST v1) through the shared dialog module, which handles the MFA
-/// step-up. The Users panels carry no success audit row (the Settings fragment they
+/// step-up. The assignments panel writes `rbac.assignments.list` exactly as its REST twin does.
+/// The Users panels carry no success audit row (the Settings fragment they
 /// re-surface has none), and a refused cookie session writes no denial row there either (the
 /// panels auto-load); a refused token does. The Roles panels use the SAME securable as
 /// their REST twins (`GET /api/v1/rbac/roles`, `.../{role}/permissions`), which emit none
@@ -62,6 +64,9 @@ struct Deps {
     using RolePermissionsFn =
         std::function<std::expected<std::vector<Permission>, std::string>(const std::string&)>;
 
+    /// `RbacStore::list_all_principal_roles_checked()`.
+    using ListAssignmentsFn = std::function<std::expected<std::vector<PrincipalRole>, std::string>()>;
+
     // Designated initialisers must follow this order (GCC and MSVC reject a reordered one).
     AuthFn auth_fn;
     AdminFn admin_fn;
@@ -70,6 +75,7 @@ struct Deps {
     ListUsersFn list_users_fn;
     ListRolesFn list_roles_fn;
     RolePermissionsFn role_permissions_fn;
+    ListAssignmentsFn list_assignments_fn;
 };
 
 /// Throws `std::invalid_argument` when any `Deps` member is unbound.

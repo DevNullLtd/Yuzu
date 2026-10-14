@@ -54,6 +54,13 @@ extern const char* const kAccessUsersTemplate =
         <div class="hd"><h2>Role permissions</h2></div>
         <div class="empty"><span>Select a role to see what it allows.</span></div>
       </section>
+      <section class="panel" id="acc-assignments" hx-get="/fragments/access/roles/assignments" hx-trigger="load" hx-swap="innerHTML"
+               data-src="/fragments/access/roles/assignments"
+               data-denied="The grant table needs AccessReview:Read (the Administrator and Reviewer roles)."
+               data-unavailable="The grant table could not be read, so who holds which role is unknown. This is not an empty list.">
+        <div class="hd"><h2>Role assignments</h2></div>
+        <div class="pb"><p class="hint">Loading...</p></div>
+      </section>
     </div>
     <div class="side2">
       <section class="panel" id="acc-detail"
@@ -63,6 +70,7 @@ extern const char* const kAccessUsersTemplate =
         <div class="hd"><h2>Account</h2></div>
         <div class="empty"><span>Select a user from the list to see the account.</span></div>
       </section>
+      <!--yuzu:account-->
     </div>
   </div>
 </main>

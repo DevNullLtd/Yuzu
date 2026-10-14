@@ -15648,6 +15648,11 @@ private:
                         return std::unexpected(std::string("rbac store not open"));
                     return rbac_store_->get_role_permissions_checked(role);
                 },
+                .list_assignments_fn = [this]() -> std::expected<std::vector<PrincipalRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_all_principal_roles_checked();
+                },
             });
 
         // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three

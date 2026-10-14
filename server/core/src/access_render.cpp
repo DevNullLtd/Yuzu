@@ -58,7 +58,8 @@ std::string action_button(std::string_view label, std::string_view act, const st
 std::string user_row(const auth::UserEntry& u, bool is_self) {
     std::string out = "<tr data-username=\"" + esc(u.username) + "\"><td class=\"long\"><b>" +
                       esc(u.username) + "</b></td><td>" + source_pill(u) + "</td><td>" +
-                      role_pill(u) + "</td><td><div class=\"rowact\">";
+                      role_pill(u) + "</td><td class=\"wrap\" data-rbac-for=\"" + esc(u.username) +
+                      "\">Not shown</td><td><div class=\"rowact\">";
     if (is_self) {
         out += "<span class=\"pill idle\" title=\"This is your own account\">Current user</span>";
     } else {
@@ -149,11 +150,11 @@ std::string render_users_list(const std::variant<UsersList, Unavailable>& state)
                " accounts.</div></div>";
 
     out += "<div class=\"tw\"><table><thead><tr><th>User</th><th>Source</th><th>Account role</th>"
-           "<th></th></tr></thead><tbody>";
+           "<th>RBAC roles</th><th></th></tr></thead><tbody>";
     if (total == 0) {
         // A fresh install has its first admin, so this is not expected; it is a true empty
         // (the store answered), never the Unavailable text.
-        out += "<tr><td colspan=\"4\" class=\"hint\">No active accounts were returned.</td></tr>";
+        out += "<tr><td colspan=\"5\" class=\"hint\">No active accounts were returned.</td></tr>";
     }
     const std::size_t shown = std::min(total, kUsersRenderCap);
     for (std::size_t i = 0; i < shown; ++i) {
@@ -162,7 +163,8 @@ std::string render_users_list(const std::variant<UsersList, Unavailable>& state)
     }
     out += "</tbody></table></div><div class=\"pb\"><p class=\"hint\">Account role (admin or user) "
            "is the legacy role: it decides who can open Settings and what applies while RBAC "
-           "enforcement is off. RBAC roles apply once enforcement is on.</p></div>";
+           "enforcement is off. RBAC roles apply once enforcement is on, and are listed here from the "
+           "Role assignments panel.</p></div>";
     return out;
 }
 
@@ -208,12 +210,13 @@ std::string render_roles_list(const std::variant<RolesList, Unavailable>& state)
     std::string out = "<div class=\"hd\"><h2>Roles</h2><span class=\"sub\">" +
                       plural(list->roles.size(), "role", "roles") +
                       "</span></div><div class=\"tw\"><table><thead><tr><th>Role</th>"
-                      "<th>What it allows</th><th></th></tr></thead><tbody>";
+                      "<th>What it allows</th><th class=\"r\">Assigned</th><th></th></tr></thead><tbody>";
     for (const auto& r : list->roles) {
         out += "<tr data-role=\"" + esc(r.name) + "\"><td><b>" + esc(r.name) + "</b>";
         if (r.is_system)
             out += " <span class=\"pill idle\">Built-in</span>";
-        out += "</td><td class=\"wrap\">" + esc(r.description) + "</td><td><div class=\"rowact\">";
+        out += "</td><td class=\"wrap\">" + esc(r.description) + "</td><td class=\"r\" data-assigned-for=\"" +
+               esc(r.name) + "\">Not shown</td><td><div class=\"rowact\">";
         if (is_addressable_name(r.name))
             out += "<button type=\"button\" class=\"btn link sm\" hx-get=\"" +
                    std::string(kPermsUrl) + esc(url_q(r.name)) +
@@ -267,6 +270,103 @@ std::string render_role_permissions(const std::variant<RolePerms, NotFound, Unav
     for (std::size_t i = 0; i < areas.size(); ++i)
         out += "<tr><td class=\"mono\">" + esc(areas[i]) + "</td><td>" + ops[i] + "</td></tr>";
     return out + "</tbody></table></div>";
+}
+
+// ---- Role assignments ---------------------------------------------------------------------
+
+namespace {
+
+std::string assign_button(const AssignmentsView& v) {
+    if (v.assignable.empty())
+        return "<button type=\"button\" class=\"btn sm\" disabled title=\"The role list could not be read, "
+               "so there is nothing to offer.\">Assign role</button>";
+    std::string roles;
+    for (const auto& r : v.assignable) {
+        if (!roles.empty())
+            roles += ',';
+        roles += esc(r);
+    }
+    return "<button type=\"button\" class=\"btn sm\" data-act=\"assign\" data-roles=\"" + roles +
+           "\">Assign role</button>";
+}
+
+std::string assignment_action(const PrincipalRole& g, const AssignmentsView& v) {
+    // Removal is a path-segment request: only a user principal whose id and role are plain
+    // segments (the DELETE route's own charset, minus dot-only names) is ever offered it.
+    const bool removable = g.principal_type == "user" && is_addressable_name(g.principal_id) &&
+                           is_addressable_name(g.role_name);
+    if (!removable)
+        return std::string("<span class=\"hint\" title=\"") +
+               (g.principal_type == "group" ? "Group grants are not removable through this route"
+                                            : "The removal route accepts local usernames only "
+                                              "(letters, digits, dot, dash, underscore)") +
+               "\">Not removable here</span>";
+    if (!v.can_assign)
+        return {};
+    if (g.principal_id == v.self && g.role_name == "Administrator")
+        return "<button type=\"button\" class=\"btn link sm danger\" disabled title=\"You cannot remove your "
+               "own Administrator assignment. Ask another administrator.\">Remove</button>";
+    return "<button type=\"button\" class=\"btn link sm danger\" data-act=\"unassign\">Remove</button>";
+}
+
+} // namespace
+
+std::string render_assignments(const std::variant<AssignmentsView, Unavailable>& state, std::size_t cap) {
+    const auto* v = std::get_if<AssignmentsView>(&state);
+    if (!v) {
+        const std::string retry = "<button type=\"button\" class=\"btn sm\" data-act=\"reload\" "
+                                  "data-target=\"acc-assignments\">Retry</button>";
+        return "<div class=\"hd\"><h2>Role assignments</h2></div><div class=\"pb\">" +
+               failbox("Role assignments could not be read.", kAssignmentsUnavailable, retry) + "</div>";
+    }
+    const std::size_t total = v->rows.size();
+    const bool capped = total > cap;
+    std::string out = "<div class=\"hd\"><h2>Role assignments</h2><span class=\"sub\">Fleet-wide grants</span>";
+    if (v->can_assign)
+        out += "<div class=\"end\">" + assign_button(*v) + "</div>";
+    out += "</div>";
+    if (capped)
+        out += "<div class=\"pb\"><div class=\"note warn\">Showing the first " + std::to_string(cap) + " of " +
+               std::to_string(total) + " grants.</div></div>";
+    // `data-capped` / `data-total` are what the page script reads before it derives any count.
+    out += "<div class=\"tw\"><table data-assignments data-total=\"" + std::to_string(total) +
+           "\" data-capped=\"" + (capped ? "1" : "0") +
+           "\"><thead><tr><th>Type</th><th>Principal</th><th>Role</th><th></th></tr></thead><tbody>";
+    if (total == 0)
+        out += "<tr><td colspan=\"4\" class=\"hint\">No role assignments yet. The grant table was read and "
+               "is empty.</td></tr>";
+    for (std::size_t i = 0; i < std::min(total, cap); ++i) {
+        const auto& g = v->rows[i];
+        out += "<tr data-principal-type=\"" + esc(g.principal_type) + "\" data-principal-id=\"" +
+               esc(g.principal_id) + "\" data-role=\"" + esc(g.role_name) + "\"><td><span class=\"pill idle\">" +
+               esc(g.principal_type) + "</span></td><td class=\"long\">" + esc(g.principal_id) +
+               "</td><td><span class=\"pill tag\">" + esc(g.role_name) + "</span></td><td><div class=\"rowact\">" +
+               assignment_action(g, *v) + "</div></td></tr>";
+    }
+    out += "</tbody></table></div><div class=\"pb\"><p class=\"hint\">Group-scoped and device-scoped roles "
+           "(ITServiceOwner) are set per management group, not here. Roles held through a management group are "
+           "not listed.</p></div>";
+    return out;
+}
+
+bool may_attempt_rbac_admin(const auth::Session& s) {
+    return s.role == auth::Role::admin && s.auth_source == "local" && s.token_scope_service.empty() &&
+           s.mcp_tier.empty() && !s.is_engine();
+}
+
+std::string render_your_account(const std::string& username, const std::string& auth_source) {
+    std::string out = "<section class=\"panel\" id=\"acc-account\"><div class=\"hd\"><h2>Your account</h2>"
+                      "<span class=\"sub\">" + esc(username) + "</span></div><div class=\"acts\"><div>";
+    if (auth_source == "local")
+        out += "<button type=\"button\" class=\"btn link sm\" data-act=\"pw-change\">Change password</button>" +
+               hint("Ends all your sessions; you sign in again.");
+    else
+        out += hint("Your password is managed by your identity provider.");
+    out += "</div><div><button type=\"button\" class=\"btn link sm danger\" data-act=\"signout-all\">Sign out "
+           "everywhere</button>" + hint("Ends all your sessions and revokes every API token you own.") +
+           "</div><div><button type=\"button\" class=\"btn link sm\" disabled title=\"Not available yet\">Sign out all "
+           "other sessions</button>" + hint("Not available yet.") + "</div></div></section>";
+    return out;
 }
 
 std::string render_select_role() {

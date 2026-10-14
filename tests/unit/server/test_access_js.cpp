@@ -65,6 +65,29 @@ TEST_CASE("access glue: the user actions call the existing routes with encoded, 
     }
 }
 
+TEST_CASE("access glue: assignments, derived cells and Your account call the existing routes safely",
+          "[access][js]") {
+    const std::string& js = yuzu::server::kYuzuAccessJs;
+    for (const char* token :
+         {"ACTS.assign", "ACTS.unassign", "ACTS['pw-change']", "ACTS['signout-all']",
+          "'/api/v1/rbac/roles/' + seg(v.role) + '/assignments'",
+          "'/api/v1/rbac/roles/' + seg(role) + '/assignments/' + seg(id)", "principal_type: 'user'",
+          // Both path segments are re-checked against the route's own charset before use.
+          "var NAME = /^[A-Za-z0-9._-]+$/;", "!NAME.test(role) || !NAME.test(id)",
+          "roles.indexOf(v.role) >= 0",
+          "'/api/v1/users/me/password'", "current_password", "new_password",
+          "'/api/v1/sessions/me'", "api_tokens_db_persisted === false",
+          // Derived cells: 'Not shown' unless the table was read in full; Map, not a plain object,
+          // so a principal named __proto__ cannot corrupt the index.
+          "data-rbac-for", "data-assigned-for", "'Not shown'", "tbl.dataset.capped === '0'",
+          "new Map()", "table[data-assignments]"}) {
+        INFO(token);
+        CHECK_THAT(js, ContainsSubstring(token));
+    }
+    // A 0 is written only on a full read.
+    CHECK_THAT(js, ContainsSubstring("full ? String(byRole.get(td.dataset.assignedFor) || 0) : 'Not shown'"));
+}
+
 TEST_CASE("access page: the template is inline-free, single-shell and under the MSVC literal cap",
           "[access][js]") {
     const std::string t = kAccessUsersTemplate;
@@ -97,6 +120,12 @@ TEST_CASE("access page: the template's sentences are byte-equal to the renderer'
     CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kRolesUnavailable) + "\""));
     CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kRolePermsUnavailable) + "\""));
     CHECK_THAT(t, ContainsSubstring(std::string(kSelectRole)));
+    CHECK_THAT(t, ContainsSubstring("data-denied=\"" + std::string(kAssignmentsDenied) + "\""));
+    CHECK_THAT(t, ContainsSubstring("data-unavailable=\"" + std::string(kAssignmentsUnavailable) + "\""));
+    CHECK_THAT(t, ContainsSubstring("data-src=\"/fragments/access/roles/assignments\""));
+    // The marker the page route fills with the signed-in user's own panel, exactly once.
+    CHECK(t.find(std::string(kAccountMarker)) != std::string::npos);
+    CHECK(t.find(std::string(kAccountMarker)) == t.rfind(std::string(kAccountMarker)));
     // The roles panel refetches itself; the permissions panel is filled by its View buttons.
     CHECK_THAT(t, ContainsSubstring("data-src=\"/fragments/access/roles/list\""));
     // Both panels name their own refetch source for the Retry button.
