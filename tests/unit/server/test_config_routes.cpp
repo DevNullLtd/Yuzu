@@ -480,10 +480,21 @@ TEST_CASE("config_routes: an elevated-only session can still write non-oidc keys
 
     // The caller's own role is admin (a local account, or an IdP-mapped SSO session).
     h.session_role = auth::Role::admin;
-    res = h.sink.Put("/api/config/oidc_admin_group", R"({"value":"group-1"})");
+    for (const auto& [key, value] :
+         std::vector<std::pair<std::string, std::string>>{{"oidc_issuer", "https://idp.example"},
+                                                          {"oidc_client_id", "cid"},
+                                                          {"oidc_redirect_uri", "https://x/cb"},
+                                                          {"oidc_admin_group", "group-1"},
+                                                          {"oidc_skip_tls_verify", "false"}}) {
+        INFO(key);
+        res = h.sink.Put("/api/config/" + key, R"({"value":")" + value + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(w.store.get_value(key) == value);
+    }
+    res = h.sink.Put("/api/config/oidc_client_secret", R"({"value":"s3cret"})");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(w.store.get_value("oidc_admin_group") == "group-1");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

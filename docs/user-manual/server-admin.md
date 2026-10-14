@@ -248,7 +248,7 @@ Check your own unit, env file, compose file or installer arguments before upgrad
 
 ### vNEXT - changing sign-in provider settings needs your own administrator role (breaking for elevation-only operators)
 
-**What changed.** `POST /api/settings/oidc` (Settings > OIDC) and `PUT /api/config/{key}` for the `oidc_*` keys refuse, with `403`, a session that is administrator only through a temporary elevation. The attempt is audited (`elevated_session_oidc_change_blocked`, `elevated_session_oidc_setting_blocked`). Other runtime-config keys are unaffected.
+**What changed.** `POST /api/settings/oidc` (Settings > OIDC) and `PUT /api/config/{key}` for the `oidc_*` keys refuse, with `403`, any session whose own role is not `admin`: a session that is administrator only through a temporary elevation, and (for the config route) a non-administrator account that holds `Infrastructure:Write` through a custom or service role. The attempt is audited (`elevated_session_oidc_change_blocked`, `elevated_session_oidc_setting_blocked`). Other runtime-config keys are unaffected.
 
 **Who this affects.** Operators who rely on an elevated session to change the OIDC issuer, client, secret, redirect URI or administrator group, in particular deployments where every administrator is an elevation-eligible `user` account.
 

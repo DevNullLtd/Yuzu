@@ -4755,17 +4755,22 @@ most keys:
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
   appear to have no effect - because it has none. Manage auto-approve through its own rules API.
-- **OIDC keys (see note)** - persisted only, and **a restart does not rebuild the provider from them.** `oidc_admin_group` is the exception to read carefully: the sign-in callback reads the administrator group from the live server config, which the startup pass overwrites with the stored value, so a stored `oidc_admin_group` does decide administrator membership after a restart. The
+- **OIDC keys (see note)** - persisted only, and **a restart does not apply them to the provider
+  either.** The
   `OidcProvider` is constructed early in server startup (`server.cpp:1894`) from CLI/environment
   configuration, whereas the stored runtime-config overrides are not read until much later in the
   same startup (`server.cpp:3466`); nothing rebuilds the provider afterwards. So a value written
   through this API never reaches the live provider, on this boot or any later one.
   **Only Settings -> OIDC (`POST /api/settings/oidc`) applies OIDC settings**, because that handler
   constructs a new provider and swaps it in - but that swap is **process-local**. The startup path
-  DOES read these keys out of the store, just too late to matter - the provider is already built and
-  nothing rebuilds it - so a restart runs on whatever the command line or environment supplies. To
+  DOES read these keys out of the store, just too late to matter to the provider - it is already built and
+  nothing rebuilds it - so a restart builds the provider from whatever the command line or environment supplies. To
   change OIDC durably, update that value as well as saving through Settings. This matters most for a credential rotation: a `PUT` of
   `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, never *in use*.
+  **One exception, which is why these keys are administrator-only:** the sign-in callback reads the
+  administrator group from the live server config, and the startup pass overwrites that with the
+  stored `oidc_admin_group`, so a stored `oidc_admin_group` does decide who becomes an
+  administrator at SSO logins after the next restart.
 
 **Request body:**
 
