@@ -342,8 +342,7 @@
       if (!r) return;
       showOrExplain('Engine credential minted', takeToken(r), '',
         'The credential was minted but the response did not include it. Rotate it to get a new one.');
-      reloadPrincipals();
-      reloadDetail(d.principalId);
+      reloadDetail(d.principalId);  // the list has no credential column: no list reload, no extra audit row
     });
   }
 
