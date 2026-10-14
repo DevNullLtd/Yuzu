@@ -12,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <fstream>
 #include <memory>
 
 namespace fs = std::filesystem;
@@ -231,4 +232,80 @@ TEST_CASE("save and reload auto-approve config", "[auto_approve][config]") {
         REQUIRE(rules[1].value == "10.0.0.0/8");
         REQUIRE(rules[1].enabled == false);
     }
+}
+
+// ── Hardening (B4): fail closed, validate before persisting ──────────────────
+
+TEST_CASE("CIDR: malformed or out-of-range prefix never throws and never matches",
+          "[auto_approve][cidr][hardening]") {
+    // evaluate() runs under the engine mutex on every agent Register that reaches
+    // the rule; std::stoi on these used to throw (or, for 33+, shift by a negative).
+    for (const char* bad : {"10.0.0.0/abc", "10.0.0.0/", "10.0.0.0/33", "10.0.0.0/-1",
+                            "10.0.0.0/99999999999999999999", "10.0.0.0/8x", "/8"}) {
+        AutoApproveEngine engine;
+        engine.add_rule({AutoApproveRuleType::ip_subnet, bad, "bad"});
+        std::string label;
+        REQUIRE_NOTHROW(label = engine.evaluate(make_ctx("", "10.1.2.3")));
+        INFO(bad);
+        CHECK(label.empty());
+    }
+}
+
+TEST_CASE("validate_auto_approve_rule: accepts well-formed rules",
+          "[auto_approve][hardening]") {
+    using T = AutoApproveRuleType;
+    CHECK(validate_auto_approve_rule(T::hostname_glob, "*.prod.com", "prod").empty());
+    CHECK(validate_auto_approve_rule(T::hostname_glob, "host1", "").empty());
+    CHECK(validate_auto_approve_rule(T::ip_subnet, "10.0.0.0/8", "lan").empty());
+    CHECK(validate_auto_approve_rule(T::ip_subnet, "10.0.0.0/0", "").empty());
+    CHECK(validate_auto_approve_rule(T::ip_subnet, "10.0.0.0/32", "").empty());
+    CHECK(validate_auto_approve_rule(T::ip_subnet, "192.168.1.5", "").empty());
+    CHECK(validate_auto_approve_rule(T::trusted_ca, std::string(64, 'a'), "ca").empty());
+    CHECK(validate_auto_approve_rule(T::cloud_provider, "aws", "").empty());
+}
+
+TEST_CASE("validate_auto_approve_rule: rejects delimiters, control chars and malformed values",
+          "[auto_approve][hardening]") {
+    using T = AutoApproveRuleType;
+    CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, "", "x").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, "a:b", "x").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, "a\nb", "x").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, "a\rb", "x").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, "a\tb", "x").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, "ok", "has:colon").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::hostname_glob, "ok",
+                                           "line\nhostname_glob:*:injected:1")
+                    .empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::ip_subnet, "10.0.0.0/abc", "").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::ip_subnet, "10.0.0.0/33", "").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::ip_subnet, "10.0.0.0/", "").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::ip_subnet, "not-an-ip/8", "").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::ip_subnet, "/8", "").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::trusted_ca, std::string(63, 'a'), "").empty());
+    CHECK_FALSE(validate_auto_approve_rule(T::trusted_ca, std::string(64, 'g'), "").empty());
+}
+
+TEST_CASE("parse_auto_approve_rule_type: unknown names are rejected, not defaulted",
+          "[auto_approve][hardening]") {
+    CHECK(parse_auto_approve_rule_type("ip_subnet") == AutoApproveRuleType::ip_subnet);
+    CHECK_FALSE(parse_auto_approve_rule_type("").has_value());
+    CHECK_FALSE(parse_auto_approve_rule_type("HOSTNAME_GLOB").has_value());
+    CHECK_FALSE(parse_auto_approve_rule_type("subnet").has_value());
+}
+
+TEST_CASE("load: a rule line with an unknown type is dropped, not widened to hostname_glob",
+          "[auto_approve][config][hardening]") {
+    yuzu::test::TempDbFile cfg{"yuzu_test_auto_approve_unk-"};
+    {
+        std::ofstream f(cfg.path);
+        f << "mode:any\nsubnet:*:oops:1\nhostname_glob:*.prod.com:prod:1\n";
+    }
+    AutoApproveEngine engine;
+    REQUIRE(engine.load(cfg.path));
+    const auto rules = engine.list_rules();
+    REQUIRE(rules.size() == 1);
+    CHECK(rules[0].type == AutoApproveRuleType::hostname_glob);
+    CHECK(rules[0].value == "*.prod.com");
+    // The dropped line must not have become a match-everything hostname_glob "*".
+    CHECK(engine.evaluate(make_ctx("anything.example.com")).empty());
 }

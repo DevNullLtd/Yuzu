@@ -6081,25 +6081,35 @@ void SettingsRoutes::register_routes(
 
     // -- Settings API: Auto-approve rules (HTMX) ------------------------------
 
+    // Every write below emits exactly one `enrollment.auto_approve.*` audit row
+    // (set-and-proceed, like the other dashboard enrollment mutations).
     sink.Post("/api/settings/auto-approve",
               [this](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
+                      return;
+                  auto session = auth_fn_(req, res);
+                  if (!session)
                       return;
                   auto type_s = extract_form_value(req.body, "type");
                   auto value = extract_form_value(req.body, "value");
                   auto label = extract_form_value(req.body, "label");
 
-                  auth::AutoApproveRuleType type;
-                  if (type_s == "trusted_ca")
-                      type = auth::AutoApproveRuleType::trusted_ca;
-                  else if (type_s == "ip_subnet")
-                      type = auth::AutoApproveRuleType::ip_subnet;
-                  else if (type_s == "cloud_provider")
-                      type = auth::AutoApproveRuleType::cloud_provider;
-                  else
-                      type = auth::AutoApproveRuleType::hostname_glob;
+                  const auto type = auth::parse_auto_approve_rule_type(type_s);
+                  std::string err = type ? auth::validate_auto_approve_rule(*type, value, label)
+                                         : "unknown rule type";
+                  if (!err.empty()) {
+                      audit_fn_(req, "enrollment.auto_approve.rule_add", "denied", "AutoApproveRule",
+                                "", "rejected=" + err + " by=" + session->username);
+                      res.status = 400;
+                      res.set_header("HX-Trigger", R"({"showToast":{"message":"Rule rejected: invalid type, value or label","level":"error"}})");
+                      res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
+                      return;
+                  }
 
-                  auto_approve_->add_rule({type, value, label, true});
+                  auto_approve_->add_rule({*type, value, label, true});
+                  audit_fn_(req, "enrollment.auto_approve.rule_add", "success", "AutoApproveRule",
+                            "", "type=" + type_s + " value=" + value + " label=" + label +
+                                    " by=" + session->username);
                   spdlog::info("Auto-approve rule added: {}:{} ({})", type_s, value, label);
                   res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
               });
@@ -6108,9 +6118,21 @@ void SettingsRoutes::register_routes(
               [this](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
+                  auto session = auth_fn_(req, res);
+                  if (!session)
+                      return;
                   auto mode = extract_form_value(req.body, "mode");
+                  if (mode != "any" && mode != "all") {
+                      audit_fn_(req, "enrollment.auto_approve.mode", "denied", "AutoApproveRule",
+                                "", "rejected=unknown mode by=" + session->username);
+                      res.status = 400;
+                      res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
+                      return;
+                  }
                   auto_approve_->set_require_all(mode == "all");
                   auto_approve_->save();
+                  audit_fn_(req, "enrollment.auto_approve.mode", "success", "AutoApproveRule", "",
+                            "mode=" + mode + " by=" + session->username);
                   spdlog::info("Auto-approve mode changed to {}", mode);
                   res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
               });
@@ -6119,10 +6141,26 @@ void SettingsRoutes::register_routes(
               [this](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
-                  auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
+                  auto session = auth_fn_(req, res);
+                  if (!session)
+                      return;
+                  const auto idx_s = req.matches[1].str();
+                  // stoul throws on overflow; an unparseable index is simply "no such rule".
+                  size_t idx = std::string::npos;
+                  if (idx_s.size() <= 9)
+                      idx = static_cast<size_t>(std::stoul(idx_s));
                   auto rules = auto_approve_->list_rules();
                   if (idx < rules.size()) {
-                      auto_approve_->set_enabled(idx, !rules[idx].enabled);
+                      const bool now = !rules[idx].enabled;
+                      auto_approve_->set_enabled(idx, now);
+                      audit_fn_(req, "enrollment.auto_approve.rule_toggle", "success",
+                                "AutoApproveRule", idx_s,
+                                std::string("enabled=") + (now ? "1" : "0") +
+                                    " by=" + session->username);
+                  } else {
+                      audit_fn_(req, "enrollment.auto_approve.rule_toggle", "denied",
+                                "AutoApproveRule", idx_s,
+                                "rule_not_found by=" + session->username);
                   }
                   res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
               });
@@ -6131,9 +6169,26 @@ void SettingsRoutes::register_routes(
                 [this](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
-                    auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
-                    auto_approve_->remove_rule(idx);
-                    spdlog::info("Auto-approve rule {} removed", idx);
+                    auto session = auth_fn_(req, res);
+                    if (!session)
+                        return;
+                    const auto idx_s = req.matches[1].str();
+                    size_t idx = std::string::npos;
+                    if (idx_s.size() <= 9)
+                        idx = static_cast<size_t>(std::stoul(idx_s));
+                    const auto rules = auto_approve_->list_rules();
+                    if (idx < rules.size()) {
+                        auto_approve_->remove_rule(idx);
+                        audit_fn_(req, "enrollment.auto_approve.rule_remove", "success",
+                                  "AutoApproveRule", idx_s,
+                                  "value=" + rules[idx].value + " label=" + rules[idx].label +
+                                      " by=" + session->username);
+                        spdlog::info("Auto-approve rule {} removed", idx);
+                    } else {
+                        audit_fn_(req, "enrollment.auto_approve.rule_remove", "denied",
+                                  "AutoApproveRule", idx_s,
+                                  "rule_not_found by=" + session->username);
+                    }
                     res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
                 });
 

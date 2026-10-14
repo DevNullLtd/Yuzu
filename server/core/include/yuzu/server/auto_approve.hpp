@@ -2,7 +2,9 @@
 
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::auth {
@@ -22,6 +24,17 @@ struct AutoApproveRule {
     std::string label; // Admin-friendly description
     bool enabled{true};
 };
+
+/// Parse a persisted/submitted rule type name. nullopt for anything unknown --
+/// callers must reject, never default to a (broader) type.
+std::optional<AutoApproveRuleType> parse_auto_approve_rule_type(std::string_view s);
+
+/// Validate a rule before it is persisted. Returns an empty string when acceptable,
+/// otherwise a short reason. Rejects ':' / CR / LF / control characters in value and
+/// label (the store is a colon/newline-delimited file), an empty value, a malformed
+/// ip_subnet (IPv4 literal, optional /0-32) and a trusted_ca that is not 64 hex.
+std::string validate_auto_approve_rule(AutoApproveRuleType type, std::string_view value,
+                                       std::string_view label);
 
 /// Context passed to the engine for evaluation. Populated from the Register RPC.
 struct ApprovalContext {

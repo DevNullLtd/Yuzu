@@ -404,3 +404,75 @@ TEST_CASE("settings enrollment: the Active token pill is not the green OK pill",
     CHECK(res->body.find("role-badge role-admin\">Active") != std::string::npos);
     CHECK(res->body.find("role-ok\">Active") == std::string::npos);
 }
+
+// ── Auto-approve rule writes (B4 hardening): validated, fail-closed, audited ──
+// No PG store involved: the rule engine is in-memory, so these run in the plain suite.
+
+TEST_CASE("settings auto-approve: a valid add persists and audits exactly one rule_add row",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    auto r = h.sink.Post("/api/settings/auto-approve",
+                         "type=ip_subnet&value=10.0.0.0%2F8&label=lan", kForm);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    REQUIRE(h.auto_approve.list_rules().size() == 1);
+    const auto row = h.only("enrollment.auto_approve.rule_add");
+    CHECK(row.result == "success");
+    CHECK(row.detail.find("by=admin") != std::string::npos);
+    CHECK(h.audit_calls.size() == 1);
+}
+
+TEST_CASE("settings auto-approve: injection, bad CIDR and unknown type are 400, audited denied, "
+          "and nothing is persisted",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    const char* bodies[] = {
+        // newline in the label injects a second rule line into the delimited file
+        "type=hostname_glob&value=a.example.com&label=x%0Ahostname_glob%3A*%3Ainj%3A1",
+        "type=hostname_glob&value=a.example.com&label=has%3Acolon", // ':' truncates on reload
+        "type=ip_subnet&value=10.0.0.0%2Fabc&label=x",               // stoi throw in evaluate()
+        "type=ip_subnet&value=10.0.0.0%2F33&label=x",
+        "type=trusted_ca&value=abcd&label=x",
+        "type=hostname_glob&value=&label=x",
+        "type=subnet&value=*&label=x", // unknown type used to default to hostname_glob
+    };
+    for (const char* body : bodies) {
+        INFO(body);
+        h.audit_calls.clear();
+        auto r = h.sink.Post("/api/settings/auto-approve", body, kForm);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(h.only("enrollment.auto_approve.rule_add").result == "denied");
+        CHECK(h.auto_approve.list_rules().empty());
+    }
+}
+
+TEST_CASE("settings auto-approve: toggle, delete and mode each audit exactly one row",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    h.auto_approve.add_rule({auth::AutoApproveRuleType::hostname_glob, "*.corp", "corp", true});
+
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/0/toggle", "", kForm)->status == 200);
+    CHECK(h.only("enrollment.auto_approve.rule_toggle").detail.find("enabled=0") !=
+          std::string::npos);
+    CHECK_FALSE(h.auto_approve.list_rules()[0].enabled);
+
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/mode", "mode=all", kForm)->status == 200);
+    CHECK(h.only("enrollment.auto_approve.mode").detail.find("mode=all") != std::string::npos);
+    CHECK(h.auto_approve.require_all());
+
+    h.audit_calls.clear();
+    CHECK(h.sink.Post("/api/settings/auto-approve/mode", "mode=bogus", kForm)->status == 400);
+    CHECK(h.only("enrollment.auto_approve.mode").result == "denied");
+    CHECK(h.auto_approve.require_all()); // unchanged
+
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Delete("/api/settings/auto-approve/0")->status == 200);
+    CHECK(h.only("enrollment.auto_approve.rule_remove").result == "success");
+    CHECK(h.auto_approve.list_rules().empty());
+
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Delete("/api/settings/auto-approve/7")->status == 200);
+    CHECK(h.only("enrollment.auto_approve.rule_remove").result == "denied");
+}

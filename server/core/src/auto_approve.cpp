@@ -7,7 +7,9 @@
 #include <cstdint>
 #include <fstream>
 #include <sstream>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #ifdef _WIN32
 // clang-format off
@@ -36,16 +38,25 @@ std::string rule_type_to_string(AutoApproveRuleType t) {
     return "unknown";
 }
 
-AutoApproveRuleType string_to_rule_type(const std::string& s) {
-    if (s == "trusted_ca")
-        return AutoApproveRuleType::trusted_ca;
-    if (s == "hostname_glob")
-        return AutoApproveRuleType::hostname_glob;
-    if (s == "ip_subnet")
-        return AutoApproveRuleType::ip_subnet;
-    if (s == "cloud_provider")
-        return AutoApproveRuleType::cloud_provider;
-    return AutoApproveRuleType::hostname_glob; // safe default
+// Prefix length 0-32 from 1-2 ASCII digits; nullopt otherwise (no stoi, never throws).
+std::optional<int> parse_prefix_len(std::string_view s) {
+    if (s.empty() || s.size() > 2)
+        return std::nullopt;
+    int n = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9')
+            return std::nullopt;
+        n = n * 10 + (c - '0');
+    }
+    if (n > 32)
+        return std::nullopt;
+    return n;
+}
+
+bool has_delimiter_or_control(std::string_view s) {
+    return std::any_of(s.begin(), s.end(), [](unsigned char c) {
+        return c == ':' || c < 0x20 || c == 0x7f;
+    });
 }
 
 std::string to_lower(std::string s) {
@@ -55,6 +66,44 @@ std::string to_lower(std::string s) {
 }
 
 } // anonymous namespace
+
+std::optional<AutoApproveRuleType> parse_auto_approve_rule_type(std::string_view s) {
+    if (s == "trusted_ca")
+        return AutoApproveRuleType::trusted_ca;
+    if (s == "hostname_glob")
+        return AutoApproveRuleType::hostname_glob;
+    if (s == "ip_subnet")
+        return AutoApproveRuleType::ip_subnet;
+    if (s == "cloud_provider")
+        return AutoApproveRuleType::cloud_provider;
+    return std::nullopt;
+}
+
+std::string validate_auto_approve_rule(AutoApproveRuleType type, std::string_view value,
+                                       std::string_view label) {
+    if (value.empty())
+        return "value is required";
+    if (has_delimiter_or_control(value))
+        return "value must not contain ':' or control characters";
+    if (has_delimiter_or_control(label))
+        return "label must not contain ':' or control characters";
+    if (type == AutoApproveRuleType::trusted_ca) {
+        const bool hex64 = value.size() == 64 && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+                               return std::isxdigit(c) != 0;
+                           });
+        if (!hex64)
+            return "trusted_ca value must be a 64-character hex SHA-256 fingerprint";
+    } else if (type == AutoApproveRuleType::ip_subnet) {
+        const auto slash = value.find('/');
+        const std::string net(value.substr(0, slash));
+        struct in_addr a{};
+        if (inet_pton(AF_INET, net.c_str(), &a) != 1)
+            return "ip_subnet value must be an IPv4 address or CIDR";
+        if (slash != std::string_view::npos && !parse_prefix_len(value.substr(slash + 1)))
+            return "ip_subnet prefix must be 0-32";
+    }
+    return {};
+}
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
@@ -90,8 +139,15 @@ bool AutoApproveEngine::load(const std::filesystem::path& path) {
         std::getline(ss, label, ':');
         std::getline(ss, enabled_s, ':');
 
+        // An unknown type is dropped, never defaulted to another (broader) type.
+        const auto parsed_type = parse_auto_approve_rule_type(type_s);
+        if (!parsed_type) {
+            spdlog::warn("Ignoring auto-approve rule with unknown type '{}' in {}", type_s,
+                         path.string());
+            continue;
+        }
         AutoApproveRule rule;
-        rule.type = string_to_rule_type(type_s);
+        rule.type = *parsed_type;
         rule.value = value;
         rule.label = label;
         rule.enabled = enabled_s.empty() || enabled_s == "1";
@@ -225,7 +281,12 @@ bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::stri
     }
 
     auto net_str = cidr.substr(0, slash);
-    int prefix_len = std::stoi(cidr.substr(slash + 1));
+    // Fail closed: a malformed/out-of-range prefix never matches and never throws
+    // (this runs under mu_ on the Register path).
+    const auto parsed_prefix = parse_prefix_len(std::string_view(cidr).substr(slash + 1));
+    if (!parsed_prefix)
+        return false;
+    const int prefix_len = *parsed_prefix;
 
     // Parse both IPs as IPv4
     struct in_addr net_addr{}, ip_addr{};
