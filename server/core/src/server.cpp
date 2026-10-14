@@ -162,6 +162,7 @@
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
 #include "access_audit_routes.hpp" // Audit and reviews page (Phase 2 UI): /access/audit
+#include "access_reviews_routes.hpp" // Audit and reviews page (Phase 2 UI): Access reviews fragments
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
@@ -15867,6 +15868,47 @@ private:
                                             : cfg_.audit_retention_days;
                     },
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
+            });
+
+        // Audit and reviews page (Phase 2 UI), Access reviews half: three read-only fragments.
+        // Every write the page makes goes to the existing REST v1 routes. `probe_perm_fn` is the
+        // loud gate on a scratch Response: a render-time hint for the Attest controls only, so a
+        // caller that holds Read but not Attest costs one denied row per view (never a gate).
+        yuzu::server::access_reviews::register_access_reviews_routes(
+            inline_sink,
+            yuzu::server::access_reviews::ReviewsDeps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .probe_perm_fn = [perm_fn](const httplib::Request& req, const std::string& type,
+                                           const std::string& op) -> bool {
+                    httplib::Response scratch;
+                    return perm_fn(req, scratch, type, op);
+                },
+                .audit_fn = audit_fn,
+                .list_campaigns_fn = [this]()
+                    -> std::expected<std::vector<AccessReviewCampaignRow>, std::string> {
+                    if (!access_review_store_ || !access_review_store_->is_open())
+                        return std::unexpected(std::string("access review store not open"));
+                    return access_review_store_->list_campaigns();
+                },
+                .get_campaign_fn = [this](const std::string& id)
+                    -> std::expected<CampaignView, std::string> {
+                    if (!access_review_store_ || !access_review_store_->is_open())
+                        return std::unexpected(std::string("access review store not open"));
+                    return access_review_store_->get_campaign(id);
+                },
+                .grants_fn = [this]()
+                    -> std::expected<yuzu::server::access_reviews::GrantsView, std::string> {
+                    // The same read as GET /api/v1/access-reviews/export (the grant TABLE,
+                    // never a roster walk, so orphan grants are kept).
+                    auto rows = build_access_review(auth_mgr_.auth_db_ptr(), rbac_store_.get(),
+                                                    engine_principal_store_.get(),
+                                                    api_token_store_.get(), directory_sync_.get());
+                    if (!rows)
+                        return std::unexpected(rows.error());
+                    return yuzu::server::access_reviews::GrantsView{
+                        std::move(*rows), access_review_rbac_enforcement(rbac_store_.get())};
+                },
             });
 
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the

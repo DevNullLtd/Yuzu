@@ -19,6 +19,7 @@ extern const char* const kAccessAuditTemplate =
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <script src="/static/yuzu-access.js" defer></script>
+  <script src="/static/yuzu-dialog.js" defer></script>
   <script src="/static/yuzu-audit.js" defer></script>
 </head>
 <body>
@@ -27,7 +28,7 @@ extern const char* const kAccessAuditTemplate =
   <header class="page-header">
     <div>
       <h1>Audit and reviews</h1>
-      <p class="subtitle">A record of who did what.</p>
+      <p class="subtitle">A record of who did what, and periodic checks that access is still justified.</p>
     </div>
   </header>
   <div class="split">
@@ -53,8 +54,36 @@ extern const char* const kAccessAuditTemplate =
           <div class="pb"><p class="hint">Loading the audit log.</p></div>
         </div>
       </section>
+      <div id="ar-banner" class="strip" role="alert"></div>
+      <section class="panel" id="ar-campaigns" hx-get="/fragments/access/reviews/campaigns" hx-trigger="load" hx-swap="innerHTML"
+               data-src="/fragments/access/reviews/campaigns"
+               data-denied="Access reviews need the AccessReview:Read permission, held by the Administrator and Reviewer roles. While RBAC is off that is the Administrator account role."
+               data-unavailable="The access review store did not answer, so the campaign list is unknown. This is not no reviews.">
+        <div class="hd"><h2>Access reviews</h2><span class="sub">Campaigns</span></div>
+        <div class="pb"><p class="hint">Loading.</p></div>
+      </section>
+      <section class="panel" id="ar-campaign"
+               data-src="/fragments/access/reviews/campaign"
+               data-denied="Access reviews need the AccessReview:Read permission, held by the Administrator and Reviewer roles. While RBAC is off that is the Administrator account role."
+               data-unavailable="The access review store did not answer, so this campaign could not be read.">
+        <div class="hd"><h2>Review campaign</h2></div>
+        <div class="empty"><span>Select a campaign from the list to review its grants.</span></div>
+      </section>
+      <section class="panel" id="ar-grants"
+               data-src="/fragments/access/reviews/grants"
+               data-denied="Access reviews need the AccessReview:Read permission, held by the Administrator and Reviewer roles. While RBAC is off that is the Administrator account role."
+               data-unavailable="The grant population could not be read, so the list is unknown. This is not no grants.">
+        <div class="hd"><h2>Current grants</h2><span class="sub">Live population, not a campaign</span></div>
+        <div class="pb"><p class="hint">Reading the whole grant population is recorded in the audit log, so it is fetched on request.</p></div>
+        <div class="btns"><button type="button" class="btn sm" hx-get="/fragments/access/reviews/grants"
+             hx-target="#ar-grants" hx-swap="innerHTML">Show current grants</button></div>
+      </section>
     </div>
     <div class="side2">
+      <section class="panel" id="ar-campaign-side">
+        <div class="hd"><h2>Campaign summary</h2></div>
+        <div class="empty"><span>Select a campaign from the list to review its grants.</span></div>
+      </section>
       <section class="panel" id="panel-sample">
         <div class="hd"><h2>Authentication sample</h2><span class="sub">Random sample for evidence</span></div>
         <div class="form">
