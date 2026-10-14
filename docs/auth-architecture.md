@@ -2978,6 +2978,24 @@ only when a change cannot be expressed as an idempotent additive re-seed
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
 
+## Quiet permission probe (render-time capability hints)
+
+`AuthRoutes::require_permission` and `require_tier_policy` take a trailing `Quiet` argument
+(`Quiet::No` by default). `Quiet::Yes` returns the identical verdict, status and body but
+suppresses the denial side effects: the `auth.permission_required` / `auth.approval_required`
+audit rows and the `yuzu_auth_topology_floor_denied_total` and
+`yuzu_auth_service_scope_default_denied_total` counters. The ceiling-degraded 503 path returns
+`false` without its degrade counter or audit row.
+
+Not suppressed: the one-off `role.elevation.expired` lifecycle row minted when the request
+reaps an expired elevation, and `RbacStore`'s own store-read telemetry (latency histogram,
+circuit breaker).
+
+A probe is a rendering hint, never a gate: use it to hide or disable a control, and let the
+action route re-check through the loud gate. `ServerImpl::probe_permission` is the binding
+for a `std::function<bool(const httplib::Request&, const std::string& securable,
+const std::string& operation)>` consumer; it passes a scratch `httplib::Response`.
+
 ## Settings read-twins (#4028, api-parity programme #2146)
 
 Eight `/fragments/settings/*` dashboard sub-areas (TLS, HTTPS, gateway, server-config, MCP,

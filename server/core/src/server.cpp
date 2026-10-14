@@ -12072,6 +12072,16 @@ private:
         return auth_routes_->require_permission(req, res, securable_type, operation);
     }
 
+    /// Render-time capability probe: the same verdict as `require_permission`, with no denial
+    /// audit row and no denial counter, written to a scratch response. A rendering hint, never a
+    /// gate -- the action route must re-gate through `require_permission`.
+    bool probe_permission(const httplib::Request& req, const std::string& securable_type,
+                          const std::string& operation) {
+        httplib::Response scratch;
+        return auth_routes_->require_permission(req, scratch, securable_type, operation,
+                                                yuzu::server::Quiet::Yes);
+    }
+
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
                                    const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id) {
