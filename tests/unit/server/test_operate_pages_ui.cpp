@@ -66,16 +66,11 @@ TEST_CASE("operate pages: no inline handlers and no hx-on and htmx eval disabled
         CHECK(has(p.html, "<meta name=\"htmx-config\" content='{\"allowEval\":false}'>"));
         CHECK(count_of(p.html, "src=\"/static/yuzu-operate.js\"") == 1);
         // The dialog module loads first (deferred scripts run in order); toasts are polite.
-        // Workflows is read-only (no dialog, no toasts), so it pays for neither.
+        // Every Operate page carries both: Workflows has actions now.
         const auto dlg = p.html.find("src=\"/static/yuzu-dialog.js\" defer");
-        if (std::string_view(p.name) == "workflows") {
-            CHECK(dlg == std::string::npos);
-            CHECK(count_of(p.html, "id=\"toasts\"") == 0);
-        } else {
-            REQUIRE(dlg != std::string::npos);
-            CHECK(dlg < p.html.find("src=\"/static/yuzu-operate.js\""));
-            CHECK(count_of(p.html, "id=\"toasts\" aria-live=\"polite\"") == 1);
-        }
+        REQUIRE(dlg != std::string::npos);
+        CHECK(dlg < p.html.find("src=\"/static/yuzu-operate.js\""));
+        CHECK(count_of(p.html, "id=\"toasts\" aria-live=\"polite\"") == 1);
         // Sign out is hx-post, so the page must load htmx for the shell.
         CHECK(has(p.html, "src=\"/static/htmx.js\""));
         CHECK(count_of(p.html, "<!--yuzu:shell-->") == 1);
@@ -380,7 +375,8 @@ TEST_CASE("operate pages: the Workflows template carries every hook the controll
     CHECK(has(js, "if (!block) { dseq++; selectedId = ''; markSelected(); return false; }"));
 }
 
-TEST_CASE("operate pages: Workflows copy is exact and read-only", "[ui][operate][pages]") {
+TEST_CASE("operate pages: Workflows copy is exact and the action hooks are in the template",
+          "[ui][operate][pages]") {
     const std::string html(kWorkflowsPageHtml);
     CHECK(has(html, "<title>Yuzu — Workflows</title>"));
     CHECK(has(html, "<h1>Workflows</h1>"));
@@ -391,9 +387,77 @@ TEST_CASE("operate pages: Workflows copy is exact and read-only", "[ui][operate]
     const auto body_at = html.find("<!--/yuzu:shell-->");
     REQUIRE(body_at != std::string::npos);
     const auto body = html.substr(body_at);
-    CHECK_FALSE(has(body, "<button"));
+    // The page offers New workflow and Delete as hidden buttons the controller reveals from
+    // the probed hints; Run now is a per-row button rendered with the definitions fragment.
+    CHECK(has(body, "id=\"wf-new\" hidden>New workflow</button>"));
+    CHECK(has(body, "id=\"wf-del\" hidden>Delete</button>"));
+    CHECK(has(body, "id=\"sc-new\" hidden>New schedule</button>"));
+    CHECK_FALSE(has(body, "Run now"));
+    // The dialog module loads before the controller.
+    const auto dlg = body.find("/static/yuzu-dialog.js");
+    const auto ctl = body.find("/static/yuzu-operate.js");
+    REQUIRE(dlg != std::string::npos);
+    REQUIRE(ctl != std::string::npos);
+    CHECK(dlg < ctl);
     CHECK_FALSE(has(body, "<dialog"));
     // Nothing the code cannot do is drawn.
-    for (const char* never : {"Run now", "New workflow", "Second Tuesday", "2 failed", "Wait "})
+    for (const char* never : {"Second Tuesday", "2 failed", "Wait "})
         CHECK_FALSE(has(body, never));
+}
+
+TEST_CASE("operate pages: the Workflows action controller keeps its guards",
+          "[ui][operate][pages]") {
+    const auto& js = yuzu::server::kYuzuOperateJs;
+    // Run: a bare-array device list (and the object shape), 200 shown / 500 selected, the
+    // textarea fallback ids validated client side, its own 8 s request, a bounded 5 s poll.
+    CHECK(has(js, "Array.isArray(data) ? data : (data && Array.isArray(data.agents)"));
+    CHECK(has(js, "var AGENT_SHOW_MAX = 200;"));
+    CHECK(has(js, "var AGENT_SELECT_MAX = 500;"));
+    CHECK(has(js, "var AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;"));
+    CHECK(has(js, "var RUN_POST_TIMEOUT_MS = 8000;"));
+    CHECK(has(js, "var RUN_POLL_MS = 5000;"));
+    CHECK(has(js, "var RUN_POLL_MAX_MS = 600000;"));
+    CHECK(has(js, "timeoutSignal(RUN_POST_TIMEOUT_MS)"));
+    CHECK(has(js, "if (Date.now() - started > RUN_POLL_MAX_MS) {"));
+    CHECK(has(js, "if (r.status === 403) { showFallback("));
+    // The Run control is disabled while its run is watched, and that state is re-applied after
+    // every render; a second Run is also refused in the handler itself.
+    CHECK(has(js, "setReason(b, can('run') && !watched, watched"));
+    CHECK(has(js, "if (!window.YuzuDialog || polling[id] || !can('run')) return;"));
+    CHECK(has(js, "if (polling[id]) return;"));
+    // The copy never claims the run was stopped or that it finished when it may still run.
+    CHECK(has(js, "The run may keep running on the server."));
+    CHECK_FALSE(has(js, "keeps running on the server"));
+    // A key on the row's own button is the button's, not a row selection.
+    CHECK(has(js, "if (e.target && e.target.tagName === 'BUTTON') return;"));
+    // New workflow posts the YAML as JSON; delete is the id-only DELETE; neither is retried.
+    CHECK(has(js, "'/api/workflows', { json: { yaml_source: v.yaml } }"));
+    CHECK(has(js, "YuzuDialog.request('DELETE', '/api/workflows/' + encodeURIComponent(id))"));
+    CHECK(has(js, "'/api/workflows/' + encodeURIComponent(id) + '/execute'"));
+    // Every control is a render hint: the server routes stay the gate.
+    CHECK(has(js, "'data-can-' + name"));
+    CHECK_FALSE(has(js, "setInterval("));
+}
+
+TEST_CASE("operate pages: the schedule action controller keeps its guards",
+          "[ui][operate][pages]") {
+    const auto& js = yuzu::server::kYuzuOperateJs;
+    // Enable arms a schedule that runs unattended: a confirm that says so, Disable is one click.
+    CHECK(has(js, "if (!want) { setScheduleEnabled(id, false); return; }"));
+    CHECK(has(js, "and runs without anyone present."));
+    // The routes answer 200 when the owner scope changed nothing: the stored state is re-read.
+    CHECK(has(js, "row.getAttribute('data-enabled') === '1'"));
+    CHECK(has(js, "The schedule was not changed. Only its creator can enable or disable it."));
+    CHECK(has(js, "r.data.deleted === false"));
+    // New schedule: empty targets need the explicit All devices acknowledgement, the instruction
+    // list needs its own grant, and a mandatory summary (with approval mode) comes last.
+    CHECK(has(js, "if (!v.scope_expression.trim() && v.all_ack !== 'yes')"));
+    CHECK(has(js, "'/api/instructions?enabled_only=1&limit=500'"));
+    CHECK(has(js, "Choosing an instruction needs the InstructionDefinition:Read permission."));
+    CHECK(has(js, "'Instruction approval mode: ' + mode"));
+    CHECK(has(js, "at the next scheduler tick (about now)"));
+    CHECK(has(js, "can still be refused when it '"));
+    CHECK(has(js, "one-time credentials"));
+    CHECK(has(js, "title: 'Create this schedule?'"));
+    CHECK(has(js, "'/api/schedules', { json: body }"));
 }
