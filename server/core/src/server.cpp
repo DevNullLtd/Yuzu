@@ -15728,6 +15728,7 @@ private:
                              .auth_fn = auth_fn,
                              .perm_fn = perm_fn,
                              .approval_manager = approval_manager_.get(),
+                             .instruction_store = instruction_store_.get(),
                          });
 
         // NOTE: the 3-route MCP-disabled stub module

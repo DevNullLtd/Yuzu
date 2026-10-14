@@ -255,10 +255,9 @@ const char* const kResultSetsPageTemplate = R"HTM(<!DOCTYPE html>
       <div class="rs-rail">
         <div class="rs-panel">
           <div class="rs-panel-header">Your result sets</div>
-          <form class="rs-create"
+          <form class="rs-create" id="rs-create-form"
                 hx-post="/fragments/result-sets/create"
-                hx-target="#rs-sidebar" hx-swap="innerHTML"
-                hx-on::after-request="if(event.detail.successful) this.reset()">
+                hx-target="#rs-sidebar" hx-swap="innerHTML">
             <input type="text" name="name" placeholder="Name (optional)" maxlength="128">
             <textarea name="device_ids" placeholder="Device IDs, one per line (CSV import)"></textarea>
             <button type="submit">Create result set</button>
@@ -285,6 +284,19 @@ const char* const kResultSetsPageTemplate = R"HTM(<!DOCTYPE html>
       </div>
     </div>
   </div>
+
+  <script>
+    /* Clear the create form once its request succeeds, so a second Send does
+       not repeat the same name and device list. A delegated body listener,
+       not an inline handler attribute: htmx compiles those with
+       new Function(), which this page's CSP (no 'unsafe-eval') blocks at
+       runtime. The sidebar's own poll fires htmx:afterRequest too, so the
+       listener keys on the form's id. */
+    document.body.addEventListener('htmx:afterRequest', function(e) {
+      var el = e.detail && e.detail.elt;
+      if (el && el.id === 'rs-create-form' && e.detail.successful) el.reset();
+    });
+  </script>
 
 </body></html>
 )HTM";

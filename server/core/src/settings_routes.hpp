@@ -21,6 +21,7 @@
 
 #include <httplib.h>
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -36,6 +37,14 @@ class RbacStore;
 class AccessReviewStore;
 class DirectorySync;
 class ScimStore;
+
+/// True when an enrollment token's expiry has passed at `now`. Pure: `now` is injected so
+/// the expired branch can be tested without waiting out a TTL. `expires_at` is
+/// `time_point::max()` for a token that never expires (what `list_tokens` maps a NULL expiry
+/// to). Same comparison the consume path enforces in SQL (`expires_at > now()` must hold to
+/// enrol), so a token the server refuses as expired is never listed Active.
+[[nodiscard]] bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
+                                            std::chrono::system_clock::time_point now) noexcept;
 
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {
