@@ -336,3 +336,26 @@ TEST_CASE("Quiet probe: loud and quiet agree for an engine principal (granted, u
         check_equivalent(r, req, "engine/store-unavailable", &bare);
     }
 }
+
+TEST_CASE("Quiet probe: loud and quiet agree for a human session when the wired RBAC store is "
+          "not open",
+          "[pg][authz][quiet][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quiet_tpl);
+    QuietRig r{db.dsn()};
+    // A wired store whose substrate is unreachable: !is_open(), so enforcement is "in effect"
+    // and the gate fails closed (403) on both paths -- never the legacy Read-allow.
+    PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+                .size = 1}};
+    RbacStore dead{bad};
+    REQUIRE_FALSE(dead.is_open());
+    std::shared_mutex mu;
+    std::unique_ptr<oidc::OidcProvider> no_oidc;
+    AuthRoutes wired(r.cfg, r.auth_mgr, &dead, r.api_tokens.get(), &r.audit, nullptr, &r.tags,
+                     nullptr, mu, no_oidc);
+    check_equivalent(r, r.cookie_request("frank", auth::Role::user), "user/store-dead", &wired);
+    check_equivalent(r, r.cookie_request("gina", auth::Role::admin), "admin/store-dead", &wired);
+    httplib::Response res;
+    CHECK_FALSE(wired.require_permission(r.cookie_request("hank", auth::Role::user), res,
+                                         "Infrastructure", "Read", Quiet::Yes));
+    CHECK(res.status == 403);
+}
