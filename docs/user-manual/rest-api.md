@@ -7298,7 +7298,7 @@ Delete a result set.
 
 Page through a result set's member device ids.
 
-**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+**Permission:** Session-authenticated (owner-scoped, `load_owned`), and `Infrastructure:Read` through the admit-then-filter fleet-read gate. Ownership says whose set it is, not which devices the owner can still see: the owner's *current* management-group scope is applied in the query before the page limit, so a device they can no longer see is not listed, does not use up a page slot, and is never reached by the cursor. A set whose devices have all left the caller's scope answers `{"device_ids": [], "next_cursor": ""}`. The dashboard fragment `GET /fragments/result-sets/{id}/members` and the MCP tool `get_result_set_members` apply the same gate.
 
 **Query parameters:**
 
@@ -7313,9 +7313,9 @@ Page through a result set's member device ids.
 
 | Status | Reason |
 |---|---|
-| 403 | Service-scoped API token |
+| 403 | Service-scoped API token, or the caller lacks `Infrastructure:Read` |
 | 404 | No such set, or not owned by the caller |
-| 503 | Result-set store unavailable |
+| 503 | Result-set store unavailable, or the visibility check is unavailable |
 
 #### `GET /api/v1/result-sets/{id}/lineage`
 
@@ -9715,6 +9715,25 @@ Because that surface answers htmx fragments rather than the A4 JSON envelope, it
 `200` carrying the message in the console's result line, not a `400`/`404`. `POST
 /api/instructions/{id}/execute` and MCP `execute_bundle` do not yet enforce this gate.
 
+**Targeting the console by scope expression.** `POST /api/dashboard/execute` also accepts an
+optional form field `scope_expression`, so a send can target the devices an expression matches.
+Absent, the route behaves exactly as above. Present, it is refused with a `400` (the body is the
+console's result-line span, with the reason in its `data-reason` attribute, and a `command.dispatch`
+`denied` audit row with `reason=<reason>`) when:
+
+| `reason` | Cause |
+|---|---|
+| `target_conflict` | `scope` was also supplied, even empty. The route never picks one silently. |
+| `scope_expression_empty` | The field was supplied but empty. It is never widened to the fleet. |
+| `scope_expression_too_long` | Longer than 8192 bytes. |
+| `scope_expression_invalid` | The expression does not parse (a bare `tag:finance`, `__all__` and `group:<id>` are not expressions). |
+| `scope_unknown_attribute` | An attribute outside the scope kinds catalogue. The resolver answers an empty string for an unknown name, and `!=` and `NOT` turn that into every device, so a one-letter typo would otherwise fan out fleet-wide. |
+
+An expression target is never a named agent, so a Destructive-classified instruction is still
+refused as `destructive_untargeted`. A successful send is audited as `command.dispatch` with
+`scope_expression=<text>` appended to its detail. The Console disables its picker field and sends
+the expression only after a Preview of the same text, or after the operator retypes it.
+
 Scheduled and background dispatch is deliberately **not** covered by it. A schedule targets by
 scope expression by construction (it has no `agent_ids`), so a scheduled destructive instruction
 keeps working exactly as before; it is gated instead by the schedule's own fire-time
@@ -10913,7 +10932,7 @@ data: {"execution_id":"exec-abc123","event_id":119,"timestamp_ms":...,"type":"ag
 
 Execute a TAR warehouse SQL query against targeted agents. Returns HTMX HTML fragments: a `thead` OOB swap with dynamic column headers and sets up an SSE stream for result rows.
 
-**Permission:** `Execution:Execute`
+**Permission:** `Execution:Execute`. A browser (session-cookie) caller must also send a same-site `Origin` or `Referer` naming the console; one without either, or from another site, is answered `403` and audited as `csrf.denied` before anything is parsed or dispatched. Token callers are exempt. The same rule applies to `POST /api/dashboard/execute`.
 
 **Request body (form-encoded):**
 
@@ -10927,6 +10946,7 @@ Execute a TAR warehouse SQL query against targeted agents. Returns HTMX HTML fra
 ```bash
 curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
   -H "Cookie: yuzu_session=abc123" \
+  -H "Origin: https://yuzu.example.com" \
   -d "sql=SELECT name, pid FROM \$Process_Live LIMIT 10" \
   -d "scope=__all__"
 ```
@@ -10941,7 +10961,7 @@ curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
 
 #### `GET /tar`
 
-Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list, the ad-hoc TAR SQL frame, and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`).
+Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list, the capture sources frame and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`). The Ad-hoc TAR SQL form is no longer on this page: a short note links to the Result sets page, where **From TAR query** takes the same parent scope, SQL, name and include-empty fields.
 
 **Permission:** Session-only (the page itself; embedded fragment endpoints carry their own permission gates — see below).
 
