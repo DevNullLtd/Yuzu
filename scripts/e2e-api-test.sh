@@ -1146,6 +1146,7 @@ DASH_FRAGMENTS=(
     "/fragments/schedules"
     "/fragments/health/summary"
     "/fragments/compliance/summary"
+    "/fragments/policy-fragments"
 )
 
 for frag in "${DASH_FRAGMENTS[@]}"; do

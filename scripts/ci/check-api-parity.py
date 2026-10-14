@@ -205,8 +205,12 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # existing JSON route that is itself `planned:#2146` with no REST v1 or MCP twin (the legacy
 # runtime-config and analytics routes), so there is no twin to point at and each counts as
 # untwinned. Reviewed: a fragment is UI, not a machine surface (ADR-1005 Decision 4), and the
-# routes they compose are the ledgered gap. 199 + 2 = 201, measured post-change.
-BASELINE_UNTWINNED = 201
+# routes they compose are the ledgered gap.
+#
+# Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
+# is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
+# which counts as untwinned by design. 199 + 1 (compliance) + 2 (general) = 202.
+BASELINE_UNTWINNED = 202
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
