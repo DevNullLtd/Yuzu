@@ -5037,6 +5037,19 @@ The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin r
 | `POST` | `/api/settings/api-tokens` | Create a new API bearer token. Body: `{ "name", "role", "scopes" }`. |
 | `DELETE` | `/api/settings/api-tokens/{id}` | Revoke an API token by ID. |
 
+### Tokens and principals page
+
+`/access/tokens` (Access group in the navigation) lists API tokens and engine principals. It is read-only: creating, rotating and revoking stay in Settings. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/access/tokens` | The page. Redirects to `/login` without a session. |
+| `GET` | `/fragments/access/tokens/list` | API token list (HTMX). `?state=active` (default) or `all`. Gated on `ApiToken:Read`. Administrators on a cookie session see every owner; every other caller, including an administrator's API or MCP token, sees their own tokens only, as `GET /api/v1/tokens` does. Capped at 500 rows with a banner. |
+| `GET` | `/fragments/access/principals/list` | Engine principal list (HTMX). Administrator account role only (the same gate as the Settings panel). Writes an `engine_principal.list` audit row. |
+| `GET` | `/fragments/access/principals/detail` | One principal with its active credentials and roles (HTMX). `?id=engine:<slug>`. Same gate. Writes `engine_principal.get` and `engine_principal.role.listed` audit rows. |
+
+The principal panels, and the no-administrator check above them, are requested only when the token list shows the caller is an administrator, so other users do not generate a denied-access audit row by opening the page. The no-administrator result is a statement about the roles and grants the server could read: a role read that degrades is not distinguishable from "no roles" on that route, so the page words a clean result accordingly. Device tokens are not shown: the device token store is not constructed on this server.
+
 ### OTA Updates
 
 | Method | Route | Description |

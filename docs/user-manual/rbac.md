@@ -818,6 +818,10 @@ curl -s -b cookies.txt -X POST \
   }'
 ```
 
+## Tokens and principals page
+
+The read-only `/access/tokens` page shows API tokens and engine principals. Its token list uses `ApiToken:Read` and is scoped to the caller's own tokens unless the caller is an administrator on a cookie session; an administrator's API, MCP or service-scoped token gets its own tokens only. The principal list and detail use the administrator account role (the Settings panel's gate), not `EnginePrincipal:Read`, so an RBAC-on Viewer who can call the REST routes does not see principals on this page. Role assignment for engine principals is shown here; assigning is not.
+
 ## Examples
 
 ### Deny a Specific Operation
