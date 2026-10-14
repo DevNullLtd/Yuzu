@@ -1182,8 +1182,13 @@ void GuardianRoutes::update_guard_action(const httplib::Request& req, httplib::R
         if (updated.name.empty())
             return fail(400, "Name is required.");
     }
-    if (req.has_param("enabled"))
-        updated.enabled = get("enabled") == "1";
+    if (req.has_param("enabled")) {
+        // Closed 0/1: any other value must not silently disable an enforcing Guard.
+        const std::string ev = get("enabled");
+        if (ev != "0" && ev != "1")
+            return fail(400, "enabled must be 0 or 1");
+        updated.enabled = ev == "1";
+    }
     if (req.has_param("severity")) {
         const std::string sv = get("severity");
         // Closed enum: severity renders into a CSS class (same as create).

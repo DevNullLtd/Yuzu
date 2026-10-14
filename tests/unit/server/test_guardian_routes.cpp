@@ -1921,6 +1921,13 @@ TEST_CASE("guard update: unknown Guard is 404, bad severity and empty name are 4
     CHECK(nf->status == 404);
     CHECK(sev->status == 400);
     CHECK(nm->status == 400);
+
+    // enabled is a closed 0/1: "true" must neither disable nor enable the Guard.
+    auto en = h.sink.dispatch("POST", std::string(kGuardUpdate), "enabled=true", kForm,
+                              Harness::same_site());
+    REQUIRE(en);
+    CHECK(en->status == 400);
+    CHECK((**h.store->get_rule("g1")).enabled);
 }
 
 TEST_CASE("guard update: promoting-risk check refuses an enforce Guard on a denylisted target",
