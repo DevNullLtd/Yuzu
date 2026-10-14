@@ -20,6 +20,7 @@
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
+#include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
 #include "workflow_model.hpp" // #4030: shared workflow/workflow-execution row builders
 
 #include <nlohmann/json.hpp>
@@ -2431,6 +2432,69 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // with the success path (see GET /api/v1/workflows above).
                 detail::ensure_correlation_id(res);
                 res.set_content(nlohmann::json({{"data", workflow_detail_json(**workflow_result)},
+                                                {"meta", {{"api_version", "v1"}}}})
+                                    .dump(),
+                                "application/json");
+            });
+
+    // GET /api/v1/workflow-executions -- the workflow-execution LIST (no legacy twin: the legacy
+    // surface never listed runs). Newest first, keyset-paged, or `latest_per_workflow=true` for each
+    // workflow's newest run. Rows are metadata only (workflow_execution_summary_json): no agent ids,
+    // no step results, no fleet-size count.
+    //
+    // AUTHORIZATION: fleet_read_fn is the SOLE gate -- never stacked with perm_fn on the same
+    // (Workflow, Read) tuple (authz_gates.hpp) -- and its scope is handed to the seam, where the
+    // store applies it BEFORE ORDER BY/LIMIT (ADR-0017 INV-3). Visibility is therefore decided once,
+    // in SQL: a confined caller's page, next_cursor and page length depend only on runs it may see.
+    // No audit row on a successful list: run metadata, not operator-supplied step parameters (the
+    // detail route audits because results carry those); a denial is audited by the gate itself.
+    // Input is STRICT (workflow_execution_list_model.hpp): unknown/repeated parameters are 400.
+    sink.Get("/api/v1/workflow-executions",
+            [fleet_read_fn, workflow_api](const httplib::Request& req, httplib::Response& res) {
+                if (!fleet_read_fn) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                std::vector<RawParam> raw(req.params.begin(), req.params.end());
+                auto query = parse_workflow_execution_list_params(raw);
+                if (!query) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, query.error()), "application/json");
+                    return;
+                }
+                if (!workflow_api) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto page = workflow_api->list_workflow_executions(*query, gate.scope);
+                if (!page) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         yuzu::server::genericize_db_error(
+                                             "list_workflow_executions", page.error()),
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                // `total` is the rows in THIS page, never a fleet-wide count: a count of all
+                // matching runs would disclose out-of-scope existence to a confined caller.
+                nlohmann::json pagination{{"total", page->rows.size()},
+                                          {"start", 0},
+                                          {"page_size", query->limit},
+                                          {"next_cursor", workflow_execution_next_cursor_json(*page)}};
+                if (page->truncated_by_cap)
+                    pagination["result_truncated_by_cap"] = true;
+                detail::ensure_correlation_id(res);
+                res.set_content(nlohmann::json({{"data", workflow_execution_rows_json(*page)},
+                                                {"pagination", pagination},
                                                 {"meta", {{"api_version", "v1"}}}})
                                     .dump(),
                                 "application/json");
