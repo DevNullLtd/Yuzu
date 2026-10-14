@@ -301,3 +301,64 @@ TEST_CASE("all-owner view is for a cookie administrator only", "[access-tokens][
         CHECK_FALSE(sees_all_owners(b));
     }
 }
+
+TEST_CASE("legacy stored ids never become a URL, a path or an attribute other than data-principal-id",
+          "[access-tokens][render][urlsafety]") {
+    // Rows written before the creation charset existed (or by a future writer) can hold any
+    // string. The id must reach the DOM only as an escaped data-* value; the page script
+    // percent-encodes it into a query. No renderer emits an hx-* verb or an href.
+    const std::vector<std::string> ids = {"engine:./bulk-approve?", "engine:../x", "engine:a/b/../c",
+                                          "engine:a\"onmouseover=\"1", "engine:a b#c"};
+    PrincipalsView pv;
+    for (const auto& id : ids) {
+        EnginePrincipalRow r = principal("x");
+        r.principal_id = id;
+        r.display_name = id;
+        pv.rows.push_back(r);
+    }
+    pv.roles = std::vector<PrincipalRole>{};
+    const auto list = render_principals_list(pv);
+    for (const char* bad : {"hx-", "href", "<a ", "action=", "onmouseover=\"1", "src="}) {
+        INFO(bad);
+        CHECK_THAT(list, !ContainsSubstring(bad));
+    }
+    CHECK_THAT(list, ContainsSubstring("data-principal-id=\"engine:./bulk-approve?\""));
+    CHECK_THAT(list, ContainsSubstring("engine:a&quot;onmouseover=&quot;1"));
+
+    for (const auto& id : ids) {
+        PrincipalDetail d;
+        d.row = principal("x");
+        d.row.principal_id = id;
+        d.credentials = std::vector<ApiToken>{};
+        d.roles = std::vector<PrincipalRole>{};
+        d.revoke_detail = std::string{};
+        const auto detail = render_principal_detail(d, id);
+        const auto retry = render_principal_detail(Unavailable{}, id);
+        for (const auto* html : {&detail, &retry}) {
+            CHECK_THAT(*html, !ContainsSubstring("hx-"));
+            CHECK_THAT(*html, !ContainsSubstring("href"));
+            CHECK_THAT(*html, !ContainsSubstring("onmouseover=\"1"));
+        }
+    }
+}
+
+TEST_CASE("token rows render metadata only: hash, rotation group and initiator never appear",
+          "[access-tokens][render][secrets]") {
+    auto t = tok("tid123", "ci");
+    t.token_hash = "SECRETHASHVALUE";
+    t.rotation_group = "ROTGROUPVALUE";
+    t.rotation_initiator = "INITIATORVALUE";
+    t.supersedes_token_id = "tidOLD";
+    t.mcp_tier = "operator";
+    PrincipalDetail d;
+    d.row = principal("bot");
+    d.credentials = std::vector<ApiToken>{t};
+    d.roles = std::vector<PrincipalRole>{};
+    d.revoke_detail = std::string{};
+    d.now = kNow;
+    const std::string html = render_tokens_list(view({t}), flags()) +
+                             render_principal_detail(d, d.row.principal_id);
+    CHECK_THAT(html, ContainsSubstring("tid123"));
+    for (const char* secret : {"SECRETHASHVALUE", "ROTGROUPVALUE", "INITIATORVALUE", "token_hash"})
+        CHECK_THAT(html, !ContainsSubstring(secret));
+}

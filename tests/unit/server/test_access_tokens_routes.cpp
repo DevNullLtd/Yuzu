@@ -395,7 +395,11 @@ TEST_CASE("principals routes: a malformed id is a placeholder and costs no store
     Harness h;
     h.wire();
     for (const char* q : {"", "?id=", "?id=engine:", "?id=bot", "?id=engine:A", "?id=engine:a%2Fb",
-                          "?id=user:alice"}) {
+                          "?id=user:alice",
+                          // dot segments and query smuggling: the charset has no '/', '?', '#'
+                          "?id=engine:./bulk-approve%3F", "?id=engine:../x", "?id=engine:..%2Fx",
+                          "?id=engine:a%3Fb", "?id=engine:a%23b", "?id=engine:a%00b",
+                          "?id=engine:a%5Cb"}) {
         INFO(q);
         const auto res =
             h.sink.dispatch("GET", std::string("/fragments/access/principals/detail") + q);
@@ -512,4 +516,8 @@ TEST_CASE("tokens routes: server.cpp binds the real admin gate, rbac view and ch
     CHECK_THAT(blk, ContainsSubstring("list_all_principal_roles_checked()"));
     CHECK_THAT(blk, ContainsSubstring("get_principal_roles_checked(\"engine\", id)"));
     CHECK_THAT(blk, ContainsSubstring(".perm_fn = perm_fn"));
+    // The revocation detail is the committed revoke's row, never a later failure row's error text.
+    const auto tail = text.find("revoke_detail_fn", at);
+    REQUIRE(tail != std::string::npos);
+    CHECK_THAT(text.substr(tail, 1200), ContainsSubstring("ev.result == \"success\""));
 }

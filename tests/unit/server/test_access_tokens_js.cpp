@@ -48,6 +48,34 @@ TEST_CASE("tokens glue: the one direct fetch is bounded, same-origin and uncache
     CHECK(n == 1);
 }
 
+TEST_CASE("tokens glue: every URL sink takes a fixed path, and data reaches it only as an encoded query",
+          "[access-tokens][js][urlsafety]") {
+    const std::string& js = yuzu::server::kYuzuTokensJs;
+    for (const char* bad : {".href", "window.open", "setAttribute('href'", "setAttribute('src'",
+                            ".src =", "hx-get", "hx-post", "hx-delete", "document.location",
+                            "location.replace", "location.href"}) {
+        INFO(bad);
+        CHECK_THAT(js, !ContainsSubstring(bad));
+    }
+    // The only navigation is the fixed login redirect.
+    std::size_t nav = 0;
+    for (std::size_t p = js.find("location.assign("); p != std::string::npos;
+         p = js.find("location.assign(", p + 1)) {
+        CHECK(js.compare(p, std::string("location.assign('/login')").size(), "location.assign('/login')") == 0);
+        ++nav;
+    }
+    CHECK(nav == 2);
+    // The one data-derived URL is the principal id, appended after '?id=' and percent-encoded;
+    // the state toggle is clamped to the two literals.
+    CHECK_THAT(js, ContainsSubstring("side.dataset.src + '?id=' + encodeURIComponent(id)"));
+    CHECK_THAT(js, ContainsSubstring("(b.dataset.state === 'all' ? 'all' : 'active')"));
+    // Every ajax() call site: a clamped literal, a static data-src, or the encoded id above.
+    std::size_t calls = 0;
+    for (std::size_t p = js.find("ajax("); p != std::string::npos; p = js.find("ajax(", p + 1))
+        ++calls;
+    CHECK(calls == 6);  // definition, its htmx.ajax body, 4 call sites
+}
+
 TEST_CASE("tokens glue: principals are requested only for an effective administrator",
           "[access-tokens][js]") {
     const std::string& js = yuzu::server::kYuzuTokensJs;

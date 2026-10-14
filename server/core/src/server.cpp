@@ -15440,13 +15440,16 @@ private:
                     q.target_type = "EnginePrincipal";
                     q.target_id = id;
                     q.action_prefixes = {"engine_principal.revoke"};
-                    q.limit = 1;
+                    // A later failed or denied attempt writes the same action with a store
+                    // error string as its detail; only the committed revoke is shown.
+                    q.limit = 50;
                     auto events = audit_store_->query(q);
                     if (!events)
                         return std::unexpected(std::string("audit store did not answer"));
-                    if (events->empty())
-                        return std::string{};
-                    return events->front().detail;
+                    for (const auto& ev : *events)
+                        if (ev.result == "success")
+                            return ev.detail;
+                    return std::string{};
                 },
             });
 
