@@ -12,82 +12,73 @@ extern const char* const kLoginHtml =
   <style>
     body {
       display: flex; align-items: center; justify-content: center;
-      height: 100vh;
+      min-height: 100vh; padding: 16px;
     }
+    /* A centred bordered panel on the slate canvas: no gradient, glow or shadow. */
     .login-card {
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 0.75rem; padding: 2.5rem 2rem;
-      width: 360px; text-align: center;
+      width: 380px; max-width: 100%; padding: 28px;
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: var(--rad-panel);
     }
     .login-card h1 {
-      font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem;
+      display: flex; align-items: center; gap: 9px;
+      font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; color: var(--ink);
     }
-    .login-card .subtitle {
-      font-size: 0.8rem; color: var(--mds-color-theme-text-tertiary); margin-bottom: 1.5rem;
+    /* The brand mark: the yellow diamond. */
+    .login-card h1::after {
+      content: ""; width: 9px; height: 9px; margin-top: 4px;
+      background: var(--hl); border-radius: 2px; transform: rotate(45deg);
     }
-    .field {
-      margin-bottom: 1rem; text-align: left;
-    }
-    .field label {
-      display: block; font-size: 0.8rem; font-weight: 600;
-      color: var(--mds-color-theme-text-tertiary); margin-bottom: 0.3rem;
-    }
+    .login-card .subtitle { margin: 4px 0 20px; color: var(--mut); }
+    .field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 16px; }
+    .field label { font-size: 13px; font-weight: 500; color: var(--ink2); }
     .field input {
-      width: 100%; padding: 0.5rem 0.75rem;
-      background: var(--bg); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 0.375rem;
-      font-size: 0.875rem; font-family: var(--mono);
-      outline: none;
+      width: 100%; height: var(--ctl); padding: 0 10px; font: inherit;
+      background: var(--bg); color: var(--ink);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
     }
-    .field input:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 2px var(--mds-color-state-selected);
+    .field input:focus-visible, .btn-login:focus-visible, .btn-sso:focus-visible {
+      outline: 2px solid var(--focus); outline-offset: 2px;
     }
     .btn-login {
-      width: 100%; padding: 0.6rem; font-size: 0.9rem; font-weight: 600;
-      background: var(--accent); color: var(--mds-color-text-on-accent); border: none;
-      border-radius: 0.375rem; cursor: pointer; transition: opacity 0.15s;
-      margin-top: 0.5rem;
+      width: 100%; height: var(--ctl); margin-top: 4px; cursor: pointer;
+      background: var(--primary); color: var(--on-primary);
+      border: 1px solid var(--primary); border-radius: var(--rad-ctl);
+      font: inherit; font-weight: 600; transition: background .12s, border-color .12s;
     }
-    .btn-login:hover { opacity: 0.85; }
-    .btn-login:disabled { opacity: 0.4; cursor: not-allowed; }
-    .error-msg {
-      color: var(--red); font-size: 0.8rem; margin-top: 0.75rem;
-      min-height: 1.2em;
-    }
-    .sso-section {
-      margin-top: 1.5rem; padding-top: 1rem;
-      border-top: 1px solid var(--border);
-    }
+    .btn-login:hover { background: var(--primary-h); border-color: var(--primary-h); }
+    .btn-login:disabled { opacity: .4; cursor: not-allowed; }
+    .error-msg { min-height: 1.2em; margin-top: 12px; font-size: 13px; color: var(--bad); }
+    .sso-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
     .btn-sso {
-      width: 100%; padding: 0.5rem; font-size: 0.85rem; font-weight: 500;
-      background: var(--surface); color: var(--mds-color-theme-outline-secondary);
-      border: 1px solid var(--border); border-radius: 0.375rem;
-      cursor: not-allowed; opacity: 0.5;
-      transition: opacity 0.15s, border-color 0.15s;
+      width: 100%; height: var(--ctl); cursor: not-allowed; opacity: .5;
+      background: var(--raise); color: var(--ink);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+      font: inherit; font-weight: 500; transition: background .12s, border-color .12s;
     }
-    .btn-sso.enabled {
-      color: var(--fg); cursor: pointer; opacity: 1;
-      border-color: var(--accent);
-    }
-    .btn-sso.enabled:hover { background: var(--mds-color-theme-background-solid-secondary); }
-    .sso-label {
-      font-size: 0.7rem; color: var(--mds-color-theme-outline-secondary); margin-top: 0.4rem;
-    }
+    .btn-sso.enabled { cursor: pointer; opacity: 1; }
+    .btn-sso.enabled:hover { background: var(--surface2); border-color: var(--mut); }
+    .sso-label { margin-top: 6px; font-size: 12.5px; color: var(--faint); }
     .enroll-secret {
-      text-align: left; background: var(--bg); border: 1px solid var(--border);
-      border-radius: 0.375rem; padding: 0.75rem; margin-bottom: 1rem;
-      font-size: 0.75rem;
+      margin-bottom: 16px; padding: 12px 14px; font-size: 13px;
+      background: var(--surface2); border: 1px solid var(--line2); border-radius: var(--rad-panel);
     }
-    .enroll-secret-label {
-      font-size: 0.7rem; color: var(--mds-color-theme-text-tertiary); margin-bottom: 0.2rem;
-    }
-    .enroll-secret code {
-      font-family: var(--mono); color: var(--fg); font-size: 0.8rem;
+    .enroll-secret-label { margin-bottom: 2px; font-size: 12.5px; color: var(--mut); }
+    .enroll-secret code { font-family: var(--mds-font-family-mono); font-size: 12.5px; color: var(--ink); }
+    /* The QR image carries its own white ground and quiet zone, so it is only clipped to the control radius. */
+    .enroll-qr-box { overflow: hidden; border-radius: var(--rad-ctl); line-height: 0; }
+    .enroll-qr-hint { margin-bottom: 8px; text-align: center; font-size: 12.5px; color: var(--mut); }
+    .recovery-list {
+      margin: 0 0 16px; padding: 12px 12px 12px 28px;
+      background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+      font-family: var(--mds-font-family-mono); font-size: 12.5px; color: var(--ink);
     }
   </style>
 </head>
-<body>
+)HTM"
+    // Split here to stay under MSVC's C2026 16380-byte raw-string limit; adjacent
+    // literals concatenate, so the served HTML is unchanged.
+    R"HTM(<body>
   <div class="login-card">
     <h1>Yuzu</h1>
     <div class="subtitle">Sign in to the dashboard</div>
@@ -125,11 +116,10 @@ extern const char* const kLoginHtml =
       <div class="subtitle">Multi-factor authentication is required. Scan this with your
         authenticator app, then enter the 6-digit code it shows to finish signing in.</div>
       <input type="hidden" id="enroll-pending-token">
-      <div id="enroll-qr" style="display:none;justify-content:center;margin:0 0 0.5rem 0">
-        <div style="background:#fff;padding:8px;border-radius:6px;line-height:0"></div>
+      <div id="enroll-qr" style="display:none;justify-content:center;margin:0 0 8px 0">
+        <div class="enroll-qr-box"></div>
       </div>
-      <div id="enroll-qr-hint" style="display:none;font-size:0.7rem;
-        color:var(--mds-color-theme-text-tertiary);text-align:center;margin-bottom:0.5rem">
+      <div id="enroll-qr-hint" class="enroll-qr-hint" style="display:none">
         Can't scan? Enter the secret below manually.</div>
       <div class="enroll-secret">
         <div class="enroll-secret-label">Base32 secret (manual entry)</div>
@@ -147,12 +137,10 @@ extern const char* const kLoginHtml =
       <div class="error-msg" id="enroll-error-msg" role="alert" aria-live="polite"></div>
     </form>
 
-    <div id="recovery-panel" style="display:none;text-align:left">
-      <div class="subtitle" style="text-align:center">Save these recovery codes now — each can be
+    <div id="recovery-panel" style="display:none">
+      <div class="subtitle">Save these recovery codes now — each can be
         used once if you lose your authenticator.</div>
-      <ul id="recovery-list" style="font-family:var(--mono);font-size:0.85rem;
-        background:var(--bg);border:1px solid var(--border);border-radius:0.375rem;
-        padding:0.75rem 0.75rem 0.75rem 1.75rem;margin:0 0 1rem 0"></ul>
+      <ul id="recovery-list" class="recovery-list"></ul>
       <button type="button" class="btn-login" onclick="window.location.href='/'"
               aria-label="Continue to dashboard">I've saved them — Continue</button>
     </div>

@@ -281,7 +281,7 @@ Operator                     Server                                  Agent
 
 **Why a single-flight cache?** A topology fetch fans out to every agent in scope, so concurrent operator requests would otherwise dispatch N parallel `tar.fleet_snapshot` storms. The store coalesces concurrent misses onto one refill goroutine; in-flight waiters block on a condition variable up to a bounded timeout; subsequent gets within the 5 s TTL hit the cache.
 
-**Why ES modules + importmap rather than UMD?** Three.js dropped UMD in r150+ — modern releases only publish `three.module.min.js`. The page declares an importmap mapping the bare specifier `"three"` to the vendored bundle, so OrbitControls' own `import { ... } from 'three'` resolves through the same map without a build-time bundler. Browser support floor: Chrome 89 / Firefox 108 / Safari 16.4 (importmap), all comfortably below the dashboard's existing baseline.
+**Why ES modules + importmap rather than UMD?** Three.js dropped UMD in r150+ — modern releases only publish `three.module.min.js`. The page declares an importmap mapping the bare specifier `"three"` to the vendored bundle, so OrbitControls' own `import { ... } from 'three'` resolves through the same map without a build-time bundler. Importmap alone needs Chrome 89 / Firefox 108 / Safari 16.4, but the shared dashboard stylesheet (`color-mix()`, `:has()`) sets the real floor for every page: Chrome/Edge 111, Firefox 121, Safari 16.2, with this page's importmap raising Safari to 16.4 (see "Browser requirements" in `docs/user-manual/server-admin.md`).
 
 **Why a kill switch?** WebGL has a much larger attack surface than HTML, the renderer module is large (~6 KB hand-written + ~717 KB vendored), and the data path fans out to every agent. Operators who never use the feature should be able to disable it cleanly. `--viz-disable` (or `YUZU_VIZ_DISABLE=1`) makes both the page and the REST surface return 503 with an audit row, ahead of any RBAC check (tier-before-permission per `docs/auth-architecture.md` §3).
 
@@ -300,7 +300,7 @@ in-process-untestable handler is an authorization/CSRF/scope-check blind spot) i
 surfaces this prose previously credited to this inline count have moved to their own
 `HttpRouteSink` modules: `POST /api/command` is `command_routes.cpp` (#2557); the
 page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
-`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is
+`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 29 routes — is
 `page_routes.{hpp,cpp}` (#2542 PR-2); a #2542 follow-up split 10 further scattered routes into
 `dashboard_api_routes.{hpp,cpp}` (`/api/me`, `/api/agents`, `/api/audit`, `POST
 /api/export/json-to-csv`, `POST /api/scope/validate`, `/api/analytics/{status,recent}`; 7 routes)

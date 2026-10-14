@@ -1924,6 +1924,8 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
     s.send_orphan_exceptions =
         spark_drain_worker_ ? spark_drain_worker_->send_orphan_exception_count() : 0;
     s.send_stalls = spark_drain_worker_ ? spark_drain_worker_->send_stall_count() : 0;
+    s.send_order_hold_releases =
+        spark_drain_worker_ ? spark_drain_worker_->cross_lane_order_release_count() : 0;
     return s;
 }
 
@@ -2125,10 +2127,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // or one whose late result has returned and whose compensating teardown is still
     // running; #5459 option D - the generation is held, never acknowledged, so this
     // re-push keeps arriving, and suppressing it is what keeps a held endpoint from
-    // paying a full teardown + re-arm every 25s; bounded by decide_retry()'s safety
-    // valve) - without this, every such retry would
-    // re-run the full teardown+re-arm below, withdrawing and re-dispatching a claim
-    // that was already correctly in flight (a spurious detach_all() per retry; an
+    // re-running the whole reconcile every 25s; bounded by decide_retry()'s safety
+    // valve) - without this, every such retry would re-run it below. Since #4415 that
+    // re-run leaves a healthy, unchanged rule and an identical in-flight arm alone
+    // (attach_core's skip) but still rebuilds a rule that is not, so the suppression
+    // stays the cheap path. Before #4415 each retry tore down and re-armed every rule,
+    // withdrawing and re-dispatching a claim that was already correctly in flight (an
     // arm slower than the retry interval would never converge). content_id is
     // computed BEFORE begin_application() below can supersede the application this
     // checks against. guardian_push_content_id() allocates on the unguarded dispatch
@@ -2223,14 +2227,18 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // never this counter (arm_failures_/reconcile_failures stay a genuine-failure
     // signal only, unaffected by Accepted).
     std::size_t pending_arms = 0;
-    // F7: rule_ids seen in a full_sync push, for the unsupported_rules_ sweep below.
-    // guards_/spark_runtime_ don't need this - they're unconditionally torn down and
-    // rebuilt fresh by stop_all_guards_locked()/detach_all() + the loop below.
-    // unsupported_rules_ is passive bookkeeping, not a live resource, so it is
-    // deliberately NOT blanket-cleared the same way (see the comment further down) -
-    // it needs this set instead.
-    std::set<std::string> full_sync_ids;
+    // F7: rule_ids seen in a full_sync push, for the unsupported_rules_ sweep below, and (#4415)
+    // the set the spark teardown below keeps. Legacy guards are still torn down and rebuilt
+    // wholesale by stop_all_guards_locked() + the loop below, but a spark-attached rule the push
+    // still carries is left to reconcile_rule_locked, which skips it when healthy and unchanged;
+    // only an omitted one is detached here. unsupported_rules_ is passive bookkeeping, not a live
+    // resource, so it is deliberately NOT blanket-cleared (see the comment further down) - it
+    // needs this set instead. Filled for EVERY rule in the push, disabled ones included:
+    // reconcile_rule_locked detaches a disabled rule itself.
+    std::set<std::string, std::less<>> full_sync_ids; // transparent: contains(string_view) allocates nothing
     if (push.full_sync()) {
+        for (const auto& rule : push.rules())
+            full_sync_ids.insert(rule.rule_id());
         // #4021: NEVER kv_->clear(kKvNamespace) here — a blanket clear would also
         // wipe every kBaselinePrefix baseline record, reintroducing exactly the
         // silent-relaunder bug this file's baseline persistence exists to close (a
@@ -2240,6 +2248,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // and kBaselinePrefix records (deliberately untouched by full_sync — see
         // guardian_seed_baseline's doc for why absence-from-a-push must not sweep
         // a baseline either).
+        // #4415: within kRulePrefix the sweep removes only the rows the push OMITS
+        // (absent from full_sync_ids). A row the push still carries is left in place and
+        // put_rule_locked rewrites it only when the stored bytes differ, so an identical
+        // re-push no longer deletes and re-inserts every rule row (~2R KV events per push).
+        // Every latch below is unchanged and now applies to the omitted set: it is the set
+        // a failed scan or a failed delete could wrongly leave behind.
         // Gate 4 governance BLOCKING-class finding (unhappy-path UP-1): `list()`'s
         // bare `while (step()==SQLITE_ROW)` loop cannot distinguish end-of-rows
         // from a mid-scan I/O error (kv_store.cpp's own comment on `list_entries`
@@ -2289,6 +2303,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                 const std::string_view rid = key_view.size() > kRulePrefix.size()
                                                   ? key_view.substr(kRulePrefix.size())
                                                   : std::string_view{};
+                // #4415: a row the push still carries is kept (put_rule_locked below
+                // decides whether to rewrite it). full_sync_ids holds only ids the
+                // up-front validation accepted, so a non-conforming stored row never
+                // matches and is still swept and counted.
+                if (full_sync_ids.contains(rid))
+                    continue;
                 if (!is_valid_rule_id(rid))
                     ++non_conforming;
                 rule_keys.push_back(std::move(row.key));
@@ -2302,7 +2322,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             if (!rule_keys.empty()) {
                 const int cleared = kv_->del_keys(kKvNamespace, rule_keys);
                 if (static_cast<std::size_t>(cleared) == rule_keys.size()) {
-                    spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
+                    spdlog::info("Guardian: full_sync removed {} prior rule(s) absent from the push",
+                                 cleared);
                 } else {
                     // del_keys() is transactional (all-or-nothing) but returns 0 on
                     // EITHER a genuine BEGIN/step/COMMIT failure OR (defensively) a
@@ -2327,14 +2348,15 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // call sites got (rung 9c PR-2 Unit 6 gate, coordinator finding): this site
         // does not GATE an advance decision - policy_generation_ is already whatever
         // it was, unchanged by this call either way - it only re-affirms the CURRENT
-        // value defensively after a full_sync KV clear. A failed write here just
+        // value defensively after a full_sync KV sweep. A failed write here just
         // means the durable marker can lag the in-memory value for one more cycle,
         // never a wrong "caught up" signal to the server; out of scope for this fix.
         (void)persist_generation_locked(policy_generation_);
-        // Full sync replaces the active set - tear down BOTH backends before
-        // re-arming (rung 7: a spark-attached rule the new push omits must be
-        // withdrawn too, not left dangling - Sol's rev-2 review). FIREWALLED like the
-        // per-rule reconcile below: stop_all_guards_locked/detach_all allocate (lifecycle
+        // Full sync replaces the active set - tear down the legacy backend and the spark
+        // rules the push omits before re-arming (rung 7: a spark-attached rule the new push
+        // omits must be withdrawn too, not left dangling - Sol's rev-2 review; #4415: a rule it
+        // still carries is NOT detached here, see full_sync_ids above). FIREWALLED like the
+        // per-rule reconcile below: stop_all_guards_locked/detach_rules_except allocate (lifecycle
         // enqueue, disarm, Key strings), and a bad_alloc here would otherwise escape
         // apply_rules onto the un-firewalled dispatch/run() thread and abort the whole
         // agent - the same #2037 class the per-rule firewall closes, on the full_sync
@@ -2343,7 +2365,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         try {
             stop_all_guards_locked();
             if (spark_runtime_)
-                spark_runtime_->detach_all();
+                spark_runtime_->detach_rules_except(full_sync_ids);
             // F7: deliberately NOT unsupported_rules_.clear() here - that would make
             // every rule the loop below re-classifies Unsupported look "newly"
             // unsupported (the per-outcome erase/insert in reconcile_rule_locked can't
@@ -2361,6 +2383,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         }
     }
 
+    preserved_tally_.reset(); // #4415: this push's skipped-rule record starts empty
     for (const auto& rule : push.rules()) {
         // #4665: an empty rule_id is one shape of an invalid rule_id, already
         // rejected for the WHOLE push by the pre-validation scan at the top of
@@ -2369,8 +2392,6 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // so the per-rule skip-and-continue this comment used to sit above is
         // unreachable and has been removed rather than kept as dead defensive
         // code.
-        if (push.full_sync())
-            full_sync_ids.insert(rule.rule_id()); // F7
         if (!put_rule_locked(rule)) {
             // This return skips the reconcile_failures > 0 latch below entirely -
             // latch explicitly, so a later heartbeat tick can never advance this
@@ -2392,7 +2413,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             ++reconcile_failures;
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
-                spdlog::error("Guardian: reconcile threw for rule '{}' - persisted but not armed",
+                spdlog::error("Guardian: reconcile threw for rule '{}' - persisted; whether its "
+                              "previous arm survives is not guaranteed",
                               log_id_token(rule.rule_id()));
             } catch (...) {
             }
@@ -2429,9 +2451,19 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     }
 
     if (push.full_sync()) {
+        // #4415: name the rules this full_sync left in place, so a reader can account for every
+        // rule in the push (re-armed, preserved or neither) instead of inferring by count. One
+        // bounded line per full_sync that reaches the end of the rule loop (N may be 0), from
+        // this thread only; best-effort under allocation failure (the catch below).
+        try {
+            auto line = preserved_tally_.format();
+            spdlog::info("{}", line);
+            last_full_sync_preserved_line_for_test_ = std::move(line);
+        } catch (...) {
+        }
         // F7: a rule_id that was Unsupported before this full_sync but is absent from
-        // the new push is no longer part of the active rule set at all (kv_ was
-        // cleared above; only push.rules() gets re-persisted) - forget it, or it
+        // the new push is no longer part of the active rule set at all (the omitted rows
+        // were deleted above; only push.rules() gets re-persisted) - forget it, or it
         // reports a phantom count forever. Rule_ids retained in the new push were
         // already updated in place by the loop above (erase-if-not-Unsupported /
         // insert-if-Unsupported inside reconcile_rule_locked), so this only removes
@@ -2691,6 +2723,11 @@ std::string GuardianEngine::last_rearm_degrade_message_for_test() const {
     return last_rearm_degrade_message_for_test_;
 }
 
+std::string GuardianEngine::last_full_sync_preserved_line_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_full_sync_preserved_line_for_test_;
+}
+
 GuardianEngine::UnsupportedLogRecord GuardianEngine::last_unsupported_log_for_test() const {
     std::lock_guard lock(mtx_);
     return last_unsupported_log_for_test_;
@@ -2745,7 +2782,16 @@ void GuardianEngine::note_boot_rearm_failure_locked() noexcept {
 bool GuardianEngine::put_rule_locked(const gpb::GuaranteedStateRule& rule) {
     if (!kv_) return false;
     auto j = rule_to_json(rule).dump();
-    return kv_->set(kKvNamespace, make_rule_key(rule.rule_id()), j);
+    const auto key = make_rule_key(rule.rule_id());
+    // #4415: skip the write when the stored row already holds these exact bytes, so an
+    // identical full_sync re-push does not re-write every rule row. get_entry (not get)
+    // because it tells an absent row from a failed read; ANY read failure, an absent row
+    // or a byte difference (including a corrupt stored row) falls through to the write.
+    // An unreadable row is never treated as "already equal".
+    if (auto stored = kv_->get_entry(kKvNamespace, key); stored && stored->has_value() &&
+                                                         **stored == j)
+        return true;
+    return kv_->set(kKvNamespace, key, j);
 }
 
 void GuardianEngine::refresh_count_locked() {
@@ -3440,8 +3486,20 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
                     spark_runtime_->detach_rule(rule.rule_id());
                 return ReconcileOutcome::Failed;
             }
+            // #4415: the runtime skipped this rule (healthy and unchanged, or an identical arm
+            // already in flight). Recorded here, on the apply_rules thread under mtx_, never in
+            // the runtime's mechanism path; apply_rules logs the aggregate after the rule loop.
+            // A skip that is still Pending (Accepted) is NOT a confirmed arm: it is reported
+            // separately so the reader keeps waiting for its outcome (R5.7 completeness).
+            if (res->skipped) {
+                if (res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed)
+                    preserved_tally_.note(rule.rule_id());
+                else
+                    preserved_tally_.note_pending(rule.rule_id());
+            }
             if (res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed)
-                return ReconcileOutcome::Armed; // attach_rule already enqueued its own "armed" audit entry
+                return ReconcileOutcome::Armed; // attach_rule already enqueued its own "armed" audit entry,
+                                                // unless it skipped the rule (#4415): then none is owed
             // Accepted: register the receipt with whichever application is currently open
             // (apply_rules()'s per-push application, or none at boot - start_local()'s own
             // re-arm loop opens its own application before this ever runs, §R5.3's "handle

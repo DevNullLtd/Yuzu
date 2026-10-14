@@ -695,7 +695,7 @@ else
     # because a non-default option stored in a persistent, branch-shared CI build
     # dir makes every older branch's --reconfigure fail ("Unknown options").
     error('Erlang gateway required (-Drequire_gateway=true) but rebar3 was not '
-          + 'found on PATH. Install Erlang/OTP 28 + rebar3 (CI: erlef/setup-beam).')
+          + 'found on PATH. Install Erlang/OTP 28 + rebar3 (CI: see this leg\'s Erlang install step in ci.yml).')
   endif
   message('Erlang gateway: skipped (rebar3 not found)')
 endif

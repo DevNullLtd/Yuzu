@@ -70,6 +70,7 @@
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
+#include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
 #include "response_export_metrics.hpp" // #4644/#4703: param-rejected counter (shared with REST)
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
@@ -1018,6 +1019,46 @@ static const ToolDef kTools[] = {
      "read whose audit row was dropped) — a genuinely nonexistent id writes no audit row.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"workflow_id":{"type":"string"},"status":{"type":"string"},"agent_ids":{"type":"array","items":{"type":"string"}},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"steps":{"type":"array","items":{"type":"object","properties":{"step_index":{"type":"integer"},"instruction_id":{"type":"string"},"status":{"type":"string"},"result":{},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"attempt":{"type":"integer"}},"required":["step_index","instruction_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the confinement-denied or success audit row failed to persist (set-and-proceed — the read still succeeds)."}},"required":["id","workflow_id","status","agent_ids","current_step","started_at","completed_at","steps"]})j"},
+
+    {"list_workflow_executions", "List workflow executions (runs) — WorkflowEngine's own multi-step "
+     "run records, a DIFFERENT data model from list_executions's single-instruction fan-out "
+     "Executions: a workflow run never appears there. Use it to see which runs happened, their "
+     "status and progress, then call get_workflow_execution with an id for the per-step results. "
+     "Rows are metadata only (id, workflow_id, workflow_name, workflow_deleted, status, "
+     "current_step, started_at, completed_at) — never agent ids, step results or a fleet-size "
+     "count. Newest first by (started_at, id); page with next_cursor passed back as cursor (null "
+     "when no more rows exist) — a cursor is a position only and does not bind the other filters. "
+     "latest_per_workflow=true returns at most one run per workflow (the newest among the runs "
+     "that pass the other filters and your visibility), ordered by workflow_id, with no cursor "
+     "(combining the two is refused) and result_truncated_by_cap true when more workflows matched "
+     "than limit. Requires Workflow:Read through the fleet-read gate (admit-then-filter): a "
+     "confined caller (management-group or service-scoped) sees only runs with at least one agent "
+     "in its scope, applied before ordering and the page limit, so hidden runs never consume a "
+     "page slot or shape a cursor. Input is strict: an unknown argument, an out-of-vocabulary "
+     "status, a malformed workflow_id/since/until/cursor, since after until, or limit below 1 is "
+     "refused as invalid params; limit above 500 is clamped. Scale: only workflow_id is indexed — "
+     "since, until and status narrow the result but not the scan — and a confined caller also pays "
+     "to check the agent list of every candidate run, so a confined caller on a large run table "
+     "should always pass workflow_id. A store failure or a read that exceeds the 1.5 s budget is a "
+     "retryable error carrying retry_after_ms, never a short or empty list: narrow by workflow_id "
+     "and retry. Mirrors REST GET "
+     "/api/v1/workflow-executions. Read-only; audited as the generic mcp.list_workflow_executions "
+     "on success (the gate audits a denial).",
+     R"j({"type":"object","properties":{)j"
+     R"j("workflow_id":{"type":"string","maxLength":128,"pattern":"^[A-Za-z0-9_-]{1,128}$","description":"Exact workflow filter"},)j"
+     R"j("status":{"type":"string","enum":["pending","running","completed","failed","cancelled"],"description":"Exact status filter"},)j"
+     R"j("since":{"type":"integer","minimum":0,"maximum":9007199254740992,"description":"Runs started at or after this epoch second"},)j"
+     R"j("until":{"type":"integer","minimum":0,"maximum":9007199254740992,"description":"Runs started strictly before this epoch second; must not be before since"},)j"
+     R"j("limit":{"type":"integer","default":50,"minimum":1,"maximum":500,"description":"Page size; above 500 is clamped"},)j"
+     R"j("cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page; not combinable with latest_per_workflow"},)j"
+     R"j("latest_per_workflow":{"type":"boolean","default":false,"description":"At most one (the newest visible) run per workflow, ordered by workflow_id"})j"
+     R"j(},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("id":{"type":"string"},"workflow_id":{"type":"string"},"workflow_name":{"type":"string"},"workflow_deleted":{"type":"boolean","description":"True when the workflow was soft-deleted; its history is kept"},"status":{"type":"string"},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"})j"
+     R"j(},"required":["id","workflow_id","workflow_name","workflow_deleted","status","current_step","started_at","completed_at"]}},)j"
+     R"j("next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows exist"},)j"
+     R"j("result_truncated_by_cap":{"type":"boolean","description":"Present (true) only under latest_per_workflow when more workflows matched than limit"})j"
+     R"j(},"required":["executions","next_cursor"]})j"},
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
@@ -3193,13 +3234,16 @@ static const ToolDef kTools[] = {
      "decision (PluginConfigStore::action_allowed collapses any store error to disabled, "
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
-     "enabled=true with no reason/set_by. Without os this reports the all-OS layer only and "
+     "enabled=true with no reason/set_by. For a protective action (the quarantine plugin's "
+     "quarantine/unquarantine/status/whitelist and __guard__.push_rules) the state shown here is "
+     "informational only: enabled=false can be displayed while dispatch still proceeds. "
+     "Without os this reports the all-OS layer only and "
      "never reflects a per-OS OFF row. Requires PluginConfig:Read.",
      // plugin maxLength is 68, not 64: parse_kill_switch_scope also accepts a
      // reserved-namespace plugin name (__<identifier>__, #3265), whose total
      // length can reach kMaxIdentifierBytes (64) + 4 sentinel bytes = 68 —
      // this schema must not reject an input the store would accept.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the EFFECTIVE state and reason/set_by/source name the row that produced it. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"}},"required":["plugin"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the effective state of the switch row (for a protective action that row never gates dispatch) and reason/set_by/source name the row that produced it. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"}},"required":["plugin"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"os":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"set_plugin_kill_switch",
@@ -3208,10 +3252,14 @@ static const ToolDef kTools[] = {
      "dispatch-gating caller that consults this switch fails CLOSED (treats disabled) on any "
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
+     "Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/"
+     "whitelist and __guard__.push_rules) is never refused by this switch; a row for one is "
+     "stored and echoed but has no dispatch effect; to stop Guardian rule delivery disable or "
+     "remove the rules instead (disarms them on the agent's next reconcile). "
      "The result echoes the row written, not the effective state. Requires "
      "PluginConfig:Write.",
      // plugin maxLength is 68 — see the identical note on get_plugin_kill_switch above.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS to narrow the switch to; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS to narrow the switch to; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed; for a protective action the row is stored but has no dispatch effect"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"os":{"type":"string"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"mint_upload_grant",
@@ -3900,6 +3948,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // gated on fleet_read_fn — a real confinement mechanism, so it earns the
     // `confined` tag (same precedent as query_responses/get_agent_details).
     {"get_workflow_execution", {"Workflow", "Read", ServiceScopeClass::confined}},
+    // The run LIST is the same data under the same gate: fleet_read_fn_ is its sole authorization
+    // and its scope is pushed into the store's SQL before ORDER BY/LIMIT (a real confinement
+    // mechanism, so `confined` is honest). kServiceScopeGlobalSafe is NOT widened.
+    {"list_workflow_executions", {"Workflow", "Read", ServiceScopeClass::confined}},
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     // #2146 Batch B2 -- result-set tools. `ResultSet` is NOT a seeded RBAC
@@ -4663,6 +4715,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_workflows", {ToolEffect::ReadOnly, true, "List workflows"}},
     {"get_workflow", {ToolEffect::ReadOnly, true, "Get workflow"}},
     {"get_workflow_execution", {ToolEffect::ReadOnly, true, "Get workflow execution"}},
+    {"list_workflow_executions", {ToolEffect::ReadOnly, true, "List workflow executions"}},
     {"validate_scope", {ToolEffect::ReadOnly, true, "Validate scope"}},
     {"preview_scope_targets", {ToolEffect::ReadOnly, true, "Preview scope targets"}},
     // #2146 Batch B2 -- result-set tools. The mechanical rule (readOnlyHint
@@ -11742,6 +11795,64 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto payload = workflow_execution_detail_json(**exec_result, gate.scope);
                 if (!audit_ok)
                     payload["audit_persisted"] = false;
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── list_workflow_executions ──────────────────────────────────
+            // The run LIST: same data model and gate as get_workflow_execution above. fleet_read_fn_
+            // is the SOLE gate (never paired with perm_fn on (Workflow, Read)); its scope goes to the
+            // WorkflowApi seam, whose store applies it before ORDER BY/LIMIT (ADR-0017 INV-3), so no
+            // post-fetch workflow_execution_visible() pass is needed or wanted here. Strict input, no
+            // success-path audit beyond the generic mcp_audit (REST writes none).
+            if (tool_name == "list_workflow_executions") {
+                // The two unwired branches carry the A4 envelope with no retry hint: both
+                // dependencies are wired once at construction, so a retry cannot succeed.
+                if (!fleet_read_fn_) {
+                    spdlog::error(
+                        "list_workflow_executions: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(a4_error(kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Workflow", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                auto query = parse_workflow_execution_list_args(args);
+                if (!query) {
+                    // retry-hint-exempt: caller-input rejection, not a store fault.
+                    res.set_content(
+                        a4_error(kInvalidParams, query.error(),
+                                 "correct the arguments to match this tool's tools/list "
+                                 "inputSchema and re-call"),
+                        "application/json");
+                    return;
+                }
+                if (!workflow_api_) {
+                    res.set_content(a4_error(kInternalError, "Workflow engine unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto page = workflow_api_->list_workflow_executions(*query, gate.scope);
+                if (!page) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                yuzu::server::genericize_db_error("list_workflow_executions",
+                                                                  page.error()),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Assigned key by key, not built as a braced initializer: a line that opens with
+                // an initializer entry is read by check-mcp-retry-hints.py as a new tool entry.
+                nlohmann::json payload = nlohmann::json::object();
+                payload["executions"] = workflow_execution_rows_json(*page);
+                payload["next_cursor"] = workflow_execution_next_cursor_json(*page);
+                if (page->truncated_by_cap)
+                    payload["result_truncated_by_cap"] = true;
+                mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                     "application/json");
@@ -19072,17 +19183,18 @@ McpServer::HandlerFn McpServer::build_handler(
                             -> std::pair<std::string, int> {
                             // ReapplyDispatchFn's narrower pair shape is deliberate --
                             // see its own doc comment. `is_quarantine_control_plugin`
-                            // exempts the quarantine plugin's own actions from the
-                            // CONTAINMENT gate only (dispatch_confined_arms.hpp's
-                            // `compose_containment_gate`) -- it does NOT exempt them
-                            // from #3511's plugin-presence filter, which is sourced
-                            // unconditionally from `AgentRegistry::ids_missing_plugin`.
-                            // A reapply to an agent genuinely missing the quarantine
-                            // plugin is still withheld (correctly -- it would fail
-                            // regardless), it just can't be DISCRIMINATED as such
-                            // through this narrower return shape; see the caller's
-                            // `agents_reached == 0` handling, which reads this as an
-                            // ordinary unreached/retry case, not a permanent one.
+                            // is the closed quarantine set inside the shared
+                            // protective predicate (yuzu::protective::
+                            // is_protective_action): these actions are exempt from
+                            // the CONTAINMENT gate, the kill switch, the per-OS
+                            // withhold and #3511's plugin-presence filter
+                            // (`AgentRegistry::ids_missing_plugin` returns nothing
+                            // for them). A reapply to an agent genuinely missing
+                            // the quarantine plugin is therefore delivered and the
+                            // agent answers with its own plugin-not-found; the
+                            // narrower return shape can't discriminate that, so see
+                            // the caller's `agents_reached == 0` handling, which
+                            // reads an unreached result as an ordinary retry case.
                             if (!dispatch_fn)
                                 return {};
                             const auto outcome = dispatch_fn("quarantine", "quarantine", {agent_id},
@@ -20966,8 +21078,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // fleet-wide, which is exactly what an incident review needs
                 // evidence of and cannot reconstruct afterwards.
                 const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
+                // A row on a protective pair is stored but never gates dispatch;
+                // label the evidence so it is never read as proof of a stop.
+                const std::string ks_detail =
+                    plugin_config::kill_switch_set_detail(*scope, enabled);
                 if (!audit_fn(req, "plugin_config.kill_switch.set", "attempted", "PluginConfig",
-                              target_id, std::string("enabled=") + (enabled ? "true" : "false"))) {
+                              target_id, ks_detail)) {
                     res.set_content(
                         a4_error(503, "the audit record could not be persisted; the kill switch was "
                                       "NOT changed — retry once the audit store recovers"),
@@ -20977,8 +21093,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto result = plugin_config_store_->set_kill_switch(plugin, action, enabled, reason,
                                                                     session->username, *os);
-                const std::string ks_detail =
-                    std::string("enabled=") + (enabled ? "true" : "false");
                 if (!result) {
                     plugin_config_outcome("plugin_config.kill_switch.set", false, "PluginConfig",
                                           target_id, ks_detail);
@@ -20992,6 +21106,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 plugin_config_outcome("plugin_config.kill_switch.set", true, "PluginConfig",
                                       target_id, ks_detail);
+                // Warn only once the row is stored, so the log never claims a store
+                // that an audit 503 or a failed write prevented.
+                if (plugin_config::kill_switch_row_covers_protective(*scope)) {
+                    spdlog::warn("plugin_config: kill-switch row {} covers a protective action; "
+                                 "stored, never refuses the protective dispatch",
+                                 target_id);
+                }
                 JObj payload;
                 payload.add("plugin", result->plugin)
                     .add("action", result->action)

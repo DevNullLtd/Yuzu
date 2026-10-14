@@ -2001,6 +2001,10 @@ Quarantine a device.
 > | `os_gate_unreadable` (#5294) | Agent presence could not be read while a per-OS kill switch is set, so the dispatch failed closed rather than reaching only this replica's local agents. Transient. | `5000` |
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
+> `plugin_not_found`, `kill_switched_os` and `os_gate_unreadable` are never produced for a
+> protective action (the quarantine plugin's four actions and `__guard__.push_rules`); see
+> [Upgrading](upgrading.md#behaviour-change-protective-actions-exempt-from-plugin-enablement).
+>
 > `reason` is a top-level key on the error object, not part of the A4
 > `error.data` envelope. `POST /api/instructions/{id}/execute` carries the
 > same `reason` `503` split as `POST /api/command` above
@@ -5876,6 +5880,8 @@ surfaces admit the same **result set** for a given caller: `GET /api/v1/executio
 branch (below) is materially broader than the pre-existing MCP `list_executions` confinement
 (own-dispatches-only) — a disclosed, pre-#4030 difference, not a silent one (`docs/user-manual/mcp.md`).
 
+`GET /fragments/executions` also takes `view=page` (the Executions page list) and `status`, an allow-list of this fragment's own (`running`, `succeeded`, `completed`, `cancelled`, `pending`), not the v1 twin's enum. An empty `status` is no filter; an unknown `status` or a malformed `definition_id` answers `200` with a `data-invalid` note, never an empty list.
+
 **Prerequisite fix bundled with this PR:** `Workflow` was used as an RBAC securable throughout
 `workflow_routes.cpp` but was never seeded into `RbacStore`'s securable-types catalogue — meaning
 no role, including Administrator, could ever be granted `Workflow:Read` while RBAC was enabled.
@@ -5911,6 +5917,62 @@ you've already narrowed them.
 **Permission:** `Workflow:Read`. Fetch one workflow's full detail, including `yaml_source`. The v1
 twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
 soft-deleted id.
+
+#### `GET /api/v1/workflow-executions`
+
+**Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (ADR-0017), the same sole gate as
+the detail route below. Lists workflow **runs** (`WorkflowEngine`'s own multi-step run records, a
+different data model from the instruction `Execution`s `GET /api/v1/executions` lists; a workflow
+run never appears there). MCP twin `list_workflow_executions`; there is no legacy unversioned list.
+
+Rows carry metadata only: `id`, `workflow_id`, `workflow_name`, `workflow_deleted` (`true` when the
+workflow was soft-deleted; its history is kept), `status`, `current_step`, `started_at`,
+`completed_at`. Never agent ids, step results or `agents_reached` (use the detail route for those).
+Newest first by `(started_at, id)`.
+
+A confined caller (management-group or service-scoped) sees only runs with at least one agent in
+its scope. The scope is applied in the database **before** ordering and the page limit, so a run
+the caller cannot see never takes a page slot, `next_cursor` and the page length depend only on
+runs the caller may see, and a hand-made cursor naming a hidden run reveals nothing. A run whose
+stored agent list is malformed, empty or not an array is invisible to a confined caller.
+`pagination.total` is the number of rows **in this page**, never a fleet-wide count.
+
+| Parameter | Meaning |
+|---|---|
+| `workflow_id` | Exact workflow filter (1-128 characters of `A-Z a-z 0-9 _ -`). |
+| `status` | Exact filter: `pending`, `running`, `completed`, `failed`, `cancelled`. |
+| `since` / `until` | Epoch seconds, `started_at >= since` and `started_at < until`; `0` to `2^53`; `since` must not be after `until`. |
+| `limit` | Page size, default 50. Below 1 is a `400`; above 500 is clamped to 500. |
+| `cursor` | The previous page's `next_cursor`. A position only: it does not bind the other filters. |
+| `latest_per_workflow` | `true` returns at most one run per workflow: its newest run among those passing the other filters **and** the caller's visibility (so a confined caller gets its newest *visible* run, never a blanked newest one), ordered by `workflow_id`, with no cursor. `result_truncated_by_cap` is `true` when more workflows matched than `limit`. |
+
+Input is strict: an unknown or repeated parameter, a value outside the vocabulary or bounds above, or
+`cursor` together with `latest_per_workflow` is a `400` (A4 envelope) rather than being ignored, so a
+mistyped filter can never read as "all runs". No audit row is written for a successful list (run
+metadata, not operator-supplied step parameters); a refusal is audited by the gate as
+`auth.fleet_read_required`. A store failure or the 1.5 s statement timeout is a `503` with
+`retry_after_ms`, never an empty `200`.
+
+**Scale.** Only `workflow_id` is indexed (`idx_wf_exec_workflow`). `since`, `until` and `status`
+narrow the result but not the scan, and there is no `started_at` index, so a large run table is
+scanned and sorted on every call. A confined caller also pays to check the stored agent list of every
+candidate run, so a confined caller on a large table should always pass `workflow_id`. A read that
+does not finish inside the 1.5 s budget answers an honest `503` (never a short or empty page):
+narrow by `workflow_id` and retry.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "exec-wf-9", "workflow_id": "wf-1", "workflow_name": "Patch and Reboot",
+      "workflow_deleted": false, "status": "failed", "current_step": 1,
+      "started_at": 1735693200, "completed_at": 1735693260 }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50, "next_cursor": null },
+  "meta": { "api_version": "v1" }
+}
+```
 
 #### `GET /api/v1/workflow-executions/{id}`
 
@@ -7749,7 +7811,7 @@ Revoke a device token.
 ### Pre-flight & Deploy
 
 REST twins of the `/auto` pre-flight ASSESS stage's saved-runs rail and the deploy ACT stage's
-go/warn preview — see [Pre-flight readiness checks](preflight.md) for the full workflow these
+go/warn preview — see [Deployments and pre-flight readiness checks](preflight.md) for the full workflow these
 routes are read-only slices of. Both are **owner-scoped** (your own runs/deployments only) and
 confirmed inert — neither creates a run or a deployment. MCP twins: `list_preflight_runs` /
 `get_deployment_preview` (`docs/mcp-server.md`).
@@ -8194,9 +8256,9 @@ The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` 
 
 Browser-facing page that renders the 3D fleet topology. The page itself is auth-gated only; per-request RBAC enforcement happens when the page's JS hits `GET /api/v1/viz/fleet/topology` (see below).
 
-**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables only the API endpoint, not the page shell — the page continues to load and the `503` from the disabled API surfaces in the browser console.
+**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/login` first).
 
-**Browser requirements:** importmap support is required (Chrome 89+, Firefox 108+, Safari 16.4+, Edge 89+). On unsupported browsers the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
+**Browser requirements:** the dashboard stylesheet needs Chrome 111+, Edge 111+, Firefox 121+ or Safari 16.2+ (`color-mix()` and `:has()`), and this page also requires importmap support (Safari 16.4+; the other browsers already meet it). On a browser without importmap the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
 
 **Cache posture:** the response sets `Cache-Control: no-cache, no-store, must-revalidate`. Vendored static assets (Three.js, OrbitControls, yuzu-viz.js) cache for 24 hours; the page itself revalidates on every navigation so a server upgrade cannot leave operators with a stale page that references the new assets.
 
@@ -8211,11 +8273,11 @@ Browser-facing page that renders the 3D fleet topology. The page itself is auth-
 
 **Renderer behaviour (PR 6):**
 
-The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#f0c674`, macOS/Darwin `#a0a0a0`, Windows `#5294e2`, default `#666666`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear above each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
+The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear above each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
 
 **Renderer behaviour (PR 7):**
 
-Each machine cube contains interior `SphereGeometry` dots, one per process reported in the `processes` array of the topology payload. Dots are coloured by process category using a fixed six-colour palette: system `#6e7681`, browser `#58a6ff`, database `#d29922`, web `#56d364`, runtime `#bc8cff`, other `#8b949e`. Category values in the JSON payload are lowercase strings matching `category_to_string()` in the server's process classifier (`server/core/src/process_category.hpp`); the renderer normalises with `String(category).trim().toLowerCase()` and uses `Object.prototype.hasOwnProperty.call` for the palette lookup so unknown / mixed-case / whitespace-padded values fall through to `other` and prototype keys (`constructor`, `__proto__`) cannot poison the colour pipeline.
+Each machine cube contains interior `SphereGeometry` dots, one per process reported in the `processes` array of the topology payload. Dots are coloured by process category using a fixed six-colour palette: system `#9aa2ae`, browser `#4c9aff`, database `#f5c542`, web `#2dd4bf`, runtime `#a78bfa`, other `#9199a6`. Category values in the JSON payload are lowercase strings matching `category_to_string()` in the server's process classifier (`server/core/src/process_category.hpp`); the renderer normalises with `String(category).trim().toLowerCase()` and uses `Object.prototype.hasOwnProperty.call` for the palette lookup so unknown / mixed-case / whitespace-padded values fall through to `other` and prototype keys (`constructor`, `__proto__`) cannot poison the colour pipeline.
 
 Dot positions are deterministic across reloads — `hash(pid|ppid)`-mod-bucket layout inside 78% of the cube's interior volume, with per-process `hash('j|pid')` jitter to break visual stripes. Per-machine processes are attached as a named child group (`yuzu-processes`) of each cube so they orbit and pan with the cube under OrbitControls without synchronisation overhead. To bound the worst-case render cost on heavily-threaded hosts (e.g. JVM thread pools), the renderer soft-caps at **1000 dots per cube**; the cube tooltip's `processes` count still reflects the true total reported by the agent.
 
@@ -10134,6 +10196,10 @@ v1 `{data, meta}` envelope above. **Not migrated onto the checked read path**: o
 Postgres failure this route silently returns `{"count": 0}` — indistinguishable from a genuinely
 empty queue — rather than a `503`; prefer `GET /api/v1/approvals/pending/count` or MCP
 `get_pending_approval_count` for failure-honest polling.
+
+#### `GET /fragments/approvals`
+
+HTML fragment behind the Instructions Approvals tab and the Approvals page (`/approvals`). Requires `Approval:Read`. `view=page` renders the page list (pending by default); `status` is one of `pending`, `approved`, `rejected`, `expired`, and an empty value means every status. An unknown `status` answers `200` with a `data-invalid="status"` note, a failed store read answers `200` with `data-degraded="store"`, and a refused caller gets `200` with `data-denied="true"` (the dashboard drops `4xx` bodies). The page view lists the 100 most recent rows and marks a cut list with `data-truncated="1"`.
 
 #### `POST /api/approvals/{id}/approve`
 

@@ -56,13 +56,6 @@ std::string os_label(const std::string& os) {
     return os.empty() ? "?" : esc(os);
 }
 
-const char* os_cls(const std::string& os) {
-    if (os == "windows" || os == "win") return "win";
-    if (os == "linux" || os == "lin") return "lin";
-    if (os == "darwin" || os == "macos" || os == "mac") return "mac";
-    return "";
-}
-
 std::string ci_disp(const std::string& s) {
     if (s.empty() || s == "unknown")
         return "<span class=\"inv-grey\">&mdash;</span>";
@@ -129,62 +122,81 @@ std::string list_url(const HardwareListQuery& q, bool with_q = true, bool result
 
 std::string hw_style() {
     return R"css(<style>
-  .hw-wrap{max-width:1180px}
-  .hw-h1{font-size:1.35rem;margin:.2rem 0 0;color:var(--white,#fff);font-weight:700}
-  .hw-sub{color:var(--muted,#8fa3bd);font-size:.8rem;margin-top:.25rem}
-  .hw-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.55rem;margin:.8rem 0}
-  .hw-kpi{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.5rem;padding:.55rem .8rem}
-  .hw-kpi .h{font-size:.6rem;color:var(--muted,#8fa3bd);text-transform:uppercase;letter-spacing:.05em}
-  .hw-kpi .big{font-size:1.3rem;font-weight:800;color:var(--white,#fff);margin-top:.1rem}
-  .hw-kpi.warn .big{color:var(--yellow,#ffcc00)}
-  .hw-ctrls{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:.7rem 0}
-  .hw-search{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.4rem;color:var(--fg,#cfdbe8);padding:.32rem .6rem;font-size:.78rem;min-width:240px}
-  .hw-breadcrumb{display:flex;gap:.4rem;flex-wrap:wrap;margin:.4rem 0;font-size:.7rem}
-  .hw-crumb{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.4rem;padding:.15rem .5rem;color:var(--lightblue,#a5d6ff)}
-  .hw-crumb a{color:var(--muted,#8fa3bd);margin-left:.35rem;text-decoration:none}
-  table.hw-tbl{width:100%;border-collapse:collapse;font-size:.8rem}
-  table.hw-tbl th{text-align:left;padding:.42rem .6rem;border-bottom:2px solid var(--border,#2d4068);color:var(--muted,#8fa3bd);font-size:.58rem;text-transform:uppercase;letter-spacing:.05em}
-  table.hw-tbl th.sortable{cursor:pointer;user-select:none}
-  table.hw-tbl th.sortable:hover{color:var(--fg,#cfdbe8)}
-  table.hw-tbl td{padding:.44rem .6rem;border-bottom:1px solid var(--border,#2d4068);vertical-align:middle}
-  table.hw-tbl tr.click{cursor:pointer}table.hw-tbl tr.click:hover td{background:var(--surface,#1a2940)}
-  .hw-name{color:var(--white,#fff);font-weight:600;text-decoration:none}
-  .hw-mono{font-family:'JetBrains Mono',Consolas,monospace;font-size:.72rem;color:var(--muted,#8fa3bd)}
-  .hw-pill{font-size:.57rem;border:1px solid var(--border,#2d4068);border-radius:.3rem;padding:.04rem .4rem;color:var(--lightblue,#a5d6ff)}
-  .hw-pill.win{color:#a5d6ff}.hw-pill.lin{color:#ffcc88}.hw-pill.mac{color:#c7b3ff}
-  .hw-pill.on{color:var(--green,#4ed27e);border-color:rgba(78,210,126,.4)}
-  .hw-pill.off{color:var(--slate,#6f86a6)}
-  .hw-page{display:flex;gap:.5rem;align-items:center;margin-top:.6rem;font-size:.72rem;color:var(--muted,#8fa3bd)}
-  .hw-degrade{font-size:.78rem;color:#ff8a94;background:rgba(255,87,101,.08);border:1px solid rgba(255,87,101,.4);border-radius:.5rem;padding:.7rem .9rem;margin:.7rem 0}
-  .hw-degrade b{color:var(--red,#ff5765)}
-  .hw-empty{color:var(--muted,#8fa3bd);font-size:.78rem;padding:.8rem .2rem}
-  .hw-grey{color:var(--slate,#6f86a6)}
-  .hw-hdr{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.4rem 0 .2rem}
-  .hw-dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;margin-right:.35rem}
-  .hw-tag{font-size:.62rem;background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.3rem;padding:.08rem .4rem;color:var(--muted,#8fa3bd)}
-  .hw-lens{display:flex;gap:.3rem;border-bottom:1px solid var(--border,#2d4068);padding-bottom:.5rem;margin:.7rem 0}
-  .hw-lens a{font-size:.75rem;color:var(--muted,#8fa3bd);border:1px solid transparent;border-radius:.35rem;padding:.2rem .65rem;cursor:pointer}
-  .hw-lens a.on{color:var(--white,#fff);border-color:var(--accent,#00bceb)}
-  .ci-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.3rem .9rem;font-size:.74rem;margin-bottom:.7rem}
-  .ci-grid .ci-lab{color:var(--muted,#8fa3bd);font-size:.62rem;text-transform:uppercase;letter-spacing:.03em}
-  .ci-sec{margin-top:1rem}
-  .ci-sec h4{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted,#8fa3bd);margin:0 0 .35rem;border-bottom:1px solid var(--border,#2d4068);padding-bottom:.25rem}
+  .hw-h1{font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+  .hw-sub{color:var(--mut);margin-top:4px;max-width:70ch}
+  .hw-panel{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+  .hw-hd{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .hw-hd h2{font-size:14px;font-weight:600;color:var(--ink)}
+  .hw-hd .hw-end{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-left:auto}
+  .hw-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .hw-search{height:28px;min-width:220px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font-size:13px;-webkit-appearance:none;appearance:none}
+  .hw-search::placeholder{color:var(--faint)}
+  .hw-hd .hw-search{min-width:300px}
+  .hw-wrap :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+  .hw-wrap .gp-btn:disabled{opacity:.5;cursor:not-allowed}
+  .hw-breadcrumb{display:flex;flex-wrap:wrap;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line)}
+  .hw-crumb{display:inline-flex;align-items:center;gap:6px;padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--ink2);font-size:12.5px;font-weight:500}
+  .hw-crumb a{color:var(--mut);cursor:pointer}
+  .hw-crumb a:hover{color:var(--ink)}
   .hw-scroll{overflow-x:auto}
-  .hw-macs{display:flex;flex-wrap:wrap;gap:.25rem;margin-top:.2rem}
-  .hw-selbar{display:none;position:sticky;top:0;z-index:2;align-items:center;gap:.5rem;flex-wrap:wrap;background:var(--surface,#1a2940);border:1px solid var(--accent,#00bceb);border-radius:.4rem;padding:.5rem .7rem;margin-bottom:.6rem}
-  .hw-selbar.show{display:flex}
-  #hw-selcount{font-weight:700;color:var(--white,#fff);font-size:.75rem}
+  table.hw-tbl{width:100%;border-collapse:collapse}
+  table.hw-tbl th{padding:8px 12px;border-bottom:1px solid var(--line);background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500;text-align:left;white-space:nowrap}
+  table.hw-tbl th.sortable{cursor:pointer;user-select:none}
+  table.hw-tbl th.sortable:hover{color:var(--ink)}
+  table.hw-tbl td{padding:var(--cell-y) 12px;border-bottom:1px solid var(--line);color:var(--ink2);white-space:nowrap;vertical-align:middle}
+  table.hw-tbl tbody tr:last-child td{border-bottom:0}
+  table.hw-tbl tr.click{cursor:pointer}
+  table.hw-tbl tbody tr:hover td{background:var(--surface2)}
+  table.hw-tbl tbody tr:has(.hw-sel:checked) td{background:color-mix(in srgb,var(--hl) 8%,transparent)}
+  table.hw-tbl tbody tr:has(.hw-sel:checked) td:first-child{box-shadow:inset 3px 0 0 var(--hl)}
+  table.hw-tbl input[type=checkbox]{width:16px;height:16px;accent-color:var(--primary);color-scheme:dark;vertical-align:middle}
+  table.hw-tbl td.hw-mono{color:var(--ink2)}
+  .hw-name{color:var(--ink);font-weight:600;text-decoration:none}
+  .hw-mono{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--mut)}
+  .hw-lab{color:var(--mut);font-size:13px}
+  .hw-grey,.inv-grey{color:var(--faint)}
+  .hw-pill{display:inline-flex;align-items:center;padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500;white-space:nowrap}
+  .hw-pill.ok{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+  .hw-pill.warn{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
+  .hw-pill.bad{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
+  .hw-os{padding:0 5px;border:1px solid var(--line2);border-radius:3px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:11.5px}
+  .hw-tag{display:inline-flex;align-items:center;margin-right:4px;padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500}
   a.hw-tag.link{cursor:pointer}
+  a.hw-tag.link:hover{color:var(--ink)}
+  .hw-macs{display:flex;flex-wrap:wrap;gap:4px}
+  .hw-macs .hw-tag{margin:0}
+  .hw-page{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 16px;border-top:1px solid var(--line);color:var(--mut);font-size:13px}
+  .hw-page span:first-child{margin-right:auto}
+  .hw-toolbar .gp-filters{margin:0}
+  #hw-results>.gp-banner{margin:12px 16px 0}
+  #hw-results>.gp-banner:last-child{margin-bottom:12px}
+  .gp-tiles+.hw-panel{margin-top:22px}
+  .hw-empty{padding:16px;border:1px solid var(--line);border-radius:var(--rad-panel);background:var(--surface);color:var(--mut);font-size:13.5px}
+  .hw-panel .hw-empty{border:0;border-radius:0}
+  .hw-panel .gp-placeholder{border:0;border-radius:0;background:none}
+  .hw-hdr{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:0 0 12px}
+  .ci-sec{margin-top:22px;border:1px solid var(--line);border-radius:var(--rad-panel);background:var(--surface)}
+  .ci-sec:first-child{margin-top:0}
+  .ci-sec h4{padding:12px 16px;border-bottom:1px solid var(--line);color:var(--ink);font-size:14px;font-weight:600}
+  .ci-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(400px,100%),1fr));margin-bottom:-1px}
+  .ci-grid>div,.ci-row{display:flex;justify-content:space-between;gap:16px;padding:9px 16px;border-bottom:1px solid var(--line);color:var(--ink);font-size:13.5px;text-align:right}
+  .ci-sec>.ci-row{border-bottom:0}
+  .ci-lab{flex:none;color:var(--mut);text-align:left}
+  .hw-tools{padding:10px 16px;border-bottom:1px solid var(--line)}
+  .hw-panel>form.hw-hdr{margin:0;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .hw-selbar{display:none;position:sticky;top:0;z-index:2;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line2);background:var(--raise)}
+  .hw-selbar.show{display:flex}
+  #hw-selcount{color:var(--ink);font-size:13px;font-weight:600}
 </style>)css";
 }
 
 std::string kpi(const char* label, std::string value, const char* extra_class = "") {
-    return std::string("<div class=\"hw-kpi ") + extra_class + "\"><div class=\"h\">" + label +
-           "</div><div class=\"big\">" + std::move(value) + "</div></div>";
+    return std::string("<div class=\"gp-tile\"><div class=\"n ") + extra_class + "\">" +
+           std::move(value) + "</div><div class=\"l\">" + label + "</div></div>";
 }
 
 std::string kpis_html(const HardwareKpis& k, bool ci_degraded) {
-    std::string h = "<div class=\"hw-kpis\">";
+    std::string h = "<div class=\"gp-tiles\">";
     h += kpi("Total CIs", std::to_string(k.total));
     h += kpi("Online", std::to_string(k.online));
     h += kpi("Offline", std::to_string(k.offline));
@@ -223,10 +235,8 @@ std::string chip(const char* label, const std::string& value, const HardwareList
 std::string dex_badge(int score) {
     if (score < 0)
         return "<span class=\"hw-grey\">&mdash;</span>";
-    const char* color = score >= 90 ? "#4ed27e" : (score >= 75 ? "#ffcc00" : "#ff5765");
-    return "<span style=\"display:inline-block;min-width:1.7rem;text-align:center;font-weight:700;"
-           "font-size:.68rem;border-radius:.3rem;padding:.05rem .4rem;color:#06121f;background:" +
-           std::string(color) + "\">" + std::to_string(score) + "</span>";
+    const char* tone = score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad");
+    return "<span class=\"hw-pill " + std::string(tone) + "\">" + std::to_string(score) + "</span>";
 }
 
 // A clickable tag chip that narrows the list to this exact key[=value] — targets the
@@ -300,8 +310,8 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
 std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q) {
     const std::string name = d.hostname.empty() ? d.agent_id : d.hostname;
     const std::string status_pill = d.online
-        ? "<span class=\"hw-pill on\">online</span>"
-        : (d.stale ? "<span class=\"hw-pill\">stale</span>" : "<span class=\"hw-pill off\">offline</span>");
+        ? "<span class=\"hw-pill ok\">online</span>"
+        : (d.stale ? "<span class=\"hw-pill warn\">stale</span>" : "<span class=\"hw-pill\">offline</span>");
     const std::string cpu_ram = [&] {
         const std::string ct = ci_cores_threads(d.ci_cpu_cores, d.ci_cpu_threads);
         const std::string ram = ci_ram_gb(d.ci_ram_bytes);
@@ -335,18 +345,18 @@ std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q) {
            "<td><a class=\"hw-name\" href=\"/hardware/ci?id=" + url_encode(d.agent_id) + "\">" +
            esc(name) + "</a></td>"
            "<td class=\"hw-mono\">" + ip_cell + "</td>"
-           "<td><span class=\"hw-pill " + os_cls(d.os) + "\">" + os_label(d.os) + "</span></td>"
+           "<td><span class=\"hw-os\">" + os_label(d.os) + "</span></td>"
            "<td>" + status_pill + "</td>"
            "<td>" + dex_badge(d.dex_score) + "</td>"
            "<td class=\"hw-mono\">" + version_cell + "</td>"
-           "<td class=\"hw-mono\">" + (d.last_seen.empty() ? "?" : esc(d.last_seen)) + "</td>"
+           "<td>" + (d.last_seen.empty() ? "?" : esc(d.last_seen)) + "</td>"
            "<td>" + tags_cell + "</td>"
-           "<td class=\"hw-mono\">" + ci_cell(d.ci_manufacturer) + "</td>"
-           "<td class=\"hw-mono\">" + ci_cell(d.ci_model) + "</td>"
+           "<td>" + ci_cell(d.ci_manufacturer) + "</td>"
+           "<td>" + ci_cell(d.ci_model) + "</td>"
            "<td class=\"hw-mono\">" + ci_cell(d.ci_serial) + "</td>"
-           "<td class=\"hw-mono\">" + cpu_ram + "</td>"
-           "<td class=\"hw-mono\">" + ram_cell + "</td>"
-           "<td class=\"hw-mono\">" + ci_cell(d.ci_os_version) + "</td>"
+           "<td>" + cpu_ram + "</td>"
+           "<td>" + ram_cell + "</td>"
+           "<td>" + ci_cell(d.ci_os_version) + "</td>"
            "</tr>";
 }
 
@@ -371,7 +381,7 @@ std::string sync_button(const std::string& agent_id, const char* source, const c
                        : sync.state == S::NoExecute  ? "needs the Execute permission"
                                                      : "predates sync-on-demand (0.13.1+)";
     std::string h = std::string("<button type=\"button\" class=\"gp-btn\" disabled>") + label +
-                    "</button> <span class=\"hw-mono\">";
+                    "</button> <span class=\"hw-lab\">";
     if (sync.state == S::Unsupported && !sync.agent_version.empty())
         h += "agent " + esc(sync.agent_version) + " ";
     h += note;
@@ -390,10 +400,10 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     // only #hw-results (results_only=1), so a banner in the page shell would vanish on
     // the first refresh and leave a blank cell reading as "no CI" / "no tags".
     if (ci_degraded)
-        h += "<div class=\"hw-degrade\"><b>CI columns unavailable.</b> The device-CI store could not "
+        h += "<div class=\"gp-banner hw-degrade\"><b>CI columns unavailable.</b> The device-CI store could not "
              "be read &mdash; a blank cell here is not \"no CI\", it is a degraded read.</div>";
     if (tags_degraded)
-        h += "<div class=\"hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
+        h += "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
              "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
     // Sticky bulk-tag action bar (round-3 item 7) — hidden by CSS until a row is
     // checked (hwSelRender toggles a `show` class); JS lives in guardian_page_ui.cpp.
@@ -402,22 +412,23 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     // row) rather than a new bulk route — see hwBulkTag.
     h += "<div id=\"hw-selbar\" class=\"hw-selbar\">"
          "<span id=\"hw-selcount\">0 selected</span>"
-         "<span class=\"hw-mono\">Add tag</span>"
+         "<span class=\"hw-lab\">Add tag</span>"
          "<input id=\"hw-bulk-key\" class=\"hw-search\" placeholder=\"key\" style=\"min-width:120px\" "
          "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\">"
          "<input id=\"hw-bulk-value\" class=\"hw-search\" placeholder=\"value\" style=\"min-width:120px\" "
          "maxlength=\"448\">"
          "<button type=\"button\" class=\"gp-btn accent\" onclick=\"hwBulkTag(this,'set')\">Apply</button>"
-         "<span class=\"hw-mono\">Remove tag</span>"
+         "<span class=\"hw-lab\">Remove tag</span>"
          "<input id=\"hw-bulk-rkey\" class=\"hw-search\" placeholder=\"key\" style=\"min-width:120px\" "
          "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\">"
          "<button type=\"button\" class=\"gp-btn\" onclick=\"hwBulkTag(this,'delete')\">Apply</button>"
          "<button type=\"button\" class=\"gp-btn\" onclick=\"hwSelClear()\">Clear</button>"
          "</div>";
-    h += "<div class=\"gp-filters\">" + chip("All OS", "all", q, true) + chip("Windows", "windows", q, true) +
-         chip("Linux", "linux", q, true) + chip("macOS", "macos", q, true) + "</div>";
-    h += "<div class=\"gp-filters\">" + chip("All status", "all", q, false) +
-         chip("Online", "online", q, false) + chip("Offline", "offline", q, false) + "</div>";
+    h += "<div class=\"hw-toolbar\"><div class=\"gp-filters\">" + chip("All OS", "all", q, true) +
+         chip("Windows", "windows", q, true) + chip("Linux", "linux", q, true) +
+         chip("macOS", "macos", q, true) + "</div><div class=\"gp-filters\">" +
+         chip("All status", "all", q, false) + chip("Online", "online", q, false) +
+         chip("Offline", "offline", q, false) + "</div></div>";
 
     h += breadcrumb(q);
 
@@ -456,7 +467,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
                                           bool roster_unavailable, bool results_only,
                                           bool tags_degraded) {
     constexpr const char* kRosterBanner =
-        "<div class=\"hw-degrade\"><b>Hardware roster unavailable.</b> The device roster could "
+        "<div class=\"gp-banner hw-degrade\"><b>Hardware roster unavailable.</b> The device roster could "
         "not be read. This is <b>not</b> \"no devices\" &mdash; reads here are authoritative, so "
         "this banner is shown instead of an empty table. Retry shortly.</div>";
     // #5531: the banner must also replace a results_only re-render, keeping the
@@ -469,8 +480,8 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
 
     std::string h = hw_style();
     h += "<div class=\"hw-wrap\">";
-    h += "<h1 class=\"hw-h1\">Hardware</h1>";
-    h += "<div class=\"hw-sub\">Configuration items across the fleet &mdash; search, filter, sort.</div>";
+    h += "<header><h1 class=\"hw-h1\">Hardware</h1>";
+    h += "<div class=\"hw-sub\">Configuration items across the fleet &mdash; search, filter, sort.</div></header>";
 
     if (roster_unavailable) {
         h += kRosterBanner;
@@ -481,7 +492,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
     h += kpis_html(page.kpis, ci_degraded);
 
     const HardwareListQuery& q = page.query;
-    h += "<div class=\"hw-ctrls\">";
+    h += "<section class=\"hw-panel\"><div class=\"hw-hd\"><h2>Hardware inventory</h2><div class=\"hw-end\">";
     // CSP-safe search (round-2 item 5): htmx's `[key=='Enter']` event filter compiles
     // with `Function()`, which the dashboard CSP (no unsafe-eval) refuses at runtime —
     // htmx silently drops the filter and falls back to a bare `keyup`, firing on every
@@ -493,10 +504,10 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
          esc(list_url([&] { HardwareListQuery nq = q; nq.offset = 0; return nq; }(), false, true)) +
          "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" "
          "hx-trigger=\"keyup changed delay:400ms, search\" hx-sync=\"this:replace\">";
-    h += "</div>";
+    h += "</div></div>";
 
     h += render_hardware_results_region(page, ci_degraded, tags_degraded);
-    h += "</div>";
+    h += "</section></div>";
     return h;
 }
 
@@ -570,18 +581,18 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
             const std::string version = !id.agent_version.empty() ? id.agent_version : aff.sync.agent_version;
             const std::string arch = !id.arch.empty() ? id.arch : id.ci_arch;
             h += "<div class=\"ci-sec\"><h4>General</h4><div class=\"ci-grid\">";
-            h += "<div><span class=\"ci-lab\">Agent id: </span>" + esc(agent_id) + "</div>";
-            h += "<div><span class=\"ci-lab\">OS: </span>" + esc(os_label(id.os)) + "</div>";
-            h += "<div><span class=\"ci-lab\">Agent version: </span>" + ci_disp(version) + "</div>";
-            h += "<div><span class=\"ci-lab\">Architecture: </span>" + ci_disp(arch) + "</div>";
+            h += "<div><span class=\"ci-lab\">Agent id</span>" + esc(agent_id) + "</div>";
+            h += "<div><span class=\"ci-lab\">OS</span>" + esc(os_label(id.os)) + "</div>";
+            h += "<div><span class=\"ci-lab\">Agent version</span>" + ci_disp(version) + "</div>";
+            h += "<div><span class=\"ci-lab\">Architecture</span>" + ci_disp(arch) + "</div>";
             h += "</div></div>";
         } else if (detail.identity_degraded) {
-            h += "<div class=\"hw-degrade\"><b>Device identity unavailable.</b> The device roster "
+            h += "<div class=\"gp-banner hw-degrade\"><b>Device identity unavailable.</b> The device roster "
                  "could not be read &mdash; the agent id is shown in place of the hostname, OS is "
                  "omitted and last-seen is unknown; this is not \"not found\".</div>";
         }
         if (!detail.ci.has_value()) {
-            h += "<div class=\"hw-degrade\"><b>CI record unavailable.</b> The device-CI store could "
+            h += "<div class=\"gp-banner hw-degrade\"><b>CI record unavailable.</b> The device-CI store could "
                  "not be read (Postgres pool/query degraded). This is <b>not</b> \"no CI record\" "
                  "&mdash; reads here are authoritative. Retry shortly.</div>";
         } else if (!detail.ci->has_value()) {
@@ -592,14 +603,14 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
         } else {
             const DeviceCiRecord& r = **detail.ci;
             auto field = [](const char* label, const std::string& val) {
-                return std::string("<div><span class=\"ci-lab\">") + label + ": </span>" +
+                return std::string("<div><span class=\"ci-lab\">") + label + "</span>" +
                        ci_disp(val) + "</div>";
             };
             h += "<div class=\"ci-sec\"><h4>Domain &amp; sync</h4><div class=\"ci-grid\">";
             h += field("Domain", r.domain);
             h += field("OU", r.ou);
-            h += "<div><span class=\"ci-lab\">First synced: </span>" + esc(rel_time(now_secs, r.first_seen)) + "</div>";
-            h += "<div><span class=\"ci-lab\">Last synced: </span>" + esc(rel_time(now_secs, r.last_seen)) + "</div>";
+            h += "<div><span class=\"ci-lab\">First synced</span>" + esc(rel_time(now_secs, r.first_seen)) + "</div>";
+            h += "<div><span class=\"ci-lab\">Last synced</span>" + esc(rel_time(now_secs, r.last_seen)) + "</div>";
             h += "</div></div>";
 
             h += "<div class=\"ci-sec\"><h4>Hardware</h4><div class=\"ci-grid\">";
@@ -625,7 +636,7 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
             h += "</div>";
             // A comma-joined string trails off the page at any width (round-3 item
             // 12) — one wrapping chip per address instead of one unbroken line.
-            h += "<div><span class=\"ci-lab\">All MACs: </span>";
+            h += "<div class=\"ci-row\"><span class=\"ci-lab\">All MACs</span>";
             if (r.macs_summary.empty() || r.macs_summary == "unknown") {
                 h += "<span class=\"inv-grey\">&mdash;</span>";
             } else {
@@ -676,13 +687,12 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
     h += "<div class=\"hw-wrap\">";
     h += "<div class=\"hw-hdr\"><a class=\"gp-btn\" href=\"/hardware\">&larr; Hardware</a></div>";
     h += "<div class=\"hw-hdr\">";
-    h += "<span class=\"hw-dot\" style=\"background:" + std::string(online ? "#4ed27e" : "#6f86a6") +
-         "\"></span>";
+    h += std::string("<span class=\"hw-pill") + (online ? " ok\">online" : "\">offline") + "</span>";
     h += "<h1 class=\"hw-h1\" style=\"margin:0\">" + esc(hostname) + "</h1>";
     if (!os.empty())
-        h += "<span class=\"hw-pill " + std::string(os_cls(os)) + "\">" + os_label(os) + "</span>";
+        h += "<span class=\"hw-os\">" + os_label(os) + "</span>";
     h += "<span class=\"hw-mono\">" + esc(agent_id) + "</span>";
-    h += "<span class=\"hw-mono\">last seen " + esc(last_seen.empty() ? "?" : last_seen) + "</span>";
+    h += "<span class=\"hw-lab\">last seen " + esc(last_seen.empty() ? "?" : last_seen) + "</span>";
     h += "<span style=\"flex:1\"></span>";
     h += sync_button(agent_id, "all", active_lens.c_str(), aff.sync, "Sync now");
     h += "</div>";
@@ -702,7 +712,7 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
 }
 
 std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob) {
-    std::string h = "<div class=\"hw-lens\" id=\"hw-lens-bar\"" +
+    std::string h = "<div class=\"gp-subnav\" id=\"hw-lens-bar\"" +
                     std::string(oob ? " hx-swap-oob=\"true\"" : "") + ">";
     h += device_lens_tab("overview", "Overview", agent_id, active);
     h += device_lens_tab("software", "Installed software", agent_id, active);
@@ -737,7 +747,7 @@ std::string render_hardware_sync_pending(const std::string& agent_id, const std:
 
 std::string render_hardware_sync_terminal(const std::string& agent_id, const std::string& lens,
                                           const std::string& refusal_output, bool timed_out) {
-    std::string h = "<div class=\"hw-degrade\">";
+    std::string h = "<div class=\"gp-banner hw-degrade\">";
     if (!refusal_output.empty())
         h += "<b>The device refused the sync request:</b> " + esc(refusal_output);
     else if (timed_out)
@@ -753,7 +763,7 @@ std::string render_hardware_software_lens(const std::string& agent_id,
                                           const std::optional<std::vector<SoftwareEntry>>& software,
                                           bool truncated, bool online, const HwSyncAffordance& sync) {
     if (!software)
-        return "<div class=\"hw-degrade\"><b>Installed software unavailable.</b> The software "
+        return "<div class=\"gp-banner hw-degrade\"><b>Installed software unavailable.</b> The software "
                "inventory store could not be read. Retry shortly.</div>";
     if (software->empty()) {
         if (!online)
@@ -767,23 +777,24 @@ std::string render_hardware_software_lens(const std::string& agent_id,
     // Round-3 item 3: a searchable text filter over this device's own installed-
     // software table (gpSearch, group "hwsw" — self-contained to this lens, no
     // server round-trip needed since a per-device list is small).
-    std::string h = "<input class=\"hw-search\" style=\"margin-bottom:.5rem\" "
+    std::string h = "<div class=\"hw-panel\"><div class=\"hw-tools\"><input class=\"hw-search\" "
                     "placeholder=\"Filter installed software…\" oninput=\"gpSearch(this)\" "
-                    "data-gpf=\"hwsw\">";
-    h += "<table class=\"hw-tbl\"><thead><tr><th>Name</th><th>Version</th><th>Publisher</th>"
+                    "data-gpf=\"hwsw\"></div>";
+    h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr><th>Name</th><th>Version</th><th>Publisher</th>"
          "<th>Install date</th><th>Signature</th><th>Ecosystem</th></tr></thead><tbody>";
     for (const auto& e : *software) {
         const std::string searchable = lc(e.name + " " + e.version + " " + e.publisher);
         h += "<tr data-gpf=\"hwsw\" data-gpname=\"" + esc(searchable) + "\"><td class=\"hw-name\">" +
              esc(e.name) + "</td><td class=\"hw-mono\">" + ci_disp(e.version) +
-             "</td><td class=\"hw-mono\">" + ci_disp(e.publisher) + "</td><td class=\"hw-mono\">" +
-             ci_disp(e.install_date) + "</td><td class=\"hw-mono\">" + ci_disp(e.signature_status) +
-             "</td><td class=\"hw-mono\">" + ci_disp(e.ecosystem) + "</td></tr>";
+             "</td><td>" + ci_disp(e.publisher) + "</td><td class=\"hw-mono\">" +
+             ci_disp(e.install_date) + "</td><td>" + ci_disp(e.signature_status) +
+             "</td><td>" + ci_disp(e.ecosystem) + "</td></tr>";
     }
-    h += "</tbody></table>";
+    h += "</tbody></table></div>";
     if (truncated)
         h += "<div class=\"hw-page\">List truncated &mdash; showing the first " +
              std::to_string(kHwSoftwareCap) + " entries.</div>";
+    h += "</div>";
     return h;
 }
 
@@ -791,9 +802,9 @@ std::string render_hardware_tags_lens(const std::string& agent_id,
                                       const std::optional<std::vector<DeviceTag>>& tags,
                                       bool can_write) {
     if (!tags)
-        return "<div class=\"hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read. "
+        return "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read. "
                "Retry shortly.</div>";
-    std::string h;
+    std::string h = "<div class=\"hw-panel\">";
     if (can_write) {
         // Posts JSON to the EXISTING /api/tags/set (scoped Tag:Write, audited tag.set)
         // via hwTagSet — no new route. Key rules mirror TagStore::validate_key.
@@ -805,20 +816,20 @@ std::string render_hardware_tags_lens(const std::string& agent_id,
              "</form>";
     }
     if (tags->empty()) {
-        h += "<div class=\"hw-empty\">No tags set on this device.</div>";
+        h += "<div class=\"hw-empty\">No tags set on this device.</div></div>";
         return h;
     }
-    h += "<table class=\"hw-tbl\"><thead><tr><th>Key</th><th>Value</th><th>Source</th>" +
+    h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr><th>Key</th><th>Value</th><th>Source</th>" +
          std::string(can_write ? "<th></th>" : "") + "</tr></thead><tbody>";
     for (const auto& t : *tags) {
         h += "<tr><td class=\"hw-name\">" + esc(t.key) + "</td><td class=\"hw-mono\">" + esc(t.value) +
              "</td><td class=\"hw-mono\">" + esc(t.source) + "</td>";
         if (can_write)
-            h += "<td><a class=\"gp-btn\" data-agent=\"" + esc(agent_id) + "\" data-key=\"" + esc(t.key) +
+            h += "<td><a class=\"gp-btn danger\" data-agent=\"" + esc(agent_id) + "\" data-key=\"" + esc(t.key) +
                  "\" onclick=\"hwTagDelete(this)\">remove</a></td>";
         h += "</tr>";
     }
-    h += "</tbody></table>";
+    h += "</tbody></table></div></div>";
     return h;
 }
 

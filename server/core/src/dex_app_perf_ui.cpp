@@ -28,6 +28,7 @@ namespace yuzu::server {
 // Shared with dex_routes.cpp (declared in dex_routes.hpp).
 std::string dex_window_token(int window_days);
 std::string dex_subnav(const std::string& active, int window_days);
+std::string dex_fragment_style();
 
 namespace {
 
@@ -104,7 +105,7 @@ std::string spark(const std::vector<double>& vals) {
         const double y = h - p - (vals[i] - mn) / rng * (h - 2 * p);
         pts += std::format("{:.1f},{:.1f} ", x, y);
     }
-    return "<svg width=\"110\" height=\"22\"><polyline fill=\"none\" stroke=\"#58a6ff\" "
+    return "<svg width=\"110\" height=\"22\"><polyline fill=\"none\" stroke=\"var(--c1)\" "
            "stroke-width=\"1.5\" points=\"" + pts + "\"/></svg>";
 }
 
@@ -165,10 +166,8 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
     const std::string qs_q = q.empty() ? "" : "&q=" + url_encode(q);
     const std::string qs_sort = "&sort=" + sortv;
 
-    h += "<div class=\"gp-filters\"><input name=\"q\" value=\"" + esc(q) +
+    h += "<div class=\"gp-filters\"><input class=\"dx-ctl\" name=\"q\" value=\"" + esc(q) +
          "\" placeholder=\"Search applications\xE2\x80\xA6\" "
-         "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-         "border-radius:.4rem;padding:.3rem .6rem;font-size:.78rem;min-width:220px\" "
          "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_sort +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
          "hx-trigger=\"keyup changed delay:300ms\"></div>";
@@ -181,10 +180,9 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
                    val_qs + qs_sort + qs_q +
                    "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
         };
-        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
-             "align-self:center\">Platform</span>" +
+        h += "<div class=\"gp-filters\"><span class=\"dx-lbl\">Platform</span>" +
              chip("all", "All") + chip("windows", "Windows") + chip("linux", "Linux") + "</div>";
-        h += "<div class=\"gp-mute\" style=\"font-size:.66rem;margin-top:.2rem\">Platform is "
+        h += "<div class=\"gp-note\">Platform is "
              "inferred from the app name (&quot;.exe&quot; = Windows) &mdash; it is not a "
              "tracked field yet, so a mismatch is possible.</div>";
     }
@@ -194,12 +192,9 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
             return "<option value=\"" + std::string(val) + "\"" +
                    (sortv == val ? " selected" : "") + ">" + label + "</option>";
         };
-        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
-             "align-self:center\">Sort</span><select name=\"sort\" "
+        h += "<div class=\"gp-filters\"><span class=\"dx-lbl\">Sort</span><select class=\"dx-ctl\" name=\"sort\" "
              "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_q +
-             "\" hx-trigger=\"change\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-             "border-radius:.35rem;padding:.15rem .4rem;\">" +
+             "\" hx-trigger=\"change\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
              opt("last_seen", "Last seen (most recent)") + opt("name", "Name (A-Z)") +
              opt("versions", "Versions (most first)") + "</select></div>";
     }
@@ -268,7 +263,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
     const bool is_group = !scope_group_id.empty();
     const bool is_model = !is_group && !active_model.empty();
     const bool is_filtered = !active_version.empty();
-    std::string h;
+    std::string h = dex_fragment_style();
     h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf/apps?window=" + w +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
          "style=\"cursor:pointer;\">&larr; All applications</a>";
@@ -287,7 +282,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         scope_name = "devices modeled " + esc(active_model);
     }
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(app_name) +
-         " <span class=\"gp-mute\" style=\"font-weight:400;font-size:.85rem\">&mdash; by version, "
+         " <span class=\"gp-mute dx-sub\">&mdash; by version, "
          "over time</span></h1></div><div class=\"gp-sub\">CPU &amp; memory per version across <b>" +
          scope_name + "</b>. Each row's trend is the daily mean over the retained history; the "
          "headline is the most recent day.</div></div></div>";
@@ -328,9 +323,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             base += "&amp;version=" + url_encode(active_version); // preserve the version filter
         h += "<div class=\"gp-note\">Scope: <select name=\"group\" hx-get=\"" + base +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
-             "hx-sync=\"#guardian-detail:replace\" "
-             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-             "border-radius:.35rem;padding:.15rem .4rem;\">";
+             "hx-sync=\"#guardian-detail:replace\" class=\"dx-ctl\">";
         h += "<option value=\"\"" + std::string(is_group ? "" : " selected") +
              ">Whole fleet</option>";
         for (const auto& g : groups) {
@@ -352,9 +345,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             mbase += "&amp;version=" + url_encode(active_version);
         h += "<div class=\"gp-note\">Model: <select name=\"model\" hx-get=\"" + mbase +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
-             "hx-sync=\"#guardian-detail:replace\" "
-             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-             "border-radius:.35rem;padding:.15rem .4rem;\">";
+             "hx-sync=\"#guardian-detail:replace\" class=\"dx-ctl\">";
         h += "<option value=\"\"" + std::string(is_model ? "" : " selected") +
              ">Whole fleet</option>";
         for (const auto& mv : model_values) {
@@ -413,8 +404,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
     for (const auto& v : versions) {
         const std::string tag =
             (v.latest_day == newest && versions.size() > 1)
-                ? " <span style=\"font-size:.62rem;color:#062534;background:var(--accent);"
-                  "border-radius:.3rem;padding:.03rem .35rem;font-weight:700\">latest</span>"
+                ? " <span class=\"dx-tag\">latest</span>"
                 : "";
         // Narrow-to-this-version link — skipped when already filtered (only one
         // row anyway) or for the "(no version)" bucket, whose empty string can't
@@ -459,7 +449,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             // reports, tar_proc_perf.cpp).
             const std::string devices_qs =
                 "app=" + url_encode(app_name) + "&amp;version=" + url_encode(v.version);
-            devices_cell += " <a style=\"cursor:pointer;font-size:.68rem\" class=\"gp-mute\" "
+            devices_cell += " <a style=\"cursor:pointer\" class=\"gp-mute\" "
                             "hx-get=\"/fragments/dex/perf/app/devices?" +
                             devices_qs +
                             "\" hx-target=\"closest tr\" hx-swap=\"afterend\" "
@@ -513,21 +503,21 @@ std::string render_dex_app_perf_version_devices(const std::vector<AppPerfVersion
                "<b>31-day</b> retention window even though the fleet trend above covers up to "
                "<b>180 days</b> &mdash; the two stores retain independently.</div>";
     }
-    std::string h = "<table class=\"gp-table\" style=\"margin:.3rem 0 0 1.2rem;width:auto\">"
+    std::string h = "<table class=\"gp-table dx-nested\">"
                     "<thead><tr><th>Device</th><th>Last seen</th><th>CPU</th>"
                     "<th>Working set</th></tr></thead><tbody>";
     for (const auto& d : devices) {
-        h += "<tr><td style=\"font-family:var(--mono);font-size:.78rem\">" + esc(d.agent_id) +
+        h += "<tr><td class=\"dx-mono\">" + esc(d.agent_id) +
              "</td><td>" + ymd(d.last_day) + "</td><td>" + fmt_pct(d.cpu_avg) + "</td><td>" +
              fmt_bytes(static_cast<double>(d.ws_avg_bytes)) + "</td></tr>";
     }
     h += "</tbody></table>";
-    h += "<div class=\"gp-note\" style=\"margin-left:1.2rem\">Devices where this exact "
+    h += "<div class=\"gp-note dx-nested\">Devices where this exact "
          "app-version was among the device's own top resource consumers &mdash; <b>not a full "
          "inventory</b> of every device running it. &ldquo;Last seen&rdquo; is this version's "
          "most recent reported day within the 31-day per-device retention.</div>";
     if (truncated)
-        h += "<div class=\"gp-note\" style=\"margin-left:1.2rem\">List capped &mdash; showing "
+        h += "<div class=\"gp-note dx-nested\">List capped &mdash; showing "
              "the highest-CPU devices only; more devices reported this version than shown.</div>";
     return h;
 }
@@ -536,9 +526,7 @@ namespace {
 
 // The "newest version" cue — a factual tag (most recent day on this device), not a
 // verdict. Same idiom as the fleet trend's latest tag.
-const char* const kLatestTag =
-    " <span style=\"font-size:.62rem;color:#062534;background:var(--accent);border-radius:.3rem;"
-    "padding:.03rem .35rem;font-weight:700\">latest</span>";
+const char* const kLatestTag = " <span class=\"dx-tag\">latest</span>";
 
 // One version's metric cells (Avg CPU · Peak CPU · CPU trend · Avg WS · Peak WS ·
 // Instances · Days) — shared by the single-version combined row and the multi-
@@ -572,8 +560,8 @@ std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps
         if (app.versions.size() == 1) {
             // Common case: collapse the app + its one version into a single row.
             const auto& v = app.versions.front();
-            h += "<tr><td><span style=\"font-weight:600;color:var(--white)\">" + esc(app.app_name) +
-                 "</span> " + version_label(v) + "</td>" + device_metric_cells(v) + "</tr>";
+            h += "<tr><td><b>" + esc(app.app_name) + "</b> " + version_label(v) + "</td>" +
+                 device_metric_cells(v) + "</tr>";
             continue;
         }
         // Multi-version: an app header row (the version count) then per-version
@@ -585,13 +573,13 @@ std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps
         std::int64_t newest = 0;
         for (const auto& v : app.versions)
             newest = (std::max)(newest, v.latest_day);
-        h += "<tr style=\"background:var(--surface)\"><td style=\"font-weight:700;color:var(--white)\">" +
-             esc(app.app_name) + " <span class=\"gp-mute\" style=\"font-weight:400;font-size:.7rem\">&middot; " +
+        h += "<tr class=\"dx-apphead\"><td>" + esc(app.app_name) +
+             " <span class=\"gp-mute\">&middot; " +
              std::to_string(app.versions.size()) +
              " versions</span></td><td colspan=\"7\" class=\"gp-mute\">per-version below</td></tr>";
         for (const auto& v : app.versions) {
             const std::string tag = (v.latest_day == newest) ? kLatestTag : "";
-            h += "<tr><td style=\"padding-left:1.5rem\">" + version_label(v) + tag + "</td>" +
+            h += "<tr><td class=\"dx-indent\">" + version_label(v) + tag + "</td>" +
                  device_metric_cells(v) + "</tr>";
         }
     }
