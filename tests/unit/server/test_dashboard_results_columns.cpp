@@ -32,11 +32,13 @@
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
+#include "url_attr_scan.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <optional>
 #include <set>
 #include <string>
@@ -90,6 +92,15 @@ struct DashboardResultsColumnsTestAccess {
         return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", definition_id);
+    }
+    // URL-encoding pins: lets a test supply the request-reflected values
+    // (text query, definition id) that end up in the sort/page links.
+    std::string render_reflected(const std::string& command_id, const std::string& plugin,
+                                 const std::string& text_query,
+                                 const std::string& definition_id) {
+        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+                                     /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
+                                     /*filters=*/{}, text_query, definition_id);
     }
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
                                    const std::string& username = {}) {
@@ -807,6 +818,39 @@ TEST_CASE("render_filter_bar route: a JIT-elevated session sees every agent's "
     CHECK(res->status == 200);
     CHECK(contains(res->body, "value=\"loaded\""));
     CHECK(contains(res->body, "value=\"unloaded\""));
+}
+
+
+TEST_CASE("render_results: request-reflected values are query-encoded in the sort link, once",
+          "[pg][server][dashboard][render_results][url_path_segment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(nullptr, &rs);
+
+    const std::string q = "a&dir=desc#x\"><b>";
+    const std::string plugin = "reg&per_page=1";
+    const std::string html = acc.render_reflected("cmd 1", plugin, q, "d/../e");
+    const auto urls = yuzu::test::url_attr_values(html);
+
+    const std::string want =
+        "/fragments/results?command_id=cmd%201&plugin=" + yuzu::server::url_query_value(plugin) +
+        "&sort=agent&dir=desc&page=1&per_page=50&definition_id=d%2F..%2Fe&q=" +
+        yuzu::server::url_query_value(q);
+    CHECK(yuzu::test::has_url(urls, want));
+    // The raw reflected markup never reaches the page, and nothing was escaped twice.
+    CHECK_FALSE(contains(html, "<b>"));
+    CHECK_FALSE(contains(html, "%26amp"));
+    CHECK_FALSE(contains(html, "&amp;amp;"));
+    for (const auto& u : urls) {
+        CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+        if (u.rfind("/fragments/results?", 0) == 0) {
+            // one query string, exactly the parameters the renderer itself appended
+            CHECK(std::count(u.begin(), u.end(), '#') == 0);
+            CHECK(std::count(u.begin(), u.end(), '&') == 7);
+        }
+    }
 }
 
 } // namespace yuzu::server

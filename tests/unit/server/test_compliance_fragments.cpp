@@ -282,3 +282,89 @@ TEST_CASE("policy fragments: Delete is disabled while a policy uses the fragment
     CHECK(html.substr(f2, f3 - f2).find("disabled") != std::string::npos);
     CHECK(html.substr(f3).find("disabled") != std::string::npos);
 }
+
+// ── URL path-segment encoding (policy id in hx-get / data-id) ──────────────
+
+#include "url_attr_scan.hpp"
+
+namespace {
+ch::PolicyRow row_with_id(const std::string& id) {
+    auto r = row("p", 5, 1);
+    r.id = id;
+    return r;
+}
+} // namespace
+
+TEST_CASE("compliance summary: a hostile policy id is encoded as ONE path segment in the View link",
+          "[compliance][fragments][url_path_segment]") {
+    const std::vector<std::string> hostile = {
+        "./bulk-approve?", "../auto-approve/mode?", "../users/x", "a/b",      "%252e",
+        "%2E%2E/x",        "a#b",                   "a?b",        "caf\xC3\xA9", "a b&c",
+    };
+    for (const auto& id : hostile) {
+        INFO("id=" << id);
+        ch::SummaryView v;
+        v.can_write = v.can_execute = v.can_delete = true;
+        v.policies.push_back(row_with_id(id));
+        const auto html = ch::render_summary(v);
+        const auto urls = yuzu::test::url_attr_values(html);
+
+        const std::string expected = "/fragments/compliance/" + url_path_segment(id);
+        CHECK(yuzu::test::has_url(urls, expected));
+        for (const auto& u : urls) {
+            CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+            // exactly the two slashes of `/fragments/compliance/<seg>`
+            if (u.rfind("/fragments/compliance/", 0) == 0)
+                CHECK(yuzu::test::path_slashes(u) == 3);
+        }
+        // the raw id never appears inside an hx-get value
+        CHECK_FALSE(has(html, "hx-get=\"/fragments/compliance/" + html_escape(id)));
+    }
+}
+
+TEST_CASE("compliance summary: an empty or dot-only policy id gets no link, switch or action",
+          "[compliance][fragments][url_path_segment]") {
+    for (const std::string id : {std::string(), std::string("."), std::string(".."),
+                                 std::string("%2e%2e"), std::string("%2E")}) {
+        INFO("id=" << id);
+        ch::SummaryView v;
+        v.can_write = v.can_execute = v.can_delete = true;
+        v.policies.push_back(row_with_id(id));
+        const auto html = ch::render_summary(v);
+        CHECK_FALSE(has(html, "hx-get=\"/fragments/compliance/"));
+        CHECK_FALSE(has(html, "data-act=\"toggle-enabled\""));
+        CHECK_FALSE(has(html, "data-act=\"evaluate\""));
+        CHECK_FALSE(has(html, "data-act=\"delete-policy\""));
+        CHECK(has(html, "identifier not supported for actions"));
+        // the row itself (name) is still shown
+        CHECK(has(html, "policy-name\">p<"));
+    }
+}
+
+TEST_CASE("compliance summary: an ordinary id keeps every action and its data-id",
+          "[compliance][fragments][url_path_segment]") {
+    ch::SummaryView v;
+    v.can_write = v.can_execute = v.can_delete = true;
+    v.policies.push_back(row_with_id("pol-ok_1.2"));
+    const auto html = ch::render_summary(v);
+    CHECK(has(html, "hx-get=\"/fragments/compliance/pol-ok_1.2\""));
+    CHECK(has(html, "data-act=\"toggle-enabled\" data-id=\"pol-ok_1.2\""));
+    CHECK(has(html, "data-act=\"evaluate\" data-id=\"pol-ok_1.2\""));
+    CHECK(has(html, "data-act=\"delete-policy\" data-id=\"pol-ok_1.2\""));
+}
+
+TEST_CASE("compliance fragments list: a dot-only fragment id gets no delete action",
+          "[compliance][fragments][url_path_segment]") {
+    ch::FragmentsView v;
+    ch::FragmentRow ok;
+    ok.id = "frag-1";
+    ok.name = "Frag one";
+    ch::FragmentRow bad;
+    bad.id = "..";
+    bad.name = "Frag two";
+    v.fragments = {ok, bad};
+    const auto html = ch::render_fragments(v);
+    CHECK(has(html, "data-act=\"delete-fragment\" data-id=\"frag-1\""));
+    CHECK_FALSE(has(html, "data-id=\"..\""));
+    CHECK(has(html, "identifier not supported for actions"));
+}

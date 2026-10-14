@@ -6,10 +6,14 @@
 #include "deployment_routes.hpp"
 #include "preflight_routes.hpp"
 #include "verify_ui.hpp"
+#include "url_attr_scan.hpp"
+#include "web_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -169,4 +173,53 @@ TEST_CASE("auto fragments: verify drill keeps its table wrapper and truncation b
     REQUIRE(has(cut, "Truncated \xE2\x80\x94 the cohort exceeded the read cap"));
     // Banner first, then the table panel.
     REQUIRE(cut.find("vf-ind bad") < cut.find("af-panel vf-tw"));
+}
+
+// ── URL encoding of the agent id in the device links (/hardware/ci?id=) ──────
+
+namespace {
+const std::vector<std::string> kHostileAgentIds = {
+    "a&lens=x#y", "../../fragments/device/live/run?id=z", "a/b", "x y", "%2e%2e", "caf\xC3\xA9",
+};
+
+void check_device_links(const std::string& html, const std::string& id) {
+    INFO("id=" << id);
+    const auto urls = yuzu::test::url_attr_values(html);
+    const std::string want = "/hardware/ci?id=" + yuzu::server::url_query_value(id);
+    CHECK(yuzu::test::has_url(urls, want));
+    for (const auto& u : urls) {
+        if (u.rfind("/hardware/ci", 0) != 0)
+            continue;
+        // one '?', one parameter, no fragment: the id can neither add a parameter nor truncate.
+        CHECK(std::count(u.begin(), u.end(), '?') == 1);
+        CHECK(std::count(u.begin(), u.end(), '&') == 0);
+        CHECK(std::count(u.begin(), u.end(), '#') == 0);
+        CHECK(yuzu::test::path_slashes(u) == 2); // /hardware/ci
+    }
+}
+} // namespace
+
+TEST_CASE("auto fragments: a hostile agent id is query-encoded in the pre-flight, deploy and "
+          "verify device links",
+          "[preflight][deployment][verify][ui][url_path_segment]") {
+    for (const auto& id : kHostileAgentIds) {
+        preflight::PreflightDeviceResult go;
+        go.agent_id = id;
+        go.bucket = preflight::Bucket::kPass;
+        check_device_links(render_auto_results({go}, "cfg", "Group", "", true, "run1"), id);
+
+        DeploymentRow dep;
+        DeploymentDeviceRow dev;
+        dev.agent_id = id;
+        dev.step = "failed";
+        check_device_links(render_deploy_results(dep, {dev}, ""), id);
+
+        PairedComparison c;
+        c.paired = 1;
+        c.window_days = 7;
+        MachinePair p;
+        p.agent_id = id;
+        c.pairs.push_back(p);
+        check_device_links(render_verify_drill(c, false), id);
+    }
 }

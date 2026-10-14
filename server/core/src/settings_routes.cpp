@@ -1914,17 +1914,25 @@ std::string SettingsRoutes::render_pending_fragment() {
                     "</span></td>"
                     "<td>";
 
-            if (a.status == auth::PendingStatus::pending) {
+            if (a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id)) {
+                // The id is empty or only dots: a browser collapses a dot-only
+                // path segment, so no per-row URL can be built for it. Offer no
+                // row action (the bulk buttons below still cover the queue).
+                html += "<span class=\"muted\">identifier not supported for row actions</span>";
+            } else if (a.status == auth::PendingStatus::pending) {
+                // The id is agent-supplied: percent-encode it as ONE path segment
+                // (html_escape alone leaves `/`, `?`, `#` and `.` live in the URL).
+                const std::string seg = url_path_segment(a.agent_id);
                 html += "<button class=\"btn btn-primary\" "
                         "style=\"margin-right:0.3rem\" "
                         "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
+                        seg +
                         "/approve\" "
                         "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
                         ">Approve</button>"
                         "<button class=\"btn btn-danger\" "
                         "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
+                        seg +
                         "/deny\" "
                         "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Deny agent enrollment?\""
@@ -2316,6 +2324,50 @@ std::string SettingsRoutes::render_updates_fragment() {
                                 ? std::to_string(pkg.file_size / 1024) + " KB"
                                 : std::to_string(pkg.file_size / (1024 * 1024)) + " MB";
 
+            // platform/arch/version are operator-uploaded path segments: encode
+            // each, and offer no rollout/delete URL when one is empty or only
+            // dots (a browser collapses a dot segment).
+            const bool pkg_actionable = path_segment_ok(pkg.platform) &&
+                                        path_segment_ok(pkg.arch) && path_segment_ok(pkg.version);
+            std::string rollout_cell;
+            std::string delete_cell;
+            if (pkg_actionable) {
+                const std::string pkg_path = url_path_segment(pkg.platform) + "/" +
+                                             url_path_segment(pkg.arch) + "/" +
+                                             url_path_segment(pkg.version);
+                rollout_cell =
+                    "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
+                    "hx-post=\"/api/settings/updates/" +
+                    pkg_path +
+                    "/rollout\" "
+                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
+                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
+                    "value=\"" +
+                    std::to_string(pkg.rollout_pct) +
+                    "\" "
+                    "style=\"width:60px\" "
+                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
+                    "<span style=\"width:2.5em\">" +
+                    std::to_string(pkg.rollout_pct) +
+                    "%</span>"
+                    "<button class=\"btn btn-secondary\" type=\"submit\" "
+                    ">Set</button>"
+                    "</form>";
+                delete_cell = "<button class=\"btn btn-danger\" "
+                              "hx-delete=\"/api/settings/updates/" +
+                              pkg_path +
+                              "\" "
+                              "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                              "hx-confirm=\"Delete update package " +
+                              html_escape(pkg.version) + " for " + html_escape(pkg.platform) +
+                              "/" + html_escape(pkg.arch) +
+                              "?\""
+                              ">Delete</button>";
+            } else {
+                rollout_cell = delete_cell =
+                    "<span class=\"muted\">identifier not supported for actions</span>";
+            }
+
             html += "<tr>"
                     "<td>" +
                     html_escape(pkg.platform) +
@@ -2370,39 +2422,14 @@ std::string SettingsRoutes::render_updates_fragment() {
                                        "--update-require-signature will refuse this "
                                        "package.\">unsigned</span>")) +
                     "</td>"
-                    "<td>"
-                    "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
-                    "hx-post=\"/api/settings/updates/" +
-                    html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "/" +
-                    html_escape(pkg.version) +
-                    "/rollout\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
-                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
-                    "value=\"" +
-                    std::to_string(pkg.rollout_pct) +
-                    "\" "
-                    "style=\"width:60px\" "
-                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
-                    "<span style=\"width:2.5em\">" +
-                    std::to_string(pkg.rollout_pct) +
-                    "%</span>"
-                    "<button class=\"btn btn-secondary\" type=\"submit\" "
-                    ">Set</button>"
-                    "</form></td>"
+                    "<td>" +
+                    rollout_cell +
+                    "</td>"
                     "<td>" +
                     std::string(pkg.mandatory ? "Yes" : "No") +
                     "</td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "hx-delete=\"/api/settings/updates/" +
-                    html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "/" +
-                    html_escape(pkg.version) +
-                    "\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Delete update package " +
-                    html_escape(pkg.version) + " for " + html_escape(pkg.platform) + "/" +
-                    html_escape(pkg.arch) +
-                    "?\""
-                    ">Delete</button></td></tr>";
+                    "<td>" +
+                    delete_cell + "</td></tr>";
         }
     }
 
@@ -6034,13 +6061,33 @@ void SettingsRoutes::register_routes(
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
+    // A pending-agent id that is empty or only dots can never be addressed by a
+    // browser-built URL (dot segments collapse), so an API call carrying one is
+    // refused outright rather than matched against the store.
+    auto refuse_unaddressable_agent_id = [this](const httplib::Request& req,
+                                                httplib::Response& res, const char* verb,
+                                                const std::string& agent_id,
+                                                const std::string& by) -> bool {
+        if (path_segment_ok(agent_id))
+            return false;
+        audit_fn_(req, verb, "denied", "Agent", agent_id, "invalid_agent_id by=" + by);
+        res.status = 400;
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"Invalid agent id","level":"error"}})");
+        res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+        return true;
+    };
+
     sink.Post(R"(/api/settings/pending-agents/(.+)/approve)",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
                   auto session = auth_fn_(req, res);
                   if (!session)
+                      return;
+                  if (refuse_unaddressable_agent_id(req, res, "enrollment.approve", agent_id,
+                                                    session->username))
                       return;
                   auto approved = auth_mgr_->approve_pending_agent(agent_id, session->username);
                   if (!approved) {
@@ -6065,12 +6112,15 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post(R"(/api/settings/pending-agents/(.+)/deny)",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
                   auto session = auth_fn_(req, res);
                   if (!session)
+                      return;
+                  if (refuse_unaddressable_agent_id(req, res, "enrollment.deny", agent_id,
+                                                    session->username))
                       return;
                   auto denied = auth_mgr_->deny_pending_agent(agent_id, session->username);
                   if (!denied) {
@@ -6095,12 +6145,15 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Delete(R"(/api/settings/pending-agents/(.+))",
-                [this](const httplib::Request& req, httplib::Response& res) {
+                [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
                     auto agent_id = req.matches[1].str();
                     auto session = auth_fn_(req, res);
                     if (!session)
+                        return;
+                    if (refuse_unaddressable_agent_id(req, res, "enrollment.remove", agent_id,
+                                                      session->username))
                         return;
                     auto removed = auth_mgr_->remove_pending_agent(agent_id);
                     if (!removed) {

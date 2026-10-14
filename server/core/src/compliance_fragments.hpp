@@ -159,8 +159,12 @@ inline std::string render_summary(const SummaryView& v) {
     }
     for (const auto& p : v.policies) {
         const int pct = p.total > 0 ? static_cast<int>(p.compliant * 100 / p.total) : 0;
+        // An empty or dot-only id cannot be placed in a link (browsers collapse
+        // dot segments, and the id feeds /api/policies/<id> paths in the page
+        // script), so such a row is shown without any action.
+        const bool addressable = path_segment_ok(p.id);
         html += "<tr><td>";
-        if (v.can_write) {
+        if (v.can_write && addressable) {
             html += "<input type=\"checkbox\" class=\"sw\" role=\"switch\" data-act=\"toggle-enabled\" "
                     "data-id=\"" + html_escape(p.id) + "\" data-name=\"" + html_escape(p.name) +
                     "\" data-enabled=\"" + (p.enabled ? "1" : "0") + "\"" +
@@ -179,14 +183,20 @@ inline std::string render_summary(const SummaryView& v) {
             html += "<span class=\"policy-count\">-</span>";
         }
         html += "</td><td class=\"policy-count\">" + std::to_string(p.compliant) + "/" +
-                std::to_string(p.total) +
-                "</td><td><button class=\"btn btn-secondary btn-sm\" hx-get=\"/fragments/compliance/" +
-                html_escape(p.id) +
-                "\" hx-target=\"#compliance-detail\" hx-swap=\"innerHTML\">View</button>";
-        if (v.can_execute)
-            html += act_button("evaluate", "Evaluate", p.id, p.name);
-        if (v.can_delete)
-            html += act_button("delete-policy", "Delete", p.id, p.name);
+                std::to_string(p.total) + "</td><td>";
+        if (!addressable) {
+            html += "<span class=\"cell-mut\">identifier not supported for actions</span>";
+        } else {
+            // url_path_segment, not html_escape: the id is author-supplied text and
+            // must stay inside this one path segment.
+            html += "<button class=\"btn btn-secondary btn-sm\" hx-get=\"/fragments/compliance/" +
+                    url_path_segment(p.id) +
+                    "\" hx-target=\"#compliance-detail\" hx-swap=\"innerHTML\">View</button>";
+            if (v.can_execute)
+                html += act_button("evaluate", "Evaluate", p.id, p.name);
+            if (v.can_delete)
+                html += act_button("delete-policy", "Delete", p.id, p.name);
+        }
         html += "</td></tr>";
     }
     html += "</tbody></table></div></div>";
@@ -334,10 +344,13 @@ inline std::string render_fragments(const FragmentsView& v) {
                 "</td><td class=\"policy-count\">" + std::to_string(f.used_by) +
                 (f.used_by_capped ? "+" : "") + " " + (f.used_by == 1 && !f.used_by_capped ? "policy" : "policies") +
                 "</td><td>" +
-                act_button("delete-fragment", "Delete", f.id, f.name,
-                           (f.used_by > 0 || f.used_by_capped)
-                               ? " data-perm=\"delete\" disabled title=\"In use by policies\""
-                               : " data-perm=\"delete\"") +
+                (path_segment_ok(f.id)
+                     ? act_button("delete-fragment", "Delete", f.id, f.name,
+                                  (f.used_by > 0 || f.used_by_capped)
+                                      ? " data-perm=\"delete\" disabled title=\"In use by policies\""
+                                      : " data-perm=\"delete\"")
+                     : std::string("<span class=\"cell-mut\">identifier not supported for "
+                                   "actions</span>")) +
                 "</td></tr>";
     }
     html += "</tbody></table></div></div>";

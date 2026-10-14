@@ -378,7 +378,7 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                      });
 
     // -- Policy fragments list (the HTML twin of GET /api/policy-fragments) --
-    // Deliberately OUTSIDE /fragments/compliance/(\w[\w\-]*): that regex is
+    // Deliberately OUTSIDE /fragments/compliance/(\w[\w.\-]*): that regex is
     // the per-policy id namespace and would swallow a sibling literal.
     sink.Get("/fragments/policy-fragments",
                      [this](const httplib::Request& req, httplib::Response& res) {
@@ -394,7 +394,7 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
     // scope, and the per-agent read writes compliance.agent_statuses.view.
     // Audit posture follows the dashboard convention (set-and-proceed, flag
     // via Sec-Audit-Failed); the REST twin fails closed instead.
-    sink.Get(R"(/fragments/compliance/(\w[\w\-]*))",
+    sink.Get(R"(/fragments/compliance/(\w[\w.\-]*))",
                      [this](const httplib::Request& req, httplib::Response& res) {
                          if (deny_service_scoped_(req, res)) return;
                          if (!fleet_read_fn_) {
