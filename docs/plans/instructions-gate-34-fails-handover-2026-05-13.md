@@ -98,7 +98,9 @@ for o in d['outcomes']:
 #    actual response (the runner doesn't always surface it cleanly):
 curl -s -c /tmp/cookies.txt -X POST http://localhost:8080/login \
     -d 'username=admin&password=YuzuUatAdmin1!' >/dev/null
+# Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
 RESP=$(curl -s -b /tmp/cookies.txt -X POST \
+    -H 'Origin: http://localhost:8080' \
     'http://localhost:8080/api/instructions/<DEF_ID>/execute' \
     -H 'Content-Type: application/json' -d '{}')
 echo "$RESP"
