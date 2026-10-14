@@ -215,6 +215,17 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/workflows",
+    "capability_id": "get.fragments-workflows",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflows"
+    },
+    "mcp_twin": "list_workflows",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/schedules",
     "capability_id": "get.fragments-schedules",
     "rest_v1_twin": {

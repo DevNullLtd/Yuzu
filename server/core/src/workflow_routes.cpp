@@ -6,6 +6,7 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
 #include "executions_page_render.hpp" // Operate O1: view=page renderers
+#include "workflows_page_render.hpp" // Operate WF-A: workflows + schedules page renderers
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
 #include "execution_scope_rules.hpp" // execution_visible / confined_projection (shared with GET /api/v1/executions)
@@ -1493,23 +1494,46 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     };
 
     // GET /fragments/schedules -- schedule list HTMX fragment
-    sink.Get("/fragments/schedules", [perm_fn, schedule_api,
+    sink.Get("/fragments/schedules", [auth_fn, perm_fn, schedule_api,
                                       deny_service_scoped_schedule_list](
                                          const httplib::Request& req, httplib::Response& res) {
+        // `view=page` (Operate Workflows page) serves the same rows through
+        // operate_pages::render_schedules_page behind the SAME two-stage gate and the same
+        // seam call; only the output differs. The default view below is the Schedules tab on
+        // /instructions and stays byte-identical (pinned by test_workflows_page_routes.cpp).
+        // htmx drops 4xx/5xx bodies, so in the page view a 403 becomes a 200 note.
+        const bool view_page = req.get_param_value("view") == "page";
+        auto page_note = [&res](const char* attr, std::string_view text) {
+            res.status = 200;
+            res.headers.erase("Retry-After");
+            res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
+                                html_escape(std::string(text)) + "</div>",
+                            "text/html; charset=utf-8");
+        };
         // deny_service_scoped_schedule_list already resolved (and validated)
         // the session via auth_fn — a second auth_fn call here would be
         // redundant, matching the original handler's only use of `session`
         // (the existence check; the body never read the session itself).
-        if (deny_service_scoped_schedule_list(req, res))
+        if (deny_service_scoped_schedule_list(req, res)) {
+            if (view_page && res.status == 403)
+                page_note("denied", operate_pages::kSchedulesDeniedNote);
             return;
+        }
         // sec-M1-style gate (mirrors /fragments/executions immediately above):
         // the LIST exposes every schedule's name/frequency/enabled state/
         // execution count fleet-wide — previously reachable by ANY
         // authenticated session with no RBAC check at all (guardian-
         // confinement-2298 hardening sweep).
-        if (!perm_fn(req, res, "Schedule", "Read"))
+        if (!perm_fn(req, res, "Schedule", "Read")) {
+            if (view_page && res.status == 403)
+                page_note("denied", operate_pages::kSchedulesDeniedNote);
             return;
+        }
         if (!schedule_api) {
+            if (view_page) {
+                page_note("degraded", operate_pages::kSchedulesDegradedNote);
+                return;
+            }
             res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
             return;
         }
@@ -1536,6 +1560,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // value is intentionally discarded, never rendered (the fixed
             // banner text below is the only thing sent to the client).
             (void)yuzu::server::genericize_db_error("list_schedules", result.error());
+            if (view_page) {
+                page_note("degraded", operate_pages::kSchedulesDegradedNote);
+                return;
+            }
             res.set_content(
                 "<div class=\"empty-state\">Schedule list temporarily unavailable &mdash; "
                 "retry shortly.</div>",
@@ -1543,6 +1571,44 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto& scheds = result->schedules;
+        if (view_page) {
+            // The owner flag is computed HERE from the session and only that boolean reaches
+            // the page. The expression, interval, approval flag and parameter count are in no
+            // read that carries a non-owner's schedule (REST v1, MCP), so they are filled in
+            // for a row the caller created and left at their defaults for every other row;
+            // created_by is never copied. An empty created_by is nobody's (the #4131 gap).
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            operate_pages::ScheduleListView view;
+            view.truncated = result->truncated;
+            view.rows.reserve(scheds.size());
+            for (const auto& sc : scheds) {
+                operate_pages::ScheduleRowView row;
+                row.id = sc.id;
+                row.name = sc.name;
+                row.definition_id = sc.definition_id;
+                row.frequency_type = sc.frequency_type;
+                row.enabled = sc.enabled;
+                row.next_execution_at = sc.next_execution_at;
+                row.last_executed_at = sc.last_executed_at;
+                row.execution_count = sc.execution_count;
+                row.targeted = !sc.scope_expression.empty();
+                row.owner = !sc.created_by.empty() && sc.created_by == session->username;
+                if (row.owner) {
+                    row.interval_minutes = sc.interval_minutes;
+                    row.scope_expression = sc.scope_expression;
+                    row.requires_approval = sc.requires_approval;
+                    const auto params = nlohmann::json::parse(sc.parameter_values, nullptr, false);
+                    row.parameter_count =
+                        params.is_object() ? static_cast<int>(params.size()) : 0;
+                }
+                view.rows.push_back(std::move(row));
+            }
+            res.set_content(operate_pages::render_schedules_page(view),
+                            "text/html; charset=utf-8");
+            return;
+        }
         std::string html;
         // adversarial-review-kimi round (Codex C1 / Kimi K1, both independently):
         // schedule_api.hpp's own contract says "every caller (REST, MCP, and the
@@ -1587,6 +1653,74 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         html += "</section>";
         res.set_content(html, "text/html; charset=utf-8");
+    });
+
+    // GET /fragments/workflows -- the Workflows page's definitions list (Operate WF-A).
+    //
+    // SINGLE gate: perm_fn(Workflow, Read), exactly the one GET /api/v1/workflows uses. It is
+    // never stacked with fleet_read_fn (a definition carries no agent axis, and a stacked
+    // pair on one tuple is the BLOCKING defect FleetReadFn's doc comment names). Step labels
+    // and instruction ids come from the workflow's own definition: there is NO instruction
+    // name lookup, because that read needs InstructionDefinition:Read, which Workflow:Read
+    // does not imply. Reads one past the 100 shown so truncation is known, not guessed.
+    // list_workflows loads every row's yaml_source and steps (one query per row under one
+    // lease), so the page limit stays at 101 and the YAML is never rendered.
+    sink.Get("/fragments/workflows", [perm_fn, workflow_api](const httplib::Request& req,
+                                                             httplib::Response& res) {
+        // htmx drops 4xx/5xx bodies: every refusal and degrade is a 200 note, and nothing from
+        // the gate's own body (reason, role or permission names) reaches the fragment.
+        auto note = [&res](const char* attr, std::string_view text) {
+            res.status = 200;
+            res.headers.erase("Retry-After");
+            res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
+                                html_escape(std::string(text)) + "</div>",
+                            "text/html; charset=utf-8");
+        };
+        if (!perm_fn(req, res, "Workflow", "Read")) {
+            if (res.status == 403)
+                note("denied", operate_pages::kWorkflowsDeniedNote);
+            return;
+        }
+        if (!workflow_api) {
+            note("degraded", operate_pages::kWorkflowsDegradedNote);
+            return;
+        }
+        operate_pages::WorkflowListView view;
+        WorkflowQuery q;
+        q.limit = view.page_cap + 1;
+        auto result = workflow_api->list_workflows(q);
+        if (!result) {
+            // Called for its logging side effect only; the fixed note is all that is sent.
+            (void)yuzu::server::genericize_db_error("list_workflows", result.error());
+            note("degraded", operate_pages::kWorkflowsDegradedNote);
+            return;
+        }
+        const auto shown = std::min<std::size_t>(result->size(),
+                                                 static_cast<std::size_t>(view.page_cap));
+        view.truncated = result->size() > shown;
+        view.rows.reserve(shown);
+        for (std::size_t i = 0; i < shown; ++i) {
+            const auto& w = (*result)[i];
+            operate_pages::WorkflowRowView row;
+            row.id = w.id;
+            row.name = w.name;
+            row.description = w.description;
+            row.steps.reserve(w.steps.size());
+            for (const auto& st : w.steps) {
+                operate_pages::WorkflowStepView sv;
+                sv.index = st.index;
+                sv.instruction_id = st.instruction_id;
+                sv.label = st.label;
+                sv.condition = st.condition;
+                sv.foreach_source = st.foreach_source;
+                sv.on_failure = st.on_failure;
+                sv.retry_count = st.retry_count;
+                sv.retry_delay_seconds = st.retry_delay_seconds;
+                row.steps.push_back(std::move(sv));
+            }
+            view.rows.push_back(std::move(row));
+        }
+        res.set_content(operate_pages::render_workflows_list(view), "text/html; charset=utf-8");
     });
 
     // -- Scope estimate API ----------------------------------------------------

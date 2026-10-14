@@ -478,6 +478,7 @@ yuzu_server_core_lib = static_library(
     'src/approvals_ui.cpp',
     'src/executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
     'src/executions_ui.cpp',
+    'src/workflows_page_render.cpp', # Operate WF-A: the Workflows page's pure definitions and schedules renderers
     'src/rbac_store.cpp',
     'src/rbac_admin_authority_owner.cpp',
     'src/oidc_provider.cpp',
