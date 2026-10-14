@@ -97,21 +97,48 @@ TEST_CASE("app shell: keys and hrefs are unique and every top-level entry has an
         }
 }
 
-TEST_CASE("app shell: only Software and Fleet have sub-items; Settings is one admin-only entry",
+TEST_CASE("app shell: only Software, Fleet and Settings have sub-items; Settings is the one admin-only entry",
           "[nav][shell]") {
+    // Parent keys only: a System page adds its own child line to kSettingsSub without
+    // touching this assertion (the child order is pinned by the next case).
     std::vector<std::string> with_children;
     for (const auto& g : nav_groups())
         for (const auto& it : g.items) {
             if (!it.children.empty())
-                with_children.push_back(std::string(it.key) + ">" + std::string(it.children[0].key));
+                with_children.push_back(std::string(it.key));
             CHECK((it.key == "settings") == it.admin_only);
         }
-    CHECK(with_children == std::vector<std::string>{"software>auto", "fleet>network"});
+    CHECK(with_children == std::vector<std::string>{"software", "fleet", "settings"});
 
     const auto groups = nav_groups();
     REQUIRE(groups.back().title == "System");
     REQUIRE(groups.back().items.size() == 1);
     CHECK(groups.back().items[0].href == "/settings");
+}
+
+TEST_CASE("app shell: Settings sub-items are System pages in artboard order, none on the "
+          "parent's own href",
+          "[nav][shell]") {
+    const std::vector<std::string_view> artboard = {
+        "settings-general",  "settings-security", "settings-integrations", "settings-pki",
+        "settings-plugins",  "settings-data",     "settings-licence",      "settings-developer"};
+    const auto groups = nav_groups();
+    const auto& settings = groups.back().items[0];
+    REQUIRE(settings.key == "settings");
+    REQUIRE_FALSE(settings.children.empty());
+
+    // The child keys are a subsequence of the artboard order: nothing out of order, nothing
+    // unknown. Pages that have not landed are simply absent ("nav only for pages that exist").
+    std::size_t at = 0;
+    for (const auto& c : settings.children) {
+        INFO(c.key);
+        while (at < artboard.size() && artboard[at] != c.key)
+            ++at;
+        CHECK(at < artboard.size());
+        ++at;
+        CHECK(c.href != settings.href);
+        CHECK(c.href.starts_with("/settings/"));
+    }
 }
 
 // ── Breadcrumb ──────────────────────────────────────────────────────────────
