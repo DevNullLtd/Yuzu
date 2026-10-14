@@ -89,6 +89,13 @@ readable through `GET /api/v1/network/discovered-devices`, the MCP tool
 Permission required: **`Infrastructure:Read`**. Each read is audited as
 `network.discovered.view`, and a service-scoped API token is refused.
 
+- An operator confined to a management group is refused (`403`): this read is
+  gated by the flat `Infrastructure:Read`, as the device list is, and does not yet
+  narrow rows to the confined operator's devices (tracked by `#5855`). A holder of
+  the global grant sees every discovered host.
+- The dashboard fragment answers a failed read (an invalid filter, or an
+  unavailable store) with a failure box and HTTP 200, so the page shows it; the
+  REST and MCP reads return the real `400`/`503`.
 - Results are newest last-seen first, at most 500 rows, filterable by exact
   subnet. The summary counts (hosts and distinct subnets) cover every matching
   row; `truncated` says when the list was cut.

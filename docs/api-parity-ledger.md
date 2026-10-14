@@ -129,7 +129,7 @@ not retired and is not equivalent: it is unbounded (no `limit`, no `truncated`),
 flag yet), uses the `{devices,total}` shape, writes no `network.discovered.view` audit row and has
 no explicit service-scoped denial of its own (it relies on the `Infrastructure:Read` gate). The
 bounded, audited twin is the supported read for agents and integrations; hardening or retiring the
-raw route is tracked outside this change.
+raw route is tracked by `#5856` (revisit by 2026-11-14).
 
 ## Summary
 

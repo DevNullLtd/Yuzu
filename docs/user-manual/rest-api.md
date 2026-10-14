@@ -7991,7 +7991,7 @@ row. It does not read the shelved `/software-deployments` store below. MCP twin:
 
 | Name | In | Required | Description |
 |---|---|---|---|
-| `limit` | query | No | Max deployments to return (default 20; a parseable value outside 1..100 is clamped, a non-numeric one, or one too large for a 64-bit integer, is `400`) |
+| `limit` | query | No | Max deployments to return (default 20; a whole integer outside 1..100 is clamped; anything else is `400`: non-numeric, a number followed by other characters such as `20junk`, or one too large for a 64-bit integer) |
 
 **Response:**
 
@@ -8012,10 +8012,16 @@ row. It does not read the shelved `/software-deployments` store below. MCP twin:
       "total": 35, "succeeded": 32, "failed": 2, "skipped": 1, "active": 0
     }
   ],
-  "pagination": { "total": 1, "start": 0, "page_size": 20 },
+  "pagination": { "start": 0, "page_size": 20, "truncated": false },
   "meta": { "api_version": "v1" }
 }
 ```
+
+`pagination.truncated` is `true` when you own more deployments than `limit` returned. There is no
+total and no paging cursor: raise `limit` (maximum 100) to see more, and note that a deployment
+older than your newest 100 is not reachable through this endpoint. The `total` field this endpoint
+returned before 2026-10-14 was the number of rows in the page, not a count of your deployments, and
+has been removed.
 
 `status` is `running` or `complete`; the live engine has no staged, cancelled or rolled-back state.
 `state.label` carries the failed or skipped count of a finished deployment ("Complete, 2 failed").
@@ -8027,7 +8033,7 @@ engine advance, which only happens while a Deployments page is open, so a `runni
 
 | Condition | Response |
 |---|---|
-| `limit` is not an integer (or does not fit 64 bits) | `400` |
+| `limit` is not a whole integer (non-numeric, trailing characters, or does not fit 64 bits) | `400` |
 | A service-scoped API token | `403`, audited under `deployment.list.view` |
 | Deployment run store never configured on this server | `503` (A4 envelope, no `retry_after_ms`) |
 | Deployment run store degraded (transient) | `503` (A4 envelope, `retry_after_ms: 2000`) — never an empty list |
@@ -8081,7 +8087,7 @@ in `error`.
 
 | Condition | Response |
 |---|---|
-| `limit` is not an integer (or does not fit 64 bits) | `400` |
+| `limit` is not a whole integer (non-numeric, trailing characters, or does not fit 64 bits) | `400` |
 | A service-scoped API token | `403`, audited under `deployment.detail.view` |
 | No such deployment, or it belongs to another operator | `404` — indistinguishable by design |
 | Store never configured / degraded | `503` as for the list |
@@ -9301,6 +9307,7 @@ Hosts found by network discovery scans, including hosts with no agent. The REST/
 - **Permission:** `Infrastructure:Read`
 - **Query parameters:** `subnet` (only hosts found on exactly this subnet string, at most 64 bytes); `limit` (1 to 500, default and cap 500).
 - **Response:** `{data[], summary, truncated, meta}`. `data[]` rows are `{id, ip_address, mac_address, hostname, subnet, discovered_by, discovered_at, last_seen}` (epoch seconds), newest last-seen first. `summary` is `{total, subnets}` over every row matching the filter, not just the returned page; `truncated` is `true` when more rows matched than were returned. `hostname` is `unknown` when a reverse lookup failed, and `hostname` and `mac_address` are agent-reported free text.
+- **Management-group confinement:** the read is gated by the flat `Infrastructure:Read`, like the sibling `GET /api/v1/network/devices`, and is not narrowed by the admit-then-filter list chokepoint. An operator confined to a management group is refused with `403` rather than shown a narrowed list; a holder of the global grant sees every discovered host. Narrowing rows by `discovered_by` is tracked by `#5855`.
 - **No `managed` flag:** discovery does not yet match hosts to enrolled agents, so no managed or agent field is returned rather than a value that would read "unmanaged" for an enrolled host.
 - **Errors:** `400` invalid `limit` or `subnet`; `403` a service-scoped API token (denied outright and audited as `result=denied`) or missing permission; `503` the discovery store is unavailable or degraded. A store fault is never rendered as an empty list.
 - **Audit (behavioral PII):** each row names a host fleet-wide, so a served read emits **`network.discovered.view`** (`target_type=Infrastructure`, `target_id=` empty). **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no rows. MCP twin: `list_discovered_devices` (set-and-proceed, reports `audit_persisted: false` instead of refusing).
