@@ -155,6 +155,25 @@ parse_instruction_params(const std::string& text) {
     return {command, params};
 }
 
+bool DashboardRoutes::refuse_cross_site_write(const httplib::Request& req,
+                                              httplib::Response& res) const {
+    const auto session = auth_fn_(req, res); // writes its own 401 when there is no session
+    if (!session)
+        return true;
+    if (!browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"),
+                                     req.get_header_value("Referer"), csrf_trusted_origins_))
+        return false;
+    audit_fn_(req, "csrf.denied", "denied", "Endpoint", "dashboard",
+              "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
+                    " class=\"result-context is-error\" data-reason=\"csrf_cross_origin\">"
+                    "Cross-site request refused. Nothing was sent.</span>",
+                    "text/html; charset=utf-8");
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // register_routes
 // ---------------------------------------------------------------------------
@@ -733,6 +752,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     sink.Post("/api/dashboard/execute",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
+                 if (refuse_cross_site_write(req, res)) return;
 
                  auto instruction = extract_form_value(req.body, "instruction");
 
@@ -1380,6 +1400,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     sink.Post("/api/dashboard/tar-execute",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
+                 if (refuse_cross_site_write(req, res)) return;
 
                  auto sql = req.get_param_value("sql");
                  if (sql.empty()) {

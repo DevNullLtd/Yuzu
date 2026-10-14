@@ -65,15 +65,17 @@ struct Harness {
     std::vector<AuditRow> persisted; // rows that went through the persist-reporting sink
     std::vector<std::string> order;  // "audit:<result>" / "dispatch", in call order
     bool persist_ok = true;          // false = the audit store refuses the row
+    std::string auth_source{"local"}; // the resolved session's source ("local" = cookie session)
     int sent = 3;
     std::pair<std::string, std::string> resolve_to{kReadOnly.first, kReadOnly.second};
 
     Harness() {
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "expr-op";
             s.role = auth::Role::admin;
+            s.auth_source = auth_source;
             return s;
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
@@ -113,11 +115,25 @@ struct Harness {
     }
 
     std::unique_ptr<httplib::Response> post(const std::string& body) {
-        std::unordered_map<std::string, std::string> headers{
-            {"Host", "yuzu.example:8080"}, {"Origin", "https://yuzu.example:8080"}};
+        return post_with(body, {{"Host", "yuzu.example:8080"}, {"Origin", "https://yuzu.example:8080"}});
+    }
+
+    std::unique_ptr<httplib::Response>
+    post_with(const std::string& body, const std::unordered_map<std::string, std::string>& headers) {
         auto res = sink.dispatch("POST", kPath, body, "application/x-www-form-urlencoded", headers);
         REQUIRE(res != nullptr);
         return res;
+    }
+
+    int rows(const std::string& action, const std::string& result) const {
+        int n = 0;
+        for (const auto& a : audits)
+            if (a.action == action && a.result == result)
+                ++n;
+        for (const auto& a : persisted)
+            if (a.action == action && a.result == result)
+                ++n;
+        return n;
     }
 
     int denied_with(const std::string& needle) const {
@@ -369,4 +385,63 @@ TEST_CASE("scope_expression audit: a send that reaches no agent records a failur
             contains(a.detail, "scope_expression="))
             failure = true;
     CHECK(failure);
+}
+
+// Same-site gate (browser_write_is_cross_site): a cookie session needs an Origin or Referer naming
+// this site. The refusal comes before any parsing, the audit-before-dispatch row and the dispatch.
+TEST_CASE("dashboard execute: a cookie-session write without a same-site Origin is refused",
+          "[server][dashboard][execute][csrf][security]") {
+    Harness h;
+    const std::string expr_body =
+        "instruction=version&scope_expression=" + enc(R"(ostype == "windows")");
+
+    SECTION("no Origin and no Referer") {
+        auto res = h.post_with(expr_body, {{"Host", "yuzu.example:8080"}});
+        CHECK(res->status == 403);
+    }
+    SECTION("a foreign Origin") {
+        auto res = h.post_with(expr_body,
+                               {{"Host", "yuzu.example:8080"}, {"Origin", "https://evil.example"}});
+        CHECK(res->status == 403);
+    }
+    SECTION("a foreign Referer and no Origin") {
+        auto res = h.post_with(expr_body, {{"Host", "yuzu.example:8080"},
+                                           {"Referer", "https://evil.example/page"}});
+        CHECK(res->status == 403);
+    }
+    SECTION("a plain picked-target send is gated the same way") {
+        auto res = h.post_with("instruction=version&scope=agent-1", {{"Host", "yuzu.example:8080"}});
+        CHECK(res->status == 403);
+    }
+    CHECK(h.calls.empty());                              // nothing dispatched
+    CHECK(h.rows("csrf.denied", "denied") == 1);         // the refusal is audited
+    CHECK(h.rows("command.dispatch", "attempted") == 0); // no attempted row burned
+    CHECK(h.persisted.empty());
+}
+
+TEST_CASE("dashboard execute: a token session is not gated by Origin",
+          "[server][dashboard][execute][csrf]") {
+    Harness h;
+    h.auth_source = "api_token";
+    auto res = h.post_with("instruction=version&scope=agent-1", {{"Host", "yuzu.example:8080"}});
+    CHECK(res->status == 200);
+    CHECK(h.calls.size() == 1);
+    CHECK(h.rows("csrf.denied", "denied") == 0);
+}
+
+TEST_CASE("dashboard execute: a same-site cookie-session write passes the gate",
+          "[server][dashboard][execute][csrf]") {
+    Harness h;
+    SECTION("Origin names this site") {
+        auto res = h.post("instruction=version&scope=agent-1");
+        CHECK(res->status == 200);
+    }
+    SECTION("Referer names this site, no Origin") {
+        auto res = h.post_with("instruction=version&scope=agent-1",
+                               {{"Host", "yuzu.example:8080"},
+                                {"Referer", "https://yuzu.example:8080/dashboard"}});
+        CHECK(res->status == 200);
+    }
+    CHECK(h.calls.size() == 1);
+    CHECK(h.rows("csrf.denied", "denied") == 0);
 }

@@ -258,6 +258,12 @@ public:
                                 bool extra_scope_is_authoritative = false) const;
 
 private:
+    /// Same-site gate for the cookie-authorised dashboard dispatch routes (execute, tar-execute):
+    /// see `browser_write_is_cross_site`. Runs after the permission gate and BEFORE any parsing,
+    /// audit-before-dispatch row or dispatch, so a refused request does no work. Token callers
+    /// are exempt. Writes the 403 and a `csrf.denied` audit row; returns true when refused.
+    bool refuse_cross_site_write(const httplib::Request& req, httplib::Response& res) const;
+
     std::vector<std::string> csrf_trusted_origins_;
     PersistAuditFn persist_audit_fn_;
     AuthFn auth_fn_;

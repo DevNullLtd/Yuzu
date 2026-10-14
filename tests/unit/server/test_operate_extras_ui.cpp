@@ -89,7 +89,9 @@ TEST_CASE("operate extras: the controller never writes server data as markup",
           "[ui][operate_extras][security]") {
     const auto& js = yuzu::server::kYuzuOperateExtrasJs;
     CHECK_FALSE(js.empty());
-    for (const char* banned : {"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
+    // ".innerHTML" is the property sink; the bare word also appears as htmx's `swap: 'innerHTML'`
+    // option in the Instructions controller, which writes nothing itself.
+    for (const char* banned : {".innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
                                "eval(", "new Function", "setTimeout(\"", "setInterval(\""}) {
         INFO("banned construct: " << banned);
         CHECK_FALSE(has(js, banned));
