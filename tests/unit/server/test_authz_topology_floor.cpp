@@ -397,6 +397,74 @@ TEST_CASE("require_permission: a floored denial's audit reason and counter are d
     }
 }
 
+// ── 9b. has_permission: the render-time probe (PR #5846 review; #5792) ─────
+
+TEST_CASE("has_permission: gives require_permission's verdict and writes no denial row, while "
+          "the gate still does (mutation: drop the probe guard in audit_log and the first "
+          "assertion fails)",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    const AuditQuery denied_rows{.action = "auth.permission_required", .limit = 10};
+
+    SECTION("a denied probe leaves no auth.permission_required row; the gate leaves one") {
+        auto req = fix.session_request("kim", auth::Role::user);
+        CHECK_FALSE(fix.ar->has_permission(req, "Infrastructure", "Write"));
+        auto after_probe = fix.audit_store->query(denied_rows);
+        REQUIRE(after_probe.has_value());
+        CHECK(after_probe->empty());
+
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "Infrastructure", "Write"));
+        auto after_gate = fix.audit_store->query(denied_rows);
+        REQUIRE(after_gate.has_value());
+        CHECK(after_gate->size() == 1);
+
+        // The suppression does not outlive the probe: a second probe adds nothing and a later
+        // gate denial is recorded again.
+        CHECK_FALSE(fix.ar->has_permission(req, "Infrastructure", "Write"));
+        httplib::Response res2;
+        CHECK_FALSE(fix.ar->require_permission(req, res2, "Infrastructure", "Write"));
+        auto after_both = fix.audit_store->query(denied_rows);
+        REQUIRE(after_both.has_value());
+        CHECK(after_both->size() == 2);
+    }
+
+    SECTION("the probe answers exactly as the gate does: admit, role denial, floored denial, "
+            "elevation") {
+        struct Case {
+            const char* user;
+            auth::Role role;
+            const char* securable;
+            const char* operation;
+            bool elevated;
+        };
+        const Case cases[] = {
+            {"lee", auth::Role::user, "Infrastructure", "Read", false},    // legacy Read allowed
+            {"mo", auth::Role::user, "Execution", "Execute", false},       // legacy needs admin
+            {"ned", auth::Role::user, "AccessReview", "Read", false},      // topology floor
+            {"ola", auth::Role::admin, "Execution", "Execute", false},     // admin
+            {"pat", auth::Role::user, "Execution", "Execute", true},       // JIT elevation
+        };
+        for (const auto& c : cases) {
+            INFO(c.user << " " << c.securable << ":" << c.operation);
+            auto req = c.elevated ? fix.elevated_session_request(c.user)
+                                  : fix.session_request(c.user, c.role);
+            httplib::Response res;
+            const bool gate = fix.ar->require_permission(req, res, c.securable, c.operation);
+            const bool probe = fix.ar->has_permission(req, c.securable, c.operation);
+            CHECK(probe == gate);
+        }
+    }
+
+    SECTION("an unauthenticated request is simply not permitted, and nothing is written") {
+        httplib::Request anon;
+        CHECK_FALSE(fix.ar->has_permission(anon, "Infrastructure", "Read"));
+        auto rows = fix.audit_store->query(denied_rows);
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+    }
+}
+
 // ── 10. Securable seeding ─────────────────────────────────────────────────
 
 TEST_CASE("RbacStore::seed_defaults: EnginePrincipal is seeded with Administrator+Viewer Read",

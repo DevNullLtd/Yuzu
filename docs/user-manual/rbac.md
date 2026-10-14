@@ -499,7 +499,7 @@ The 8 routes/tools in this family authorize purely on `owner_principal == sessio
 | `GET /api/v1/result-sets` | `list_result_sets` | `GET /fragments/result-sets/sidebar` |
 | `POST /api/v1/result-sets` | `create_result_set` | `POST /fragments/result-sets/create` |
 | `GET /api/v1/result-sets/{id}` | `get_result_set` | `GET /fragments/result-sets/{id}/detail` |
-| `GET /api/v1/result-sets/{id}/members` | `get_result_set_members` | *(no fragment equivalent — the detail fragment shows only a device COUNT, not the member list)* |
+| `GET /api/v1/result-sets/{id}/members` | `get_result_set_members` | `GET /fragments/result-sets/{id}/members` (same `Infrastructure:Read` scope, applied before the page limit) |
 | `GET /api/v1/result-sets/{id}/lineage` | `get_result_set_lineage` | *(shown as the breadcrumb on the detail fragment)* |
 | `POST /api/v1/result-sets/{id}/pin` | `pin_result_set` | `POST /fragments/result-sets/{id}/pin` |
 | `POST /api/v1/result-sets/{id}/unpin` | `unpin_result_set` | `POST /fragments/result-sets/{id}/unpin` |

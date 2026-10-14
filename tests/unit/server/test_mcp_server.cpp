@@ -105,6 +105,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <format>
 #include <functional>
 #include <map>
 #include <memory>
@@ -32603,6 +32604,138 @@ TEST_CASE("MCP get_result_set_members: a degraded members-table read refuses "
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
+}
+
+TEST_CASE("MCP get_result_set_members: the caller's CURRENT fleet-read scope reaches the SQL "
+          "before LIMIT, so hidden ids neither appear nor take page slots, at 1/9/10/11 visible "
+          "members and limit=10 (mutation: drop gate.scope and hidden ids lead page 1)",
+          "[pg][mcp][integration][result-sets][security][members]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    std::unordered_set<std::string> visible;
+    bool gate_reached = false;
+    std::string gate_securable, gate_operation;
+    ts.fleet_read_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                    const std::string& securable,
+                                    const std::string& operation)
+        -> yuzu::server::authz::FleetReadGate {
+        gate_reached = true;
+        gate_securable = securable;
+        gate_operation = operation;
+        return {.admitted = true, .scope = visible};
+    };
+    ts.start();
+
+    for (const int visible_n : {1, 9, 10, 11}) {
+        INFO("visible members: " << visible_n);
+        // 15 hidden ids sort before every visible one and one hidden id follows each visible
+        // one: a post-filter would return a page of only hidden ids, an interleaved one would
+        // short every page.
+        std::vector<std::string> all;
+        std::vector<std::string> expected;
+        visible.clear();
+        for (int i = 0; i < 15; ++i)
+            all.push_back(std::format("aaa-{:02d}", i));
+        for (int i = 0; i < visible_n; ++i) {
+            const auto v = std::format("dev-{:02d}", i);
+            all.push_back(v);
+            all.push_back(v + "-h");
+            visible.insert(v);
+            expected.push_back(v);
+        }
+        CreateRequest cr;
+        cr.owner_principal = "test-user";
+        cr.name = std::format("scoped-{}", visible_n);
+        cr.source_kind = std::string(source_kind::kManualCurate);
+        cr.source_payload = "{}";
+        auto seeded = rs_bundle.get()->create_materialized(cr, all);
+        REQUIRE(seeded.has_value());
+
+        std::vector<std::string> seen;
+        std::vector<std::size_t> page_sizes;
+        std::string cursor;
+        for (int guard = 0; guard < 10; ++guard) {
+            nlohmann::json args = {{"id", seeded->id}, {"limit", 10}};
+            if (!cursor.empty())
+                args["cursor"] = cursor;
+            nlohmann::json rpc = {{"jsonrpc", "2.0"},
+                                  {"method", "tools/call"},
+                                  {"id", 1},
+                                  {"params", {{"name", "get_result_set_members"},
+                                              {"arguments", args}}}};
+            auto res = ts.call(rpc.dump());
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("result"));
+            const auto& sc = body["result"]["structuredContent"];
+            page_sizes.push_back(sc["device_ids"].size());
+            for (const auto& d : sc["device_ids"])
+                seen.push_back(d.get<std::string>());
+            cursor = sc["next_cursor"].get<std::string>();
+            if (cursor.empty())
+                break;
+        }
+        CHECK(seen == expected);
+        CHECK(page_sizes.front() == static_cast<std::size_t>(std::min(visible_n, 10)));
+        CHECK(page_sizes.size() == (visible_n > 10 ? 2u : 1u));
+    }
+    CHECK(gate_reached);
+    CHECK(gate_securable == "Infrastructure");
+    CHECK(gate_operation == "Read");
+}
+
+TEST_CASE("MCP get_result_set_members: a refused fleet-read gate returns its own error and no "
+          "id, and an unwired gate fails closed",
+          "[pg][mcp][integration][result-sets][security][members]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    CreateRequest cr;
+    cr.owner_principal = "test-user";
+    cr.name = "gated";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto seeded = rs_bundle.get()->create_materialized(cr, {"dev-1", "dev-2"});
+    REQUIRE(seeded.has_value());
+    const std::string call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_result_set_members","arguments":{"id":")" +
+        seeded->id + R"("}}})";
+
+    SECTION("the gate refuses") {
+        McpTestServer ts;
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                       const std::string&,
+                                       const std::string&) -> yuzu::server::authz::FleetReadGate {
+            res.status = 403;
+            res.set_content(R"({"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"denied"}})",
+                            "application/json");
+            return {};
+        };
+        ts.start();
+        auto res = ts.call(call);
+        REQUIRE(res);
+        CHECK(res->body.find("dev-1") == std::string::npos);
+        CHECK(res->body.find("structuredContent") == std::string::npos);
+    }
+    SECTION("the gate is unwired: an error, never the unrestricted read") {
+        McpTestServer ts;
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.fleet_read_fn_for_test = {};
+        ts.start();
+        auto res = ts.call(call);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_STORE_UNAVAILABLE") !=
+              std::string::npos);
+        CHECK(res->body.find("dev-1") == std::string::npos);
+        bool saw_failure = false;
+        for (const auto& a : ts.audit_log)
+            if (a == "mcp.get_result_set_members|failure")
+                saw_failure = true;
+        CHECK(saw_failure);
+    }
 }
 
 TEST_CASE("MCP get_result_set_lineage: a degraded result_sets read refuses "

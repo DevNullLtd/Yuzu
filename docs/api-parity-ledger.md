@@ -150,8 +150,8 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
-| other | 75 | 15 | 60 |
-| **Total** | **297** | **94** | **203** |
+| other | 77 | 17 | 60 |
+| **Total** | **299** | **96** | **203** |
 
 Registered `/api/vN/*` routes: 247. OpenAPI `paths` entries: 246. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 187.
 
