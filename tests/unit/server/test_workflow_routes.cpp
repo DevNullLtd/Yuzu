@@ -1195,6 +1195,40 @@ TEST_CASE("executions page detail: a confined devices slot hides the dispatched 
           std::string::npos);
 }
 
+TEST_CASE("executions page detail: the responses list is scope-filtered before the total and "
+          "capped at 50 rows",
+          "[pg][workflow][executions][detail][page][devices][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-R", "R def");
+    const auto eid = h.make_exec("def-R", "completed", 53, 53, 0);
+    std::unordered_set<std::string> visible;
+    for (int i = 0; i < 52; ++i) {
+        const auto agent = "agent-" + std::to_string(i);
+        visible.insert(agent);
+        h.store_response("def-R", agent, "visible-output-" + std::to_string(i), eid);
+    }
+    h.store_response("def-R", "agent-hidden", "HIDDEN-OUTPUT", eid);
+
+    // Unconfined: every stored row is counted, 50 are shown, and the cap note says so.
+    auto all = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(all);
+    REQUIRE(all->status == 200);
+    CHECK(all->body.find("Show responses (53)") != std::string::npos);
+    CHECK(all->body.find("Showing 50 of 53.") != std::string::npos);
+
+    // Confined: the out-of-scope row is neither shown nor counted.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{visible};
+    auto scoped = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(scoped);
+    REQUIRE(scoped->status == 200);
+    CHECK(scoped->body.find("Show responses (52)") != std::string::npos);
+    CHECK(scoped->body.find("Showing 50 of 52.") != std::string::npos);
+    CHECK(scoped->body.find("HIDDEN-OUTPUT") == std::string::npos);
+    CHECK(scoped->body.find("agent-hidden") == std::string::npos);
+}
+
 TEST_CASE("executions page detail: gate denial stays 403 and a tracker degrade stays 503",
           "[pg][workflow][executions][detail][page][rbac]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

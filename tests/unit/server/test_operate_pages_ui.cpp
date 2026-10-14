@@ -232,6 +232,10 @@ TEST_CASE("operate pages: the Executions template carries every hook the control
     // it is about to set (refreshNow owns that).
     CHECK(has(js, "closeStream();\n        setChip('');\n        refreshNow();"));
     CHECK(has(js, "Live updates unavailable."));
+    // A live transition re-stamps the server's own pill vocabulary; `status-badge` has no
+    // CSS on this page and would strip the pill's tone and shape.
+    CHECK(has(js, "badge.className = 'pill ' + TONES[dom] + ' per-agent-status';"));
+    CHECK_FALSE(has(js, "status-badge"));
 }
 
 TEST_CASE("operate pages: Executions copy is exact and read-only", "[ui][operate][pages]") {

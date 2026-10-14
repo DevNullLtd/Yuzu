@@ -498,6 +498,7 @@
       if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(String(s));
       return String(s).replace(/(["\\])/g, '\\$1');
     }
+    var TONES = { succeeded: 'ok', failed: 'bad', running: 'info', pending: 'idle' };
     function applyAgentTransition(id, payload) {
       if (!payload || !payload.agent_id) return;
       var status = String(payload.status || '');
@@ -510,10 +511,13 @@
         c.className = 'agent-cell agent-cell--' + dom;
       });
       $$('tr' + key, devices).forEach(function (r) {
+        var bar = $('.dbar', r);
+        if (bar) bar.className = 'dbar dbar--' + dom;
         var badge = $('.per-agent-status', r);
         if (badge) {
           badge.textContent = status;
-          badge.className = 'status-badge per-agent-status status-' + dom;
+          // Same pill vocabulary the server renders (pill_tone in executions_page_render.cpp).
+          badge.className = 'pill ' + TONES[dom] + ' per-agent-status';
         }
         var ex = $('.per-agent-exit-code', r);
         if (ex && typeof payload.exit_code === 'number') ex.textContent = String(payload.exit_code);
