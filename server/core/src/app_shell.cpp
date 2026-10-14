@@ -38,6 +38,7 @@ constexpr NavItem kFleetSub[] = {
 constexpr NavItem kSettingsSub[] = {
     {.key = "settings-general", .label = "General", .href = "/settings/general"},
     {.key = "settings-integrations", .label = "Integrations", .href = "/settings/integrations"},
+    {.key = "settings-pki", .label = "Certificates and secrets", .href = "/settings/pki"},
     {.key = "settings-data", .label = "Data and retention", .href = "/settings/data"},
     {.key = "settings-developer", .label = "Developer and API", .href = "/settings/developer"},
 };
