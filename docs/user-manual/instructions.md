@@ -1268,7 +1268,8 @@ POST /api/approvals/{id}/approve
 
 The reviewer must be a different operator than the submitter — self-approval
 is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
-and the denied attempt is recorded in the audit log.
+and the denied attempt is recorded in the audit log. The `comment` is capped at
+4,000 bytes (HTTP 400 beyond that).
 
 ```bash
 curl -s -b cookies.txt \

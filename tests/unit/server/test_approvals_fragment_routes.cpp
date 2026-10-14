@@ -64,6 +64,10 @@ struct Harness {
     std::string perm_deny_body{R"({"error":{"code":403,"message":"denied"}})"};
     std::vector<std::pair<std::string, std::string>> perm_calls;
 
+    bool probe_wired{true};
+    bool probe_allow{true};
+    std::vector<std::pair<std::string, std::string>> probe_calls;
+
     yuzu::server::test::TestRouteSink sink;
 
     void wire() {
@@ -92,6 +96,12 @@ struct Harness {
             }
             return true;
         };
+        if (probe_wired)
+            deps.probe_perm_fn = [this](const httplib::Request&, const std::string& type,
+                                        const std::string& op) {
+                probe_calls.push_back({type, op});
+                return probe_allow;
+            };
         approvals_fragment::register_approvals_fragment_routes(sink, deps);
     }
 };
@@ -254,6 +264,95 @@ TEST_CASE("approvals_fragment_routes: a pending approval from ANOTHER submitter 
     CHECK(res->body.find("hx-post=\"/api/approvals/" + *submitted + "/reject\"") !=
           std::string::npos);
     CHECK(res->body.find("submitter1") != std::string::npos);
+}
+
+TEST_CASE("approvals_fragment_routes: the tab's buttons swap nothing and one hidden listener "
+          "re-fetches the tab on refreshApprovals",
+          "[pg][server][routes][approvals_fragment_routes]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    REQUIRE(mgr->submit("def-swap", "submitter1", "group:x", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.auth_username = "reviewer1";
+    h.wire();
+
+    auto res = h.sink.Get("/fragments/approvals");
+    REQUIRE(res);
+    const auto& b = res->body;
+    // The POST answers JSON: it must never be swapped into #tab-approvals.
+    CHECK(count_of(b, "hx-swap=\"none\"") == 2);
+    CHECK(count_of(b, "hx-post=\"/api/approvals/") == 2);
+    CHECK(count_of(b, "hx-trigger=\"refreshApprovals from:body\"") == 1);
+    // The only hx-target left is the listener's own.
+    CHECK(count_of(b, "hx-target=\"#tab-approvals\"") == 1);
+}
+
+TEST_CASE("approvals_fragment_routes: the page view probes Approval:Approve once per render "
+          "and only when someone else's pending row exists",
+          "[pg][server][routes][approvals_fragment_routes]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(mgr->submit("def-pr-" + std::to_string(i), "submitter1", "group:x", "",
+                            ApprovalOrigin::kInstruction)
+                    .has_value());
+
+    SECTION("granted: one probe for three pending rows, stamped 1") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.wire();
+        auto res = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(res);
+        CHECK(res->body.find("data-can-decide=\"1\"") != std::string::npos);
+        REQUIRE(h.probe_calls.size() == 1);
+        CHECK(h.probe_calls[0] == std::pair<std::string, std::string>{"Approval", "Approve"});
+        // The probe is never the gate: Read is still checked by perm_fn.
+        REQUIRE(!h.perm_calls.empty());
+        CHECK(h.perm_calls[0].second == "Read");
+    }
+    SECTION("refused: stamped 0 and the page still renders") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.probe_allow = false;
+        h.wire();
+        auto res = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("data-can-decide=\"0\"") != std::string::npos);
+        CHECK(h.probe_calls.size() == 1);
+    }
+    SECTION("unwired: cannot decide, so 0") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.probe_wired = false;
+        h.wire();
+        auto res = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(res);
+        CHECK(res->body.find("data-can-decide=\"0\"") != std::string::npos);
+    }
+    SECTION("every pending row is the caller's own: no probe") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "submitter1";
+        h.wire();
+        auto res = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(res);
+        CHECK(h.probe_calls.empty());
+        CHECK(res->body.find("data-can-decide=\"0\"") != std::string::npos);
+    }
+    SECTION("no pending row (filter) : no probe") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.wire();
+        auto res = h.sink.Get("/fragments/approvals?view=page&status=approved");
+        REQUIRE(res);
+        CHECK(h.probe_calls.empty());
+    }
 }
 
 TEST_CASE("approvals_fragment_routes: a pending approval SUBMITTED BY the viewer suppresses "
@@ -557,7 +656,7 @@ TEST_CASE("approvals_fragment_routes: the page view carries scope and comment on
     auto xss = mgr->submit(evil, evil, evil, "", ApprovalOrigin::kInstruction);
     REQUIRE(big.has_value());
     REQUIRE(xss.has_value());
-    const std::string big_comment(5000, 'C');
+    const std::string big_comment(kMaxReviewCommentBytes, 'C'); // the cap
     REQUIRE(mgr->reject(*xss, "reviewer1", big_comment).has_value());
 
     Harness h;
@@ -588,4 +687,7 @@ TEST_CASE("approvals_fragment_routes: wiring -- server.cpp still calls "
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_approvals_fragment_routes(") != std::string::npos);
+    // Both render-only probes are bound (an unbound one silently hides the controls).
+    CHECK(src.find(".probe_perm_fn =") != std::string::npos);
+    CHECK(src.find("wf_deps.probe_perm_fn = ") != std::string::npos);
 }

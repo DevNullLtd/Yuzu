@@ -10198,11 +10198,11 @@ HTML fragment behind the Instructions Approvals tab and the Approvals page (`/ap
 
 #### `POST /api/approvals/{id}/approve`
 
-Approve a pending instruction execution.
+Approve a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
 
 #### `POST /api/approvals/{id}/reject`
 
-Reject a pending instruction execution.
+Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
 
 ---
 
