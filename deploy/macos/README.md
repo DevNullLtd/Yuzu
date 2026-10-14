@@ -108,8 +108,8 @@ install -m 755 "$(git -C /opt/ci/src/Yuzu rev-parse --show-toplevel)/deploy/maco
 The **pinned per-user toolchain (cmake 4.3.4, meson 1.11.2, PyYAML) and vcpkg are
 NOT provisioned at the box level** — the `ci.yml` macOS job installs them itself
 every run (`pipx install cmake==4.3.4`, `pipx install meson==…`, `pip pyyaml`,
-`lukka/run-vcpkg` clones vcpkg into the workspace, and `erlef/setup-beam` installs
-Erlang/OTP 28 + rebar3 for the gateway, with `ImageOS: macos26`; #4841). The box only supplies brew +
+`lukka/run-vcpkg` clones vcpkg into the workspace, and a hash-pinned Erlang/OTP 28 +
+rebar3 is downloaded into `$RUNNER_TEMP` for the gateway; #4841; pins and bump procedure: `docs/darwin-compat.md`). The box only supplies brew +
 CLT + the shared binary cache. (The `/opt/ci/vcpkg` + `/opt/ci/src/Yuzu`
 checkout used for the initial manual cache-warm is optional scaffolding, not a
 runner dependency.)
