@@ -228,14 +228,6 @@ const char* const kCompliancePageTemplate =
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
     });
-
-    /* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-    document.addEventListener('keydown', function(e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        window.location.href = '/?palette=1';
-      }
-    });
   </script>
 </body>
 </html>
