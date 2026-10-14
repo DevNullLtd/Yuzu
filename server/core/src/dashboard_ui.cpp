@@ -2,6 +2,7 @@
 // the long raw string literal from MSVC's brace-matching in server.cpp.
 
 #include "app_shell.hpp"
+#include "operate_extras_ui.hpp"
 
 // NOLINTBEGIN(cert-err58-cpp)
 const char* const kDashboardIndexTemplate =
@@ -349,13 +350,17 @@ const char* const kDashboardIndexTemplate =
       .history-list { max-height: 240px; }
     }
   </style>
+  <style>
+)HTM" YUZU_OX_CSS R"HTM(  </style>
+  <script src="/static/yuzu-dialog.js" defer></script>
+  <script src="/static/yuzu-operate-extras.js" defer></script>
 </head>
 )HTM"
     // Split here: chunk 1 (head + <style>) was ~16 KB and bumped against
     // the MSVC C2026 16380-byte raw-string-literal limit after the round-2
     // visualization additions. Adjacent string literals concatenate at
     // compile time, so the runtime HTML is byte-identical.
-    R"HTM(<body>
+    R"HTM(<body data-page="dashboard">
 
   <!--yuzu:shell--><!--/yuzu:shell-->
 
@@ -393,6 +398,7 @@ const char* const kDashboardIndexTemplate =
           <input type="hidden" name="scope" id="scope-input" value="__all__">
           <button type="submit" id="btn-send">Send</button>
           <button type="button" class="btn-clear" onclick="clearResults()">Clear</button>
+          <button type="button" id="ox-tar-open" title="Run a read-only SQL query against the TAR warehouse on the selected target">Run on TAR history</button>
         </div>
       </div>
       <div class="stats">
@@ -493,6 +499,25 @@ const char* const kDashboardIndexTemplate =
 
   <!-- ── Scope and history rail ─────────────────────────────── -->
   <div class="rail">
+    <div class="ox-panel" id="ox-scope">
+      <h2>Check a scope expression</h2>
+      <div class="ox-pad">
+        <div class="ox-row">
+          <input type="text" id="ox-expr" class="ox-in" spellcheck="false" autocomplete="off"
+                 maxlength="8192" placeholder="ostype == &quot;windows&quot; AND tag:role == &quot;web&quot;"
+                 aria-label="Scope expression">
+        </div>
+        <div class="ox-row">
+          <button type="button" class="ox-btn" id="ox-validate" disabled>Validate</button>
+          <button type="button" class="ox-btn" id="ox-preview" disabled>Preview</button>
+        </div>
+        <div id="ox-expr-out" aria-live="polite"></div>
+      </div>
+      <details class="ox-det" id="ox-kinds">
+        <summary>Scope kinds</summary>
+        <div class="ox-pad"><ul class="ox-kinds" id="ox-kinds-list"></ul></div>
+      </details>
+    </div>
     <div class="scope-panel">
       <div class="scope-header">
         Scope <span class="scope-count" id="agent-count">0 agents</span>
