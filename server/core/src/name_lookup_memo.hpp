@@ -65,4 +65,21 @@ private:
     bool failed_{false};
 };
 
+/// The resolver over `InstructionStore::get_definition` (templated so this header stays
+/// store-free). Empty -- every label is the id -- when no store is wired or it is not open.
+template <class Store>
+[[nodiscard]] NameLookupMemo::Resolver instruction_name_resolver(Store* store) {
+    if (!store || !store->is_open())
+        return {};
+    return [store](const std::string& id)
+               -> std::expected<std::optional<std::string>, std::string> {
+        auto def = store->get_definition(id);
+        if (!def)
+            return std::unexpected(def.error());
+        if (!*def)
+            return std::optional<std::string>{};
+        return std::optional<std::string>{(*def)->name};
+    };
+}
+
 } // namespace yuzu::server::operate_pages

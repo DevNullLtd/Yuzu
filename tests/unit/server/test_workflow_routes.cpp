@@ -804,6 +804,199 @@ TEST_CASE("executions list: zero-agent execution renders empty-state sparkbar",
     CHECK(res->body.find("no agents matched scope") != std::string::npos);
 }
 
+// ── Operate Executions page: `view=page` list ──────────────────────────────
+
+namespace {
+/// The `data-execution-id` values of a page-view body, in order.
+std::vector<std::string> page_ids(const std::string& body) {
+    std::vector<std::string> out;
+    const std::string needle = "data-execution-id=\"";
+    for (auto at = body.find(needle); at != std::string::npos; at = body.find(needle, at)) {
+        at += needle.size();
+        out.push_back(body.substr(at, body.find('"', at) - at));
+    }
+    return out;
+}
+std::size_t occurrences(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + needle.size()))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("executions page list: the status filter returns exactly the matching ids",
+          "[pg][workflow][executions][list][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-P", "Page def");
+    const auto running = h.make_exec("def-P", "running", 3, 0, 0);
+    const auto done = h.make_exec("def-P", "succeeded", 3, 3, 0);
+    const auto failed = h.make_exec("def-P", "completed", 3, 1, 2);
+
+    auto only = h.sink.Get("/fragments/executions?view=page&status=succeeded");
+    REQUIRE(only);
+    CHECK(only->status == 200);
+    CHECK(page_ids(only->body) == std::vector<std::string>{done});
+
+    auto all = h.sink.Get("/fragments/executions?view=page");
+    REQUIRE(all);
+    auto ids = page_ids(all->body);
+    std::sort(ids.begin(), ids.end());
+    auto want = std::vector<std::string>{running, done, failed};
+    std::sort(want.begin(), want.end());
+    CHECK(ids == want);
+    CHECK(all->body.find("data-count=\"3\"") != std::string::npos);
+    CHECK(all->body.find("Page def") != std::string::npos);
+    // The page view is NOT the drawer markup, and the drawer view is not the page markup.
+    CHECK(all->body.find("onclick=") == std::string::npos);
+    auto drawer = h.sink.Get("/fragments/executions");
+    REQUIRE(drawer);
+    CHECK(drawer->body.find("ops-list") == std::string::npos);
+    CHECK(drawer->body.find("data-slot") == std::string::npos);
+}
+
+TEST_CASE("executions page list: an unknown filter is a 200 note, not an empty list",
+          "[pg][workflow][executions][list][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-I", "I");
+    h.make_exec("def-I", "completed", 1, 1, 0);
+
+    for (const char* path :
+         {"/fragments/executions?view=page&status=bogus",
+          "/fragments/executions?status=bogus", // the drawer view validates too
+          "/fragments/executions?view=page&definition_id=a%20b",
+          "/fragments/executions?definition_id=%3Cscript%3E"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("data-invalid=\"") != std::string::npos);
+        CHECK(res->body.find("Unknown filter.") != std::string::npos);
+        CHECK(res->body.find("data-execution-id") == std::string::npos);
+        CHECK(res->body.find("No executions") == std::string::npos);
+    }
+    // A definition_id past the 128-character bound is invalid too.
+    auto longid = h.sink.Get("/fragments/executions?view=page&definition_id=" + std::string(129, 'a'));
+    REQUIRE(longid);
+    CHECK(longid->body.find("data-invalid=\"definition_id\"") != std::string::npos);
+}
+
+TEST_CASE("executions page list: empty filter values mean no filter",
+          "[pg][workflow][executions][list][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-E", "E");
+    const auto a = h.make_exec("def-E", "completed", 1, 1, 0);
+    const auto b = h.make_exec("def-E", "running", 1, 0, 0);
+
+    auto res = h.sink.Get("/fragments/executions?view=page&status=&definition_id=");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("data-invalid") == std::string::npos);
+    auto ids = page_ids(res->body);
+    std::sort(ids.begin(), ids.end());
+    auto want = std::vector<std::string>{a, b};
+    std::sort(want.begin(), want.end());
+    CHECK(ids == want);
+}
+
+TEST_CASE("executions page list: truncation is known, not guessed",
+          "[pg][workflow][executions][list][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-T50", "T");
+    for (int i = 0; i < 50; ++i)
+        h.make_exec("def-T50", "completed", 1, 1, 0, 1735689600 + i);
+
+    auto exact = h.sink.Get("/fragments/executions?view=page");
+    REQUIRE(exact);
+    CHECK(exact->body.find("data-truncated=\"0\"") != std::string::npos);
+    CHECK(occurrences(exact->body, "<tr class=\"row\"") == 50);
+    CHECK(exact->body.find("Older executions are not listed") == std::string::npos);
+
+    h.make_exec("def-T50", "completed", 1, 1, 0, 1735689600 + 50);
+    auto over = h.sink.Get("/fragments/executions?view=page");
+    REQUIRE(over);
+    CHECK(over->body.find("data-truncated=\"1\"") != std::string::npos);
+    CHECK(occurrences(over->body, "<tr class=\"row\"") == 50);
+    CHECK(over->body.find("Showing the 50 most recent. Older executions are not listed.") !=
+          std::string::npos);
+    // The default view still returns its 50 and no page markup.
+    auto drawer = h.sink.Get("/fragments/executions");
+    REQUIRE(drawer);
+    CHECK(occurrences(drawer->body, "data-execution-id=\"") == 50);
+}
+
+TEST_CASE("executions page list: empty copy follows the filter and links only when true",
+          "[pg][workflow][executions][list][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+
+    auto none = h.sink.Get("/fragments/executions?view=page");
+    REQUIRE(none);
+    CHECK(none->body.find("data-state=\"empty\"") != std::string::npos);
+    CHECK(none->body.find("No executions yet.") != std::string::npos);
+    CHECK(none->body.find("href=\"/instructions\"") != std::string::npos);
+
+    auto filtered = h.sink.Get("/fragments/executions?view=page&status=running");
+    REQUIRE(filtered);
+    CHECK(filtered->body.find("No executions match these filters.") != std::string::npos);
+    CHECK(filtered->body.find("No executions yet.") == std::string::npos);
+    CHECK(filtered->body.find("href=\"/instructions\"") == std::string::npos);
+
+    // A confined caller gets the scope-truthful copy and no link.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"nobody"}};
+    auto confined = h.sink.Get("/fragments/executions?view=page");
+    REQUIRE(confined);
+    CHECK(confined->body.find("data-confined=\"1\"") != std::string::npos);
+    CHECK(confined->body.find("No executions visible in your scope.") != std::string::npos);
+    CHECK(confined->body.find("href=\"/instructions\"") == std::string::npos);
+}
+
+TEST_CASE("executions page list: a confined page view serves exactly the confined rows",
+          "[pg][workflow][executions][list][page][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-C", "C");
+    const auto mixed = h.make_exec("def-C", "completed", 2, 1, 1, 1735689600, "carol");
+    h.agent_status(mixed, "agent-in", "success");
+    h.agent_status(mixed, "agent-out", "failure", 1, "SECRET-OUT-ERR");
+    const auto hidden = h.make_exec("def-C", "completed", 1, 0, 1, 1735689601, "carol");
+    h.agent_status(hidden, "agent-out", "failure", 1, "SECRET-OUT-ONLY");
+
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions?view=page");
+    REQUIRE(res);
+    CHECK(page_ids(res->body) == std::vector<std::string>{mixed});
+    CHECK(res->body.find("data-confined=\"1\"") != std::string::npos);
+    CHECK(res->body.find("SECRET-OUT") == std::string::npos);
+    CHECK(res->body.find("agent-out") == std::string::npos);
+    // Counters recomputed from the in-scope device only: 1 of 1, no failure.
+    CHECK(res->body.find("1 of 1</span>") != std::string::npos);
+    CHECK(res->body.find("1 failed") == std::string::npos);
+}
+
+TEST_CASE("executions page list: the page view writes no audit row",
+          "[pg][workflow][executions][list][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-A1", "A1");
+    h.make_exec("def-A1", "completed", 1, 1, 0);
+    auto res = h.sink.Get("/fragments/executions?view=page");
+    REQUIRE(res);
+    CHECK(res->body.find("data-execution-id") != std::string::npos);
+    CHECK(h.audit_calls.empty());
+}
+
 // ── Detail handler ──────────────────────────────────────────────────────────
 
 TEST_CASE("executions detail: 404 on unknown id", "[pg][workflow][executions][detail]") {
@@ -813,6 +1006,113 @@ TEST_CASE("executions detail: 404 on unknown id", "[pg][workflow][executions][de
     auto res = h.sink.Get("/fragments/executions/exec-does-not-exist/detail");
     REQUIRE(res);
     CHECK(res->status == 404);
+}
+
+// ── Operate Executions page: `view=page` detail ────────────────────────────
+
+TEST_CASE("executions page detail: the selected panel and exactly one audit row",
+          "[pg][workflow][executions][detail][page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-S", "Selected def");
+    const auto eid = h.make_exec("def-S", "running", 4, 1, 1);
+
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("data-slot=\"selected\"") != std::string::npos);
+    CHECK(res->body.find("data-execution-id=\"" + eid + "\"") != std::string::npos);
+    CHECK(res->body.find("Selected def") != std::string::npos);
+    CHECK(res->body.find("2 of 4 responded") != std::string::npos);
+    // The drawer's markup is not part of the page view.
+    CHECK(res->body.find("exec-detail-grid") == std::string::npos);
+
+    int views = 0;
+    for (const auto& a : h.audit_calls)
+        if (a.action == "execution.detail.view" && a.result == "success" && a.target_id == eid)
+            ++views;
+    CHECK(views == 1);
+}
+
+TEST_CASE("executions page detail: hidden and unknown ids are indistinguishable",
+          "[pg][workflow][executions][detail][page][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-H", "H");
+    const auto hidden = h.make_exec("def-H", "completed", 1, 0, 1, 1735689600, "carol");
+    h.agent_status(hidden, "agent-out", "failure", 1, "SECRET-HIDDEN-ERR");
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+
+    auto a = h.sink.Get("/fragments/executions/" + hidden + "/detail?view=page");
+    auto b = h.sink.Get("/fragments/executions/exec-does-not-exist/detail?view=page");
+    REQUIRE(a);
+    REQUIRE(b);
+    CHECK(a->status == 404);
+    CHECK(b->status == 404);
+    CHECK(a->body == b->body);
+    CHECK(a->body.find("SECRET-HIDDEN") == std::string::npos);
+    // Each refusal is one denied row with the same non-distinguishing detail text.
+    std::vector<std::string> details;
+    for (const auto& c : h.audit_calls) {
+        CHECK(c.result == "denied");
+        details.push_back(c.detail);
+    }
+    REQUIRE(details.size() == 2);
+    CHECK(details[0] == details[1]);
+}
+
+TEST_CASE("executions page detail: a confined panel redacts and recomputes",
+          "[pg][workflow][executions][detail][page][confinement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-R", "R");
+    const auto eid = h.make_exec("def-R", "completed", 3, 2, 1, 1735689600, "carol");
+    h.agent_status(eid, "agent-in", "success");
+    h.agent_status(eid, "agent-out-1", "success");
+    h.agent_status(eid, "agent-out-2", "failure", 1, "SECRET-PANEL-ERR");
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("data-confined=\"1\"") != std::string::npos);
+    // Scope and parameters: the redaction constant, twice, and nothing else.
+    CHECK(occurrences(res->body, "(redacted - confined view)") == 2);
+    // Recomputed from the one in-scope device: 1 of 1, never the stored 3.
+    CHECK(res->body.find("1 of 1 responded") != std::string::npos);
+    CHECK(res->body.find("of 3 responded") == std::string::npos);
+    CHECK(res->body.find("agent-out") == std::string::npos);
+    CHECK(res->body.find("SECRET-PANEL") == std::string::npos);
+}
+
+TEST_CASE("executions page detail: gate denial stays 403 and a tracker degrade stays 503",
+          "[pg][workflow][executions][detail][page][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-D", "D");
+    const auto eid = h.make_exec("def-D", "completed", 1, 1, 0);
+
+    h.fleet_read_grant = false;
+    auto denied = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+    CHECK(denied->body.find("data-slot") == std::string::npos);
+    h.fleet_read_grant = true;
+
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_page");
+    auto degraded = h.sink.Get("/fragments/executions/" + eid + "/detail?view=page");
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.executions_hidden_page RENAME TO executions");
+    REQUIRE(degraded);
+    CHECK(degraded->status == 503);
+    CHECK(degraded->body.find("Execution tracker degraded") != std::string::npos);
+    CHECK(degraded->body.find("data-slot") == std::string::npos);
+    for (const auto& c : h.audit_calls)
+        CHECK(c.target_id != eid);
 }
 
 // #1712 / #3290 Phase 2: this route migrated from perm_fn onto

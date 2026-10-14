@@ -30,22 +30,6 @@ std::string note(std::string_view attr, std::string_view text) {
     return out;
 }
 
-/// Name lookups for the page view: `InstructionStore::get_definition`'s own shape, or empty
-/// (every label is then the id) when no store is wired or it is not open.
-operate_pages::NameLookupMemo::Resolver name_resolver(InstructionStore* store) {
-    if (!store || !store->is_open())
-        return {};
-    return [store](const std::string& id)
-               -> std::expected<std::optional<std::string>, std::string> {
-        auto def = store->get_definition(id);
-        if (!def)
-            return std::unexpected(def.error());
-        if (!*def)
-            return std::optional<std::string>{};
-        return std::optional<std::string>{(*def)->name};
-    };
-}
-
 } // namespace
 
 void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
@@ -105,7 +89,7 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
             }
 
             if (view_page) {
-                operate_pages::NameLookupMemo names(name_resolver(deps.instruction_store));
+                operate_pages::NameLookupMemo names(operate_pages::instruction_name_resolver(deps.instruction_store));
                 operate_pages::ApprovalListView view;
                 view.truncated = listed->truncated;
                 view.status_filter = status;
