@@ -98,8 +98,9 @@
           return;
         }
         if (d.ok && d.violations.length === 0) {
-          setNote([noteBox('No violations found in the roles and grants the server could read. Checked ' +
-                           count + ' principals.')]);
+          // The auditor reports no count, so the listed total is stated as listed, not as checked.
+          setNote([noteBox('No violations found in the roles and grants the server could read. ' +
+                           count + ' principals are listed below.')]);
           return;
         }
         var box = el('div', 'failbox');
@@ -171,7 +172,9 @@
 
   document.body.addEventListener('htmx:sendError', function (e) {
     var t = e.detail.target;
-    if (t && t.hasAttribute('data-denied')) unavailableBox(t);
+    if (!t || !t.hasAttribute('data-denied')) return;
+    unavailableBox(t);
+    if (t.id === 'tokens-body') afterTokens();
   });
 
   document.addEventListener('click', function (e) {

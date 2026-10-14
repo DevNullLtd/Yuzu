@@ -2,7 +2,7 @@
  * @file test_access_tokens_js.cpp
  * @brief String pins on the Tokens and principals template and its embedded glue script. The
  *        repo has no JS runner, so these prove a token is present, not that a branch runs;
- *        behaviour is exercised by the headless-browser run recorded in the PR body.
+ *        no executing browser test backs this glue yet (listed as unverified in the PR body).
  */
 
 #include "access_tokens_render.hpp"

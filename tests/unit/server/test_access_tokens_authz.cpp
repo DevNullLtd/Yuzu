@@ -250,14 +250,12 @@ TEST_CASE("tokens page authz: an administrator's MCP-tier bearer gets own tokens
 
     auto res = r.get_bearer(kTokens, *raw);
     REQUIRE(res);
-    // A readonly tier admits ApiToken:Read; whatever the tier policy answers, the fragment
-    // must never widen to other owners.
-    if (res->status == 200) {
-        CHECK_THAT(res->body, ContainsSubstring("root-ci"));
-        CHECK_THAT(res->body, !ContainsSubstring("alice-ci"));
-        CHECK_THAT(res->body, !ContainsSubstring("bob-ci"));
-        CHECK_THAT(res->body, ContainsSubstring("data-effective-admin=\"0\""));
-    }
+    // A readonly tier admits ApiToken:Read and the fragment never widens to other owners.
+    REQUIRE(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("root-ci"));
+    CHECK_THAT(res->body, !ContainsSubstring("alice-ci"));
+    CHECK_THAT(res->body, !ContainsSubstring("bob-ci"));
+    CHECK_THAT(res->body, ContainsSubstring("data-effective-admin=\"0\""));
 
     res = r.get_bearer(kPrincipals, *raw);
     REQUIRE(res);

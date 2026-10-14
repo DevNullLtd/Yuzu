@@ -12,6 +12,7 @@
 ///   - a read that answered with nothing is an honest empty state, never a bare `0`.
 
 #include "api_token_store.hpp"
+#include "audit_store.hpp"
 #include "engine_principal_store.hpp"
 #include "rbac_store.hpp"
 
@@ -58,6 +59,13 @@ struct PageFlags {
 
 /// `^engine:[a-z0-9._-]{1,128}$`. Checked before any store read.
 [[nodiscard]] bool valid_principal_id(std::string_view id);
+
+/// The detail of the newest COMMITTED `engine_principal.revoke` (events are newest first).
+/// A later failed or denied attempt writes the same action with a store error string as its
+/// detail; that text is never shown. "" = no committed revoke recorded. The success detail is
+/// `credentials_revoked=N[; superseded_by=ID]` from REST, or the operator's own typed reason
+/// from MCP; it is escaped like every other store string.
+[[nodiscard]] std::string committed_revoke_detail(const std::vector<AuditEvent>& newest_first);
 
 struct TokensView {
     std::vector<ApiToken> rows;  ///< store order (newest first)

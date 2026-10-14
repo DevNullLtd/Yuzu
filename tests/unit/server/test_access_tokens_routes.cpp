@@ -516,8 +516,5 @@ TEST_CASE("tokens routes: server.cpp binds the real admin gate, rbac view and ch
     CHECK_THAT(blk, ContainsSubstring("list_all_principal_roles_checked()"));
     CHECK_THAT(blk, ContainsSubstring("get_principal_roles_checked(\"engine\", id)"));
     CHECK_THAT(blk, ContainsSubstring(".perm_fn = perm_fn"));
-    // The revocation detail is the committed revoke's row, never a later failure row's error text.
-    const auto tail = text.find("revoke_detail_fn", at);
-    REQUIRE(tail != std::string::npos);
-    CHECK_THAT(text.substr(tail, 1200), ContainsSubstring("ev.result == \"success\""));
+    CHECK_THAT(text.substr(end, 1500), ContainsSubstring("committed_revoke_detail(*events)"));
 }

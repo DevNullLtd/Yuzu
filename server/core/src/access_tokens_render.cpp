@@ -105,6 +105,13 @@ bool sees_all_owners(const auth::Session& s) {
            auth::effective_role(s) == auth::Role::admin;
 }
 
+std::string committed_revoke_detail(const std::vector<AuditEvent>& newest_first) {
+    for (const auto& ev : newest_first)
+        if (ev.result == "success")
+            return ev.detail;
+    return {};
+}
+
 bool valid_principal_id(std::string_view id) {
     constexpr std::string_view kPrefix = "engine:";
     if (!id.starts_with(kPrefix))
@@ -201,7 +208,7 @@ std::string render_principals_list(const std::variant<PrincipalsView, Unavailabl
             state += "<br><span class=\"hint\">" +
                      (p.superseded_by.empty() ? std::string("no successor recorded")
                                               : "superseded by " + esc(p.superseded_by)) +
-                     "</span>";
+                     ", revoked " + date_cell(p.revoked_at, "at an unknown time") + "</span>";
         // The select control is a real button so the row is keyboard-operable.
         out += "<tr><td><button type=\"button\" class=\"btn link\" data-tk=\"principal-select\" "
                "data-principal-id=\"" + esc(p.principal_id) + "\"><b>" +
@@ -235,6 +242,7 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
     std::string out = "<section class=\"panel\"><div class=\"hd\"><h2 class=\"long\">" +
                       esc(p.display_name.empty() ? p.principal_id : p.display_name) + "</h2></div><div class=\"kvl\">";
     out += kv("Principal", "<span class=\"mono\">" + esc(p.principal_id) + "</span>");
+    out += kv("Display name", esc(p.display_name.empty() ? p.principal_id : p.display_name));
     out += kv("Owner", esc(p.owner_username));
     out += kv("Classification", esc(p.classification));
     out += kv("State", active ? pill("ok", "Active") : pill("idle", "Revoked"));
@@ -257,12 +265,12 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
         if (creds->empty()) {
             out += "<div class=\"pb\"><p class=\"hint\">No active credentials.</p></div>";
         } else {
-            out += "<div class=\"tw\"><table><thead><tr><th>Credential</th><th>Expires</th><th>Last used</th>"
+            out += "<div class=\"tw\"><table><thead><tr><th>Credential</th><th>Created</th><th>Expires</th><th>Last used</th>"
                    "<th>State</th></tr></thead><tbody>";
             for (const auto& t : *creds) {
                 const Status st = token_status(t, d.now);
                 out += "<tr><td><span class=\"mono\">" + esc(t.token_id) + "</span></td><td>" +
-                       date_cell(t.expires_at, "Never") + "</td><td>" + date_cell(t.last_used_at, "Never") +
+                       date_cell(t.created_at, "Unknown") + "</td><td>" + date_cell(t.expires_at, "Never") + "</td><td>" + date_cell(t.last_used_at, "Never") +
                        "</td><td>" + pill(st.cls, st.text) + "</td></tr>";
             }
             out += "</tbody></table></div>";

@@ -12,6 +12,7 @@
  */
 
 #include "access_tokens_render.hpp"
+#include "web_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -361,4 +362,57 @@ TEST_CASE("token rows render metadata only: hash, rotation group and initiator n
     CHECK_THAT(html, ContainsSubstring("tid123"));
     for (const char* secret : {"SECRETHASHVALUE", "ROTGROUPVALUE", "INITIATORVALUE", "token_hash"})
         CHECK_THAT(html, !ContainsSubstring(secret));
+}
+
+TEST_CASE("principal surfaces show display name, revoke date and credential creation; the list caps at 500",
+          "[access-tokens][render]") {
+    PrincipalDetail d;
+    d.row = principal("old", "revoked");
+    d.row.display_name = "Patch Bot";
+    d.row.revoked_at = kNow - 100;
+    ApiToken c = tok("c1");
+    c.created_at = kNow - 4000;
+    d.credentials = std::vector<ApiToken>{c};
+    d.roles = std::vector<PrincipalRole>{};
+    d.revoke_detail = std::string{};
+    d.now = kNow;
+    const auto detail = render_principal_detail(d, d.row.principal_id);
+    CHECK_THAT(detail, ContainsSubstring("<span>Display name</span><b>Patch Bot</b>"));
+    CHECK_THAT(detail, ContainsSubstring("<th>Created</th>"));
+    CHECK_THAT(detail, ContainsSubstring(format_iso_utc(kNow - 4000).substr(0, 10)));
+
+    PrincipalsView v;
+    v.roles = std::vector<PrincipalRole>{};
+    auto gone = principal("old", "revoked");
+    gone.revoked_at = kNow - 100;
+    v.rows = {gone};
+    CHECK_THAT(render_principals_list(v), ContainsSubstring("revoked <span title=\"" + format_iso_utc(kNow - 100)));
+
+    PrincipalsView big;
+    big.roles = std::vector<PrincipalRole>{};
+    for (int i = 0; i < 501; ++i)
+        big.rows.push_back(principal("p" + std::to_string(i)));
+    const auto html = render_principals_list(big);
+    CHECK_THAT(html, ContainsSubstring("Showing the newest 500 of 501 principals."));
+    CHECK_THAT(html, ContainsSubstring("engine:p499"));
+    CHECK_THAT(html, !ContainsSubstring("data-principal-id=\"engine:p500\""));
+}
+
+TEST_CASE("revoke detail is the newest committed revoke; a later failure's error text is never used",
+          "[access-tokens][render]") {
+    AuditEvent fail;
+    fail.result = "failure";
+    fail.detail = "pq: db_error=secret-marker";
+    AuditEvent denied;
+    denied.result = "denied";
+    denied.detail = "denied-marker";
+    AuditEvent ok;
+    ok.result = "success";
+    ok.detail = "credentials_revoked=2";
+    AuditEvent older;
+    older.result = "success";
+    older.detail = "older-success";
+    CHECK(committed_revoke_detail({fail, denied, ok, older}) == "credentials_revoked=2");
+    CHECK(committed_revoke_detail({fail, denied}).empty());
+    CHECK(committed_revoke_detail({}).empty());
 }

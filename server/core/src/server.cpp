@@ -154,6 +154,7 @@
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
+#include "access_tokens_render.hpp"
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
 #include "instruction_routes.hpp" // #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
@@ -15440,16 +15441,11 @@ private:
                     q.target_type = "EnginePrincipal";
                     q.target_id = id;
                     q.action_prefixes = {"engine_principal.revoke"};
-                    // A later failed or denied attempt writes the same action with a store
-                    // error string as its detail; only the committed revoke is shown.
-                    q.limit = 50;
+                    q.limit = 50;  // newest first; the committed revoke is picked below
                     auto events = audit_store_->query(q);
                     if (!events)
                         return std::unexpected(std::string("audit store did not answer"));
-                    for (const auto& ev : *events)
-                        if (ev.result == "success")
-                            return ev.detail;
-                    return std::string{};
+                    return yuzu::server::access_tokens::committed_revoke_detail(*events);
                 },
             });
 
