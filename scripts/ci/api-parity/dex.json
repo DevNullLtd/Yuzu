@@ -260,5 +260,13 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/alerts",
+    "capability_id": "get.fragments-dex-alerts",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.fragments-settings-dex-alerts"
   }
 ]

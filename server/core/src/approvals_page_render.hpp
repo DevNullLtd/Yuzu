@@ -47,6 +47,7 @@ struct ApprovalListView {
     bool truncated{false};             ///< the store's list cap dropped older rows
     std::string status_filter;         ///< "" = every status
     int64_t now{0};                    ///< epoch seconds, for the relative ages
+    bool can_decide{false};            ///< caller holds Approval:Approve (a render hint, not a gate)
 };
 
 /// Display name of a ticket: the tool name for an `mcp.*` ticket (no definition exists, the

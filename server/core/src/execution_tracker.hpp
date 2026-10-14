@@ -495,6 +495,11 @@ public:
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
     std::vector<DefinitionExecutionStats> get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
     FleetExecutionSummary get_fleet_summary(int64_t since = 0) const;
+    /// Same figures with the store-failure / genuinely-zero distinction: unexpected when the
+    /// store is closed, the lease fails or any statement fails (an empty table is a successful
+    /// read of zeros). `include_active_agents = false` skips the DISTINCT agent scan.
+    [[nodiscard]] std::expected<FleetExecutionSummary, std::string>
+    get_fleet_summary_checked(int64_t since = 0, bool include_active_agents = true) const;
 
     // ── Command <-> execution correlation (HA WS-1(1b), ADR-2002 section 5) ──
     //
