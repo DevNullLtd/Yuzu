@@ -194,7 +194,7 @@ TEST_CASE("operate pages: the Executions template carries every hook the control
     const auto& js = yuzu::server::kYuzuOperateJs;
 
     for (const char* id : {"id=\"exec-list\"", "id=\"exec-selected\"", "id=\"exec-devices\"",
-                           "id=\"exec-chip\"",
+                           "id=\"exec-chip\"", "id=\"exec-stats\"",
                            "id=\"exec-confined\"", "id=\"f-def\"", "id=\"f-def-hint\""})
         CHECK(has(html, id));
     // Status filter: All is the checked, empty-valued default; the five states follow.

@@ -544,7 +544,7 @@ When a user (or MCP tool) executes an instruction that requires approval:
 
 1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. The execution is queued, not dropped.
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
-3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded.
+3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded. On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
 The submitter cannot approve their own request. A different user with the appropriate role must review it.
 
@@ -1382,6 +1382,8 @@ curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
 
+Cancelling an execution that already finished (`succeeded`, `completed` or `cancelled`) answers `409` and changes nothing; the Executions page offers Cancel only for executions that are still running. Per-device results and the live view are on the page's detail pane.
+
 ---
 
 ## 13. Dashboard UI
@@ -1397,7 +1399,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
 | **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
-**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Approving, rejecting and executing stay on the Instructions tabs.
+**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
 
 ### YAML Editor
 
