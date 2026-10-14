@@ -16,6 +16,7 @@
 #include <string>
 
 extern const char* const kDashboardIndexHtml;
+extern const char* const kTarPageHtml;
 
 namespace yuzu::server {
 extern const std::string kYuzuOperateExtrasJs;
@@ -182,4 +183,25 @@ TEST_CASE("operate extras: result set producers call the real REST routes and co
     // The after-dispatch store fault must tell the operator not to re-send.
     CHECK(has(js, "FAULT_AFTER_DISPATCH"));
     CHECK(has(js, "Do not send it again"));
+}
+
+TEST_CASE("operate extras: the TAR page's Ad-hoc SQL frame is retired and points to Result sets",
+          "[ui][operate_extras]") {
+    const std::string page = kTarPageHtml;
+    // Nothing of the old form or its script survives.
+    for (const char* gone : {"id=\"tar-sql-run\"", "id=\"tar-sql-text\"", "id=\"tar-sql-scope\"",
+                             "id=\"tar-sql-include-empty\"", "/api/v1/result-sets/from-tar-query",
+                             "Scope-walking SQL frame"}) {
+        INFO("retired: " << gone);
+        CHECK_FALSE(has(page, gone));
+    }
+    // The page says where it went; the destination carries every field the frame had.
+    CHECK(has(page, "href=\"/result-sets\""));
+    CHECK(has(page, "From TAR query"));
+    const auto& js = yuzu::server::kYuzuOperateExtrasJs;
+    CHECK(has(js, "/api/v1/result-sets/from-tar-query"));
+    CHECK(has(js, "label: 'SQL (SELECT only)'"));
+    CHECK(has(js, "name: 'parent'"));
+    CHECK(has(js, "name: 'name'"));
+    CHECK(has(js, "include_empty:"));
 }
