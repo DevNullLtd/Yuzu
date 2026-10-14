@@ -87,8 +87,6 @@ namespace detail {
     return (base / std::string{rel}).string();
 }
 
-[[nodiscard]] inline std::string logical(std::string_view rel) { return "/" + std::string{rel}; }
-
 /// The manager tools in Manager enum order (homebrew is the macOS leg's), the
 /// logical root path reported on each row, and the probe directories searched.
 struct Tool {
@@ -147,10 +145,6 @@ count_entries(const std::filesystem::path& root, std::string_view rel, std::stri
     }
     if (!ok) return std::nullopt;
     return count;
-}
-
-[[nodiscard]] inline bool ends_with(std::string_view s, std::string_view suffix) noexcept {
-    return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
 }
 
 /// Row sink shared by the snap and flatpak walks: the row cap and the output-byte
@@ -219,7 +213,7 @@ struct SnapDetail {
     if (const auto v = snap_yaml_top_level_value(yaml.data, "version"); v && snap_version_ok(*v))
         d.version = *v;
     const auto type = snap_yaml_top_level_value(yaml.data, "type");
-    d.kind = snap_kind_token(true, type ? std::optional<std::string_view>{*type} : std::nullopt);
+    d.kind = snap_kind_token(type ? std::optional<std::string_view>{*type} : std::nullopt);
     return d;
 }
 
@@ -283,7 +277,7 @@ inline void flatpak_rows(const std::filesystem::path& root, StoreWalk& w) {
             w.acc.add_failure(make_token(kOs, c.source, top.detail));
             continue;
         }
-        // One nested level: lists `dir`, then calls `visit(name, child_dir)` for
+        // One nested level: lists `dir`, then calls `visit(name)` for
         // every real, well-named subdirectory. A failure to open or list a level
         // leaves rows under it missing, so it is a token (list incompleteness).
         auto each_child = [&](const posix::Dir& dir, auto&& visit) {
@@ -306,23 +300,25 @@ inline void flatpak_rows(const std::filesystem::path& root, StoreWalk& w) {
                 visit(name);
             }
         };
+        // Opens `parent/name`; a failure other than a vanished entry leaves rows
+        // under it missing, so it is a token (list incompleteness).
+        auto open_child = [&](const posix::Dir& parent,
+                              const std::string& name) -> std::optional<posix::Dir> {
+            auto child = posix::open_dir_no_follow_at(parent, name.c_str());
+            if (child.dir.valid()) return std::move(child.dir);
+            if (!child.absent) w.acc.add_failure(make_token(kOs, c.source, child.detail));
+            return std::nullopt;
+        };
         each_child(top.dir, [&](const std::string& id) {
-            auto id_dir = posix::open_dir_no_follow_at(top.dir, id.c_str());
-            if (!id_dir.dir.valid()) {
-                if (!id_dir.absent) w.acc.add_failure(make_token(kOs, c.source, id_dir.detail));
-                return;
-            }
-            each_child(id_dir.dir, [&](const std::string& arch) {
-                auto arch_dir = posix::open_dir_no_follow_at(id_dir.dir, arch.c_str());
-                if (!arch_dir.dir.valid()) {
-                    if (!arch_dir.absent)
-                        w.acc.add_failure(make_token(kOs, c.source, arch_dir.detail));
-                    return;
-                }
-                each_child(arch_dir.dir, [&](const std::string& branch) {
+            auto id_dir = open_child(top.dir, id);
+            if (!id_dir) return;
+            each_child(*id_dir, [&](const std::string& arch) {
+                auto arch_dir = open_child(*id_dir, arch);
+                if (!arch_dir) return;
+                each_child(*arch_dir, [&](const std::string& branch) {
                     StoreState state = StoreState::unknown;
                     std::string commit;
-                    auto branch_dir = posix::open_dir_no_follow_at(arch_dir.dir, branch.c_str());
+                    auto branch_dir = posix::open_dir_no_follow_at(*arch_dir, branch.c_str());
                     if (branch_dir.dir.valid()) {
                         const auto active = posix::read_link_name(branch_dir.dir, "active", 64);
                         if (active.absent) state = StoreState::inactive;
@@ -384,7 +380,7 @@ linux_manager_rows_at(const std::filesystem::path& root, std::optional<std::stri
             if (auto n = detail::count_entries(
                     root, "etc/apt/sources.list.d", "apt_sources_d", posix::EntryKind::regular,
                     [](const std::string& s) {
-                        return detail::ends_with(s, ".list") || detail::ends_with(s, ".sources");
+                        return s.ends_with(".list") || s.ends_with(".sources");
                     },
                     lim, acc, budget))
                 f.add("sources_d_files", *n);

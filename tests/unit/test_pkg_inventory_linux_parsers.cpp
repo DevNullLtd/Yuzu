@@ -43,6 +43,7 @@
 #include "pkg_inventory_parsers.hpp"
 
 #include "local_dispatcher.hpp"
+#include "pkg_inventory_test_support.hpp"
 #include "test_helpers.hpp" // yuzu::test::TempDir
 
 #include <yuzu/plugin.h>
@@ -60,6 +61,11 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+using yuzu::test::pkg_inventory_support::captured_rows;
+using yuzu::test::pkg_inventory_support::ModeGuard;
+using yuzu::test::pkg_inventory_support::open_fd_count;
+using yuzu::test::pkg_inventory_support::split_fields_escape_aware;
 
 namespace {
 
@@ -228,33 +234,6 @@ void add_btop(const fs::path& root, std::string_view yaml) {
     link(root, "snap/btop/current", "1073");
 }
 
-/// Escape-aware field split (safe_output_field writes a literal '|' as `\|`).
-std::vector<std::string> split_wire(const std::string& row) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (std::size_t i = 0; i < row.size(); ++i) {
-        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
-            cur += '|';
-            ++i;
-        } else if (row[i] == '|') {
-            out.push_back(cur);
-            cur.clear();
-        } else {
-            cur += row[i];
-        }
-    }
-    out.push_back(cur);
-    return out;
-}
-
-/// Restores a directory's mode on scope exit so TempDir's remove_all can run even
-/// when a REQUIRE unwinds. Declared AFTER the TempDir so it is destroyed first.
-struct ModeGuard {
-    fs::path path;
-    mode_t restore;
-    ~ModeGuard() { ::chmod(path.string().c_str(), restore); }
-};
-
 struct Walk {
     std::vector<std::string> rows;
     std::optional<std::string> token;
@@ -313,24 +292,6 @@ yuzu::agent::LocalDispatcher::Result run_leg(const fs::path& root, pkg::Action a
     return result;
 }
 
-std::vector<std::string> captured_rows(const std::string& captured) {
-    std::vector<std::string> out;
-    std::istringstream ss(captured);
-    std::string line;
-    while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) out.push_back(line);
-    }
-    return out;
-}
-
-std::size_t open_fd_count() {
-    std::size_t n = 0;
-    for (int fd = 0; fd < 1024; ++fd)
-        if (::fcntl(fd, F_GETFD) != -1) ++n;
-    return n;
-}
-
 const char* const kCalcCommit = "00516a24d410ad62ed3e955fa5deb5af221ab6b181ed5549103f3670d10d2fca";
 const char* const kEditorCommit = "76ecd1d6e9ecfa26f6939c54eec4e9db3491fce949c8808bdee9fb55758a1a91";
 
@@ -384,7 +345,7 @@ TEST_CASE("pkg_inventory linux: manager rows over the real-capture tree", "[pkg_
     };
     CHECK(w.rows == expected);
     for (const auto& r : w.rows) {
-        CHECK(split_wire(r).size() == 7);
+        CHECK(split_fields_escape_aware(r).size() == 7);
         CHECK(r.find(dir.path.string()) == std::string::npos); // logical paths only
     }
 }
@@ -429,7 +390,7 @@ TEST_CASE("pkg_inventory linux: store rows over the real-capture tree", "[pkg_in
     for (std::size_t i = 0; i < expected.size(); ++i) {
         INFO("row " << i);
         CHECK(w.rows[i] == expected[i]);
-        CHECK(split_wire(w.rows[i]).size() == 9);
+        CHECK(split_fields_escape_aware(w.rows[i]).size() == 9);
     }
     // `app/<id>/current` (a link) yields neither a row nor a token.
     for (const auto& r : w.rows) CHECK(r.find("current") == std::string::npos);
@@ -455,7 +416,7 @@ TEST_CASE("pkg_inventory linux [degraded, SUPPORTED]: a per-item anomaly degrade
     auto one_row = [](const Walk& w) {
         REQUIRE_FALSE(w.token.has_value());
         REQUIRE(w.rows.size() == 1);
-        CHECK(split_wire(w.rows[0]).size() == 9);
+        CHECK(split_fields_escape_aware(w.rows[0]).size() == 9);
         return w.rows[0];
     };
 
@@ -792,7 +753,7 @@ TEST_CASE("pkg_inventory linux seam: a forced constraint reaches BOTH the status
     CHECK(r.rc == 0); // a degraded read is never a failed command
     const auto rows = captured_rows(r.captured);
     REQUIRE(rows.size() == 1); // the status row only: the link target must not appear
-    const auto status = split_wire(rows[0]);
+    const auto status = split_fields_escape_aware(rows[0]);
     REQUIRE(status.size() == 4);
     CHECK(status[2] == "constrained");
     CHECK(status[3] == "linux:snapd_snaps:not_a_directory");

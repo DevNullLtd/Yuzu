@@ -354,13 +354,11 @@ TEST_CASE("pkg_inventory: snap_yaml_top_level_value reads one-line scalars only"
 
 TEST_CASE("pkg_inventory: snap_kind_token is a closed vocabulary", "[pkg_inventory][parsers][store]") {
     for (const std::string_view t : {"gadget", "kernel", "base", "snapd", "os", "app"})
-        CHECK(pi::snap_kind_token(true, t) == t);
-    CHECK(pi::snap_kind_token(true, std::string_view{"application"}) == "app");
-    CHECK(pi::snap_kind_token(true, std::nullopt) == "app"); // snapd's default
-    CHECK(pi::snap_kind_token(false, std::nullopt) == "unknown");
-    CHECK(pi::snap_kind_token(false, std::string_view{"base"}) == "unknown");
-    CHECK(pi::snap_kind_token(true, std::string_view{"evil|x"}) == "other");
-    CHECK(pi::snap_kind_token(true, std::string_view{"BASE"}) == "other");
+        CHECK(pi::snap_kind_token(t) == t);
+    CHECK(pi::snap_kind_token(std::string_view{"application"}) == "app");
+    CHECK(pi::snap_kind_token(std::nullopt) == "app"); // snapd's default
+    CHECK(pi::snap_kind_token(std::string_view{"evil|x"}) == "other");
+    CHECK(pi::snap_kind_token(std::string_view{"BASE"}) == "other");
 }
 
 TEST_CASE("pkg_inventory: snap_version_ok is snapd's isValidVersion", "[pkg_inventory][parsers][store]") {

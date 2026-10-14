@@ -468,13 +468,11 @@ namespace detail {
     return std::nullopt;
 }
 
-/// The snap `type:` as a closed token. `yaml_read` false -> `unknown` (the
-/// snap.yaml could not be read); read with no `type:` -> `app` (snapd's default);
-/// `application` -> `app`; the snapd closed set passes through; anything else is
-/// `other` (a snap author controls this text, so it never reaches the wire).
-[[nodiscard]] inline std::string_view snap_kind_token(bool yaml_read,
-                                                      std::optional<std::string_view> type) noexcept {
-    if (!yaml_read) return "unknown";
+/// The snap `type:` of a snap.yaml that WAS read, as a closed token. No `type:` ->
+/// `app` (snapd's default); `application` -> `app`; the snapd closed set passes
+/// through; anything else is `other` (a snap author controls this text, so it never
+/// reaches the wire).
+[[nodiscard]] inline std::string_view snap_kind_token(std::optional<std::string_view> type) noexcept {
     if (!type) return "app";
     const auto t = *type;
     if (t == "application" || t == "app") return "app";

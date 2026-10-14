@@ -48,6 +48,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "local_dispatcher.hpp"
+#include "pkg_inventory_test_support.hpp"
 
 #include "pkg_inventory_legs.hpp"
 #include "pkg_inventory_parsers.hpp"
@@ -65,39 +66,10 @@
 
 namespace fs = std::filesystem;
 
+using yuzu::test::pkg_inventory_support::captured_rows;
+using yuzu::test::pkg_inventory_support::split_fields_escape_aware;
+
 namespace {
-
-/// Escape-aware field split. yuzu::util::safe_output_field escapes a literal
-/// '|' as '\|', so a naive split('|') overcounts fields on any row whose text
-/// happens to contain a pipe.
-std::vector<std::string> split_fields_escape_aware(const std::string& row) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (std::size_t i = 0; i < row.size(); ++i) {
-        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
-            cur += '|';
-            ++i;
-        } else if (row[i] == '|') {
-            out.push_back(cur);
-            cur.clear();
-        } else {
-            cur += row[i];
-        }
-    }
-    out.push_back(cur);
-    return out;
-}
-
-std::vector<std::string> captured_rows(const std::string& captured) {
-    std::vector<std::string> out;
-    std::istringstream ss(captured);
-    std::string line;
-    while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) out.push_back(line);
-    }
-    return out;
-}
 
 /// Under `meson test` (MESON_BUILD_ROOT is always set) a missing plugin means
 /// the build is genuinely broken and must NOT report "All tests passed".
