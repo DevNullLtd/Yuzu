@@ -83,7 +83,7 @@ TEST_CASE("access list: one row per user, four columns, Manage encodes the usern
           "[access][render]") {
     const auto html = list_html({user("alice", auth::Role::admin), user("bob"),
                                  user("oidc:https://x/y#sub", auth::Role::user, "oidc")});
-    CHECK(count_of(html, "<th") == 4); // User, Source, Account role, actions
+    CHECK(count_of(html, "<th>") == 4); // User, Source, Account role, actions
     CHECK(count_of(html, "<tr data-username=") == 3);
     CHECK_THAT(html, ContainsSubstring("<span class=\"sub\">3 accounts</span>"));
     CHECK_THAT(html, ContainsSubstring("hx-get=\"/fragments/access/users/detail?username=bob\""));

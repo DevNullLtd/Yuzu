@@ -44,7 +44,7 @@
     var b = e.target.closest('[data-act="reload"]');
     if (!b) return;
     var t = document.getElementById(b.dataset.target);
-    if (t && t.dataset.src) htmx.ajax('GET', t.dataset.src, { target: '#' + t.id, swap: 'innerHTML' });
+    if (t && t.dataset.src) htmx.ajax('GET', t.dataset.src, { target: '#' + t.id });
   });
 
   document.body.addEventListener('htmx:responseError', function (e) {

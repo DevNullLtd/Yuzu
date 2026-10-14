@@ -15,6 +15,7 @@
 #include <cstring>
 #include <regex>
 #include <string>
+#include <vector>
 
 namespace yuzu::server {
 extern const std::string kYuzuAccessJs;
@@ -56,8 +57,8 @@ TEST_CASE("access page: the template is inline-free, single-shell and under the 
 
     // The scripts are exactly these two, both same-origin.
     std::vector<std::string> srcs;
-    for (std::sregex_iterator it(t.begin(), t.end(), std::regex(R"(<script src="([^"]+)")")), end;
-         it != end; ++it)
+    const std::regex script_src(R"re(<script src="([^"]+)")re");
+    for (std::sregex_iterator it(t.begin(), t.end(), script_src), end; it != end; ++it)
         srcs.push_back((*it)[1].str());
     CHECK(srcs == std::vector<std::string>{"/static/htmx.js", "/static/yuzu-access.js"});
 }
