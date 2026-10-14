@@ -392,13 +392,9 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
     // - event_types: rides a libpq text-format parameter verbatim; a NUL
     //   byte would silently truncate at the C-string boundary rather than
     //   erroring, and CR/LF has the same log/audit-injection shape as name.
-    auto has_control_byte = [](const std::string& s) {
-        for (char c : s) {
-            if (static_cast<unsigned char>(c) < 0x20)
-                return true;
-        }
-        return false;
-    };
+    // One definition shared with the webhook store (outbound_url_policy.hpp):
+    // bytes below 0x20 and DEL.
+    auto has_control_byte = [](const std::string& s) { return url_has_control_bytes(s); };
     if (has_control_byte(auth_credential)) {
         spdlog::warn(
             "OffloadTargetStore: rejected target with control bytes in auth_credential: {}",

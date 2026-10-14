@@ -22083,8 +22083,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const int64_t new_target_id = *result;
-                const bool audit_ok = audit_fn(req, "offload_target.create", "success",
-                                               "offload_target", std::to_string(new_target_id), name);
+                // Same `name=.. url=..` detail as the REST create row, so the audit
+                // trail records where data was sent whichever surface created it.
+                const bool audit_ok =
+                    audit_fn(req, "offload_target.create", "success", "offload_target",
+                             std::to_string(new_target_id), "name=" + name + " url=" + url);
                 nlohmann::json payload_j = {{"id", new_target_id}, {"status", "created"}};
                 if (!audit_ok)
                     payload_j["audit_persisted"] = false;

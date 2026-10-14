@@ -32,6 +32,26 @@
     if (window.htmx && document.body) { window.htmx.trigger(document.body, eventName); }
   }
 
+  // A refresh swaps the panel that holds the result box, so a message written
+  // just before it would vanish (the "outcome unknown" guidance most of all).
+  // Park the message and write it into the new panel once the swap lands.
+  var carried = null;
+  function sayAfterRefresh(action, text, kind, eventName) {
+    carried = { action: action, text: text, kind: kind };
+    window.setTimeout(function () { carried = null; }, 30000);
+    refresh(eventName);
+  }
+  document.addEventListener('htmx:afterSwap', function (ev) {
+    if (!carried || !ev.target || !ev.target.querySelector) { return; }
+    var form = ev.target.querySelector('form[data-int-action="' + carried.action + '"]');
+    var box = form ? form.querySelector('[data-int-result]') : null;
+    if (!box) { return; }
+    box.textContent = carried.text;
+    box.hidden = false;
+    box.classList.toggle('warn', carried.kind !== 'ok');
+    carried = null;
+  });
+
   function errorText(res, data) {
     if (res.status === 401) { return 'Your session has ended. Sign in again.'; }
     if (data && data.error) {
@@ -213,9 +233,8 @@
       { provider: 'entra', tenant_id: tenant, client_id: client, client_secret: secret })
       .then(function (r) {
         if (r.res.ok && r.data) {
-          say(form, 'Synced ' + Number(r.data.user_count) + ' users and ' +
-            Number(r.data.group_count) + ' groups.', 'ok');
-          refresh('refreshDirectory');
+          sayAfterRefresh('directory-sync', 'Synced ' + Number(r.data.user_count) + ' users and ' +
+            Number(r.data.group_count) + ' groups.', 'ok', 'refreshDirectory');
         } else if (r.res.status === 409) {
           say(form, 'A sync is already running.', 'bad');
         } else {
@@ -224,8 +243,9 @@
       }, function () {
         // The request is synchronous and long; a dropped connection does not
         // mean the server stopped. Never re-POST: refresh the status instead.
-        say(form, 'No answer was received. The sync may still be running on the server. Check Status.', 'bad');
-        refresh('refreshDirectory');
+        sayAfterRefresh('directory-sync',
+          'No answer was received. The sync may still be running on the server. Check Status.',
+          'bad', 'refreshDirectory');
       })
       .then(function () {
         clearSecrets(form);
@@ -272,8 +292,9 @@
         say(form, parts.join(' '), 'bad');
         return;
       }
-      say(form, 'Saved ' + changes.length + ' mappings. They are recorded for reference and are not applied to sign-in.', 'ok');
-      refresh('refreshDirectory');
+      sayAfterRefresh('directory-mapping', 'Saved ' + changes.length +
+        ' mappings. They are recorded for reference and are not applied to sign-in.', 'ok',
+        'refreshDirectory');
     }, function () {
       say(form, 'No answer was received. Reload the panel to see what was saved.', 'bad');
     }).then(function () { submit.disabled = false; });

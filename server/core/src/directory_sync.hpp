@@ -224,8 +224,13 @@ public:
 
     /// Checked variant of `get_synced_users`: a failed read is an error, never
     /// an empty list, so a page can tell "no synced users" from "could not read".
+    /// `limit` > 0 caps the rows read (and so the membership lookup); 0 = all.
+    /// `require_groups`: when true a failed group-membership lookup fails the
+    /// whole read (the users would otherwise look like members of no group);
+    /// the plain `get_synced_users` keeps the best-effort enrichment.
     [[nodiscard]] std::expected<std::vector<DirectoryUser>, DirectoryReadError>
-    get_synced_users_checked(const std::string& group_filter = {}) const;
+    get_synced_users_checked(const std::string& group_filter = {}, int limit = 0,
+                             bool require_groups = true) const;
 
     /// Number of synced users, from the stored snapshot (one COUNT, no PII
     /// read). The status row's `user_count` cannot be used for this: a failed

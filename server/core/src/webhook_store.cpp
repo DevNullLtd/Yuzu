@@ -436,12 +436,19 @@ std::optional<std::vector<Webhook>> WebhookStore::list(int limit, int offset) co
     return out;
 }
 
-std::optional<Webhook> WebhookStore::get(int64_t id) const {
-    if (!open_)
+std::optional<Webhook> WebhookStore::get(int64_t id, bool* store_ok) const {
+    if (store_ok)
+        *store_ok = true;
+    if (!open_) {
+        if (store_ok)
+            *store_ok = false;
         return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::debug("WebhookStore::get: no connection in time ({})", pool_.last_error());
+        if (store_ok)
+            *store_ok = false;
         return std::nullopt;
     }
     // Never selects `secret` — same rule as list().
@@ -451,8 +458,11 @@ std::optional<Webhook> WebhookStore::get(int64_t id) const {
         "FROM webhook_store.webhooks WHERE id=$1::bigint",
         std::vector<std::string>{std::to_string(id)});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        if (res.status() != PGRES_TUPLES_OK)
+        if (res.status() != PGRES_TUPLES_OK) {
             spdlog::debug("WebhookStore::get: query failed: {}", PQerrorMessage(lease.get()));
+            if (store_ok)
+                *store_ok = false;
+        }
         return std::nullopt;
     }
     Webhook w;

@@ -5576,7 +5576,7 @@ Sync status plus the last-synced group list (there is no separate `GET /api/dire
 
 #### `PUT /api/directory/group-mappings`
 
-Configure group-to-role mappings (which RBAC role a synced group's members receive). Requires `Directory:Write`.
+Record group-to-role mappings (the RBAC role intended for a synced group's members; mappings are recorded for reference and nothing applies them at sign-in today). Requires `Directory:Write`.
 
 **Request:** `{"mappings": [{"group_id": "...", "role_name": "..."}]}`. `role_name` is NOT required per entry — an entry with an empty/omitted `role_name` REMOVES that group's mapping rather than being rejected; a non-empty `role_name` configures (creates or overwrites) it. An entry with an empty `group_id` is silently skipped and not counted.
 
@@ -5586,7 +5586,7 @@ Configure group-to-role mappings (which RBAC role a synced group's members recei
 
 **Response (503):** `directory_sync` unavailable.
 
-**Audit:** `directory.group_mapping.update` records the pairs (`N mappings updated: <group_id>=<role>, <group_id>=(removed)`), bounded and with control bytes replaced. Mappings are recorded for reference; nothing reads them at sign-in. The write helpers swallow store failures and the route still answers `200`, so a client that needs certainty compares the echoed set with what it sent (the Integrations page does).
+**Audit:** `directory.group_mapping.update` records the pairs (`N mappings updated: <group_id>=<role>, <group_id>=(removed)`), bounded and with control bytes replaced. Mappings are recorded for reference; nothing reads them at sign-in. The write helpers swallow store failures and the route still answers `200`, so a client that needs certainty compares the echoed set with what it sent (the Integrations page does). The route reads the stored set back before auditing: the row is `result=success` only when every requested pair is stored, otherwise `result=failure` with `N mappings not confirmed by read-back: ...` listing the pairs that are not.
 
 #### `GET /api/v1/directory/users`
 

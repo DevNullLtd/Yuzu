@@ -14,6 +14,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -33,11 +34,16 @@ struct Harness {
     bool audit_ok{true};
     int admin_calls{0};
     int users_reads{0};
+    int users_limit{0};
+    int delivery_reads{0};
+    bool perm{true};
+    bool audit_throws{false};
+    std::vector<std::string> perms; // "<securable>:<operation>" per securable check
     std::vector<std::string> audits;
     std::vector<int> list_limits;
 
     std::expected<std::vector<Webhook>, ReadError> webhooks{std::vector<Webhook>{}};
-    std::optional<Webhook> webhook_row;
+    std::expected<std::optional<Webhook>, ReadError> webhook_row{std::optional<Webhook>{}};
     std::optional<std::vector<WebhookDelivery>> deliveries{std::vector<WebhookDelivery>{}};
     std::expected<std::vector<OffloadTarget>, ReadError> offload{std::vector<OffloadTarget>{}};
     std::expected<std::optional<OffloadTarget>, ReadError> offload_one{std::optional<OffloadTarget>{}};
@@ -56,8 +62,17 @@ struct Harness {
                 res.status = 403;
             return admin;
         };
+        d.perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string& sec,
+                           const std::string& op) {
+            perms.push_back(sec + ":" + op);
+            if (!perm)
+                res.status = 403;
+            return perm;
+        };
         d.audit_read = [this](const httplib::Request&, const std::string& a, const std::string& r,
                               const std::string& tt, const std::string& ti, const std::string&) {
+            if (audit_throws)
+                throw std::runtime_error("audit sink down");
             audits.push_back(a + "|" + r + "|" + tt + "|" + ti);
             return audit_ok;
         };
@@ -66,7 +81,10 @@ struct Harness {
             return webhooks;
         };
         d.webhook_get = [this](std::int64_t) { return webhook_row; };
-        d.webhook_deliveries = [this](std::int64_t, int) { return deliveries; };
+        d.webhook_deliveries = [this](std::int64_t, int) {
+            ++delivery_reads;
+            return deliveries;
+        };
         d.offload_list = [this](int limit) {
             list_limits.push_back(limit);
             return offload;
@@ -76,8 +94,9 @@ struct Harness {
         d.directory_status = [this] { return status; };
         d.directory_user_count = [this] { return user_count; };
         d.directory_groups = [this] { return groups; };
-        d.directory_users = [this] {
+        d.directory_users = [this](int limit) {
             ++users_reads;
+            users_limit = limit;
             return users;
         };
         d.role_names = [this] { return roles; };
@@ -172,11 +191,17 @@ TEST_CASE("sync routes: webhook deliveries distinguish failed, empty and missing
                ContainsSubstring("Delivery history could not be read."));
 
     h.deliveries = std::vector<WebhookDelivery>{};
-    h.webhook_row = std::nullopt;
+    h.webhook_row = std::optional<Webhook>{};
     CHECK_THAT(h.get("/fragments/settings/webhooks/9/deliveries")->body,
                ContainsSubstring("The webhook was not found."));
 
-    h.webhook_row = wh(9);
+    // A second read that fails is "could not be read", never "not found".
+    h.webhook_row = std::unexpected(ReadError::failed);
+    const auto degraded = h.get("/fragments/settings/webhooks/9/deliveries")->body;
+    CHECK_THAT(degraded, ContainsSubstring("could not be read"));
+    CHECK(!has(degraded, "was not found"));
+
+    h.webhook_row = std::optional<Webhook>{wh(9)};
     CHECK_THAT(h.get("/fragments/settings/webhooks/9/deliveries")->body,
                ContainsSubstring("No deliveries recorded."));
 }
@@ -246,6 +271,80 @@ TEST_CASE("sync routes: users fragment is audited and fails closed", "[integrati
     CHECK(closed.users_reads == 0); // data is not even read without the audit row
 }
 
+TEST_CASE("sync routes: the JSON twin's securable is checked after the admin gate",
+          "[integrations][routes]") {
+    Harness h;
+    h.perm = false;
+    for (const char* p : {"/fragments/settings/webhooks", "/fragments/settings/webhooks/1/deliveries",
+                          "/fragments/settings/offload-targets",
+                          "/fragments/settings/offload-targets/1/deliveries",
+                          "/fragments/settings/directory-sync",
+                          "/fragments/settings/directory-sync/users"}) {
+        auto res = h.get(p);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.empty());
+    }
+    REQUIRE(h.perms.size() == 6);
+    CHECK(h.perms[0] == "Infrastructure:Read");
+    CHECK(h.perms[1] == "Infrastructure:Read");
+    CHECK(h.perms[2] == "Infrastructure:Read");
+    CHECK(h.perms[3] == "Infrastructure:Read");
+    CHECK(h.perms[4] == "Directory:Read");
+    CHECK(h.perms[5] == "Directory:Read");
+    CHECK(h.users_reads == 0);
+    CHECK(h.delivery_reads == 0);
+    CHECK(h.audits.empty()); // a denied caller leaves no users-view row either
+    CHECK(h.list_limits.empty());
+
+    // The admin gate runs first: a non-admin never reaches the securable check.
+    Harness na;
+    na.admin = false;
+    na.get("/fragments/settings/directory-sync");
+    CHECK(na.perms.empty());
+}
+
+TEST_CASE("sync routes: one failed history read stops the per-row reads",
+          "[integrations][routes]") {
+    Harness h;
+    h.webhooks = std::vector<Webhook>{wh(1), wh(2), wh(3), wh(4)};
+    h.deliveries = std::nullopt;
+    auto res = h.get("/fragments/settings/webhooks");
+    REQUIRE(res);
+    CHECK(h.delivery_reads == 1); // not one timeout per row
+    // Every shown row still says its history is unknown; none reads as empty.
+    std::size_t unknown = 0;
+    for (std::size_t at = 0;
+         (at = res->body.find("Unknown (history could not be read)", at)) != std::string::npos; ++at)
+        ++unknown;
+    CHECK(unknown == 4);
+}
+
+TEST_CASE("sync routes: users fragment survives a throwing audit sink and reads a bounded page",
+          "[integrations][routes]") {
+    Harness t;
+    t.audit_throws = true;
+    DirectoryUser u;
+    u.display_name = "Ada";
+    t.users = std::vector<DirectoryUser>{u};
+    auto res = t.get("/fragments/settings/directory-sync/users");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("Directory users are not shown."));
+    CHECK(!has(res->body, "Ada"));
+    CHECK(t.users_reads == 0);
+
+    // A failed persist also sets the shared Sec-Audit-Failed signal.
+    Harness f;
+    f.audit_ok = false;
+    CHECK(f.get("/fragments/settings/directory-sync/users")->get_header_value("Sec-Audit-Failed") ==
+          "true");
+
+    Harness b;
+    b.get("/fragments/settings/directory-sync/users");
+    CHECK(b.users_limit == 201); // shown cap + 1: enough to say "more exist"
+}
+
 TEST_CASE("sync routes: controller script is served no-store", "[integrations][routes]") {
     Harness h;
     auto res = h.get("/static/yuzu-integrations-sync.js");
@@ -271,6 +370,18 @@ TEST_CASE("controller script: no eval, no inline handler, no innerHTML of server
     CHECK(!has(js, "setAttribute('on"));
     CHECK(!has(js, "localStorage"));
     CHECK(!has(js, "sessionStorage"));
+}
+
+TEST_CASE("controller script: outcome messages survive the panel refresh", "[integrations][js]") {
+    // The refresh swaps the panel holding the result box; the sync and mapping
+    // messages (above all "outcome unknown") are re-applied after the swap.
+    const auto& js = kYuzuIntegrationsSyncJs;
+    CHECK_THAT(js, ContainsSubstring("addEventListener('htmx:afterSwap'"));
+    CHECK_THAT(js, ContainsSubstring("sayAfterRefresh('directory-sync', 'Synced '"));
+    CHECK_THAT(js, ContainsSubstring("'No answer was received. The sync may still be running"));
+    CHECK_THAT(js, ContainsSubstring("sayAfterRefresh('directory-mapping'"));
+    // The carried text still reaches the DOM through textContent only.
+    CHECK_THAT(js, ContainsSubstring("box.textContent = carried.text"));
 }
 
 TEST_CASE("controller script: every write goes to an existing JSON route", "[integrations][js]") {

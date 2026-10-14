@@ -15689,7 +15689,9 @@ private:
         // offload targets, directory sync) and the page controller script.
         // Reads only; every write the page makes goes to the existing JSON
         // routes with their own gates. `admin_fn` is `require_admin`, the same
-        // gate every Settings fragment uses.
+        // gate every Settings fragment uses; `perm_fn` then adds the JSON twin's
+        // securable (Infrastructure:Read, Directory:Read) so a fragment is never
+        // wider than the route it mirrors.
         {
             auto sync_deps = yuzu::server::integrations::bind_stores(
                 webhook_store_.get(), offload_target_store_.get(), directory_sync_.get(),
@@ -15697,6 +15699,7 @@ private:
             sync_deps.admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
                 return require_admin(req, res);
             };
+            sync_deps.perm_fn = perm_fn;
             sync_deps.audit_read = audit_fn;
             yuzu::server::integrations::register_integrations_sync_routes(inline_sink,
                                                                            std::move(sync_deps));

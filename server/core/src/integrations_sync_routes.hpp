@@ -34,6 +34,12 @@ namespace yuzu::server::integrations {
 struct SyncDeps {
     /// `require_admin`: writes the 403 and its audit row itself when it denies.
     using AdminFn = std::function<bool(const httplib::Request&, httplib::Response&)>;
+    /// `perm_fn`-style securable check (writes the 403 itself when it denies).
+    /// Stacked AFTER `admin_fn` so a fragment is never wider than its JSON twin's
+    /// securable: Infrastructure:Read for webhooks and offload targets,
+    /// Directory:Read for directory sync. Unset = no extra gate (tests).
+    using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
+                                      const std::string& securable, const std::string& operation)>;
     /// Bool-returning audit hook; `false` = the row was not persisted. The
     /// users fragment fails closed on `false`.
     using AuditReadFn =
@@ -42,11 +48,13 @@ struct SyncDeps {
                            const std::string& target_id, const std::string& detail)>;
 
     AdminFn admin_fn;
+    PermFn perm_fn;
     AuditReadFn audit_read;
 
     // Webhooks. `limit` is the row cap the route asked for (shown cap + 1).
     std::function<std::expected<std::vector<Webhook>, ReadError>(int limit)> webhooks_list;
-    std::function<std::optional<Webhook>(std::int64_t id)> webhook_get;
+    /// `ReadError` = degraded (never "not found"); an empty optional = not found.
+    std::function<std::expected<std::optional<Webhook>, ReadError>(std::int64_t id)> webhook_get;
     /// `nullopt` = the read failed.
     std::function<std::optional<std::vector<WebhookDelivery>>(std::int64_t id, int limit)>
         webhook_deliveries;
@@ -63,7 +71,8 @@ struct SyncDeps {
     std::function<std::expected<SyncStatus, ReadError>()> directory_status;
     std::function<std::expected<std::int64_t, ReadError>()> directory_user_count;
     std::function<std::expected<std::vector<DirectoryGroup>, ReadError>()> directory_groups;
-    std::function<std::expected<std::vector<DirectoryUser>, ReadError>()> directory_users;
+    /// `limit` > 0 caps the rows read; the route asks for the shown cap + 1.
+    std::function<std::expected<std::vector<DirectoryUser>, ReadError>(int limit)> directory_users;
     std::function<std::expected<std::vector<std::string>, ReadError>()> role_names;
 };
 

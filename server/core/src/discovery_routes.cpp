@@ -71,6 +71,9 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  try {
                      body = nlohmann::json::parse(req.body);
                  } catch (const std::exception& e) {
+                     if (auto session = auth_fn(req, res))
+                         audit_fn(req, "directory.sync", "failure", "Directory", "",
+                                  "invalid_json");
                      res.status = 400;
                      res.set_content(nlohmann::json({{"error", e.what()}}).dump(),
                                      "application/json");
@@ -287,13 +290,25 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                     ++count;
                 }
 
-                auto session = auth_fn(req, res);
-                if (session)
-                    audit_fn(req, "directory.group_mapping.update", "success",
-                             "Directory", "group-mappings",
-                             integrations::mapping_audit_detail(applied));
-
+                // Read back before auditing: the store's writers swallow a failed
+                // write, so a "success" row listing pairs that were never stored
+                // would be false evidence. Only confirmed pairs are audited as applied.
                 auto mappings = directory_sync->get_group_role_mappings();
+                const auto unconfirmed = integrations::unconfirmed_mapping_changes(applied, mappings);
+
+                auto session = auth_fn(req, res);
+                if (session) {
+                    if (unconfirmed.empty())
+                        audit_fn(req, "directory.group_mapping.update", "success",
+                                 "Directory", "group-mappings",
+                                 integrations::mapping_audit_detail(applied));
+                    else
+                        audit_fn(req, "directory.group_mapping.update", "failure",
+                                 "Directory", "group-mappings",
+                                 integrations::mapping_audit_detail(unconfirmed, 1000,
+                                                                    "not confirmed by read-back"));
+                }
+
                 nlohmann::json mappings_arr = nlohmann::json::array();
                 for (const auto& [gid, role] : mappings) {
                     mappings_arr.push_back({{"group_id", gid}, {"role_name", role}});

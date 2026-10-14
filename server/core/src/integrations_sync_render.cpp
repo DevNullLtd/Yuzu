@@ -17,8 +17,8 @@ std::string esc(std::string_view s) { return html_escape(std::string{s}); }
 
 constexpr std::string_view kWebhookCreateConfirm =
     "Send {events} to {host}? These events carry {data}. There is no restriction on the "
-    "destination address. The destination URL is recorded in the audit log and in the analytics "
-    "event stream.";
+    "destination address. The destination URL is recorded in the audit log; the analytics event "
+    "stream carries only its scheme and host.";
 constexpr std::string_view kOffloadCreateConfirm =
     "Send {events} to {host}? These events carry {data}. There is no restriction on the "
     "destination address. The target name and destination URL are recorded in the audit log.";
@@ -204,8 +204,8 @@ std::string render_webhooks(const std::expected<std::vector<WebhookRow>, ReadErr
            "<input class=\"in mono\" id=\"wh-url\" name=\"url\" type=\"text\" required maxlength=\"2048\" "
            "autocomplete=\"off\" spellcheck=\"false\" placeholder=\"https://example.invalid/hook\">"
            "<span class=\"hint\">Must start with http:// or https://. Embedded user:password is "
-           "refused. The destination URL is recorded in the audit log and in the analytics event "
-           "stream.</span></div>" +
+           "refused. The destination URL is recorded in the audit log; the analytics event stream "
+           "carries only its scheme and host.</span></div>" +
            event_checkboxes("wh") +
            "<div class=\"fld\"><label for=\"wh-secret\">Signing secret (optional)</label>"
            "<input class=\"in mono\" id=\"wh-secret\" name=\"secret\" type=\"password\" "

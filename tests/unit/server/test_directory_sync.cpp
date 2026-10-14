@@ -416,6 +416,10 @@ TEST_CASE("DirectorySync[pg]: checked reads succeed on an open store, never-sync
     REQUIRE(store->get_synced_groups_checked().has_value());
     CHECK(store->get_synced_groups_checked()->size() == 1);
     CHECK(store->get_synced_users_checked()->size() == 2);
+    // `limit` caps the rows read (the Integrations users fragment asks for a page).
+    CHECK(store->get_synced_users_checked({}, 1)->size() == 1);
+    CHECK(store->get_synced_users_checked("g1", 5)->size() == 1);
+    CHECK(store->get_synced_users_checked("g1", 5)->front().groups.size() == 1);
 
     // A failed sync's status row carries counts of a snapshot that was never
     // stored; the snapshot count must not follow it.

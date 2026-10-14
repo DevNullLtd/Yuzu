@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <map>
 #include <string>
 
 using namespace yuzu::server;
@@ -47,6 +48,25 @@ TEST_CASE("mapping audit detail: pairs, removal marker, count", "[integrations][
     const auto d = integrations::mapping_audit_detail(
         {{"g-1", "Operator"}, {"g-2", ""}});
     CHECK(d == "2 mappings updated: g-1=Operator, g-2=(removed)");
+}
+
+TEST_CASE("mapping read-back: only pairs the store shows are confirmed", "[integrations][audit]") {
+    using integrations::MappingChange;
+    const std::map<std::string, std::string> stored{{"g-1", "Operator"}, {"g-3", "Viewer"}};
+    const std::vector<MappingChange> asked{
+        {"g-1", "Operator"}, // stored as asked
+        {"g-2", "Operator"}, // write swallowed: not stored
+        {"g-3", ""},         // removal swallowed: still stored
+        {"g-4", ""},         // removal of an absent mapping is confirmed
+        {"g-1", "Admin"}};   // stored role differs from the requested one
+    const auto bad = integrations::unconfirmed_mapping_changes(asked, stored);
+    REQUIRE(bad.size() == 3);
+    CHECK(bad[0].group_id == "g-2");
+    CHECK(bad[1].group_id == "g-3");
+    CHECK(bad[2].role_name == "Admin");
+    CHECK(integrations::mapping_audit_detail(bad, 1000, "not confirmed by read-back") ==
+          "3 mappings not confirmed by read-back: g-2=Operator, g-3=(removed), g-1=Admin");
+    CHECK(integrations::unconfirmed_mapping_changes({}, stored).empty());
 }
 
 TEST_CASE("mapping audit detail: control bytes cannot split the row", "[integrations][audit]") {

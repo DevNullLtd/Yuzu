@@ -6,8 +6,10 @@
 ///
 /// The page hosts the two existing fragments (`GET /fragments/settings/mcp`,
 /// `GET /fragments/settings/gateway`) at their existing URLs and ids, and writes through
-/// the existing `POST /api/settings/mcp`. No REST route and no MCP tool is added: the
-/// page is a page, and settings administration is the #520 exception to MCP twinning.
+/// the existing `POST /api/settings/mcp`. Its webhook, offload-target and directory-sync
+/// panels are the six read fragments of `integrations_sync_routes.hpp`. No REST route and
+/// no MCP tool is added: the page is a page, and settings administration is the #520
+/// exception to MCP twinning.
 ///
 /// The page is `admin_fn_` (`AuthRoutes::require_admin`: an effective admin, never an
 /// MCP-tier or service-scoped token); a refused caller is redirected to `/` exactly as

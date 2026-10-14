@@ -1,6 +1,7 @@
 #include "integrations_sync_routes.hpp"
 
 #include "rbac_store.hpp"
+#include "rest_audit.hpp" // detail::emit_behavioral_audit
 
 #include <memory>
 #include <stdexcept>
@@ -43,6 +44,15 @@ template <class D> LastDelivery last_of(const std::optional<std::vector<D>>& d) 
     return out;
 }
 
+/// admin gate first, then (when bound) the JSON twin's securable, so a fragment
+/// is never wider than the route it mirrors.
+[[nodiscard]] bool gate(const SyncDeps& d, const httplib::Request& req, httplib::Response& res,
+                        const char* securable) {
+    if (!d.admin_fn(req, res))
+        return false;
+    return !d.perm_fn || d.perm_fn(req, res, securable, "Read");
+}
+
 template <class T> std::expected<T, ReadError> unavailable() {
     return std::unexpected(ReadError::unavailable);
 }
@@ -65,8 +75,15 @@ SyncDeps bind_stores(WebhookStore* wh, OffloadTargetStore* off, DirectorySync* d
             return std::unexpected(ReadError::failed);
         return *std::move(r);
     };
-    d.webhook_get = [wh](std::int64_t id) -> std::optional<Webhook> {
-        return wh ? wh->get(id) : std::nullopt;
+    d.webhook_get =
+        [wh](std::int64_t id) -> std::expected<std::optional<Webhook>, ReadError> {
+        if (!wh || !wh->is_open())
+            return unavailable<std::optional<Webhook>>();
+        bool ok = true;
+        auto w = wh->get(id, &ok);
+        if (!ok)
+            return std::unexpected(ReadError::failed);
+        return w;
     };
     d.webhook_deliveries = [wh](std::int64_t id, int limit) {
         return wh ? wh->get_deliveries_checked(id, limit)
@@ -121,10 +138,10 @@ SyncDeps bind_stores(WebhookStore* wh, OffloadTargetStore* off, DirectorySync* d
             return std::unexpected(map_dir(r.error()));
         return *std::move(r);
     };
-    d.directory_users = [dir, map_dir]() -> std::expected<std::vector<DirectoryUser>, ReadError> {
+    d.directory_users = [dir, map_dir](int limit) -> std::expected<std::vector<DirectoryUser>, ReadError> {
         if (!dir)
             return unavailable<std::vector<DirectoryUser>>();
-        auto r = dir->get_synced_users_checked();
+        auto r = dir->get_synced_users_checked({}, limit);
         if (!r)
             return std::unexpected(map_dir(r.error()));
         return *std::move(r);
@@ -147,7 +164,7 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
     auto d = std::make_shared<const SyncDeps>(std::move(deps));
 
     sink.Get("/fragments/settings/webhooks", [d](const httplib::Request& req, httplib::Response& res) {
-        if (!d->admin_fn(req, res))
+        if (!gate(*d, req, res, "Infrastructure"))
             return;
         std::expected<std::vector<WebhookRow>, ReadError> rows;
         auto list = d->webhooks_list(static_cast<int>(kListShown) + 1);
@@ -156,12 +173,22 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
         } else {
             std::vector<WebhookRow> v;
             std::size_t n = 0;
+            bool history_lost = false;
             for (auto& w : *list) {
                 WebhookRow r;
                 r.webhook = std::move(w);
                 // Rows past the shown cap are only the "more exist" sentinel.
-                if (++n <= kListShown)
-                    r.last = last_of(d->webhook_deliveries(r.webhook.id, 1));
+                if (++n <= kListShown) {
+                    // One failed history read (lease timeout) means the rest would
+                    // wait out the same timeout: mark them unknown instead of
+                    // holding the worker for up to 100 timeouts.
+                    if (history_lost) {
+                        r.last.kind = LastDelivery::Kind::unknown;
+                    } else {
+                        r.last = last_of(d->webhook_deliveries(r.webhook.id, 1));
+                        history_lost = r.last.kind == LastDelivery::Kind::unknown;
+                    }
+                }
                 v.push_back(std::move(r));
             }
             rows = std::move(v);
@@ -171,7 +198,7 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
 
     sink.Get(R"(/fragments/settings/webhooks/(\d+)/deliveries)",
              [d](const httplib::Request& req, httplib::Response& res) {
-                 if (!d->admin_fn(req, res))
+                 if (!gate(*d, req, res, "Infrastructure"))
                      return;
                  const auto id = parse_id_segment(req.matches[1].str());
                  if (!id) {
@@ -183,16 +210,25 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
                      send_html(res, render_webhook_deliveries(std::unexpected(ReadError::failed)));
                      return;
                  }
-                 if (rows->empty() && !d->webhook_get(*id)) {
-                     send_html(res, render_not_found_note("The webhook"));
-                     return;
+                 if (rows->empty()) {
+                     // A second read that fails is "could not be read", never "not found".
+                     auto w = d->webhook_get(*id);
+                     if (!w) {
+                         send_html(res,
+                                   render_webhook_deliveries(std::unexpected(w.error())));
+                         return;
+                     }
+                     if (!*w) {
+                         send_html(res, render_not_found_note("The webhook"));
+                         return;
+                     }
                  }
                  send_html(res, render_webhook_deliveries(std::move(*rows)));
              });
 
     sink.Get("/fragments/settings/offload-targets",
              [d](const httplib::Request& req, httplib::Response& res) {
-                 if (!d->admin_fn(req, res))
+                 if (!gate(*d, req, res, "Infrastructure"))
                      return;
                  std::expected<std::vector<OffloadRow>, ReadError> rows;
                  auto list = d->offload_list(static_cast<int>(kListShown) + 1);
@@ -201,11 +237,18 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
                  } else {
                      std::vector<OffloadRow> v;
                      std::size_t n = 0;
+                     bool history_lost = false; // see the webhooks list: stop after one failure
                      for (auto& t : *list) {
                          OffloadRow r;
                          r.target = std::move(t);
-                         if (++n <= kListShown)
-                             r.last = last_of(d->offload_deliveries(r.target.id, 1));
+                         if (++n <= kListShown) {
+                             if (history_lost) {
+                                 r.last.kind = LastDelivery::Kind::unknown;
+                             } else {
+                                 r.last = last_of(d->offload_deliveries(r.target.id, 1));
+                                 history_lost = r.last.kind == LastDelivery::Kind::unknown;
+                             }
+                         }
                          v.push_back(std::move(r));
                      }
                      rows = std::move(v);
@@ -215,7 +258,7 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
 
     sink.Get(R"(/fragments/settings/offload-targets/(\d+)/deliveries)",
              [d](const httplib::Request& req, httplib::Response& res) {
-                 if (!d->admin_fn(req, res))
+                 if (!gate(*d, req, res, "Infrastructure"))
                      return;
                  const auto id = parse_id_segment(req.matches[1].str());
                  if (!id) {
@@ -245,7 +288,7 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
 
     sink.Get("/fragments/settings/directory-sync",
              [d](const httplib::Request& req, httplib::Response& res) {
-                 if (!d->admin_fn(req, res))
+                 if (!gate(*d, req, res, "Directory"))
                      return;
                  DirectoryView v{d->directory_status(), d->directory_user_count(),
                                  d->directory_groups(), d->role_names()};
@@ -254,16 +297,21 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
 
     sink.Get("/fragments/settings/directory-sync/users",
              [d](const httplib::Request& req, httplib::Response& res) {
-                 if (!d->admin_fn(req, res))
+                 if (!gate(*d, req, res, "Directory"))
                      return;
                  // PII: refuse to render without a persisted audit row (the
                  // REST v1 twin's fail-closed posture).
-                 if (!d->audit_read(req, "directory.users.view", "success", "Directory", "",
-                                    "integrations page directory users read")) {
+                 // The shared behavioural-audit funnel: it catches a throwing audit sink
+                 // (withheld, not a 500) and sets Sec-Audit-Failed on a failed persist.
+                 if (!detail::emit_behavioral_audit(d->audit_read, req, res,
+                                                    "directory.users.view", "success", "Directory",
+                                                    "", "integrations page directory users read")) {
                      send_html(res, render_audit_withheld_note());
                      return;
                  }
-                 auto users = d->directory_users();
+                 // The shown cap + 1: enough to tell "more exist" without reading a
+                 // whole directory (the count above is a separate COUNT).
+                 auto users = d->directory_users(static_cast<int>(kUsersShown) + 1);
                  auto total = d->directory_user_count();
                  send_html(res, render_directory_users(users, total ? *total : 0));
              });

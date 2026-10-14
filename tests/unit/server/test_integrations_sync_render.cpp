@@ -178,7 +178,7 @@ TEST_CASE("webhook create form: confirm names host and data classes, secret has 
     CHECK_THAT(tag, ContainsSubstring("autocomplete=\"new-password\""));
     CHECK(!contains(tag, "value="));
     CHECK_THAT(html, ContainsSubstring("it is not an approval step"));
-    CHECK_THAT(html, ContainsSubstring("audit log and in the analytics event stream"));
+    CHECK_THAT(html, ContainsSubstring("recorded in the audit log; the analytics event stream carries only its scheme and host"));
 }
 
 TEST_CASE("webhook deliveries: failed read, empty, and rows", "[integrations][render]") {

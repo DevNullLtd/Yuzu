@@ -171,8 +171,10 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 
 ## Settings: Integrations page
 
-**Settings → Integrations** (`/settings/integrations`, admin only; both panels also stay on the
-`/settings` page).
+**Settings → Integrations** (`/settings/integrations`, admin only; the MCP and Gateway panels also
+stay on the `/settings` page). Every panel reads through admin-only fragments that are also gated
+by the securable of the matching JSON route (Infrastructure Read for webhooks and offload
+targets, Directory Read for directory sync), so a fragment is never wider than its JSON twin.
 
 - **MCP server** enables or disables the endpoint and sets Read-only or Full access, with one
   Save. The confirmation names the state being saved (MCP off, on in read-only mode, or on with
@@ -182,6 +184,28 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 - **Gateway** shows the upstream-service state, the listen address, the gateway mode and the
   number of agents connected through the gateway, the flag guidance for a server where the
   upstream service is not running, and the gateway environment-variable reference.
+- **Webhooks** lists the configured webhooks (destination host, events, last delivery) and opens
+  a delivery history. You can create and delete a webhook; the create confirmation names the
+  destination host and the data the chosen events carry. A destination with embedded
+  `user:password@`, or with control characters in the URL or event types, is refused. The
+  signing secret is write-only. There is no restriction on the destination address, and the
+  confirmation is a click-through, not an approval step.
+- **Offload targets** lists the targets (destination host, events, batch size, last delivery),
+  opens a delivery history, and creates and deletes targets under the same rules. The credential
+  is write-only. The create audit row records the name and the full URL (see
+  [Audit Log](audit-log.md)).
+- **Directory sync** shows the Microsoft Entra sync state (never synced, running, completed or
+  failed are separate states, and a failed read says so rather than showing an empty panel), the
+  synced user and group counts, and a form that runs a sync. The tenant, client and secret are used
+  for that one request and never stored. "Show directory users" loads the list on request, audited
+  as `directory.users.view`; it is withheld if the audit row cannot be written and shows the first
+  200 users. Group-to-role mappings are recorded for reference; nothing reads them at sign-in.
+
+**Upgrade note.** `POST /api/settings/mcp` now requires exactly one `enabled` and exactly one
+`read_only` field, each the literal `true` or `false`, and answers `400` otherwise. Scripts that
+omitted a field or sent another value must be updated. Creating a webhook or offload target with
+`user:password@` in the URL, or with a control character in the URL or event types, now answers
+`400` (existing rows are not changed).
 
 ---
 

@@ -5,7 +5,9 @@
 /// route audit rows. No I/O, no store types.
 
 #include <cstddef>
+#include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -22,7 +24,8 @@ struct MappingChange {
 /// many. Free text is operator- and directory-supplied, so control bytes are
 /// replaced (an audit row must not line-split) and the whole detail is bounded.
 [[nodiscard]] inline std::string
-mapping_audit_detail(const std::vector<MappingChange>& changes, std::size_t cap = 1000) {
+mapping_audit_detail(const std::vector<MappingChange>& changes, std::size_t cap = 1000,
+                     std::string_view verb = "updated") {
     auto clean = [](const std::string& s) {
         std::string out = s;
         for (auto& c : out) {
@@ -32,7 +35,7 @@ mapping_audit_detail(const std::vector<MappingChange>& changes, std::size_t cap 
         }
         return out;
     };
-    std::string out = std::to_string(changes.size()) + " mappings updated:";
+    std::string out = std::to_string(changes.size()) + " mappings " + std::string(verb) + ":";
     bool first = true;
     for (const auto& ch : changes) {
         std::string piece = std::string(first ? " " : ", ") + clean(ch.group_id) + "=" +
@@ -43,6 +46,24 @@ mapping_audit_detail(const std::vector<MappingChange>& changes, std::size_t cap 
             break;
         }
         out += piece;
+    }
+    return out;
+}
+
+/// The requested changes the stored mapping set does not show. The store's
+/// mapping writers swallow a failed write (void return), so the route reads the
+/// set back and audits only what is actually there: a requested role must be
+/// the stored role, a removal must be absent.
+[[nodiscard]] inline std::vector<MappingChange>
+unconfirmed_mapping_changes(const std::vector<MappingChange>& changes,
+                            const std::map<std::string, std::string>& stored) {
+    std::vector<MappingChange> out;
+    for (const auto& ch : changes) {
+        const auto it = stored.find(ch.group_id);
+        const bool ok = ch.role_name.empty() ? it == stored.end()
+                                              : it != stored.end() && it->second == ch.role_name;
+        if (!ok)
+            out.push_back(ch);
     }
     return out;
 }

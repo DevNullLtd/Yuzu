@@ -107,8 +107,12 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                      if (result.error() == WebhookWriteError::invalid_url) {
                          audit_fn(req, "webhook.create", "failure", "webhook", "", "invalid_url");
                          res.status = 400;
-                         res.set_content(detail::a4_error(res, "url must be http:// or https://"),
-                                         "application/json");
+                         res.set_content(
+                             detail::a4_error(res, "url must be http:// or https:// without "
+                                                   "embedded credentials, and url and "
+                                                   "event_types must not contain control "
+                                                   "characters"),
+                             "application/json");
                      } else {
                          audit_fn(req, "webhook.create", "failure", "webhook", "",
                                   std::string(audit_detail_for(result.error())));
