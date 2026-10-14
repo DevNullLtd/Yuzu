@@ -1,5 +1,6 @@
 #include "health_routes.hpp"
 
+#include "home_panels_render.hpp"
 #include "http_route_sink.hpp"
 
 #include "agent_registry.hpp"
@@ -872,6 +873,60 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             body += "}";
             res.set_content(body, "application/json");
         }
+    });
+
+    // -- Home "Server health" panel (HM-2) ------------------------------------
+    // Lives here so it can call the registered `health_handler` in-process: one
+    // definition of "healthy". Gate order matches /fragments/health/summary
+    // (deny_service_scoped_fn, then auth_fn). Every outcome is a 200 panel note
+    // so htmx swaps it. The JSON is parsed and only seven fields are read;
+    // `system.*`, `tls.*` and `agents.pending` are never rendered.
+    sink.Get("/fragments/home/health", [deps, health_handler](const httplib::Request& req,
+                                                              httplib::Response& res) {
+        using home_panels::Fact;
+        using home_panels::FactState;
+        using home_panels::HealthPanel;
+        const auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+        auto serve = [&](const Fact<HealthPanel>& f) {
+            res.status = 200;
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(home_panels::render_health_panel(f, now_secs), "text/html; charset=utf-8");
+        };
+        {
+            httplib::Response scratch;
+            if (deps.deny_service_scoped_fn(req, scratch, "home.fragment.access_denied",
+                                            "service-scoped tokens may not read the Home health panel",
+                                            "", "")) {
+                serve(Fact<HealthPanel>::of(FactState::Denied, "an interactive session"));
+                return;
+            }
+        }
+        if (!deps.auth_fn(req, res))
+            return;
+        httplib::Response doc;
+        health_handler(req, doc);
+        // A fresh httplib::Response carries status -1 until the server finalises
+        // it, so "handler wrote a body and no error" is -1 or 200.
+        const bool doc_ok = doc.status == 200 || doc.status == -1;
+        auto panel = doc_ok ? home_panels::parse_health_json(doc.body) : std::nullopt;
+        if (!panel) {
+            serve(Fact<HealthPanel>::of(FactState::Unavailable));
+            return;
+        }
+        // `agents.online` is the same unauthenticated /api/health field and is
+        // exempt from the scope rule. `executions.in_flight` is fleet-wide and
+        // unconfined, so it needs an admitted, unscoped Execution:Read.
+        bool show_exec = false;
+        if (deps.fleet_read_fn) {
+            httplib::Response scratch;
+            const auto gate = deps.fleet_read_fn(req, scratch, "Execution", "Read");
+            show_exec = gate.admitted && !gate.scope.has_value();
+        }
+        if (!show_exec)
+            panel->executions_running.reset();
+        serve(Fact<HealthPanel>::ok(std::move(*panel)));
     });
 
     // -- Health summary dashboard fragment (7.2) ----------------------------

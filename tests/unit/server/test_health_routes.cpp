@@ -42,6 +42,7 @@
 #include <fstream>
 #include <optional>
 #include <stdexcept>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,12 @@ struct Harness {
     bool deny_scoped{false};
     bool deny_scoped_fn_called{false};
     std::string last_deny_action, last_deny_target_type, last_deny_target_id;
+
+    // HM-2 /fragments/home/health: the optional Execution:Read fleet gate.
+    bool fleet_wired{false};
+    bool fleet_admit{true};
+    bool fleet_scoped{false};
+    std::vector<std::string> fleet_calls; // "Securable:Op"
 
     yuzu::server::test::TestRouteSink sink;
 
@@ -126,6 +133,21 @@ struct Harness {
             }
             return false;
         };
+        if (fleet_wired)
+            deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                        const std::string& sec,
+                                        const std::string& op) -> authz::FleetReadGate {
+                fleet_calls.push_back(sec + ":" + op);
+                if (!fleet_admit) {
+                    res.status = 403;
+                    return {};
+                }
+                authz::FleetReadGate g;
+                g.admitted = true;
+                g.scope = fleet_scoped ? authz::VisibleSet{std::unordered_set<std::string>{"a1"}}
+                                       : authz::VisibleSet{std::nullopt};
+                return g;
+            };
         deps.cfg = &cfg;
         deps.metrics = &metrics;
         deps.registry = &registry;
@@ -151,10 +173,10 @@ struct Harness {
 
 // ── Registration shape ────────────────────────────────────────────────────
 
-TEST_CASE("health_routes: registers exactly 6 routes", "[server][routes][health_routes]") {
+TEST_CASE("health_routes: registers exactly 7 routes", "[server][routes][health_routes]") {
     Harness h;
     h.wire();
-    CHECK(h.sink.route_count() == 6);
+    CHECK(h.sink.route_count() == 7);
 }
 
 TEST_CASE("health_routes: throws std::invalid_argument if cfg or metrics is unbound",
@@ -676,4 +698,88 @@ TEST_CASE("health_routes: /metrics exports the reachability gauges on scrape",
     CHECK(r->body.find("yuzu_server_pg_reachable 1") != std::string::npos);
     CHECK(r->body.find("yuzu_server_pg_reachability_last_success_age_seconds") !=
           std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// HM-2: /fragments/home/health (Home "Server health" panel)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("health_routes: /fragments/home/health denies a service-scoped token first, as a 200 note",
+          "[server][routes][health_routes][home]") {
+    Harness h;
+    h.deny_scoped = true;
+    h.wire();
+    auto r = h.sink.dispatch("GET", "/fragments/home/health");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(h.deny_scoped_fn_called);
+    CHECK(h.last_deny_action == "home.fragment.access_denied");
+    CHECK_FALSE(h.auth_fn_called); // deny runs BEFORE auth_fn
+    CHECK(r->body.find("service-scoped tokens") == std::string::npos); // gate text never reaches the page
+    CHECK(r->get_header_value("Cache-Control") == "no-store");
+}
+
+TEST_CASE("health_routes: /fragments/home/health without a session writes 401 and no panel",
+          "[server][routes][health_routes][home]") {
+    Harness h;
+    h.session_present = false;
+    h.wire();
+    auto r = h.sink.dispatch("GET", "/fragments/home/health");
+    REQUIRE(r);
+    CHECK(r->status == 401);
+}
+
+TEST_CASE("health_routes: /fragments/home/health renders real rows, executions row only when unscoped",
+          "[server][routes][health_routes][home]") {
+    SECTION("unbound fleet gate omits the executions row") {
+        Harness h;
+        h.wire();
+        auto r = h.sink.dispatch("GET", "/fragments/home/health");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("id=\"home-health\"") != std::string::npos);
+        CHECK(r->body.find("Agents connected to this server") != std::string::npos);
+        CHECK(r->body.find("Executions running") == std::string::npos);
+        CHECK(h.fleet_calls.empty());
+    }
+    SECTION("admitted and unscoped shows it, gate asked for Execution:Read") {
+        Harness h;
+        h.fleet_wired = true;
+        h.wire();
+        auto r = h.sink.dispatch("GET", "/fragments/home/health");
+        REQUIRE(r);
+        CHECK(r->body.find("Executions running") != std::string::npos);
+        REQUIRE(h.fleet_calls.size() == 1);
+        CHECK(h.fleet_calls[0] == "Execution:Read");
+    }
+    SECTION("engaged scope omits it") {
+        Harness h;
+        h.fleet_wired = true;
+        h.fleet_scoped = true;
+        h.wire();
+        auto r = h.sink.dispatch("GET", "/fragments/home/health");
+        REQUIRE(r);
+        CHECK(r->body.find("Executions running") == std::string::npos);
+        CHECK(r->body.find("Agents connected to this server") != std::string::npos);
+    }
+    SECTION("denied omits it") {
+        Harness h;
+        h.fleet_wired = true;
+        h.fleet_admit = false;
+        h.wire();
+        auto r = h.sink.dispatch("GET", "/fragments/home/health");
+        REQUIRE(r);
+        CHECK(r->body.find("Executions running") == std::string::npos);
+    }
+}
+
+TEST_CASE("health_routes: /fragments/home/health never renders system, tls or pending-agent fields",
+          "[server][routes][health_routes][home]") {
+    Harness h;
+    h.fleet_wired = true;
+    h.wire();
+    auto r = h.sink.dispatch("GET", "/fragments/home/health");
+    REQUIRE(r);
+    for (const char* banned : {"cpu_percent", "rss", "tls", "pending", "command_queue_depth"})
+        CHECK(r->body.find(banned) == std::string::npos);
 }
