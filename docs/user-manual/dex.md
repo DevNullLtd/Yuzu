@@ -16,7 +16,9 @@ It is reached from the **DEX** link in the dashboard nav, or directly at
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
 links* into seven deep pages. A shared sub-nav switches between **Overview ·
 Apps · Catalogue · Health score · Trends · Performance · App Performance ·
-Network**; the window selector (below) applies to the signal views (Performance
+Network · Alerts**; the Alerts tab is the configuration page for DEX alert
+routing and is for administrators only (anyone else sees a role note). The
+window selector (below) applies to the signal views (Performance
 and Network are now-views — see below). The Network view also has its own URL,
 `/network`, but it is a DEX sub-view, not a standalone top-level nav item.
 
@@ -61,8 +63,9 @@ and perf identity already share on Windows/Linux — an exact match, not a
 name-normalized guess. Attribution of repository/install/service signals to the
 originating app is a follow-on slice; the Apps tab today scopes to crash and
 hang signals only. Per-version crash/hang *counts* on the performance trend
-(as opposed to the per-app crash/hang totals already shown here) remain
-deferred — see "Fleet-wide application performance" under Drill-downs.
+(as opposed to the per-app crash/hang totals already shown here) are not
+rendered on the Apps tab; `GET /api/v1/dex/perf/app` carries them per version
+— see "Fleet-wide application performance" under Drill-downs.
 
 ### Catalogue
 
@@ -228,9 +231,9 @@ numbers match.
   narrows the trend to one version at a time (the same `version` parameter the
   `GET /api/v1/dex/perf/app` / `/perf/group` / `/perf/tag` endpoints already
   accept); "all
-  versions" is the default. Per-version crash/hang counts are not shown here
-  yet (a separate central crash-store join, still deferred) — use the
-  per-application crash/hang drill above for those.
+  versions" is the default. Per-version crash/hang counts are not shown on
+  this panel yet: `GET /api/v1/dex/perf/app` carries the join, the panel does
+  not render it — use the per-application crash/hang drill above for those.
   On the **fleet-wide** view (no management-group or device-model scope), each version row
   has a **&#9656; devices** affordance that expands in place to list the
   devices behind that number — `agent_id`, last-seen day, and that day's CPU /
@@ -382,7 +385,10 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/perf/apps`** — the application-performance-over-time picker
   (apps with retained fleet data; `{app_name, versions, last_day}`).
 - **`GET /api/v1/dex/perf/app?app=&version=`** — the fleet trend for one app, one
-  point per `(version, day)` over the retained B2 window (≤180 days).
+  point per `(version, day)` over the retained B2 window (≤180 days), plus a
+  per-version `versions[]` join of crash and hang counts, exposure and the
+  exposed-device failure rate and rate ratio (no device floor on the join; the
+  point floor is unchanged — see the REST reference).
 - **`GET /api/v1/dex/perf/app/devices?app=&version=`** — the version-row "which
   devices" drill: devices reporting one EXACT `(app, version)` among their
   retained top-N daily summaries (B1, ≤31 days), one row per device (`agent_id`,
@@ -420,7 +426,9 @@ view; the rollup, scope, and true aggregate perf endpoints (`/perf/fleet`,
 `/perf/tag`)
 are machine-health telemetry / fleet metadata and are not audited — and the
 app-perf aggregates suppress any sub-floor `(version, day)` point (fewer than
-10 devices) to a count only. **`/perf/devices` and `/perf/app/devices` are the
+10 devices) to a count only; the per-version crash and hang join on
+`/perf/app` carries no device floor (maintainer ruling, 2026-10-14 — see the
+REST reference). **`/perf/devices` and `/perf/app/devices` are the
 exceptions**: each row names an `agent_id` fleet-wide (or, for `/perf/app/
 devices`, the caller's visible subset), so unlike their aggregate siblings
 they ARE audited — `/perf/devices` as `dex.perf.device.view` (fail-closed,
@@ -513,7 +521,7 @@ A standing incident re-alerts at most once per cooldown period (per-pair), and
 a global per-minute fan-out cap keeps a correlated multi-subject incident (e.g.
 a bad update crashing many apps at once) from flooding your ITSM. The
 thresholds (default **5 devices / 15 min window / 1 h cooldown**) are
-**operator-tunable under Settings → DEX alerts** and apply immediately — no
+**operator-tunable on the DEX → Alerts tab** and apply immediately — no
 restart. The memory and fan-out bounds are not configurable (they are DoS
 posture, not policy). Detector activity is observable via the
 `yuzu_server_dex_blast_radius_*` Prometheus metrics. Subscribe to the event in
@@ -522,7 +530,7 @@ posture, not policy). Detector activity is observable via the
 ## Routing signals to alerts
 
 Beyond fleet incidents, you can route **individual signal types** to alerts
-under **Settings → DEX alerts**: tick the types you care about (grouped by the
+on the **DEX → Alerts** tab: tick the types you care about (grouped by the
 same families as the Catalogue) and each routed observation raises an operator
 notification and fires the **`dex.signal`** webhook/offload event
 (`obs_type`, `subject`, `agent_id`) — **once per device per hour** per type, so
@@ -561,7 +569,7 @@ rejected; percentages clamp at 100) so a single misbehaving agent cannot poison
 a fleet percentile. Agents with `--dex-disable` ship no perf tags at all.
 
 **Per-cohort export (opt-in).** Setting a **cohort export tag key** in
-Settings → DEX alerts additionally publishes the same stats per cohort of that
+The DEX → Alerts tab additionally publishes the same stats per cohort of that
 key:
 
 | Gauge | Meaning |

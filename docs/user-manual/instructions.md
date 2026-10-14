@@ -544,7 +544,7 @@ When a user (or MCP tool) executes an instruction that requires approval:
 
 1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. The execution is queued, not dropped.
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
-3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded.
+3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded. On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
 The submitter cannot approve their own request. A different user with the appropriate role must review it.
 
@@ -1268,7 +1268,8 @@ POST /api/approvals/{id}/approve
 
 The reviewer must be a different operator than the submitter — self-approval
 is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
-and the denied attempt is recorded in the audit log.
+and the denied attempt is recorded in the audit log. The `comment` is capped at
+4,000 bytes (HTTP 400 beyond that).
 
 ```bash
 curl -s -b cookies.txt \
@@ -1381,6 +1382,8 @@ curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
 
+Cancelling an execution that already finished (`succeeded`, `completed` or `cancelled`) answers `409` and changes nothing; the Executions page offers Cancel only for executions that are still running. Per-device results and the live view are on the page's detail pane.
+
 ---
 
 ## 13. Dashboard UI
@@ -1396,7 +1399,15 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
 | **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
-**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Approving, rejecting and executing stay on the Instructions tabs.
+**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
+
+**Workflows page.** `/workflows` is a read-only page in the sidebar under Instructions: the workflow definitions (name, description, step count; selecting one lists its steps with each step's failure policy) and the recurring schedules. Schedules run a single instruction on the cadence the scheduler really applies (once, every N minutes, daily, weekly or monthly; time of day, weekday and day of month are stored but not used) and are not linked to workflows. A schedule you did not create shows only whether it targets all devices or a subset. Creating, running and deleting workflows and schedules are not on this page yet.
+
+The definitions table also shows each workflow's Last run and Result (the newest run you may see: "Not run" when there is none, "None visible" when runs exist only on devices outside your scope, "Unknown" when the list of newest runs was cut off before it reached that workflow). Selecting a workflow loads its latest run in the **Latest run** panel (status, start, duration, device count and one row per step) and the **Recent runs** disclosure lists its ten newest runs; selecting one loads it. A step shown as *Dispatched* means the command was sent: it says nothing about the result on a device, and for a caller confined to a device scope it reads *Dispatched (run-wide)* because the send covered the run's whole target list. A skipped step says why only for the three reasons the engine writes (condition not met, previous step failed, workflow aborted); a failed step shows its error text when the engine stored one, otherwise "No detail.". A run is visible to you only if at least one of its target devices is in your scope; a run you may not see and a run that does not exist look the same.
+
+Who sees what: Administrator, Operator, PlatformEngineer, Viewer and ITServiceOwner hold `Workflow:Read` and see all definitions; runs follow the fleet-read scope of the account. A caller scoped only to management groups is refused the definitions and schedules panels (the existing global-grant rule) but sees runs that include a device in scope. ITServiceOwner can create, enable and delete its own schedules elsewhere but has no Run, New workflow or Delete workflow control, and a service-scoped token is refused the schedules panel outright.
+
+Operational notes: listing definitions reads each workflow's steps with one query per row (up to 101 per page load, newest first), so the page asks for 101 and never renders the YAML. Opening the page or refreshing a denied panel writes a denial audit row for each refused panel, so a denied panel is not polled; reading a run's detail writes `workflow_execution.detail.fetch`. Not verified by running it: that a run keeps going on the server when the browser disconnects, and the content of the `perm_fn` denial audit rows for the refused panels.
 
 ### YAML Editor
 

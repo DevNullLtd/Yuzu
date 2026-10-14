@@ -296,7 +296,7 @@ def create_baseline_form(op, name, member_names):
     req = urllib.request.Request(
         BASE + "/fragments/guardian/baselines",
         data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+        headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8", "Origin": BASE},
     )
     return op.open(req, timeout=15).read().decode("utf-8", "replace")
 
@@ -332,7 +332,7 @@ def deploy_baseline_form(op, baseline_id):
     req = urllib.request.Request(
         BASE + f"/fragments/guardian/baseline/{baseline_id}/deploy",
         data=b"",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Origin": BASE},
     )
     resp = op.open(req, timeout=15).read().decode("utf-8", "replace")
     _raise_if_baseline_action_failed(resp, "deploy")
@@ -343,7 +343,7 @@ def delete_baseline_form(op, baseline_id):
     req = urllib.request.Request(
         BASE + f"/fragments/guardian/baseline/{baseline_id}/delete",
         data=b"",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Origin": BASE},
     )
     resp = op.open(req, timeout=15).read().decode("utf-8", "replace")
     _raise_if_baseline_action_failed(resp, "delete")

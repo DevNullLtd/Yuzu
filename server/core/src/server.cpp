@@ -102,6 +102,7 @@
 #include "app_perf_cohort_reader.hpp"
 #include "app_perf_group_reader.hpp"
 #include "app_perf_rollup.hpp"
+#include "dex_app_version_failures_owner.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
@@ -6980,6 +6981,8 @@ public:
                               "could not be created/opened)");
                 startup_failed_ = true;
             } else {
+                dex_app_version_failures_owner_ = std::make_unique<DexAppVersionFailuresOwner>(
+                    *pg_pool_, cfg_.guardian_event_retention_days);
                 legacy_sqlite_probe::warn_if_legacy_rows(
                     cfg_.db_dir() / "guaranteed-state.db", "GuaranteedStateStore",
                     {"guaranteed_state_rules", "guardian_meta", "guardian_agent_rule_status",
@@ -10667,6 +10670,7 @@ public:
         agent_service_.set_guaranteed_state_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_guaranteed_state_store(nullptr);
+        dex_app_version_failures_owner_.reset();
         guaranteed_state_store_.reset();
         // RbacStore (authorization substrate, ADR-0041) borrows pg_pool_ — drop
         // before the pool. Every HTTP/gRPC/MCP handler holding the raw pointer is
@@ -15726,6 +15730,12 @@ private:
             inline_sink, yuzu::server::approvals_fragment::Deps{
                              .auth_fn = auth_fn,
                              .perm_fn = perm_fn,
+                             .probe_perm_fn =
+                                 [perm_fn](const httplib::Request& req, const std::string& type,
+                                           const std::string& op) -> bool {
+                                     httplib::Response scratch;
+                                     return perm_fn(req, scratch, type, op);
+                                 },
                              .approval_manager = approval_manager_.get(),
                              .instruction_store = instruction_store_.get(),
                          });
@@ -17251,7 +17261,9 @@ private:
             [this](const std::string& scope, bool full_sync) -> int {
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
             },
-            &metrics_); // #4252 — platform-support-matrix-stale counter
+            &metrics_, // #4252 — platform-support-matrix-stale counter
+            step_up_fn); // Guard edit/delete twins: same MFA step-up as the REST PUT/DELETE
+        guardian_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
 
         // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
         // perf tags (validated through the SAME dex_perf_rules the Prometheus
@@ -17448,7 +17460,8 @@ private:
         // — mirrors DexApi's own FleetFn threading (dex_api, below).
         auto dex_perf_api = make_local_dex_perf_api(
             dex_perf_fn, app_perf_fleet_store_.get(), app_perf_daily_store_.get(),
-            app_perf_group_reader_.get(), mgmt_group_store_.get(), tag_store_.get());
+            app_perf_group_reader_.get(), mgmt_group_store_.get(), tag_store_.get(),
+            dex_app_version_failures_owner_.get());
         // The dashboard scope-selector's group list (id + name only). NO per-group
         // member count: that would be an N+1 get_members() over the store on every
         // render (UP-7); the selector needs names, not counts.
@@ -18623,6 +18636,11 @@ private:
         WorkflowRoutes::Deps wf_deps;
         wf_deps.auth_fn = auth_fn;
         wf_deps.perm_fn = perm_fn;
+        wf_deps.probe_perm_fn = [perm_fn](const httplib::Request& req, const std::string& type,
+                                          const std::string& op) -> bool {
+            httplib::Response scratch;
+            return perm_fn(req, scratch, type, op);
+        };
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software and DashboardRoutes above;
         // used only by the executions-drawer detail route.
@@ -21169,6 +21187,9 @@ private:
     std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
     std::unique_ptr<ScheduleRunner> schedule_runner_;   // borrows engine + stores (#1191)
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
+    /// Cross-schema read owner for the per-version crash and hang join (borrows
+    /// the pool; constructed with the same observation retention as the store).
+    std::unique_ptr<DexAppVersionFailuresOwner> dex_app_version_failures_owner_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
     // HA WS-6 CRL follow-ups (#4828-#4831): constructed once ca_store_, audit_store_ AND

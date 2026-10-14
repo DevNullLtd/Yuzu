@@ -98,6 +98,17 @@
   },
   {
     "method": "POST",
+    "path": "/fragments/guardian/guard/{param}/delete",
+    "capability_id": "post.fragments-guardian-guard-param-delete",
+    "rest_v1_twin": {
+      "method": "DELETE",
+      "path": "/api/v1/guaranteed-state/rules/{param}"
+    },
+    "mcp_twin": "delete_guardian_rule",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
     "path": "/fragments/guardian/guard/{param}/enabled",
     "capability_id": "post.fragments-guardian-guard-param-enabled",
     "rest_v1_twin": null,
@@ -113,6 +124,17 @@
       "path": "/api/v1/guaranteed-state/rules/{rule_id}/status"
     },
     "mcp_twin": "get_guardian_rule_status",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/guardian/guard/{param}/update",
+    "capability_id": "post.fragments-guardian-guard-param-update",
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/guaranteed-state/rules/{param}"
+    },
+    "mcp_twin": "update_guardian_rule",
     "status": "twinned"
   },
   {

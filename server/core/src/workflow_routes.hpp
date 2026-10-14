@@ -52,6 +52,8 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
+    using ProbePermFn = std::function<bool(const httplib::Request&, const std::string& securable_type,
+                                           const std::string& operation)>;
     using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
@@ -147,6 +149,12 @@ public:
         yuzu::server::detail::StreamBudget* stream_budget{nullptr};
         AuthFn auth_fn;
         PermFn perm_fn;
+        /// Side-effect-free permission probe for RENDERING decisions only (never a gate):
+        /// `perm_fn` against a throwaway Response (the gate still writes one
+        /// `auth.permission_required` audit row per probe for a caller without the grant).
+        /// Routes keep gating with perm_fn / fleet_read_fn; the probe only decides whether to
+        /// render a control. Unwired = cannot decide: the control is not rendered.
+        ProbePermFn probe_perm_fn;
         /// #1712 / #3290 Phase 2 — see FleetReadFn's doc comment above.
         /// Consumed by the executions-drawer detail route
         /// (/fragments/executions/{id}/detail), the executions LIST

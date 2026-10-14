@@ -94,6 +94,15 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                 view.truncated = listed->truncated;
                 view.status_filter = status;
                 view.now = static_cast<int64_t>(std::time(nullptr));
+                // One probe per render, and only when some pending row is not the caller's
+                // own (self-review is refused server-side whatever the grant). Never per row.
+                const bool decidable_row = std::any_of(
+                    listed->approvals.begin(), listed->approvals.end(), [&](const auto& a) {
+                        return a.status == "pending" &&
+                               (session->username.empty() || a.submitted_by != session->username);
+                    });
+                view.can_decide = decidable_row && deps.probe_perm_fn &&
+                                  deps.probe_perm_fn(req, "Approval", "Approve");
                 view.rows.reserve(listed->approvals.size());
                 for (const auto& a : listed->approvals) {
                     operate_pages::ApprovalRowView row;
@@ -151,18 +160,22 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             html += "<button class=\"btn btn-primary btn-sm\" "
                                     "hx-post=\"/api/approvals/" +
                                     a.id +
-                                    "/approve\" hx-target=\"#tab-approvals\" "
-                                    "hx-swap=\"innerHTML\">Approve</button>"
+                                    "/approve\" hx-swap=\"none\">Approve</button>"
                                     " <button class=\"btn btn-danger btn-sm\" "
                                     "hx-post=\"/api/approvals/" +
                                     a.id +
-                                    "/reject\" hx-target=\"#tab-approvals\" "
-                                    "hx-swap=\"innerHTML\">Reject</button>";
+                                    "/reject\" hx-swap=\"none\">Reject</button>";
                         }
                     }
                     html += "</td></tr>";
                 }
                 html += "</tbody></table></div></section>";
+                // The decision POSTs answer JSON, which must not be swapped into the tab
+                // (it replaced the table with raw JSON). The success HX-Trigger
+                // `refreshApprovals` re-fetches this fragment through this listener.
+                html += "<span hidden hx-get=\"/fragments/approvals\" "
+                        "hx-trigger=\"refreshApprovals from:body\" "
+                        "hx-target=\"#tab-approvals\" hx-swap=\"innerHTML\"></span>";
             }
             res.set_content(html, "text/html; charset=utf-8");
         });

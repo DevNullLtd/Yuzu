@@ -21,6 +21,7 @@ namespace {
 
 constexpr NavItem kInstructionsSub[] = {
     {.key = "executions", .label = "Executions", .href = "/executions"},
+    {.key = "workflows", .label = "Workflows", .href = "/workflows"},
     {.key = "approvals", .label = "Approvals", .href = "/approvals", .badge = true},
 };
 constexpr NavItem kSoftwareSub[] = {
@@ -350,6 +351,7 @@ constexpr std::string_view kShellScript = R"JS(<script>
     }).catch(function(){badge.hidden=true;}).then(function(){binflight=false;});
   }
   if(badge){document.addEventListener('visibilitychange',pollBadge);pollBadge();setInterval(pollBadge,30000);}
+  document.addEventListener('yuzu:approvals-changed',pollBadge);
 })();
 </script>)JS";
 
