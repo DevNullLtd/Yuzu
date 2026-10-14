@@ -6145,7 +6145,9 @@ HTML fragment of workflow run rows for the Workflows page: each workflow's newes
 (`latest_per_workflow=true&limit=500`) or one workflow's recent runs (`workflow_id=<id>&limit=10`).
 The sole gate is the fleet-read gate for `Workflow:Read`, the one `GET /api/v1/workflow-executions`
 uses; its scope narrows the rows in the store before ordering and limiting, so a confined caller's
-rows are exactly the runs with a device in its scope. Only `workflow_id`, `status`, `limit` and
+rows are exactly the runs with a device in its scope. A `latest_per_workflow` list cut off by the
+`limit` is marked `data-truncated="1"`, and the page then shows Unknown rather than Not run for a
+workflow the list did not include. Only `workflow_id`, `status`, `limit` and
 `latest_per_workflow` are accepted; any other parameter, a repeated one or an out-of-vocabulary value
 answers `200` with `data-invalid="true"` and a fixed note (a mistyped filter never reads as all
 runs). A refused caller gets `200` with `data-denied="true"`, a failed read `200` with
