@@ -396,7 +396,6 @@ const char* const kDexCss = R"CSS(
 .dx-ctl:hover{border-color:var(--mut)}
 .dx-ctl::placeholder{color:var(--faint)}
 input.dx-ctl{min-width:220px}
-.dx-mono{font-family:var(--mds-font-family-mono);font-size:12.5px}
 .dx-code{color:var(--mut);font-family:var(--mds-font-family-mono);font-size:14px;font-weight:400}
 .dx-sub{color:var(--mut);font-size:14px;font-weight:400}
 .dx-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr));gap:22px;align-items:start}
@@ -1224,18 +1223,18 @@ std::string dex_sparkline(const std::vector<int64_t>& series, const char* color)
     return "<svg width=\"130\" height=\"28\" viewBox=\"0 0 130 28\"><polyline points=\"" + pts +
            "\" fill=\"none\" stroke=\"" + color + "\" stroke-width=\"1.5\"/></svg>";
 }
-const char* dex_heat_class(double t) { // t in 0..1, within-row scaled -> `.gp-heat i.hN` step
+const char* dex_heat_class(double t) { // t in 0..1, within-row scaled -> `.gp-heat i.hN` step token
     if (t <= 0.0)
         return "";
     if (t < 0.2)
-        return " class=\"h1\"";
+        return "h1";
     if (t < 0.4)
-        return " class=\"h2\"";
+        return "h2";
     if (t < 0.6)
-        return " class=\"h3\"";
+        return "h3";
     if (t < 0.8)
-        return " class=\"h4\"";
-    return " class=\"h5\"";
+        return "h4";
+    return "h5";
 }
 
 // DEX Trends — cross-OS comparison + per-family small-multiples + activity heatmap
@@ -1358,7 +1357,8 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
         h += "<div class=\"hrow\"><span class=\"hlbl\">" + esc(g.name) + "</span>";
         for (int d = day0; d < static_cast<int>(days.size()); ++d) {
             const double t = static_cast<double>(cell[fi][d]) / static_cast<double>(rowmax);
-            h += "<i" + std::string(dex_heat_class(cell[fi][d] > 0 ? t : 0.0)) + " title=\"" +
+            const std::string step = dex_heat_class(cell[fi][d] > 0 ? t : 0.0);
+            h += "<i" + (step.empty() ? std::string() : " class=\"" + step + "\"") + " title=\"" +
                  esc(days[d]) + ": " + num(cell[fi][d]) + "\"></i>";
         }
         h += "</div>";
@@ -1540,9 +1540,9 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
             h += "<div class=\"gp-note\">" + num(unscored) +
                  " device(s) could not be scored (DEX store read degraded).</div>";
         if (!ds.empty()) {
-            auto seg = [](int n, const char* tone) {
+            auto seg = [](int n, const char* cls) {
                 return n <= 0 ? std::string()
-                              : "<span class=\"" + std::string(tone) + "\" style=\"flex:" +
+                              : "<span class=\"" + std::string(cls) + "\" style=\"flex:" +
                                     std::to_string(n) + "\">" + std::to_string(n) + "</span>";
             };
             h += "<div class=\"dx-seg\">" + seg(great, "ok") + seg(fair, "warn") +
@@ -2038,7 +2038,7 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
     // facts we hold (Option-D enrichment later adds the event's own ErrorCode /
     // operation / app into the same panel).
     std::string h = "<div class=\"gp-sech\">" + dex_signal_label(r.obs_type) +
-                    " <span class=\"gp-mute dx-mono\">" + esc(r.obs_type) + "</span></div>";
+                    " <span class=\"gp-mute mono\">" + esc(r.obs_type) + "</span></div>";
     h += "<div class=\"gp-spec\">";
     auto row = [&](const char* k, const std::string& v) {
         h += "<span class=\"k\">" + std::string(k) + "</span><code>" +

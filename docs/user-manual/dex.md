@@ -8,7 +8,7 @@ picture of what the workforce actually experiences on their machines. It does
 **not** author or enforce anything (that is [Guardian](guaranteed-state.md)); it
 only reads and aggregates.
 
-It is reached from the **DEX** link in the dashboard nav, or directly at
+It is reached from the **DEX** entry in the sidebar, or directly at
 `/dex`. Access requires the **`GuaranteedState:Read`** permission.
 
 ## The eight views

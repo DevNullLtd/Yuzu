@@ -156,6 +156,8 @@ std::string inv_style() {
   .inv-resbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
   .inv-count{font-size:13px;color:var(--mut)}.inv-count b{color:var(--ink);font-weight:600}
   .inv-exports{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;color:var(--mut)}
+  .inv-exports .inv-exp-gap{margin-left:.5rem}
+  .inv-degrade .inv-btn{margin-left:.6rem}
   .inv-btn{display:inline-flex;align-items:center;height:var(--ctl);padding:0 14px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--raise);color:var(--ink);font:inherit;font-weight:500;white-space:nowrap;text-decoration:none;cursor:pointer}
   .inv-btn:hover{border-color:var(--mut);background:var(--surface2)}
   .inv-btn:disabled{opacity:.5;cursor:not-allowed}
@@ -321,7 +323,7 @@ std::string sw_degrade(const SoftwarePageFilters& f) {
     return std::string("<div class=\"inv-degrade\"><b>Inventory store unavailable.</b> The "
                        "installed-software store did not answer, so nothing is shown rather "
                        "than an empty list that could be mistaken for \"no software\". <button "
-                       "class=\"inv-btn\" data-act=\"retry\" style=\"margin-left:.6rem\" hx-get=\"") +
+                       "class=\"inv-btn\" data-act=\"retry\" hx-get=\"") +
            esc(software_page_url(f, SoftwarePageMode::Full, true)) + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Retry</button></div>";
 }
 
@@ -651,7 +653,7 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
          "</div><div class=\"inv-exports\"><span>Export installs</span>" +
          dl("json", "software-installs.json", "/api/v1/inventory/software?" + export_kv("json", false), tip, "JSON") +
          dl("csv", "software-installs.csv", "/api/v1/inventory/software?" + export_kv("csv", false), tip, "CSV") +
-         "<span style=\"margin-left:.5rem\">Export titles</span>" +
+         "<span class=\"inv-exp-gap\">Export titles</span>" +
          dl("titles", "software-titles.csv", "/api/v1/inventory/software/catalogue?" + export_kv("csv", true),
             "one row per title with installs and versions", "CSV") +
          "</div></div>";

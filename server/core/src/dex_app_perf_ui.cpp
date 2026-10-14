@@ -507,7 +507,7 @@ std::string render_dex_app_perf_version_devices(const std::vector<AppPerfVersion
                     "<thead><tr><th>Device</th><th>Last seen</th><th>CPU</th>"
                     "<th>Working set</th></tr></thead><tbody>";
     for (const auto& d : devices) {
-        h += "<tr><td class=\"dx-mono\">" + esc(d.agent_id) +
+        h += "<tr><td class=\"mono\">" + esc(d.agent_id) +
              "</td><td>" + ymd(d.last_day) + "</td><td>" + fmt_pct(d.cpu_avg) + "</td><td>" +
              fmt_bytes(static_cast<double>(d.ws_avg_bytes)) + "</td></tr>";
     }
