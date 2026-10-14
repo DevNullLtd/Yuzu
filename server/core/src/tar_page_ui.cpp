@@ -339,8 +339,7 @@ R"HTM(</head>
       <h1>TAR</h1>
       <p class="tar-subtitle">
         Timeline Activity Record: what ran, what it connected to, and what
-        changed, recorded on each device. Disable a
-        collector to freeze its data for analysis; re-enable when finished.
+        changed, recorded on each device.
       </p>
     </div>
 
