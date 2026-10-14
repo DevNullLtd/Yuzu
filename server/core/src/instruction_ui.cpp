@@ -595,14 +595,6 @@ function formToYaml() {
     }
     switchEditorMode('yaml', document.querySelectorAll('.editor-tab')[1]);
 }
-/* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-document.addEventListener('keydown', function(e) {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-    e.preventDefault();
-    window.location.href = '/?palette=1';
-  }
-});
-
 /* ── Executions drawer toggle ─────────────────────────────────────────────
    Modeled on dashboard_ui.cpp's toggleDetail. Single-drawer-open invariant:
    clicking a row collapses any other open drawer first so the operator

@@ -203,7 +203,10 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # needs attention) over the existing hardware roster, approvals count,
 # executions and fleet-compliance reads; a UI fragment, no machine twin owed (ADR-1005).
 # Measured with the checker at 200 (199 + 1), not hand-picked; whoever lands second re-reads it.
-BASELINE_UNTWINNED = 200
+# Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
+# is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
+# which counts as untwinned by design, so the count rises 199 -> 200.
+BASELINE_UNTWINNED = 201
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

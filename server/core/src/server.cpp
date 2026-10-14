@@ -15727,7 +15727,14 @@ private:
             inline_sink, yuzu::server::approvals_fragment::Deps{
                              .auth_fn = auth_fn,
                              .perm_fn = perm_fn,
+                             .probe_perm_fn =
+                                 [perm_fn](const httplib::Request& req, const std::string& type,
+                                           const std::string& op) -> bool {
+                                     httplib::Response scratch;
+                                     return perm_fn(req, scratch, type, op);
+                                 },
                              .approval_manager = approval_manager_.get(),
+                             .instruction_store = instruction_store_.get(),
                          });
 
         // NOTE: the 3-route MCP-disabled stub module
@@ -18717,6 +18724,11 @@ private:
         WorkflowRoutes::Deps wf_deps;
         wf_deps.auth_fn = auth_fn;
         wf_deps.perm_fn = perm_fn;
+        wf_deps.probe_perm_fn = [perm_fn](const httplib::Request& req, const std::string& type,
+                                          const std::string& op) -> bool {
+            httplib::Response scratch;
+            return perm_fn(req, scratch, type, op);
+        };
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software and DashboardRoutes above;
         // used only by the executions-drawer detail route.

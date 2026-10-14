@@ -117,15 +117,13 @@ public:
     /// fail-closed. The seam itself is a store-free DATA PROVIDER only; auth,
     /// confinement and audit live in the consumer (route/MCP handler), not
     /// here.
-    /// NOTE: two PRE-EXISTING consumers do not yet fully satisfy this contract
-    /// and are tracked separately (kept byte-identical by this seam, NOT
+    /// NOTE: one PRE-EXISTING consumer does not yet fully satisfy this contract
+    /// and is tracked separately (kept byte-identical by this seam, NOT
     /// introduced here): the legacy `GET /api/compliance/{id}` route serves
-    /// unfiltered rows on `perm_fn_` alone (#4333), and the dashboard
-    /// compliance fragments have no RBAC gate AND emit no audit (#4042) — the
-    /// per-channel description above is the contract a CONFORMING consumer
-    /// follows; these fragments are the non-conforming exception. The MUST above is the
-    /// contract every conforming/new consumer meets and the target those two
-    /// are being brought to.
+    /// unfiltered rows on `perm_fn_` alone (#4333). The dashboard
+    /// `/fragments/compliance/{id}` fragment conforms since #4042 (fleet-read
+    /// gate, confined tally, `compliance.agent_statuses.view` audit with the
+    /// dashboard's set-and-proceed posture).
     [[nodiscard]] virtual std::expected<std::vector<PolicyAgentStatus>, PolicyReadError>
     policy_agent_statuses(const std::string& policy_id) const = 0;
 };
