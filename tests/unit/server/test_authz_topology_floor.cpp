@@ -754,3 +754,82 @@ TEST_CASE("AuditLog:Read floor: the four REST audit surfaces refuse a non-admin 
     }
     CHECK(floored.value() == static_cast<double>(surfaces.size())); // admin never bumps it
 }
+
+// ── 14. The floor runs BEFORE the audit filter validation (#5771 x filter parity) ──
+//
+// The audit filters and paging bounds (since/until/target_*/offset) answer 400 on
+// bad input. A non-admin on a default (RBAC-off) install must be refused 403 first,
+// valid filters or not: a 400/200 from the validation layer would tell a caller
+// that has no AuditLog:Read about the query surface and its limits. The admin
+// control proves each malformed query really is a 400 when the gate admits it.
+
+TEST_CASE("AuditLog:Read floor: a non-admin is refused 403 on filtered and malformed audit "
+          "queries, ahead of the 400 validation",
+          "[pg][authz][floor][audit]") {
+    FloorFixture fix;
+    REQUIRE_FALSE(fix.rbac_store.is_rbac_enabled());
+
+    auto auth_fn = [&fix](const httplib::Request& req, httplib::Response& res) {
+        return fix.ar->require_auth(req, res);
+    };
+    auto perm_fn = [&fix](const httplib::Request& req, httplib::Response& res,
+                          const std::string& securable, const std::string& operation) {
+        return fix.ar->require_permission(req, res, securable, operation);
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+
+    dashboard_api::Deps deps;
+    deps.auth_fn = auth_fn;
+    deps.perm_fn = perm_fn;
+    deps.visible_agents_json_fn = [](const std::string&) { return nlohmann::json::array(); };
+    deps.rbac_store = &fix.rbac_store;
+    deps.audit_store = fix.audit_store.get();
+    dashboard_api::register_dashboard_api_routes(sink, std::move(deps));
+
+    RestApiV1 api;
+    api.register_routes(
+        sink, auth_fn, perm_fn,
+        [](const httplib::Request&, const std::string&, const std::string&, const std::string&,
+           const std::string&, const std::string&) { return true; },
+        &fix.rbac_store, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
+        /*quarantine_store=*/nullptr, /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+        /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
+        /*tag_store=*/nullptr, /*audit_store=*/fix.audit_store.get());
+
+    const std::unordered_map<std::string, std::string> user_headers{
+        {"Cookie", fix.session_request("uma", auth::Role::user).get_header_value("Cookie")}};
+    const std::unordered_map<std::string, std::string> admin_headers{
+        {"Cookie", fix.session_request("ada", auth::Role::admin).get_header_value("Cookie")}};
+    REQUIRE_FALSE(user_headers.at("Cookie").empty());
+    REQUIRE_FALSE(admin_headers.at("Cookie").empty());
+
+    // Each query is a 400 for an admitted caller (bad paging bound, unparseable bound,
+    // inverted window, target_id without target_type) except the last, a valid filter.
+    const std::vector<std::pair<std::string, int>> queries = {
+        {"/api/audit?offset=10001", 400},
+        {"/api/audit?since=abc", 400},
+        {"/api/v1/audit?offset=10001", 400},
+        {"/api/v1/audit?since=9&until=3", 400},
+        {"/api/v1/audit?target_id=x", 400},
+        {"/api/v1/audit?target_type=Tag&target_id=t1&since=1&until=9&offset=0", 200},
+    };
+
+    for (const auto& [path, admin_status] : queries) {
+        INFO("admin: " << path);
+        auto res = sink.Get(path, admin_headers);
+        REQUIRE(res);
+        CHECK(res->status == admin_status);
+    }
+    auto& floored = fix.metrics.counter("yuzu_auth_topology_floor_denied_total",
+                                        {{"permission", "AuditLog:Read"}});
+    CHECK(floored.value() == 0.0); // the admin control never bumps the floor counter
+
+    for (const auto& [path, admin_status] : queries) {
+        INFO("non-admin: " << path << " (admin status " << admin_status << ")");
+        auto res = sink.Get(path, user_headers);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(floored.value() == static_cast<double>(queries.size()));
+}

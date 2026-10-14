@@ -17599,6 +17599,47 @@ TEST_CASE("MCP audit surfaces gate on exactly AuditLog:Read (#5771: the pair the
     }
 }
 
+TEST_CASE("MCP query_audit_log: the AuditLog:Read gate runs ahead of the filter and offset "
+          "validation (#5771 x filter parity)",
+          "[pg][mcp][integration][audit]") {
+    // A caller refused AuditLog:Read must get the 403, never the -32602 that a bad
+    // offset / filter type would earn: validation answers would leak the query
+    // surface and its bounds to a principal with no read right on the log.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer denied;
+    denied.audit_store_for_test = &store;
+    denied.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "AuditLog" && op == "Read");
+    };
+    denied.start("readonly");
+    McpTestServer allowed;
+    allowed.audit_store_for_test = &store;
+    allowed.start("readonly");
+
+    for (const std::string bad :
+         {R"({"offset":10001})", R"({"offset":"5"})", R"({"target_id":"id-a"})",
+          R"({"principal":42})", R"({"since":9,"until":3})", R"({"target_type":"a\u0000b"})"}) {
+        INFO(bad);
+        const std::string body =
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":911,)"
+                        R"("params":{"name":"query_audit_log","arguments":)") +
+            bad + "}}";
+        auto refused = denied.call(body);
+        REQUIRE(refused);
+        CHECK(refused->status == 403);
+        // Control: the same arguments are an invalid-params error once the gate admits.
+        auto admitted = allowed.call(body);
+        REQUIRE(admitted);
+        auto j = nlohmann::json::parse(admitted->body);
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["code"] == -32602);
+    }
+}
+
 TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution_id loop",
           "[pg][mcp][integration][response][fanout][execute]") {
     // End-to-end: dispatch via execute_instruction (real ExecutionTracker mints
