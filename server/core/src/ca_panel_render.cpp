@@ -29,8 +29,6 @@ std::string esc(std::string_view s) {
     return html_escape(std::string(s));
 }
 
-const char* kFixedHeading = "<div class=\"hd\"><h2>Certificate authority</h2></div>";
-
 std::string note_panel(const char* heading, const std::string& inner_html) {
     return "<section class=\"panel\"><div class=\"hd\"><h2>" + std::string(heading) +
            "</h2></div><div class=\"pb\">" + inner_html + "</div></section>";
@@ -59,7 +57,7 @@ std::string pill(const char* cls, const std::string& text, const std::string& ti
 std::string ca_panel(const Model& m) {
     const auto& r = m.root;
     std::string h = "<section class=\"panel\" id=\"ca-panel\">";
-    h += kFixedHeading;
+    h += "<div class=\"hd\"><h2>Certificate authority</h2></div>";
     h += "<div class=\"kvl\">";
     h += "<div><span>Trust mode</span><b>" +
          std::string(r.subordinate ? "Subordinate (enterprise-rooted)"
