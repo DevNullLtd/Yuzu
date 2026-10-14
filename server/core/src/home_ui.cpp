@@ -231,12 +231,15 @@ std::string render_landing(const LandingView& v) {
     out.reserve(24000);
     out += kHead;
     out += R"(<span class="srv">)";
-    if (!host.empty()) {
-        out += host;
-        out += " &middot; ";
+    // The page is reachable without a session, so the running version (what an
+    // attacker looks up CVEs against) is shown to a signed-in user only.
+    out += host;
+    if (v.who) {
+        if (!host.empty())
+            out += " &middot; ";
+        out += "version ";
+        out += html_escape(std::string(v.version));
     }
-    out += "version ";
-    out += html_escape(std::string(v.version));
     out += "</span></header>";
     out += kHeadline;
     out += R"(<p class="lede">)";

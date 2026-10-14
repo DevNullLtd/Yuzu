@@ -73,9 +73,10 @@ TEST_CASE("GET /home signed out: the sign-in form, no session needed, never cach
     CHECK(has(r->body, "id=\"signin\" aria-label=\"Sign in\" data-next=\"\">"));
     CHECK_FALSE(has(r->body, "aria-label=\"Signed in\""));
     CHECK_FALSE(has(r->body, "signin-notice"));
-    // The slim bar carries the running version and a server name, not invented values.
-    CHECK(has(r->body, "version "));
-    CHECK(has(r->body, "&middot;"));
+    // The slim bar carries the server name and, to a signed-out visitor, no version.
+    CHECK(has(r->body, "<span class=\"srv\">"));
+    CHECK_FALSE(has(r->body, "version "));
+    CHECK_FALSE(has(r->body, "&middot;"));
     // No single sign-on without a provider; no two-factor note under the default enforcement.
     CHECK_FALSE(has(r->body, "single sign-on"));
     CHECK_FALSE(has(r->body, "two-factor"));

@@ -140,13 +140,21 @@ TEST_CASE("landing: no shell, no header-bar controls, no bell, no fragment loads
     }
 }
 
-TEST_CASE("landing: slim bar shows the server name and version it was given", "[home][ui]") {
-    const auto html = home_ui::render_landing(signed_out());
-    CHECK_THAT(html, ContainsSubstring("<span class=\"srv\">yuzu-01 &middot; version 0.14.1</span>"));
-    // With no server name: version only, nothing invented.
-    const auto bare = home_ui::render_landing({.version = "0.14.1"});
-    CHECK_THAT(bare, ContainsSubstring("<span class=\"srv\">version 0.14.1</span>"));
-    CHECK(count_of(bare, "&middot;") == 0);
+TEST_CASE("landing: the slim bar shows the version only to a signed-in user", "[home][ui]") {
+    // Signed out the page is public: server name only, the version string appears nowhere.
+    const auto out = home_ui::render_landing(signed_out());
+    CHECK_THAT(out, ContainsSubstring("<span class=\"srv\">yuzu-01</span>"));
+    CHECK(count_of(out, "0.14.1") == 0);
+    CHECK(count_of(out, "version ") == 0);
+    // Signed in: name and version.
+    const auto in = home_ui::render_landing(signed_in());
+    CHECK_THAT(in, ContainsSubstring("<span class=\"srv\">yuzu-01 &middot; version 0.14.1</span>"));
+    // With no server name: version only (signed in), nothing invented.
+    auto bare = signed_in();
+    bare.server_name = {};
+    const auto bare_html = home_ui::render_landing(bare);
+    CHECK_THAT(bare_html, ContainsSubstring("<span class=\"srv\">version 0.14.1</span>"));
+    CHECK(count_of(bare_html, "&middot;") == 0);
 }
 
 TEST_CASE("landing signed out: the real sign-in form, labelled fields, no SSO or two-factor note by default",

@@ -3,7 +3,7 @@
 /// @file home_ui.hpp
 /// The landing and sign-in page (`GET /home`; `GET /login` redirects here). No
 /// shell: no sidebar, no header bar, no bell — there may be no session yet. Top
-/// to bottom: a slim bar (Yuzu mark; server name and version), the hero (rule,
+/// to bottom: a slim bar (Yuzu mark; server name, and the version once signed in), the hero (rule,
 /// headline, one sentence, the sign-in panel), then the fifteen screens as
 /// colour-coded tiles in five families. The page fetches nothing: the tiles say
 /// what each area does, not live figures.
