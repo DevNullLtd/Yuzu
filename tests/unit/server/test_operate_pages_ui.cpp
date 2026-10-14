@@ -270,6 +270,12 @@ TEST_CASE("operate pages: the Workflows template carries every hook the controll
     CHECK(has(js, "if ($('.ops-list', wfHost)) loadWorkflows();"));
     CHECK(has(js, "if ($('.ops-list', scHost)) loadSchedules();"));
     CHECK_FALSE(has(js, "setInterval("));
+    // A run detail still in flight must not land on a newly selected workflow: selecting (or
+    // losing the selection) invalidates the detail token before the new panel is resolved.
+    // A cut-off latest-per-workflow list never reads as "Not run".
+    CHECK(has(js, "(cut ? 'Unknown'"));
+    CHECK(has(js, "dseq++; // a detail still in flight belongs to the workflow just left"));
+    CHECK(has(js, "if (!block) { dseq++; selectedId = ''; markSelected(); return false; }"));
 }
 
 TEST_CASE("operate pages: Workflows copy is exact and read-only", "[ui][operate][pages]") {

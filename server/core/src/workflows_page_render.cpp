@@ -160,7 +160,8 @@ std::string render_runs_list(const RunListView& v) {
     out.reserve(256 + v.rows.size() * 520);
     out += std::string("<div class=\"ops-list\" data-state=\"") + (v.rows.empty() ? "empty" : "ok") +
            "\" data-count=\"" + std::to_string(v.rows.size()) + "\" data-confined=\"" +
-           (v.confined ? "1" : "0") + "\">";
+           (v.confined ? "1" : "0") + "\" data-truncated=\"" + (v.truncated ? "1" : "0") +
+           "\">";
     if (v.rows.empty()) {
         out += "<div class=\"empty-state\">" +
                esc(v.confined ? kRunsConfinedEmptyNote : kRunsEmptyNote) + "</div></div>";

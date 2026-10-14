@@ -266,6 +266,9 @@ TEST_CASE("runs render: the list carries ids for the controller and escapes name
     CHECK(html.find("Workflow deleted") != std::string::npos);
     CHECK(html.find("<img") == std::string::npos);
     CHECK(html.find("1m 12s") != std::string::npos);
+    CHECK(html.find("data-truncated=\"0\"") != std::string::npos);
+    v.truncated = true;
+    CHECK(render_runs_list(v).find("data-truncated=\"1\"") != std::string::npos);
 }
 
 TEST_CASE("runs render: step detail comes from known shapes only",

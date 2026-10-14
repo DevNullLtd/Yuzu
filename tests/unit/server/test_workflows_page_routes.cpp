@@ -463,6 +463,15 @@ TEST_CASE("/fragments/workflow-runs: fleet_read_fn is the sole gate and its scop
     CHECK(fx.audit_actions.empty());
 }
 
+TEST_CASE("/fragments/workflow-runs: a cut-off latest-per-workflow list says so",
+          "[workflow][workflows][page][runs]") {
+    Fx fx;
+    fx.runs = WorkflowExecutionPage{{run_row("r1", "wf-1")}, std::nullopt, true};
+    auto res = fx.get("/fragments/workflow-runs?latest_per_workflow=true&limit=500");
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-truncated=\"1\""));
+}
+
 TEST_CASE("/fragments/workflow-runs: a refusal is a 200 note and the store is not read",
           "[workflow][workflows][page][runs][security]") {
     Fx fx;

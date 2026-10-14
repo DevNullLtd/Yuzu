@@ -490,7 +490,7 @@
 
     function showSteps(id) {
       var block = id ? stepsFor(id) : null;
-      if (!block) { selectedId = ''; markSelected(); return false; }
+      if (!block) { dseq++; selectedId = ''; markSelected(); return false; }
       selectedId = id;
       markSelected();
       stepsTitle.textContent = (block.getAttribute('data-name') || id) + ': steps';
@@ -504,6 +504,7 @@
       if (!runsDone) return;
       var list = $('.ops-list', runsStore);
       var confined = !!list && list.getAttribute('data-confined') === '1';
+      var cut = !!list && list.getAttribute('data-truncated') === '1';
       $$('tr.row', wfHost).forEach(function (row) {
         var wid = row.getAttribute('data-workflow-id');
         var src = null;
@@ -521,7 +522,9 @@
           return;
         }
         when.removeAttribute('data-epoch-ms');
-        when.textContent = !list ? 'Unavailable' : (confined ? 'None visible' : 'Not run');
+        // A cut-off runs list cannot say a workflow has no run: never a false 'Not run'.
+        when.textContent = !list ? 'Unavailable'
+          : (cut ? 'Unknown' : (confined ? 'None visible' : 'Not run'));
         res.textContent = '-';
       });
       renderLocalTimes(wfHost);
@@ -555,6 +558,10 @@
       $$('tr.row', runsStore).forEach(function (r) {
         if (r.getAttribute('data-workflow-id') === selectedId) src = r;
       });
+      if (!src && list.getAttribute('data-truncated') === '1') {
+        setNote(runBody, 'The run list was cut off, so this workflow\'s latest run is not shown.');
+        return;
+      }
       if (!src) {
         setNote(runBody, list.getAttribute('data-confined') === '1'
           ? 'No runs include devices in your scope.' : 'No runs yet.');
@@ -592,6 +599,7 @@
     function select(row) {
       var id = row.getAttribute('data-workflow-id') || '';
       if (!id) return;
+      dseq++; // a detail still in flight belongs to the workflow just left
       showSteps(id);
       writeQs(function (p) { p.set('wf', id); });
       panelFor = '';

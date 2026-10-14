@@ -1780,6 +1780,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         operate_pages::RunListView view;
         view.confined = gate.scope.has_value();
+        view.truncated = page->truncated_by_cap;
         view.rows.reserve(page->rows.size());
         for (const auto& r : page->rows) {
             operate_pages::RunRowView row;

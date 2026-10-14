@@ -124,6 +124,7 @@ struct RunRowView {
 struct RunListView {
     std::vector<RunRowView> rows;
     bool confined{false}; ///< the caller's reads are narrowed to its device scope
+    bool truncated{false}; ///< latest_per_workflow matched more workflows than the cap allowed
 };
 
 [[nodiscard]] std::string render_runs_list(const RunListView& v);
