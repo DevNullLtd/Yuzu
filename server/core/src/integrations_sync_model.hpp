@@ -48,13 +48,13 @@ mapping_audit_chunks(const std::vector<MappingChange>& changes, std::string_view
         in_chunk = 0;
     };
     for (const auto& ch : changes) {
-        const std::string piece = std::string(in_chunk ? ", " : " ") + clean(ch.group_id) + "=" +
-                                  (ch.role_name.empty() ? std::string("(removed)")
-                                                         : clean(ch.role_name));
-        // 24 bytes of headroom for the "<n> mappings <verb>:" prefix.
-        if (in_chunk && body.size() + piece.size() + 24 + verb.size() > cap)
+        const std::string pair = clean(ch.group_id) + "=" +
+                                 (ch.role_name.empty() ? std::string("(removed)")
+                                                        : clean(ch.role_name));
+        // 24 bytes of headroom for the "<n> mappings <verb>:" prefix, 2 for the separator.
+        if (in_chunk && body.size() + pair.size() + 2 + 24 + verb.size() > cap)
             flush();
-        body += piece;
+        body += (in_chunk ? ", " : " ") + pair;
         ++in_chunk;
     }
     if (in_chunk || out.empty())

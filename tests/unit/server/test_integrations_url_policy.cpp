@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cctype>
 #include <map>
 #include <string>
 
@@ -125,6 +126,10 @@ TEST_CASE("mapping audit detail: a long list is split, never truncated", "[integ
     std::size_t pairs = 0;
     bool found = false;
     for (const auto& c : chunks) {
+        // Every row has the documented shape, continuation rows included.
+        CHECK(c.find(" mappings updated: ") != std::string::npos);
+        CHECK(c.find(":,") == std::string::npos);
+        CHECK(std::isdigit(static_cast<unsigned char>(c.front())));
         CHECK(c.size() <= 1000);
         CHECK(c.find("...") == std::string::npos);
         found = found || c.find("the-real-group=Administrator") != std::string::npos;
