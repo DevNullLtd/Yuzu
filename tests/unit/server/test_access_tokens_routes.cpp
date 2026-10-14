@@ -32,6 +32,10 @@
 #include <string>
 #include <vector>
 
+namespace yuzu::server {
+extern const std::string kYuzuCss;
+} // namespace yuzu::server
+
 using Catch::Matchers::ContainsSubstring;
 using namespace yuzu::server;
 
@@ -537,4 +541,28 @@ TEST_CASE("tokens routes: server.cpp binds the real admin gate, rbac view and ch
     CHECK_THAT(blk, ContainsSubstring("get_principal_roles_checked(\"engine\", id)"));
     CHECK_THAT(blk, ContainsSubstring(".perm_fn = perm_fn"));
     CHECK_THAT(text.substr(end, 1500), ContainsSubstring("committed_revoke_detail(*events)"));
+}
+
+// The fragments are swapped into #tokens-body / #principals-body, so their header and body are
+// not direct children of .panel and the `.panel > .hd` / `.panel > .pb` rules never match them.
+// Without these rules the panel header stacks (title, owner label, toggle in a column).
+TEST_CASE("tokens page: the header and body rules reach the swapped fragment bodies",
+          "[access-tokens][css]") {
+    const auto& css = yuzu::server::kYuzuCss;
+    const auto at = css.find("/* -- Tokens page");
+    REQUIRE(at != std::string::npos);
+    const auto end = css.find("/* -- end Tokens page", at);
+    REQUIRE(end != std::string::npos);
+    const std::string block = css.substr(at, end - at);
+    for (const char* sel : {":is(#tokens-body, #principals-body) > .hd {",
+                            ":is(#tokens-body, #principals-body) > .hd h2 {",
+                            ":is(#tokens-body, #principals-body) > .hd .sub {",
+                            ":is(#tokens-body, #principals-body) > .hd .end {",
+                            ":is(#tokens-body, #principals-body) > .pb {"})
+        CHECK_THAT(block, ContainsSubstring(sel));
+    // Both bodies the rules name exist in the page template.
+    CHECK_THAT(std::string(::kAccessTokensHtml),
+               ContainsSubstring("id=\"tokens-body\""));
+    CHECK_THAT(std::string(::kAccessTokensHtml),
+               ContainsSubstring("id=\"principals-body\""));
 }

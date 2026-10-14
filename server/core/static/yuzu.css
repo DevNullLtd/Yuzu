@@ -671,4 +671,12 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 /* -- Tokens page ------------------------------------------------------------------------ */
 .strip { margin: 12px 16px 0; }
 .strip:empty { display: none; }
+/* The token and principal fragments are swapped into a body div that sits between .panel and the
+   fragment's header and body, so the direct-child panel rules (.panel > .hd, .panel > .pb) do not
+   reach them; give those two bodies the same header and padding. */
+:is(#tokens-body, #principals-body) > .hd { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+:is(#tokens-body, #principals-body) > .hd h2 { font-size: 14px; font-weight: 600; }
+:is(#tokens-body, #principals-body) > .hd .sub { color: var(--mut); font-size: 13px; }
+:is(#tokens-body, #principals-body) > .hd .end { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+:is(#tokens-body, #principals-body) > .pb { padding: 12px 16px; }
 /* -- end Tokens page -------------------------------------------------------------------- */
