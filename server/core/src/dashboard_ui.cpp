@@ -331,13 +331,18 @@ constexpr char kDashCss2[] = R"HTM(
       border-top: 1px solid var(--line); font-size: 12px; color: var(--faint);
     }
   </style>
-  <style>
+)HTM";
+static_assert(sizeof(kDashCss2) < kPartCap, "kDashCss2 must stay under the MSVC raw-string cap: split it");
+
+// the shared Operate-extras style chunk and its two scripts (own part: the chunk's literal is
+// 2.4 KB and kDashCss2 is already 12 KB)
+constexpr char kDashHeadOx[] = R"HTM(  <style>
 )HTM" YUZU_OX_CSS R"HTM(  </style>
   <script src="/static/yuzu-dialog.js" defer></script>
   <script src="/static/yuzu-operate-extras.js" defer></script>
 </head>
 )HTM";
-static_assert(sizeof(kDashCss2) < kPartCap, "kDashCss2 must stay under the MSVC raw-string cap: split it");
+static_assert(sizeof(kDashHeadOx) < kPartCap, "kDashHeadOx must stay under the MSVC raw-string cap: split it");
 
 // shell, page header, scope bar (the kinds line follows at run time)
 constexpr char kDashBodyScope[] = R"HTM(<body data-page="dashboard" data-secret-params=")HTM" YUZU_OX_SECRET_PARAMS R"HTM(">
@@ -1502,7 +1507,7 @@ std::string scope_kinds_line() {
 
 // Composed once at static init; one owner string keeps the baked page's source alive.
 // NOLINTBEGIN(cert-err58-cpp)
-const std::string kDashboardTemplateStr = std::string(kDashHead) + kDashCss2 + kDashBodyScope +
+const std::string kDashboardTemplateStr = std::string(kDashHead) + kDashCss2 + kDashHeadOx + kDashBodyScope +
                                           scope_kinds_line() + kDashBodyConsole + kDashBodyRows +
                                           kDashOverlays + kDashJs1 + kDashJs2 + kDashJs3 + kDashJs4 +
                                           kDashJs5 + kDashJs6 + kDashJs7 + kDashJs8;
