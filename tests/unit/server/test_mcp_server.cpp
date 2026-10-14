@@ -17550,6 +17550,55 @@ TEST_CASE("MCP query_audit_log: target_id and offset filter and page; wrong type
     }
 }
 
+TEST_CASE("MCP audit surfaces gate on exactly AuditLog:Read (#5771: the pair the "
+          "topology floor keys on)",
+          "[pg][mcp][integration][audit]") {
+    // authz_topology_floor.hpp floors by (securable, operation) STRING. If an
+    // MCP audit surface were re-gated on any other securable the floor entry
+    // would silently protect nothing for it, so each one is pinned to the pair
+    // here: the mock gate denies ONLY AuditLog:Read, so a 403 can only come
+    // from that pair, and a server with no override must still admit.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    const std::string query_audit =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":901,)"
+        R"("params":{"name":"query_audit_log","arguments":{"limit":5}}})";
+    const std::string recent_resource =
+        R"({"jsonrpc":"2.0","method":"resources/read","id":902,)"
+        R"("params":{"uri":"yuzu://audit/recent"}})";
+    const std::string no_admin =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":903,)"
+        R"("params":{"name":"audit_engine_no_admin","arguments":{}}})";
+
+    {
+        McpTestServer denied;
+        denied.audit_store_for_test = &store;
+        denied.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !(securable == "AuditLog" && op == "Read");
+        };
+        denied.start("readonly");
+        for (const auto& body : {query_audit, recent_resource, no_admin}) {
+            INFO(body);
+            auto res = denied.call(body);
+            REQUIRE(res);
+            CHECK(res->status == 403);
+        }
+    }
+
+    McpTestServer allowed;
+    allowed.audit_store_for_test = &store;
+    allowed.start("readonly");
+    for (const auto& body : {query_audit, recent_resource}) {
+        INFO(body);
+        auto res = allowed.call(body);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+}
+
 TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution_id loop",
           "[pg][mcp][integration][response][fanout][execute]") {
     // End-to-end: dispatch via execute_instruction (real ExecutionTracker mints

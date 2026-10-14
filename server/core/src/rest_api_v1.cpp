@@ -1018,10 +1018,10 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
-      "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "responses": {"200": {"description": "List of roles"}}}
+      "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "description": "Requires UserManagement:Read. A degraded RBAC store is a retryable 503 (retry_after_ms 5000), never an empty 200 list.", "responses": {"200": {"description": "List of roles"}, "403": {"description": "Requires UserManagement:Read"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
     },
     "/rbac/roles/{role}/permissions": {
-      "get": {"summary": "Get permissions for a role", "tags": ["RBAC"], "parameters": [{"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of permissions"}}}
+      "get": {"summary": "Get permissions for a role", "tags": ["RBAC"], "parameters": [{"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "description": "Requires UserManagement:Read. A role the roles table does not hold is 404 (not an empty 200); a degraded RBAC store is a retryable 503 (retry_after_ms 5000).", "responses": {"200": {"description": "List of permissions"}, "403": {"description": "Requires UserManagement:Read"}, "404": {"description": "No such role"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
     },
     "/rbac/check": {
       "post": {"summary": "Check if current user has a permission", "tags": ["RBAC"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"securable_type": {"type": "string"}, "operation": {"type": "string"}}}}}}, "responses": {"200": {"description": "Permission check result"}}}
@@ -6178,8 +6178,26 @@ void RestApiV1::register_routes(
 
     // ── RBAC (/api/v1/rbac) ──────────────────────────────────────────────
 
+    // Both role reads below are on the CHECKED store reads: a closed store, a
+    // pool-acquire timeout or a query error is a retryable 503, never the empty
+    // `200 {"data":[]}` the fail-soft `list_roles()` / `get_role_permissions()`
+    // returned — an empty role list or permission set reads as "nobody has any
+    // access". The message is fixed on purpose: the store's libpq text is never
+    // echoed (#5063 family), the 503 and its correlation_id are the signal.
+    // No audit: neither read captures `audit_fn`, and no audit verb exists for
+    // either (same as the /rbac/roles/assignments genuine-failure path).
+    const auto rbac_read_degraded = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(
+            detail::a4_error(res, "rbac store read degraded",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                 .remediation = "retry shortly"}),
+            "application/json");
+    };
+
     sink.Get("/api/v1/rbac/roles",
-             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, rbac_store, rbac_read_degraded](const httplib::Request& req,
+                                                       httplib::Response& res) {
                  if (!perm_fn(req, res, "UserManagement", "Read"))
                      return;
                  if (!rbac_store) {
@@ -6188,21 +6206,26 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 auto roles = rbac_store->list_roles();
+                 auto roles = rbac_store->list_roles_checked();
+                 if (!roles) {
+                     rbac_read_degraded(res);
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& r : roles) {
+                 for (const auto& r : *roles) {
                      arr.add(JObj()
                                  .add("name", r.name)
                                  .add("description", r.description)
                                  .add("is_system", r.is_system)
                                  .add("created_at", r.created_at));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(roles.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(roles->size())),
                                  "application/json");
              });
 
     sink.Get(R"(/api/v1/rbac/roles/(.+)/permissions)",
-             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, rbac_store, rbac_read_degraded](const httplib::Request& req,
+                                                       httplib::Response& res) {
                  if (!perm_fn(req, res, "UserManagement", "Read"))
                      return;
                  if (!rbac_store) {
@@ -6211,10 +6234,33 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 auto role_name = req.matches[1].str();
-                 auto perms = rbac_store->get_role_permissions(role_name);
+                 const auto role_name = req.matches[1].str();
+                 // Existence on a CHECKED read, then the permissions on another: a degrade
+                 // at either step is a 503 and can never surface as a 404, and a name the
+                 // roles table does not hold is a 404, not `200 {"data":[]}`. get_role()
+                 // is not usable here — it reads a degrade as "no such role". The scan is
+                 // over a handful of rows and compares the name exactly (no libpq text
+                 // parameter, so an embedded NUL cannot truncate into a real role).
+                 auto roles = rbac_store->list_roles_checked();
+                 if (!roles) {
+                     rbac_read_degraded(res);
+                     return;
+                 }
+                 const bool known = std::any_of(roles->begin(), roles->end(),
+                                                [&](const RbacRole& r) { return r.name == role_name; });
+                 if (!known) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "role not found"), "application/json");
+                     return;
+                 }
+
+                 auto perms = rbac_store->get_role_permissions_checked(role_name);
+                 if (!perms) {
+                     rbac_read_degraded(res);
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& p : perms) {
+                 for (const auto& p : *perms) {
                      arr.add(JObj()
                                  .add("securable_type", p.securable_type)
                                  .add("operation", p.operation)

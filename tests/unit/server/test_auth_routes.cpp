@@ -967,6 +967,40 @@ TEST_CASE("AuthRoutes::require_permission — no MCP tier (incl. readonly, admin
     }
 }
 
+// #5771: AuditLog:Read is in the topology floor. The audit surfaces are reached by
+// ordinary API tokens as well as cookie sessions; a token session carries its creator's
+// live legacy role, so with RBAC off a non-admin creator's token is refused and an
+// admin creator's is admitted. Real bearer -> require_permission path (no mocks).
+TEST_CASE("AuthRoutes::require_permission — AuditLog:Read floor: RBAC-off ordinary API token "
+          "of a non-admin is refused, an admin-owned token is admitted (#5771)",
+          "[pg][auth_routes][security][floor]") {
+    AuthRoutesFixture fix;
+    REQUIRE(fix.auth_mgr.upsert_user("plain_user", "plain_password1", auth::Role::user));
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto user_raw = fix.api_tokens->create_token("audit-user", "plain_user", now + 3600);
+    REQUIRE(user_raw.has_value());
+    auto admin_raw = fix.api_tokens->create_token("audit-admin", "test_user", now + 3600);
+    REQUIRE(admin_raw.has_value());
+
+    {
+        auto req = request_with_header("Authorization", "Bearer " + *user_raw);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        CHECK(res.status == 403);
+        CHECK(fix.counter("yuzu_auth_topology_floor_denied_total",
+                          {{"permission", "AuditLog:Read"}}) == 1.0);
+    }
+    {
+        auto req = request_with_header("Authorization", "Bearer " + *admin_raw);
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        CHECK(fix.counter("yuzu_auth_topology_floor_denied_total",
+                          {{"permission", "AuditLog:Read"}}) == 1.0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // require_scoped_permission MCP-tier enforcement tests (#520)
 // ---------------------------------------------------------------------------
