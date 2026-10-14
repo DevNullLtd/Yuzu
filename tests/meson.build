@@ -1389,6 +1389,7 @@ if build_server
       'unit/server/test_notification_routes.cpp',
       'unit/server/test_command_routes.cpp',
       'unit/server/test_page_routes.cpp',
+      'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',

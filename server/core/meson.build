@@ -181,6 +181,21 @@ yuzu_viz_host_js_embed = custom_target(
   ],
 )
 
+# Shared modal dialog + request helper (window.YuzuDialog). Symbol: kYuzuDialogJs
+# (std::string). First consumer: the Operate action dialogs.
+yuzu_dialog_js_embed = custom_target(
+  'yuzu_dialog_js_bundle',
+  input: 'static/yuzu-dialog.js',
+  output: 'yuzu_dialog_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuDialogJs',
+  ],
+)
+
 cytoscape_js_embed = custom_target(
   'cytoscape_js_bundle',
   input: 'static/cytoscape.min.js',
@@ -375,7 +390,7 @@ yuzu_key_provider_dep = declare_dependency(
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
-   yuzu_viz_host_js_embed, cytoscape_js_embed,
+   yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_dialog_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
