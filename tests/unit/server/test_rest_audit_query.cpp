@@ -173,7 +173,8 @@ TEST_CASE("v1 audit: offset pages with real start and page_size and ties are sta
 TEST_CASE("v1 audit: malformed filters are 400 and never silently dropped", "[audit][rest]") {
     QueryHarness h(/*populated=*/false); // validation precedes the store read
     for (const char* q : {"?since=abc", "?since=-1", "?until=1.5", "?since=2000&until=1000",
-                          "?offset=-1", "?offset=10001", "?offset=x", "?target_id=t1", "?target_type=a%00b"}) {
+                          "?offset=-1", "?offset=10001", "?offset=x", "?target_id=t1", "?target_type=a%00b",
+                          "?principal=a%00b", "?action=a%00b", "?target_type=T&target_id=a%00b"}) {
         INFO(q);
         h.get(q, 400);
     }

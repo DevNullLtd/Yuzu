@@ -17312,7 +17312,8 @@ TEST_CASE("MCP query_audit_log: target_id and offset filter and page; wrong type
     for (const std::string bad :
          {R"({"offset":"5"})", R"({"offset":-1})", R"({"offset":10001})", R"({"target_id":7})",
           R"({"target_id":"id-a"})" /* no target_type */, R"({"target_type":7})", R"({"principal":42})", R"({"action":false})",
-          R"({"target_type":"a\u0000b"})", R"({"since":"1"})", R"({"until":-1})", R"({"since":9,"until":3})"}) {
+          R"({"target_type":"a\u0000b"})", R"({"principal":"a\u0000b"})", R"({"action":"a\u0000b"})",
+          R"({"target_type":"T","target_id":"a\u0000b"})", R"({"since":"1"})", R"({"until":-1})", R"({"since":9,"until":3})"}) {
         INFO(bad);
         auto body = call(bad);
         REQUIRE(body.contains("error"));

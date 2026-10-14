@@ -8103,9 +8103,11 @@ void RestApiV1::register_routes(
                  };
                  // A NUL (%00) would truncate the bound value at the C-string boundary and
                  // silently widen the filter.
-                 if (q.target_type.find('\0') != std::string::npos ||
+                 if (q.principal.find('\0') != std::string::npos ||
+                     q.action.find('\0') != std::string::npos ||
+                     q.target_type.find('\0') != std::string::npos ||
                      q.target_id.find('\0') != std::string::npos) {
-                     bad_request("target_type/target_id must not contain NUL");
+                     bad_request("string filters must not contain NUL");
                      return;
                  }
                  // since/until: epoch seconds, whole value one non-negative integer;

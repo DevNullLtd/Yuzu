@@ -106,7 +106,7 @@ echo `offset`/`limit`); scope further with `&principal=`, or page with `offset`.
 window — it does not by itself guarantee you retrieved everything inside that window if
 more rows matched than one call returns. The reliable recipe is both together: freeze a
 bounded window with `since`/`until` first, then page exhaustively through it with `offset`.
-A `503` from either endpoint is the deny-on-degrade behavior `YuzuAuditReadDegraded`
+A `503` from `/api/v1/audit` is the deny-on-degrade behavior `YuzuAuditReadDegraded`
 covers, not "no matching rows" — treat it as an audit-store availability problem and
 retry once that alert clears, not as a clean result.
 
@@ -208,13 +208,13 @@ take, which happens in three states:
    `reason=post_pin_slots` for exactly this rejection — other reasons on the same action
    share the row shape but not the reason. `GET /api/v1/audit?action=mcp.session.reject&limit=1000`,
    filtering the `detail` field for `reason=post_pin_slots`; if you already have a candidate
-   session id, `GET /api/v1/audit?action=mcp.session.reject&target_type=<type>&target_id=<8 chars>`
+   session id, `GET /api/v1/audit?action=mcp.session.reject&target_type=McpSession&target_id=<8 chars>`
    narrows directly (`target_id` requires `target_type`). **A response at exactly
    `limit` rows is not proof you have everything** — `total` describes the rows in the
-   response, not what matched; if you hit the cap, page with `offset`, and `since`/`until` alone only bounds the time window — it
-   does not guarantee completeness inside that window by itself. Freeze the window with
-   `since`/`until` first, then page through it with `offset` if you need everything in it.
-   A `503` from either endpoint is the deny-on-degrade behavior `YuzuAuditReadDegraded`
+   response, not what matched; if you hit the cap, page with `offset`. `since`/`until` alone only bound
+   the time window; freeze the window with them first (a fixed `until` in the past), then page
+   through it with `offset` and de-duplicate on `id` if you need everything in it.
+   A `503` from `/api/v1/audit` is the deny-on-degrade behavior `YuzuAuditReadDegraded`
    covers, not "no matching rows" — treat it as an audit-store availability problem and
    retry once that alert clears, not as a clean result.
 2. If the rate is falling on its own, it was (1) or (2). Nothing to do.
