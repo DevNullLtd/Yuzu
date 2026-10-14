@@ -1,10 +1,12 @@
-# Pre-flight readiness checks (`/auto`)
+# Deployments and pre-flight readiness checks (`/auto`)
 
-The **Pre-flight** page is an operator surface for a **go/no-go check across a
-device cohort before a fleet change** (a rollout, a patch, an upgrade). You pick a
-scope and a set of thresholds, run it, and get a result grouped by device. It is
-reached from **Software > Deployments** in the sidebar, or at **`/auto`** by URL,
-and the same checks are intended to be driven headless by an orchestrator later.
+The **Deployments** page (formerly called **Pre-flight**) checks software
+rollouts first, deploys them, then verifies the result. Its first stage is an
+operator surface for a **go/no-go check across a device cohort before a fleet
+change** (a rollout, a patch, an upgrade). You pick a scope and a set of
+thresholds, run it, and get a result grouped by device. It is reached from
+**Software > Deployments** in the sidebar, or at **`/auto`** by URL, and the
+same checks are intended to be driven headless by an orchestrator later.
 
 ## The checks
 

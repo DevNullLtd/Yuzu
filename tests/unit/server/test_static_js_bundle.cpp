@@ -357,6 +357,20 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares per-OS palette for linux/darwin
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickOsColor"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("linux:   '#2dd4bf'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:  '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("macos:   '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows: '#4c9aff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("default: '#9aa2ae'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs leaves the stage backdrop to the page CSS",
+          "[static-js][viz]") {
+    // The page's .viz-stage rule paints the backdrop so it follows the
+    // theme. That only shows through a transparent renderer, so alpha: true
+    // is load-bearing and the scene must not set an opaque background.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("alpha: true"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, !ContainsSubstring("scene.background ="));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs uses FNV-1a 32-bit hash for stable layout",
@@ -668,19 +682,19 @@ TEST_CASE("static_js_bundle: kYuzuVizJs guards camera position against NaN/Infin
 TEST_CASE("static_js_bundle: kYuzuVizJs declares CATEGORY_PALETTE for the six categories",
           "[static-js][viz][pr7]") {
     // PR 7 category palette. Each colour is a UX contract — it carries
-    // semantic meaning to the operator (browser=blue, db=amber, web=green
+    // semantic meaning to the operator (browser=blue, db=yellow, web=teal
     // etc.) so a stealth refactor that swaps a hex code is a deliberate
     // UX decision worth surfacing in PR review. Pin both the palette
     // constant name and every category=hex pair so a refactor that drops
     // or recolours a category fails this test loud.
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("CATEGORY_PALETTE"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickCategoryColor"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#6e7681'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#58a6ff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#d29922'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#56d364'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#bc8cff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#8b949e'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#9aa2ae'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#4c9aff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#2dd4bf'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#a78bfa'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#9199a6'"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs lays processes out on hash(pid|ppid)-mod-bucket grid",
@@ -1248,6 +1262,9 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml renders IPC graph mount point", "[
 TEST_CASE("static_js_bundle: kVizHostPageHtml renders TAR tree mount point", "[viz-host][page]") {
     std::string html(kVizHostPageHtml);
     CHECK_THAT(html, ContainsSubstring("id=\"tar-tree\""));
+    // The pane fills itself over htmx on load; losing either attribute leaves it empty.
+    CHECK_THAT(html, ContainsSubstring("hx-get=\"/fragments/tar/process-tree?device={{AGENT_ID}}\""));
+    CHECK_THAT(html, ContainsSubstring("hx-trigger=\"load\""));
 }
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml binds via data-agent-id attribute",
@@ -1438,6 +1455,21 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml has a resizable splitter persisted
     CHECK_THAT(html, ContainsSubstring("yuzuVizHostSplitRatio"));
     CHECK_THAT(html, ContainsSubstring("localStorage"));
     CHECK_THAT(html, ContainsSubstring("splitter"));
+}
+
+TEST_CASE("static_js_bundle: kVizHostPageHtml clamps the splitter to the fixed chrome",
+          "[viz-host][page][splitter]") {
+    // The splitter, the "Process tree" header and the tree's own padding
+    // cannot shrink, so a bare 0.1-0.9 clamp overflows .vh-main (39 px at
+    // 1440x900 for a stored 0.9). The max ratio is measured from the root,
+    // applied on load (apply), on drag, and on resize; the old literal
+    // upper bound must not return as the only gate.
+    std::string html(kVizHostPageHtml);
+    CHECK_THAT(html, ContainsSubstring("function maxRatio()"));
+    CHECK_THAT(html, ContainsSubstring("r = Math.min(r, maxRatio());"));
+    CHECK_THAT(html, ContainsSubstring("r < maxRatio()"));
+    CHECK_THAT(html, ContainsSubstring("new ResizeObserver(() => apply(ratio)).observe(root);"));
+    CHECK_THAT(html, !ContainsSubstring("r < 0.9"));
 }
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",

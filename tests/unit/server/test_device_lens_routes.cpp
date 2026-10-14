@@ -395,10 +395,10 @@ TEST_CASE("device lenses: DEX lens renders the per-device score + known signal c
     // Signal rows — exact markup, count anchored per-row (obs_type -> label
     // mapping is byte-fixed in dex_routes.cpp's dex_signal_label).
     CHECK(r->body.find("<tr><td>App crash</td><td class=\"gp-mute\" "
-                       "style=\"font-family:Consolas,monospace;font-size:.7rem\">process.crashed"
+                       "style=\"font-family:var(--mds-font-family-mono);font-size:12.5px\">process.crashed"
                        "</td><td class=\"gp-num\">2</td></tr>") != std::string::npos);
     CHECK(r->body.find("<tr><td>App hang</td><td class=\"gp-mute\" "
-                       "style=\"font-family:Consolas,monospace;font-size:.7rem\">process.hung"
+                       "style=\"font-family:var(--mds-font-family-mono);font-size:12.5px\">process.hung"
                        "</td><td class=\"gp-num\">1</td></tr>") != std::string::npos);
 }
 
@@ -461,16 +461,19 @@ TEST_CASE("device lenses: Guardian lens renders known guards incl. an orphan-rul
     // Order-insensitive: each row asserted independently by exact markup
     // (name cell + guard_state_badge markup + updated_at, byte-for-byte).
     CHECK(r->body.find("<tr><td class=\"name\">Alpha Guard</td><td><span "
-                       "style=\"font-size:.6rem;font-weight:700;border-radius:.3rem;padding:.05rem "
-                       ".4rem;color:#06121f;background:#ffcc00\">drifted</span></td>"
+                       "style=\"display:inline-block;padding:1px 8px;border-radius:3px;font-size:12.5px;"
+                       "font-weight:500;color:var(--warn);background:color-mix(in srgb,var(--warn) 14%,"
+                       "transparent)\">drifted</span></td>"
                        "<td class=\"gp-mute\">2026-04-19T12:00:00Z</td></tr>") != std::string::npos);
     CHECK(r->body.find("<tr><td class=\"name\">Bravo Guard</td><td><span "
-                       "style=\"font-size:.6rem;font-weight:700;border-radius:.3rem;padding:.05rem "
-                       ".4rem;color:#06121f;background:#4ed27e\">compliant</span></td>"
+                       "style=\"display:inline-block;padding:1px 8px;border-radius:3px;font-size:12.5px;"
+                       "font-weight:500;color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,"
+                       "transparent)\">compliant</span></td>"
                        "<td class=\"gp-mute\">2026-04-19T13:00:00Z</td></tr>") != std::string::npos);
     CHECK(r->body.find("<tr><td class=\"name\">r-orphan</td><td><span "
-                       "style=\"font-size:.6rem;font-weight:700;border-radius:.3rem;padding:.05rem "
-                       ".4rem;color:#06121f;background:#ffcc00\">drifted</span></td>"
+                       "style=\"display:inline-block;padding:1px 8px;border-radius:3px;font-size:12.5px;"
+                       "font-weight:500;color:var(--warn);background:color-mix(in srgb,var(--warn) 14%,"
+                       "transparent)\">drifted</span></td>"
                        "<td class=\"gp-mute\">2026-04-19T14:00:00Z</td></tr>") != std::string::npos);
 }
 
@@ -500,10 +503,11 @@ TEST_CASE("device lenses: Guardian lens: a guard.errored lifecycle event shows t
     auto r = sink.Get("/fragments/device/guardian?id=" + agent + "&bare=1");
     REQUIRE(r);
     CHECK(r->status == 200);
-    // errored badge is red (#ff5765) and carries the later event's timestamp.
+    // errored badge is red (--bad) and carries the later event's timestamp.
     CHECK(r->body.find("<tr><td class=\"name\">Errored Guard</td><td><span "
-                       "style=\"font-size:.6rem;font-weight:700;border-radius:.3rem;padding:.05rem "
-                       ".4rem;color:#06121f;background:#ff5765\">errored</span></td>"
+                       "style=\"display:inline-block;padding:1px 8px;border-radius:3px;font-size:12.5px;"
+                       "font-weight:500;color:var(--bad);background:color-mix(in srgb,var(--bad) 14%,"
+                       "transparent)\">errored</span></td>"
                        "<td class=\"gp-mute\">2026-04-19T13:00:00Z</td></tr>") != std::string::npos);
     // errored does not count as compliant: 0 of 1 guards.
     CHECK(r->body.find("<div class=\"n warn\">0%</div><div class=\"l\">Compliant</div>"
