@@ -454,6 +454,9 @@ inline int run_linux_at(yuzu::CommandContext& ctx, Action a, const std::filesyst
 /// run_linux_at behind the single-flight slot: the shape production runs.
 inline int run_linux_guarded(yuzu::CommandContext& ctx, Action a,
                              const std::filesystem::path& root) {
+    // `packages` is unsupported by design and walks nothing: answer it without the slot so
+    // an overlapping dispatch is never told `busy` for an action that cannot be in flight.
+    if (a == Action::packages) return run_linux_at(ctx, a, root);
     const auto slot = WalkSlot::try_acquire(a);
     if (!slot) {
         emit_result(ctx, a, {}, make_token(kOs, action_name(a), "busy"));

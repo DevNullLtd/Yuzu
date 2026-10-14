@@ -1063,7 +1063,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "with apt/snap/flatpak counts; read-only, no subprocess; Windows planned)"},
         {"pkg_inventory.packages",
          "List macOS Homebrew formulae and casks by name, version and kind (macOS only; "
-         "Linux unsupported by design, the roster is installed_apps')"},
+         "Linux unsupported by design; installed_apps owns the roster)"},
         {"pkg_inventory.store_packages",
          "List installed snaps and flatpak apps/runtimes from the system store (Linux; "
          "read-only, no subprocess; macOS unsupported by design, Windows planned)"},

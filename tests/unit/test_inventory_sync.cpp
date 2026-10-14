@@ -1640,6 +1640,22 @@ TEST_CASE("pkg_inventory store_packages adapter: active rows map, the rest are s
     for (const auto& e : r.entries) CHECK(e.source.empty()); // the collector stamps source
 }
 
+TEST_CASE("pkg_inventory store_packages adapter: an over-wide row is dropped, never truncated",
+          "[sync][parse][adapter]") {
+    // MUTATION: split_tokens(line, 9) truncates a 10-token row to a valid nine-token one and
+    // maps it with its extra column silently lost.
+    const std::string good = snap_store_row("btop", "1.4.7", "app", "1073");
+    for (const std::string extra : {"|x", "|x|y"}) {
+        const auto r = parse_pkg_inventory_store_packages_output(
+            nl({supported_status("store_packages"), good + extra}));
+        CHECK(r.status == Status::ok);
+        CHECK(r.entries.empty());
+    }
+    const auto ok = parse_pkg_inventory_store_packages_output(
+        nl({supported_status("store_packages"), good}));
+    CHECK(ok.entries.size() == 1);
+}
+
 TEST_CASE("pkg_inventory store_packages adapter: status grammar", "[sync][parse][adapter]") {
     const std::string row = snap_store_row("btop", "1.4.7", "app", "1073");
     SECTION("constrained fails (a partial roster would delete stored rows)") {

@@ -428,7 +428,8 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > **Update (2026-10-14):** `pkg_inventory.store_packages` is collected as
 > ecosystems `snap` (kind `app` or `pkg`; version from the mounted revision's
 > `snap.yaml`; release = the revision) and `flatpak` (kind `app` or `pkg`;
-> version empty, a branch being a ref; release = the commit), active rows only.
+> version empty, a branch being a ref; release = the commit), active rows only;
+> snap/flatpak rows carry no distro fields.
 
 Mechanics:
 

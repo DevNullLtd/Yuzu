@@ -511,6 +511,17 @@ TEST_CASE("pkg_inventory linux [degraded, SUPPORTED]: a per-item anomaly degrade
         ModeGuard restore{meta, 0755};
         CHECK(one_row(store(dir.path)) == "package|snap|btop|-|unknown|1073|-|-|active");
     }
+    SECTION("an unreadable snap/<name> dir is unknown, silently") {
+        // MUTATION: treating a non-ABSENT open failure of the name dir as a constraint (or
+        // as "try the next tree") stalls the cycle / flips the row's state.
+        if (::geteuid() == 0) SKIP("running as root: permission bits bypassed");
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_linux_name000_"};
+        add_btop(dir.path, "version: 1.0\n");
+        const auto name_dir = dir.path / "snap/btop";
+        REQUIRE(::chmod(name_dir.string().c_str(), 0000) == 0);
+        ModeGuard restore{name_dir, 0755};
+        CHECK(one_row(store(dir.path)) == "package|snap|btop|-|unknown|1073|-|-|unknown");
+    }
     SECTION("a snap.yaml that is a symlink, a FIFO or oversized degrades; the open never blocks") {
         yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_linux_hostileyaml_"};
         add_btop(dir.path, "version: 1.0\n");
@@ -553,6 +564,18 @@ TEST_CASE("pkg_inventory linux [degraded, SUPPORTED]: a per-item anomaly degrade
             INFO(c.yaml);
             CHECK(one_row(store(dir.path)) == c.expected);
         }
+    }
+    SECTION("an unreadable flatpak branch dir is one unknown row, silently") {
+        // MUTATION: a token on a per-item branch failure stalls the host's cycle.
+        if (::geteuid() == 0) SKIP("running as root: permission bits bypassed");
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_linux_branch000_"};
+        const std::string base = "var/lib/flatpak/app/org.example.App/x86_64/stable";
+        mkdirs(dir.path, base);
+        const auto branch = dir.path / base;
+        REQUIRE(::chmod(branch.string().c_str(), 0000) == 0);
+        ModeGuard restore{branch, 0755};
+        CHECK(one_row(store(dir.path)) ==
+              "package|flatpak|org.example.App|-|app|-|x86_64|stable|unknown");
     }
     SECTION("flatpak active link anomalies degrade the row") {
         yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_linux_fpactive_"};
@@ -611,6 +634,18 @@ TEST_CASE("pkg_inventory linux [constrained]: an unlistable root or nested level
         const auto w = store(dir.path);
         CHECK(has_token(w, "linux:flatpak_runtime:permission_denied"));
         CHECK(w.rows.size() == 8); // six snaps + two apps; the runtimes are the missing rows
+    }
+    SECTION("one unreadable flatpak arch dir: its rows are missing and the token says so") {
+        // MUTATION: silencing an arch-level open failure ships an incomplete roster as supported.
+        if (::geteuid() == 0) SKIP("running as root: permission bits bypassed");
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_linux_arch000_"};
+        mkdirs(dir.path, "var/lib/flatpak/app/org.example.App/x86_64/stable");
+        const auto arch = dir.path / "var/lib/flatpak/app/org.example.App/x86_64";
+        REQUIRE(::chmod(arch.string().c_str(), 0000) == 0);
+        ModeGuard restore{arch, 0755};
+        const auto w = store(dir.path);
+        CHECK(has_token(w, "linux:flatpak_app:permission_denied"));
+        CHECK(w.rows.empty());
     }
     SECTION("one unreadable flatpak id dir: its rows are missing and the token says so") {
         // MUTATION: silencing a nested-level failure ships an incomplete roster as supported.

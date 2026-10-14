@@ -501,6 +501,9 @@ inline int run_macos_at(yuzu::CommandContext& ctx, Action a, const std::filesyst
 /// run_macos_at behind the single-flight slot: the shape production runs.
 inline int run_macos_guarded(yuzu::CommandContext& ctx, Action a,
                              const std::filesystem::path& root) {
+    // `store_packages` is unsupported by design and walks nothing: answer it without the slot
+    // so an overlapping dispatch is never told `busy` for an action that cannot be in flight.
+    if (a == Action::store_packages) return run_macos_at(ctx, a, root);
     const auto slot = WalkSlot::try_acquire(a);
     if (!slot) {
         emit_result(ctx, a, {}, make_token(detail::kOs, action_name(a), "busy"));

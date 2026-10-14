@@ -146,10 +146,11 @@ int run_guarded(yuzu::CommandContext& ctx, std::string_view action, Body&& body)
 // is open/openat/fstatat/readdir/readlinkat with O_NOFOLLOW on the leaf (leaf
 // no-follow; root-owned parents trusted -- open_dir_no_follow opens ONE joined
 // path, so only its final component is refused if a link), so a swapped-in
-// symlink is refused rather than followed (a private copy of the autoruns_macos.cpp dir_open_outcome_from_fd
-// / open_dir_no_follow_checked shape; posix_dir_walk.hpp deliberately leaves
-// opening to each caller). Guarded because posix_dir_walk.hpp does not exist on
-// Windows; the portable row/text layer is pkg_inventory_parsers.hpp.
+// symlink is refused rather than followed (a private copy of the
+// autoruns_macos.cpp dir_open_outcome_from_fd / open_dir_no_follow_checked
+// shape; posix_dir_walk.hpp deliberately leaves opening to each caller).
+// Guarded because posix_dir_walk.hpp does not exist on Windows; the portable
+// row/text layer is pkg_inventory_parsers.hpp.
 #if !defined(_WIN32)
 
 namespace posix {

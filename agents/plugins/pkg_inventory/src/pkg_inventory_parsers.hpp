@@ -18,7 +18,7 @@
  * WIRE GRAMMAR. Every action writes the status row FIRST, then data rows:
  *
  *   status|<action>|<supported|constrained|unsupported>|<tokens or ->
- *   manager|<dpkg|apt|rpm|dnf|pacman|apk|homebrew>|<present|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->
+ *   manager|<dpkg|apt|rpm|dnf|pacman|apk|snap|flatpak|homebrew>|<present|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->
  *   package|homebrew|<id>|<version>|<formula|cask>
  *   package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<active|inactive|unknown>
  *
@@ -68,7 +68,7 @@ namespace yuzu::pkg_inventory {
 
 /// Per-directory entry cap handed to walk_dir_capped.
 inline constexpr std::size_t kMaxEntriesPerDir = 4096;
-/// Whole-action package row cap (Homebrew): once reached, no further row is
+/// Whole-action package row cap (the macOS Homebrew and Linux snap/flatpak walks): once reached, no further row is
 /// added and the status carries `row_cap` (a later container is still opened, but
 /// stops at its first version directory).
 inline constexpr std::size_t kMaxPackageRows = 20000;
@@ -77,14 +77,14 @@ inline constexpr std::size_t kMaxPackageRows = 20000;
 /// cap of its own). A real install is a few KB; beyond it no further row is
 /// added and the status carries `byte_cap`.
 inline constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
-/// Whole-ACTION entries budget across each action's entire walk (`packages`:
-/// both prefixes x Cellar/Caskroom; `managers`: both prefixes x Taps, Cellar,
-/// Caskroom): each directory's own listing is bounded by kMaxEntriesPerDir and
+/// Whole-ACTION entries budget across each action's entire walk (macOS Homebrew
+/// `packages`: both prefixes x Cellar/Caskroom; `managers`: both prefixes x Taps,
+/// Cellar, Caskroom; Linux `store_packages`: the snap and flatpak trees): each directory's own listing is bounded by kMaxEntriesPerDir and
 /// rows are bounded by kMaxPackageRows, but neither bounds the walk as a whole
 /// -- a tree with kMaxEntriesPerDir id/org-directories x kMaxEntriesPerDir
 /// entries each (or a Cellar full of plain files that never trip the row cap)
 /// is otherwise read in full every call. Sized generously for a real large
-/// Homebrew install.
+/// Homebrew, snap or flatpak install.
 inline constexpr std::size_t kMaxPackageWalkEntries = 200000;
 /// Whole-action wall-clock budget (seconds) for the same walks.
 inline constexpr std::size_t kMaxPackageWalkSeconds = 10;
