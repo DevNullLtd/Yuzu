@@ -161,6 +161,21 @@ yuzu_viz_js_embed = custom_target(
   ],
 )
 
+# Page script for the System > Integrations page (/static/yuzu-integrations.js).
+# Symbol: kYuzuIntegrationsJs (std::string). Routed in integrations_routes.cpp.
+yuzu_integrations_js_embed = custom_target(
+  'yuzu_integrations_js_bundle',
+  input: 'static/yuzu-integrations.js',
+  output: 'yuzu_integrations_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuIntegrationsJs',
+  ],
+)
+
 # System pages (SYS-5): controller for the Integrations webhook / offload /
 # directory-sync panels. Symbol: kYuzuIntegrationsSyncJs (std::string).
 yuzu_integrations_sync_js_embed = custom_target(
@@ -391,7 +406,7 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_integrations_sync_js_embed,
-   yuzu_viz_host_js_embed, cytoscape_js_embed,
+   yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_integrations_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -417,6 +432,9 @@ yuzu_server_core_lib = static_library(
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
+    'src/integrations_render.cpp', # System Integrations: pure MCP/Gateway panels + MCP form parser
+    'src/integrations_routes.cpp',
+    'src/integrations_ui.cpp',
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',

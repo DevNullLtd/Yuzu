@@ -20,6 +20,7 @@
 #include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
 #include "directory_sync.hpp"   // access-review read-model optional email enrichment
 #include "http_route_sink.hpp"
+#include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
@@ -2484,86 +2485,16 @@ std::string SettingsRoutes::render_updates_fragment() {
 std::string SettingsRoutes::render_gateway_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/gateway formats the SAME
     // JSON as its response body instead of re-deriving these fields.
+    // The markup lives in integrations_render.cpp (pure, on yuzu.css classes) so this
+    // fragment looks the same on /settings/integrations and on the monolith.
     auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
     const auto v = settings_model::build_gateway_settings(*cfg_, gateway_enabled_, count);
-    bool enabled = v.at("enabled").get<bool>();
-    std::string status_cls = enabled ? "role-badge role-ok" : "role-badge";
-    std::string status_text = enabled ? "Enabled" : "Disabled";
-
-    std::string html;
-
-    html += "<div class=\"form-row\">"
-            "  <label>Upstream Service</label>"
-            "  <span class=\"" + status_cls + "\">" + status_text +
-            "</span>"
-            "</div>";
-
-    if (enabled) {
-        html += "<div class=\"form-row\">"
-                "  <label>Listen Address</label>"
-                "  <code>" +
-                html_escape(v.at("listen_address").get<std::string>()) +
-                "</code>"
-                "</div>";
-
-        const bool gw_mode = v.at("gateway_mode").get<bool>();
-        html += "<div class=\"form-row\">"
-                "  <label>Gateway Mode</label>"
-                "  <span class=\"" +
-                std::string(gw_mode ? "role-badge role-ok" : "role-badge") + "\">" +
-                (gw_mode ? "Active" : "Inactive") +
-                "</span>"
-                "</div>";
-
-        auto shown_count = v.at("active_sessions").get<std::int64_t>();
-        html += "<div class=\"form-row\">"
-                "  <label>Active Sessions</label>"
-                "  <span>" +
-                std::to_string(shown_count) + " agent" + (shown_count != 1 ? "s" : "") +
-                " via gateway</span>"
-                "</div>";
-    } else {
-        html += "<p class=\"section-note\">"
-                "The gateway upstream service is not running. Start the server with "
-                "<code>--gateway-upstream 0.0.0.0:50055</code> to enable it. The service "
-                "requires an authorized gateway peer: pin the gateway's key with "
-                "<code>--gateway-peer-pin</code> or <code>--gateway-peer-pin-file</code> "
-                "(automatic on the built-in default certificates), or, on a plaintext "
-                "development rig only, acknowledge that peer authorization is disabled with "
-                "<code>--insecure-gateway-peer</code>. Without one of these the server "
-                "refuses to start. Pins are read once at boot; changing them needs a restart.</p>";
-    }
-
-    html += "<div style=\"margin-top:1rem;padding-top:0.75rem;border-top:1px solid var(--line)\">"
-            "<div class=\"sub-head\" style=\"margin-top:0\">"
-            "Erlang gateway environment variables</div>"
-            "<table class=\"user-table\">"
-            "<thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead>"
-            "<tbody>"
-            "<tr><td><code>YUZU_GW_UPSTREAM_ADDR</code></td>"
-            "    <td>C++ server hostname</td><td><code>127.0.0.1</code></td></tr>"
-            "<tr><td><code>YUZU_GW_UPSTREAM_PORT</code></td>"
-            "    <td>C++ server port</td><td><code>50055</code></td></tr>"
-            "<tr><td><code>YUZU_GW_AGENT_PORT</code></td>"
-            "    <td>Agent-facing listener port</td><td><code>50051</code></td></tr>"
-            "<tr><td><code>YUZU_GW_MGMT_PORT</code></td>"
-            "    <td>Management listener port</td><td><code>50052</code></td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_ENABLED</code></td>"
-            "    <td>TLS master switch</td><td><code>auto</code></td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_CERTFILE</code></td>"
-            "    <td>Gateway certificate path</td><td>&mdash;</td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_KEYFILE</code></td>"
-            "    <td>Gateway private key path</td><td>&mdash;</td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_CACERTFILE</code></td>"
-            "    <td>CA certificate bundle</td><td>&mdash;</td></tr>"
-            "<tr><td><code>YUZU_GW_PROMETHEUS_PORT</code></td>"
-            "    <td>Prometheus metrics port</td><td><code>9568</code></td></tr>"
-            "<tr><td><code>YUZU_GW_HEALTH_PORT</code></td>"
-            "    <td>Health endpoint port</td><td><code>8080</code></td></tr>"
-            "</tbody></table>"
-            "</div>";
-
-    return html;
+    integrations::GatewayView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.listen_address = v.at("listen_address").get<std::string>();
+    view.gateway_mode = v.at("gateway_mode").get<bool>();
+    view.active_sessions = v.at("active_sessions").get<std::int64_t>();
+    return integrations::render_gateway_panel(view);
 }
 
 std::string SettingsRoutes::render_https_fragment() {
@@ -2853,81 +2784,13 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
 std::string SettingsRoutes::render_mcp_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/mcp formats the SAME
     // JSON as its response body instead of re-deriving these fields.
+    // Markup and the form's one-value-per-field encoding: integrations_render.cpp.
     const auto v = settings_model::build_mcp_settings(*cfg_);
-
-    std::string html;
-    bool mcp_enabled = v.at("enabled").get<bool>();
-
-    std::string status_cls = mcp_enabled ? "role-badge role-ok" : "role-badge";
-    std::string status_text = mcp_enabled ? "Enabled" : "Disabled";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Status</label>"
-            "  <span class=\"" + status_cls + "\">" + status_text +
-            "</span>"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Endpoint</label>"
-            "  <code>POST /mcp/v1/</code>"
-            "</div>";
-
-    std::string enabled_checked = mcp_enabled ? " checked" : "";
-    html += "<form hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\" hx-swap=\"innerHTML\">"
-            "<div class=\"form-row\">"
-            "  <label>MCP Enabled</label>"
-            "  <label class=\"toggle\">"
-            "    <input type=\"hidden\" name=\"enabled\" value=\"false\">"
-            "    <input type=\"checkbox\" name=\"enabled\" value=\"true\"" +
-            enabled_checked +
-            " hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\""
-            " hx-swap=\"innerHTML\" hx-include=\"closest form\">"
-            "    <span class=\"slider\"></span>"
-            "  </label>"
-            "</div>";
-
-    const bool mcp_read_only = v.at("read_only").get<bool>();
-    std::string readonly_checked = mcp_read_only ? " checked" : "";
-    std::string readonly_cls = mcp_read_only ? "role-badge role-warn" : "role-badge";
-    std::string readonly_text = mcp_read_only ? "Read-Only" : "Full Access";
-    html += "<div class=\"form-row\">"
-            "  <label>Access Mode</label>"
-            "  <label class=\"toggle\">"
-            "    <input type=\"hidden\" name=\"read_only\" value=\"false\">"
-            "    <input type=\"checkbox\" name=\"read_only\" value=\"true\"" +
-            readonly_checked +
-            " hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\""
-            " hx-swap=\"innerHTML\" hx-include=\"closest form\">"
-            "    <span class=\"slider\"></span>"
-            "  </label>"
-            "  <span class=\"" +
-            readonly_cls + "\">" + readonly_text +
-            "</span>"
-            "</div>";
-
-    html += "</form>";
-
-    html += "<p class=\"section-note\">"
-            "MCP authentication uses API Tokens with an MCP tier. "
-            "Create tokens in the <strong>API Tokens</strong> section above — "
-            "select an MCP tier (readonly, operator, or supervised) from the dropdown."
-            "</p>";
-
-    std::string url = v.at("endpoint_url").get<std::string>();
-
-    html += "<div class=\"callout\" style=\"margin-top:0.75rem\">"
-            "  <div class=\"sub-head\" style=\"margin-top:0\">MCP client connection</div>"
-            "  <div style=\"margin-bottom:0.3rem\">"
-            "    Endpoint: <code>" +
-            html_escape(url) +
-            "</code></div>"
-            "  <div class=\"hint\">"
-            "    Transport: HTTP + JSON-RPC 2.0 &nbsp;|&nbsp; "
-            "    Auth: <code>Authorization: Bearer &lt;mcp-token&gt;</code>"
-            "  </div>"
-            "</div>";
-
-    return html;
+    integrations::McpView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.read_only = v.at("read_only").get<bool>();
+    view.endpoint_url = v.at("endpoint_url").get<std::string>();
+    return integrations::render_mcp_panel(view);
 }
 
 std::string SettingsRoutes::render_nvd_fragment() {
@@ -6203,13 +6066,23 @@ void SettingsRoutes::register_routes(
         });
 
     // -- Settings API: MCP toggle (HTMX POST) ---------------------------------
+    // The body is parsed at a key boundary and must carry exactly one `enabled` and one
+    // `read_only`, each `true` or `false` (integrations_render.cpp). The earlier first-match
+    // read treated an absent field as false, so a partial body switched MCP off or flipped
+    // Read-only to Full access. Nothing changes on a refused body.
     sink.Post("/api/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        auto enabled_val = extract_form_value(req.body, "enabled");
-        auto read_only_val = extract_form_value(req.body, "read_only");
-        cfg_->mcp_disable = (enabled_val != "true");
-        cfg_->mcp_read_only = (read_only_val == "true");
+        const auto form = integrations::parse_mcp_form(req.body);
+        if (!form) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", {{"code", 400}, {"message", form.error()}}}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
+        cfg_->mcp_disable = !form->enabled;
+        cfg_->mcp_read_only = form->read_only;
         spdlog::info("MCP settings changed: enabled={}, read_only={}", !cfg_->mcp_disable,
                      cfg_->mcp_read_only);
         audit_fn_(req, "settings.mcp", "success", "MCP", "mcp_settings",
