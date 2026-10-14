@@ -216,18 +216,30 @@ const char* const kCompliancePageTemplate =
       showToast(d.message || 'Done', d.level || 'success');
     });
 
-    /* htmx drops 4xx/5xx bodies, so a refused or failed panel would sit on
-       "Loading..." forever: say why in the panel the request targeted. */
-    document.body.addEventListener('htmx:responseError', function(e) {
-      var d = e.detail || {};
-      var t = d.target;
+    /* htmx drops 4xx/5xx bodies and swaps nothing on a network failure, so a
+       refused or unreachable panel would sit on "Loading..." forever: say why
+       in the panel the request targeted. A 401 is an expired session, not a
+       missing permission: it goes to the login page, as done() does for the
+       action layer. text === null means the panel's own denied note. */
+    function panelNote(e, text) {
+      var t = (e.detail || {}).target;
       if (!t || !t.hasAttribute || !t.hasAttribute('data-denied')) return;
-      var st = d.xhr ? d.xhr.status : 0;
-      t.textContent = (st === 401 || st === 403)
-        ? t.getAttribute('data-denied')
-        : 'Temporarily unavailable. Try Refresh in a moment.';
+      t.textContent = text === null ? t.getAttribute('data-denied') : text;
       t.className = 'empty-state';
+    }
+    document.body.addEventListener('htmx:responseError', function(e) {
+      var st = e.detail && e.detail.xhr ? e.detail.xhr.status : 0;
+      if (st === 401) { location.assign('/login'); return; }
+      panelNote(e, st === 403 ? null : 'Temporarily unavailable. Try Refresh in a moment.');
     });
+    function unreachable(e) {
+      panelNote(e, 'Could not reach the server. Try Refresh in a moment.');
+    }
+    document.body.addEventListener('htmx:sendError', unreachable);
+    document.body.addEventListener('htmx:timeout', unreachable);
+    /* htmx has no request timeout by default, so a server that takes the
+       connection and never answers raises no event at all. */
+    if (window.htmx) htmx.config.timeout = 30000;
 
     /* Per-viewer controls: the summary render probes Policy:Write/Execute/Delete
        once and leaves the answer on #policies-panel; the detail and fragment

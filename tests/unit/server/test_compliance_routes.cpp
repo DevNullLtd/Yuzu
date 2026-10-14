@@ -896,7 +896,19 @@ TEST_CASE("compliance page: hosts the summary, detail, fragments and tag panels 
     // listener writes it into the targeted panel.
     CHECK(page.find("data-denied=\"Needs the Policy Read permission.\"") != std::string::npos);
     CHECK(page.find("data-denied=\"Needs the Tag Read permission.\"") != std::string::npos);
-    CHECK(page.find("htmx:responseError") != std::string::npos);
+    const auto on_error = page.find("addEventListener('htmx:responseError'");
+    REQUIRE(on_error != std::string::npos);
+    // A 401 is an expired session: the handler sends the viewer to login
+    // instead of reporting a missing permission (the old `401 || 403` branch).
+    const std::string handler = page.substr(on_error, 400);
+    CHECK(handler.find("st === 401") != std::string::npos);
+    CHECK(handler.find("location.assign('/login')") != std::string::npos);
+    CHECK(page.find("st === 401 || st === 403") == std::string::npos);
+    // A network failure or a timeout swaps nothing; both must reach the panel,
+    // and htmx has no timeout unless the page sets one.
+    CHECK(page.find("addEventListener('htmx:sendError'") != std::string::npos);
+    CHECK(page.find("addEventListener('htmx:timeout'") != std::string::npos);
+    CHECK(page.find("htmx.config.timeout") != std::string::npos);
     // CSP forbids hx-on; the page also carries no inline handler attributes.
     CHECK(page.find("hx-on") == std::string::npos);
     CHECK(page.find(" onclick=") == std::string::npos);
