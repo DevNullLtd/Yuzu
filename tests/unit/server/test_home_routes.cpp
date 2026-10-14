@@ -11,11 +11,12 @@
 
 #include <atomic>
 #include <filesystem>
-#include <future>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -352,6 +353,9 @@ TEST_CASE("summary: the TOP estate read is cached 60 s on the server clock", "[h
     REQUIRE(hit);
     CHECK(estate_calls == 1);
     CHECK(has(hit->body, "of 101 seen in the last 30 days"));
+    // The panels are stamped with the view time, not the time the cached figure was read.
+    CHECK(has(hit->body, "As of " + hhmm_utc(now)));
+    CHECK_FALSE(has(hit->body, "As of " + hhmm_utc(now - 59)));
     now += 1; // 60 s after the read
     auto miss = sink.Get("/fragments/home/summary");
     REQUIRE(miss);
@@ -414,9 +418,23 @@ TEST_CASE("summary: a failed TOP estate read is never a figure and backs off bri
 
 // Kills: viewers queued behind a failing read each retrying it serially (the lock is held
 // across the read), so the last waits N x the failure latency with a worker held throughout.
+// The in-flight read is held until every viewer has passed the Inventory gate, i.e. is about
+// to enter the cache. A viewer descheduled between the gate and the lock can still miss the
+// window, so removing the lock is killed with overwhelming probability, never a false fail.
 TEST_CASE("summary: viewers queued behind a failing TOP estate read share its failure",
           "[home][route][cache]") {
+    constexpr int kViewers = 4;
     Deps d = top_deps(); // fixed clock
+    std::atomic<int> at_gate{0};
+    d.fleet_read_fn = [&](const httplib::Request&, httplib::Response&, const std::string& securable,
+                          const std::string&) {
+        if (securable == "Inventory")
+            at_gate.fetch_add(1);
+        authz::FleetReadGate g;
+        g.admitted = true;
+        g.scope = std::nullopt;
+        return g;
+    };
     std::atomic<int> estate_calls{0};
     std::promise<void> entered, release;
     auto release_gate = release.get_future().share();
@@ -435,12 +453,64 @@ TEST_CASE("summary: viewers queued behind a failing TOP estate read share its fa
     std::vector<std::future<std::string>> viewers;
     viewers.push_back(std::async(std::launch::async, view));
     entered.get_future().wait();
-    for (int i = 0; i < 3; ++i)
+    for (int i = 1; i < kViewers; ++i)
         viewers.push_back(std::async(std::launch::async, view));
+    while (at_gate.load() < kViewers)
+        std::this_thread::yield();
     release.set_value();
     for (auto& v : viewers)
         CHECK(has(v.get(), "Could not read The device roster. This is not zero."));
     CHECK(estate_calls.load() == 1);
+}
+
+// Kills: the failure being stamped when the read STARTED, so a slow failure's backoff has
+// already lapsed by the time the viewers queued behind it get the lock and each retries.
+TEST_CASE("summary: the failure backoff starts when a slow failed read ends", "[home][route][cache]") {
+    Deps d = top_deps();
+    std::int64_t now = 1'760'000'000;
+    d.now_fn = [&] { return now; };
+    int estate_calls = 0;
+    d.fleet_estate_fn = [&](std::int64_t) -> std::optional<EstateCounts> {
+        ++estate_calls;
+        now += 2 * kEstateFailBackoffSecs; // the read itself outlasts the backoff window
+        return std::nullopt;
+    };
+    HomeRoutes r;
+    test::TestRouteSink sink;
+    r.register_routes(sink, std::move(d));
+    REQUIRE(sink.Get("/fragments/home/summary"));
+    REQUIRE(estate_calls == 1);
+    auto queued = sink.Get("/fragments/home/summary"); // a viewer that got the lock after it
+    REQUIRE(queued);
+    CHECK(estate_calls == 1);
+    CHECK(has(queued->body, "Could not read The device roster. This is not zero."));
+}
+
+// Kills: cache or backoff state shared between instances (a static or global), which would
+// make replicas' views of one process-local fact interfere.
+TEST_CASE("summary: the estate cache is instance-local", "[home][route][cache]") {
+    int calls_a = 0, calls_b = 0;
+    auto make = [](int& calls, std::int64_t total) {
+        Deps d = top_deps();
+        d.fleet_estate_fn = [&calls, total](std::int64_t) -> std::optional<EstateCounts> {
+            ++calls;
+            return EstateCounts{total, total, 0, 0};
+        };
+        return d;
+    };
+    HomeRoutes a, b;
+    test::TestRouteSink sink_a, sink_b;
+    a.register_routes(sink_a, make(calls_a, 111));
+    b.register_routes(sink_b, make(calls_b, 222));
+    auto fa = sink_a.Get("/fragments/home/summary");
+    auto fb = sink_b.Get("/fragments/home/summary");
+    REQUIRE(fa);
+    REQUIRE(fb);
+    CHECK(sink_a.Get("/fragments/home/summary"));
+    CHECK(calls_a == 1);
+    CHECK(calls_b == 1);
+    CHECK(has(fa->body, "of 111 seen"));
+    CHECK(has(fb->body, "of 222 seen"));
 }
 
 // Kills: a cache that cannot expire because there is no clock to expire it on.
