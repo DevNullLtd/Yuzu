@@ -2084,7 +2084,7 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     }
 
     // Assignment (deferred until management groups land).
-    h += "<div class=\"gp-sech\">Assignment <span class=\"gp-mute\">"
+    h += "<div class=\"gp-sech\">Assignment <span class=\"gp-mute gp-reg\">"
          "(management groups)</span></div>";
     if (assign.empty()) {
         h += "<div class=\"gp-placeholder\"><b>Targeting not available yet</b>"
@@ -2354,7 +2354,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
              "to Enforce and a remediation-effectiveness block appears here.</div>";
 
     // Per-device census (filterable, on-demand).
-    h += "<div class=\"gp-sech\">Per-device status <span class=\"gp-mute\">"
+    h += "<div class=\"gp-sech\">Per-device status <span class=\"gp-mute gp-reg\">"
          "&mdash; on-demand census</span></div>";
     if (d_total == 0) {
         h += "<div class=\"gp-note\">No device reports yet.</div>";

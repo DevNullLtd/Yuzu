@@ -47,7 +47,7 @@ const char* const kGuardianDetailPageTemplate =
     .gp-actions { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
 
     .gp-sech { font-size: 14px; font-weight: 600; color: var(--ink); margin: 22px 0 8px; }
-    .gp-sech .gp-mute { font-weight: 400; }
+    .gp-sech .gp-reg { font-weight: 400; }
     .gp-note { font-size: 12.5px; color: var(--mut); margin-top: 8px; }
     .gp-note b { color: var(--ink); font-weight: 600; }
 
