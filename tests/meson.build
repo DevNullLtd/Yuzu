@@ -1583,6 +1583,9 @@ if build_server
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
       'unit/server/test_webhook_routes.cpp',
+      'unit/server/test_integrations_url_policy.cpp', # SYS-5: outbound URL policy + mapping audit detail (pure)
+      'unit/server/test_integrations_sync_render.cpp', # SYS-5: webhook / offload / directory-sync panel renderers (pure)
+      'unit/server/test_integrations_sync_routes.cpp', # SYS-5: the six fragments + controller script pins (TestRouteSink)
       'unit/server/test_migration_runner.cpp',
       'unit/server/test_rate_limiter.cpp',
       'unit/server/test_cert_reloader.cpp',

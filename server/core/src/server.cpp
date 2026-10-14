@@ -264,6 +264,7 @@
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
 #include "notification_routes.hpp"
+#include "integrations_sync_routes.hpp"
 #include "offload_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
@@ -15678,6 +15679,23 @@ private:
                              .auto_approve = &auto_approve_,
                              .runtime_config_store = runtime_config_store_.get(),
                          });
+
+        // System pages (SYS-5): the six Integrations read fragments (webhooks,
+        // offload targets, directory sync) and the page controller script.
+        // Reads only; every write the page makes goes to the existing JSON
+        // routes with their own gates. `admin_fn` is `require_admin`, the same
+        // gate every Settings fragment uses.
+        {
+            auto sync_deps = yuzu::server::integrations::bind_stores(
+                webhook_store_.get(), offload_target_store_.get(), directory_sync_.get(),
+                rbac_store_.get());
+            sync_deps.admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
+                return require_admin(req, res);
+            };
+            sync_deps.audit_read = audit_fn;
+            yuzu::server::integrations::register_integrations_sync_routes(inline_sink,
+                                                                           std::move(sync_deps));
+        }
 
         // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API.
         // `forward_legacy_command_fn` wraps the ServerImpl-private
