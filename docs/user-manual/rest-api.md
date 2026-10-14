@@ -327,7 +327,7 @@ All endpoints are under the `/api/v1/` prefix.
 
 #### `GET /api/v1/me`
 
-Returns the authenticated user's identity and role.
+Returns the authenticated user's identity, role and what the server will honour for this session.
 
 **Permission:** Authenticated session (no specific RBAC permission required).
 
@@ -336,12 +336,32 @@ Returns the authenticated user's identity and role.
 ```json
 {
   "data": {
-    "username": "admin",
-    "role": "admin"
+    "username": "alice",
+    "display_name": "Alice",
+    "role": "user",
+    "rbac_enabled": false,
+    "rbac_role": "Viewer",
+    "effective_role": "admin",
+    "elevated": true,
+    "elevated_until": "2026-10-13T22:31:54Z",
+    "can_access_settings": true
   },
   "meta": { "api_version": "v1" }
 }
 ```
+
+| Field | Meaning |
+|---|---|
+| `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. |
+| `effective_role` | The role the server enforces now: `admin` while a just-in-time elevation is active, otherwise `role`. |
+| `elevated` | `true` while a just-in-time elevation is active. Always `false` for API, MCP and service-scoped tokens. |
+| `elevated_until` | End of the elevation window, ISO-8601 UTC. Present only when `elevated` is `true`. |
+| `can_access_settings` | `true` when `GET /settings` would render for this session. MCP-tier and service-scoped tokens are always `false`. A display hint only: every route is still gated server-side. |
+
+The response is sent with `Cache-Control: no-store, private`. During a rolling
+upgrade an older replica omits the four new fields; clients should treat a
+missing `can_access_settings` as `false`. `GET /api/me` returns the same keys
+without the `data` envelope.
 
 ---
 

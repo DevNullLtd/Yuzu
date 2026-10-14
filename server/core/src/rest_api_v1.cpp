@@ -61,6 +61,7 @@
 #include "password_policy.hpp"       // #5342 — check_password_policy for the password routes
 #include "credential_change_owner.hpp" // #5342 — CredentialChangeRequest/Outcome (the one-transaction write)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
+#include "admin_gate.hpp"
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_catalogue_model.hpp" // shared REST+MCP software catalogue model
@@ -873,7 +874,7 @@ const std::string& openapi_spec() {
   "security": [{"bearerAuth": [], "apiKeyHeader": [], "cookieAuth": []}],
   "paths": {
     "/me": {
-      "get": {"summary": "Get current user info", "tags": ["Authentication"], "responses": {"200": {"description": "Current user details"}}}
+      "get": {"summary": "Get current user info (adds effective_role, elevated, elevated_until, can_access_settings)", "tags": ["Authentication"], "responses": {"200": {"description": "Current user details"}}}
     },
     "/devices": {
       "get": {"summary": "Fleet device list (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check). Row shape matches the pre-existing MCP list_agents tool exactly: agent_id/hostname/os/arch/agent_version, 5 fields, sourced from the live AgentRegistry. devices_omitted counts agents dropped by the caller's management-group/service-scope confinement (0 = unfiltered or nothing dropped). Not audited on success (device identity is machine metadata, not behavioural PII) — require_fleet_read itself audits every denial path internally.", "responses": {"200": {"description": "{data: {devices[], count, devices_omitted}, pagination, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "503": {"description": "Route misconfigured (fleet_read_fn/device registry unwired) or authorization store unavailable"}}}
@@ -2815,6 +2816,19 @@ void RestApiV1::register_routes(
             data.add("rbac_enabled", false);
             data.add("rbac_role", session->role == auth::Role::admin ? "Administrator" : "Viewer");
         }
+        // Same session self-description as legacy GET /api/me (#5779, #4208).
+        const bool elevated = auth::is_elevated(*session);
+        data.add("effective_role", auth::role_to_string(auth::effective_role(*session)))
+            .add("elevated", elevated);
+        if (elevated) {
+            data.add("elevated_until",
+                     format_iso_utc(std::chrono::duration_cast<std::chrono::seconds>(
+                                        session->elevated_until.time_since_epoch())
+                                        .count()));
+        }
+        data.add("can_access_settings",
+                 authz::admin_gate_verdict(*session) == authz::AdminGate::Admit);
+        res.set_header("Cache-Control", "no-store, private");
         res.set_content(ok_json(data.str()), "application/json");
     });
 

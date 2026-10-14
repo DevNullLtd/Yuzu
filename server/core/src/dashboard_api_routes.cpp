@@ -1,5 +1,6 @@
 #include "dashboard_api_routes.hpp"
 
+#include "admin_gate.hpp"
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
 #include "data_export.hpp"
@@ -7,6 +8,7 @@
 #include "json_extract.hpp" // extract_json_string — shared JSON body-extraction helper
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
+#include "web_utils.hpp"
 
 #include <exception>
 #include <stdexcept>
@@ -59,6 +61,21 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             j["rbac_enabled"] = false;
             j["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
         }
+        // Session self-description (#5779, #4208). `role` stays the persisted
+        // role; these report what the server will actually honour. No store
+        // read and no gate call, so no audit row per page load.
+        const bool elevated = auth::is_elevated(*session);
+        j["effective_role"] = auth::role_to_string(auth::effective_role(*session));
+        j["elevated"] = elevated;
+        if (elevated) {
+            j["elevated_until"] = format_iso_utc(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    session->elevated_until.time_since_epoch())
+                    .count());
+        }
+        j["can_access_settings"] =
+            authz::admin_gate_verdict(*session) == authz::AdminGate::Admit;
+        res.set_header("Cache-Control", "no-store, private");
         res.set_content(j.dump(), "application/json");
     });
 

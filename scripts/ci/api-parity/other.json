@@ -300,7 +300,7 @@
     "method": "GET",
     "path": "/api/me",
     "capability_id": "get.api-me",
-    "rest_v1_twin": null,
+    "rest_v1_twin": {"method": "GET", "path": "/api/v1/me"},
     "mcp_twin": null,
     "status": "planned:#2146"
   },

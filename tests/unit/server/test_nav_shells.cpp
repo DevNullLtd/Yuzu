@@ -195,9 +195,14 @@ TEST_CASE("app shell: keeps the identity hooks, Sign out and the admin-only Sett
     CHECK_THAT(html, ContainsSubstring("href=\"/settings\" id=\"nav-settings-link\""));
     // Sign out posts to /logout through htmx, as the old nav's Logout button did.
     CHECK_THAT(html, ContainsSubstring("<button class=\"shell-out\" type=\"button\" hx-post=\"/logout\">Sign out</button>"));
-    // The same /api/me read + non-admin rule the pages used to carry.
+    // The Settings link follows the server's own page-gate decision, never a
+    // client-side role guess; it is hidden before the fetch and on any failure.
     CHECK_THAT(html, ContainsSubstring("fetch('/api/me')"));
-    CHECK_THAT(html, ContainsSubstring("d.role!=='admin'&&role!=='Administrator'&&role!=='PlatformEngineer'"));
+    CHECK_THAT(html, ContainsSubstring("d.can_access_settings===true"));
+    CHECK_THAT(html, !ContainsSubstring("PlatformEngineer"));
+    CHECK_THAT(html, !ContainsSubstring("d.role!=='admin'"));
+    CHECK(html.find("settings(false);") < html.find("fetch('/api/me')"));
+    CHECK_THAT(html, ContainsSubstring(".catch(function(){})"));
 }
 
 TEST_CASE("app shell: breadcrumb text is HTML-escaped", "[nav][shell]") {

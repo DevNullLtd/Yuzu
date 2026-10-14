@@ -270,16 +270,16 @@ html body{padding-left:0}
 constexpr std::string_view kShellScript = R"JS(<script>
 (function(){
   function el(i){return document.getElementById(i);}
+  var sl=el('nav-settings-link'), sg=sl&&sl.closest?sl.closest('.shell-grp'):null;
+  function settings(on){if(sl)sl.style.display=on?'':'none';if(sg)sg.style.display=on?'':'none';}
+  settings(false);
   fetch('/api/me').then(function(r){return r.json();}).then(function(d){
     var name=d.display_name||d.username||'', role=d.rbac_role||d.role||'';
     el('nav-user').textContent=name;
     el('context-user').textContent=name;
     el('role-badge').textContent=role;
     document.body.setAttribute('data-role',role);
-    if(d.role!=='admin'&&role!=='Administrator'&&role!=='PlatformEngineer'){
-      var sl=el('nav-settings-link');
-      if(sl){sl.style.display='none';var g=sl.closest('.shell-grp');if(g)g.style.display='none';}
-    }
+    settings(d.can_access_settings===true);
   }).catch(function(){});
 
   function openPalette(){

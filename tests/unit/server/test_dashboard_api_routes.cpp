@@ -17,6 +17,8 @@
 ///     round-trip, and the real `/api/analytics/{status,recent}` shapes are
 ///     `[pg]`, gated behind YUZU_TEST_POSTGRES_DSN.
 
+#include <chrono>
+
 #include "dashboard_api_routes.hpp"
 #include "test_route_sink.hpp"
 
@@ -56,6 +58,9 @@ struct Harness {
     bool session_present{true};
     std::string session_username{"alice"};
     auth::Role session_role{auth::Role::user};
+    std::string session_mcp_tier;
+    std::string session_scope_service;
+    bool session_elevated{false};
 
     RbacStore* rbac_store{nullptr};
     AuditStore* audit_store{nullptr};
@@ -96,6 +101,12 @@ struct Harness {
             auth::Session s;
             s.username = session_username;
             s.role = session_role;
+            s.mcp_tier = session_mcp_tier;
+            s.token_scope_service = session_scope_service;
+            if (session_elevated) {
+                s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+                s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
+            }
             return s;
         };
         deps.visible_agents_json_fn = [this](const std::string& username) {
@@ -148,6 +159,44 @@ TEST_CASE("dashboard_api_routes: /api/me reports session info with rbac_enabled:
     CHECK(j["display_name"] == "alice"); // falls back to username when unset
     CHECK(j["rbac_enabled"] == false);
     CHECK(j["rbac_role"] == "Administrator");
+}
+
+TEST_CASE("dashboard_api_routes: /api/me self-description per persona (#5779, #4208)",
+          "[server][routes][dashboard_api_routes]") {
+    struct Row {
+        auth::Role role;
+        bool elevated;
+        const char* mcp_tier;
+        const char* scope;
+        const char* effective;
+        bool can_access;
+    };
+    const Row rows[] = {
+        {auth::Role::admin, false, "", "", "admin", true},
+        {auth::Role::user, false, "", "", "user", false},
+        {auth::Role::user, true, "", "", "admin", true},
+        {auth::Role::admin, false, "operator", "", "admin", false},
+        {auth::Role::user, false, "", "finance", "user", false},
+    };
+    for (const auto& row : rows) {
+        Harness h;
+        h.session_role = row.role;
+        h.session_elevated = row.elevated;
+        h.session_mcp_tier = row.mcp_tier;
+        h.session_scope_service = row.scope;
+        h.wire();
+        auto r = h.sink.Get("/api/me");
+        REQUIRE(r);
+        auto j = json::parse(r->body);
+        CHECK(j["role"] == auth::role_to_string(row.role));
+        CHECK(j["effective_role"] == row.effective);
+        CHECK(j["elevated"] == row.elevated);
+        CHECK(j.contains("elevated_until") == row.elevated);
+        CHECK(j["can_access_settings"] == row.can_access);
+        CHECK(r->get_header_value("Cache-Control") == "no-store, private");
+        // Reporting is a pure read of the session: no gate is consulted.
+        CHECK(h.last_perm_type.empty());
+    }
 }
 
 TEST_CASE("dashboard_api_routes: /api/me falls back to the legacy-role mapping for a Viewer "
