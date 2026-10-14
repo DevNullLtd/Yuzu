@@ -747,4 +747,4 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 .att-rowb b { color: var(--ink); font-weight: 500; }
 .att-row .sd { flex: 0 0 auto; margin-right: 0; }
 .dash .panel > .att-list { flex: 1; }
-@media (max-width: 1140px) { .dash .rw { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 1140px) { .dash .rw, .dash .rw.t3 { grid-template-columns: minmax(0, 1fr); } }

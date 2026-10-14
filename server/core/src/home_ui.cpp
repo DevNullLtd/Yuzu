@@ -83,7 +83,7 @@ constexpr std::string_view kHead = R"HTM(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu</title>
-<link rel="stylesheet" href="/static/yuzu.css">
+<link rel="icon" href="data:,"><link rel="stylesheet" href="/static/yuzu.css">
 <script src="/static/htmx.js"></script>
 </head><body>
 <div class="land">

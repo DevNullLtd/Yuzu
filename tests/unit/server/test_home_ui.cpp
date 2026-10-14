@@ -329,4 +329,6 @@ TEST_CASE("landing: every page piece is under the MSVC literal cap and the page 
     const std::string html = home_ui::render_landing(signed_out());
     CHECK(count_of(html, "<style") == 0);
     CHECK(count_of(html, "<link rel=\"stylesheet\" href=\"/static/yuzu.css\">") == 1);
+    // An empty icon, so a visitor's browser does not log a 404 for /favicon.ico on the first page.
+    CHECK(count_of(html, "<link rel=\"icon\" href=\"data:,\">") == 1);
 }

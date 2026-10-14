@@ -15,6 +15,9 @@
 #include <vector>
 
 extern const char* const kDashboardIndexHtml;
+namespace yuzu::server {
+extern const std::string kYuzuCss; // server/core/static/yuzu.css (build-time embed)
+} // namespace yuzu::server
 
 namespace {
 
@@ -193,4 +196,17 @@ TEST_CASE("dashboard page: every template part is pinned under the MSVC literal 
         CHECK(src.find("static_assert(sizeof(" + n + ") < kPartCap") != std::string::npos);
     }
     CHECK(src.find("constexpr std::size_t kPartCap = 15000;") != std::string::npos);
+}
+
+// Kills: the equal-thirds row (.rw.t3, specificity 3 classes) keeping its auto-fit columns
+// under 1140px because the stacking rule only named `.rw` (seen in a 1100px browser run:
+// two columns of 300px instead of one).
+TEST_CASE("dashboard rows: every row, including the three-equal one, stacks under 1140px",
+          "[dashboard][ui]") {
+    const std::string css = yuzu::server::kYuzuCss;
+    const auto at = css.find("@media (max-width: 1140px)");
+    REQUIRE(at != std::string::npos);
+    const auto rule = css.substr(at, css.find('}', css.find('}', at) + 1) - at);
+    CHECK(rule.find(".dash .rw.t3") != std::string::npos);
+    CHECK(rule.find("grid-template-columns: minmax(0, 1fr)") != std::string::npos);
 }
