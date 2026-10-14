@@ -5403,7 +5403,13 @@ corresponding webhook's secret via this store first.
 payload is transmitted in cleartext. Production deployments should use `https://` only. The
 store accepts `http://` for development convenience — same posture as Offload Targets below.
 
-**Errors.** `400` for an empty/missing `url`, invalid JSON, or a URL that isn't `http://`/`https://`.
+**URL rules.** A URL with embedded credentials (`https://user:pass@host`) or with control bytes
+(CR, LF, NUL) in the URL or in `event_types` is refused with `400` and nothing is stored. The
+`webhook.created` analytics event carries the scheme and host only; the audit row keeps the full
+URL. The same hooks are managed from **Settings > Integrations**, which calls this route.
+
+**Errors.** `400` for an empty/missing `url`, invalid JSON, a URL that isn't `http://`/`https://`,
+or a URL with embedded credentials or control bytes.
 `503` for a store/database degradation. Every error response is audited (`webhook.create`,
 result `failure`, a distinct detail string per cause).
 
@@ -5439,7 +5445,7 @@ A target is identified by a unique `name` so a definition can reference it via `
 
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — same caveat as the Webhooks section above, and the same event-type table, since both sinks fire off the identical set of events. A target wired to a low-tolerance channel should filter or debounce on the receiving end if reconnect noise matters.
 
-All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`, not even as the encrypted-at-rest blob) — a `has_credential` boolean instead reports whether one is configured. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`.
+All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`, not even as the encrypted-at-rest blob) — a `has_credential` boolean instead reports whether one is configured. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`. The create row's detail is `name=<name> url=<url>`, the same shape as the delete row. A `url` with embedded `user:password@` is refused with `400`. These targets are also managed from **Settings > Integrations**, which calls these routes.
 
 #### `GET /api/v1/offload-targets`
 
@@ -5527,7 +5533,7 @@ AD/Entra directory integration (Phase 7). Backed by `DirectorySync` (`directory_
 
 #### `POST /api/directory/sync`
 
-Trigger a directory sync. Requires `Directory:Write`.
+Trigger a directory sync. Requires `Directory:Write`. Also available from **Settings > Integrations > Directory sync**, which sends the tenant, client and secret for that one request and never stores them. A `400` (missing credentials) and a `500` (sync failed) are audited as `directory.sync` with result `failure`; the `500` row carries a fixed detail, not the upstream error text.
 
 **Request (`provider: "entra"`):**
 
@@ -5579,6 +5585,8 @@ Configure group-to-role mappings (which RBAC role a synced group's members recei
 **Response (400):** malformed body, or a missing `mappings` array.
 
 **Response (503):** `directory_sync` unavailable.
+
+**Audit:** `directory.group_mapping.update` records the pairs (`N mappings updated: <group_id>=<role>, <group_id>=(removed)`), bounded and with control bytes replaced. Mappings are recorded for reference; nothing reads them at sign-in. The write helpers swallow store failures and the route still answers `200`, so a client that needs certainty compares the echoed set with what it sent (the Integrations page does).
 
 #### `GET /api/v1/directory/users`
 
