@@ -25,6 +25,12 @@ constexpr NavItem kSoftwareSub[] = {
 constexpr NavItem kFleetSub[] = {
     {.key = "network", .label = "Network", .href = "/network"},
 };
+// System pages, in the design's artboard order. Own entries only, and only for pages that
+// exist: each System page adds its line here when it lands. The parent keeps `/settings`
+// (the monolith), so no child repeats the parent's href.
+constexpr NavItem kSettingsSub[] = {
+    {.key = "settings-general", .label = "General", .href = "/settings/general"},
+};
 
 constexpr NavItem kOperate[] = {
     {.key = "dashboard", .label = "Dashboard", .href = "/", .icon = "M4 17l6-6-6-6 M12 19h8"},
@@ -75,6 +81,7 @@ constexpr NavItem kSystem[] = {
      .label = "Settings",
      .href = "/settings",
      .icon = "M4 6h10 M18 6h2 M4 12h4 M12 12h8 M4 18h12 M14 4v4 M10 10v4 M16 16v4",
+     .children = kSettingsSub,
      .admin_only = true},
 };
 
