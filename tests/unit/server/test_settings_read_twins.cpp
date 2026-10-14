@@ -39,6 +39,7 @@
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -213,6 +214,42 @@ TEST_CASE("GET /api/v1/settings/server-config returns the A4 envelope and Server
 
     auto body = nlohmann::json::parse(res->body);
     CHECK(body.at("data").at("max_agents").get<std::int64_t>() == 12345);
+}
+
+TEST_CASE("server-config twin and fragment carry the sign-in limits and the true heartbeat label",
+          "[settings][rest][settings-read-twins][general]") {
+    SettingsReadTwinsHarness h;
+    h.cfg.session_timeout = std::chrono::seconds(75);
+    h.cfg.session_inactivity_secs = 900;
+
+    auto json = h.sink.Get("/api/v1/settings/server-config");
+    REQUIRE(json);
+    const auto data = nlohmann::json::parse(json->body).at("data");
+    // The lifetime is the AuthManager constant (8 h), supplied by the route, not by Config.
+    CHECK(data.at("session_absolute_lifetime_seconds").get<std::int64_t>() == 8 * 3600);
+    CHECK(data.at("session_inactivity_seconds").get<std::int64_t>() == 900);
+    CHECK(data.at("session_timeout_seconds").get<std::int64_t>() == 75);
+
+    auto frag = h.sink.Get("/fragments/settings/server-config");
+    REQUIRE(frag);
+    CHECK(frag->status == 200);
+    // The row that was labelled "Session Timeout" is the agent window, and says so.
+    CHECK(frag->body.find("Session Timeout") == std::string::npos);
+    CHECK(frag->body.find("<td>Agent heartbeat timeout</td><td><code>75s</code>") !=
+          std::string::npos);
+    CHECK(frag->body.find("<td>Dashboard idle timeout</td><td><code>900s</code>") !=
+          std::string::npos);
+    CHECK(frag->body.find("<td>Dashboard session lifetime</td><td><code>28800s</code>") !=
+          std::string::npos);
+}
+
+TEST_CASE("server-config fragment says the idle timeout is off when it is 0",
+          "[settings][rest][settings-read-twins][general]") {
+    SettingsReadTwinsHarness h;
+    h.cfg.session_inactivity_secs = 0;
+    auto frag = h.sink.Get("/fragments/settings/server-config");
+    REQUIRE(frag);
+    CHECK(frag->body.find("<td>Dashboard idle timeout</td><td>Off</td>") != std::string::npos);
 }
 
 TEST_CASE("GET /api/v1/settings/mcp returns the A4 envelope and ServerConfig:Read",

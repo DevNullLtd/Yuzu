@@ -17,6 +17,7 @@
 #include "settings_model.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 
 #include <yuzu/server/server.hpp>
 
@@ -407,8 +408,10 @@ TEST_CASE("build_server_config_settings reflects Config verbatim", "[settings][s
     cfg.web_port = 8080;
     cfg.max_agents = 12345;
     cfg.rate_limit = 100;
+    cfg.session_timeout = std::chrono::seconds(45);
+    cfg.session_inactivity_secs = 900;
 
-    auto j = sm::build_server_config_settings(cfg);
+    auto j = sm::build_server_config_settings(cfg, 28800);
 
     CHECK(j.at("agent_grpc_address").get<std::string>() == "0.0.0.0:50051");
     CHECK(j.at("management_grpc_address").get<std::string>() == "0.0.0.0:50052");
@@ -416,6 +419,11 @@ TEST_CASE("build_server_config_settings reflects Config verbatim", "[settings][s
     CHECK(j.at("web_port").get<int>() == 8080);
     CHECK(j.at("max_agents").get<std::int64_t>() == 12345);
     CHECK(j.at("rate_limit_per_ip").get<int>() == 100);
+    // The agent heartbeat window keeps its frozen key; the sign-in limits are separate fields.
+    CHECK(j.at("session_timeout_seconds").get<std::int64_t>() == 45);
+    CHECK(j.at("session_inactivity_seconds").get<std::int64_t>() == 900);
+    // A caller input, not a Config field (the builder has no auth dependency).
+    CHECK(j.at("session_absolute_lifetime_seconds").get<std::int64_t>() == 28800);
 }
 
 // ── build_plugin_signing_settings ─────────────────────────────────────────

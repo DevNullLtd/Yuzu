@@ -4999,6 +4999,13 @@ Erlang gateway upstream status: enabled state, listen address, gateway mode, liv
 Core server configuration: gRPC/web addresses and ports, session timeout, max agents, rate limits,
 OTA/gRPC tuning knobs. Nothing secret.
 
+`session_timeout_seconds` is the **agent heartbeat timeout**: the number of seconds without a
+heartbeat after which this server drops a directly connected agent. It is not the dashboard sign-in
+expiry. The sign-in limits are `session_inactivity_seconds` (the `--session-inactivity-secs` idle
+timeout; `0` means off) and `session_absolute_lifetime_seconds` (the fixed sign-in lifetime, 8 hours).
+The heartbeat timeout can be changed at runtime with `PUT /api/config/heartbeat_timeout`; the two
+sign-in limits cannot.
+
 **Permission:** `ServerConfig:Read`. **Audit:** none.
 
 ```json
@@ -5008,7 +5015,9 @@ OTA/gRPC tuning knobs. Nothing secret.
     "management_grpc_address": "0.0.0.0:50052",
     "web_address": "127.0.0.1",
     "web_port": 8080,
-    "session_timeout_seconds": 3600,
+    "session_timeout_seconds": 90,
+    "session_inactivity_seconds": 0,
+    "session_absolute_lifetime_seconds": 28800,
     "max_agents": 10000,
     "auth_config_path": "/etc/yuzu/yuzu-server.cfg",
     "rate_limit_per_ip": 100,

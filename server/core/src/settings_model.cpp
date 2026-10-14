@@ -179,13 +179,16 @@ nlohmann::json build_gateway_settings(const Config& cfg, bool gateway_enabled,
     return j;
 }
 
-nlohmann::json build_server_config_settings(const Config& cfg) {
+nlohmann::json build_server_config_settings(const Config& cfg,
+                                            std::int64_t session_absolute_lifetime_seconds) {
     nlohmann::json j;
     j["agent_grpc_address"] = cfg.listen_address;
     j["management_grpc_address"] = cfg.management_address;
     j["web_address"] = cfg.web_address;
     j["web_port"] = cfg.web_port;
     j["session_timeout_seconds"] = static_cast<std::int64_t>(cfg.session_timeout.count());
+    j["session_inactivity_seconds"] = static_cast<std::int64_t>(cfg.session_inactivity_secs);
+    j["session_absolute_lifetime_seconds"] = session_absolute_lifetime_seconds;
     j["max_agents"] = static_cast<std::int64_t>(cfg.max_agents);
     j["auth_config_path"] = cfg.auth_config_path.string();
     j["rate_limit_per_ip"] = cfg.rate_limit;
