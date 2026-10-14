@@ -1390,6 +1390,7 @@ if build_server
       'unit/server/test_command_routes.cpp',
       'unit/server/test_page_routes.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
+      'unit/server/test_access_render.cpp', # Access pages (Phase 2): Users list + Account panel renderers
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
