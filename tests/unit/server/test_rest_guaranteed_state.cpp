@@ -3395,14 +3395,10 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         h.fleet_rows_ = {mk("124.0.0.0", 12), mk("125.0.0.0", 15)};
         yuzu::server::AppPerfVersionFailureRow f124;
         f124.version = "124.0.0.0";
-        f124.exposure_devices = 12;
+        f124.exposure_devices = 9; // under the old device floor: published all the same
         f124.crashes = 7;
         f124.hangs = 1;
-        f124.affected_devices = 5; // under the floor: counts withheld
-        f124.crash_devices = 5;
-        f124.hang_devices = 1;
-        f124.exposed_crash_devices = 3;
-        f124.exposed_hang_devices = 1;
+        f124.affected_devices = 5;
         f124.exposed_crashes = 4;
         f124.exposed_hangs = 1;
         yuzu::server::AppPerfVersionFailureRow f125;
@@ -3413,10 +3409,6 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         f125.affected_devices = 14;
         f125.exposed_crashes = 10;
         f125.exposed_hangs = 2;
-        f125.crash_devices = 14; // every affected device is exposed: both totals shown
-        f125.hang_devices = 14;
-        f125.exposed_crash_devices = 14;
-        f125.exposed_hang_devices = 14;
         h.failure_rows_ = {f124, f125};
         auto res = h.sink.Get("/api/v1/dex/perf/app?app=chrome.exe");
         REQUIRE(res);
@@ -3440,17 +3432,23 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         const auto& v125 = j["data"]["versions"][0];
         CHECK(v125["version"].get<std::string>() == "125.0.0.0");
         CHECK(v125["previous_version"].get<std::string>() == "124.0.0.0");
-        CHECK(v125["below_floor"] == false);
+        CHECK_FALSE(v125.contains("below_floor"));
+        CHECK_FALSE(v125.contains("exposure_below_floor"));
         CHECK(v125["crashes"] == 10);
         CHECK(v125["exposure_devices"] == 15);
         CHECK(v125["failure_rate"]["estimate"].get<double>() == Catch::Approx(0.8));
-        CHECK(v125["failure_rate_ratio"]["estimate"].get<double>() == Catch::Approx(1.92));
+        // (12/15) / (5/9): the 9-device arm is published, not withheld.
+        CHECK(v125["failure_rate_ratio"]["estimate"].get<double>() == Catch::Approx(1.44));
         CHECK(v125["failure_rate_ratio"]["unbounded"] == false);
         const auto& v124 = j["data"]["versions"][1];
-        CHECK(v124["below_floor"] == true);
+        CHECK_FALSE(v124.contains("below_floor"));
         CHECK(v124["affected_devices"] == 5);
-        CHECK_FALSE(v124.contains("crashes"));
-        CHECK_FALSE(v124.contains("hangs")); // 1 hanging device: its own cohort is under the floor
+        CHECK(v124["crashes"] == 7);
+        CHECK(v124["hangs"] == 1); // one hanging device, still published
+        CHECK(v124["exposure_devices"] == 9);
+        CHECK(v124["exposed_crashes"] == 4);
+        CHECK(v124["exposed_hangs"] == 1);
+        CHECK(v124["failure_rate"]["estimate"].get<double>() == Catch::Approx(5.0 / 9.0));
         CHECK(v124["previous_version"].is_null());
         CHECK(v124["failure_rate_ratio"].is_null());
     }

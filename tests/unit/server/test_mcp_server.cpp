@@ -9815,20 +9815,17 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
         -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
         return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)}; // >= kDexCohortFloor
     };
-    // One version, exposure 20 devices, 12 affected devices (6 crashes + 3 hangs
-    // fleet-wide), all 9 events on exposed devices.
+    // One version, exposure 3 devices (published all the same: the join carries no
+    // device floor), 2 affected devices (6 crashes + 3 hangs fleet-wide), all 9
+    // events on exposed devices.
     yuzu::server::AppPerfVersionFailureRow failure_row;
     failure_row.version = "124.0";
-    failure_row.exposure_devices = 20;
+    failure_row.exposure_devices = 3;
     failure_row.crashes = 6;
     failure_row.hangs = 3;
-    failure_row.affected_devices = 12;
+    failure_row.affected_devices = 2;
     failure_row.exposed_crashes = 6;
     failure_row.exposed_hangs = 3;
-    failure_row.crash_devices = 12;
-    failure_row.hang_devices = 12;
-    failure_row.exposed_crash_devices = 12;
-    failure_row.exposed_hang_devices = 12;
     ts.app_perf_providers_for_test.failures =
         [failure_row](std::string_view, const std::vector<std::string>&, std::int64_t,
                       std::int64_t, std::string_view)
@@ -9883,10 +9880,14 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     REQUIRE(fleet["versions"].size() == 1);
     CHECK(fleet["versions"] ==
           nlohmann::json::parse(yuzu::server::dex_app_perf_versions_json(expected_report)));
-    CHECK(fleet["versions"][0]["exposure_devices"] == 20);
+    CHECK(fleet["versions"][0]["exposure_devices"] == 3);
     CHECK(fleet["versions"][0]["crashes"] == 6);
+    CHECK(fleet["versions"][0]["hangs"] == 3);
+    CHECK(fleet["versions"][0]["exposed_crashes"] == 6);
+    CHECK_FALSE(fleet["versions"][0].contains("below_floor"));
+    CHECK_FALSE(fleet["versions"][0].contains("exposure_below_floor"));
     CHECK(fleet["versions"][0]["failure_rate"]["estimate"].get<double>() ==
-          Catch::Approx(9.0 / 20.0));
+          Catch::Approx(9.0 / 3.0));
     CHECK(fleet["versions"][0]["failure_rate_ratio"].is_null()); // a single version
     CHECK(fleet["versions_truncated"] == false);
     CHECK(fleet["failure_window_days"] == 30);
@@ -9928,11 +9929,8 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
               {"upper", number_or_null},
               {"unbounded", {{"type", "boolean"}}},
               {"reliable", {{"type", "boolean"}}}}}};
-        const nlohmann::json omitted_total = {
-            {"type", "integer"},
-            {"description",
-             "Omitted when its own device cohort is 1 to 9 devices or its remainder outside the "
-             "exposure cohort is (below_floor)"}};
+        const nlohmann::json event_total = {
+            {"type", "integer"}, {"description", "Fleet-wide event count, always present"}};
         const nlohmann::json versions_items = {
             {"type", "object"},
             {"properties",
@@ -9942,22 +9940,20 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
               {"device_count", {{"type", "integer"}}},
               {"suppressed", {{"type", "boolean"}}},
               {"affected_devices", {{"type", "integer"}}},
-              {"below_floor", {{"type", "boolean"}}},
-              {"crashes", omitted_total},
-              {"hangs", omitted_total},
+              {"crashes", event_total},
+              {"hangs", event_total},
               {"exposure_devices",
                {{"type", nlohmann::json::array({"integer", "null"})},
                 {"description",
                  "Devices with retained resource-significant samples; null = unknown, never "
                  "zero"}}},
-              {"exposure_below_floor", {{"type", "boolean"}}},
               {"exposed_crashes", integer_or_null},
               {"exposed_hangs", integer_or_null},
               {"failure_rate", rate},
               {"previous_version", {{"type", nlohmann::json::array({"string", "null"})}}},
               {"failure_rate_ratio", ratio}}},
-            {"required", nlohmann::json::array({"version", "affected_devices", "below_floor",
-                                                "exposure_devices", "exposure_below_floor"})}};
+            {"required", nlohmann::json::array({"version", "affected_devices", "crashes", "hangs",
+                                                "exposure_devices"})}};
         CHECK(props["versions"]["items"] == versions_items);
 
         // Every key a row emits is declared, and every required key is emitted. The
@@ -10362,6 +10358,19 @@ TEST_CASE("MCP app-perf: unavailable provider + missing arg degrade",
                 ->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams); // missing 'app'
+
+        // A present non-string `version` is rejected, never read as the all-versions
+        // sentinel; omitting it stays all-versions.
+        for (const char* bad : {"5", "null", "true", "[\"1.0\"]", "{}"}) {
+            CAPTURE(bad);
+            const auto call = std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":87,)") +
+                              R"("params":{"name":"get_dex_app_perf","arguments":)" +
+                              R"({"app":"chrome.exe","version":)" + bad + "}}}";
+            auto b = nlohmann::json::parse(ts.call(call)->body);
+            REQUIRE(b.contains("error"));
+            CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(b["error"]["message"] == "invalid parameter 'version'");
+        }
     }
     {
         // The trend reads fine but the failure read degrades: the whole call is an

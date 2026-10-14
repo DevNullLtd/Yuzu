@@ -593,70 +593,19 @@ TEST_CASE("DexStats: dex_rate_ratio converges at a slow large-arm pair", "[dex][
     CHECK(s->upper == Approx(29870.889158898113).epsilon(2e-5));
 }
 
-TEST_CASE("DexStats: floored rate ratio at and above the floor equals the ratio", "[dex][stats]") {
-    // 12 events over 15 devices against 5 over 12: (12/15) / (5/12) = 0.8 / 0.416667 = 1.92.
-    for (const std::int64_t extra : {std::int64_t{0}, std::int64_t{3}}) {
-        const auto f = dex_floored_rate_ratio(12, 15.0, 15 + extra, 5, 12.0, 12 + extra);
-        const auto want = dex_rate_ratio(12, 15.0, 5, 12.0);
-        REQUIRE(f.stats);
-        REQUIRE(want);
-        CHECK(f.devices_a == 15 + extra);
-        CHECK(f.devices_b == 12 + extra);
-        CHECK_FALSE(f.below_floor_a);
-        CHECK_FALSE(f.below_floor_b);
-        CHECK(f.stats->estimate == Approx(1.92));
-        CHECK(f.stats->estimate == want->estimate);
-        CHECK(f.stats->lower == want->lower);
-        CHECK(f.stats->upper == want->upper);
-        CHECK(f.stats->reliable == want->reliable);
-    }
-    // Exactly at the floor on both arms is above it (the comparison is strict below).
-    const auto edge = dex_floored_rate_ratio(4, 10.0, kDexCohortFloor, 2, 10.0, kDexCohortFloor);
-    CHECK(edge.stats);
-    CHECK_FALSE(edge.below_floor_a);
-    CHECK_FALSE(edge.below_floor_b);
-}
-
-TEST_CASE("DexStats: floored rate ratio withholds on either arm under the floor", "[dex][stats]") {
-    // Exposure is 40 on both arms, so an implementation that floored on exposure
-    // rather than devices would let all three through.
-    const auto a = dex_floored_rate_ratio(3, 40.0, kDexCohortFloor - 1, 2, 40.0, kDexCohortFloor);
-    CHECK(a.below_floor_a);
-    CHECK_FALSE(a.below_floor_b);
-    CHECK_FALSE(a.stats);
-    CHECK(a.devices_a == kDexCohortFloor - 1);
-    CHECK(a.devices_b == kDexCohortFloor);
-
-    const auto b = dex_floored_rate_ratio(3, 40.0, kDexCohortFloor, 2, 40.0, kDexCohortFloor - 1);
-    CHECK_FALSE(b.below_floor_a);
-    CHECK(b.below_floor_b);
-    CHECK_FALSE(b.stats);
-
-    const auto both = dex_floored_rate_ratio(3, 40.0, 0, 2, 40.0, 1);
-    CHECK(both.below_floor_a);
-    CHECK(both.below_floor_b);
-    CHECK_FALSE(both.stats);
-}
-
-TEST_CASE("DexStats: floored rate ratio treats negative devices and bad input as no statistic",
-          "[dex][stats]") {
-    // A negative device count is invalid, not a small cohort: no flag, no stats.
-    const auto neg = dex_floored_rate_ratio(3, 40.0, -1, 2, 40.0, kDexCohortFloor);
-    CHECK_FALSE(neg.below_floor_a);
-    CHECK_FALSE(neg.below_floor_b);
-    CHECK_FALSE(neg.stats);
-    const auto neg_b = dex_floored_rate_ratio(
-        3, 40.0, kDexCohortFloor, 2, 40.0, std::numeric_limits<std::int64_t>::min());
-    CHECK_FALSE(neg_b.below_floor_b);
-    CHECK_FALSE(neg_b.stats);
-    // Devices clear the floor but the ratio refuses (both arms zero-event): no flag,
-    // no stats -- the consumer decides whether that refusal is a failure.
-    const auto zero = dex_floored_rate_ratio(0, 40.0, kDexCohortFloor, 0, 40.0, kDexCohortFloor);
-    CHECK_FALSE(zero.below_floor_a);
-    CHECK_FALSE(zero.below_floor_b);
-    CHECK_FALSE(zero.stats);
-    // An invalid pair below the floor still reports only the floor.
-    const auto bad = dex_floored_rate_ratio(-1, 40.0, 2, 3, 40.0, kDexCohortFloor);
-    CHECK(bad.below_floor_a);
-    CHECK_FALSE(bad.stats);
+TEST_CASE("DexStats: dex_rate_ratio with a lowered minimum exposure", "[dex][stats]") {
+    // (3 / 2) / (1 / 1) = 1.5. Two devices of exposure sit under the default
+    // guard of 10 and over a caller-supplied minimum of 1.
+    CHECK_FALSE(dex_rate_ratio(3, 2.0, 1, 1.0));
+    const auto lowered = dex_rate_ratio(3, 2.0, 1, 1.0, 1.0);
+    REQUIRE(lowered);
+    CHECK(lowered->estimate == Approx(1.5));
+    // A lowered minimum never admits a zero or negative exposure.
+    CHECK_FALSE(dex_rate_ratio(3, 0.0, 1, 1.0, 1.0));
+    CHECK_FALSE(dex_rate_ratio(3, 2.0, 1, 0.0, 0.0));
+    CHECK_FALSE(dex_rate_ratio(3, -1.0, 1, 1.0, -5.0));
+    // The default argument is the old guard.
+    const auto dflt = dex_rate_ratio(12, 15.0, 5, 12.0);
+    REQUIRE(dflt);
+    CHECK(dflt->estimate == dex_rate_ratio(12, 15.0, 5, 12.0, kDexRateRatioMinExposure)->estimate);
 }

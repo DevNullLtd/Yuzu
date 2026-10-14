@@ -458,8 +458,7 @@ AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> 
     for (const auto& f : failures)
         by_version.emplace(f.version, &f);
 
-    // Exposed events and exposure per row, kept beside the rows because the
-    // public optionals are withheld below the floor but the ratio needs them.
+    // Exposed events per row, kept beside the rows for the ratio's second arm.
     std::vector<std::int64_t> exposed_events(summaries.size(), 0);
     rep.versions.reserve(summaries.size());
     for (std::size_t i = 0; i < summaries.size(); ++i) {
@@ -469,45 +468,25 @@ AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> 
         if (const auto it = by_version.find(row.perf.version); it != by_version.end())
             f = *it->second;
 
+        // No device floor on this join (maintainer ruling 2026-10-14): every count
+        // is published at any device count.
         row.affected_devices = f.affected_devices;
-
-        // Exposure cohort first: whether its figures are shown decides whether the
-        // remainder below can be read off them.
+        row.crashes = f.crashes;
+        row.hangs = f.hangs;
         row.exposure_devices = f.exposure_devices;
-        bool exposed_shown = false;
         if (f.exposure_devices) {
             exposed_events[i] = f.exposed_crashes + f.exposed_hangs;
-            const auto fr = dex_floored_rate(exposed_events[i],
-                                             static_cast<double>(*f.exposure_devices),
-                                             *f.exposure_devices);
-            row.exposure_below_floor = fr.below_floor;
-            if (!fr.below_floor) {
-                exposed_shown = true;
-                row.exposed_crashes = f.exposed_crashes;
-                row.exposed_hangs = f.exposed_hangs;
-                row.failure_rate = fr.stats;
-                if (!fr.stats)
-                    ++rep.stat_failures; // no statistic on a count the join could not pre-screen
-                                         // (a corrupt row) or a kernel failure
+            row.exposed_crashes = f.exposed_crashes;
+            row.exposed_hangs = f.exposed_hangs;
+            // A zero or negative exposure is a refusal (no divide by zero, no
+            // healthy zero), not a failure; a corrupt event count is a failure.
+            if (*f.exposure_devices > 0) {
+                row.failure_rate =
+                    dex_rate(exposed_events[i], static_cast<double>(*f.exposure_devices));
+                if (!row.failure_rate)
+                    ++rep.stat_failures;
             }
         }
-
-        // A total is withheld when the devices that contributed it number between one
-        // and the floor minus one, or, with the exposed part shown beside it, when the
-        // contributing devices outside the exposure cohort do: total minus exposed
-        // part would otherwise single them out. Each type is judged on its own devices.
-        const auto withheld = [exposed_shown](std::int64_t devices, std::int64_t exposed_devices) {
-            const std::int64_t remainder = devices - exposed_devices;
-            return (devices > 0 && devices < kDexCohortFloor) ||
-                   (exposed_shown && remainder > 0 && remainder < kDexCohortFloor);
-        };
-        const bool crashes_withheld = withheld(f.crash_devices, f.exposed_crash_devices);
-        const bool hangs_withheld = withheld(f.hang_devices, f.exposed_hang_devices);
-        row.below_floor = crashes_withheld || hangs_withheld;
-        if (!crashes_withheld)
-            row.crashes = f.crashes;
-        if (!hangs_withheld)
-            row.hangs = f.hangs;
         rep.versions.push_back(std::move(row));
     }
 
@@ -519,21 +498,20 @@ AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> 
         if (cur.perf.version.empty() || prev.perf.version.empty())
             continue;
         cur.previous_version = prev.perf.version;
-        if (!cur.exposure_devices || !prev.exposure_devices)
+        if (!cur.exposure_devices || !prev.exposure_devices || *cur.exposure_devices <= 0 ||
+            *prev.exposure_devices <= 0)
             continue;
-        const auto fr = dex_floored_rate_ratio(
-            exposed_events[i], static_cast<double>(*cur.exposure_devices), *cur.exposure_devices,
-            exposed_events[i + 1], static_cast<double>(*prev.exposure_devices),
-            *prev.exposure_devices);
-        if (fr.below_floor_a || fr.below_floor_b)
-            continue;
-        cur.failure_rate_ratio = fr.stats;
+        // The exposure is a device count the join does not floor: the minimum
+        // exposure is 1, not the default device floor.
+        cur.failure_rate_ratio =
+            dex_rate_ratio(exposed_events[i], static_cast<double>(*cur.exposure_devices),
+                           exposed_events[i + 1], static_cast<double>(*prev.exposure_devices), 1.0);
         // Both arms zero-event, or an arm past the ratio's accuracy limit, are
         // documented refusals; any other missing ratio is a computation failure.
         const bool refusal = (exposed_events[i] == 0 && exposed_events[i + 1] == 0) ||
                              exposed_events[i] > kDexRateRatioMaxEvents ||
                              exposed_events[i + 1] > kDexRateRatioMaxEvents;
-        if (!fr.stats && !refusal)
+        if (!cur.failure_rate_ratio && !refusal)
             ++rep.stat_failures;
     }
     return rep;
@@ -549,13 +527,9 @@ std::string dex_app_perf_versions_json(const AppPerfFleetReport& report) {
         o["device_count"] = r.perf.device_count;
         o["suppressed"] = r.perf.suppressed;
         o["affected_devices"] = r.affected_devices;
-        o["below_floor"] = r.below_floor;
-        if (r.crashes)
-            o["crashes"] = *r.crashes;
-        if (r.hangs)
-            o["hangs"] = *r.hangs;
+        o["crashes"] = r.crashes;
+        o["hangs"] = r.hangs;
         o["exposure_devices"] = opt_i64(r.exposure_devices);
-        o["exposure_below_floor"] = r.exposure_below_floor;
         o["exposed_crashes"] = opt_i64(r.exposed_crashes);
         o["exposed_hangs"] = opt_i64(r.exposed_hangs);
         o["failure_rate"] = r.failure_rate ? interval_json(*r.failure_rate, false) : json(nullptr);

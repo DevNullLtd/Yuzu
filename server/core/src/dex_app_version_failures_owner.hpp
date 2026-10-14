@@ -19,9 +19,9 @@
 ///
 /// Window contract: the caller passes ONE cut. Exposure covers B1 days in
 /// `[since_day, end_day]` (UTC midnights, epoch seconds); events cover
-/// `observed_at >= since_iso` (the same instant, ISO-8601 UTC). `end_day` keeps
-/// the daily store's forward-slack rows (clock skew) from counting as exposure;
-/// observations carry no upper bound, as in every sibling DEX read.
+/// `[since_iso, end of end_day)` (ISO-8601 UTC; the owner derives the exclusive
+/// upper bound from `end_day`, so both sides share one cut). Forward-slack rows
+/// of either store (clock skew, a future-dated observation) never count.
 ///
 /// Read-only, no state written, idempotent per request.
 

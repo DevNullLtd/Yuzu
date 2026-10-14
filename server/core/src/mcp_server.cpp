@@ -1818,25 +1818,24 @@ static const ToolDef kTools[] = {
      "listed, so no row is not no failures) joining the last failure_window_days of "
      "crash and hang observations (30, clamped to one day less than the observation "
      "retention when that is 1 to 30 days; whole UTC days plus the current day so "
-     "far), matched on the exact canonical version and subject the agent reported: "
+     "far; an observation stamped after the end of the current UTC day is excluded), "
+     "matched on the exact canonical version and subject the agent reported: "
      "affected_devices (fleet-wide devices that reported a crash or hang) with crashes "
-     "and hangs, each omitted when its own devices number 1 to 9 or, with the exposed "
-     "figures shown, when its devices outside the exposure cohort do (below_floor=true "
-     "when either is omitted); exposure_devices (devices with retained "
-     "resource-significant samples, a selected subset and not a census; null when "
-     "unknown, so affected_devices > 0 with null exposure is failures recorded under a "
-     "version with no samples); and, when exposure_devices >= 10, exposed_crashes and "
-     "exposed_hangs and failure_rate (exposed events per exposed device over the "
-     "window, not per day of use: read it beside day_count and latest_day, a version "
-     "with fewer than failure_window_days + 1 days has had less time to fail; exact 95 percent interval), and, when "
-     "both versions have exposure_devices >= 10, failure_rate_ratio against "
-     "previous_version (the next older returned version; null for the oldest known "
-     "version and for the unknown version; exact conditional interval; upper is null with "
-     "unbounded=true when the previous version saw no exposed events). "
-     "exposure_below_floor=true withholds the exposed figures; it is false also when "
-     "exposure_devices is null (unknown). The exposed counts and the rate are floored on "
-     "exposure_devices, not on the exposed devices that failed, so they can reflect events "
-     "from 1 to 9 devices. exposure_basis "
+     "and hangs, always present as fleet-wide event counts; exposure_devices (devices "
+     "with retained resource-significant samples, a selected subset and not a census; "
+     "null when unknown, so affected_devices > 0 with null exposure is failures "
+     "recorded under a version with no samples); and, when exposure_devices is known, "
+     "exposed_crashes and exposed_hangs and, when it is positive, failure_rate "
+     "(exposed events per exposed device over the window, not per day of use: read it "
+     "beside day_count and latest_day, a version with fewer than failure_window_days + 1 "
+     "days has had less time to fail; exact 95 percent interval; a zero exposure gives a "
+     "null rate), and, when both versions have a known positive exposure_devices, "
+     "failure_rate_ratio against previous_version (the next older returned version; null "
+     "for the oldest known version and for the unknown version; exact conditional "
+     "interval; upper is null with unbounded=true when the previous version saw no "
+     "exposed events). This join carries no device floor (maintainer ruling): every "
+     "figure is published at any device count, and the per-(version, day) point floor "
+     "on points[] is unchanged. exposure_basis "
      "resource_significant: exposure is the daily top-N consumers, not a census. "
      "stat_failures counts statistics that returned nothing on valid input (expected 0). "
      "Mirrors GET /api/v1/dex/perf/app. Requires GuaranteedState:Read.",
@@ -1857,14 +1856,14 @@ static const ToolDef kTools[] = {
      R"j(},"required":["version","day","device_count","suppressed"]}},)j"
      R"j("versions":{"type":"array","items":{"type":"object","properties":{)j"
      R"j("version":{"type":"string"},"latest_day":{"type":"integer"},"day_count":{"type":"integer"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
-     R"j("affected_devices":{"type":"integer"},"below_floor":{"type":"boolean"},)j"
-     R"j("crashes":{"type":"integer","description":"Omitted when its own device cohort is 1 to 9 devices or its remainder outside the exposure cohort is (below_floor)"},"hangs":{"type":"integer","description":"Omitted when its own device cohort is 1 to 9 devices or its remainder outside the exposure cohort is (below_floor)"},)j"
-     R"j("exposure_devices":{"type":["integer","null"],"description":"Devices with retained resource-significant samples; null = unknown, never zero"},"exposure_below_floor":{"type":"boolean"},)j"
+     R"j("affected_devices":{"type":"integer"},)j"
+     R"j("crashes":{"type":"integer","description":"Fleet-wide event count, always present"},"hangs":{"type":"integer","description":"Fleet-wide event count, always present"},)j"
+     R"j("exposure_devices":{"type":["integer","null"],"description":"Devices with retained resource-significant samples; null = unknown, never zero"},)j"
      R"j("exposed_crashes":{"type":["integer","null"]},"exposed_hangs":{"type":["integer","null"]},)j"
      R"j("failure_rate":{"type":["object","null"],"properties":{"estimate":{"type":"number"},"lower":{"type":"number"},"upper":{"type":"number"},"reliable":{"type":"boolean"}}},)j"
      R"j("previous_version":{"type":["string","null"]},)j"
      R"j("failure_rate_ratio":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"unbounded":{"type":"boolean"},"reliable":{"type":"boolean"}}})j"
-     R"j(},"required":["version","affected_devices","below_floor","exposure_devices","exposure_below_floor"]}},)j"
+     R"j(},"required":["version","affected_devices","crashes","hangs","exposure_devices"]}},)j"
      R"j("versions_truncated":{"type":"boolean"},"failure_window_days":{"type":"integer"},"exposure_basis":{"type":"string"},"stat_failures":{"type":"integer"})j"
      R"j(},"required":["app","version","points","versions","versions_truncated","failure_window_days","exposure_basis","stat_failures"]})j"},
 
@@ -16428,6 +16427,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(id, kInvalidParams, "invalid parameter 'app'",
                                            a4_data(0, "app must be <= 512 bytes, no control chars")),
+                            "application/json");
+                        return;
+                    }
+                    // A present non-string must not read as the all-versions
+                    // sentinel (param_str would return its default), so the type is
+                    // checked here, as it is for `app`.
+                    if (args.contains("version") && !args["version"].is_string()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'version'",
+                                           a4_data(0, "version must be a string")),
                             "application/json");
                         return;
                     }

@@ -1,5 +1,7 @@
 #include "dex_app_version_failures_owner.hpp"
 
+#include "dex_window.hpp" // dex_iso_at (pure)
+
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -28,9 +30,9 @@ constexpr const char* kStatementTimeout = "10s";
 // FULL OUTER JOIN keeps a version that has only one side; exposure_devices is
 // NULL (unknown, never zero) when a version has no exposure rows. The version
 // list is bounded by the caller's ANY() list, so LIMIT is a depth guard only.
-// The four per-type distinct-device columns are the cohorts the join floors each
-// total on (and, restricted to exposed devices, the remainder it floors); they
-// are never serialised.
+// Events are cut at BOTH ends: `observed_at >= $5` and `observed_at < $7` (the
+// end of the current UTC day, the same cut as the exposure side), so a
+// future-dated observation never enters a numerator the denominator cannot see.
 constexpr const char* kReadSql =
     "WITH exp AS ("
     " SELECT version, agent_id FROM app_perf_daily_store.app_perf_daily"
@@ -42,7 +44,7 @@ constexpr const char* kReadSql =
     " FROM guaranteed_state_store.guardian_observations o"
     " LEFT JOIN exp e ON e.version = o.version AND e.agent_id = o.agent_id"
     " WHERE o.obs_type IN ('process.crashed', 'process.hung')"
-    "   AND o.observed_at >= $5 AND o.subject = $1 AND o.version = ANY($2::text[])), "
+    "   AND o.observed_at >= $5 AND o.observed_at < $7 AND o.subject = $1 AND o.version = ANY($2::text[])), "
     "ex AS (SELECT version, COUNT(*) AS exposure_devices FROM exp GROUP BY version), "
     "fo AS ("
     " SELECT version,"
@@ -50,19 +52,11 @@ constexpr const char* kReadSql =
     "  COUNT(*) FILTER (WHERE obs_type = 'process.hung') AS hangs,"
     "  COUNT(DISTINCT agent_id) AS affected_devices,"
     "  COUNT(*) FILTER (WHERE obs_type = 'process.crashed' AND exposed) AS exposed_crashes,"
-    "  COUNT(*) FILTER (WHERE obs_type = 'process.hung' AND exposed) AS exposed_hangs,"
-    "  COUNT(DISTINCT agent_id) FILTER (WHERE obs_type = 'process.crashed') AS crash_devices,"
-    "  COUNT(DISTINCT agent_id) FILTER (WHERE obs_type = 'process.hung') AS hang_devices,"
-    "  COUNT(DISTINCT agent_id) FILTER (WHERE obs_type = 'process.crashed' AND exposed)"
-    "   AS exposed_crash_devices,"
-    "  COUNT(DISTINCT agent_id) FILTER (WHERE obs_type = 'process.hung' AND exposed)"
-    "   AS exposed_hang_devices"
+    "  COUNT(*) FILTER (WHERE obs_type = 'process.hung' AND exposed) AS exposed_hangs"
     " FROM obs GROUP BY version) "
     "SELECT COALESCE(ex.version, fo.version), ex.exposure_devices,"
     " COALESCE(fo.crashes, 0), COALESCE(fo.hangs, 0), COALESCE(fo.affected_devices, 0),"
-    " COALESCE(fo.exposed_crashes, 0), COALESCE(fo.exposed_hangs, 0),"
-    " COALESCE(fo.crash_devices, 0), COALESCE(fo.hang_devices, 0),"
-    " COALESCE(fo.exposed_crash_devices, 0), COALESCE(fo.exposed_hang_devices, 0)"
+    " COALESCE(fo.exposed_crashes, 0), COALESCE(fo.exposed_hangs, 0)"
     " FROM ex FULL OUTER JOIN fo ON ex.version = fo.version"
     " ORDER BY 1 LIMIT $6::bigint";
 
@@ -95,7 +89,10 @@ DexAppVersionFailuresOwner::read(std::string_view app, const std::vector<std::st
         std::to_string(since_day),
         std::to_string(end_day),
         std::string(since_iso),
-        std::to_string(versions.size() + 1)};
+        std::to_string(versions.size() + 1),
+        // Exclusive upper cut: the end of `end_day`'s UTC day, one derivation with
+        // the exposure side's `day <= end_day`.
+        dex_iso_at(end_day + 86400)};
 
     std::optional<std::vector<AppPerfVersionFailureRow>> out;
     bool statement_failed = false;
@@ -130,10 +127,6 @@ DexAppVersionFailuresOwner::read(std::string_view app, const std::vector<std::st
             row.affected_devices = col_i64(r.get(), i, 4);
             row.exposed_crashes = col_i64(r.get(), i, 5);
             row.exposed_hangs = col_i64(r.get(), i, 6);
-            row.crash_devices = col_i64(r.get(), i, 7);
-            row.hang_devices = col_i64(r.get(), i, 8);
-            row.exposed_crash_devices = col_i64(r.get(), i, 9);
-            row.exposed_hang_devices = col_i64(r.get(), i, 10);
             rows.push_back(std::move(row));
         }
         out = std::move(rows);

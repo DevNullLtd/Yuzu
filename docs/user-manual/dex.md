@@ -385,8 +385,8 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/perf/app?app=&version=`** — the fleet trend for one app, one
   point per `(version, day)` over the retained B2 window (≤180 days), plus a
   per-version `versions[]` join of crash and hang counts, exposure and the
-  exposed-device failure rate and rate ratio (see the REST reference for the two
-  cohort floors).
+  exposed-device failure rate and rate ratio (no device floor on the join; the
+  point floor is unchanged — see the REST reference).
 - **`GET /api/v1/dex/perf/app/devices?app=&version=`** — the version-row "which
   devices" drill: devices reporting one EXACT `(app, version)` among their
   retained top-N daily summaries (B1, ≤31 days), one row per device (`agent_id`,
@@ -424,8 +424,9 @@ view; the rollup, scope, and true aggregate perf endpoints (`/perf/fleet`,
 `/perf/tag`)
 are machine-health telemetry / fleet metadata and are not audited — and the
 app-perf aggregates suppress any sub-floor `(version, day)` point (fewer than
-10 devices) to a count only and withhold a per-version crash or hang count
-whose own device cohort (or whose unexposed remainder, with the exposed figures shown) is 1 to 9 devices (the exposed counts and failure rate are floored on the exposure cohort of 10 or more devices instead, so they can reflect events from 1 to 9 devices — see the REST reference). **`/perf/devices` and `/perf/app/devices` are the
+10 devices) to a count only; the per-version crash and hang join on
+`/perf/app` carries no device floor (maintainer ruling, 2026-10-14 — see the
+REST reference). **`/perf/devices` and `/perf/app/devices` are the
 exceptions**: each row names an `agent_id` fleet-wide (or, for `/perf/app/
 devices`, the caller's visible subset), so unlike their aggregate siblings
 they ARE audited — `/perf/devices` as `dex.perf.device.view` (fail-closed,
