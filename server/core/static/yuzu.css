@@ -957,3 +957,15 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
                   background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl); }
 #token-section > .note { margin: 16px 16px 0; }
 /* -- end Groups and enrolment ------------------------------------------------------------ */
+
+/* -- System: pki ---------------------------------------------------------
+   Classes the System pages share (/settings/pki, /settings/plugins). Own block
+   at EOF; a sibling System page that adds the same class keeps both rules. */
+.ph { padding: 0 0 4px; }
+.ph h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; }
+.ph p { margin: 6px 0 0; color: var(--mut); font-size: 13.5px; max-width: 80ch; }
+.stack { display: flex; flex-direction: column; gap: 16px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 16px; align-items: start; }
+.kvl small { display: block; color: var(--mut); font-size: 12px; font-weight: 400; }
+.kvl .fp b { word-break: break-all; }
+.pb.hint { color: var(--mut); font-size: 12.5px; }

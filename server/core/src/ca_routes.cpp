@@ -1,6 +1,7 @@
 #include "ca_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "ca_panel_render.hpp"
 #include "rest_a4_envelope.hpp"
 #include "web_utils.hpp"
 
@@ -263,6 +264,83 @@ std::string render_ca_fragment(CaStore* ca_store) {
             "Revocation takes effect immediately server-side; the public CRL is republished "
             "automatically.</p>";
     return html;
+}
+
+// ── System > Certificates and secrets (view=pki) ─────────────────────────────
+// The artboard shape of the same fragment, selected by `?view=pki` (GET) or a hidden
+// `view=pki` form field (the two wrappers). The default shape above is untouched so
+// /settings and its tests are byte-for-byte unchanged.
+
+constexpr std::size_t kPkiPanelLimit = 500;
+
+bool wants_pki_view(const httplib::Request& req) {
+    return req.get_param_value("view") == "pki";
+}
+
+ca_panel::Model build_pki_model(CaStore* ca_store) {
+    ca_panel::Model m;
+    m.now = static_cast<std::int64_t>(std::time(nullptr));
+    m.panel_limit = kPkiPanelLimit;
+    if (!ca_store || !ca_store->is_open()) {
+        m.availability = ca_panel::Availability::Unavailable;
+        return m;
+    }
+    auto root_or_err = ca_store->get_root();
+    if (!root_or_err) {
+        m.availability = ca_panel::Availability::StoreError;
+        return m;
+    }
+    if (!*root_or_err) {
+        m.availability = ca_panel::Availability::NoRoot;
+        return m;
+    }
+    const auto& root = **root_or_err;
+    m.availability = ca_panel::Availability::Ready;
+    m.root = {.algo = root.algo,
+              .fingerprint_sha256 = root.fingerprint_sha256,
+              .not_after = root.not_after,
+              .subordinate = root.mode == CaMode::Subordinate};
+
+    // `latest_crl()` conflates "none published" and "read failed"; both render as the
+    // honest "None published, or the store could not be read", never "0 revoked".
+    if (auto crl = ca_store->latest_crl()) {
+        m.crl.present = true;
+        m.crl.version = crl->version;
+        m.crl.published_at = crl->published_at;
+        m.crl.next_update = crl->next_update;
+        m.crl.revoked_count = crl->revoked_count;
+        auto stale = ca_store->has_unpublished_revocations();
+        if (!crl->revoked_count || !stale)
+            m.crl.state = ca_panel::CrlState::Unconfirmed;
+        else
+            m.crl.state = *stale ? ca_panel::CrlState::OutOfDate : ca_panel::CrlState::Current;
+    }
+
+    auto issued_or_err = ca_store->list_issued(static_cast<int>(kPkiPanelLimit), 0);
+    if (!issued_or_err) {
+        m.inventory_error = true;
+        return m;
+    }
+    for (const auto& c : *issued_or_err)
+        m.issued.push_back({.serial_hex = c.serial_hex,
+                            .subject = c.subject,
+                            .purpose = c.purpose,
+                            .not_after = c.not_after,
+                            .revoked = c.status == CertStatus::Revoked});
+    return m;
+}
+
+/// The panel in whichever shape the caller asked for.
+std::string render_ca(CaStore* ca_store, bool pki_view) {
+    return pki_view ? ca_panel::render(build_pki_model(ca_store)) : render_ca_fragment(ca_store);
+}
+
+/// Surface a non-2xx wrapper outcome. htmx 2 drops every 4xx/5xx body, so without this the
+/// operator sees nothing. `message` is always a code-authored constant. `ensure_ascii` keeps
+/// the header value 7-bit.
+void set_error_toast(httplib::Response& res, const std::string& message) {
+    const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", "error"}}}};
+    res.set_header("HX-Trigger", toast.dump(-1, ' ', true));
 }
 
 } // namespace
@@ -951,7 +1029,8 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
              [perm_fn, ca_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Security", "Read"))
                      return;
-                 res.set_content(render_ca_fragment(ca_store), "text/html; charset=utf-8");
+                 res.set_content(render_ca(ca_store, wants_pki_view(req)),
+                                 "text/html; charset=utf-8");
              });
 
     // ── POST /api/settings/ca/revoke ── dashboard revoke wrapper (PR4b). ──────
@@ -1007,10 +1086,12 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         // Error branches re-render the FULL fragment with an inline banner rather
         // than swapping a bare <span> into #ca-section (which blanked the whole
         // panel until reload — #1241 happy/UP-6).
+        const bool pki_view = wants_pki_view(req);
         auto error_panel = [&](int status, const std::string& msg) {
             res.status = status;
+            set_error_toast(res, msg);
             res.set_content("<div class=\"alert alert-error\" style=\"margin-bottom:0.75rem\">" +
-                                html_escape(msg) + "</div>" + render_ca_fragment(ca_store),
+                                html_escape(msg) + "</div>" + render_ca(ca_store, pki_view),
                             "text/html; charset=utf-8");
         };
         if (!ca_store || !ca_store->is_open()) {
@@ -1041,7 +1122,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         }
         if (!rv.audit_ok)
             res.set_header("Sec-Audit-Failed", "true");
-        res.set_content(render_ca_fragment(ca_store), "text/html; charset=utf-8");
+        res.set_content(render_ca(ca_store, pki_view), "text/html; charset=utf-8");
     });
 
     // ── POST /api/settings/ca/import-chain ── dashboard subordinate import (PR6).
@@ -1072,11 +1153,13 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                   }
                   if (!perm_fn(req, res, "Security", "Write"))
                       return;
+                  const bool pki_view = wants_pki_view(req);
                   auto error_panel = [&](int status, const std::string& msg) {
                       res.status = status;
+                      set_error_toast(res, msg);
                       res.set_content(
                           "<div class=\"alert alert-error\" style=\"margin-bottom:0.75rem\">" +
-                              html_escape(msg) + "</div>" + render_ca_fragment(ca_store),
+                              html_escape(msg) + "</div>" + render_ca(ca_store, pki_view),
                           "text/html; charset=utf-8");
                   };
                   if (!ca_store || !ca_store->is_open() || !import_chain_fn) {
@@ -1171,7 +1254,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                       body += "<div class=\"alert alert-warning\" style=\"margin-bottom:0.75rem\">"
                               "Subordinated, but the CRL could not be republished — external CRL "
                               "consumers will not see the new issuer until the next publish.</div>";
-                  body += render_ca_fragment(ca_store);
+                  body += render_ca(ca_store, pki_view);
                   res.set_content(body, "text/html; charset=utf-8");
               });
 }

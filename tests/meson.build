@@ -1647,6 +1647,9 @@ if build_server
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
+      'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
+      'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
+      'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification

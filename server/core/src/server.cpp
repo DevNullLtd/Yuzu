@@ -70,6 +70,7 @@
 // their free-function registrars take (they do not expose an httplib::Server&
 // overload the way KekRoutes does).
 #include "http_route_sink.hpp"
+#include "pki_routes.hpp"
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "upload_grant_store.hpp"
@@ -20247,6 +20248,14 @@ private:
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
                 });
+
+            // System > Certificates and secrets: the page. The CA and KEK panel fragments are
+            // registered by CaRoutes / KekRoutes above, beside the data they read.
+            pki::register_pki_routes(
+                operator_surface_sink,
+                pki::Deps{.admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
+                    return require_admin(req, res);
+                }});
 
             register_file_retrieval_routes(
                 operator_surface_sink,

@@ -1269,3 +1269,165 @@ TEST_CASE("ca_routes: POST /ca/issue-code-signing rejects an out-of-range validi
         REQUIRE(j["error"]["message"] == "validity_days must be between 1 and 730");
     }
 }
+
+// ── System > Certificates and secrets: the `?view=pki` shape (SYS-3) ─────────
+//
+// The default shape (`render_ca_fragment`) is exercised by the cases above and is
+// deliberately unchanged; these pin that `view=pki` selects the artboard panels, that the
+// two wrappers re-render in the shape they were called from, and that every non-2xx
+// wrapper branch reaches the operator through an HX-Trigger toast (htmx drops 4xx/5xx
+// bodies, so before this a failed revoke or import showed nothing).
+
+TEST_CASE("ca_routes: ?view=pki renders the artboard panels; the default shape is unchanged",
+          "[ca_routes][pki][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    IssuedCertRecord evil = sample_issued("CAFE");
+    evil.subject = "<script>alert(1)</script>";
+    REQUIRE(h.store->record_issued(evil));
+    IssuedCertRecord lapsed = sample_issued("E0D1");
+    lapsed.not_after = 1;
+    REQUIRE(h.store->record_issued(lapsed));
+    h.wire();
+
+    auto pki = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(pki);
+    REQUIRE(pki->status == 200);
+    CHECK(pki->body.find("class=\"grid2\"") != std::string::npos);
+    CHECK(pki->body.find("<h2>Revocation</h2>") != std::string::npos);
+    CHECK(pki->body.find("name=\"view\" value=\"pki\"") != std::string::npos);
+    CHECK(pki->body.find("&lt;script&gt;alert(1)&lt;/script&gt;") != std::string::npos);
+    CHECK(pki->body.find("<script>alert(1)") == std::string::npos);
+    // The lapsed leaf is Expired in the new shape...
+    CHECK(pki->body.find(">Expired</span>") != std::string::npos);
+    // ...and no CRL has been published in this fixture: honest sentence, no dead link.
+    CHECK(pki->body.find("None published, or the store could not be read") != std::string::npos);
+    CHECK(pki->body.find("href=\"/api/v1/ca/crl\"") == std::string::npos);
+
+    // Without the parameter, byte-for-byte the Settings panel: none of the new markup.
+    auto old = h.sink.Get("/fragments/settings/ca");
+    REQUIRE(old);
+    CHECK(old->body.find("grid2") == std::string::npos);
+    CHECK(old->body.find("user-table") != std::string::npos);
+    CHECK(old->body.find("name=\"view\"") == std::string::npos);
+    CHECK(old->body.find("role-badge role-admin\">Active") != std::string::npos);
+}
+
+TEST_CASE("ca_routes: ?view=pki is gated on Security:Read like the default shape",
+          "[ca_routes][pki][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+    h.perm_allow = false;
+    auto r = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+    CHECK(h.last_perm_type == "Security");
+    CHECK(h.last_perm_op == "Read");
+}
+
+TEST_CASE("ca_routes: a published CRL shows its figures and the download link in view=pki",
+          "[ca_routes][pki][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    CrlVersionRecord crl;
+    crl.version = 1;
+    crl.der = {0x30, 0x03, 0x01, 0x02, 0x03};
+    crl.this_update = 1'800'000'000;
+    crl.next_update = 1'800'086'400;
+    crl.published_at = 1'800'000'000;
+    crl.revoked_count = 0;
+    REQUIRE(h.store->record_crl_for_test(crl));
+    h.wire();
+
+    auto r = h.sink.Get("/fragments/settings/ca?view=pki");
+    REQUIRE(r);
+    CHECK(r->body.find("2027-01-15 08:00 UTC") != std::string::npos);
+    CHECK(r->body.find("version 1") != std::string::npos);
+    CHECK(r->body.find("href=\"/api/v1/ca/crl\"") != std::string::npos);
+    // A count of 0 that WAS recorded is "0"; only a missing count is "Not recorded".
+    CHECK(r->body.find("<span>Revoked entries</span><b>0</b>") != std::string::npos);
+}
+
+TEST_CASE("ca_routes: wrapper errors carry a toast trigger and re-render the shape asked for",
+          "[ca_routes][pki][security][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+    const std::unordered_map<std::string, std::string> same_origin = {
+        {"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}};
+
+    // pki view: invalid serial -> 400, toast header, panel re-rendered in the pki shape.
+    auto bad = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=zz&view=pki", "",
+                               "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    const auto trig = bad->get_header_value("HX-Trigger");
+    REQUIRE_FALSE(trig.empty());
+    const auto toast = json::parse(trig);
+    CHECK(toast["showToast"]["level"] == "error");
+    CHECK(toast["showToast"]["message"] == "Invalid certificate serial.");
+    CHECK(bad->body.find("grid2") != std::string::npos);
+
+    // Default view: same trigger (the Settings page has the listener), old shape kept.
+    auto bad_old = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=zz", "",
+                                   "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(bad_old);
+    CHECK(bad_old->status == 400);
+    CHECK_FALSE(bad_old->get_header_value("HX-Trigger").empty());
+    CHECK(bad_old->body.find("grid2") == std::string::npos);
+    CHECK(bad_old->body.find("<table") != std::string::npos);
+
+    // An unknown serial is a 404 toast, not a silent success.
+    auto missing = h.sink.dispatch("POST", "/api/settings/ca/revoke?serial_hex=FEED&view=pki", "",
+                                   "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(missing);
+    CHECK(missing->status == 404);
+    CHECK_FALSE(missing->get_header_value("HX-Trigger").empty());
+}
+
+TEST_CASE("ca_routes: the cross-origin refusal keeps its bare body and never re-renders",
+          "[ca_routes][pki][security][pg]") {
+    // Re-rendering the inventory here would hand a cross-site probe a view of it before the
+    // permission check; a toast header would also suggest the request was processed.
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.wire();
+    auto res = h.sink.dispatch(
+        "POST", "/api/settings/ca/revoke?serial_hex=DEAD&view=pki", "",
+        "application/x-www-form-urlencoded",
+        {{"Host", "yuzu.example"}, {"Origin", "https://attacker.example"}});
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body == "<span class=\"feedback-error\">Cross-origin request refused.</span>");
+    CHECK(res->get_header_value("HX-Trigger").empty());
+    CHECK_FALSE(h.store->is_revoked("DEAD"));
+}
+
+TEST_CASE("ca_routes: import wrapper in view=pki re-renders the pki shape and toasts failures",
+          "[ca_routes][pki][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    h.wire();
+    const std::unordered_map<std::string, std::string> same_origin = {
+        {"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}};
+
+    // Missing PEMs: 400 with the toast and the pki shape.
+    auto none = h.sink.dispatch("POST", "/api/settings/ca/import-chain?view=pki", "",
+                                "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(none);
+    CHECK(none->status == 400);
+    CHECK_FALSE(none->get_header_value("HX-Trigger").empty());
+    CHECK(none->body.find("grid2") != std::string::npos);
+
+    // Success: the pki shape is re-rendered (the import fake returns Ok by default).
+    auto ok = h.sink.dispatch(
+        "POST", "/api/settings/ca/import-chain?view=pki&intermediate_pem=X&chain_pem=Y", "",
+        "application/x-www-form-urlencoded", same_origin);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.import_calls == 1);
+    CHECK(ok->body.find("grid2") != std::string::npos);
+    CHECK(ok->get_header_value("HX-Trigger").empty());
+}
