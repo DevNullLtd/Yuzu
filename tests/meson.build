@@ -1531,6 +1531,7 @@ if build_server
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
       'unit/server/test_home_render.cpp',         # Home: pure renderers, partitions, states
+      'unit/server/test_home_routes.cpp',         # Home: gates, scope, degrade, caller matrix
       'unit/server/test_home_ui.cpp',             # Home: page pins
       'unit/server/test_inventory_routes.cpp',
       'unit/server/test_software_page_ui.cpp',
