@@ -71,7 +71,6 @@ std::string render_mfa(const MfaView& v);
 
 // Confirm strings, exposed so tests pin the exact wording the operator reads.
 extern const char* const kConfirmSaveSso;
-extern const char* const kConfirmSkipTlsVerify;
 extern const char* const kConfirmMtls;
 extern const char* const kConfirmRegenerateCodes;
 extern const char* const kConfirmDisableMfa;

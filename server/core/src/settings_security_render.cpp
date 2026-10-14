@@ -13,9 +13,6 @@ const char* const kConfirmSaveSso =
     "restart the server uses its start-up flags or environment again, so update those too. If "
     "you change or clear the Admin group ID, SSO administrators sign in as ordinary users from "
     "their next sign-in.";
-const char* const kConfirmSkipTlsVerify =
-    "Turn off certificate checks for the identity provider? Anyone who can intercept traffic "
-    "to it can impersonate it. Development only.";
 const char* const kConfirmMtls =
     "Change the gRPC mTLS setting shown here? This only changes what this server reports. It is "
     "not saved and does not change the running listeners; the start-up flags decide.";
@@ -25,10 +22,6 @@ const char* const kConfirmDisableMfa =
     "Disable MFA for your account? Step-up authentication will no longer be required.";
 
 namespace {
-
-std::string esc(const std::string& s) {
-    return html_escape(s);
-}
 
 // One label / value row of a .kvl list. `value_html` is already-safe markup.
 void kv(std::string& out, std::string_view label, const std::string& value_html) {
@@ -51,12 +44,12 @@ std::string pill(std::string_view cls, std::string_view text) {
 std::string mono_or(const std::string& v, std::string_view fallback) {
     if (v.empty())
         return "<span class=\"muted\">" + std::string(fallback) + "</span>";
-    return "<span class=\"mono\">" + esc(v) + "</span>";
+    return "<span class=\"mono\">" + html_escape(v) + "</span>";
 }
 
 // hx-confirm is a static attribute; the text is escaped here, never built from request data.
 std::string confirm_attr(const std::string& text) {
-    return " hx-confirm=\"" + esc(text) + "\"";
+    return " hx-confirm=\"" + html_escape(text) + "\"";
 }
 
 std::string replace_confirm(std::string_view slot) {
@@ -201,12 +194,12 @@ std::string render_directory(const DirectoryView& v) {
            "<div class=\"fld\"><label for=\"oidc-issuer\">Issuer URL</label>"
            "<input class=\"in mono\" id=\"oidc-issuer\" type=\"text\" name=\"issuer\" "
            "autocomplete=\"off\" value=\"" +
-           esc(v.issuer) +
+           html_escape(v.issuer) +
            "\" placeholder=\"https://login.microsoftonline.com/{tenant}/v2.0\"></div>"
            "<div class=\"fld\"><label for=\"oidc-client-id\">Client ID</label>"
            "<input class=\"in mono\" id=\"oidc-client-id\" type=\"text\" name=\"client_id\" "
            "autocomplete=\"off\" value=\"" +
-           esc(v.client_id) + "\" placeholder=\"Application (client) ID\"></div></div>";
+           html_escape(v.client_id) + "\" placeholder=\"Application (client) ID\"></div></div>";
     out += "<div class=\"fld\"><label for=\"oidc-secret\">Client secret</label>"
            "<input class=\"in mono\" id=\"oidc-secret\" type=\"password\" name=\"client_secret\" "
            "autocomplete=\"new-password\" value=\"\" placeholder=\"";
@@ -217,12 +210,12 @@ std::string render_directory(const DirectoryView& v) {
            "<div class=\"fld\"><label for=\"oidc-redirect\">Redirect URI</label>"
            "<input class=\"in mono\" id=\"oidc-redirect\" type=\"text\" name=\"redirect_uri\" "
            "autocomplete=\"off\" value=\"" +
-           esc(v.redirect_uri) +
+           html_escape(v.redirect_uri) +
            "\" placeholder=\"(auto-computed from web address)\"></div>"
            "<div class=\"fld\"><label for=\"oidc-admin-group\">Admin group ID</label>"
            "<input class=\"in mono\" id=\"oidc-admin-group\" type=\"text\" name=\"admin_group\" "
            "autocomplete=\"off\" value=\"" +
-           esc(v.admin_group) +
+           html_escape(v.admin_group) +
            "\" placeholder=\"Group object ID that maps to the admin role\"></div></div>";
     out += "<details";
     if (v.skip_tls_verify)
@@ -255,7 +248,7 @@ std::string render_directory(const DirectoryView& v) {
     if (!v.message.empty()) {
         out += v.message_is_error ? "<div class=\"alert alert-error\" role=\"alert\">"
                                   : "<div class=\"alert alert-success\">";
-        out += esc(v.message);
+        out += html_escape(v.message);
         out += "</div>";
     }
     out += "</div>";
@@ -284,10 +277,10 @@ void mfa_provisional(std::string& out, const MfaView& v) {
         }
         out += "<div class=\"hint\" style=\"margin-top:8px\">Base32 secret (manual entry):</div>"
                "<code>" +
-               esc(v.secret_b32) +
+               html_escape(v.secret_b32) +
                "</code><div class=\"hint\" style=\"margin-top:8px\">otpauth URI:</div>"
                "<code style=\"display:block;word-break:break-all\">" +
-               esc(v.otpauth_uri) + "</code></div>";
+               html_escape(v.otpauth_uri) + "</code></div>";
     } else {
         out += "<p class=\"hint\">Codes refresh every 30 seconds - wait for the next code shown "
                "by your authenticator and try again.";
@@ -318,16 +311,16 @@ void mfa_status(std::string& out, const MfaView& v) {
     out += "<div class=\"kvl\">";
     if (enrolled) {
         kv(out, "Status", pill("ok", "Enabled"));
-        kv(out, "Enrolled", esc(v.enrolled_at) + " UTC");
+        kv(out, "Enrolled", html_escape(v.enrolled_at) + " UTC");
         kv(out, "Recovery codes remaining", std::to_string(v.recovery_codes_remaining));
     } else if (!v.disabled_at.empty()) {
         kv(out, "Status", pill("idle", "Disabled"));
-        kv(out, "Last disabled", esc(v.disabled_at) + " UTC");
+        kv(out, "Last disabled", html_escape(v.disabled_at) + " UTC");
     } else {
         kv(out, "Status", pill("idle", "Not enrolled"));
     }
     if (!v.enforcement_mode.empty())
-        kv(out, "Two-factor policy", esc(v.enforcement_mode));
+        kv(out, "Two-factor policy", html_escape(v.enforcement_mode));
     out += "</div>";
 
     if (enrolled) {
@@ -341,7 +334,7 @@ void mfa_status(std::string& out, const MfaView& v) {
             out += "<button class=\"btn btn-danger\" type=\"button\" disabled "
                    "title=\"Required by policy\">Disable two-factor</button></div>"
                    "<p class=\"hint\">Required by policy (" +
-                   esc(v.enforcement_mode) + "); it cannot be disabled for your account.</p>";
+                   html_escape(v.enforcement_mode) + "); it cannot be disabled for your account.</p>";
         } else {
             out += "<form hx-post=\"/api/settings/mfa/disable\" hx-target=\"#mfa-section\" "
                    "hx-swap=\"innerHTML\"" +
@@ -364,22 +357,14 @@ void mfa_status(std::string& out, const MfaView& v) {
 
 std::string render_mfa(const MfaView& v) {
     std::string out = "<div style=\"padding:16px\">";
-    switch (v.kind) {
-    case MfaKind::kStoreUnavailable:
-        out += "<span class=\"muted\">MFA store unavailable (no AuthDB configured).</span>";
-        break;
-    case MfaKind::kSsoManaged:
-        out += "<div class=\"note\">Two-factor for your account is managed by your identity "
-               "provider.</div>";
-        break;
-    default:
-        break;
-    }
-    if (v.kind == MfaKind::kStoreUnavailable || v.kind == MfaKind::kSsoManaged)
-        return out + "</div>";
+    if (v.kind == MfaKind::kStoreUnavailable)
+        return out + "<span class=\"muted\">MFA store unavailable (no AuthDB configured).</span></div>";
+    if (v.kind == MfaKind::kSsoManaged)
+        return out + "<div class=\"note\">Two-factor for your account is managed by your identity "
+                     "provider.</div></div>";
 
     if (!v.error_msg.empty())
-        out += "<div class=\"alert alert-error\" role=\"alert\">" + esc(v.error_msg) + "</div>";
+        out += "<div class=\"alert alert-error\" role=\"alert\">" + html_escape(v.error_msg) + "</div>";
 
     switch (v.kind) {
     case MfaKind::kProvisional:
@@ -399,7 +384,7 @@ std::string render_mfa(const MfaView& v) {
                    "once to bypass two-factor, and they are not shown again.</b>"
                    "<ul class=\"mono\" style=\"margin:8px 0;padding-left:20px\">";
             for (const auto& c : v.new_recovery_codes)
-                out += "<li><code>" + esc(c) + "</code></li>";
+                out += "<li><code>" + html_escape(c) + "</code></li>";
             out += "</ul><button class=\"btn btn-primary\" type=\"button\" ";
             out += kMfaRefresh;
             out += ">I have stored these codes</button></div>";
