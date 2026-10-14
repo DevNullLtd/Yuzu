@@ -117,6 +117,37 @@ of `approval` is recorded in the audit detail as `approval_mode: <old> -> <new>`
 approval" column and the instruction sets panel appear for callers who hold
 `InstructionDefinition:Read` and `InstructionSet:Read` respectively.
 
+**Page controls follow permissions.** New, Edit, Import, Delete and the set
+controls appear for callers who hold `InstructionDefinition:Write`,
+`InstructionDefinition:Delete`, `InstructionSet:Write` and `InstructionSet:Delete`
+respectively, not for a role. Each capability is probed once per page render, and
+a denied probe is audited as a denial, so loading the page as a caller who lacks
+a capability writes one denial row for it.
+
+**Sets.** The sets panel lists each set with the number of definitions in it.
+New set asks for a name and description. Delete set states that its definitions
+stay and become unassigned. Each library row has a set select that assigns the
+definition to a set or clears it.
+
+**Response templates.** Templates on a library row loads that definition's
+templates: the built-in default (never editable) first, then the authored ones.
+New, Edit and Delete open dialogs that call
+`/api/v1/definitions/{id}/response-templates`. Filters are written one per line as
+`column | op | value`.
+
+**Import and export.** Import definition takes the JSON document that Export
+produces (Ed25519-signed or not); unsigned documents can be refused by policy and
+a duplicate id is refused. When the audit record could not be written the page
+says so. Export saves the definition as `<id>.json`.
+
+**Dispatch.** Selecting a definition on the Executions tab reads its parameters
+from `GET /api/v1/instructions/{id}`; `grant_secret` and `grant_id` are write-only
+password inputs. The Target select offers a scope expression with Validate
+(syntax only) and Preview (needs `Infrastructure:Read`). Dispatch always
+confirms, naming the instruction, `plugin:action`, type and target; a definition
+whose approval mode is not `auto` says it will be submitted for approval and not
+run, and an expression that was not previewed needs `DISPATCH` typed to send.
+
 ---
 
 ## 3. InstructionDefinition Reference
