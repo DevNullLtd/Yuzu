@@ -215,11 +215,11 @@
   --c4: var(--mds-color-chart-4);
   --c5: var(--mds-color-chart-5);
   /* Home tile families (delta 2026-10-14): one colour per menu family. */
-  --fam-operate: #4c9aff;
-  --fam-posture: #2dd4bf;
-  --fam-estate:  #a78bfa;
-  --fam-access:  #f5c542;
-  --fam-system:  #9aa2ae;
+  --fam-operate: var(--c1);
+  --fam-posture: var(--c2);
+  --fam-estate:  var(--c5);
+  --fam-access:  var(--c3);
+  --fam-system:  var(--mds-color-theme-text-tertiary);
   --shadow:    var(--mds-elevation-3);
   --font:      var(--mds-font-family-default);
   --ctl:       36px;              /* control height; 28px for .btn-sm */
@@ -681,7 +681,7 @@ dialog.dlg::backdrop { background: var(--mds-color-state-overlay-scrim); }
 .land .ht { flex: 1 1 560px; display: flex; flex-direction: column; gap: 18px; align-items: flex-start; }
 .land .ht h1 { font-size: 56px; font-weight: 600; letter-spacing: -.03em; line-height: 1.06; }
 .land .ht .lede { color: var(--ink2); font-size: 17px; line-height: 1.55; max-width: 56ch; text-wrap: balance; }
-.land .rule { width: 44px; height: 4px; background: var(--accent); border-radius: 1px; }
+.land .rule { width: 44px; height: 4px; background: var(--hl); border-radius: 1px; }
 .land .lc { flex: 0 1 380px; min-width: 300px; }
 .land .login .form { gap: 14px; }
 .land .login .btn { width: 100%; justify-content: center; height: 40px; }
