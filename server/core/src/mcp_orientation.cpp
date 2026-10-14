@@ -61,7 +61,8 @@ constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "get_ex
                                                  "list_executions", "query_audit_log"};
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
-                                           "query_software_licenses", "get_agent_app_usage"};
+                                           "query_software_licenses", "get_agent_app_usage",
+                                           "query_software_catalogue", "get_software_versions"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -183,7 +184,7 @@ constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_dep
 // Workflow composes multiple steps, and its execution record is a different
 // data model from an Execution (see get_workflow_execution's tool doc).
 constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
-                                           "get_workflow_execution"};
+                                           "list_workflow_executions", "get_workflow_execution"};
 // #4027 — TAR (Timeline / Activity Recorder) had zero MCP presence before this
 // read-twin batch; its own family rather than folding into an unrelated one.
 constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",

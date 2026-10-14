@@ -4,9 +4,14 @@
 #include "app_perf_fleet_store.hpp"
 #include "app_perf_group_reader.hpp"
 #include "dex_app_perf_builders.hpp" // app_perf_fleet_trend/group_trend, dex_device_app_perf_json
+#include "dex_app_version_failures_owner.hpp"
+#include "dex_window.hpp"
 #include "management_group_store.hpp"
 #include "tag_store.hpp"
 
+#include <spdlog/spdlog.h>
+
+#include <chrono>
 #include <utility>
 
 namespace yuzu::server {
@@ -19,10 +24,12 @@ class LocalDexPerfApi final : public DexPerfApi {
 public:
     LocalDexPerfApi(DexPerfFn dex_perf_fn, AppPerfFleetStore* fleet_store,
                     AppPerfDailyStore* daily_store, AppPerfGroupReader* group_reader,
-                    ManagementGroupStore* mgmt_group_store, TagStore* tag_store)
+                    ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
+                    DexAppVersionFailuresOwner* failures_owner)
         : dex_perf_fn_(std::move(dex_perf_fn)), fleet_store_(fleet_store),
           daily_store_(daily_store), group_reader_(group_reader),
-          mgmt_group_store_(mgmt_group_store), tag_store_(tag_store) {}
+          mgmt_group_store_(mgmt_group_store), tag_store_(tag_store),
+          failures_owner_(failures_owner) {}
 
     LocalDexPerfApi(const LocalDexPerfApi&) = delete;
     LocalDexPerfApi& operator=(const LocalDexPerfApi&) = delete;
@@ -43,12 +50,38 @@ public:
 
     std::optional<std::vector<AppPerfTrendPoint>>
     app_fleet_trend(const std::string& app, const std::string& version) const override {
-        if (!fleet_store_)
+        return fleet_points(app, version);
+    }
+
+    std::optional<AppPerfFleetReport> app_fleet_report(const std::string& app,
+                                                       const std::string& version) const override {
+        if (!failures_owner_)
             return std::nullopt;
-        auto rows = fleet_store_->get_app_fleet_perf(app, version);
-        if (!rows)
-            return std::nullopt;
-        return app_perf_fleet_trend(*rows);
+        auto points = fleet_points(app, version);
+        if (!points)
+            return std::nullopt; // AUTHORITATIVE degrade — the B2 read failed
+        // The join keeps only the newest kAppPerfVersionJoinCap versions; ask the
+        // failure read for exactly those so it never counts a version that is
+        // dropped from the report.
+        const auto sel = app_perf_newest_versions(*points);
+
+        // One cut for events and exposure: the UTC midnight `window` days back.
+        const int window = failures_owner_->failure_window_days();
+        const auto cut = dex_day_window(std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count(),
+                                        window);
+        // A second, separate bounded read — the B2 lease is already released.
+        auto failures =
+            failures_owner_->read(app, sel.versions, cut.since_day, cut.end_day, cut.since_iso);
+        if (!failures)
+            return std::nullopt; // AUTHORITATIVE degrade — the failure read failed
+        auto report = app_perf_version_failure_join(std::move(*points), *failures, window);
+        if (report.stat_failures > 0)
+            spdlog::warn("DexPerfApi: {} version statistic(s) returned nothing on valid input "
+                         "(app report)",
+                         report.stat_failures);
+        return report;
     }
 
     std::optional<std::vector<AppPerfVersionDeviceRow>>
@@ -119,6 +152,18 @@ public:
     }
 
 private:
+    /// The B2 read and floor-applying transform shared by `app_fleet_trend` and
+    /// `app_fleet_report`, so the two cannot disagree on the points.
+    std::optional<std::vector<AppPerfTrendPoint>>
+    fleet_points(const std::string& app, const std::string& version) const {
+        if (!fleet_store_)
+            return std::nullopt;
+        auto rows = fleet_store_->get_app_fleet_perf(app, version);
+        if (!rows)
+            return std::nullopt;
+        return app_perf_fleet_trend(*rows);
+    }
+
     /// Shared raw-row read backing BOTH device_app_perf_json and
     /// device_app_summaries (the single daily_store_->get_agent_app_perf
     /// call each of them needs) — see this class's two callers' own doc
@@ -135,6 +180,7 @@ private:
     AppPerfGroupReader* group_reader_;
     ManagementGroupStore* mgmt_group_store_;
     TagStore* tag_store_;
+    DexAppVersionFailuresOwner* failures_owner_;
 };
 
 } // namespace
@@ -142,9 +188,11 @@ private:
 std::shared_ptr<DexPerfApi>
 make_local_dex_perf_api(DexPerfFn dex_perf_fn, AppPerfFleetStore* fleet_store,
                         AppPerfDailyStore* daily_store, AppPerfGroupReader* group_reader,
-                        ManagementGroupStore* mgmt_group_store, TagStore* tag_store) {
+                        ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
+                        DexAppVersionFailuresOwner* failures_owner) {
     return std::make_shared<LocalDexPerfApi>(std::move(dex_perf_fn), fleet_store, daily_store,
-                                             group_reader, mgmt_group_store, tag_store);
+                                             group_reader, mgmt_group_store, tag_store,
+                                             failures_owner);
 }
 
 } // namespace yuzu::server

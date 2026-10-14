@@ -21,6 +21,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "acquire_retry.hpp"
+#include "auth_db_sql_helpers.hpp" // one copy of the soft-delete / role-write statements (#4966)
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
@@ -271,13 +272,14 @@ const std::vector<pg::PgMigration>& migrations() {
     // UPDATE that just blocks on this lock) cannot commit between that read and the
     // guard's own COMMIT. The lock order is documented in
     // rbac_admin_authority_owner.hpp: `principal_roles` rows, then one `auth.users`
-    // row, then `rbac_meta`. A change here (e.g. a last-Administrator guard on
-    // `remove_user`, #4966) that holds an `auth.users` row lock and then touches
-    // `principal_roles` or `rbac_meta` would invert it and can deadlock. Honour that
-    // order, or have EVERY participant, the unassign guard as well as a `remove_user`
-    // guard, take one shared transaction-scoped advisory lock as the first statement of
-    // its own transaction; an advisory lock taken by only some of them removes no
-    // inversion.
+    // row, then `rbac_meta`. A change here that holds an `auth.users` row lock and then
+    // touches `principal_roles` or `rbac_meta` would invert it and can deadlock. The
+    // last-Administrator guard for account lifecycle (#4966) honours that order: it lives
+    // in the owner (`RbacAdminAuthorityOwner::deactivate_account` / `set_local_role`),
+    // which takes `rbac_enabled` and the counted `principal_roles` rows BEFORE its one
+    // `auth.users` row, and calls this file's `auth_sql::` statements (auth_db_sql_helpers.hpp)
+    // so the soft delete and the role write exist once. Keep this file free of
+    // `rbac_store` SQL (tests/test_rbac_query_owner_seam.py pins it).
     //
     // A1's `RbacAdminAuthorityOwner::set_enforcement` (`RbacStore::set_rbac_enforcement`
     // delegates to it, same as `unassign_role` above) is the SECOND external
@@ -969,30 +971,22 @@ std::expected<bool, AuthDBError> AuthDB::remove_user(const std::string& username
     // side effect here — AuthDB carries no session surface at all (see the
     // .hpp header note); AuthManager wipes its own in-memory map.
     bool removed = false;
+    std::string sql_err;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        // AND is_active = TRUE: re-removing an already-inactive row must be a
-        // no-op (matches zero rows -> removed=false), never a spurious
-        // "re-removal" success — the test/caller contract is idempotent-false,
-        // not idempotent-true, on an already-soft-deleted user.
-        pg::PgResult upd = pg::exec_params(
-            conn,
-            "UPDATE auth.users SET is_active = FALSE, mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
-            "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
-            "WHERE username = $1 AND is_active = TRUE RETURNING id",
-            std::vector<std::string>{username});
-        if (upd.status() != PGRES_TUPLES_OK)
+        // The soft-delete statement pair lives ONCE in auth_db_sql_helpers.hpp, shared with the
+        // last-Administrator-guarded owner path (#4966); see there for the idempotent-false
+        // contract on an already-inactive user.
+        const auto soft_deleted = auth_sql::soft_delete_user_in_txn(conn, username, sql_err);
+        if (!soft_deleted)
             return false;
-        if (PQntuples(upd.get()) == 0) {
-            removed = false;
-            return true; // commit a no-op — user not found is not a write failure
-        }
-        removed = true;
-        pg::PgResult del = pg::exec_params(conn, "DELETE FROM auth.mfa_recovery_codes WHERE username = $1",
-                                           std::vector<std::string>{username});
-        return del.status() == PGRES_COMMAND_OK;
+        removed = *soft_deleted; // false: user not found is not a write failure, commit a no-op
+        return true;
     });
-    if (!ok)
+    if (!ok) {
+        if (!sql_err.empty())
+            spdlog::error("AuthDB::remove_user failed for '{}': {}", username, sql_err);
         return std::unexpected(AuthDBError::WriteFailed);
+    }
 
     if (removed) {
         spdlog::info("User removed (MFA state cleared): {}", username);
@@ -1031,14 +1025,14 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(AuthDBError::WriteFailed);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.users SET role = $1, updated_at = now() WHERE username = $2 AND is_active = TRUE "
-        "RETURNING id",
-        std::vector<std::string>{role_str, username});
-    if (res.status() != PGRES_TUPLES_OK)
+    std::string sql_err;
+    const auto written = auth_sql::set_role_in_txn(lease.get(), username, role_str,
+                                                   /*match_inactive=*/false, sql_err);
+    if (!written) {
+        spdlog::error("AuthDB::update_role failed for '{}': {}", username, sql_err);
         return std::unexpected(AuthDBError::WriteFailed);
-    if (PQntuples(res.get()) == 0) {
+    }
+    if (!*written) {
         spdlog::warn("update_role: user not found or inactive: '{}'", username);
         return std::unexpected(AuthDBError::UserNotFound);
     }
@@ -1122,10 +1116,10 @@ AuthDB::recheck_role_locked(
         }
         if (PQntuples(sel.get()) == 0) {
             // No active row - either never existed, or a concurrent
-            // remove_user() already committed its soft-delete UPDATE (which
-            // took this SAME row lock for its own transaction, so this
-            // SELECT either saw it directly or waited for it) before this
-            // SELECT ran.
+            // soft delete (the owner's `deactivate_account`, #4966) already
+            // committed (its UPDATE took this SAME row lock for its own
+            // transaction, so this SELECT either saw it directly or waited
+            // for it) before this SELECT ran.
             err = AuthDBError::UserNotFound;
             return false;
         }
@@ -1217,6 +1211,25 @@ AuthDB::get_provisioning_source(const std::string& username) {
     if (PQntuples(res.get()) == 0)
         return std::unexpected(AuthDBError::UserNotFound);
     return col_str(res.get(), 0, 0);
+}
+
+std::expected<auth::Role, AuthDBError>
+AuthDB::get_role_including_inactive(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Deliberately NO `is_active = TRUE` filter: see the .hpp doc comment.
+    auto lease = impl_->pool.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::QueryFailed);
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT role FROM auth.users WHERE username = $1",
+                                       std::vector<std::string>{username});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(AuthDBError::QueryFailed);
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected(AuthDBError::UserNotFound);
+    return auth::string_to_role(col_str(res.get(), 0, 0));
 }
 
 std::expected<void, AuthDBError> AuthDB::set_identity_source(const std::string& username,

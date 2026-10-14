@@ -197,7 +197,7 @@ async function sendCommand(page, instruction) {
         badge: badgeText,
         rows: rows.length,
         rowCount: rowCount?.textContent || '0',
-        isError: context?.style?.color?.includes('f85149') || false,
+        isError: context?.classList?.contains('is-error') || false,
         context: context?.textContent?.trim()?.substring(0, 80) || '',
       };
     }).catch(() => ({ badge: '?', rows: 0, rowCount: '0', isError: false, context: '' }));

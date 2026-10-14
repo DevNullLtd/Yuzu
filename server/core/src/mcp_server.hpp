@@ -544,19 +544,19 @@ public:
     /// #2146 Batch B3 — the fleet-visualization store trio backing
     /// `get_fleet_topology`/`get_host_topology` (mirrors GET
     /// /api/v1/viz/fleet/topology and GET /api/v1/viz/host/{id}/topology).
-    /// Same setter idiom as `set_preflight_run_store` above. `offline_store`
-    /// may be null (offline hosts are then not stale-flagged, matching
-    /// `VizRoutes`' own null-offline-store legacy behavior); `kill_switch`
+    /// Same setter idiom as `set_preflight_run_store` above. `offline_roster_fn`
+    /// may be empty (an unwired roster: offline hosts are then not
+    /// merged and the topology is live-only, with no degraded flag); `kill_switch`
     /// may be null (then the viz kill switch is never consulted on the MCP
     /// path — production MUST wire the same `--viz-disable` /
     /// `yuzu_viz_disabled` atomic the REST `VizRoutes` registration uses, or
     /// disabling the feature would silently leave the MCP twins reachable).
     /// Unset `fleet_topology_store` (`nullptr`, the default) ⇒ both tools
     /// answer "unavailable" rather than crashing.
-    void set_viz_deps(FleetTopologyStore* fleet_topology_store, OfflineEndpointStore* offline_store,
+    void set_viz_deps(FleetTopologyStore* fleet_topology_store, OfflineRosterFn offline_roster_fn,
                       const std::atomic<bool>* kill_switch) {
         fleet_topology_store_ = fleet_topology_store;
-        offline_endpoint_store_ = offline_store;
+        offline_roster_fn_ = std::move(offline_roster_fn);
         viz_kill_switch_ = kill_switch;
     }
 
@@ -739,12 +739,13 @@ public:
 
     /// ADR-0031 WS-A4 (eighth family): the SAME in-process workflow-read API
     /// seam the REST `GET /api/v1/workflows[/{id}]` and
-    /// `GET /api/v1/workflow-executions/{id}` handlers use — server.cpp
+    /// `GET /api/v1/workflow-executions[/{id}]` handlers use — server.cpp
     /// wires the IDENTICAL instance so `list_workflows`/`get_workflow`/
-    /// `get_workflow_execution` can never disagree with REST v1.
+    /// `get_workflow_execution`/`list_workflow_executions` can never
+    /// disagree with REST v1.
     /// A SETTER, not a `build_handler` parameter — mirrors `set_schedule_api`
     /// above: `build_handler`'s own `WorkflowEngine* workflow_engine`
-    /// parameter is now unused inside these three tool bodies (superseded by
+    /// parameter is now unused inside these tool bodies (superseded by
     /// this seam) but is kept, unremoved, for constructor-signature
     /// stability — a bounded, disclosed, deferred follow-up, not an
     /// oversight (matrix doc, `workflow` family row). Unset (default-
@@ -1212,7 +1213,7 @@ private:
     GuardianPushFn guardian_push_fn_;
     // #2146 Batch B3 — see set_viz_deps above.
     FleetTopologyStore* fleet_topology_store_{nullptr};
-    OfflineEndpointStore* offline_endpoint_store_{nullptr};
+    yuzu::server::OfflineRosterFn offline_roster_fn_;
     const std::atomic<bool>* viz_kill_switch_{nullptr};
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;

@@ -180,16 +180,50 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # Software catalogue REST routes: get.fragments-inventory-software-versions
 # flips "planned:#2146" -> "twinned" (GET /api/v1/inventory/software/catalogue/versions;
-# REST only until the MCP twin lands, #3988) and the title-catalogue row
+# MCP twin get_software_versions, added with the MCP twins) and the title-catalogue row
 # get.fragments-inventory-software is repointed at GET /api/v1/inventory/software/catalogue
 # (already "twinned", count unchanged). The catalogue route's format=csv titles export is REST-only by design: a CSV
 # body is a download for a person or a pipeline, not a structured tool result (the JSON route
-# is the structured surface; its MCP twin is tracked by #3988).
+# is the structured surface; its MCP twin, query_software_catalogue, now exists, and the
+# remaining exception is recorded under ADR-1005 as #5699).
 # Measured post-flip at 204 (205 - 1), not hand-picked.
 #
 # Merge of the two changes above: 205 - 4 (legacy rows deleted) - 1 (versions row twinned)
 # = 200, the value the checker itself reported on the merged tree.
-BASELINE_UNTWINNED = 200
+#
+# MCP twins + raw-route exports (the second PR of the software catalogue): the
+# get.fragments-inventory-software-devices row flips "planned:#2146" -> "twinned" (GET
+# /api/v1/inventory/software + MCP query_installed_software, which gains version/cursor/source);
+# the title-catalogue row gains its MCP twin query_software_catalogue and the versions row
+# get_software_versions (both already "twinned", count unchanged). The raw route's
+# format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
+# same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
+# DEX Alerts tab (posture PR-E): GET /fragments/dex/alerts is "composed-of" the legacy
+# settings fragment (+1, 199 -> 200); the fragment's three POSTs stay planned:#2146.
+#
+# Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
+# is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
+# which counts as untwinned by design, so the count rises 199 -> 200.
+#
+# Device containment fragments (es-1): get.fragments-hardware-quarantine is "twinned" to GET
+# /api/v1/quarantine (no MCP list tool exists; the gap is recorded on the row), and
+# get.fragments-hardware-ci-containment is "composed-of:get.fragments-hardware-quarantine"
+# (a single-device read of the same active-record set; REST has no per-device GET). One
+# composed-of row, so 200 -> 201, measured by the checker, not hand-picked.
+#
+# Stored data panel (es-1): get.fragments-hardware-ci-stored-data is an "exception:" row (the
+# erase it fronts is DELETE /api/v1/sle/agents/{id}, which has no ledger row to compose), so
+# 201 -> 202, measured by the checker, not hand-picked.
+#
+# The DEX Alerts and policy-fragments changes above landed on 199 and merged together to 201
+# (199 + 1 + 1). The two containment rows above landed on that, so merged with them the count
+# is 203 (201 + 1 composed-of + 1 exception), the value the checker reports on the merged tree.
+#
+# Hardware record properties panel (device data, merged from dev): GET /fragments/hardware/ci/properties
+# is "planned:#2146" (its data routes, /api/agents/{id}/properties*, are dashboard-only with no REST v1
+# or MCP twin), so it deepens an untwinned surface by one row. Merged with the containment rows above
+# the count is 204 (203 + 1), the value the checker reports on the merged tree.
+BASELINE_UNTWINNED = 204
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

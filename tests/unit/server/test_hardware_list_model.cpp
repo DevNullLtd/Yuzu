@@ -26,6 +26,8 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -46,6 +48,17 @@ InventoryDeviceRow make_row(std::string agent_id) {
     r.last_seen_ms = 1000;
     return r;
 }
+
+OfflineEndpoint make_offline_ep(const std::string& id, std::int64_t hb_ms) {
+    OfflineEndpoint e;
+    e.agent_id = id;
+    e.hostname = "host-" + id;
+    e.os = "linux";
+    e.last_heartbeat_ms = hb_ms;
+    return e;
+}
+std::string fake_age(std::int64_t) { return std::string("aged"); }
+constexpr std::int64_t kDayMs = 24LL * 60 * 60 * 1000;
 
 } // namespace
 
@@ -532,6 +545,18 @@ TEST_CASE("hardware_ci_json: absent identity renders null identity fields, onlin
     CHECK(j["os"].is_null());
     CHECK(j["online"] == false);
     CHECK(j["last_seen"].is_null());
+    CHECK(j["identity_state"] == "absent");
+}
+
+// A set identity is a found identity: identity_degraded only describes an unanswered read.
+TEST_CASE("hardware_ci_json: identity outranks identity_degraded in identity_state",
+          "[hardware][model][json]") {
+    HardwareCiDetail d;
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    d.identity = row;
+    d.identity_degraded = true;
+    CHECK(hardware_ci_json(d, 0)["identity_state"] == "found");
 }
 
 TEST_CASE("hardware_ci_json: ci_state discriminates degraded/absent/found", "[hardware][model][json]") {
@@ -606,4 +631,138 @@ TEST_CASE("hardware_ci_json: software_last_seen distinguishes nullopt (degraded)
 
     d.software_last_seen = 1234567;
     CHECK(hardware_ci_json(d, 0)["software_last_seen"] == 1234567);
+}
+
+// ── #5531: the pure store-to-bit mappings server.cpp's closures delegate to ───
+
+// Kills: apply_roster_read treating a failed read as healthy (returns true / leaves a degraded
+// bit unset), and a healthy read being flagged degraded.
+TEST_CASE("apply_roster_read: failed read sets every degraded bit; healthy read touches nothing",
+          "[hardware][model]") {
+    InventoryDevicesResult failed;
+    CHECK_FALSE(apply_roster_read(failed, OfflineRosterRead{std::unexpected(PresenceReadError::DbError)}));
+    CHECK(failed.roster_degraded);
+    CHECK(failed.ci_degraded);
+    CHECK(failed.tags_degraded);
+
+    InventoryDevicesResult healthy;
+    CHECK(apply_roster_read(healthy, OfflineRosterRead{std::vector<OfflineEndpoint>{}}));
+    CHECK_FALSE(healthy.roster_degraded);
+    CHECK_FALSE(healthy.ci_degraded);
+    CHECK_FALSE(healthy.tags_degraded);
+}
+
+// Kills: a failed key read collapsed to "no keys" (blank Tags column reads as authoritative), a
+// failed values read ignored, the reader being called after a failed key read, a healthy read
+// (incl. empty keys / a device with no tags) being flagged degraded, and tags not being attached.
+TEST_CASE("apply_tag_read: every failed read degrades and every healthy read populates without degrading",
+          "[hardware][model]") {
+    using Keys = std::expected<std::vector<std::string>, TagReadError>;
+    struct Row {
+        const char* name;
+        Keys keys;
+        TagValuesRead values;
+        bool reader_called;
+        bool degraded;
+        std::vector<std::pair<std::string, std::string>> a1_tags;
+        std::vector<std::string> expected_keys; // what the reader must be handed
+    };
+    const TagValuesRead no_values{TagValuesRead::value_type{}};
+    const std::array<Row, 5> table{{
+        {"key read fails", std::unexpected(TagReadError::kDegraded), no_values, false, true, {}, {}},
+        {"keys ok, values fail", Keys{std::vector<std::string>{"env"}},
+         std::unexpected(TagReadError::kDegraded), true, true, {}, {"env"}},
+        {"keys ok, values ok",
+         Keys{std::vector<std::string>{"env"}},
+         TagValuesRead{TagValuesRead::value_type{{"a1", {{"env", "prod"}}}}}, true, false, {{"env", "prod"}},
+         {"env"}},
+        {"keys ok but empty", Keys{std::vector<std::string>{}}, no_values, true, false, {}, {}},
+        {"keys ok, device has no tags", Keys{std::vector<std::string>{"env"}},
+         TagValuesRead{TagValuesRead::value_type{{"a2", {{"env", "dev"}}}}}, true, false, {},
+         {"env"}},
+    }};
+    for (const auto& row : table) {
+        CAPTURE(row.name);
+        InventoryDevicesResult result;
+        result.rows.resize(2);
+        result.rows[0].agent_id = "a1";
+        result.rows[1].agent_id = "a2";
+        bool called = false;
+        std::vector<std::string> seen;
+        apply_tag_read(result, row.keys, [&](const std::vector<std::string>& keys) {
+            called = true;
+            seen = keys;
+            return row.values;
+        });
+        CHECK(called == row.reader_called);
+        if (row.reader_called)
+            CHECK(seen == row.expected_keys); // the keys read are the ones handed to the values read
+        CHECK(result.tags_degraded == row.degraded);
+        CHECK(result.rows[0].tags == row.a1_tags);
+    }
+}
+
+// Kills: offline_identity_row swallowing the read error into an empty optional ("not found"); and
+// the stale-boundary mutant (`>=` for `>` on kHardwareStaleAfterMs).
+TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullopt",
+          "[hardware][model]") {
+    const auto err = offline_identity_row(
+        OfflineRosterRead{std::unexpected(PresenceReadError::StoreUnavailable)}, "a1", 10 * kDayMs, fake_age);
+    REQUIRE_FALSE(err.has_value());
+    CHECK(err.error() == PresenceReadError::StoreUnavailable);
+
+    const OfflineRosterRead roster{std::vector<OfflineEndpoint>{make_offline_ep("a1", 9 * kDayMs)}};
+    const auto hit = offline_identity_row(roster, "a1", 10 * kDayMs, fake_age);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->has_value());
+    CHECK((*hit)->hostname == "host-a1");
+    CHECK_FALSE((*hit)->online);
+    CHECK_FALSE((*hit)->stale); // 1 day old
+    CHECK((*hit)->last_seen == "aged");
+
+    const auto old = offline_identity_row(
+        OfflineRosterRead{std::vector<OfflineEndpoint>{make_offline_ep("a1", 0)}}, "a1", 10 * kDayMs, fake_age);
+    REQUIRE(old.has_value());
+    CHECK((*old)->stale);
+
+    // kHardwareStaleAfterMs boundary: the probes are derived from the constant, so its value is
+    // pinned separately; at the edge is fresh, one millisecond over is stale.
+    CHECK(kHardwareStaleAfterMs == 2 * kDayMs);
+    const auto at_edge = offline_identity_row(
+        OfflineRosterRead{
+            std::vector<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - kHardwareStaleAfterMs)}},
+        "a1", 10 * kDayMs, fake_age);
+    REQUIRE(at_edge.has_value());
+    CHECK_FALSE((*at_edge)->stale);
+    const auto past_edge = offline_identity_row(
+        OfflineRosterRead{
+            std::vector<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - kHardwareStaleAfterMs - 1)}},
+        "a1", 10 * kDayMs, fake_age);
+    REQUIRE(past_edge.has_value());
+    CHECK((*past_edge)->stale);
+
+    const auto miss = offline_identity_row(roster, "zzz", 10 * kDayMs, fake_age);
+    REQUIRE(miss.has_value());
+    CHECK_FALSE(miss->has_value());
+}
+
+// Kills: apply_identity_read never setting identity_degraded, or setting it on a clean miss.
+TEST_CASE("apply_identity_read: error degrades; nullopt is absent; row is identity", "[hardware][model]") {
+    HardwareCiDetail d;
+    apply_identity_read(d, std::unexpected(PresenceReadError::DbError));
+    CHECK(d.identity_degraded);
+    CHECK_FALSE(d.identity.has_value());
+
+    HardwareCiDetail absent;
+    apply_identity_read(absent, std::optional<InventoryDeviceRow>{});
+    CHECK_FALSE(absent.identity_degraded);
+    CHECK_FALSE(absent.identity.has_value());
+
+    HardwareCiDetail found;
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    apply_identity_read(found, std::optional<InventoryDeviceRow>{row});
+    CHECK_FALSE(found.identity_degraded);
+    REQUIRE(found.identity.has_value());
+    CHECK(found.identity->agent_id == "a1");
 }

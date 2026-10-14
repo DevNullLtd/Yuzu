@@ -8,10 +8,13 @@
 
 #include "hardware_routes.hpp"
 
+#include "app_shell.hpp"
 #include "authz_model.hpp"          // authz::in_scope
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
+
+#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 
 #include <nlohmann/json.hpp>
 
@@ -22,6 +25,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp).
 extern const char* const kGuardianDetailPageHtml;
@@ -42,15 +46,16 @@ std::string page_shell(const std::string& title, const std::string& fragment_url
     };
     sub("{{TITLE}}", title);
     sub("{{FRAGMENT}}", fragment_url);
-    sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
-        "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-    // The nav-sweep (10 shells) hasn't landed yet at this point in the branch history
-    // in a fresh checkout of this file alone — once it has, this activates the real
-    // Hardware nav link. Until then this is a silent no-op (the `sub` idiom's own
-    // known failure mode), which is exactly why test_nav_shells.cpp pins it.
-    sub("<a href=\"/hardware\" class=\"nav-link\">Hardware</a>",
-        "<a href=\"/hardware\" class=\"nav-link active\">Hardware</a>");
-    return html;
+    // The shared dialog module, the estate controller (quarantine, stored-data removal) and the
+    // tags/properties controls load after the template's own scripts, in that order. The shell is
+    // shared with pages that load none of them, so only this route family adds them.
+    // Same-origin static files: the dashboard CSP needs no change.
+    if (const auto end = html.rfind("</body>"); end != std::string::npos)
+        html.insert(end, "<script src=\"/static/yuzu-dialog.js\" defer></script>"
+                         "<script src=\"/static/yuzu-estate.js\" defer></script>"
+                         "<script src=\"/static/yuzu-device-data.js\" defer></script>\n");
+    // test_nav_shells.cpp pins that the shared shell carries the marker apply_shell fills.
+    return shell::apply_shell(std::move(html), {.active_key = "hardware"});
 }
 
 std::string url_encode_id(const std::string& s) {
@@ -83,6 +88,15 @@ bool bad_hw_ident(std::string_view v) {
         return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
                  c == '_' || c == '.' || c == '-');
     });
+}
+
+std::string hw_lens_or_overview(const std::string& raw) {
+    static constexpr std::string_view kLenses[] = {"overview", "software", "tags",    "containment",
+                                                   "dex",      "guardian", "live",    "actions"};
+    for (const auto l : kLenses)
+        if (raw == l)
+            return raw;
+    return "overview";
 }
 
 std::int64_t now_secs() {
@@ -124,6 +138,15 @@ scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope)
         out.push_back(row);
     }
     return {std::move(out), dropped};
+}
+
+// Audit-trail floor for an id taken raw from a URL: a device id reaches `target_id`
+// on every audit row these routes write and on the permission-denial audit, so ids over
+// kMaxAgentIdLength bytes or carrying a byte below 0x20 (CR/LF) are refused before any
+// audit write. Mirrors viz_routes.cpp's agent_id floor.
+bool id_is_audit_safe(const std::string& id) {
+    return id.size() <= auth::kMaxAgentIdLength &&
+           std::none_of(id.begin(), id.end(), [](unsigned char c) { return c < 0x20; });
 }
 
 } // namespace
@@ -171,8 +194,13 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!session) { res.set_redirect("/login"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        send_html(res, page_shell("Yuzu \xE2\x80\x94 Hardware",
-                                  "/fragments/hardware/ci?id=" + url_encode_id(id)));
+        // `lens` is forwarded so a link can open a specific lens (the row's Quarantine
+        // link). It is only a hint here: the fragment applies the allowlist, and the value
+        // is URL-encoded so it can never break out of the fragment URL.
+        std::string fragment = "/fragments/hardware/ci?id=" + url_encode_id(id);
+        if (req.has_param("lens"))
+            fragment += "&lens=" + url_encode_id(req.get_param_value("lens"));
+        send_html(res, page_shell("Yuzu \xE2\x80\x94 Hardware", fragment));
     });
 
     // -- Fragment: CI list --
@@ -201,7 +229,18 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!normalised) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\"><b>Bad request.</b> Unrecognised sort, "
-                          "direction, OS, or status filter.</div>");
+                          "OS, or status filter, or invalid tag key.</div>");
+            return;
+        }
+        const bool results_only = req.has_param("results_only") && req.get_param_value("results_only") == "1";
+        if (all.roster_degraded) {
+            // 200, not 5xx: htmx does not swap a failed response, so the banner
+            // would never render. Mirrors the unwired arm above.
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.devices", "failure",
+                                                "Inventory", "fleet", "hardware roster read failed");
+            HardwareListPage degraded;
+            degraded.query = *normalised;
+            send_html(res, render_hardware_list_fragment(degraded, false, /*roster_unavailable=*/true, results_only));
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
@@ -212,13 +251,44 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             for (auto& row : page.rows)
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
 
+        // Quarantined pill. Phase 1 reads which of THIS PAGE's devices have an active record
+        // (the read is restricted to the page's ids, so its cost is bounded by the page size
+        // and nothing is shown yet). Only if there is a candidate does phase 2 make ONE
+        // Security:Read list-gate decision (ADR-0017) and keep the candidates inside its
+        // scope — so a caller without Security:Read, or a page with no quarantines, costs no
+        // gate call and no denied audit row. The gate answers into a throwaway Response (the
+        // list itself is the response): a 403 means "this caller may not see pills" and draws
+        // none; an unavailable or unwired gate, or a degraded store, sets the banner flag and
+        // no pill (absence is then not evidence).
+        if (deps_.quarantine_list_fn && !page.rows.empty()) {
+            std::vector<std::string> page_ids;
+            page_ids.reserve(page.rows.size());
+            for (const auto& row : page.rows)
+                page_ids.push_back(row.agent_id);
+            const auto candidates = deps_.quarantine_list_fn(&page_ids, 0);
+            if (!candidates) {
+                page.quarantine_degraded = true;
+            } else if (!candidates->empty()) {
+                httplib::Response gate_res;
+                const authz::FleetReadGate qgate =
+                    deps_.fleet_read_fn ? deps_.fleet_read_fn(req, gate_res, "Security", "Read")
+                                        : authz::FleetReadGate{};
+                if (qgate.admitted) {
+                    for (const auto& r : *candidates)
+                        if (authz::in_scope(qgate.scope, r.agent_id))
+                            page.quarantined_ids.insert(r.agent_id);
+                } else if (!deps_.fleet_read_fn || gate_res.status != 403) {
+                    page.quarantine_degraded = true; // gate unwired/401/503: not a scope refusal
+                }
+            }
+        }
+
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list: devices=" + std::to_string(page.total_matching) +
                 " omitted=" + std::to_string(omitted));
         (void)persisted; // HTML fragment: set-and-proceed — the header is the signal
 
-        const bool results_only = req.has_param("results_only") && req.get_param_value("results_only") == "1";
         send_html(res, render_hardware_list_fragment(page, all.ci_degraded, false, results_only, all.tags_degraded));
     });
 
@@ -230,9 +300,17 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             send_html(res, "<div class=\"gp-placeholder\">Missing device id.</div>");
             return;
         }
+        if (!id_is_audit_safe(id)) {
+            res.status = 400;
+            send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
+            return;
+        }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
-        const std::string lens = req.has_param("lens") ? req.get_param_value("lens") : "overview";
+        // Allowlisted: the value reaches the audit detail and echoed markup, so an unknown
+        // or oversized `lens` falls back to the overview rather than being carried through.
+        const std::string lens = hw_lens_or_overview(req.has_param("lens") ? req.get_param_value("lens")
+                                                                          : std::string{});
         const bool lens_only = req.has_param("lens_only") && req.get_param_value("lens_only") == "1";
         if (!deps_.ci_detail_fn) {
             res.status = 503;
@@ -262,14 +340,21 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         const HardwareCiDetail detail = deps_.ci_detail_fn(id);
-        const HwCiAffordances aff = affordances_for(req, id, detail);
+        HwCiAffordances aff = affordances_for(req, id, detail);
+        if (lens == "tags")
+            aff.can_delete_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Delete", id);
 
         std::string verb = "inventory.device.ci";
         std::string state = !detail.ci.has_value() ? "store degraded"
                             : !detail.ci->has_value() ? "absent" : "found";
+        const bool no_record = !detail.identity && (!detail.ci.has_value() || !detail.ci->has_value());
+        if (detail.identity_degraded && no_record)
+            state = "roster unreadable";
+        else if (detail.identity_degraded)
+            state += " identity=roster unreadable";
         if (lens == "software") verb = "inventory.device.software";
         (void)detail::emit_behavioral_audit(
-            deps_.audit_fn, req, res, verb, "success", "Agent", id,
+            deps_.audit_fn, req, res, verb, detail.identity_degraded ? "failure" : "success", "Agent", id,
             "hardware CI lens=" + lens + " state=" + state +
                 (await_since ? " await=" + std::to_string(attempt) : ""));
 
@@ -328,6 +413,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                         httplib::Response& res) {
         detail::ensure_correlation_id(res);
         const std::string id = req.matches[1].str();
+        if (!id_is_audit_safe(id)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid device id"), "application/json");
+            return;
+        }
         if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) return;
 
         std::string source = "all";
@@ -465,7 +555,16 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto normalised = normalise_hardware_query(raw);
         if (!normalised) {
             res.status = 400;
-            res.set_content(detail::a4_error(res, "unrecognised sort, dir, os, or status token"),
+            res.set_content(detail::a4_error(res, "unrecognised sort, os, or status token or invalid tag key"),
+                            "application/json");
+            return;
+        }
+        if (all.roster_degraded) {
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.devices", "failure",
+                                                "Inventory", "fleet", "hardware roster read failed");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware roster unavailable",
+                                             {.retry_after_ms = 5000}),
                             "application/json");
             return;
         }
@@ -508,6 +607,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!gate.admitted) return;
 
         const std::string agent_id = req.matches[1].str();
+        if (!id_is_audit_safe(agent_id)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid device id"), "application/json");
+            return;
+        }
         if (!authz::in_scope(gate.scope, agent_id)) {
             // Out-of-scope collapses to the same "not found" as a genuinely
             // nonexistent id — the SAME 404 existence-oracle closure
@@ -531,6 +635,17 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                   (!detail.ci.has_value() ? false : !detail.ci->has_value()) &&
                                   (!detail.software || detail.software->empty()) &&
                                   (!detail.tags || detail.tags->empty());
+        if (truly_absent && detail.identity_degraded) {
+            // A failed roster read is never a 404 (#5531).
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.device.ci", "failure",
+                                                "Agent", agent_id,
+                                                "hardware CI record (REST) state=roster unreadable");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware roster unavailable",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
         if (truly_absent) {
             res.status = 404;
             res.set_content(detail::a4_error(res, "not found"), "application/json");
@@ -539,8 +654,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         std::string state = !detail.ci.has_value() ? "store degraded"
                             : !detail.ci->has_value() ? "absent" : "found";
+        if (detail.identity_degraded)
+            state += " identity=roster unreadable";
         const bool persisted = detail::emit_behavioral_audit(
-            deps_.audit_fn, req, res, "inventory.device.ci", "success", "Agent", agent_id,
+            deps_.audit_fn, req, res, "inventory.device.ci", detail.identity_degraded ? "failure" : "success",
+            "Agent", agent_id,
             "hardware CI record (REST) state=" + state);
         if (!persisted) {
             res.status = 503;
@@ -567,6 +685,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                       httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
+        if (!id_is_audit_safe(id)) {
+            res.status = 400;
+            send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
+            return;
+        }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
         if (!deps_.scoped_probe_fn || !deps_.scoped_probe_fn(req, "Execution", "Execute", id)) {
@@ -641,6 +764,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const std::string command_id = req.has_param("command_id") ? req.get_param_value("command_id") : "";
         const std::string plugin = req.has_param("plugin") ? req.get_param_value("plugin") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
+        if (!id_is_audit_safe(id)) {
+            res.status = 400;
+            send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
+            return;
+        }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
         if (bad_hw_ident(plugin) || command_id.size() > 64 ||

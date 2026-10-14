@@ -8,12 +8,14 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -48,6 +50,12 @@ constexpr const char* kStoreName = "gateway_route_store";
 // shortened one.
 constexpr std::chrono::milliseconds kWriteTimeout{500};
 constexpr std::chrono::milliseconds kReadTimeout{2000};
+// Reads on the BatchHeartbeat/NotifyStreamStatus handler thread: a stalled pool
+// must degrade fast (fail-open to the local hint) rather than pin the thread.
+constexpr std::chrono::milliseconds kHotReadTimeout{500};
+// Session ids bound into one ANY($1) statement; a longer batch is chunked.
+constexpr std::size_t kSessionLookupChunk = 1024;
+constexpr std::size_t kMaxLookupSessionIdLen = 64;
 
 // reap_stale_routes() runs off a background timer (Task B's job wiring), not
 // a gRPC handler thread, so it keeps the 2s codebase norm rather than the
@@ -430,7 +438,7 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
     return AnnounceResult{.matched = false, .cluster_affinity_violation = cluster_affinity_violation};
 }
 
-std::expected<bool, GatewayRouteStoreError>
+std::expected<ReclaimOutcome, GatewayRouteStoreError>
 GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
                                               std::string_view session_id,
                                               int lease_ttl_secs) {
@@ -458,28 +466,40 @@ GatewayRouteStore::reclaim_tombstoned_session(std::string_view agent_id,
     // always wins regardless of commit order (file header "THE FENCE"):
     // its nextval mint exceeds a fresh row's 0, and a tombstone's retained
     // epoch is exactly what register_fresh already tolerated overwriting.
+    // One statement so the cross-agent check that decides the INSERT is the
+    // same snapshot that classifies the refusal.
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "INSERT INTO gateway_route_store.agent_routes "
-        "  (agent_id, connection_epoch, session_id, lease_until, updated_at) "
-        "VALUES ($1, 0, $2, now() + ($3 || ' seconds')::interval, now()) "
-        "ON CONFLICT (agent_id) DO UPDATE SET "
-        "  session_id = EXCLUDED.session_id, "
-        "  lease_until = EXCLUDED.lease_until, "
-        "  updated_at = now() "
-        "WHERE agent_routes.session_id IS NULL "
-        "RETURNING agent_id",
+        "WITH other AS (SELECT 1 FROM gateway_route_store.agent_routes "
+        "               WHERE session_id = $2::text AND agent_id <> $1::text LIMIT 1), "
+        "ins AS ("
+        "  INSERT INTO gateway_route_store.agent_routes "
+        "    (agent_id, connection_epoch, session_id, lease_until, updated_at) "
+        "  SELECT $1::text, 0, $2::text, now() + ($3 || ' seconds')::interval, now() "
+        "  WHERE NOT EXISTS (SELECT 1 FROM other) "
+        "  ON CONFLICT (agent_id) DO UPDATE SET "
+        "    session_id = EXCLUDED.session_id, "
+        "    lease_until = EXCLUDED.lease_until, "
+        "    updated_at = now() "
+        "  WHERE agent_routes.session_id IS NULL "
+        "  RETURNING agent_id) "
+        "SELECT EXISTS (SELECT 1 FROM ins), EXISTS (SELECT 1 FROM other)",
         std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
                                                  std::to_string(lease_ttl_secs)});
-    if (res.status() != PGRES_TUPLES_OK) {
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
         spdlog::error("GatewayRouteStore::reclaim_tombstoned_session: query failed: {}",
                       PQresultErrorMessage(res.get()));
         return std::unexpected(GatewayRouteStoreError::db_error);
     }
-    // Zero rows: the ON CONFLICT branch's WHERE guard rejected the update
-    // because the row belongs to a DIFFERENT, LIVE (non-NULL) session — a
-    // genuine stale/zombie replay. The caller must refuse it outright.
-    return PQntuples(res.get()) == 1;
+    if (std::string_view(PQgetvalue(res.get(), 0, 0)) == "t")
+        return ReclaimOutcome::adopted;
+    // Not adopted: either another agent's row holds the id (best-effort: the
+    // index is non-unique) or the caller's own row holds a LIVE session
+    // (normally a different one; a concurrent identical reclaim also lands
+    // here). Either way the caller must refuse it outright.
+    return std::string_view(PQgetvalue(res.get(), 0, 1)) == "t"
+               ? ReclaimOutcome::held_by_other_agent
+               : ReclaimOutcome::superseded;
 }
 
 std::expected<DeregisterResult, GatewayRouteStoreError>
@@ -762,7 +782,7 @@ std::expected<std::optional<RouteRow>, GatewayRouteStoreError>
 GatewayRouteStore::lookup_route(std::string_view agent_id) {
     if (!open_)
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
-    auto lease = pool_.try_acquire_for(kReadTimeout);
+    auto lease = pool_.try_acquire_for(kHotReadTimeout);
     if (!lease) {
         spdlog::warn("GatewayRouteStore::lookup_route: lease timeout — degraded");
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
@@ -856,6 +876,71 @@ GatewayRouteStore::lookup_routes(std::span<const std::string> agent_ids) {
         rr.route.is_stale = std::string_view(PQgetvalue(res.get(), i, 6)) == "t";
         rr.routable = std::string_view(PQgetvalue(res.get(), i, 7)) == "t";
         out.push_back(std::move(rr));
+    }
+    return out;
+}
+
+std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
+GatewayRouteStore::lookup_by_sessions(std::span<const std::string> session_ids) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    // Deduped: a repeat split across two chunks would otherwise return its row
+    // twice and read as ambiguous.
+    std::vector<std::string_view> views;
+    std::unordered_set<std::string_view> seen;
+    views.reserve(session_ids.size());
+    seen.reserve(session_ids.size());
+    for (const std::string& s : session_ids)
+        if (!s.empty() && s.size() <= kMaxLookupSessionIdLen && seen.insert(s).second)
+            views.emplace_back(s);
+    if (views.empty())
+        return std::vector<RoutableRoute>{};
+    auto lease = pool_.try_acquire_for(kHotReadTimeout);
+    if (!lease) {
+        spdlog::warn("GatewayRouteStore::lookup_by_sessions: lease timeout — degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    // Array-param idiom and in-SQL DB-clock `routable` as lookup_routes, one
+    // statement per chunk on this lease; session_id is not unique so EVERY
+    // match is returned.
+    std::vector<RoutableRoute> out;
+    for (std::size_t off = 0; off < views.size(); off += kSessionLookupChunk) {
+        const std::size_t n_ids = std::min(kSessionLookupChunk, views.size() - off);
+        const std::vector<std::string_view> chunk(views.begin() + static_cast<std::ptrdiff_t>(off),
+                                                  views.begin() + static_cast<std::ptrdiff_t>(off + n_ids));
+        pg::PgResult res = pg::exec_params(
+            lease.get(),
+            "SELECT agent_id, cluster_id, gateway_node, connection_epoch, session_id, "
+            "       (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, "
+            "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale, "
+            "       (session_id IS NOT NULL AND lease_until >= now() AND cluster_id IS NOT NULL) "
+            "         AS routable "
+            "FROM gateway_route_store.agent_routes WHERE session_id = ANY($1::text[]) "
+            "ORDER BY agent_id",
+            std::vector<std::string>{pg::to_text_array(chunk)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("GatewayRouteStore::lookup_by_sessions: query failed: {}",
+                          PQresultErrorMessage(res.get()));
+            return std::unexpected(GatewayRouteStoreError::db_error);
+        }
+        const int n = PQntuples(res.get());
+        for (int i = 0; i < n; ++i) {
+            RoutableRoute rr;
+            rr.route.agent_id = PQgetvalue(res.get(), i, 0);
+            rr.route.cluster_id = col_opt(res.get(), i, 1);
+            rr.route.gateway_node = col_opt(res.get(), i, 2);
+            {
+                const char* v = PQgetvalue(res.get(), i, 3);
+                std::from_chars(v, v + std::char_traits<char>::length(v), rr.route.connection_epoch);
+            }
+            rr.route.session_id = col_opt(res.get(), i, 4);
+            rr.route.lease_until_ms = PQgetisnull(res.get(), i, 5)
+                                           ? std::nullopt
+                                           : parse_ms(PQgetvalue(res.get(), i, 5));
+            rr.route.is_stale = std::string_view(PQgetvalue(res.get(), i, 6)) == "t";
+            rr.routable = std::string_view(PQgetvalue(res.get(), i, 7)) == "t";
+            out.push_back(std::move(rr));
+        }
     }
     return out;
 }

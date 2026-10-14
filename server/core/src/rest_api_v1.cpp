@@ -49,6 +49,7 @@
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
+#include "quarantine_visible.hpp" // quarantine_visible_records: shared admit-then-filter read (REST GET + dashboard fragments)
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
 #include "result_set_model.hpp" // #2146 Batch B2: shared REST v1 + MCP result-set JSON builder
 #include "scope_engine.hpp"     // yuzu::scope::validate — POST /api/v1/scope/validate
@@ -63,7 +64,7 @@
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
-#include "software_catalogue_model.hpp" // shared software catalogue model
+#include "software_catalogue_model.hpp" // shared REST+MCP software catalogue model
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
@@ -882,13 +883,13 @@ const std::string& openapi_spec() {
       "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Always includes a tags array (key/value/source), empty when the device has no tags (a null/unwired TagStore degrades to an empty array, never an omitted key). Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags[]}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
     },
     "/hardware": {
-      "get": {"summary": "Hardware CI list (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint). Query params q/os/status/sort/dir/tag/offset/limit — an unrecognised sort/os/status/dir token is a 400. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. `dex_score` is `null` both when the device has no DEX data and when the per-device DEX read degraded (#4855) — this list/badge view does not distinguish the two (tracked at #4909); see `GET /api/v1/dex/devices/{id}` for a degrade-distinguishing per-device read. Audited on success as inventory.devices; a persist failure on the audit fails the request closed (503).", "responses": {"200": {"description": "{data: {rows[], kpis, query}, pagination, meta}"}, "400": {"description": "Unrecognised sort, dir, os, or status token"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster/audit unwired) or audit subsystem degraded"}}}
+      "get": {"summary": "Hardware CI list (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint). Query params q/os/status/sort/dir/tag/offset/limit — an unrecognised sort/os/status token or an invalid tag key is a 400, and any dir other than desc sorts ascending. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. `dex_score` is `null` both when the device has no DEX data and when the per-device DEX read degraded (#4855) — this list/badge view does not distinguish the two (tracked at #4909); see `GET /api/v1/dex/devices/{id}` for a degrade-distinguishing per-device read. Audited as inventory.devices (result=failure when the roster read failed); a persist failure on the success audit fails the request closed (503).", "responses": {"200": {"description": "{data: {devices[], kpis, query}, pagination, meta}"}, "400": {"description": "Unrecognised sort, os, or status token, or an invalid tag key"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster unwired), the device roster could not be read (retry_after_ms set), the authorization store unavailable (retry_after_ms 5000), or audit subsystem degraded"}}}
     },
     "/hardware/{id}": {
-      "get": {"summary": "Hardware CI record (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read via require_fleet_read; an id outside the caller's fleet-read scope collapses to the same 404 as a genuinely nonexistent id (same existence-oracle closure as /devices/{id}). Composes identity + CI blob + installed software + tags into one record — each independently distinguishes degraded from absent. Audited on success as inventory.device.ci; a persist failure on the audit fails the request closed (503).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {identity, ci, software, tags, ci_state}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, or audit subsystem degraded"}}}
+      "get": {"summary": "Hardware CI record (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read via require_fleet_read; an id outside the caller's fleet-read scope collapses to the same 404 as a genuinely nonexistent id (same existence-oracle closure as /devices/{id}). Composes identity + CI blob + installed software + tags into one record — each independently distinguishes degraded from absent. Audited as inventory.device.ci (result=failure when the roster read failed); a persist failure on the success audit fails the request closed (503).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, online, last_seen, identity_state (found|degraded|absent), ci, ci_state, software, tags, software_truncated, agent_version, sync_supported, software_last_seen}, meta}. A degraded CI store alongside a degraded roster is a 200 carrying identity_state and ci_state as degraded"}, "400": {"description": "Device id longer than 256 bytes or containing a byte below 0x20 (agent registration refuses both, so a registered device is not affected)"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, audit subsystem degraded, the authorization store unavailable (retry_after_ms 5000), or the device roster could not be read (retry_after_ms set) and the device was not otherwise found (CI record readable-and-absent, no software, no tags) — never a 404"}}}
     },
     "/hardware/{id}/sync": {
-      "post": {"summary": "Request an on-demand agent sync (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Execution:Execute scoped to the device. Body is an optional JSON object with a source field (one of installed_software/app_perf/device_ci/software_licensing/all, default all). Dispatches the reserved __sync__.now agent command (system_reserved, ExecuteGate::None — gated entirely at this route). Audited BEFORE dispatch as inventory.sync.request; a persist failure on that audit fails the request closed (503) with no dispatch. Agents below the 0.13.1 sync-on-demand floor are refused with 409.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["installed_software", "app_perf", "device_ci", "software_licensing", "all"]}}}}}}, "responses": {"202": {"description": "{data: {command_id, source, agents_reached, requested_at}, meta}"}, "400": {"description": "Malformed body, or source not one of the recognised tokens"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks the scoped Execution:Execute grant for this device"}, "409": {"description": "Agent version predates sync-on-demand (needs 0.13.1 or later)"}, "503": {"description": "Sync dispatch unwired, agent not connected, agent unreachable, or audit subsystem degraded"}}}
+      "post": {"summary": "Request an on-demand agent sync (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Execution:Execute scoped to the device. Body is an optional JSON object with a source field (one of installed_software/app_perf/device_ci/software_licensing/all, default all). Dispatches the reserved __sync__.now agent command (system_reserved, ExecuteGate::None — gated entirely at this route). Audited BEFORE dispatch as inventory.sync.request; a persist failure on that audit fails the request closed (503) with no dispatch. Agents below the 0.13.1 sync-on-demand floor are refused with 409.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["installed_software", "app_perf", "device_ci", "software_licensing", "all"]}}}}}}, "responses": {"202": {"description": "{data: {command_id, source, agents_reached, requested_at}, meta}"}, "400": {"description": "Malformed body, source not one of the recognised tokens, or a device id longer than 256 bytes or containing a byte below 0x20 (answered before the permission check, no audit row)"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks the scoped Execution:Execute grant for this device"}, "409": {"description": "Agent version predates sync-on-demand (needs 0.13.1 or later)"}, "503": {"description": "Sync dispatch unwired, agent not connected, agent unreachable, or audit subsystem degraded"}}}
     },
     "/management-groups": {
       "get": {"summary": "List management groups", "tags": ["Management Groups"], "responses": {"200": {"description": "List of management groups"}}},
@@ -1028,7 +1029,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Assign a built-in RBAC role to a human user, fleet-wide (A2)", "tags": ["RBAC"], "description": "Gated on a durable is_rbac_administrator check (re-read fresh from the store), NOT an ordinary permission check — see docs/user-manual/rbac.md \"Fleet-Wide Role Assignment\". principal_type must be \"user\"; ITServiceOwner is rejected (its confinement needs a management-group scope this route does not carry — use POST /api/v1/management-groups/{id}/roles instead). Pre-provisioning (a principal_id with no existing auth.users row) is allowed.", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"principal_type": {"type": "string", "enum": ["user"]}, "principal_id": {"type": "string"}}, "required": ["principal_type", "principal_id"]}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Invalid JSON, a non-object body, a wrong-typed principal_type/principal_id (degrades to missing/invalid, never a 500), unknown role, ITServiceOwner, principal_type != \"user\", invalid principal_id format, or the store rejects the grant for a genuine client-validation reason (defensive -- not reachable via this route today, since principal_type is hardcoded \"user\" and principal_id has already passed the same charset check DELETE enforces, but kept classified as 400 rather than 503 for when this changes) — the same uniform message for an unknown role and ITServiceOwner (M1: no role-catalog oracle)"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the assign_rbac_role tool instead, which requires the supervised tier plus an approval ticket)"}, "503": {"description": "RBAC/AuthDB store unavailable (including when the admin gate itself cannot confirm authority — now audited too), a genuine store/query fault while writing the grant (never misreported as a 400 — classified via an allow-list of known validation-error shapes), the defense-in-depth role lookup finding an already-validated role missing from the store, or the audit write for this mutation failed (fail-closed)"}}}
     },
     "/rbac/roles/{name}/assignments/{principal_id}": {
-      "delete": {"summary": "Revoke a fleet-wide RBAC role grant from a human user (A2)", "tags": ["RBAC"], "description": "Idempotent (success even when the role was not held). A caller may not remove their own Administrator assignment. Removing the fleet's last remaining authenticatable Administrator grant is refused for anyone, by a store-level check in the same transaction as the removal. That check also holds against a concurrent reactivation of an existing account. It does not cover an account created concurrently for a pre-provisioned grant, or a surviving Administrator's account deactivated concurrently (both tracked at #4966).", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "principal_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is removing their own Administrator assignment, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the unassign_rbac_role tool instead, which requires the supervised tier plus an approval ticket)"}, "409": {"description": "Refused: would remove the fleet's last remaining authenticatable Administrator role grant"}, "503": {"description": "RBAC store unavailable (including when the admin gate itself cannot confirm authority — now audited too), a genuine store/query fault removing the grant, or the audit write for this mutation failed (fail-closed)"}}}
+      "delete": {"summary": "Revoke a fleet-wide RBAC role grant from a human user (A2)", "tags": ["RBAC"], "description": "Idempotent (success even when the role was not held). A caller may not remove their own Administrator assignment. Removing the fleet's last remaining authenticatable Administrator grant is refused for anyone, by a store-level check in the same transaction as the removal. That check also holds against a concurrent reactivation of an existing account. It does not cover an account created concurrently for a pre-provisioned grant.", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "principal_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}, "401": {"description": "Not authenticated, or MFA step-up required (stale/absent proof) - see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is removing their own Administrator assignment, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the unassign_rbac_role tool instead, which requires the supervised tier plus an approval ticket)"}, "409": {"description": "Refused: would remove the fleet's last remaining authenticatable Administrator role grant"}, "503": {"description": "RBAC store unavailable (including when the admin gate itself cannot confirm authority - now audited too), a genuine store/query fault removing the grant, or the audit write for this mutation failed (fail-closed)"}}}
     },
     "/rbac/enforcement": {
       "put": {"summary": "Enable or disable RBAC enforcement fleet-wide (A1)", "tags": ["RBAC"], "description": "Gated on the SAME durable is_rbac_administrator check as the role-assignment routes above, not an ordinary permission check, plus MFA step-up. On a real transition, refused (403) unless the caller ALSO holds authority under the regime that is durably true right now (an authenticatable fleet-wide Administrator grant while currently on, local admin role while currently off), and refused (409) unless the caller would remain a durable administrator under the destination regime: enabling requires the caller's own fleet-wide Administrator grant, disabling requires the caller's own local account to hold the admin role. Idempotent: requesting the current state returns changed=false without evaluating either check. No GET twin — read the current state via GET /api/v1/me (rbac_enabled) or this route's own response.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}}}}, "responses": {"200": {"description": "Enforcement state applied (or already matched — changed=false)"}, "400": {"description": "Invalid JSON, or enabled missing/not a JSON boolean (strict — no string/number coercion)"}, "401": {"description": "Not authenticated, or MFA step-up required or failed (stale/absent proof; api_token/mcp_token bearer sessions are exempt) — see meta.challenge_url"}, "403": {"description": "Caller does not hold a durable Administrator role, is a service-scoped/engine session, or presented an MCP-tier bearer token of any tier (MCP callers use the set_rbac_enforcement tool instead, which requires the supervised tier plus an approval ticket), or (on a real transition) does not hold authority under the regime that is durably true right now"}, "409": {"description": "Refused: the caller would not remain a durable administrator after the switch"}, "503": {"description": "RBAC/AuthDB store unavailable (including when the admin gate itself cannot confirm authority — now audited too), or the audit write for this mutation failed (fail-closed)"}}}
@@ -1069,7 +1070,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Query inventory across agents with filter expression", "tags": ["Inventory"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string", "description": "Filter by agent ID"}, "plugin": {"type": "string", "description": "Filter by plugin name"}, "since": {"type": "integer", "description": "Only records after this epoch"}, "until": {"type": "integer", "description": "Only records before this epoch"}, "limit": {"type": "integer", "default": 100}}}}}}, "responses": {"200": {"description": "Matching inventory records"}}}
     },
     "/inventory/software": {
-      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app|pkg|feat), ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); out-of-scope devices are dropped and counted in devices_omitted (a positive value means matching software exists outside your scope — an empty/short result does NOT mean the software is absent fleet-wide). A correctly-confined service-scoped token now gets a real filtered read here rather than an outright 403. Capped at limit rows (max 1000); result_truncated_by_cap=true means more exist past the cap (keyset pagination is a follow-up). On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, devices_omitted, result_truncated_by_cap?, audit_persisted?}}"}, "400": {"description": "Non-integer limit"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
+      "get": {"summary": "Fleet-wide installed-software inventory (typed daily-sync store, ADR-0016)", "tags": ["Inventory"], "description": "Installed-software rows across the fleet from the typed SoftwareInventoryStore (DISTINCT from the generic /inventory/* routes, which read the generic blob store). Rows carry name, version, publisher, install_date plus the blob-v2 package fields: kind (package|app|pkg|feat), ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), epoch, release, arch, signature_status (rpm stored-tag), distro_id, distro_version — fields an ecosystem does not store are empty, never synthesised. Requires Inventory:Read (#3290 Phase 2: the SOLE gate is the ADR-0017 admit-then-filter fleet-read gate, never stacked with a separate permission check). Results are scoped to the caller's management groups AND, for a service-scoped API token, to that token's service-tagged agents (the intersection of both when both apply); the scope is applied in SQL (up to 10000 visible devices) so a confined caller gets COMPLETE pages of its own devices; devices_omitted is 0 under push-down; for a scope wider than that bound the rows are filtered after the read and devices_omitted is the count of distinct out-of-scope devices within the scanned window(s), a bounded and audited signal that out-of-scope matches exist. A denied audit row is written when it is above zero or when the request names an agent_id outside the caller's scope. On a wide scope a page can be empty with a non-null next_cursor; the cursor re-anchors at the last row served and carries a count of the rows scanned since, never a row of another device, and an export reads at most four bounded windows. A correctly-confined service-scoped token gets a real filtered read here (incl. export), unlike the two catalogue routes which deny service-scoped tokens. Each row also carries source (<plugin>.<action>, an open set). Optional filters: version (present-empty selects the empty-version rows), q, kind, ecosystem, source. Keyset pagination: next_cursor is non-null when more rows may exist (result_truncated_by_cap=true, also in export mode); pass it back as cursor — a malformed cursor or one issued for a different filter set is a 400. format=json|csv is an export (limit is the TOTAL cap, default and max 10000; csv adds Content-Disposition, X-Result-Truncated-By-Cap and X-Next-Cursor, and a trailer record when more rows may exist) audited as inventory.software.export. Every served call is audited (inventory.software.query success, inventory.software.export for an export; continuation pages tagged page=continuation). Repeated query parameters keep the first value; a non-integer limit is a 400. On store degradation, or the caller's tag-scope lookup degrading, the endpoint returns 503 (never an empty 200) so a vulnerability query cannot read a transient outage as 'installed nowhere'.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Exact software-name filter (optional)"}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}, "description": "Exact agent filter (optional)"}, {"name": "version", "in": "query", "schema": {"type": "string"}, "description": "Exact version filter; present-empty selects the empty-version rows"}, {"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over name, publisher, ecosystem and source"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}, "description": "Export mode (limit is the total cap, max 10000)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "{data:{software[], count, next_cursor, devices_omitted, result_truncated_by_cap?, audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=software-installs.csv"}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when more rows may exist (the export reached the total cap, or a wide-scope read was cut short)"}, "X-Next-Cursor": {"schema": {"type": "string"}, "description": "format=csv only: the continuation, present with X-Result-Truncated-By-Cap; pass it back as cursor"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when an audit row of the export did not persist (the export is still served)"}}}, "400": {"description": "Non-integer limit, unknown format, text that is not valid UTF-8 or holds a NUL byte, an over-long value, or a refused cursor"}, "401": {"description": "Unauthenticated"}, "403": {"description": "No management-group grant for Inventory:Read (or a service-scoped token whose RBAC/ITServiceOwner grant is missing/RBAC disabled)"}, "503": {"description": "Software inventory store unavailable/degraded, RBAC/management-group/tag store unavailable, or the fleet-read gate unwired"}}}
     },
     "/policy-fragments": {
       "get": {"summary": "List policy fragments (api-parity #4034)", "tags": ["Compliance"], "description": "REST v1 twin of legacy GET /api/policy-fragments; MCP twin list_policy_fragments. Requires Policy:Read.", "parameters": [{"name": "name", "in": "query", "schema": {"type": "string"}, "description": "Substring name filter (optional)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}], "responses": {"200": {"description": "{data:[{id,name,description,check_instruction,check_compliance,fix_instruction,post_check_instruction,created_at,updated_at}], pagination}"}, "400": {"description": "Non-integer limit"}, "503": {"description": "Policy store not available/degraded"}}}
@@ -1088,8 +1089,8 @@ const std::string& openapi_spec() {
     },)json"
         // The software catalogue twins. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
-    "/inventory/software/catalogue": {"get": {"summary": "Fleet software title catalogue with totals and KPIs", "tags": ["Inventory"], "description": "One row per software title rolled up across the whole fleet from the precomputed catalogue rollup, ordered by installs descending then name (per-device view: by name). totals{titles,installs} cover EVERY row matching the filters (not just this page), so a page can say N of M; installs sums each title's distinct-device count. kpis (first page only; null on continuation pages and the per-device view) carries the headline numbers computed by the hourly refresh plus derived percentages, and coverage{reporting,connected,stale} as counts (reporting = devices with stored inventory, connected = devices currently connected, stale = not seen in 48 hours; null when that figure is unavailable). Requires a GLOBAL Inventory:Read for the fleet view: a management-group-confined caller gets 403 with permission Inventory:Read (the rollup is fleet-wide and cannot be scoped); the per-device view (agent_id) is admitted for an in-scope device, an out-of-scope device returns an empty page with devices_omitted 1, and a confined caller sees newest_version blank with newest_omitted true. Service-scoped API tokens are denied (403, no permission field). Pagination is keyset: next_cursor is non-null when the page is full; a cursor presented with a different filter set, a malformed cursor, or one issued before the latest catalogue refresh (1 second generation granularity) is a 400 and the walk must restart from the first page. Every call that serves a page is audited (inventory.software.catalog success, continuation pages tagged page=continuation); an out-of-scope per-device read writes denied only (denied plus an empty-file inventory.software.export success on format=csv). format=csv exports the titles (total cap 10000, X-Result-Truncated-By-Cap when the cap is reached; audited as inventory.software.export). An empty kind, ecosystem or source means no filter. A degraded rows, totals or refresh-metadata read is a 503 with retry_after_ms, never an empty 200. Before the first catalogue refresh the JSON page answers 200 with kpis.building true, while the fleet format=csv export is a 503 with retry_after_ms (an empty file would read as no titles; the per-device export is unaffected).", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over title name, publisher, ecosystems and sources (% and _ are not wildcards); clamped to 128 bytes"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's titles (installs are 1)"}, {"name": "versions_min", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100000}, "description": "Only titles with at least this many distinct versions"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size, clamped into 1..1000; with format=csv it is the TOTAL export cap (clamped into 1..10000, default 10000)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the filter set and to the catalogue refresh generation"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}, "description": "csv streams a titles export (REST only; audited as inventory.software.export)"}], "responses": {"200": {"description": "{data:{titles[{name,publisher,installs,versions,ecosystems[],kinds[],newest_version}],count,next_cursor,totals{titles,installs},kpis|null,devices_omitted,newest_omitted?,audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=\"software-titles.csv\""}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the walk reached the total export cap (rows may have been left behind)"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the export audit row did not persist, or when only the paired denied row failed to persist (the export is still served)"}}}, "400": {"description": "Repeated or malformed parameter, non-integer limit or versions_min, unknown format, a cursor sent with format=csv, or a refused cursor: invalid cursor, different filter set, or predates the current catalogue refresh (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (no permission field) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Rows, totals or refresh-metadata read degraded, or (fleet format=csv) the catalogue is not built yet: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
-    "/inventory/software/catalogue/versions": {"get": {"summary": "Installs per version for one software title", "tags": ["Inventory"], "description": "Distinct-device install counts per version of one title under the same filters as the catalogue; the newest flag marks the title's fleet-wide newest version. truncated is true when the limit was reached. Same access posture as the catalogue: a global Inventory:Read for the fleet view (a confined caller gets 403), the per-device view for an in-scope device (newest is false on every row and newest_omitted is true for a confined caller; an out-of-scope device returns an empty list with devices_omitted 1), service-scoped tokens denied. Every call that serves a page is audited (inventory.software.versions success); a 400 writes nothing; a confined or service-scoped refusal writes denied; the Inventory:Read gate's own refusal is audited as auth.fleet_read_required. A degraded read is a 503 with retry_after_ms, never an empty 200; so is the unfiltered read (no kind, ecosystem, source or agent_id) before the first catalogue refresh.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 1024}, "description": "Exact title name"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's versions of the title"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}, "description": "Maximum versions returned, clamped into 1..1000"}], "responses": {"200": {"description": "{data:{name,versions[{version,installs,newest}],count,truncated,devices_omitted,newest_omitted?,audit_persisted?}}"}, "400": {"description": "name missing, repeated or malformed parameter, an over-long value, invalid UTF-8 or a NUL byte (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Versions or refresh-metadata read degraded, or the unfiltered read before the first refresh: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
+    "/inventory/software/catalogue": {"get": {"summary": "Fleet software title catalogue with totals and KPIs", "tags": ["Inventory"], "description": "One row per software title rolled up across the whole fleet from the precomputed catalogue rollup, ordered by installs descending then name (per-device view: by name). MCP twin query_software_catalogue; both are shaped by one shared model. totals{titles,installs} cover EVERY row matching the filters (not just this page), so a page can say N of M; installs sums each title's distinct-device count. kpis (first page only; null on continuation pages and the per-device view) carries the headline numbers computed by the hourly refresh plus derived percentages, and coverage{reporting,connected,stale} as counts (reporting = devices with stored inventory, connected = devices currently connected, stale = not seen in 48 hours; null when that figure is unavailable). Requires a GLOBAL Inventory:Read for the fleet view: a management-group-confined caller gets 403 with permission Inventory:Read (the rollup is fleet-wide and cannot be scoped); the per-device view (agent_id) is admitted for an in-scope device, an out-of-scope device returns an empty page with devices_omitted 1, and a confined caller sees newest_version blank with newest_omitted true. Service-scoped API tokens are denied (403, no permission field). Pagination is keyset: next_cursor is non-null when the page is full; a cursor presented with a different filter set, a malformed cursor, or one issued before the latest catalogue refresh (1 second generation granularity) is a 400 and the walk must restart from the first page. Every call that serves a page is audited (inventory.software.catalog success, continuation pages tagged page=continuation); an out-of-scope per-device read writes denied only (denied plus an empty-file inventory.software.export success on format=csv). format=csv exports the titles (total cap 10000, X-Result-Truncated-By-Cap when the cap is reached; audited as inventory.software.export). An empty kind, ecosystem or source means no filter. A degraded rows, totals or refresh-metadata read is a 503 with retry_after_ms, never an empty 200. Before the first catalogue refresh the JSON page answers 200 with kpis.building true, while the fleet format=csv export is a 503 with retry_after_ms (an empty file would read as no titles; the per-device export is unaffected).", "parameters": [{"name": "q", "in": "query", "schema": {"type": "string", "maxLength": 128}, "description": "Case-insensitive literal substring over title name, publisher, ecosystems and sources (% and _ are not wildcards); clamped to 128 bytes"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's titles (installs are 1)"}, {"name": "versions_min", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100000}, "description": "Only titles with at least this many distinct versions"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}, "description": "Page size, clamped into 1..1000; with format=csv it is the TOTAL export cap (clamped into 1..10000, default 10000)"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "Opaque next_cursor from the previous page; bound to the filter set and to the catalogue refresh generation"}, {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}, "description": "csv streams a titles export (REST only; audited as inventory.software.export)"}], "responses": {"200": {"description": "{data:{titles[{name,publisher,installs,versions,ecosystems[],kinds[],newest_version}],count,next_cursor,totals{titles,installs},kpis|null,devices_omitted,newest_omitted?,audit_persisted?}}; with format=csv the body is text/csv", "headers": {"Content-Disposition": {"schema": {"type": "string"}, "description": "format=csv only: attachment; filename=\"software-titles.csv\""}, "X-Result-Truncated-By-Cap": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the walk reached the total export cap (rows may have been left behind)"}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "format=csv only: present when the export audit row did not persist, or when only the paired denied row failed to persist (the export is still served)"}}}, "400": {"description": "Repeated or malformed parameter, non-integer limit or versions_min, unknown format, a cursor sent with format=csv, or a refused cursor: invalid cursor, different filter set, or predates the current catalogue refresh (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (no permission field) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Rows, totals or refresh-metadata read degraded, or (fleet format=csv) the catalogue is not built yet: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},
+    "/inventory/software/catalogue/versions": {"get": {"summary": "Installs per version for one software title", "tags": ["Inventory"], "description": "Distinct-device install counts per version of one title under the same filters as the catalogue; the newest flag marks the title's fleet-wide newest version. MCP twin get_software_versions. truncated is true when the limit was reached. Same access posture as the catalogue: a global Inventory:Read for the fleet view (a confined caller gets 403), the per-device view for an in-scope device (newest is false on every row and newest_omitted is true for a confined caller; an out-of-scope device returns an empty list with devices_omitted 1), service-scoped tokens denied. Every call that serves a page is audited (inventory.software.versions success); a 400 writes nothing; a confined or service-scoped refusal writes denied; the Inventory:Read gate's own refusal is audited as auth.fleet_read_required. A degraded read is a 503 with retry_after_ms, never an empty 200; so is the unfiltered read (no kind, ecosystem, source or agent_id) before the first catalogue refresh.", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 1024}, "description": "Exact title name"}, {"name": "kind", "in": "query", "schema": {"type": "string", "enum": ["package", "app", "pkg", "feat"]}, "description": "Exact kind filter; empty means no filter"}, {"name": "ecosystem", "in": "query", "schema": {"type": "string", "enum": ["rpm", "deb", "apk", "pacman", "windows", "macos", "macos_pkgutil", "brew", "optional_feature"]}, "description": "Exact ecosystem filter; empty means no filter"}, {"name": "source", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact source filter (open set, <plugin>.<action>); empty means no filter"}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Per-device view of one device's versions of the title"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200}, "description": "Maximum versions returned, clamped into 1..1000"}], "responses": {"200": {"description": "{data:{name,versions[{version,installs,newest}],count,truncated,devices_omitted,newest_omitted?,audit_persisted?}}"}, "400": {"description": "name missing, repeated or malformed parameter, an over-long value, invalid UTF-8 or a NUL byte (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Confined caller on the fleet view (permission Inventory:Read) or a service-scoped token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Versions or refresh-metadata read degraded, or the unfiltered read before the first refresh: retry_after_ms 5000. An absent store or an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
         // #4029 (api-parity Batch A content/catalog half) — GET /api/v1/instructions*
         // and GET /api/v1/product-packs*. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
@@ -1116,7 +1117,7 @@ const std::string& openapi_spec() {
         R"json(
     "/sle/agents/{agent_id}": {
       "get": {"summary": "SLE per-agent detected-licence drill (ADR-0024)", "tags": ["SLE"], "description": "One device's detected software licences (product, type, channel, state, expiry, confidence, exe_hints) INCLUDING the per-user fields user_scope/user_ref (personal data, ADR-0024 Decision 11). Requires SoftwareLicensing:Read SCOPED to the device (tier + management group, ancestor-aware — a global grant passes fleet-wide, otherwise the caller must hold Read via a management group the device is in; 403 outside scope). Individual-identifying data, so every call emits a per-open sle.agent.view behavioural audit and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that audit row cannot persist — the licence PII is never served without durable evidence (SOC 2 CC7.2). REAL data in PR1a. A store degrade returns 503 (never an empty 200).", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{agent_id, licenses[].{product, vendor, version, license_type, state, expiry_at, channel, key_hint, detector, confidence, exe_hints, user_scope, user_ref, collected_at, first_seen, last_seen}, count}}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Outside the caller's management scope (SoftwareLicensing:Read on the device)"}, "503": {"description": "Store degraded, OR the sle.agent.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when per-agent licence PII was withheld because the access-audit row failed to persist."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}},
-      "delete": {"summary": "SLE agent decommission — durable erasure trigger (ADR-0024 Decision 11, amended Wave 7 PR7.2)", "tags": ["SLE"], "description": "Erase a decommissioned device's stored rows across SIX per-agent stores (the decommission cascade's production caller): InventoryStore, SoftwareInventoryStore, DeviceInventoryStore (all three read-gated by Inventory), AppPerfDailyStore (read-gated by GuaranteedState — DEX behavioural PII), SoftwareLicensingStore (read-gated by SoftwareLicensing — detected-licence rows incl. the Decision-11 user_ref personal data, GDPR Art.17), and AppUsageStore (read-gated by Forensics, Wave 7 PR7.2 — per-executable last-used rows). Requires ONE SCOPED securable, Decommission:Delete — a device-level erasure grant that authorizes for the cascade's whole blast radius rather than a hand-maintained conjunction over each store's own READ securable (Administrator + ITServiceOwner hold it via seed_defaults(); an operator-authored custom role that had assembled the old per-store Delete grants is refused until granted the new securable). AUDIT-BEFORE-ERASE, FAIL-CLOSED: a durable sle.agent.decommission attempt is recorded first and, if it cannot persist, NO erasure occurs (503 + Sec-Audit-Failed). Each store reports its committed delete status, so a rolled-back store is reported failed (HTTP 500 — re-issue the idempotent DELETE), never a false decommissioned:true. NB per ADR-0024 'Placement under ADR-1005' the fleet posture/fan-out reads are the SAM use-case-engine module's, not served by this server.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{agent_id, decommissioned:true, stores, deleted, skipped, failed}}"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Outside scope, or lacks Decommission:Delete"}, "500": {"description": "One or more stores failed to erase (partial) — re-issue the idempotent DELETE (A4 envelope)"}, "503": {"description": "Cascade unconfigured, or the attempt audit could not persist (Sec-Audit-Failed: true — no erasure)"}}}
+      "delete": {"summary": "SLE agent decommission — durable erasure trigger (ADR-0024 Decision 11, amended Wave 7 PR7.2)", "tags": ["SLE"], "description": "Erase a decommissioned device's stored rows across SEVEN per-agent stores (the decommission cascade's production caller): InventoryStore, SoftwareInventoryStore, DeviceInventoryStore (all three read-gated by Inventory), AppPerfDailyStore (read-gated by GuaranteedState — DEX behavioural PII), SoftwareLicensingStore (read-gated by SoftwareLicensing — detected-licence rows incl. the Decision-11 user_ref personal data, GDPR Art.17), AppUsageStore (read-gated by Forensics, Wave 7 PR7.2 — per-executable last-used rows), and OfflineEndpointStore (#5682 — the endpoint_state presence row: hostname, os, agent version, arch; read on /hardware under Inventory and /viz/fleet under Response). Requires ONE SCOPED securable, Decommission:Delete — a device-level erasure grant that authorizes for the cascade's whole blast radius rather than a hand-maintained conjunction over each store's own READ securable (Administrator + ITServiceOwner hold it via seed_defaults(); an operator-authored custom role that had assembled the old per-store Delete grants is refused until granted the new securable). AUDIT-BEFORE-ERASE, FAIL-CLOSED: a durable sle.agent.decommission attempt is recorded first and, if it cannot persist, NO erasure occurs (503 + Sec-Audit-Failed). Each store reports its committed delete status, so a rolled-back store is reported failed (HTTP 500 — re-issue the idempotent DELETE), never a false decommissioned:true. A still-enrolled agent re-creates its presence row on its next heartbeat (erasure does not unenroll); stop the agent first. NB per ADR-0024 'Placement under ADR-1005' the fleet posture/fan-out reads are the SAM use-case-engine module's, not served by this server.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{agent_id, decommissioned:true, stores, deleted, skipped, failed}}"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Outside scope, or lacks Decommission:Delete"}, "500": {"description": "One or more stores failed to erase (partial) — re-issue the idempotent DELETE (A4 envelope)"}, "503": {"description": "Cascade unconfigured, or the attempt audit could not persist (Sec-Audit-Failed: true — no erasure)"}}}
     },)json"
         // Forensics (Wave 7 PR7.2) — the single app_usage REST surface, gated on
         // the Forensics securable (Administrator-only by design, deliberately
@@ -1262,6 +1263,12 @@ const std::string& openapi_spec() {
     },
     "/workflows/{id}": {
       "get": {"summary": "Fetch one workflow (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflows/{id} and MCP get_workflow (new). Requires Workflow:Read. Full step list plus yaml_source. Shared builder workflow_detail_json.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Workflow detail"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "404": {"description": "Workflow not found"}, "503": {"description": "Workflow engine not available"}}}
+    },)json"
+        // The workflow-execution LIST. Own segment (MSVC C2026 16,380-byte cap): joined to the
+        // previous literal (about 13 KB) it would exceed the limit.
+        R"json(
+    "/workflow-executions": {
+      "get": {"summary": "List workflow executions", "tags": ["Workflows"], "description": "REST v1 / MCP list_workflow_executions twin pair, new (no legacy route listed runs). WorkflowEngine's own multi-step runs, a DIFFERENT data model from GET /executions (single-instruction fan-out Executions). Requires Workflow:Read through the fleet-read gate (admit-then-filter, ADR-0017): a confined caller (management-group or service-scoped) sees only runs with at least one agent in its scope, and that scope is applied in the store BEFORE ordering and the page limit, so an invisible run never consumes a page slot and next_cursor and page length depend only on runs the caller may see; a forged cursor reveals nothing. Rows are metadata only (id, workflow_id, workflow_name, workflow_deleted, status, current_step, started_at, completed_at): never agent ids, step results or a fleet-size count. Newest first by (started_at, id) with keyset paging: pass next_cursor back as cursor (null when no more rows exist); a cursor is a position only and does not bind the other filters. latest_per_workflow=true returns at most one run per workflow, the newest among the runs that pass the other filters AND the caller's visibility, ordered by workflow_id, with no cursor (combining the two is a 400) and result_truncated_by_cap true when more workflows matched than limit. pagination.total is the number of rows in this page, never a fleet-wide count. Input is strict: an unknown or repeated parameter, an out-of-vocabulary status, a malformed workflow_id/since/until/cursor, since after until, or limit below 1 is a 400; limit above 500 is clamped to 500. No audit row is written for a successful list (run metadata); a denial is audited by the gate as auth.fleet_read_required. A store failure or statement timeout is a 503 with retry_after_ms, never an empty 200. Service-scoped tokens are admitted only through the fleet-read gate's ITServiceOwner ceiling and tag scope (the service-scope allow-list is unchanged).", "parameters": [{"name": "workflow_id", "in": "query", "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$", "maxLength": 128}, "description": "Exact workflow filter"}, {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["pending", "running", "completed", "failed", "cancelled"]}, "description": "Exact status filter"}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 9007199254740992}, "description": "Runs started at or after this epoch second"}, {"name": "until", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 9007199254740992}, "description": "Runs started strictly before this epoch second; must not be before since"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}, "description": "Page size; above 500 is clamped"}, {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 2048}, "description": "next_cursor from the previous page; not combinable with latest_per_workflow"}, {"name": "latest_per_workflow", "in": "query", "schema": {"type": "boolean", "default": false}, "description": "At most one (the newest visible) run per workflow, ordered by workflow_id"}], "responses": {"200": {"description": "{data:[{id,workflow_id,workflow_name,workflow_deleted,status,current_step,started_at,completed_at}],pagination:{total,start,page_size,next_cursor,result_truncated_by_cap?}}"}, "400": {"description": "Unknown or repeated parameter, or a malformed or out-of-range value (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Insufficient permission (Workflow:Read) or a service-scoped token the gate refuses (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Workflow engine unavailable or the read degraded (store failure, statement timeout): retry_after_ms 5000; an unwired fleet-read gate is a 503 without retry_after_ms (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/workflow-executions/{id}": {
       "get": {"summary": "Fetch one workflow execution (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflow-executions/{id} and MCP get_workflow_execution (new) — WorkflowEngine's own per-step execution record, a DIFFERENT data model from ExecutionTracker's fan-out Execution (GET /executions/{id}). Both this route and the legacy twin gate on fleet_read_fn (Workflow:Read) with record-level confinement (#4030 Gate 8 fix): a caller with no agent visible in agent_ids_json 404s identically to a nonexistent execution, never a narrower-but-present record; an admitted confined caller's agent_ids is narrowed to their visible agents and each step's result.agents_reached is stripped. Audited as workflow_execution.detail.fetch (set-and-proceed) on both the success path and the confinement-denied path — a genuinely nonexistent id writes no audit row (the denied row alone therefore distinguishes 'exists, out of scope' from 'never existed' for a caller who also holds AuditLog:Read; tracked open). Shared builder workflow_execution_detail_json.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Workflow execution detail"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "404": {"description": "Execution not found"}, "503": {"description": "Workflow engine not available"}}}
@@ -1326,7 +1333,9 @@ const std::string& openapi_spec() {
       "get": {"summary": "Apps with retained fleet app-perf data (picker)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Lists the distinct apps that currently have retained fleet performance-over-time data in the Postgres B2 store, so a worker discovers which app= values GET /dex/perf/app can answer (agentic-first A2 discovery). Each entry carries the count of distinct retained versions and the most recent UTC-midnight epoch day seen. truncated=true means the distinct-app list was clipped at the server cap (5000). Fleet metadata — NOT audited.", "responses": {"200": {"description": "Picker object (apps[].{app_name, versions, last_day}, truncated)"}, "503": {"description": "service unavailable, or the app-perf store read degraded (retry)"}}}
     },
     "/dex/perf/app": {
-      "get": {"summary": "Fleet performance-over-time trend for one app", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The 'over time' companion to /dex/perf/fleet: reads the retained Postgres B1/B2 substrate (NOT live heartbeat) to answer 'did this app regress across the fleet'. Returns one point per (version, UTC day) over the B2 retention (up to 180 days). version omitted = every version interleaved, each point tagged with its canonicalized version; a supplied version is canonicalized to match the stored key. Each point carries the EXACT fleet mean and max (cpu_mean share-of-capacity %, ws_mean working-set bytes) plus bucket-resolution p50/p95 read from the fixed histogram. A percentile is {value, lower_bound}: lower_bound=true means it falls in the open top bucket and value is a FLOOR (render '>= value'), and a percentile is null when the population is empty or the row predates the current histogram scheme. hist_stale=true flags a point whose stored histogram scheme differs from the running one — its means/maxima still stand, its percentiles are withheld. Fleet aggregate (no agent_id) — NOT audited; the per-device drill lives on the audited /dex/devices/{id} family.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover valid names via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized and matched exactly; omit for all versions."}], "responses": {"200": {"description": "Trend object (app, version, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale}). A sub-floor (<10 devices) point carries suppressed=true with device_count only."}, "400": {"description": "missing app, or app/version invalid (too long or control characters)"}, "503": {"description": "service unavailable, or the app-perf store read degraded (retry)"}}}
+      "get": {"summary": "Fleet performance-over-time trend for one app", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The 'over time' companion to /dex/perf/fleet: reads the retained Postgres B1/B2 substrate (NOT live heartbeat) to answer 'did this app regress across the fleet'. Returns one point per (version, UTC day) over the B2 retention (up to 180 days). version omitted = every version interleaved, each point tagged with its canonicalized version; a supplied version is canonicalized to match the stored key. Each point carries the EXACT fleet mean and max (cpu_mean share-of-capacity %, ws_mean working-set bytes) plus bucket-resolution p50/p95 read from the fixed histogram. A percentile is {value, lower_bound}: lower_bound=true means it falls in the open top bucket and value is a FLOOR (render '>= value'), and a percentile is null when the population is empty or the row predates the current histogram scheme. hist_stale=true flags a point whose stored histogram scheme differs from the running one — its means/maxima still stand, its percentiles are withheld. )json"
+        R"json(Also carries versions[], one row per version (the 20 highest canonical versions the agents reported, newest first; versions_truncated=true when older versions were dropped; a version with no retained performance rows is not listed, so no row is not no failures) joining the last failure_window_days of crash and hang observations (30, clamped to one day less than the observation retention when that is 1 to 30 days; whole UTC days plus the current day so far; an observation stamped after the end of the current UTC day is excluded), matched on the exact canonical version and subject the agent reported: affected_devices (fleet-wide devices that reported a crash or hang) with crashes and hangs, always present as fleet-wide event counts; exposure_devices (devices with retained resource-significant samples, a selected subset and not a census, null when unknown, so affected_devices > 0 with null exposure is failures recorded under a version with no samples), and when exposure_devices is known: exposed_crashes and exposed_hangs and, when it is positive, failure_rate (exposed events per exposed device over the window, not per day of use: read it beside day_count and latest_day, a version with fewer than failure_window_days + 1 days has had less time to fail; exact 95 percent interval; a zero exposure gives a null rate), and, when both versions have a known positive exposure_devices, failure_rate_ratio against previous_version (the next older returned version; null for the oldest known version and for the unknown version; exact conditional interval; upper null with unbounded=true when the previous version saw no exposed events). This join carries no device floor (maintainer ruling): every figure is published at any device count, and the per-(version, day) point floor on points[] is unchanged. exposure_basis resource_significant: exposure is the daily top-N consumers, not a census. stat_failures counts statistics that returned nothing on valid input (expected 0). )json"
+        R"json(Fleet aggregate (no agent_id) — NOT audited; the per-device drill lives on the audited /dex/devices/{id} family.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover valid names via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized and matched exactly; omit for all versions."}], "responses": {"200": {"description": "Trend object (app, version, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale}). A sub-floor (<10 devices) point carries suppressed=true with device_count only. Also versions[], versions_truncated, failure_window_days, exposure_basis (resource_significant) and stat_failures."}, "400": {"description": "missing app, or app/version invalid (too long or control characters)"}, "503": {"description": "service unavailable, or the app-perf or crash-and-hang read degraded (retry)"}}}
     },
     "/dex/perf/app/devices": {
       "get": {"summary": "Which devices reported one app version (version-row drill)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read via AuthRoutes::require_fleet_read (ADR-0017 admit-then-filter — the SOLE gate on this route, never stacked with a bare permission check). Unlike GET /dex/perf/app above, each row here names an agent_id — a fleet-wide fan-out of identified per-device data — so the caller's management-group/service-scope confinement is pushed into the underlying SQL query itself (never a post-fetch filter): a confined caller sees exactly their visible devices, never an unfiltered page. version is REQUIRED and matched EXACTLY (omit-means-'all-versions' does NOT apply here, unlike /dex/perf/app — pass an empty string for the unknown-version bucket; Linux procperf reports every app under this empty bucket today). Each row is that device's MOST RECENT reported day for this exact (app, version) among its retained daily top-N resource-significant app-versions — NOT a census of every device with this app-version installed (see /api/v1/inventory/software for the census). Rows are ordered by descending cpu_avg and capped; truncated=true means only the highest-CPU devices are shown. Per-device (B1) data retains only 31 days, shorter than this trend's 180-day (B2) retention, so a version last seen >31 days ago legitimately returns zero devices even though GET /dex/perf/app still shows aggregate history for it. Individual-identifying, so every call emits a dex.app_perf.devices.view audit event and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that row cannot persist.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Exact version, canonicalized and matched exactly; empty string = the unknown-version bucket, NOT 'all versions'."}], "responses": {"200": {"description": "Devices-drill object (app, version, truncated, devices[].{agent_id, last_day, samples, cpu_avg, ws_avg_bytes})"}, "400": {"description": "missing/invalid app or version (version must be present, even if empty)"}, "403": {"description": "caller lacks GuaranteedState:Read"}, "503": {"description": "Service unavailable, the app-perf store read degraded, OR the dex.app_perf.devices.view audit row could not persist (carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
@@ -1449,8 +1458,8 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Delete a sealed plugin secret", "tags": ["Plugin Config"], "description": "Requires PluginSecret:Delete. Audited (plugin_secret.delete) before the mutation is attempted — no existence pre-check exists on this write-only plane, so a delete of an already-absent key still records the attempt.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{deleted: true}"}, "400": {"description": "Invalid plugin/key grammar"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
     },
     "/plugin-config/{plugin}/kill-switch": {
-      "get": {"summary": "Read a plugin or plugin-action kill-switch's display state", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read. NOT the dispatch-gating decision (PluginConfigStore::action_allowed fails closed on any store error, which this display accessor deliberately does not) — this is the inspection view. Absence of a prior flip reads as enabled=true. GET without os reports the all-OS layer only and never reflects a per-OS OFF row.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["windows", "linux", "darwin"]}, "description": "Agent OS as reported by the agent; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer. enabled is the effective state and reason/set_by/source name the row that produced it"}], "responses": {"200": {"description": "{plugin, action, os, enabled, reason, set_by, updated_at_ms, source}"}, "400": {"description": "Invalid plugin/action/os grammar, or a present-but-empty os"}, "503": {"description": "Plugin config store unavailable"}}},
-      "put": {"summary": "Flip a plugin or plugin-action kill switch", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Write. Every dispatch-gating caller that consults this switch fails CLOSED on any store error, so this is a reliable emergency stop for the named plugin/action. Audited (plugin_config.kill_switch.set) before the mutation is attempted. The response echoes the row written, not the effective state.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["windows", "linux", "darwin"]}, "description": "Agent OS as reported by the agent; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer. The response echoes the row written, not the effective state"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["enabled"], "properties": {"enabled": {"type": "boolean"}, "reason": {"type": "string", "maxLength": 512}}}}}}, "responses": {"200": {"description": "{plugin, action, os, enabled, reason, set_by, updated_at_ms, source}"}, "400": {"description": "Invalid plugin/action/os/reason grammar, a present-but-empty os, or missing/non-boolean enabled"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
+      "get": {"summary": "Read a plugin or plugin-action kill-switch's display state", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read. NOT the dispatch-gating decision (PluginConfigStore::action_allowed fails closed on any store error, which this display accessor deliberately does not) — this is the inspection view. Absence of a prior flip reads as enabled=true. GET without os reports the all-OS layer only and never reflects a per-OS OFF row. For a protective action (the quarantine plugin's quarantine/unquarantine/status/whitelist and __guard__.push_rules) the state shown here is informational only: enabled=false can be displayed while dispatch still proceeds.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["windows", "linux", "darwin"]}, "description": "Agent OS as reported by the agent; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer. enabled is the effective state of the switch row (for a protective action that row never gates dispatch) and reason/set_by/source name the row that produced it"}], "responses": {"200": {"description": "{plugin, action, os, enabled, reason, set_by, updated_at_ms, source}"}, "400": {"description": "Invalid plugin/action/os grammar, or a present-but-empty os"}, "503": {"description": "Plugin config store unavailable"}}},
+      "put": {"summary": "Flip a plugin or plugin-action kill switch", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Write. Every dispatch-gating caller that consults this switch fails CLOSED on any store error, so this is a reliable emergency stop for the named plugin/action. Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/whitelist and __guard__.push_rules) is never refused by this switch; a row for one is stored and echoed but has no dispatch effect; to stop Guardian rule delivery disable or remove the rules instead (disarms them on the agent's next reconcile). Audited (plugin_config.kill_switch.set) before the mutation is attempted. The response echoes the row written, not the effective state.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["windows", "linux", "darwin"]}, "description": "Agent OS as reported by the agent; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer. The response echoes the row written, not the effective state"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["enabled"], "properties": {"enabled": {"type": "boolean", "description": "true = allowed (the default/no-row state); false = killed; for a protective action the row is stored but has no dispatch effect"}, "reason": {"type": "string", "maxLength": 512}}}}}}, "responses": {"200": {"description": "{plugin, action, os, enabled, reason, set_by, updated_at_ms, source}"}, "400": {"description": "Invalid plugin/action/os/reason grammar, a present-but-empty os, or missing/non-boolean enabled"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
     },)json"
         // Split again (MSVC C2026 16,380-byte cap): the plugin-config segment
         // above sat 12 bytes under it. Upload-grant + chunked-receive paths.
@@ -1509,7 +1518,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Infrastructure topology pointer (legacy, capability 22.2)", "tags": ["Topology"], "description": "Requires Infrastructure:Read. Deliberately NOT the fleet_topology.v1 aggregate — topology data is assembled from the in-memory agent registry via the server.cpp HTMX fragment routes; this REST endpoint returns a static pointer ({message: \"Use /frag/topology-data for HTMX or query individual stores\"}) for external callers, distinct from the 3D fleet-visualization document served by GET /viz/fleet/topology.", "responses": {"200": {"description": "{message}"}}}
     },
     "/viz/fleet/topology": {
-      "get": {"summary": "Fleet 3D-visualization topology document (fleet_topology.v1)", "tags": ["Fleet Visualization"], "description": "Requires Response:Read. Aggregate per-agent tar.fleet_snapshot data (machine cubes + interior processes + connection edges + listeners) behind the /viz/fleet 3D renderer, 60s LRU-of-2 cache keyed on include_vuln. Tier-before-permission: the --viz-disable/YUZU_VIZ_DISABLE kill switch is checked BEFORE RBAC (503 either way it fires). Every request emits a viz.fleet_topology audit row; ?fresh=1 additionally emits viz.fleet_topology.invalidate.", "parameters": [{"name": "include_vuln", "in": "query", "required": false, "schema": {"type": "boolean"}, "description": "When true, populate per-process worst_severity/cve_count from NVD CPE matching (selects a separate cache slot). Default false."}, {"name": "fresh", "in": "query", "required": false, "schema": {"type": "boolean"}, "description": "When true, invalidate the cache slot before the read (emits its own audit row). Default false."}, {"name": "machines_max", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Soft cap on returned machines, in [1, 100000]. Default 5000; exceeding it returns 413 rather than a truncated body."}], "responses": {"200": {"description": "fleet_topology.v1 envelope: {schema, schema_minor, generated_at, include_vuln, machines[].{agent_id, hostname, os, local_ips[], ts, stale, processes[], listeners[], connections[]}}"}, "400": {"description": "machines_max non-numeric, out of [1, 100000], or overflows int"}, "403": {"description": "RBAC denied (Response:Read)"}, "413": {"description": "Materialised snapshot exceeds machines_max — never truncated silently; raise the cap or scope down"}, "503": {"description": "Kill switch on (--viz-disable), or the fleet topology store is unavailable"}}}
+      "get": {"summary": "Fleet 3D-visualization topology document (fleet_topology.v1)", "tags": ["Fleet Visualization"], "description": "Requires Response:Read. Aggregate per-agent tar.fleet_snapshot data (machine cubes + interior processes + connection edges + listeners) behind the /viz/fleet 3D renderer, 60s LRU-of-2 cache keyed on include_vuln. Tier-before-permission: the --viz-disable/YUZU_VIZ_DISABLE kill switch is checked BEFORE RBAC (503 either way it fires). Every request emits a viz.fleet_topology audit row; ?fresh=1 additionally emits viz.fleet_topology.invalidate.", "parameters": [{"name": "include_vuln", "in": "query", "required": false, "schema": {"type": "boolean"}, "description": "When true, populate per-process worst_severity/cve_count from NVD CPE matching (selects a separate cache slot). Default false."}, {"name": "fresh", "in": "query", "required": false, "schema": {"type": "boolean"}, "description": "When true, invalidate the cache slot before the read (emits its own audit row). Default false."}, {"name": "machines_max", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Soft cap on returned machines, in [1, 100000]. Default 5000; exceeding it returns 413 rather than a truncated body."}], "responses": {"200": {"description": "fleet_topology.v1 envelope: {schema, schema_minor, generated_at, include_vuln, machines[].{agent_id, hostname, os, local_ips[], ts, stale, processes[], listeners[], connections[]}, offline_roster_degraded (true only when the durable offline-host read failed; machines then live-only)}"}, "400": {"description": "machines_max non-numeric, out of [1, 100000], or overflows int"}, "403": {"description": "RBAC denied (Response:Read)"}, "413": {"description": "Materialised snapshot exceeds machines_max — never truncated silently; raise the cap or scope down"}, "503": {"description": "Kill switch on (--viz-disable), or the fleet topology store is unavailable"}}}
     },
     "/viz/host/{agent_id}/topology": {
       "get": {"summary": "Single host's 3D-visualization topology (host_topology.v1)", "tags": ["Fleet Visualization"], "description": "Requires Response:Read. One MachineNode sliced out of the current fleet_topology.v1 snapshot, for the per-host IPC-graph drill-down page. Same kill-switch/store-availability posture as GET /viz/fleet/topology.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "host_topology.v1 envelope: {schema, schema_minor, generated_at, stale, machine: <MachineNode, same shape as a fleet_topology.v1 machines[] entry>}"}, "403": {"description": "RBAC denied (Response:Read)"}, "404": {"description": "No machine with that agent_id in the current snapshot"}, "500": {"description": "Topology fetch threw or returned null"}, "503": {"description": "Kill switch on (--viz-disable), or the fleet topology store is unavailable"}}}
@@ -5901,14 +5910,15 @@ void RestApiV1::register_routes(
 
     sink.Get(
         "/api/v1/quarantine",
-        [auth_fn, scoped_perm_fn, quarantine_store](const httplib::Request& req,
-                                                     httplib::Response& res) {
-            // gov-fix(consistency-auditor): admit-then-filter, matching POST/DELETE
-            // (CDX-P1-02) rather than the flat global gate this route shipped with —
-            // a management-group-confined operator who can act on a device via
-            // POST/DELETE must also be able to SEE it here, and must not see
-            // quarantine records for devices outside their scope. Fail CLOSED (500)
-            // if scoped_perm_fn is unwired, never fall back to an unfiltered list.
+        [auth_fn, fleet_read_fn, quarantine_store](const httplib::Request& req,
+                                                    httplib::Response& res) {
+            // ADR-0017 (World A): a list of per-agent data goes through the admit-then-filter
+            // list chokepoint (`fleet_read_fn` = `require_fleet_read`) — ONE Security:Read
+            // decision per request, its scope pushed into the store query, so a management-
+            // group-confined operator sees only their own records and an out-of-scope record
+            // costs neither a probe nor an audit row. Fail CLOSED (500) if the gate is
+            // unwired, never fall back to an unfiltered list. POST/DELETE keep the per-
+            // device `scoped_perm_fn` (one device, one decision).
             if (!auth_fn(req, res))
                 return;
             if (!quarantine_store || !quarantine_store->is_open()) {
@@ -5916,18 +5926,26 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
-            if (!scoped_perm_fn) {
+            if (!fleet_read_fn) {
                 res.status = 500;
                 res.set_content(detail::a4_error(res, "scope gate not configured"),
                                 "application/json");
                 return;
             }
+            const authz::FleetReadGate gate = fleet_read_fn(req, res, "Security", "Read");
+            if (!gate.admitted)
+                return; // response already written by fleet_read_fn
 
-            // AUTHORITATIVE read (ADR-0047): nullopt is a degraded read, NEVER
-            // rendered as an empty quarantine list — a device could still be
-            // actively contained while the caller sees "nothing quarantined".
-            auto records = quarantine_store->list_quarantined();
-            if (!records) {
+            // AUTHORITATIVE scoped read, shared with the dashboard fragments
+            // (quarantine_visible.hpp — one copy of the rules): a nullopt store read is a
+            // degraded read, NEVER an empty list (a degraded read must not render as
+            // "not quarantined").
+            const auto visible_set = quarantine_visible_records(
+                gate.scope,
+                [quarantine_store](const std::vector<std::string>* ids, std::size_t limit) {
+                    return quarantine_store->list_quarantined_in(ids, limit);
+                });
+            if (visible_set.status == QuarantineReadStatus::StoreDegraded) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "quarantine list unavailable — try again"),
                                 "application/json");
@@ -5935,39 +5953,7 @@ void RestApiV1::register_routes(
             }
             JArr arr;
             int64_t visible = 0;
-            for (const auto& r : *records) {
-                httplib::Response probe; // throwaway: per-record admit probe, never sent
-                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id)) {
-                    // gov-fix(security-guardian, widened by unhappy-path Gate 4):
-                    // a per-record degrade is NOT a denial and must not be
-                    // silently filtered out — that would render a degraded
-                    // authz check as "not quarantined", the exact fail-open
-                    // the store-layer nullopt check above exists to close,
-                    // just one layer up. The auth caller has ALREADY been
-                    // authenticated once by auth_fn above, using the SAME
-                    // req — every per-record call re-derives authorization
-                    // from scratch (require_scoped_permission calls
-                    // require_auth internally on every invocation), so any
-                    // outcome OTHER than an explicit 403 (a genuine scope
-                    // denial) is anomalous mid-request and must fail the
-                    // WHOLE list closed, not just the RBAC/tag-store-degrade
-                    // 503 case: a transient engine-principal store outage
-                    // landing between auth_fn's initial check and a later
-                    // per-record probe surfaces as a bare 401 (require_auth
-                    // does not distinguish "no session" from "could not
-                    // determine" for that principal class — see
-                    // EngineLookupStatus::StoreUnreachable's own comment,
-                    // auth_routes.cpp), which the original 503-only check
-                    // would have silently treated as a denial.
-                    if (probe.status != 403) {
-                        res.status = 503;
-                        res.set_content(
-                            detail::a4_error(res, "authorization check unavailable — try again"),
-                            "application/json");
-                        return;
-                    }
-                    continue;
-                }
+            for (const auto& r : visible_set.records) {
                 arr.add(JObj()
                             .add("agent_id", r.agent_id)
                             .add("status", r.status)
@@ -6069,6 +6055,22 @@ void RestApiV1::register_routes(
         auto session = auth_fn(req, res);
         std::string by = session ? session->username : "system";
 
+        // ADR-0033 §9: a mutating capability fails closed on audit failure (no audit row,
+        // no mutation). The attempt row is written AFTER authorisation and validation and
+        // BEFORE the store write, so containment is never changed without a record; the
+        // outcome row below says whether it applied (`success` keeps meaning "applied").
+        if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "attempt",
+                                           "Security", agent_id, reason)) {
+            res.status = 503;
+            res.set_content(
+                detail::a4_error(res,
+                                 "audit subsystem unavailable; refusing to change containment "
+                                 "without durable evidence",
+                                 {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                "application/json");
+            return;
+        }
+
         auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
         if (!result) {
             const bool db_error = is_quarantine_db_error(result.error());
@@ -6086,10 +6088,14 @@ void RestApiV1::register_routes(
             // already audits this branch (mcp_audit("failure", ...)) — REST
             // was silently skipping it, the only quarantine failure path with
             // no audit row.
-            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id, result.error());
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "failure",
+                                                "Security", agent_id, result.error());
             return;
         }
-        audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
+        // The change is made; a lost outcome row is signalled by Sec-Audit-Failed, and the
+        // attempt row already records who asked.
+        (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.enable", "success",
+                                            "Security", agent_id, reason);
         res.status = 201;
         res.set_content(ok_json(JObj().add("quarantined", true).str()), "application/json");
     });
@@ -6132,6 +6138,19 @@ void RestApiV1::register_routes(
             if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
                 return;
 
+            // ADR-0033 §9: attempt row before the store write, fail closed (see POST above).
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "attempt",
+                                               "Security", agent_id, "")) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "audit subsystem unavailable; refusing to change containment "
+                                     "without durable evidence",
+                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                    "application/json");
+                return;
+            }
+
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
                 const bool db_error = is_quarantine_db_error(result.error());
@@ -6142,11 +6161,12 @@ void RestApiV1::register_routes(
                                                  db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
                                                            : detail::A4ErrorOpts{}),
                                 "application/json");
-                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
-                         result.error());
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable",
+                                                    "failure", "Security", agent_id, result.error());
                 return;
             }
-            audit_fn(req, "quarantine.disable", "success", "Security", agent_id, "");
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, "quarantine.disable", "success",
+                                                "Security", agent_id, "");
             res.set_content(ok_json(JObj().add("released", true).str()), "application/json");
         });
 
@@ -8894,7 +8914,7 @@ void RestApiV1::register_routes(
     // GET /api/v1/inventory/software/catalogue         — fleet title catalogue + totals + KPIs
     // GET /api/v1/inventory/software/catalogue/versions — installs-per-version drill
     // Both shape their answers through the shared pure model (software_catalogue_model.hpp), the
-    // single source the /software page can also use. Posture:
+    // single source the MCP twins and the /software page also use. Posture:
     //   * service-scoped tokens are denied outright (no .permission: nothing would admit them);
     //   * the fleet catalogue/versions need a GLOBAL Inventory:Read (the rollup is fleet-wide and
     //     cannot be scoped) — a confined caller gets 403 + a `denied` audit row; the per-device
@@ -9046,12 +9066,7 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            const swc::CatalogueReads io{
-                [&] { return software_inventory_store->catalog_rollup_meta(); },
-                [&](const SoftwareCatalogQuery& c) { return software_inventory_store->software_catalog(c); },
-                [&](const SoftwareCatalogQuery& c) {
-                    return software_inventory_store->software_catalog_totals(c);
-                }};
+            const auto io = swc::catalogue_reads(*software_inventory_store, device_api.get());
             if (csv) {
                 const auto ex = swc::read_titles_export(io, rq, omit_newest);
                 if (!ex) {
@@ -9066,7 +9081,8 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            const auto read = swc::read_catalogue_page(io, rq);
+            const auto read =
+                swc::read_catalogue_page(io, rq, static_cast<std::int64_t>(std::time(nullptr)));
             if (!read) {
                 if (!read.error()) {
                     sw_fail_degraded(req, res, cid, verb, target, "catalogue read");
@@ -9080,22 +9096,12 @@ void RestApiV1::register_routes(
             }
             const auto& page = *read;
 
-            // Coverage + KPIs only on a first fleet page (continuation pages carry kpis:null).
-            std::optional<swc::KpiFigures> kpis;
-            if (page.meta && !continuation) {
-                swc::Coverage cov;
-                if (device_api)
-                    cov.connected = static_cast<std::int64_t>(device_api->list_devices().size());
-                cov.stale = software_inventory_store->count_stale_agents(
-                    static_cast<std::int64_t>(std::time(nullptr)) - swc::kStaleWindowSecs);
-                kpis = swc::derive_kpis(*page.meta, cov);
-            }
             audit_ok = detail::try_persist_audit(
                 audit_fn, req, "inventory.software.catalog", "success", "Inventory", target,
                 "titles=" + std::to_string(page.rows.size()) + " totals=" +
                     std::to_string(page.totals.titles) + "/" + std::to_string(page.totals.installs) +
                     (continuation ? " page=continuation" : "") + " cid=" + cid);
-            auto body = swc::catalogue_response_json(page.rows, page.totals, kpis, page.next_cursor,
+            auto body = swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
                                                      omit_newest, 0);
             if (!audit_ok)
                 body["audit_persisted"] = false;
@@ -9141,25 +9147,13 @@ void RestApiV1::register_routes(
                 res.set_content(ok_json(swc::dump_safe(body)), "application/json");
                 return;
             }
-            // Only the unfiltered read serves the precomputed version_rollup; filtered and
-            // per-device drills read installed_software, so their rows and counts do not depend
-            // on the rollup (`newest` is false until the first refresh).
-            if (!host && q.kind.empty() && q.ecosystem.empty() && q.source.empty()) {
-                const auto meta = software_inventory_store->catalog_rollup_meta();
-                if (!meta) {
+            const auto rows = swc::read_versions(swc::versions_reads(*software_inventory_store), q);
+            if (!rows) {
+                if (rows.error() == swc::VersionsError::kBuilding)
+                    sw_building(req, res, cid, "inventory.software.versions", target);
+                else
                     sw_fail_degraded(req, res, cid, "inventory.software.versions", target,
                                      "versions read");
-                    return;
-                }
-                if (meta->refreshed_at == 0) {
-                    sw_building(req, res, cid, "inventory.software.versions", target);
-                    return;
-                }
-            }
-            auto rows = software_inventory_store->software_versions(q);
-            if (!rows) {
-                sw_fail_degraded(req, res, cid, "inventory.software.versions", target,
-                                 "versions read");
                 return;
             }
             const bool truncated = static_cast<int>(rows->size()) == q.limit;
@@ -9275,8 +9269,10 @@ void RestApiV1::register_routes(
 
     // GET /api/v1/inventory/software — typed daily-sync installed-software FLEET read
     // (ADR-0016). The REST sibling of the governed MCP query_installed_software tool;
-    // mirrors it 1:1 (require_fleet_read → store → cap → meet(mgmt, service) scope
-    // filter → audit). DISTINCT from the generic /api/v1/inventory/* routes above,
+    // mirrors it (require_fleet_read → parse_devices_params → cursor decode → one model read
+    // with the meet(mgmt, service) scope pushed into SQL, post-filtered only above
+    // kScopePushdownMaxIds → audit → json, or csv/json export which MCP does not serve).
+    // DISTINCT from the generic /api/v1/inventory/* routes above,
     // which read the generic blob InventoryStore — this reads the typed
     // SoftwareInventoryStore (normalized rows). Single path segment, so it does not
     // collide with the two-segment /api/v1/inventory/{agent}/{plugin} regex.
@@ -9309,8 +9305,8 @@ void RestApiV1::register_routes(
     // sink → false, not a 500 with no trail) — full parity with the MCP sibling's
     // mcp_audit (which wraps the same kernel), not just the bool-surfacing half.
     sink.Get("/api/v1/inventory/software",
-             [fleet_read_fn, audit_fn, software_inventory_store](const httplib::Request& req,
-                                                                  httplib::Response& res) {
+             [fleet_read_fn, audit_fn, software_inventory_store,
+              sw_503](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
 
@@ -9345,35 +9341,37 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 SoftwareFleetQuery q;
-                 q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
-                 q.name = req.has_param("name") ? req.get_param_value("name") : "";
-                 // Clamp in 64-bit BEFORE narrowing (mirror the MCP tool / query_responses):
-                 // limit<1 clamps to 1 and limit>1000 clamps to 1000; clamping in int64
-                 // first stops a negative/wrapped value from binding unbounded and defeating
-                 // the cap. No offset — the scope filter runs AFTER the store LIMIT, so paging
-                 // would yield unstable windows over a sync-mutating table; keyset is the
-                 // #1634 follow-up.
-                 std::int64_t want = 100;
-                 if (req.has_param("limit")) {
-                     try {
-                         want = std::stoll(req.get_param_value("limit"));
-                     } catch (...) {
+                 namespace swc = software_catalogue;
+                 auto parsed = swc::parse_devices_params(req.params);
+                 if (!parsed) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, parsed.error()), "application/json");
+                     return;
+                 }
+                 const auto& rq = *parsed;
+                 const bool csv = rq.format == "csv";
+                 const bool export_mode = !rq.format.empty();
+                 const bool continuation = !rq.cursor.empty();
+                 const char* const verb =
+                     export_mode ? "inventory.software.export" : "inventory.software.query";
+                 const std::string audit_key = swc::audit_target(rq.query);
+
+                 // The model decodes the cursor, pushes the scope into SQL up to
+                 // kScopePushdownMaxIds (complete pages, nothing hidden) and post-filters only a
+                 // wider scope — the gate's own composed meet(management-group, service-scope)
+                 // VisibleSet (#3290). `devices_omitted` is DEFINED as the devices hidden by that
+                 // filter (0 under push-down).
+                 const auto read = swc::read_devices_page(
+                     swc::devices_reader(*software_inventory_store), rq, gate.scope);
+                 if (!read) {
+                     if (read.error()) {
                          res.status = 400;
                          res.set_content(
-                             detail::error_json_a4(400, "invalid limit (expected integer)", cid),
+                             detail::a4_error(res,
+                                              std::string(swc::cursor_error_message(*read.error()))),
                              "application/json");
                          return;
                      }
-                 }
-                 q.limit = static_cast<int>(std::clamp<std::int64_t>(want, 1, 1000));
-
-                 const std::string audit_key = !q.name.empty()      ? ("name=" + q.name)
-                                               : !q.agent_id.empty() ? ("agent=" + q.agent_id)
-                                                                     : std::string("fleet");
-
-                 auto rows_opt = software_inventory_store->query_software(q);
-                 if (!rows_opt) {
                      // Store degraded (pool/query failure) — surface it, NEVER an empty list.
                      // A silent empty reads as "installed nowhere" for a fleet vuln query
                      // (ADR-0016 §7 authoritative reads; agentic-first A4 failure-vs-empty).
@@ -9381,110 +9379,59 @@ void RestApiV1::register_routes(
                      // outage must still leave a who/when/what trail. Routed through the #1647
                      // throw-safe kernel (NOT raw audit_fn) so a throwing audit sink can't eat
                      // the 503 — exact parity with the MCP sibling's mcp_audit (gov chaos CH-3).
-                     (void)detail::try_persist_audit(audit_fn, req, "inventory.software.query",
-                                                     "failure", "Inventory", audit_key,
-                                                     "store degraded; cid=" + cid);
-                     res.status = 503;
-                     res.set_content(
-                         detail::error_json_a4(503,
-                                               "software inventory store degraded — query failed",
-                                               cid, 5000, "retry the request"),
-                         "application/json");
+                     sw_503(req, res, cid, verb, audit_key, "store degraded",
+                            "software inventory store degraded — query failed");
                      return;
                  }
-                 auto& rows = *rows_opt;
-
-                 // Cap hit BEFORE scope filtering → result incomplete (the store's hard ceiling
-                 // >> 1000, so the binding cap is q.limit). Captured pre-filter: the filter
-                 // shrinks `rows`. As with the MCP sibling, an empty-filter call is an unbounded
-                 // fleet scan capped at q.limit on a global ORDER BY *before* the per-agent scope
-                 // filter, so a narrow-scope operator may see few of their own rows in one page
-                 // (signalled by result_truncated_by_cap). Narrow-scope completeness over a wide
-                 // fleet is the keyset follow-up (#1634).
-                 const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
-
-                 // Scope filter — the gate's own composed meet(management-group,
-                 // service-scope) VisibleSet (#3290, replaces the retired per-row
-                 // inventory_scope_fn predicate; mirrors the MCP tool /
-                 // query_responses #1550's per-agent-ownership intent, now on the
-                 // real ADR-0017 admit-then-filter mechanism instead of a filter
-                 // layered under a global gate). nullopt (TOP) ⇒ unfiltered — a
-                 // global grant or RBAC-off, byte-identical to the pre-#3290 no-op
-                 // filter path for that caller class.
-                 bool scope_filtered = false;
-                 std::size_t dropped_agents = 0;
-                 if (gate.scope) {
-                     std::unordered_set<std::string> dropped_ids;
-                     std::vector<SoftwareFleetRow> visible;
-                     visible.reserve(rows.size());
-                     for (auto& r : rows) {
-                         if (authz::in_scope(gate.scope, r.agent_id)) {
-                             visible.push_back(std::move(r));
-                         } else {
-                             scope_filtered = true;
-                             dropped_ids.insert(r.agent_id); // count each DISTINCT dropped device once
-                         }
-                     }
-                     rows.swap(visible);
-                     dropped_agents = dropped_ids.size();
-                 }
-
-                 JArr arr;
-                 for (const auto& r : rows) {
-                     // Blob contract v2 fields ride along; a field the ecosystem
-                     // does not store is "" (honest-empty, never synthesised).
-                     arr.add(JObj()
-                                 .add("agent_id", r.agent_id)
-                                 .add("name", r.entry.name)
-                                 .add("version", r.entry.version)
-                                 .add("publisher", r.entry.publisher)
-                                 .add("install_date", r.entry.install_date)
-                                 .add("kind", r.entry.kind)
-                                 .add("ecosystem", r.entry.ecosystem)
-                                 .add("epoch", r.entry.epoch)
-                                 .add("release", r.entry.release)
-                                 .add("arch", r.entry.arch)
-                                 .add("signature_status", r.entry.signature_status)
-                                 .add("distro_id", r.entry.distro_id)
-                                 .add("distro_version", r.entry.distro_version));
-                 }
+                 const auto& page = *read;
 
                  // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
                  // bool, surface audit_persisted:false, never withhold. Routed through the
-                 // #1647 throw-safe kernel `try_persist_audit` (NOT raw audit_fn) so a throwing
-                 // audit sink returns false → audit_persisted:false instead of escaping the
-                 // lambda as a 500 with no trail — exact throw-safety parity with the MCP
-                 // sibling's mcp_audit (gov chaos CH-3). We use the kernel, NOT the fail-closed
-                 // emit_behavioral_audit, because this machine-scope data is set-and-proceed.
-                 // A scope-dropped read is security-relevant → audit it distinctly with the
-                 // DISTINCT dropped count.
+                 // #1647 throw-safe kernel `try_persist_audit` so a throwing audit sink returns
+                 // false instead of escaping as a 500 with no trail. `success` is written on
+                 // EVERY call (continuation pages tagged page=continuation): the cursor is
+                 // opaque but unauthenticated, so per-call audit keeps a forged cursor from
+                 // walking the fleet unrecorded. A post-filter drop is audited distinctly.
                  bool denied_ok = true;
-                 if (scope_filtered)
-                     denied_ok = detail::try_persist_audit(
-                         audit_fn, req, "inventory.software.query", "denied", "Inventory", audit_key,
-                         "scope: filtered " + std::to_string(dropped_agents) +
-                             " out-of-scope device(s) (management-group and/or service-tag "
-                             "axis); cid=" +
-                             cid);
+                 if (const auto denied = swc::denied_detail(page); !denied.empty())
+                     denied_ok = detail::try_persist_audit(audit_fn, req, verb, "denied",
+                                                           "Inventory", audit_key,
+                                                           denied + "; cid=" + cid);
+                 const std::string detail_text =
+                     (export_mode ? "installs format=" + rq.format +
+                                        " rows=" + std::to_string(page.rows.size()) +
+                                        " truncated=" + (page.hit_cap ? "true" : "false")
+                                  : "rows=" + std::to_string(page.rows.size())) +
+                     (continuation ? " page=continuation" : "") + " cid=" + cid;
                  const bool audit_ok =
-                     detail::try_persist_audit(audit_fn, req, "inventory.software.query", "success",
-                                               "Inventory", audit_key,
-                                               "rows=" + std::to_string(arr.size()) + " cid=" + cid) &&
+                     detail::try_persist_audit(audit_fn, req, verb, "success", "Inventory",
+                                               audit_key, detail_text) &&
                      denied_ok;
 
-                 JObj data;
-                 data.raw("software", arr.str());
-                 data.add("count", arr.size());
-                 // Surface the count of devices dropped by the scope filter (0 when none) so an
-                 // agentic caller can tell "out of my scope" from "not installed anywhere": a
-                 // positive value means matching software exists outside the caller's scope
-                 // (gov UP-12 false-negative guard). The audit row carries it too.
-                 data.add("devices_omitted", static_cast<int64_t>(dropped_agents));
-                 if (hit_cap)
-                     data.add("result_truncated_by_cap", true);
+                 if (csv) {
+                     res.set_header("Content-Disposition",
+                                    "attachment; filename=\"software-installs.csv\"");
+                     if (page.hit_cap)
+                         res.set_header("X-Result-Truncated-By-Cap", "true");
+                     // The continuation rides in a header (the body is rectangular rows): feed it
+                     // back as `cursor` to read on. A page that may have more rows also ends with
+                     // the in-band trailer record, as the responses export does.
+                     if (!page.next_cursor.empty())
+                         res.set_header("X-Next-Cursor", page.next_cursor);
+                     if (!audit_ok)
+                         res.set_header("Sec-Audit-Failed", "true");
+                     auto body = swc::installs_csv(page.rows);
+                     if (page.hit_cap)
+                         body += export_csv_truncation_row(ExportCut{.row_cap = true},
+                                                           swc::kInstallsCsvColumns);
+                     res.set_content(std::move(body), "text/csv; charset=utf-8");
+                     return;
+                 }
+                 auto body = swc::devices_response_json(page.rows, page.next_cursor,
+                                                        page.devices_omitted, page.hit_cap);
                  if (!audit_ok)
-                     data.add("audit_persisted", false);
-                 res.set_content(ok_json(data.str()), "application/json");
+                     body["audit_persisted"] = false;
+                 res.set_content(ok_json(swc::dump_safe(body)), "application/json");
              });
 
     // ── Devices (#4033, #2146 API-parity Batch A) ─────────────────────────
@@ -16524,18 +16471,18 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 auto trend = dex_perf_api->app_fleet_trend(app, version);
-                 if (!trend) { // AUTHORITATIVE read degrade
+                 auto report = dex_perf_api->app_fleet_report(app, version);
+                 if (!report) { // AUTHORITATIVE read degrade
                      res.status = 503;
                      res.set_content(
                          detail::error_json_a4(503, "app-perf store read degraded", cid,
                                                /*retry_after_ms=*/2000,
-                                               "the app-perf store could not be read; retry shortly"),
+                                               "the app-perf or crash-and-hang store could not be read; retry shortly"),
                          "application/json");
                      return;
                  }
                  JArr points;
-                 for (const auto& pt : *trend) {
+                 for (const auto& pt : report->points) {
                      // The fleet path floors too now, so a sub-floor point carries
                      // suppressed=true with device_count only — same shape as the
                      // group endpoint; without the flag a suppressed point would read
@@ -16561,6 +16508,13 @@ void RestApiV1::register_routes(
                                              .add("app", app)
                                              .add("version", version)
                                              .raw("points", points.str())
+                                             .raw("versions", dex_app_perf_versions_json(*report))
+                                             .add("versions_truncated", report->versions_truncated)
+                                             .add("failure_window_days",
+                                                  std::int64_t{report->failure_window_days})
+                                             .add("exposure_basis", "resource_significant")
+                                             .add("stat_failures",
+                                                  std::int64_t{report->stat_failures})
                                              .str()),
                                  "application/json");
              });

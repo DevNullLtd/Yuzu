@@ -225,6 +225,10 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[pg][dex][rout
     // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
     CHECK(html.find("/fragments/dex/overview") != std::string::npos);
     CHECK(html.find("gp-subnav") != std::string::npos);
+    // The Alerts tab is static chrome: present for every viewer, no capability probe
+    // behind it (the Alerts fragment itself shows the role note).
+    CHECK(html.find("hx-get=\"/fragments/dex/alerts?window=7d\"") != std::string::npos);
+    CHECK(html.find(">Alerts</a>") != std::string::npos);
     CHECK(html.find("actively monitored") != std::string::npos);
     CHECK(html.find("of 114 signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)
@@ -747,7 +751,7 @@ TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
     DexFleet fleet;
     fleet.windows_online = 10;
     const auto html = render_dex_health_fragment(&store, "", 7, fleet, "default");
-    CHECK(html.find("Experience health") != std::string::npos);
+    CHECK(html.find("DEX health") != std::string::npos);
     CHECK(html.find("100 &minus; weighted deductions") != std::string::npos); // the formula is shown
     CHECK(html.find("derived &middot; secondary") != std::string::npos);
     CHECK(html.find("Why this score") != std::string::npos);
@@ -812,7 +816,7 @@ TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
     const auto html = render_dex_overview_fragment(&store, "", 7, fleet);
     CHECK(html.find("Explore") != std::string::npos);
     CHECK(html.find("Signal catalogue") != std::string::npos);
-    CHECK(html.find("Experience health") != std::string::npos);
+    CHECK(html.find("DEX health") != std::string::npos);
     CHECK(html.find("Cross-OS &amp; trends") != std::string::npos);
     // each card drills into its deep page
     CHECK(html.find("/fragments/dex/catalogue?window=") != std::string::npos);
@@ -912,10 +916,10 @@ TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; cr
     // 2 connected Windows agents: WS-1 crashed (<100), WS-2 clean (100).
     DexFleet fleet{2, 2, {"windows"}, {{"WS-1", "windows"}, {"WS-2", "windows"}}};
     auto html = render_dex_overview_fragment(&store, "", 7, fleet);
-    CHECK(html.find("Experience") != std::string::npos);         // new headline section
+    CHECK(html.find("DEX health") != std::string::npos);         // new headline section
     CHECK(html.find("Overall experience") != std::string::npos); // per-device median tile
     CHECK(html.find("great") != std::string::npos);              // the distribution bar
-    CHECK(html.find("Experience by segment") != std::string::npos); // the segment breakdown
+    CHECK(html.find("DEX score by segment") != std::string::npos); // the segment breakdown
     CHECK(html.find("Crash-free devices") != std::string::npos); // crashes demoted, not removed
 }
 
@@ -1259,6 +1263,28 @@ TEST_CASE("DEX apps list: empty store → no-data placeholder", "[pg][dex][route
     GuaranteedStateStore store(pool);
     auto html = render_dex_apps_fragment(&store, "", 7);
     CHECK(html.find("No data") != std::string::npos);
+}
+
+// Kills: a wrong active_key literal on /dex — apply_shell lights nothing and says nothing for an
+// unknown key, so only a test that fetches the page can see it. The page handler touches only
+// auth_fn_ and apply_shell, so no store is wired and this runs without Postgres.
+TEST_CASE("DEX routes: /dex lights DEX in the sidebar and ends the breadcrumb on it",
+          "[dex][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, /*perm_fn=*/{}, /*store=*/nullptr, /*fleet_fn=*/{},
+                           /*audit_fn=*/{});
+
+    auto page = sink.Get("/dex");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    CHECK(page->body.find("/fragments/dex/overview") != std::string::npos);
+    CHECK(page->body.find("<a class=\"shell-nav on\" href=\"/dex\" aria-current=\"page\">") !=
+          std::string::npos);
+    CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>DEX</b>") != std::string::npos);
 }
 
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") {
