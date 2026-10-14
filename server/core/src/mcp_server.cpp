@@ -13740,10 +13740,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     limit = 1;
                 if (limit > 10000)
                     limit = 10000;
+                // Ownership says whose set it is, not which devices the owner may
+                // still see (their management-group authority can narrow after the
+                // set was made). Resolve the CURRENT list-read scope through the
+                // Infrastructure:Read admit-then-filter gate, the one create_result_set
+                // applies to device_ids, and push it into the SQL before LIMIT
+                // (ADR-0017 INV-3). Same gate on the REST twin and the dashboard
+                // fragment.
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_result_set_members: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    const bool audit_ok = mcp_audit("failure", rs_id);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_STORE_UNAVAILABLE: device visibility check "
+                                 "unavailable",
+                                 {}, /*retry_after_ms=*/-1, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
                 // #4306 finding 3 / #4307 finding 2: never a success response
                 // with an empty result on a degraded read.
-                auto page =
-                    result_set_store_->members_checked(rs_id, cursor, static_cast<int>(limit));
+                auto page = result_set_store_->members_checked(rs_id, cursor,
+                                                               static_cast<int>(limit), gate.scope);
                 if (!page) {
                     const bool audit_ok = mcp_audit("failure", rs_id);
                     res.set_content(

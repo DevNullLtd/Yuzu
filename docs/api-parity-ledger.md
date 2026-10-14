@@ -159,8 +159,8 @@ raw route is tracked outside this change.
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 1 | 14 |
 | enrollment | 19 | 5 | 14 |
-| other | 75 | 14 | 61 |
-| **Total** | **301** | **97** | **204** |
+| other | 77 | 16 | 61 |
+| **Total** | **303** | **99** | **204** |
 
 Registered `/api/vN/*` routes: 250. OpenAPI `paths` entries: 249. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 190.
 
