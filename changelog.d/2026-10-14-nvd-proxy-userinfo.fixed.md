@@ -1,0 +1,1 @@
+- **The NVD settings panel no longer shows proxy credentials.** `user:password@` is removed from the configured NVD HTTP proxy before `/fragments/settings/nvd` displays it.

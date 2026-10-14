@@ -2989,7 +2989,9 @@ std::string SettingsRoutes::render_nvd_fragment() {
             "  <span>" +
             (cfg_->nvd_proxy.empty()
                  ? std::string("<span class=\"muted\">None</span>")
-                 : std::string("<code>") + html_escape(cfg_->nvd_proxy) + "</code>") +
+                 : std::string("<code>") +
+                       html_escape(settings_model::sanitize_url_userinfo(cfg_->nvd_proxy)) +
+                       "</code>") +
             "</span></div>";
 
     if (!cfg_->nvd_sync_enabled) {

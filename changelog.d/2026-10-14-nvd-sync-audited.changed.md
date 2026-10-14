@@ -1,0 +1,1 @@
+- **`POST /api/nvd/sync` is now audited.** Each request writes an `nvd.sync.request` audit row (`success`, or `disabled` when sync is off) before the sync is requested; if the row cannot be persisted the request is refused with `503` and no sync starts.

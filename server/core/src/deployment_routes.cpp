@@ -64,6 +64,24 @@ std::string gen_id() {
     return auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 }
 
+// Parse an optional integer query parameter clamped to [lo, hi]. Returns false on a
+// non-numeric value (the caller answers 400); absent means `dflt`.
+bool parse_clamped(const httplib::Request& req, const char* key, int dflt, int lo, int hi,
+                   int& out) {
+    out = dflt;
+    if (!req.has_param(key))
+        return true;
+    try {
+        out = static_cast<int>(
+            std::clamp<long long>(std::stoll(req.get_param_value(key)), lo, hi));
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+constexpr const char* kStoreDown = "deployment run store is unavailable on this server";
+
 deployment::DeploymentConfig config_from_req(const httplib::Request& req) {
     deployment::DeploymentConfig c;
     c.url = param(req, "url");
@@ -103,6 +121,79 @@ nlohmann::json deploy_preview_json(const std::string& run_id, const std::string&
         {"go", go_count},
         {"warn", warn_count},
     };
+}
+
+nlohmann::json deployment_row_json(const DeploymentRow& d) {
+    const auto st = deployment_state(d.status, d.failed, d.skipped);
+    return nlohmann::json{
+        {"deployment_id", d.deployment_id},
+        {"source_run_id", d.source_run_id},
+        {"name", d.name},
+        {"artifact_filename", d.artifact_filename},
+        {"artifact_sha256", d.artifact_sha256},
+        {"has_args", !d.exec_args.empty()},
+        {"status", d.status},
+        {"state", {{"code", st.code}, {"label", st.label}, {"tone", st.tone}}},
+        {"created_at_ms", d.created_at_ms},
+        {"completed_at_ms", d.completed_at_ms},
+        {"total", d.total},
+        {"succeeded", d.succeeded},
+        {"failed", d.failed},
+        {"skipped", d.skipped},
+        {"active", d.active},
+    };
+}
+
+nlohmann::json deployment_device_json(const DeploymentDeviceRow& d) {
+    return nlohmann::json{
+        {"agent_id", d.agent_id},
+        {"hostname", d.hostname},
+        {"os", d.os},
+        {"step", deployment::step_token(deployment::step_from_token(d.step))},
+        {"exit_code", d.exit_code},
+        {"error", d.error},
+        {"updated_at_ms", d.updated_at_ms},
+    };
+}
+
+nlohmann::json deployment_detail_json(const DeploymentRow& d,
+                                      const std::vector<DeploymentDeviceRow>& devices,
+                                      int device_limit) {
+    nlohmann::json j = deployment_row_json(d);
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& dev : devices)
+        arr.push_back(deployment_device_json(dev));
+    j["devices"] = std::move(arr);
+    j["device_limit"] = device_limit;
+    j["truncated"] = d.total > static_cast<int>(devices.size());
+    return j;
+}
+
+DeploymentDetailRead read_deployment_detail(DeploymentRunStore& store,
+                                            const std::string& deployment_id,
+                                            const std::string& viewer, int device_limit) {
+    DeploymentDetailRead out;
+    out.device_limit = device_limit;
+    // An empty viewer would turn the owner-scope into "unscoped (engine)"; never let a
+    // caller reach that by accident.
+    if (viewer.empty()) {
+        out.outcome = DeploymentDetailRead::Outcome::kNotFound;
+        return out;
+    }
+    auto dep = store.get_deployment_checked(deployment_id, viewer);
+    if (!dep)
+        return out; // kStoreFault
+    if (!*dep) {
+        out.outcome = DeploymentDetailRead::Outcome::kNotFound;
+        return out;
+    }
+    auto devs = store.get_devices_checked(deployment_id, device_limit);
+    if (!devs)
+        return out; // kStoreFault
+    out.deployment = **dep;
+    out.devices = std::move(*devs);
+    out.outcome = DeploymentDetailRead::Outcome::kOk;
+    return out;
 }
 
 yuzu::server::DispatchCaller
@@ -546,6 +637,200 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
             {"meta", {{"api_version", "v1"}}},
         };
         res.set_content(out.dump(), "application/json");
+    });
+
+    // ── Read-only list + detail twins (REST v1, then the two fragments) ────────
+    // The live `/auto` model had no read route: `deploy/result` ADVANCES the engine
+    // and audits per poll. These reads never advance, never write a per-poll audit
+    // row, and are owner-scoped (`is_admin=false`, like /preflight/runs). A store
+    // fault is a 503 / failbox, never an empty list. `artifact_url` / `exec_args`
+    // are excluded from every shape (deployment_row_json).
+    sink.Get("/api/v1/deployments", [this](const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        // Owner-scoped by username, which a service-scoped token shares with its
+        // creating human (SEC-2/SEC-3): deny early under this surface's own verb.
+        if (deny_service_scoped_(req, res, "deployment.list.view",
+                                 "REST deployments list denied to a service-scoped token"))
+            return;
+        if (!perm_fn_ || !perm_fn_(req, res, "SoftwareDeployment", "Read"))
+            return;
+        if (!deploy_store_) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, kStoreDown), "application/json");
+            return;
+        }
+        int limit = kDeploymentListDefault;
+        if (!parse_clamped(req, "limit", kDeploymentListDefault, 1, kDeploymentListMax, limit)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
+            return;
+        }
+        auto rows = deploy_store_->list_deployments_checked(session->username,
+                                                            /*is_admin=*/false, limit);
+        if (!rows) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, kStoreDown, {.retry_after_ms = 2000}),
+                            "application/json");
+            return;
+        }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& d : *rows)
+            arr.push_back(deployment_row_json(d));
+        // Unaudited on success: run lifecycle metadata, not per-agent behavioural PII
+        // (same posture as /api/v1/preflight/runs). The denial path audits.
+        nlohmann::json out = {
+            {"data", arr},
+            {"pagination", {{"total", static_cast<int64_t>(rows->size())},
+                            {"start", 0},
+                            {"page_size", limit}}},
+            {"meta", {{"api_version", "v1"}}},
+        };
+        res.set_content(out.dump(), "application/json");
+    });
+
+    // `preview` is registered above as an exact path and the id class below is hex
+    // only, so the two cannot shadow each other.
+    sink.Get(R"(/api/v1/deployments/([a-f0-9]+))",
+             [this](const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        if (deny_service_scoped_(req, res, "deployment.detail.view",
+                                 "REST deployment detail denied to a service-scoped token"))
+            return;
+        if (!perm_fn_ || !perm_fn_(req, res, "SoftwareDeployment", "Read"))
+            return;
+        if (!deploy_store_) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, kStoreDown), "application/json");
+            return;
+        }
+        int limit = kDeploymentDeviceDefault;
+        if (!parse_clamped(req, "limit", kDeploymentDeviceDefault, 1, kDeploymentDeviceMax,
+                           limit)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
+            return;
+        }
+        const auto read =
+            read_deployment_detail(*deploy_store_, req.matches[1].str(), session->username, limit);
+        using O = DeploymentDetailRead::Outcome;
+        if (read.outcome == O::kStoreFault) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, kStoreDown, {.retry_after_ms = 2000}),
+                            "application/json");
+            return;
+        }
+        if (read.outcome == O::kNotFound) {
+            // Not found and not-yours are indistinguishable (no existence oracle).
+            res.status = 404;
+            res.set_content(detail::a4_error(res, "deployment not found"), "application/json");
+            return;
+        }
+        nlohmann::json out = {
+            {"data", deployment_detail_json(read.deployment, read.devices, read.device_limit)},
+            {"meta", {{"api_version", "v1"}}},
+        };
+        res.set_content(out.dump(), "application/json");
+    });
+
+    // Fragments: 200 + an honest box on a degraded state (htmx does not swap a non-2xx).
+    sink.Get("/fragments/auto/deployments", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        if (deny_service_scoped_(req, res, "deployment.list.view",
+                                 "deployments list fragment denied to a service-scoped token"))
+            return;
+        if (!perm_fn_ || !perm_fn_(req, res, "SoftwareDeployment", "Read"))
+            return;
+        res.set_header("Cache-Control", "no-store");
+        constexpr int kPageCap = 50; // each row costs one source-run lookup below
+        int limit = kPageCap;
+        if (!parse_clamped(req, "limit", kPageCap, 1, kPageCap, limit))
+            limit = kPageCap;
+        if (!deploy_store_) {
+            res.set_content(render_deployments_failbox("The deployment store is unavailable on "
+                                                       "this server."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        auto rows = deploy_store_->list_deployments_checked(session->username,
+                                                            /*is_admin=*/false, limit);
+        if (!rows) {
+            res.set_content(render_deployments_failbox("Deployments could not be read just now. "
+                                                       "Try again in a moment."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // Target = the source pre-flight run's scope label, owner-scoped. A miss means
+        // the run aged out of retention (renderer copy); a store fault is its own word.
+        std::vector<std::string> targets;
+        targets.reserve(rows->size());
+        for (const auto& d : *rows) {
+            std::string label = preflight_store_ ? std::string{} : std::string("Unavailable");
+            if (preflight_store_) {
+                auto run = preflight_store_->get_run_checked(d.source_run_id, session->username);
+                if (!run)
+                    label = "Unavailable";
+                else if (*run)
+                    label = (*run)->scope_label;
+            }
+            targets.push_back(std::move(label));
+        }
+        res.set_content(render_deployments_list(*rows, targets), "text/html; charset=utf-8");
+    });
+
+    sink.Get("/fragments/auto/deployments/detail", [this](const httplib::Request& req,
+                                                          httplib::Response& res) {
+        auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
+        if (!session) {
+            res.status = 401;
+            res.set_content("auth required", "text/plain");
+            return;
+        }
+        if (deny_service_scoped_(req, res, "deployment.detail.view",
+                                 "deployment detail fragment denied to a service-scoped token"))
+            return;
+        if (!perm_fn_ || !perm_fn_(req, res, "SoftwareDeployment", "Read"))
+            return;
+        res.set_header("Cache-Control", "no-store");
+        if (!deploy_store_) {
+            res.set_content(render_deployments_failbox("The deployment store is unavailable on "
+                                                       "this server."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // Read-only by construction: no advance(), no audit row per poll (H3).
+        const auto read = read_deployment_detail(*deploy_store_, param(req, "dep"),
+                                                 session->username, kDeploymentDeviceDefault);
+        using O = DeploymentDetailRead::Outcome;
+        if (read.outcome == O::kStoreFault) {
+            res.set_content(render_deployments_failbox("The deployment could not be read just "
+                                                       "now. Try again in a moment."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (read.outcome == O::kNotFound) {
+            res.set_content(render_deploy_note("Deployment not found, it may have aged out of "
+                                               "retention."),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        res.set_content(render_deployment_detail(read.deployment, read.devices),
+                        "text/html; charset=utf-8");
     });
 }
 

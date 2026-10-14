@@ -3,6 +3,8 @@
 #include "http_route_sink.hpp"
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
+#include "rest_audit.hpp" // detail::try_persist_audit
+#include "web_utils.hpp"  // html_escape
 
 #include <nlohmann/json.hpp>
 
@@ -12,6 +14,49 @@
 
 namespace yuzu::server::nvd {
 
+nlohmann::json status_json(const NvdDatabase* db, const NvdSyncManager* sync) {
+    if (!db || !db->is_open())
+        return nlohmann::json{{"enabled", false}};
+    nlohmann::json j;
+    // "enabled" reflects whether the sync manager exists, not merely whether the DB file is
+    // open: under --no-nvd-sync the catalog DB is still open (for matching) but sync is off,
+    // so reporting enabled=true then 503-ing POST /api/nvd/sync was contradictory (#1889 r2).
+    j["enabled"] = (sync != nullptr);
+    j["total_cves"] = db->total_cve_count();
+    if (sync) {
+        auto st = sync->status();
+        j["syncing"] = st.syncing;
+        j["last_sync_time"] = st.last_sync_time;
+        j["last_error"] = st.last_error;
+        j["backfill_complete"] = st.backfill_complete;
+        j["backfill_oldest_published"] = st.backfill_oldest_published;
+    }
+    return j;
+}
+
+std::string render_nvd_status(const nlohmann::json& st) {
+    constexpr std::size_t kErrorCap = 300;
+    if (!st.value("enabled", false))
+        return "<div class=\"gp-placeholder\" data-nvd=\"off\">NVD sync is off on this server.</div>";
+    std::string h = "<dl class=\"kvl\" data-nvd=\"on\">";
+    h += "<dt>CVE entries</dt><dd>" + std::to_string(st.value("total_cves", 0)) + "</dd>";
+    const std::string last = st.value("last_sync_time", std::string{});
+    h += "<dt>Last sync</dt><dd>" + html_escape(last.empty() ? std::string("Never") : last) +
+         "</dd>";
+    if (st.value("syncing", false))
+        h += "<dt>Status</dt><dd>Sync in progress</dd>";
+    h += std::string("<dt>Catalog build</dt><dd>") +
+         (st.value("backfill_complete", false) ? "Complete" : "In progress") + "</dd>";
+    std::string err = st.value("last_error", std::string{});
+    if (!err.empty()) {
+        if (err.size() > kErrorCap)
+            err = err.substr(0, kErrorCap) + "...";
+        h += "<dt>Last error</dt><dd data-nvd-error=\"1\">" + html_escape(err) + "</dd>";
+    }
+    h += "</dl>";
+    return h;
+}
+
 void register_nvd_routes(HttpRouteSink& sink, Deps deps) {
     // -- NVD CVE feed endpoints -------------------------------------------
 
@@ -19,37 +64,41 @@ void register_nvd_routes(HttpRouteSink& sink, Deps deps) {
              [deps](const httplib::Request& req, httplib::Response& res) {
                  if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
                      return;
-                 if (!deps.nvd_db || !deps.nvd_db->is_open()) {
-                     res.set_content(R"({"enabled":false})", "application/json");
-                     return;
-                 }
-                 nlohmann::json j;
-                 // "enabled" reflects whether the sync manager exists, not
-                 // merely whether the DB file is open: under --no-nvd-sync the
-                 // catalog DB is still open (for matching) but sync is off, so
-                 // reporting enabled=true then 503-ing POST /api/nvd/sync was
-                 // contradictory (#1889 review r2).
-                 j["enabled"] = (deps.nvd_sync != nullptr);
-                 j["total_cves"] = deps.nvd_db->total_cve_count();
-                 if (deps.nvd_sync) {
-                     auto st = deps.nvd_sync->status();
-                     j["syncing"] = st.syncing;
-                     j["last_sync_time"] = st.last_sync_time;
-                     j["last_error"] = st.last_error;
-                     j["backfill_complete"] = st.backfill_complete;
-                     j["backfill_oldest_published"] = st.backfill_oldest_published;
-                 }
-                 res.set_content(j.dump(), "application/json");
+                 res.set_content(status_json(deps.nvd_db, deps.nvd_sync).dump(),
+                                 "application/json");
              });
+
+    // Status card for the Deployments page. Same gate and same JSON as /api/nvd/status.
+    sink.Get("/fragments/auto/nvd", [deps](const httplib::Request& req, httplib::Response& res) {
+        if (!deps.perm_fn(req, res, "Infrastructure", "Read"))
+            return;
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(render_nvd_status(status_json(deps.nvd_db, deps.nvd_sync)),
+                        "text/html; charset=utf-8");
+    });
 
     sink.Post("/api/nvd/sync", [deps](const httplib::Request& req,
                                       httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Execute"))
             return;
         if (!deps.nvd_sync) {
+            // Audit the refused request too (outcome "disabled"); the 503 stands either way.
+            (void)detail::try_persist_audit(deps.audit_fn, req, "nvd.sync.request", "disabled",
+                                            "NvdSync", "nvd", "");
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"NVD sync not enabled"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        // A privileged outbound action: the request is recorded BEFORE it is made, and an
+        // unrecorded request is refused (ADR-1005, mutations fail closed on audit failure).
+        // Nothing has been started yet, so there is nothing to reconcile.
+        if (!detail::try_persist_audit(deps.audit_fn, req, "nvd.sync.request", "success", "NvdSync",
+                                       "nvd", "")) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"audit unavailable; sync not requested"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }

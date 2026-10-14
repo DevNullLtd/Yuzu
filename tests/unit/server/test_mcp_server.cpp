@@ -78,6 +78,8 @@
 #include "pg/pg_raii.hpp"     // PgConn/PgResult — direct-SQL secret-row verification
 #include "pg/secret_codec.hpp"
 #include "plugin_config_store.hpp"
+#include "deployment_routes.hpp"    // deployment_row_json (shared REST/MCP builder)
+#include "deployment_run_store.hpp" // list_deployments / get_deployment
 #include "preflight_run_store.hpp" // #4036: PreflightRunStore for list_preflight_runs / get_deployment_preview
 #include "result_set_store.hpp" // #2146 Batch B2: ResultSetStore for the 12 result-set MCP tools
 #include "custom_properties_store.hpp" // #4981 PR-2: props.<key> preview_scope_targets [pg] coverage
@@ -1112,6 +1114,11 @@ struct McpTestServer {
     /// pre-existing test on the "store unavailable" path.
     yuzu::server::PreflightRunStore* preflight_run_store_for_test{nullptr};
 
+    /// Read-only deployment list/detail (list_deployments / get_deployment): optionally
+    /// wire a real DeploymentRunStore, same idiom as above. Default nullptr keeps every
+    /// pre-existing test on the "store unavailable" path.
+    yuzu::server::DeploymentRunStore* deployment_run_store_for_test{nullptr};
+
     /// #2146 Batch B2 — optionally wire a real ResultSetStore so the 12
     /// result-set MCP tools can be exercised end-to-end against live
     /// Postgres state, same setter-idiom pattern as
@@ -1628,6 +1635,7 @@ private:
         // the two above — wire before the handlers are built.
         if (preflight_run_store_for_test)
             mcp.set_preflight_run_store(preflight_run_store_for_test);
+            mcp.set_deployment_run_store(deployment_run_store_for_test);
         // #2146 Batch B2: result_set_store ALSO rides a setter, same pattern
         // as preflight_run_store immediately above — wire before the
         // handlers are built.
@@ -20367,6 +20375,155 @@ TEST_CASE("MCP get_deployment_preview: an exhausted pool answers "
           mcp::kMcpStoreFaultShortRetryMs); // A5: genuinely retryable, NOT
                                             // the kInvalidParams a genuine
                                             // miss returns.
+}
+
+// ── list_deployments / get_deployment (read-only twins of GET /api/v1/deployments[/{id}]) ──
+
+namespace {
+
+yuzu::test::PgTestTemplate mcp_deprun_tpl{"deprun", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::DeploymentRunStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcp deprun template: store failed to migrate");
+}};
+
+yuzu::server::DeploymentRow mcp_dep(const std::string& id, const std::string& run,
+                                    const std::string& owner, std::int64_t created) {
+    yuzu::server::DeploymentRow d;
+    d.deployment_id = id;
+    d.source_run_id = run;
+    d.created_by = owner;
+    d.name = "MCP dep " + id;
+    d.artifact_url = "https://repo.example/pkg.msi?sig=MCPSECRETTOKEN";
+    d.artifact_filename = "pkg.msi";
+    d.artifact_sha256 = std::string(64, 'b');
+    d.exec_args = "/qn KEY=MCPSECRETKEY";
+    d.created_at_ms = created;
+    return d;
+}
+
+} // namespace
+
+TEST_CASE("MCP list_deployments / get_deployment: owner-scoped, shared builders, no secrets, "
+          "and a read never advances the engine",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_deprun_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    // McpTestServer's default principal is "test-user".
+    REQUIRE(store.create_deployment(mcp_dep("00000000000000a1", "run-1", "test-user", 2000),
+                                    {{"ag1", "host-1", "windows"}, {"ag2", "host-2", "linux"}}));
+    REQUIRE(store.create_deployment(mcp_dep("00000000000000a2", "run-2", "test-user", 1000),
+                                    {{"ag3", "host-3", "windows"}}));
+    REQUIRE(store.create_deployment(mcp_dep("00000000000000b1", "run-3", "someone-else", 3000),
+                                    {{"ag9", "host-9", "windows"}}));
+
+    McpTestServer ts;
+    ts.deployment_run_store_for_test = &store;
+    ts.start();
+
+    auto list = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_deployments",)"
+        R"("arguments":{}}})");
+    REQUIRE(list);
+    auto lp = operator_surface_payload(list);
+    REQUIRE(lp["data"].size() == 2); // someone-else's row is not ours
+    CHECK(lp["data"][0]["deployment_id"] == "00000000000000a1"); // newest first
+    CHECK(lp["data"][0]["has_args"] == true);
+    CHECK(list->body.find("MCPSECRET") == std::string::npos);
+    // The row IS the shared builder's output (REST/MCP parity by construction).
+    auto direct = store.get_deployment("00000000000000a1", "test-user");
+    REQUIRE(direct);
+    CHECK(lp["data"][0] == yuzu::server::deployment_row_json(*direct));
+
+    auto det = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_deployment",)"
+        R"("arguments":{"deployment_id":"00000000000000a1","limit":1}}})");
+    REQUIRE(det);
+    auto dp = operator_surface_payload(det);
+    CHECK(dp["data"]["total"] == 2);
+    CHECK(dp["data"]["devices"].size() == 1);
+    CHECK(dp["data"]["truncated"] == true);
+    CHECK(det->body.find("MCPSECRET") == std::string::npos);
+
+    // Not-yours reads exactly like not-found: kInvalidParams, no oracle.
+    auto theirs = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"get_deployment",)"
+        R"("arguments":{"deployment_id":"00000000000000b1"}}})");
+    auto absent = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"get_deployment",)"
+        R"("arguments":{"deployment_id":"00000000000000ff"}}})");
+    REQUIRE(theirs);
+    REQUIRE(absent);
+    CHECK(nlohmann::json::parse(theirs->body)["error"]["code"] ==
+          yuzu::server::mcp::kInvalidParams);
+    // Same code and message (only the per-request correlation id differs): no oracle.
+    CHECK(nlohmann::json::parse(theirs->body)["error"]["message"] ==
+          nlohmann::json::parse(absent->body)["error"]["message"]);
+
+    auto noid = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"get_deployment",)"
+        R"("arguments":{}}})");
+    REQUIRE(noid);
+    CHECK(nlohmann::json::parse(noid->body)["error"]["code"] ==
+          yuzu::server::mcp::kInvalidParams);
+
+    // Nothing advanced: every device is still pending after four reads.
+    for (const auto& d : store.get_devices("00000000000000a1"))
+        CHECK(d.step == "pending");
+}
+
+TEST_CASE("MCP list_deployments / get_deployment: service-scoped token denied at C8; an "
+          "exhausted pool is a retryable error, never an empty list or a miss",
+          "[pg][mcp][integration][security][service_scope]") {
+    {
+        McpTestServer ts;
+        ts.mock_token_scope_service = "printers";
+        ts.start();
+        auto a = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_deployments",)"
+            R"("arguments":{}}})");
+        auto b = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_deployment",)"
+            R"("arguments":{"deployment_id":"00000000000000a1"}}})");
+        REQUIRE(a);
+        REQUIRE(b);
+        CHECK(nlohmann::json::parse(a->body)["error"]["code"] ==
+              yuzu::server::mcp::kPermissionDenied);
+        CHECK(nlohmann::json::parse(b->body)["error"]["code"] ==
+              yuzu::server::mcp::kPermissionDenied);
+    }
+
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_deprun_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    yuzu::server::DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_deployment(mcp_dep("00000000000000c1", "run-s", "test-user", 1000),
+                                    {{"ag1", "host-1", "windows"}}));
+    McpTestServer ts;
+    ts.deployment_run_store_for_test = &store;
+    ts.start();
+    auto hog = pool.try_acquire_for(std::chrono::seconds{8});
+    REQUIRE(hog);
+
+    auto l = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_deployments",)"
+        R"("arguments":{}}})");
+    auto d = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_deployment",)"
+        R"("arguments":{"deployment_id":"00000000000000c1"}}})");
+    REQUIRE(l);
+    REQUIRE(d);
+    for (const auto* r : {&l, &d}) {
+        auto body = nlohmann::json::parse((*r)->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+              mcp::kMcpStoreFaultShortRetryMs);
+    }
 }
 
 // ── Live-query bundle MCP tools (ADR-0011) ──────────────────────────────────

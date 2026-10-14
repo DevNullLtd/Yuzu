@@ -207,7 +207,13 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # Both of the two changes above landed on 199; merged together the count is 201
 # (199 + 1 DEX Alerts + 1 policy fragments), the value the checker reported on the merged tree.
-BASELINE_UNTWINNED = 201
+#
+# Estate deployment read twins: GET /fragments/auto/deployments and .../detail are new routes
+# ledgered "twinned" (GET /api/v1/deployments[/{id}] + MCP list_deployments / get_deployment,
+# count unchanged). The new GET /fragments/auto/nvd status card is ledgered "exception"
+# (grandfathered NVD surface, no get_nvd_status MCP): +1. Merged on top of the 201 above, the
+# checker reported 202 on the merged tree.
+BASELINE_UNTWINNED = 202
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

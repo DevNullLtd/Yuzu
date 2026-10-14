@@ -15243,15 +15243,6 @@ private:
                              .analytics_store = analytics_store_.get(),
                          });
 
-        // #2542 follow-up: the 3 NVD CVE-feed routes (/api/nvd/status,
-        // /api/nvd/sync, /api/nvd/match), extracted onto the same inline_sink
-        // seam.
-        yuzu::server::nvd::register_nvd_routes(inline_sink, yuzu::server::nvd::Deps{
-                                                                 .perm_fn = perm_fn,
-                                                                 .nvd_db = nvd_db_.get(),
-                                                                 .nvd_sync = nvd_sync_.get(),
-                                                             });
-
         // Per-device tier + management-group scope gate (wraps
         // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
         // operator can only open / read / live-query a device inside their scope,
@@ -15368,6 +15359,16 @@ private:
                                const std::string& target_id, const std::string& detail) -> bool {
             return audit_log(req, action, result, target_type, target_id, detail);
         };
+
+        // #2542 follow-up: the NVD CVE-feed routes (/api/nvd/status, /api/nvd/sync,
+        // /api/nvd/match, plus the /fragments/auto/nvd status card), on the same
+        // inline_sink seam. Placed after audit_fn (the sync request is audited).
+        yuzu::server::nvd::register_nvd_routes(inline_sink, yuzu::server::nvd::Deps{
+                                                                 .perm_fn = perm_fn,
+                                                                 .audit_fn = audit_fn,
+                                                                 .nvd_db = nvd_db_.get(),
+                                                                 .nvd_sync = nvd_sync_.get(),
+                                                             });
 
         // #2542 PR-4: the 5-route Custom Properties API (7.6)
         // (/api/agents/:id/properties[/:key], /api/property-schemas),
@@ -20309,6 +20310,9 @@ private:
             // DeploymentRoutes already hold (constructed well before this
             // point, server.cpp:4041) — no new construction needed.
             mcp_server_->set_preflight_run_store(preflight_run_store_.get());
+            // Read-only deployment list/detail twins (list_deployments / get_deployment):
+            // the live /auto engine's store, already built at server.cpp:4843.
+            mcp_server_->set_deployment_run_store(deployment_run_store_.get());
             // #2146 Batch B2 — backs the 12 result-set MCP tools. Same store
             // ResultSetRoutes/rest_api_v1's result-set routes already hold
             // (constructed well before this point) — no new construction

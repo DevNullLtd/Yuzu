@@ -603,6 +603,7 @@ yuzu_server_core_lib = static_library(
     'src/dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
+    'src/deployments_render.cpp',
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/tar_process_tree.cpp',

@@ -134,14 +134,14 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 | guardian | 18 | 8 | 10 |
 | tar | 12 | 4 | 8 |
 | auto-preflight | 4 | 1 | 3 |
-| auto-deploy | 4 | 1 | 3 |
+| auto-deploy | 6 | 3 | 3 |
 | auto-verify | 3 | 0 | 3 |
 | network | 2 | 1 | 1 |
 | viz | 2 | 2 | 0 |
 | executions | 6 | 1 | 5 |
 | scope-result-sets | 1 | 0 | 1 |
 | instructions | 27 | 14 | 13 |
-| compliance-policy | 20 | 6 | 14 |
+| compliance-policy | 21 | 6 | 15 |
 | settings | 15 | 0 | 15 |
 | rbac | 10 | 0 | 10 |
 | auth-mfa | 7 | 0 | 7 |
@@ -151,11 +151,11 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 13 | 61 |
-| **Total** | **289** | **88** | **201** |
+| **Total** | **292** | **90** | **202** |
 
-Registered `/api/vN/*` routes: 247. OpenAPI `paths` entries: 246. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 187.
+Registered `/api/vN/*` routes: 249. OpenAPI `paths` entries: 248. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 189.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 201.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 202.
 
 <!-- END GENERATED -->
 

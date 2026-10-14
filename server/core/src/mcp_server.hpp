@@ -114,6 +114,10 @@ class PluginConfigStore;
 // handler, which is the same shape). Forward-declared (pointer-only in the
 // setter below); the .cpp includes preflight_run_store.hpp for the definition.
 class PreflightRunStore;
+// Read-only deployment list/detail (list_deployments / get_deployment). Forward-declared
+// (pointer-only in the setter below); the .cpp includes deployment_routes.hpp, which pulls in
+// the store definition and the shared JSON builders.
+class DeploymentRunStore;
 // #2146 Batch B1 — backs get_guardian_device_compliance (the SAME BaselineStore
 // GET /guaranteed-state/device-compliance already reads). Forward-declared
 // (pointer-only in the setter below); the .cpp includes baseline_store.hpp for
@@ -519,6 +523,12 @@ public:
     /// `set_plugin_config_store` above. Unset (`nullptr`, the default) ⇒
     /// both tools answer "unavailable" rather than crashing.
     void set_preflight_run_store(PreflightRunStore* store) { preflight_run_store_ = store; }
+
+    /// The deployment run store, backing `list_deployments` and `get_deployment`
+    /// (mirror GET /api/v1/deployments[/{id}], owner-scoped, read-only). Unset
+    /// (`nullptr`, the default) => both tools answer "unavailable". This is the live
+    /// `/auto` engine's store, NOT the dormant `SoftwareDeploymentStore`.
+    void set_deployment_run_store(DeploymentRunStore* store) { deployment_run_store_ = store; }
 
     /// #2146 Batch B2 — the scope-walking result-set store, backing the 12
     /// result-set MCP tools (`list_result_sets` through `delete_result_set`).
@@ -1203,6 +1213,7 @@ private:
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
     PreflightRunStore* preflight_run_store_{nullptr};
+    DeploymentRunStore* deployment_run_store_{nullptr};
     // #2146 Batch B2 — see set_result_set_store above.
     ResultSetStore* result_set_store_{nullptr};
     // #4981 PR-2 — see set_scope_evaluate_fn above.

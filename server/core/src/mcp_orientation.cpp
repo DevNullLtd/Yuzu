@@ -177,7 +177,8 @@ constexpr std::string_view kGuardian[] = {
 // stages' read twins. Own family, distinct from Fleet & agents / Live
 // execution: these are owner-scoped readiness/preview reads over the
 // operator's OWN saved runs, not fleet-wide agent data or dispatch.
-constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_deployment_preview"};
+constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_deployment_preview",
+                                                 "list_deployments", "get_deployment"};
 // #4030: WorkflowEngine's multi-step orchestration — its own family, distinct
 // from both "Instructions & schedules" (single InstructionDefinitions) and
 // "Executions & audit" (ExecutionTracker's single-instruction fan-out): a
@@ -340,8 +341,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Guardian", "live Guardian rule/event state and per-device guard status (not the schema "
                 "catalog -- see Policy & compliance for that)",
      kGuardian},
-    {"Pre-flight & deploy", "owner-scoped saved pre-flight runs and the deploy-config go/warn "
-                            "preview for one of them",
+    {"Pre-flight & deploy", "owner-scoped saved pre-flight runs, the deploy-config go/warn "
+                            "preview for one of them, and the caller's deployments and their "
+                            "device grids",
      kPreflightDeploy},
     {"Workflows", "multi-step workflow definitions and their per-step execution records",
      kWorkflows},
