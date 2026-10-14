@@ -425,6 +425,30 @@ TEST_CASE("pkg_inventory linux [degraded, SUPPORTED]: a per-item anomaly degrade
         put(dir.path, "var/lib/snapd/snaps/btop_1073.snap");
         CHECK(one_row(store(dir.path)) == "package|snap|btop|-|unknown|1073|-|-|unknown");
     }
+    SECTION("an empty /snap beside the live /var/lib/snapd/snap does not empty the catalogue") {
+        // MUTATION: taking the first mount tree that OPENS (not the first that CONTAINS the
+        // snap) makes every capture row `inactive` and drops the host's snaps silently.
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_linux_emptysnap_"};
+        std::string err;
+        REQUIRE(build_capture_tree(dir.path, err));
+        fs::rename(dir.path / "snap", dir.path / "var/lib/snapd/snap");
+        fs::create_directory(dir.path / "snap");
+        const auto w = store(dir.path);
+        CHECK_FALSE(w.token.has_value());
+        REQUIRE(w.rows.size() >= 6);
+        const std::vector<std::string> expected{
+            "package|snap|btop|1.4.7|app|1073|-|-|active",
+            "package|snap|core|16-2.61.4-20260225|os|17292|-|-|active",
+            "package|snap|core24|20260824|base|2124|-|-|active",
+            "package|snap|hello-world|6.4|app|29|-|-|active",
+            "package|snap|jq|1.5+dfsg-1|app|6|-|-|active",
+            "package|snap|snapd|2.77.1|snapd|28254|-|-|active",
+        };
+        for (std::size_t i = 0; i < expected.size(); ++i) {
+            INFO("row " << i);
+            CHECK(w.rows[i] == expected[i]);
+        }
+    }
     SECTION("a symlinked mount dir is refused, never followed") {
         yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_linux_mountlink_"};
         put(dir.path, "var/lib/snapd/snaps/btop_1073.snap");

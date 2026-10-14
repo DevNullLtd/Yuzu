@@ -186,13 +186,21 @@ struct SnapDetail {
     std::string_view kind = "unknown";
 };
 
-[[nodiscard]] inline SnapDetail snap_detail(const std::optional<posix::Dir>& mount,
+[[nodiscard]] inline SnapDetail snap_detail(const std::vector<posix::Dir>& mounts,
                                             const SnapFile& snap) {
     SnapDetail d;
-    if (!mount) return d; // no mount tree at all: state unknown, version `-`
-    auto name_dir = posix::open_dir_no_follow_at(*mount, snap.name.c_str());
+    if (mounts.empty()) return d; // no mount tree at all: state unknown, version `-`
+    // The snap lives under whichever tree holds its name dir: an ABSENT name dir moves
+    // on to the next tree (a stale empty /snap beside a live /var/lib/snapd/snap must
+    // not empty the catalogue); any other open failure is `unknown`, without retry.
+    posix::OpenDirResult name_dir;
+    for (const auto& mount : mounts) {
+        name_dir = posix::open_dir_no_follow_at(mount, snap.name.c_str());
+        if (name_dir.dir.valid()) break;
+        if (!name_dir.absent) return d; // unknown
+    }
     if (!name_dir.dir.valid()) {
-        d.state = name_dir.absent ? StoreState::inactive : StoreState::unknown;
+        d.state = StoreState::inactive; // absent in every tree
         return d;
     }
     const auto cur = posix::read_link_name(name_dir.dir, "current", 32);
@@ -236,15 +244,13 @@ inline void snap_rows(const std::filesystem::path& root, StoreWalk& w) {
         return a.name != b.name ? a.name < b.name : a.revision < b.revision;
     });
 
-    // The mount tree: the first of /snap (Debian family) and /var/lib/snapd/snap
-    // (Fedora family) that opens. None opens -> every row is `unknown`, silently.
-    std::optional<posix::Dir> mount;
+    // The mount trees: /snap (Debian family) and /var/lib/snapd/snap (Fedora family),
+    // every one that opens, consulted in this order per snap. None opens -> every row
+    // is `unknown`, silently.
+    std::vector<posix::Dir> mounts;
     for (const std::string_view rel : {"snap", "var/lib/snapd/snap"}) {
         auto m = posix::open_dir_no_follow(under(root, rel));
-        if (m.dir.valid()) {
-            mount = std::move(m.dir);
-            break;
-        }
+        if (m.dir.valid()) mounts.push_back(std::move(m.dir));
     }
 
     for (const auto& f : files) {
@@ -252,7 +258,7 @@ inline void snap_rows(const std::filesystem::path& root, StoreWalk& w) {
             w.budget_tripped(kSource);
             return;
         }
-        const auto d = snap_detail(mount, f);
+        const auto d = snap_detail(mounts, f);
         if (!w.add(format_store_row(Store::snap, f.name, d.version, d.kind, f.revision, "", "",
                                     d.state)))
             return;
