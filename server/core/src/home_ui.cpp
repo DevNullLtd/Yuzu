@@ -1,6 +1,8 @@
 // Home page — the landing worklist (readout, needs attention).
 // Server-rendered HTMX; no page JavaScript, no polling (Refresh is a plain link).
-// Every panel is filled by `/fragments/home/summary`; see home_routes.hpp.
+// The readout and needs-attention panel are filled by `/fragments/home/summary`
+// (home_routes.hpp); policies, activity and health by their own fragments
+// (home_panels_routes.hpp, health_routes.cpp).
 
 #include "app_shell.hpp"
 #include "home_ui.hpp"
@@ -19,6 +21,10 @@ const char* const kHomeCss = R"CSS(
 .home-rowb{flex:1 1 auto;min-width:0}
 .home-rowb b{color:var(--ink);font-weight:500}
 .home-row .sd{flex:0 0 auto;margin-right:0}
+.home-panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:22px;align-items:start}
+.home-panels .panel{min-width:0}
+.home-panels .kvl{padding:0}
+.home-panels .bar{margin:0 16px 10px}
 )CSS";
 
 static const char* const kHomeHead = R"HTM(<!DOCTYPE html>
@@ -52,6 +58,24 @@ static const char* const kHomeBody = R"HTM(</style>
     <div class="hd"><h2>Needs attention</h2></div>
     <div class="pb mut">Loading</div>
   </section>
+
+  <div class="home-panels">
+    <section class="panel" id="home-policies" hx-get="/fragments/home/policies"
+             hx-trigger="load" hx-swap="outerHTML">
+      <div class="hd"><h3>Compliance by policy</h3></div>
+      <div class="pb mut">Loading</div>
+    </section>
+    <section class="panel" id="home-activity" hx-get="/fragments/home/activity"
+             hx-trigger="load" hx-swap="outerHTML">
+      <div class="hd"><h3>Recent activity</h3></div>
+      <div class="pb mut">Loading</div>
+    </section>
+    <section class="panel" id="home-health" hx-get="/fragments/home/health"
+             hx-trigger="load" hx-swap="outerHTML">
+      <div class="hd"><h3>Server health</h3></div>
+      <div class="pb mut">Loading</div>
+    </section>
+  </div>
 </main>
 
 </body></html>

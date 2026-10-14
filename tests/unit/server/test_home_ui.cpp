@@ -51,10 +51,16 @@ TEST_CASE("home page: no handlers, no hx-on, no innerHTML, only the htmx script"
         CHECK((*it)[1].str() == "/static/htmx.js");
 }
 
-TEST_CASE("home page: the only fragment the page loads is the summary", "[home][ui]") {
+TEST_CASE("home page: loads exactly the summary and the three panel fragments", "[home][ui]") {
     const std::string tpl(kHomeTemplate);
-    CHECK(count_of(tpl, "hx-get=") == 1);
+    CHECK(count_of(tpl, "hx-get=") == 4);
     CHECK(count_of(tpl, "hx-get=\"/fragments/home/summary\"") == 1);
+    for (const char* id : {"policies", "activity", "health"}) {
+        const std::string frag = std::string("hx-get=\"/fragments/home/") + id + "\"";
+        CHECK(count_of(tpl, frag) == 1);
+        // The fragment answers a full <section id="home-..."> for an outerHTML swap.
+        CHECK(count_of(tpl, std::string("id=\"home-") + id + "\"") == 1);
+    }
     // No polling: Refresh is a plain link.
     CHECK(count_of(tpl, "every ") == 0);
     CHECK(count_of(tpl, "href=\"/home\">Refresh</a>") == 1);
