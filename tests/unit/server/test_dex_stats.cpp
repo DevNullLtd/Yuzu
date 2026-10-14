@@ -592,3 +592,20 @@ TEST_CASE("DexStats: dex_rate_ratio converges at a slow large-arm pair", "[dex][
     CHECK(s->lower == Approx(29240.202199451534).epsilon(2e-5));
     CHECK(s->upper == Approx(29870.889158898113).epsilon(2e-5));
 }
+
+TEST_CASE("DexStats: dex_rate_ratio with a lowered minimum exposure", "[dex][stats]") {
+    // (3 / 2) / (1 / 1) = 1.5. Two devices of exposure sit under the default
+    // guard of 10 and over a caller-supplied minimum of 1.
+    CHECK_FALSE(dex_rate_ratio(3, 2.0, 1, 1.0));
+    const auto lowered = dex_rate_ratio(3, 2.0, 1, 1.0, 1.0);
+    REQUIRE(lowered);
+    CHECK(lowered->estimate == Approx(1.5));
+    // A lowered minimum never admits a zero or negative exposure.
+    CHECK_FALSE(dex_rate_ratio(3, 0.0, 1, 1.0, 1.0));
+    CHECK_FALSE(dex_rate_ratio(3, 2.0, 1, 0.0, 0.0));
+    CHECK_FALSE(dex_rate_ratio(3, -1.0, 1, 1.0, -5.0));
+    // The default argument is the old guard.
+    const auto dflt = dex_rate_ratio(12, 15.0, 5, 12.0);
+    REQUIRE(dflt);
+    CHECK(dflt->estimate == dex_rate_ratio(12, 15.0, 5, 12.0, kDexRateRatioMinExposure)->estimate);
+}

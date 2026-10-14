@@ -1812,7 +1812,33 @@ static const ToolDef kTools[] = {
      "lower_bound}: lower_bound=true => value is a FLOOR ('>= value', the open top "
      "bucket); a percentile is null when the population is empty or the row predates "
      "the current histogram scheme (hist_stale=true). Fleet aggregate (no agent_id) — "
-     "not audited. Mirrors GET /api/v1/dex/perf/app. Requires GuaranteedState:Read.",
+     "not audited. Also returns versions[], one row per version (the 20 highest "
+     "canonical versions the agents reported, newest first; versions_truncated=true "
+     "when older ones were dropped; a version with no retained performance rows is not "
+     "listed, so no row is not no failures) joining the last failure_window_days of "
+     "crash and hang observations (30, clamped to one day less than the observation "
+     "retention when that is 1 to 30 days; whole UTC days plus the current day so "
+     "far; an observation stamped after the end of the current UTC day is excluded), "
+     "matched on the exact canonical version and subject the agent reported: "
+     "affected_devices (fleet-wide devices that reported a crash or hang) with crashes "
+     "and hangs, always present as fleet-wide event counts; exposure_devices (devices "
+     "with retained resource-significant samples, a selected subset and not a census; "
+     "null when unknown, so affected_devices > 0 with null exposure is failures "
+     "recorded under a version with no samples); and, when exposure_devices is known, "
+     "exposed_crashes and exposed_hangs and, when it is positive, failure_rate "
+     "(exposed events per exposed device over the window, not per day of use: read it "
+     "beside day_count and latest_day, a version with fewer than failure_window_days + 1 "
+     "days has had less time to fail; exact 95 percent interval; a zero exposure gives a "
+     "null rate), and, when both versions have a known positive exposure_devices, "
+     "failure_rate_ratio against previous_version (the next older returned version; null "
+     "for the oldest known version and for the unknown version; exact conditional "
+     "interval; upper is null with unbounded=true when the previous version saw no "
+     "exposed events). This join carries no device floor (maintainer ruling): every "
+     "figure is published at any device count, and the per-(version, day) point floor "
+     "on points[] is unchanged. exposure_basis "
+     "resource_significant: exposure is the daily top-N consumers, not a census. "
+     "stat_failures counts statistics that returned nothing on valid input (expected 0). "
+     "Mirrors GET /api/v1/dex/perf/app. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
      R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
@@ -1827,8 +1853,19 @@ static const ToolDef kTools[] = {
      R"j("ws_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
      R"j("ws_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
      R"j("hist_stale":{"type":"boolean"})j"
-     R"j(},"required":["version","day","device_count","suppressed"]}})j"
-     R"j(},"required":["app","version","points"]})j"},
+     R"j(},"required":["version","day","device_count","suppressed"]}},)j"
+     R"j("versions":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("version":{"type":"string"},"latest_day":{"type":"integer"},"day_count":{"type":"integer"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("affected_devices":{"type":"integer"},)j"
+     R"j("crashes":{"type":"integer","description":"Fleet-wide event count, always present"},"hangs":{"type":"integer","description":"Fleet-wide event count, always present"},)j"
+     R"j("exposure_devices":{"type":["integer","null"],"description":"Devices with retained resource-significant samples; null = unknown, never zero"},)j"
+     R"j("exposed_crashes":{"type":["integer","null"]},"exposed_hangs":{"type":["integer","null"]},)j"
+     R"j("failure_rate":{"type":["object","null"],"properties":{"estimate":{"type":"number"},"lower":{"type":"number"},"upper":{"type":"number"},"reliable":{"type":"boolean"}}},)j"
+     R"j("previous_version":{"type":["string","null"]},)j"
+     R"j("failure_rate_ratio":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"unbounded":{"type":"boolean"},"reliable":{"type":"boolean"}}})j"
+     R"j(},"required":["version","affected_devices","crashes","hangs","exposure_devices"]}},)j"
+     R"j("versions_truncated":{"type":"boolean"},"failure_window_days":{"type":"integer"},"exposure_basis":{"type":"string"},"stat_failures":{"type":"integer"})j"
+     R"j(},"required":["app","version","points","versions","versions_truncated","failure_window_days","exposure_basis","stat_failures"]})j"},
 
     {"list_dex_app_perf_devices",
      "The version-row 'which devices' drill for get_dex_app_perf: unlike that aggregate "
@@ -16393,6 +16430,16 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
+                    // A present non-string must not read as the all-versions
+                    // sentinel (param_str would return its default), so the type is
+                    // checked here, as it is for `app`.
+                    if (args.contains("version") && !args["version"].is_string()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'version'",
+                                           a4_data(0, "version must be a string")),
+                            "application/json");
+                        return;
+                    }
                     const auto version = param_str(args, "version");
                     if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
                         res.set_content(
@@ -16401,17 +16448,17 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    auto trend = dex_perf_api_->app_fleet_trend(app, version);
-                    if (!trend) { // AUTHORITATIVE read degrade
+                    auto report = dex_perf_api_->app_fleet_report(app, version);
+                    if (!report) { // AUTHORITATIVE read degrade
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store read degraded",
-                                           a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
+                                           a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf or crash-and-hang store could not be read; "
                                                          "retry shortly")),
                             "application/json");
                         return;
                     }
                     JArr points;
-                    for (const auto& pt : *trend) {
+                    for (const auto& pt : report->points) {
                         // Fleet floors now too — emit suppressed + gate stats, same
                         // shape as get_dex_group_app_perf (a suppressed point must not
                         // read as "N devices @ 0% CPU").
@@ -16436,6 +16483,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .add("app", app)
                                   .add("version", version)
                                   .raw("points", points.str())
+                                  .raw("versions", dex_app_perf_versions_json(*report))
+                                  .add("versions_truncated", report->versions_truncated)
+                                  .add("failure_window_days",
+                                       std::int64_t{report->failure_window_days})
+                                  .add("exposure_basis", "resource_significant")
+                                  .add("stat_failures", std::int64_t{report->stat_failures})
                                   .str();
                 } else if (tool_name == "get_dex_group_app_perf") {
                     // An interim deny_fleet_wide_service_scoped() call used to
