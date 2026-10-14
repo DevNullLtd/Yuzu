@@ -31,32 +31,39 @@ inline std::string neutralize_formula(const std::string& field) {
     return field;
 }
 
-// RFC 4180 CSV field escaping: quote fields containing commas, quotes, or newlines.
-// Internal double-quotes are doubled. Formula-injection neutralization (above)
-// runs first, so every caller of this chokepoint is protected without having
-// to know CWE-1236 exists.
-inline std::string csv_escape(const std::string& field) {
-    const std::string neutralized = neutralize_formula(field);
+// RFC 4180 quote-only: wrap in double quotes (doubling any internal quote)
+// when the field contains a comma, quote, CR or LF. No formula neutralisation,
+// so it is the right call for cells that are not free text -- a JSON number
+// `-5` must stay `-5`, and a serialised nested object must keep its commas
+// inside one cell (neutralisation of those would be wrong or a no-op).
+inline std::string csv_quote(const std::string& field) {
     bool needs_quoting = false;
-    for (char c : neutralized) {
+    for (char c : field) {
         if (c == ',' || c == '"' || c == '\n' || c == '\r') {
             needs_quoting = true;
             break;
         }
     }
     if (!needs_quoting)
-        return neutralized;
+        return field;
 
     std::string result;
-    result.reserve(neutralized.size() + 8);
+    result.reserve(field.size() + 8);
     result += '"';
-    for (char c : neutralized) {
+    for (char c : field) {
         if (c == '"')
             result += '"';
         result += c;
     }
     result += '"';
     return result;
+}
+
+// RFC 4180 CSV field escaping for free-text fields: formula-injection
+// neutralization (above) runs first, then csv_quote, so every caller of this
+// chokepoint is protected without having to know CWE-1236 exists.
+inline std::string csv_escape(const std::string& field) {
+    return csv_quote(neutralize_formula(field));
 }
 
 // Convert a JSON array string to CSV.  Expects a JSON array of objects
