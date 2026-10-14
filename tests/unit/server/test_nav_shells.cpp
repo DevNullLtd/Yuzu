@@ -27,7 +27,6 @@
 // Full-page templates (defined at global scope in the *_ui.cpp translation units).
 extern const char* const kDashboardIndexHtml;
 extern const char* const kHelpHtml;
-extern const char* const kHomeHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kApprovalsPageHtml;
 extern const char* const kExecutionsPageHtml;
@@ -501,7 +500,8 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},
-        {"home", kHomeHtml, {}}, // reached from the logo, no nav item
+        // Not listed on purpose: /home is the landing and sign-in page and carries no
+        // shell at all (test_home_ui.cpp pins that). The logo reaches it (below).
     };
     for (const auto& p : pages) {
         INFO(p.name);
@@ -529,6 +529,14 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         const auto page_only = html.substr(0, sb) + html.substr(se);
         CHECK(count_of(page_only, "palette=1'") + count_of(page_only, "palette=1\"") == 0);
     }
+}
+
+TEST_CASE("app shell: the brand link reaches the landing page, which has no nav item", "[nav][shell]") {
+    const auto html = render_shell({.active_key = "dashboard"});
+    CHECK(count_of(html, R"(<a class="shell-brand" href="/home" aria-label="Yuzu home">Yuzu<i></i></a>)") == 1);
+    for (const auto& g : nav_groups())
+        for (const auto& it : g.items)
+            CHECK(it.href != "/home");
 }
 
 TEST_CASE("app shell: approvals badge is hidden until the count answers, polls every 30 s and stops on a refusal",

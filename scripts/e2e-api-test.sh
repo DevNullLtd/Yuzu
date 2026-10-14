@@ -1155,15 +1155,15 @@ for frag in "${DASH_FRAGMENTS[@]}"; do
     assert_status_any "GET $frag" "$HTTP_STATUS" 200 400 404
 done
 
-# Home: the admin session is unconfined, so both routes must answer 200 with their own
-# markup. The loose status list above would also accept a route that was never registered.
+# Home: the landing and sign-in page. With the admin session it must show the signed-in
+# panel (never a redirect); the summary fragment below must answer with its own markup.
 http_get "$SERVER_URL/home"
 assert_eq "GET /home status" "200" "$HTTP_STATUS"
 TESTS=$((TESTS + 1))
-if [[ "$HTTP_BODY" == *'id="home-readout"'* ]]; then
-    pass "GET /home carries the readout target"
+if [[ "$HTTP_BODY" == *'aria-label="Signed in"'* ]]; then
+    pass "GET /home shows the signed-in panel"
 else
-    fail "GET /home missing id=home-readout"
+    fail "GET /home missing the signed-in panel"
 fi
 http_get "$SERVER_URL/fragments/home/summary"
 assert_eq "GET /fragments/home/summary status" "200" "$HTTP_STATUS"
