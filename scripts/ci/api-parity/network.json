@@ -12,6 +12,17 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/network/discovered",
+    "capability_id": "get.fragments-network-discovered",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/network/discovered-devices"
+    },
+    "mcp_twin": "list_discovered_devices",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/network/overview",
     "capability_id": "get.fragments-network-overview",
     "rest_v1_twin": null,

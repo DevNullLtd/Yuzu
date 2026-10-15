@@ -241,13 +241,30 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # Design delta 2026-10-14: the four rows above moved with their panels to the Dashboard and
 # are now /fragments/dashboard/{summary,policies,activity,health} (same composed-of status,
 # same count; a rename, not a new surface), so the count stays 208.
+#
+# Estate deployment read twins: GET /fragments/auto/deployments and .../detail are new routes
+# ledgered "twinned" (GET /api/v1/deployments[/{id}] + MCP list_deployments / get_deployment,
+# count unchanged). The new GET /fragments/auto/nvd status card is ledgered "exception"
+# (grandfathered NVD surface, no get_nvd_status MCP): +1. Merged on top of the 201 above, the
+# checker reported 202 on the merged tree.
+#
+# Network discovery read twin (Estate E-2): the unbounded legacy GET /api/discovery/results
+# row flips "planned:#2146" -> "twinned" (GET /api/v1/network/discovered-devices + MCP
+# list_discovered_devices); the new GET /fragments/network/discovered row is born "twinned"
+# (count unchanged): -1 on its own. Combined with the +1 above the checker reported 201 on the
+# merged tree, not a hand-added delta.
+#
+# Landing on dev's 208 (device containment, hardware properties and the Home/Dashboard rows, above),
+# the two Estate changes net 0 on their own (+1 NVD status card exception, -1 discovery row
+# twinned), so the count after this merge is the value the checker reports, set from its output.
+#
 # Integrations page, webhook panel (System pages SYS-5): the two new webhook fragments
 # (GET /fragments/settings/webhooks and .../{id}/deliveries) are `composed-of:` the legacy
 # /api/webhooks routes, which are themselves `planned:#2146` and have no REST v1 or MCP twin
 # yet, so they cannot be `twinned`. +2, measured by the checker on its own base (204 -> 206). The
 # offload-target and directory sync fragments are `twinned` to existing v1 routes and MCP tools and add nothing.
-# Merged with the dev changes above (208) the two webhook rows bring the count to 210 (208 + 2), the
-# value the checker reports on the merged tree.
+# Merged with the dev changes above (208, including the Estate read twins) the two webhook rows
+# bring the count to 210 (208 + 2), the value the checker reports on the merged tree.
 BASELINE_UNTWINNED = 210
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────

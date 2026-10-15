@@ -34,6 +34,8 @@
 /// see ADR-0044's Update. `server.cpp` now runs a detect-and-warn probe over
 /// the legacy file instead.
 
+#include "discovery_types.hpp"
+
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -50,19 +52,6 @@ class PgPool;
 }
 
 namespace yuzu::server {
-
-struct DiscoveredDevice {
-    std::int64_t id{0};
-    std::string ip_address;
-    std::string mac_address;
-    std::string hostname;
-    bool managed{false};       ///< true if IP matches a known enrolled agent
-    std::string agent_id;      ///< agent_id if managed
-    std::string discovered_by; ///< agent_id of the agent that discovered this device
-    std::int64_t discovered_at{0}; ///< epoch seconds, first-seen (preserved across upserts)
-    std::int64_t last_seen{0};     ///< epoch seconds, most-recent-seen
-    std::string subnet;            ///< the subnet that was scanned
-};
 
 class DiscoveryStore {
 public:
@@ -97,6 +86,18 @@ public:
     /// genuinely empty result).
     [[nodiscard]] std::optional<std::vector<DiscoveredDevice>>
     list_devices(const std::string& subnet_filter = {});
+
+    /// Bounded twin of `list_devices`: at most `limit` rows (clamped to >= 1),
+    /// newest last-seen first. A store/pool/query failure is `std::unexpected`
+    /// so a machine reader can tell "could not ask" from "no rows" — the
+    /// `std::optional` form above carries the same distinction but no reason.
+    [[nodiscard]] std::expected<std::vector<DiscoveredDevice>, std::string>
+    list_devices_checked(const std::string& subnet_filter, int limit);
+
+    /// Row and distinct-subnet counts computed in the database (no full-table
+    /// fetch), over the same optional subnet filter.
+    [[nodiscard]] std::expected<DiscoverySummary, std::string>
+    summarize(const std::string& subnet_filter = {});
 
     /// One device by `ip_address`. AUTHORITATIVE read: `std::unexpected(msg)`
     /// on a store/pool/query failure; a value holding `std::nullopt` when
