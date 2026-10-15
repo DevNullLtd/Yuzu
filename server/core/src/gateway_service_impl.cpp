@@ -657,6 +657,21 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
         // never falls through as "absent" (mirror of the direct Register path).
         auto prior_result = auth_mgr_.get_pending_status(info.agent_id());
         if (!prior_result) {
+            if (prior_result.error() == StoreError::InvalidInput) {
+                // The enrollment store refused the id itself (a control byte other than NUL, or
+                // ','): caller input, not a store outage. Warn and count it like the door
+                // rejections above; the wire status is unchanged (INVALID_ARGUMENT).
+                spdlog::warn("[gateway] ProxyRegister rejected: agent_id refused by the "
+                             "enrollment store (control byte or ',') for agent {}",
+                             safe_agent_id);
+                if (metrics_) {
+                    metrics_
+                        ->counter("yuzu_register_invalid_agent_id_total",
+                                  {{"reason", "control"}, {"source", "gateway_proxy"}})
+                        .increment();
+                }
+                return enrollment_store_status(prior_result.error());
+            }
             spdlog::error("[gateway] Register: enrollment status read failed for agent {}",
                           safe_agent_id);
             return enrollment_store_status(prior_result.error());

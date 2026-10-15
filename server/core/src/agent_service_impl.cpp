@@ -172,6 +172,17 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         // rejection to the agent, agent.cpp:1649-1657 — #3401).
         auto prior_result = auth_mgr_.get_pending_status(info.agent_id());
         if (!prior_result) {
+            if (prior_result.error() == StoreError::InvalidInput) {
+                // The enrollment store refused the id itself (a control byte other than NUL, or
+                // ','): caller input, not a store outage. Warn and count it like the door
+                // rejections above; the wire status is unchanged (INVALID_ARGUMENT).
+                spdlog::warn("Register rejected: agent_id refused by the enrollment store "
+                             "(control byte or ',') for agent {}",
+                             safe_agent_id);
+                metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "control"}})
+                    .increment();
+                return enrollment_store_status(prior_result.error());
+            }
             spdlog::error("Register: enrollment status read failed for agent {}", safe_agent_id);
             return enrollment_store_status(prior_result.error());
         }
@@ -966,7 +977,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             const auto ids = extract_peer_identities(*context);
             const std::string cert_id = ids.empty() ? std::string{} : ids.front();
             spdlog::warn("Subscribe rejected: revoked client cert (session={}, cert_id={})",
-                         session_id, cert_id);
+                         ::yuzu::log_id_token(session_id), ::yuzu::log_id_token(cert_id));
             if (audit_store_ && audit_store_->is_open()) {
                 AuditEvent ev;
                 ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(

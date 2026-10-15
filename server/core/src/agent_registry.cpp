@@ -18,6 +18,7 @@
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "tar_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -693,7 +694,8 @@ bool gateway_capability_missing(const AgentSession& session, yuzu::MetricsRegist
         .increment();
     spdlog::warn("send_to: refusing to route a dispatch-tagged command to agent {} via gateway "
                  "node '{}' — gateway has not advertised '{}'",
-                 agent_id, session.gateway_node, kGatewayWireCapabilityDispatchTagV1);
+                 agent_id, onbehalf::sanitize_for_log(session.gateway_node, 64),
+                 kGatewayWireCapabilityDispatchTagV1);
     return true;
 }
 

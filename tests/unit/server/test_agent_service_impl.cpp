@@ -1244,8 +1244,8 @@ TEST_CASE("Register: logs a claimed agent_id with control bytes neutralised",
     cap.stop();
 
     CHECK_FALSE(status.ok());
-    CHECK(cap.text().find("enrollment status read failed for agent agent_x_1_fake") !=
-          std::string::npos);
+    CHECK(cap.text().find("agent_id refused by the enrollment store (control byte or ',') for "
+                          "agent agent_x_1_fake") != std::string::npos);
     CHECK(cap.text().find("agent x=1") == std::string::npos);
 }
 
@@ -1270,9 +1270,126 @@ TEST_CASE("ProxyRegister: logs a claimed agent_id with control bytes neutralised
     cap.stop();
 
     CHECK_FALSE(status.ok());
-    CHECK(cap.text().find("enrollment status read failed for agent agent_x_1_fake") !=
-          std::string::npos);
+    CHECK(cap.text().find("agent_id refused by the enrollment store (control byte or ',') for "
+                          "agent agent_x_1_fake") != std::string::npos);
     CHECK(cap.text().find("agent x=1") == std::string::npos);
+}
+
+namespace {
+
+apb::RegisterRequest make_register_request(const std::string& agent_id) {
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(agent_id);
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    return req;
+}
+
+double invalid_id_count(yuzu::MetricsRegistry& m, const char* reason, bool gateway) {
+    yuzu::Labels labels{{"reason", reason}};
+    if (gateway)
+        labels.emplace_back("source", "gateway_proxy");
+    return m.counter("yuzu_register_invalid_agent_id_total", labels).value();
+}
+
+} // namespace
+
+TEST_CASE("Register: an agent_id with a control byte the door lets through is counted as "
+          "reason=control and logged at warn, not as a store outage",
+          "[pg][agent_service][register][failclosed][control_id]") {
+    // A control byte other than NUL passes the door (length ok, no NUL) and is refused by the
+    // enrollment store's id check (StoreError::InvalidInput). That is caller input, so it must
+    // not read as a store failure: warn level, its own metric reason, same INVALID_ARGUMENT.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    auto req = make_register_request("a\tb");
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(status.error_message() == "invalid enrollment request");
+    CHECK(invalid_id_count(h.metrics, "control", false) == 1.0);
+    CHECK(invalid_id_count(h.metrics, "length", false) == 0.0);
+    CHECK(invalid_id_count(h.metrics, "nul", false) == 0.0);
+    CHECK(invalid_id_count(h.metrics, "charset", false) == 0.0);
+    const std::string text = cap.text();
+    CHECK(text.find("[warning] Register rejected: agent_id refused by the enrollment store") !=
+          std::string::npos);
+    CHECK(text.find("status read failed") == std::string::npos);
+    CHECK(text.find("[error]") == std::string::npos);
+    CHECK(text.find('\t') == std::string::npos);
+}
+
+TEST_CASE("ProxyRegister: an agent_id with a control byte the door lets through is counted as "
+          "reason=control and logged at warn, not as a store outage",
+          "[pg][agent_service][register][gateway][failclosed][control_id]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    auto req = make_register_request("a\tb");
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(status.error_message() == "invalid enrollment request");
+    CHECK(invalid_id_count(h.metrics, "control", true) == 1.0);
+    CHECK(invalid_id_count(h.metrics, "length", true) == 0.0);
+    CHECK(invalid_id_count(h.metrics, "nul", true) == 0.0);
+    CHECK(invalid_id_count(h.metrics, "charset", true) == 0.0);
+    // The direct-Register series (no source label) did not move.
+    CHECK(invalid_id_count(h.metrics, "control", false) == 0.0);
+    const std::string text = cap.text();
+    CHECK(text.find("[warning] [gateway] ProxyRegister rejected: agent_id refused by the "
+                    "enrollment store") != std::string::npos);
+    CHECK(text.find("status read failed") == std::string::npos);
+    CHECK(text.find("[error]") == std::string::npos);
+    CHECK(text.find('\t') == std::string::npos);
+    CHECK(h.registry.trusted_gateway_peer_count() == 0);
+}
+
+TEST_CASE("Register and ProxyRegister: a genuine enrollment store failure still logs the "
+          "error-level status read failure and moves no invalid-id series",
+          "[pg][agent_service][register][gateway][failclosed][control_id]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    // No store attached: get_pending_status fails with StoreError::Unavailable (not InvalidInput).
+    h.auth_mgr.set_auth_db(nullptr);
+
+    auto req = make_register_request("good-agent-1");
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto direct = h.svc.Register(/*context=*/nullptr, &req, &resp);
+    auto proxied = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK(direct.error_code() == grpc::StatusCode::UNAVAILABLE);
+    CHECK(proxied.error_code() == grpc::StatusCode::UNAVAILABLE);
+    const std::string text = cap.text();
+    CHECK(text.find("[error] Register: enrollment status read failed for agent good-agent-1") !=
+          std::string::npos);
+    CHECK(text.find("[error] [gateway] Register: enrollment status read failed for agent "
+                    "good-agent-1") != std::string::npos);
+    CHECK(text.find("refused by the enrollment store") == std::string::npos);
+    for (const char* reason : {"control", "length", "nul", "charset"}) {
+        INFO("reason=" << reason);
+        CHECK(invalid_id_count(h.metrics, reason, false) == 0.0);
+        CHECK(invalid_id_count(h.metrics, reason, true) == 0.0);
+    }
 }
 
 TEST_CASE("CheckForUpdate: logs a claimed agent_id and version with control bytes neutralised",

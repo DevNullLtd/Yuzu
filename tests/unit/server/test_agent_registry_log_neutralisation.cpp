@@ -13,6 +13,8 @@
 // one).
 
 #include "agent_registry.hpp"
+#include "command_capability.hpp"
+#include "command_capability_parsers.hpp"
 #include "event_bus.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -28,6 +30,7 @@
 #include <string>
 
 using yuzu::server::detail::AgentRegistry;
+using yuzu::server::detail::ClassifiedCommandTestAccess;
 using yuzu::server::detail::EventBus;
 namespace agent_pb = ::yuzu::agent::v1;
 
@@ -130,4 +133,37 @@ TEST_CASE("AgentRegistry::register_agent: the superseded refusal logs the claime
     CHECK(stray_control_bytes(text) == 0);
     // The winner's "Agent registered" line and the superseded warning: two log calls.
     CHECK(count_char(text, '\n') == 2);
+}
+
+TEST_CASE("AgentRegistry::send_to: the gateway-capability refusal logs the gateway node "
+          "neutralised",
+          "[agent_registry][log_injection][5513]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    REQUIRE(registry.register_agent(make_info("dev-gw", "host.local")).has_value());
+    // The node name comes from the gateway's CONNECTED notification and is stored unclamped; the
+    // capability set is left empty so the dispatch-tag refusal fires.
+    REQUIRE(registry.set_gateway_route("dev-gw", /*session_id=*/{}, "a\nb x='1", {}));
+
+    agent_pb::CommandRequest cmd;
+    cmd.set_command_id("routed-cmd");
+    cmd.set_plugin("tar");
+    cmd.set_action("fleet_snapshot");
+    cmd.set_dispatch_tag(yuzu::server::encode_dispatch_tag(yuzu::server::DispatchClass::ReadOnly,
+                                                           yuzu::server::Mutability::None,
+                                                           std::string(32, 'a')));
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    yuzu::test::LogCapture cap;
+    const bool sent = registry.send_to("dev-gw", classified);
+    cap.stop();
+
+    REQUIRE_FALSE(sent);
+    const std::string text = cap.text();
+    CHECK(text.find("via gateway node 'a?b x='1' ") != std::string::npos);
+    CHECK(text.find("a\nb") == std::string::npos);
+    CHECK(stray_control_bytes(text) == 0);
+    // One refusal line: exactly one newline, the log terminator.
+    CHECK(count_char(text, '\n') == 1);
 }

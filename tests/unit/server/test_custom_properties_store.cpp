@@ -898,16 +898,29 @@ TEST_CASE("CustomPropertiesStore: a failed statement logs the libpq error text o
     }
 
     yuzu::test::LogCapture cap;
-    CHECK(store.get_properties("agent-1").error() == CustomPropertiesReadError::kDegraded);
-    CHECK(store.get_property("agent-1", "k").error() == CustomPropertiesReadError::kDegraded);
-    CHECK(store.get_property_map("agent-1").error() == CustomPropertiesReadError::kDegraded);
-    CHECK(store.get_values_for_keys({"k"}).error() == CustomPropertiesReadError::kDegraded);
+    auto props = store.get_properties("agent-1");
+    auto prop = store.get_property("agent-1", "k");
+    auto prop_map = store.get_property_map("agent-1");
+    auto values = store.get_values_for_keys({"k"});
     CHECK_FALSE(store.delete_property("agent-1", "k"));
     store.delete_all_properties("agent-1");
     CHECK(store.list_schemas().empty());
-    CHECK(store.get_schema("k").error() == CustomPropertiesReadError::kDegraded);
-    CHECK(store.delete_schema("k").error() == CustomPropertiesReadError::kDegraded);
+    auto schema = store.get_schema("k");
+    auto deleted = store.delete_schema("k");
     cap.stop();
+
+    REQUIRE_FALSE(props.has_value());
+    CHECK(props.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(prop.has_value());
+    CHECK(prop.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(prop_map.has_value());
+    CHECK(prop_map.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(values.has_value());
+    CHECK(values.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(schema.has_value());
+    CHECK(schema.error() == CustomPropertiesReadError::kDegraded);
+    REQUIRE_FALSE(deleted.has_value());
+    CHECK(deleted.error() == CustomPropertiesReadError::kDegraded);
 
     const std::string text = cap.text();
     // Every log line this store wrote carries "CustomPropertiesStore::" exactly once and ends in

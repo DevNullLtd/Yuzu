@@ -58,6 +58,10 @@ namespace agent_pb = ::yuzu::agent::v1;
 
 namespace {
 
+// Passes AuthDB's id check (it refuses control bytes and ',' only) yet carries a space and '='
+// that log_id_token folds to '_' (#5513): used by the revoke-failure log assertion.
+constexpr const char* kSpacedId = "endpoint x=1 99";
+
 agent_pb::AgentInfo make_info(const std::string& id, const std::string& host = "host.local") {
     agent_pb::AgentInfo info;
     info.set_agent_id(id);
@@ -222,7 +226,7 @@ TEST_CASE("AgentRegistry: register_agent refuses the registration when the devic
 
     // First-time registration — establishes the prior session that must
     // survive the refused re-registration below.
-    REQUIRE(registry.register_agent(make_info("endpoint-99", "legit.local")).has_value());
+    REQUIRE(registry.register_agent(make_info(kSpacedId, "legit.local")).has_value());
     CHECK(registry.agent_count() == 1);
 
     {
@@ -236,15 +240,18 @@ TEST_CASE("AgentRegistry: register_agent refuses the registration when the devic
     // Re-registration now hits a genuine store failure on the revoke sweep —
     // must be REFUSED, not installed.
     yuzu::test::LogCapture cap;
-    auto refused = registry.register_agent(make_info("endpoint-99", "attacker.local"));
+    auto refused = registry.register_agent(make_info(kSpacedId, "attacker.local"));
     cap.stop();
     REQUIRE(!refused.has_value());
 
     // #5513: the store's error text is printed through log_key_token, so the refusal is ONE
     // physical log line however many lines the store's own message spans.
     const std::string log_text = cap.text();
-    CHECK(log_text.find("device token revoke-by-device failed for 'endpoint-99'") !=
+    // The claimed id carries a space and '=' (accepted by AuthDB), so the line proves the
+    // `safe_agent_id` fold: the neutralised form is present, the raw form is not.
+    CHECK(log_text.find("device token revoke-by-device failed for 'endpoint_x_1_99'") !=
           std::string::npos);
+    CHECK(log_text.find(kSpacedId) == std::string::npos);
     CHECK(std::count(log_text.begin(), log_text.end(), '\n') == 1);
 
     // The prior (legitimate) session must still be the one on record.

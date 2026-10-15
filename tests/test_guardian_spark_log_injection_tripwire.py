@@ -150,13 +150,17 @@ spdlog:: argument that is an agent-supplied hostname (`info.hostname()` or a loc
 from it) or the `.error()` of a `revoke_by_device(` or `register_agent(` result (a store error
 string that can quote the device id) to be wholly one wrap call. The `register_agent(` half
 also runs on agent_service_impl.cpp and gateway_service_impl.cpp (REGISTRY_FREE_TEXT_FILES).
-A fifth, narrower rule (COMMAND_TEXT_FILES, agent_service_impl.cpp and gateway_service_impl.cpp)
+A fifth, narrower rule (COMMAND_TEXT_FILES, agent_service_impl.cpp, gateway_service_impl.cpp and
+agent_registry.cpp)
 requires every spdlog:: argument that is `.command_id()` or `.plugin()` on a message receiver
 (these are free-form bytes on a CommandResponse frame the agent sends), `.gateway_node()` on a
 message receiver or a `.cluster_id()` accessor or the bare local `cluster_id` (gateway-asserted
 provenance fields on the stream-status and heartbeat notifications) to be wholly one
-log_id_token / log_key_token / audit_token / sanitize_for_log call. It reads argument text
-only: a value copied into a local under another name first is not seen.
+log_id_token / log_key_token / audit_token / sanitize_for_log call. It also matches the
+member form `.gateway_node` (no parentheses, a session-table read) in agent_registry.cpp. It
+reads argument text only: a value copied into a local under another name first is not seen;
+request-metadata session ids printed before their lookup, `sync.error()`-style fixed-text
+errors and member-form session reads other than `.gateway_node` are not tracked (lexical limit).
 A sixth guard (UNSCANNED_LOGGING_FILES, the same five files as the second check) fails on any
 logging FORM the scanner does not parse: an `SPDLOG_TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL(`
 macro, `spdlog::log(` or `default_logger`. The rules above only understand `spdlog::<level>(`
@@ -1063,11 +1067,19 @@ def find_registry_free_text_violations_in_text(text: str) -> list[tuple[int, str
 COMMAND_TEXT_FILES: tuple[str, ...] = (
     "server/core/src/agent_service_impl.cpp",
     "server/core/src/gateway_service_impl.cpp",
+    "server/core/src/agent_registry.cpp",
 )
 
 _RAW_COMMAND_TEXT_ACCESSOR_RE = re.compile(
     r"(?:\.|->)\s*(?:command_id|plugin|gateway_node|cluster_id)\(\)"
     r"(?!\s*\.\s*(?:size|empty|length)\s*\()"
+)
+# The member form `.gateway_node` / `->gateway_node` (no parentheses): the session table keeps the
+# gateway's CONNECTED-notification node name unclamped in `AgentSession::gateway_node`, and
+# agent_registry.cpp prints it from the session. Not a call, so the accessor pattern above does
+# not see it; a `.gateway_node.empty()` / `.size()` / `.length()` test is not a print.
+_RAW_GATEWAY_NODE_MEMBER_RE = re.compile(
+    r"(?:\.|->)\s*gateway_node\b(?!\s*\()(?!\s*\.\s*(?:size|empty|length)\s*\()"
 )
 # The bare local `cluster_id` (gateway_service_impl.cpp binds `std::string cluster_id =
 # request->cluster_id();` and clamps it); not a member access, not a call.
@@ -1083,6 +1095,7 @@ def find_command_text_violations_in_text(text: str) -> list[tuple[int, str]]:
         for arg in split_top_level_args(parsed[1]):
             raw = (
                 _RAW_COMMAND_TEXT_ACCESSOR_RE.search(arg) is not None
+                or _RAW_GATEWAY_NODE_MEMBER_RE.search(arg) is not None
                 or _RAW_BARE_CLUSTER_ID_RE.search(arg) is not None
             )
             if raw and not (
@@ -1515,6 +1528,9 @@ def _selfcheck() -> None:
         'spdlog::warn("cluster \'{}\'", cluster_id);',
         'spdlog::warn("cluster \'{}\'", request->cluster_id());',
         'spdlog::warn("x {} {}", ::yuzu::log_id_token(agent_id), "c=" + cluster_id);',
+        'spdlog::warn("node \'{}\'", session.gateway_node);',
+        'spdlog::warn("node \'{}\'", sess->gateway_node);',
+        'spdlog::warn("x {} \'{}\'", agent_id, session.gateway_node, cap);',
     ]
     for src in cmd_must_match:
         if not find_command_text_violations_in_text(src):
@@ -1533,6 +1549,10 @@ def _selfcheck() -> None:
         'spdlog::warn("cluster {}", unmapped_cluster_id);',
         'spdlog::warn("n {}", request->cluster_id().size());',
         'spdlog::warn("cap {}", kMaxClusterIdLen);',
+        'spdlog::warn("node \'{}\'", onbehalf::sanitize_for_log(session.gateway_node, 64));',
+        'spdlog::warn("n {}", session.gateway_node.size());',
+        'spdlog::warn("e {}", session.gateway_node.empty());',
+        'spdlog::warn("x {}", session.gateway_nodes);',
     ]
     for src in cmd_must_not:
         if find_command_text_violations_in_text(src):
