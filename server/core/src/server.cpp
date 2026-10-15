@@ -12370,6 +12370,38 @@ private:
         return ok;
     }
 
+    /// Sync-on-demand (`__sync__.now {source}`): a system-reserved push to each id under ONE
+    /// command id and ONE gateway flush (the TAR fleet_snapshot shape). This is the
+    /// Guardian-push path (build_classified_command(system) + send_system_reserved +
+    /// forward_gateway_pending) - NOT dispatch_confined, which would withhold `__sync__` as a
+    /// plugin no agent advertises (#3511). Authorization and targeting belong to the caller:
+    /// the per-device and the fan-out sync routes gate and confine before they get here, and
+    /// the agent ignores stagger for this action, so the caller bounds the herd. `sent`
+    /// counts sessions that accepted the frame; a command that cannot be classified sends
+    /// nothing and returns the empty result (no command id).
+    [[nodiscard]] yuzu::server::software_sync::DispatchResult
+    push_sync_now(const std::vector<std::string>& ids, const std::string& source) {
+        const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        yuzu::server::software_sync::DispatchResult out;
+        const auto command_id = "__sync__-now-" + std::to_string(now_s) + "-" +
+                                auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+        auto classified =
+            build_classified_command(yuzu::server::DispatchCaller{.system = true}, "__sync__", "now",
+                                     command_id, /*parameters=*/{{"source", source}});
+        if (!classified)
+            return out;
+        out.command_id = command_id;
+        for (const auto& id : ids)
+            if (send_system_reserved(id, *classified,
+                                     yuzu::server::SystemReservedPush::inventory_sync_now))
+                ++out.sent;
+        if (out.sent > 0)
+            forward_gateway_pending(); // gateway agents are only QUEUED
+        return out;
+    }
+
     /// #3687: the `has_permission` binder `classify_and_authorize_dispatch`
     /// needs, extracted so `build_classified_command`'s authoritative check
     /// and the MCP pre-dispatch dry run (`authorize_dispatch_fn_` below, the
@@ -18493,32 +18525,13 @@ private:
                                          return std::nullopt;
                                      return doc->json;
                                  },
-                             // Sync-on-demand: system-reserved push, the Guardian-push path
-                             // (build_classified_command(system) + send_system_reserved +
-                             // forward_gateway_pending) — NOT dispatch_confined, which would
-                             // withhold `__sync__` as a plugin no agent advertises (#3511).
+                             // Sync-on-demand for ONE device: push_sync_now (the Guardian-push
+                             // path, NOT dispatch_confined - #3511).
                              .sync_dispatch_fn =
                                  [this](const std::string& id, const std::string& source)
                                      -> HardwareRoutes::HwSyncDispatchResult {
-                                     const auto now_s =
-                                         std::chrono::duration_cast<std::chrono::seconds>(
-                                             std::chrono::system_clock::now().time_since_epoch())
-                                             .count();
-                                     const auto command_id =
-                                         "__sync__-now-" + std::to_string(now_s) + "-" +
-                                         auth::AuthManager::bytes_to_hex(
-                                             auth::AuthManager::random_bytes(8));
-                                     auto classified = build_classified_command(
-                                         yuzu::server::DispatchCaller{.system = true}, "__sync__",
-                                         "now", command_id, /*parameters=*/{{"source", source}});
-                                     if (!classified)
-                                         return {};
-                                     const bool ok = send_system_reserved(
-                                         id, *classified,
-                                         yuzu::server::SystemReservedPush::inventory_sync_now);
-                                     if (ok)
-                                         forward_gateway_pending(); // gateway agents are only QUEUED
-                                     return {ok, command_id};
+                                     const auto r = push_sync_now({id}, source);
+                                     return {r.sent > 0, r.command_id};
                                  },
                              .agent_version_fn =
                                  [this](const std::string& id) -> std::optional<std::string> {
@@ -18626,35 +18639,12 @@ private:
                                      out.status = software_sync::Resolved::Status::Ok;
                                      return out;
                                  },
-                             // One system-reserved push per target under ONE command id and ONE
-                             // gateway flush (the TAR fleet_snapshot shape) - the agent ignores
-                             // stagger for `__sync__.now`, so the herd is bounded by the route's
-                             // 500-target cap, not here.
+                             // push_sync_now for every target; the agent ignores stagger for
+                             // `__sync__.now`, so the herd is bounded by the route's 500-target
+                             // cap, not here.
                              .sync_dispatch_many_fn =
-                                 [this](const std::vector<std::string>& ids)
-                                     -> software_sync::DispatchResult {
-                                     const auto now_s =
-                                         std::chrono::duration_cast<std::chrono::seconds>(
-                                             std::chrono::system_clock::now().time_since_epoch())
-                                             .count();
-                                     software_sync::DispatchResult out;
-                                     out.command_id =
-                                         "__sync__-fleet-" + std::to_string(now_s) + "-" +
-                                         auth::AuthManager::bytes_to_hex(
-                                             auth::AuthManager::random_bytes(8));
-                                     auto classified = build_classified_command(
-                                         yuzu::server::DispatchCaller{.system = true}, "__sync__",
-                                         "now", out.command_id,
-                                         /*parameters=*/{{"source", std::string(software_sync::kSource)}});
-                                     if (!classified)
-                                         return out;
-                                     for (const auto& id : ids)
-                                         if (send_system_reserved(
-                                                 id, *classified,
-                                                 yuzu::server::SystemReservedPush::inventory_sync_now))
-                                             ++out.sent;
-                                     forward_gateway_pending(); // gateway agents are only QUEUED
-                                     return out;
+                                 [this](const std::vector<std::string>& ids) {
+                                     return push_sync_now(ids, std::string(software_sync::kSource));
                                  },
                          });
 
