@@ -341,9 +341,10 @@ struct Counts {
     /// dispatch capability). Which devices are candidates depends on the arm: a group or a named
     /// device lists its disconnected members too, but `__all__` and a scope expression list only
     /// this server's own sessions plus the shared presence record, so a device offline everywhere
-    /// is never enumerated or counted, and a degraded presence read also hides devices attached to
-    /// other servers. So `requested` and `skipped_offline` describe what THIS server could reach;
-    /// they are not a census of the fleet.
+    /// is never enumerated or counted. If the presence read is degraded, an `__all__` run lists
+    /// fewer devices (those attached to other servers) and a scope-expression run is refused with
+    /// 503. So `requested` and `skipped_offline` describe what THIS server could reach; they are
+    /// not a census of the fleet.
     std::size_t skipped_offline{0};
     std::size_t skipped_version{0};
 };
