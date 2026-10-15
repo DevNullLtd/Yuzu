@@ -35,6 +35,7 @@
 
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -65,6 +66,7 @@ struct OffloadHarness {
     yuzu::server::test::TestRouteSink sink;
     std::optional<OffloadTargetStorePg> store;
     bool perm_grant{true};
+    bool audit_persists{true}; // false: the audit sink reports a failed write
     std::vector<AuditRecord> audit_log;
     OffloadRoutes routes;
 
@@ -93,11 +95,18 @@ struct OffloadHarness {
                                const std::string& r, const std::string& tt,
                                const std::string& ti, const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
-            return true;
+            return audit_persists;
         };
+        auto resolve_fn = [](const httplib::Request&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "tester";
+            s.auth_source = "local"; // a cookie session, so the same-site gate applies
+            return s;
+        };
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn,
-                               store ? store->get() : nullptr);
+                               store ? store->get() : nullptr, WriteGate{resolve_fn, {}});
     }
 };
 
@@ -132,12 +141,18 @@ TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload][pg
     CHECK(j["status"] == "created");
     CHECK(j["id"].get<int64_t>() > 0);
 
-    REQUIRE(h.audit_log.size() == 1);
+    // Audit-first: an `attempted` row, then the outcome row.
+    REQUIRE(h.audit_log.size() == 2);
     CHECK(h.audit_log[0].action == "offload_target.create");
-    CHECK(h.audit_log[0].result == "success");
-    // The create row records where data goes (same shape as the delete row),
-    // so a create-then-delete cannot erase the only record of the destination.
-    CHECK(h.audit_log[0].detail == "name=siem-primary url=https://siem.example.com/ingest");
+    CHECK(h.audit_log[0].result == "attempted");
+    CHECK(h.audit_log[1].action == "offload_target.create");
+    CHECK(h.audit_log[1].result == "success");
+    // The create row records where data goes (same shape as the delete row), so a
+    // create-then-delete cannot erase the only record of the destination: scheme+host and a
+    // fingerprint, never the URL itself (a bearer secret, ADR-0010 Decision 4).
+    CHECK(h.audit_log[1].detail ==
+          "name=siem-primary url=https://siem.example.com url_fp=37e8a3290af1");
+    CHECK(h.audit_log[0].detail == h.audit_log[1].detail);
 }
 
 TEST_CASE("REST offload-targets: rejects userinfo in the URL, audited, nothing stored",
@@ -149,11 +164,13 @@ TEST_CASE("REST offload-targets: rejects userinfo in the URL, audited, nothing s
     auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
     REQUIRE(res);
     CHECK(res->status == 400);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].result == "denied");
-    CHECK(h.audit_log[0].detail == "validation_failed");
-    // The refused password never reaches the audit row.
-    CHECK(h.audit_log[0].detail.find("hunter2") == std::string::npos);
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[0].result == "attempted");
+    CHECK(h.audit_log[1].result == "denied");
+    CHECK(h.audit_log[1].detail == "validation_failed");
+    // The refused password never reaches an audit row, attempted or outcome.
+    for (const auto& rec : h.audit_log)
+        CHECK(rec.detail.find("hunter2") == std::string::npos);
     auto list = h.sink.Get("/api/v1/offload-targets");
     REQUIRE(list);
     CHECK(nlohmann::json::parse(list->body)["offload_targets"].empty());
@@ -208,9 +225,9 @@ TEST_CASE("REST offload-targets: rejects CRLF in auth_credential",
     auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
     REQUIRE(res);
     CHECK(res->status == 400);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "offload_target.create");
-    CHECK(h.audit_log[0].result == "denied");
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].action == "offload_target.create");
+    CHECK(h.audit_log[1].result == "denied");
 }
 
 TEST_CASE("REST offload-targets: GET /:id 404 on int64 overflow",
@@ -274,9 +291,14 @@ TEST_CASE("REST offload-targets: DELETE removes and audits", "[rest][offload][pg
     CHECK(del->status == 200);
     CHECK(nlohmann::json::parse(del->body)["status"] == "deleted");
 
-    REQUIRE(h.audit_log.size() == 1);
+    REQUIRE(h.audit_log.size() == 2);
     CHECK(h.audit_log[0].action == "offload_target.delete");
-    CHECK(h.audit_log[0].result == "success");
+    CHECK(h.audit_log[0].result == "attempted");
+    CHECK(h.audit_log[1].action == "offload_target.delete");
+    CHECK(h.audit_log[1].result == "success");
+    // The pre-delete snapshot records the destination as scheme+host and a fingerprint.
+    CHECK(h.audit_log[1].detail.starts_with("name=doomed url=https://x.example.com url_fp="));
+    CHECK(h.audit_log[1].detail.find("/h") == std::string::npos);
 
     // Second delete: 404
     auto del2 = h.sink.Delete("/api/v1/offload-targets/" + std::to_string(id));
@@ -305,9 +327,64 @@ TEST_CASE("REST offload-targets: POST 400 on bad URL scheme",
                            R"({"name":"bad","url":"ftp://evil/h"})");
     REQUIRE(res);
     CHECK(res->status == 400);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "offload_target.create");
-    CHECK(h.audit_log[0].result == "denied");
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].action == "offload_target.create");
+    CHECK(h.audit_log[1].result == "denied");
+}
+
+TEST_CASE("REST offload-targets: a failed attempted row refuses create and delete 503, nothing "
+          "changes (mutation: mutate before auditing)",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    auto made = h.sink.Post("/api/v1/offload-targets",
+                            R"({"name":"keep","url":"https://x.example.com/h"})");
+    REQUIRE(made);
+    const auto id = nlohmann::json::parse(made->body)["id"].get<int64_t>();
+
+    h.audit_persists = false;
+    h.audit_log.clear();
+    auto create = h.sink.Post("/api/v1/offload-targets",
+                              R"({"name":"other","url":"https://y.example.com/h"})");
+    REQUIRE(create);
+    CHECK(create->status == 503);
+    CHECK(create->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(create->get_header_value("X-Correlation-Id") != "");
+    auto del = h.sink.Delete("/api/v1/offload-targets/" + std::to_string(id));
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(del->get_header_value("Sec-Audit-Failed") == "true");
+    REQUIRE(h.audit_log.size() == 2); // each attempted row was tried; nothing followed
+    CHECK(h.audit_log[0].result == "attempted");
+    CHECK(h.audit_log[1].result == "attempted");
+
+    h.audit_persists = true;
+    auto list = h.sink.Get("/api/v1/offload-targets");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["offload_targets"].size() == 1); // neither happened
+}
+
+TEST_CASE("REST offload-targets: a cross-site or header-less cookie write is refused 403",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    using Hdrs = std::unordered_map<std::string, std::string>;
+    for (const auto& headers : {Hdrs{{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+                                Hdrs{{"Host", "yuzu.test"}}}) {
+        h.sink.default_headers = headers;
+        h.audit_log.clear();
+        auto post = h.sink.Post("/api/v1/offload-targets",
+                                R"({"name":"x","url":"https://x.example.com/h"})");
+        REQUIRE(post);
+        CHECK(post->status == 403);
+        auto del = h.sink.Delete("/api/v1/offload-targets/1");
+        REQUIRE(del);
+        CHECK(del->status == 403);
+        REQUIRE(h.audit_log.size() == 2);
+        CHECK(h.audit_log[0].action == "csrf.denied");
+    }
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+    auto list = h.sink.Get("/api/v1/offload-targets");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["offload_targets"].empty()); // nothing was stored
 }
 
 TEST_CASE("REST offload-targets: POST 400 (not 500) on type-mismatched field",

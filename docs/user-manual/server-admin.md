@@ -205,7 +205,12 @@ targets, Directory Read for directory sync), so a fragment is never wider than i
 `read_only` field, each the literal `true` or `false`, and answers `400` otherwise. Scripts that
 omitted a field or sent another value must be updated. Creating a webhook or offload target with
 `user:password@` in the URL, or with a control character in the URL or event types, now answers
-`400` (existing rows are not changed).
+`400` (existing rows are not changed). Webhook and offload-target audit rows now record the
+destination's scheme and host plus a short fingerprint, never the URL path or query; rows written by
+earlier builds still hold the full URL and should be treated like a credential. These writes (and
+directory sync, the group-mapping save and `POST /api/settings/mcp`) write an `attempted` audit row
+first and refuse with `503` if it cannot be stored, and refuse a cross-site browser request with
+`403`.
 
 ---
 

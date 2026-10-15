@@ -19171,18 +19171,20 @@ private:
             [this](const std::string& event_type, const httplib::Request& req,
                    const nlohmann::json& attrs,
                    const nlohmann::json& payload) { emit_event(event_type, req, attrs, payload); },
-            webhook_store_.get());
+            webhook_store_.get(), WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins});
 
         // OffloadRoutes — /api/v1/offload-targets/* (Phase 8.3, #255)
         offload_routes_ = std::make_unique<OffloadRoutes>();
         offload_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
-                                         offload_target_store_.get());
+                                         offload_target_store_.get(),
+                                         WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins});
 
         // DiscoveryRoutes — /api/directory/*, /api/patches/*, /api/deployments/*, /api/discovery/*
         discovery_routes_ = std::make_unique<DiscoveryRoutes>();
         discovery_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
                                            directory_sync_.get(), patch_manager_.get(),
-                                           deployment_store_.get(), discovery_store_.get());
+                                           deployment_store_.get(), discovery_store_.get(),
+                                           WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins});
 
         // EnrollmentDirectoryRoutes — #4031 REST v1 read twins:
         // /api/v1/directory/{users,status}, /api/v1/enrollment/{auto-approve-rules,

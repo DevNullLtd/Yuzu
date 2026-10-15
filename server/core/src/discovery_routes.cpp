@@ -40,26 +40,29 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                                       AuditFn audit_fn, DirectorySync* directory_sync,
                                       PatchManager* patch_manager,
                                       DeploymentStore* deployment_store,
-                                      DiscoveryStore* discovery_store) {
+                                      DiscoveryStore* discovery_store, WriteGate write_gate) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors DexRoutes/GuardianRoutes).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                    directory_sync, patch_manager, deployment_store, discovery_store);
+                    directory_sync, patch_manager, deployment_store, discovery_store,
+                    std::move(write_gate));
 }
 
 void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                       AuditFn audit_fn, DirectorySync* directory_sync,
                                       PatchManager* patch_manager,
                                       DeploymentStore* deployment_store,
-                                      DiscoveryStore* discovery_store) {
+                                      DiscoveryStore* discovery_store, WriteGate write_gate) {
     // ── Directory Sync API (Phase 7: AD/Entra integration) ──────────────
 
     // POST /api/directory/sync — trigger directory sync
     sink.Post("/api/directory/sync",
-             [auth_fn, perm_fn, audit_fn, directory_sync](const httplib::Request& req,
-                                                           httplib::Response& res) {
+             [auth_fn, perm_fn, audit_fn, directory_sync, write_gate](const httplib::Request& req,
+                                                                       httplib::Response& res) {
                  if (!perm_fn(req, res, "Directory", "Write"))
+                     return;
+                 if (write_gate.refuse_cross_site(audit_fn, req, res, "/api/directory/sync"))
                      return;
                  if (!directory_sync || !directory_sync->is_open()) {
                      res.status = 503;
@@ -102,6 +105,11 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                          return;
                      }
 
+                     // Audit-first (ADR-0033 section 9): no `attempted` row, no sync. The
+                     // row names the provider only; the credentials never reach it.
+                     if (!detail::audit_attempted(audit_fn, req, res, "directory.sync",
+                                                  "Directory", "entra", ""))
+                         return;
                      auto result = directory_sync->sync_entra(ec);
                      if (!result) {
                          // ADR-1007: the re-entrancy guard's specific refusal
@@ -247,9 +255,12 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
     // PUT /api/directory/group-mappings — configure group-to-role mappings
     sink.Put("/api/directory/group-mappings",
-            [auth_fn, perm_fn, audit_fn, directory_sync](const httplib::Request& req,
-                                                          httplib::Response& res) {
+            [auth_fn, perm_fn, audit_fn, directory_sync, write_gate](const httplib::Request& req,
+                                                                      httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Write"))
+                    return;
+                if (write_gate.refuse_cross_site(audit_fn, req, res,
+                                                 "/api/directory/group-mappings"))
                     return;
                 if (!directory_sync || !directory_sync->is_open()) {
                     res.status = 503;
@@ -276,20 +287,46 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                     return;
                 }
 
-                int count = 0;
+                // Read the WHOLE request before writing any of it: an entry that is not an
+                // object, or whose fields are not strings, would otherwise throw after the
+                // earlier pairs were already stored, leaving a part-applied batch with no
+                // audit row. Nothing is stored for a refused request.
                 std::vector<integrations::MappingChange> applied;
                 for (const auto& m : body["mappings"]) {
-                    auto group_id = m.value("group_id", "");
-                    auto role_name = m.value("role_name", "");
+                    if (!m.is_object()) {
+                        res.status = 400;
+                        res.set_content(detail::a4_error(res, "each mapping must be an object"),
+                                        "application/json");
+                        return;
+                    }
+                    const auto gid = m.find("group_id");
+                    const auto role = m.find("role_name");
+                    if ((gid != m.end() && !gid->is_string()) ||
+                        (role != m.end() && !role->is_string())) {
+                        res.status = 400;
+                        res.set_content(
+                            detail::a4_error(res, "group_id and role_name must be strings"),
+                            "application/json");
+                        return;
+                    }
+                    auto group_id = gid != m.end() ? gid->get<std::string>() : std::string{};
                     if (group_id.empty())
                         continue;
+                    applied.push_back({std::move(group_id),
+                                       role != m.end() ? role->get<std::string>() : std::string{}});
+                }
 
+                // Audit-first (ADR-0033 section 9): no `attempted` row, no mapping change. The
+                // per-pair rows below follow the read-back.
+                if (!detail::audit_attempted(audit_fn, req, res, "directory.group_mapping.update",
+                                             "Directory", "group-mappings",
+                                             std::to_string(applied.size()) + " mappings requested"))
+                    return;
+                for (const auto& [group_id, role_name] : applied) {
                     if (role_name.empty())
                         directory_sync->remove_group_role_mapping(group_id);
                     else
                         directory_sync->configure_group_role_mapping(group_id, role_name);
-                    applied.push_back({group_id, role_name});
-                    ++count;
                 }
 
                 // Read back before auditing: the store's writers swallow a failed

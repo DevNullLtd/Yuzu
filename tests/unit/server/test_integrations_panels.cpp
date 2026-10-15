@@ -250,7 +250,9 @@ struct McpHarness {
     struct Audit {
         std::string action, result, target_type, target_id, detail;
     };
-    std::vector<Audit> audits;
+    std::vector<Audit> audits;   // outcome rows (the void AuditFn)
+    std::vector<Audit> attempts; // the audit-first `attempted` rows (the bool AuditReadFn)
+    bool audit_persists{true};   // false: the audit-first hook reports a failed write
 
     yuzu::server::test::TestRouteSink sink; // last: handlers capture `this`
 
@@ -275,11 +277,17 @@ struct McpHarness {
                                const std::string& tt, const std::string& ti, const std::string& d) {
             audits.push_back({a, r, tt, ti, d});
         };
+        auto audit_read_fn = [this](const httplib::Request&, const std::string& a,
+                                    const std::string& r, const std::string& tt,
+                                    const std::string& ti, const std::string& d) -> bool {
+            attempts.push_back({a, r, tt, ti, d});
+            return audit_persists;
+        };
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                /*gateway_enabled=*/true, []() -> std::size_t { return 7; },
                                []() -> std::string { return "[]"; }, oidc_mu, oidc_provider,
-                               nullptr, {}, {});
+                               nullptr, {}, audit_read_fn);
     }
 
     auto post(const std::string& body) {
@@ -305,14 +313,54 @@ TEST_CASE("mcp POST: a refused body changes nothing and is not audited",
         auto res = h.post(body);
         REQUIRE(res);
         CHECK(res->status == 400);
+        // The A4 envelope, as on every other migrated /api/settings/* route: the body names
+        // the refusal and its correlation id, and the same id rides the response header.
         const auto j = nlohmann::json::parse(res->body);
         CHECK(j.at("error").at("code").get<int>() == 400);
         CHECK_FALSE(j.at("error").at("message").get<std::string>().empty());
+        const auto cid = res->get_header_value("X-Correlation-Id");
+        CHECK_FALSE(cid.empty());
+        CHECK(j.at("error").at("correlation_id").get<std::string>() == cid);
         // Observed state is untouched.
         CHECK_FALSE(h.cfg.mcp_disable);
         CHECK(h.cfg.mcp_read_only);
     }
     CHECK(h.audits.empty());
+    CHECK(h.attempts.empty());
+}
+
+TEST_CASE("mcp POST: when the attempted row cannot be written nothing changes (mutation: "
+          "mutate before auditing)",
+          "[integrations][mcp][settings][routes][security]") {
+    McpHarness h;
+    h.cfg.mcp_disable = false;
+    h.cfg.mcp_read_only = true;
+    h.audit_persists = false;
+
+    auto res = h.post("enabled=false&read_only=false");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(h.cfg.mcp_disable);
+    CHECK(h.cfg.mcp_read_only);
+    REQUIRE(h.attempts.size() == 1);
+    CHECK(h.attempts[0].result == "attempted");
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("mcp POST: a cross-site Origin is refused 403 and changes nothing",
+          "[integrations][mcp][settings][routes][security]") {
+    McpHarness h;
+    h.cfg.mcp_disable = false;
+    h.cfg.mcp_read_only = true;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}};
+
+    auto res = h.post("enabled=false&read_only=false");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK_FALSE(h.cfg.mcp_disable);
+    CHECK(h.cfg.mcp_read_only);
+    CHECK(h.attempts.empty());
 }
 
 TEST_CASE("mcp POST: an accepted body sets exactly the two flags, audits and re-renders",
@@ -327,6 +375,10 @@ TEST_CASE("mcp POST: an accepted body sets exactly the two flags, audits and re-
     CHECK_FALSE(h.cfg.mcp_disable);
     CHECK_FALSE(h.cfg.mcp_read_only);
 
+    REQUIRE(h.attempts.size() == 1); // audit-first: written before the flags move
+    CHECK(h.attempts[0].action == "settings.mcp");
+    CHECK(h.attempts[0].result == "attempted");
+    CHECK(h.attempts[0].detail == "enabled=true, read_only=false");
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].action == "settings.mcp");
     CHECK(h.audits[0].result == "success");

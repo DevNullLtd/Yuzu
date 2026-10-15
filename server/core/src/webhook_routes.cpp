@@ -30,7 +30,8 @@ std::string_view audit_detail_for(WebhookWriteError err) {
 }
 
 void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::AuditFn audit_fn,
-          WebhookRoutes::EmitEventFn emit_event_fn, WebhookStore* webhook_store) {
+          WebhookRoutes::EmitEventFn emit_event_fn, WebhookStore* webhook_store,
+          WriteGate write_gate) {
     // GET /api/webhooks — list all webhooks
     sink.Get("/api/webhooks",
             [perm_fn, webhook_store](const httplib::Request& req, httplib::Response& res) {
@@ -70,9 +71,11 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
 
     // POST /api/webhooks — create a new webhook
     sink.Post("/api/webhooks",
-             [perm_fn, audit_fn, emit_event_fn, webhook_store](const httplib::Request& req,
-                                                                httplib::Response& res) {
+             [perm_fn, audit_fn, emit_event_fn, webhook_store,
+              write_gate](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Write"))
+                     return;
+                 if (write_gate.refuse_cross_site(audit_fn, req, res, "/api/webhooks"))
                      return;
                  if (!webhook_store || !webhook_store->is_open()) {
                      res.status = 503;
@@ -100,6 +103,10 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  auto secret = body.value("secret", "");
                  auto enabled = body.value("enabled", true);
 
+                 // Audit-first (ADR-0033 section 9): no `attempted` row, no webhook.
+                 if (!detail::audit_attempted(audit_fn, req, res, "webhook.create", "webhook", "",
+                                              url_audit_detail(url)))
+                     return;
                  auto result = webhook_store->create_webhook(url, event_types, secret, enabled);
                  if (!result) {
                      // #3097 classification: caller error (bad URL) is 400,
@@ -125,14 +132,16 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  const auto id = *result;
                  // The analytics event carries scheme+host only: a Slack-style
                  // URL path is a bearer secret and the stream can leave the host.
-                 // gov Gate 2 security-guardian / Gate 4 consistency-auditor
+                 // The audit row follows the same rule (scheme+host plus a
+                 // fingerprint, ADR-0010 Decision 4). History: gov Gate 2 security-guardian / Gate 4 consistency-auditor
                  // (PR #3563 full-PR review): record the URL in the audit
                  // detail, not just the id — a compromise-and-cleanup
                  // attacker who creates a webhook, exfiltrates data to it,
                  // then deletes it must not be able to erase every durable
                  // record of WHERE the data went. Matches the sibling
                  // hardening already applied to `offload_routes.cpp`.
-                 audit_fn(req, "webhook.create", "success", "webhook", std::to_string(id), url);
+                 audit_fn(req, "webhook.create", "success", "webhook", std::to_string(id),
+                          url_audit_detail(url));
                  if (emit_event_fn)
                      emit_event_fn("webhook.created", req, {},
                                    {{"webhook_id", id}, {"url", url_scheme_host(url)}});
@@ -143,9 +152,11 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
 
     // DELETE /api/webhooks/:id — delete a webhook
     sink.Delete(R"(/api/webhooks/(\d+))",
-               [perm_fn, audit_fn, webhook_store](const httplib::Request& req,
-                                                   httplib::Response& res) {
+               [perm_fn, audit_fn, webhook_store, write_gate](const httplib::Request& req,
+                                                                   httplib::Response& res) {
                    if (!perm_fn(req, res, "Infrastructure", "Write"))
+                       return;
+                   if (write_gate.refuse_cross_site(audit_fn, req, res, "/api/webhooks/{id}"))
                        return;
                    if (!webhook_store) {
                        res.status = 503;
@@ -163,6 +174,11 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                    // OR a transient read failure) just means the audit
                    // detail stays empty, not that the delete is refused.
                    auto snapshot = webhook_store->get(id);
+                   const std::string snapshot_detail =
+                       snapshot ? url_audit_detail(snapshot->url) : "";
+                   if (!detail::audit_attempted(audit_fn, req, res, "webhook.delete", "webhook",
+                                                std::to_string(id), snapshot_detail))
+                       return;
                    auto result = webhook_store->delete_webhook(id);
                    if (!result) {
                        // #3097 classification: a query failure against an
@@ -177,7 +193,7 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                    }
                    if (*result) {
                        audit_fn(req, "webhook.delete", "success", "webhook", std::to_string(id),
-                                snapshot ? snapshot->url : "");
+                                snapshot_detail);
                        res.set_content(R"({"status":"deleted"})", "application/json");
                    } else {
                        audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
@@ -225,15 +241,17 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
 
 void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn /*auth_fn*/, PermFn perm_fn,
                                     AuditFn audit_fn, EmitEventFn emit_event_fn,
-                                    WebhookStore* webhook_store) {
+                                    WebhookStore* webhook_store, WriteGate write_gate) {
     HttplibRouteSink sink(svr);
-    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store);
+    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store,
+          std::move(write_gate));
 }
 
 void WebhookRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn perm_fn,
                                     AuditFn audit_fn, EmitEventFn emit_event_fn,
-                                    WebhookStore* webhook_store) {
-    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store);
+                                    WebhookStore* webhook_store, WriteGate write_gate) {
+    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store,
+          std::move(write_gate));
 }
 
 } // namespace yuzu::server

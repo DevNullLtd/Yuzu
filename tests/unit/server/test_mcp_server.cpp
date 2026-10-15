@@ -33787,10 +33787,16 @@ TEST_CASE("MCP B5: offload-target CRUD lifecycle over a LIVE store — "
     REQUIRE(ts.audit_log.size() >= 2);
     CHECK(ts.audit_log[ts.audit_log.size() - 2] == "offload_target.create|success");
     CHECK(ts.audit_log.back() == "mcp.create_offload_target|success");
-    // Same detail shape as the REST create row: where the data was sent is on record.
+    // Same detail shape as the REST create row: where the data was sent is on record as
+    // scheme+host and a fingerprint, never the URL (a bearer secret, ADR-0010 Decision 4).
     REQUIRE(ts.audit_details.size() >= 2);
     CHECK(ts.audit_details[ts.audit_details.size() - 2] ==
-          "name=siem url=https://siem.example.com/ingest");
+          "name=siem url=https://siem.example.com url_fp=37e8a3290af1");
+    // Audit-first: the `attempted` row precedes the mutation and carries the same detail.
+    REQUIRE(ts.audit_log.size() >= 3);
+    CHECK(ts.audit_log[ts.audit_log.size() - 3] == "offload_target.create|attempted");
+    CHECK(ts.audit_details[ts.audit_details.size() - 3] ==
+          ts.audit_details[ts.audit_details.size() - 2]);
 
     auto list1 = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_offload_targets",)"
@@ -33831,6 +33837,10 @@ TEST_CASE("MCP B5: offload-target CRUD lifecycle over a LIVE store — "
     REQUIRE(ts.audit_log.size() >= 2);
     CHECK(ts.audit_log[ts.audit_log.size() - 2] == "offload_target.delete|success");
     CHECK(ts.audit_log.back() == "mcp.delete_offload_target|success");
+    REQUIRE(ts.audit_log.size() >= 3);
+    CHECK(ts.audit_log[ts.audit_log.size() - 3] == "offload_target.delete|attempted");
+    CHECK(ts.audit_details[ts.audit_details.size() - 2] ==
+          "name=siem url=https://siem.example.com url_fp=37e8a3290af1");
 
     // get after delete -> not found (business fact, not a crash).
     auto missing_res = get_call(target_id);
@@ -33847,6 +33857,38 @@ TEST_CASE("MCP B5: offload-target CRUD lifecycle over a LIVE store — "
     REQUIRE(redelete_body.contains("error"));
     CHECK(redelete_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(ts.audit_log.back() == "offload_target.delete|denied");
+}
+
+TEST_CASE("MCP B5: offload create and delete fail closed when the attempted row cannot be "
+          "written (mutation: mutate before auditing)",
+          "[pg][mcp][integration][b5][security]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+
+    auto call = [&](int call_id, const std::string& tool, const std::string& args) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id) +
+                       R"(,"params":{"name":")" + tool + R"(","arguments":)" + args + "}}");
+    };
+    auto made = call(1, "create_offload_target",
+                     R"({"name":"keep","url":"https://example.com/hook"})");
+    const auto target_id = operator_surface_payload(made)["id"].get<int64_t>();
+
+    ts.audit_fail_result_ = "attempted";
+    auto create = call(2, "create_offload_target",
+                       R"({"name":"other","url":"https://other.example/hook"})");
+    REQUIRE(create);
+    CHECK(nlohmann::json::parse(create->body).contains("error"));
+    auto del = call(3, "delete_offload_target", R"({"id":)" + std::to_string(target_id) + "}");
+    REQUIRE(del);
+    CHECK(nlohmann::json::parse(del->body).contains("error"));
+    ts.audit_fail_result_.clear();
+
+    auto list = call(4, "list_offload_targets", "{}");
+    auto payload = operator_surface_payload(list);
+    REQUIRE(payload["offload_targets"].size() == 1); // neither write happened
+    CHECK(payload["offload_targets"][0]["name"] == "keep");
 }
 
 TEST_CASE("MCP B5: create_offload_target rejects a duplicate name and an unrecognized "

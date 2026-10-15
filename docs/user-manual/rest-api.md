@@ -5414,20 +5414,22 @@ store accepts `http://` for development convenience — same posture as Offload 
 
 **URL rules.** A URL with embedded credentials (`https://user:pass@host`) or with control bytes
 (any byte below 0x20, including tab, CR, LF and NUL, and DEL) in the URL or in `event_types` is refused with `400` and nothing is stored. The
-`webhook.created` analytics event carries the scheme and host only; the audit row keeps the full
-URL. The same hooks are managed from **Settings > Integrations**, which calls this route.
+`webhook.created` analytics event and the audit rows carry the scheme and host (plus, in the audit rows, a
+short `url_fp` fingerprint) only: a destination URL is a bearer secret and its path and query are never
+recorded. A URL with a query but no path (`https://hooks.example?token=x`) is delivered to the host with
+the query intact. The same hooks are managed from **Settings > Integrations**, which calls this route.
 
 **Errors.** `400` for an empty/missing `url`, invalid JSON, a URL that isn't `http://`/`https://`,
 or a URL with embedded credentials or control bytes.
 `503` for a store/database degradation. Every error response is audited (`webhook.create`,
-result `failure`, a distinct detail string per cause).
+result `failure`, a distinct detail string per cause). Create and delete write a `result=attempted` audit row before they change anything; if that row cannot be written the call answers `503` with `Sec-Audit-Failed: true` and nothing changes. A browser (cookie-session) call whose `Origin`/`Referer` names another site, or carries neither, is refused `403`; token callers are not gated.
 
 #### `DELETE /api/webhooks/{id}`
 
 Delete a webhook by numeric ID. `200` on success, `404` if no webhook has that id, `503` on a
 store/database error. Every outcome (including `404`) is audited as `webhook.delete`; a
-successful delete's audit detail carries the webhook's URL (captured just before deletion), so
-the record of where a webhook pointed survives its removal.
+successful delete's audit detail carries the webhook's scheme, host and URL fingerprint (captured just before deletion), so
+the record of where a webhook pointed survives its removal. Same audit-first and same-site rules as create.
 
 #### `GET /api/webhooks/{id}/deliveries`
 
@@ -5511,6 +5513,8 @@ Every delivery also carries `X-Yuzu-Event` and `X-Yuzu-Event-Count` headers; bat
 
 Delete a target. Cascades on `offload_deliveries`. Pending events buffered for batching are dropped — operator who deletes the target asked for it.
 
+**Audit and same-site rules (create and delete).** The audit rows (`offload_target.create`/`.delete`) record `name`, the destination's scheme and host, and a short `url_fp` fingerprint of the URL, never its path or query (the URL is a bearer secret in practice). Each call writes a `result=attempted` row before it changes anything; if that row cannot be written the call answers `503` with `Sec-Audit-Failed: true` and nothing changes. A browser (cookie-session) call whose `Origin`/`Referer` names another site, or carries neither, is refused `403`; token callers are not gated. A URL with a query but no path (`https://hooks.example?token=x`) is delivered to the host with the query intact.
+
 #### `GET /api/v1/offload-targets/{id}/deliveries`
 
 Recent delivery attempts for a target (default 50, override via `?limit=N`). Each row records `event_type`, `event_count`, `payload`, `status_code`, `delivered_at` (epoch seconds), and `error` (set on connection failure or exception).
@@ -5563,7 +5567,9 @@ Trigger a directory sync. Requires `Directory:Write`. Also available from **Sett
 
 **Response (400):** malformed body, or a missing required Entra field.
 
-**Response (503):** `directory_sync` is unavailable (store not open).
+**Response (403):** a browser (cookie-session) call whose `Origin`/`Referer` names another site, or carries neither (token callers are not gated).
+
+**Response (503):** `directory_sync` is unavailable (store not open), or the `result=attempted` audit row written before the sync could not be persisted (`Sec-Audit-Failed: true`; no upstream call is made).
 
 **Response (500):** a genuine sync failure (e.g. Graph API error) — the error message is passed through from `sync_entra`'s result.
 
@@ -5591,9 +5597,11 @@ Record group-to-role mappings (the RBAC role intended for a synced group's membe
 
 **Response (200):** `{"mappings": [{"group_id","role_name"}], "count": <n>}` — the FULL current mapping set after applying this request's changes (not the size of the batch just submitted).
 
-**Response (400):** malformed body, or a missing `mappings` array.
+**Response (400):** malformed body, a missing `mappings` array, or an entry that is not an object or whose `group_id`/`role_name` is not a string. The whole request is checked before anything is stored, so a refused request changes nothing.
 
-**Response (503):** `directory_sync` unavailable.
+**Response (403):** a cross-site or header-less cookie-session write (token callers are not gated).
+
+**Response (503):** `directory_sync` unavailable, or the `result=attempted` audit row written before the first mapping change could not be persisted (`Sec-Audit-Failed: true`; nothing stored).
 
 **Audit:** `directory.group_mapping.update` records the pairs (`N mappings updated: <group_id>=<role>, <group_id>=(removed)`), with control bytes replaced; a long list is split across several rows so every pair is recorded. Mappings are recorded for reference; nothing reads them at sign-in. The write helpers swallow store failures and the route still answers `200`, so a client that needs certainty compares the echoed set with what it sent (the Integrations page does). The route reads the stored set back before auditing: stored pairs get a `result=success` row and pairs the store did not take get a `result=failure` row (`N mappings not confirmed by read-back: ...`); a failed read-back confirms nothing, removals included.
 

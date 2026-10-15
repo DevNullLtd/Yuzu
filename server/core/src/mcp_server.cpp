@@ -34,6 +34,7 @@
 #include "product_pack_model.hpp" // #4029: ProductPackStore (fwd-declared only in mcp_server.hpp) + shared builders
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
+#include "outbound_url_policy.hpp"       // url_audit_detail: audit rows never carry a destination URL in full
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
@@ -22316,6 +22317,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Audit-first (ADR-0033 section 9, REST parity): no `attempted` row, no target.
+                if (!yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "offload_target.create", "attempted", "offload_target",
+                        audit_token(name), "name=" + audit_token(name) + " " + url_audit_detail(url))) {
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the target was not created",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
                 auto result = offload_target_store->create_target(
                     name, url, auth_type, auth_credential, event_types, batch_size, enabled);
                 if (!result.has_value()) {
@@ -22346,11 +22358,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const int64_t new_target_id = *result;
-                // Same `name=.. url=..` detail as the REST create row, so the audit
-                // trail records where data was sent whichever surface created it.
+                // Same `name=.. url=.. url_fp=..` detail as the REST create row, so the
+                // audit trail records where data was sent whichever surface created it
+                // (scheme+host and a fingerprint; the path and query are a bearer secret).
                 const bool audit_ok =
                     audit_fn(req, "offload_target.create", "success", "offload_target",
-                             std::to_string(new_target_id), "name=" + name + " url=" + url);
+                             std::to_string(new_target_id),
+                             "name=" + name + " " + url_audit_detail(url));
                 nlohmann::json payload_j = {{"id", new_target_id}, {"status", "created"}};
                 if (!audit_ok)
                     payload_j["audit_persisted"] = false;
@@ -22436,9 +22450,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto target_snapshot = offload_target_store->get(target_id);
                 std::string snapshot_detail;
                 if (target_snapshot)
-                    snapshot_detail = "name=" + target_snapshot->name + " url=" + target_snapshot->url;
-                auto result = offload_target_store->delete_target(target_id);
+                    snapshot_detail = "name=" + target_snapshot->name + " " +
+                                      url_audit_detail(target_snapshot->url);
                 const std::string target_id_str = std::to_string(target_id);
+                if (!yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.delete",
+                                                             "attempted", "offload_target",
+                                                             target_id_str, snapshot_detail)) {
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the target was not deleted",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto result = offload_target_store->delete_target(target_id);
                 if (!result.has_value()) {
                     const char* write_err_detail =
                         result.error() == OffloadWriteError::store_unavailable ? "store_unavailable"

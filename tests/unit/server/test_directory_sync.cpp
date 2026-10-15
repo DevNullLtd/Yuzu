@@ -56,6 +56,7 @@
 #include <future>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -785,7 +786,9 @@ struct DirectoryRouteHarness {
     struct Row {
         std::string action, result, target_id, detail;
     };
-    std::vector<Row> audits;
+    std::vector<Row> audits;   // outcome rows
+    std::vector<Row> attempts; // the audit-first `attempted` rows, written before any change
+    bool audit_persists{true}; // false: the audit sink reports a failed write
     DiscoveryRoutes routes;
     yuzu::server::test::TestRouteSink sink; // declared after what its handlers capture
 
@@ -800,10 +803,19 @@ struct DirectoryRouteHarness {
                           const std::string&) { return true; };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&,
-                               const std::string& target_id, const std::string& detail) {
-            audits.push_back({action, result, target_id, detail});
+                               const std::string& target_id, const std::string& detail) -> bool {
+            (result == "attempted" ? attempts : audits).push_back({action, result, target_id, detail});
+            return audit_persists;
         };
-        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, store, nullptr, nullptr, nullptr);
+        auto resolve_fn = [](const httplib::Request&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "dir-admin";
+            s.auth_source = "local"; // a cookie session, so the same-site gate applies
+            return s;
+        };
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, store, nullptr, nullptr, nullptr,
+                               WriteGate{resolve_fn, {}});
     }
     auto put_mappings(const std::string& body) {
         return sink.Put("/api/directory/group-mappings", body, "application/json");
@@ -848,6 +860,9 @@ TEST_CASE("DiscoveryRoutes[pg]: group mapping audit records what is stored, not 
     CHECK(h.audits[0].action == "directory.group_mapping.update");
     CHECK(h.audits[0].result == "success");
     CHECK(h.audits[0].detail == "1 mappings updated: g1=Operator");
+    REQUIRE(h.attempts.size() == 1); // audit-first: written before the change, counts only
+    CHECK(h.attempts[0].action == "directory.group_mapping.update");
+    CHECK(h.attempts[0].detail == "1 mappings requested");
 
     // A group named twice ends with its last entry: audited once, as stored.
     h.audits.clear();
@@ -913,4 +928,75 @@ TEST_CASE("DiscoveryRoutes[pg]: a large mapping request is audited in full, over
     }
     CHECK(found);
     CHECK(pairs == 121);
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a malformed mapping entry refuses the whole batch, nothing stored",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+
+    // The bad entry comes LAST: a loop that wrote as it read would store g1 first.
+    for (const char* body : {R"({"mappings":[{"group_id":"g1","role_name":"Operator"},"oops"]})",
+                             R"({"mappings":[{"group_id":"g1","role_name":"Operator"},)"
+                             R"({"group_id":7,"role_name":"Operator"}]})",
+                             R"({"mappings":[{"group_id":"g1","role_name":"Operator"},)"
+                             R"({"group_id":"g2","role_name":["x"]}]})"}) {
+        INFO(body);
+        auto res = h.put_mappings(body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->get_header_value("X-Correlation-Id") != "");
+        CHECK(h.attempts.empty()); // validated before the audit-first row
+        CHECK(h.audits.empty());
+        auto stored = store.get()->get_group_role_mappings_checked();
+        REQUIRE(stored);
+        CHECK(stored->empty());
+    }
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: mapping save and sync fail closed when the attempted row cannot be "
+          "written (mutation: mutate before auditing)",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+    h.audit_persists = false;
+
+    auto save = h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":"Operator"}]})");
+    REQUIRE(save);
+    CHECK(save->status == 503);
+    CHECK(save->get_header_value("Sec-Audit-Failed") == "true");
+    auto sync = h.sink.Post("/api/directory/sync",
+                            R"({"provider":"entra","tenant_id":"t","client_id":"c","client_secret":"s"})",
+                            "application/json");
+    REQUIRE(sync);
+    CHECK(sync->status == 503);
+    CHECK(sync->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.audits.empty()); // nothing followed the attempted rows
+    REQUIRE(h.attempts.size() == 2);
+    CHECK(h.attempts[1].action == "directory.sync");
+    CHECK(h.attempts[1].detail.empty()); // the credentials never reach the row
+    auto stored = store.get()->get_group_role_mappings_checked();
+    REQUIRE(stored);
+    CHECK(stored->empty());
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a cross-site or header-less cookie write is refused 403",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+    using Hdrs = std::unordered_map<std::string, std::string>;
+    for (const auto& headers : {Hdrs{{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+                                Hdrs{{"Host", "yuzu.test"}}}) {
+        h.sink.default_headers = headers;
+        auto save = h.put_mappings(R"({"mappings":[{"group_id":"g1","role_name":"Operator"}]})");
+        REQUIRE(save);
+        CHECK(save->status == 403);
+        auto sync = h.sink.Post("/api/directory/sync", R"({"provider":"entra"})", "application/json");
+        REQUIRE(sync);
+        CHECK(sync->status == 403);
+    }
+    CHECK(h.attempts.empty());
+    auto stored = store.get()->get_group_role_mappings_checked();
+    REQUIRE(stored);
+    CHECK(stored->empty());
 }

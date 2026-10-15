@@ -31,6 +31,7 @@
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
+#include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
@@ -6298,24 +6299,30 @@ void SettingsRoutes::register_routes(
     // `read_only`, each `true` or `false` (integrations_render.cpp). The earlier first-match
     // read treated an absent field as false, so a partial body switched MCP off or flipped
     // Read-only to Full access. Nothing changes on a refused body.
-    sink.Post("/api/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/api/settings/mcp", [this, origin_safe](const httplib::Request& req,
+                                                       httplib::Response& res) {
         if (!admin_fn_(req, res))
+            return;
+        if (!origin_safe(req, res, "/api/settings/mcp"))
             return;
         const auto form = integrations::parse_mcp_form(req.body);
         if (!form) {
             res.status = 400;
-            res.set_content(nlohmann::json{{"error", {{"code", 400}, {"message", form.error()}}}}
-                                .dump(),
-                            "application/json");
+            res.set_content(detail::a4_error(res, form.error()), "application/json");
             return;
         }
+        const std::string requested =
+            "enabled=" + std::string(form->enabled ? "true" : "false") +
+            ", read_only=" + std::string(form->read_only ? "true" : "false");
+        // Audit-first (ADR-0033 section 9): no `attempted` row, no change to the MCP switches.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "settings.mcp", "MCP",
+                                     "mcp_settings", requested))
+            return;
         cfg_->mcp_disable = !form->enabled;
         cfg_->mcp_read_only = form->read_only;
         spdlog::info("MCP settings changed: enabled={}, read_only={}", !cfg_->mcp_disable,
                      cfg_->mcp_read_only);
-        audit_fn_(req, "settings.mcp", "success", "MCP", "mcp_settings",
-                  "enabled=" + std::string(!cfg_->mcp_disable ? "true" : "false") +
-                      ", read_only=" + std::string(cfg_->mcp_read_only ? "true" : "false"));
+        audit_fn_(req, "settings.mcp", "success", "MCP", "mcp_settings", requested);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"MCP settings saved","level":"success"}})");
         res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");
