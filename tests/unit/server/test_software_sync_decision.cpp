@@ -344,10 +344,9 @@ TEST_CASE("sync summary: counts only, never a per-device list", "[server][softwa
 
 // ── target resolution: confinement and every fail-closed branch ───────────────────
 
-TEST_CASE("sync resolve: every expanding arm is confined to the caller's visible set",
+TEST_CASE("sync resolve: a group and a scope are confined to the caller's visible set",
           "[server][software_sync][security]") {
-    const ss::Selector arms[] = {{DispatchArm::Broadcast, "__all__"},
-                                 {DispatchArm::Group, "group:finance"},
+    const ss::Selector arms[] = {{DispatchArm::Group, "group:finance"},
                                  {DispatchArm::Scope, R"(ostype == "windows")"}};
     for (const auto& sel : arms) {
         INFO(dispatch_arm_label(sel.arm));
@@ -368,6 +367,7 @@ TEST_CASE("sync resolve: present-but-empty visible set is deny-all, nullopt is u
     CHECK(none.status == ss::Resolved::Status::Ok); // a confined answer, not a failure
     CHECK(none.ids.empty());
     CHECK_FALSE(none.caller_unfiltered);
+    CHECK(f.all_calls == 0); // a confined caller's fleet request never reads the fleet
 
     const auto all = ss::resolve_targets(sel, authz::VisibleSet{}, f.expansion()); // nullopt
     CHECK(all.status == ss::Resolved::Status::Ok);
@@ -390,6 +390,21 @@ TEST_CASE("sync resolve: an Ids-arm device the caller cannot see is dropped, nev
     CHECK(seen.ids == Ids{"hidden-host"});
     CHECK(ss::resolve_targets(sel, authz::VisibleSet{}, f.expansion()).ids == Ids{"hidden-host"});
     CHECK(ss::resolve_targets(sel, authz::deny_all(), f.expansion()).ids.empty());
+}
+
+TEST_CASE("sync resolve: a confined caller's __all__ is answered empty without reading the fleet",
+          "[server][software_sync][security]") {
+    for (const auto& visible : {visible_of({"a", "c"}), authz::deny_all()}) {
+        Fakes f;
+        const auto r = ss::resolve_targets({DispatchArm::Broadcast, "__all__"}, visible, f.expansion());
+        // Ok-and-empty, not a subset: the route turns a confined Broadcast into a 403 (decide),
+        // so the only thing that matters here is that no fleet read happened.
+        CHECK(r.status == ss::Resolved::Status::Ok);
+        CHECK(r.ids.empty());
+        CHECK_FALSE(r.caller_unfiltered);
+        CHECK(f.reads() == 0);
+        CHECK(ss::fleet_wide_denied(DispatchArm::Broadcast, r.caller_unfiltered));
+    }
 }
 
 TEST_CASE("sync resolve: broadcast reads the fleet once and nothing else", "[server][software_sync]") {

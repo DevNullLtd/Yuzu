@@ -291,6 +291,9 @@ public:
     /// push (one command id, one gateway flush); `sent` counts the sessions that accepted it.
     using SyncDispatchManyFn =
         std::function<software_sync::DispatchResult(const std::vector<std::string>& ids)>;
+    /// Does the caller hold an UNFILTERED Execution:Execute (so may name the whole fleet)? Cheap
+    /// by contract: no fleet read. The route asks it before taking the run guard.
+    using SyncUnfilteredFn = std::function<bool(const auth::Session&)>;
 
     struct Deps {
         AuthFn auth_fn;
@@ -317,10 +320,13 @@ public:
         /// `sync_resolve_fn` turns a selector into the caller's visible target ids (already
         /// intersected with their Execution:Execute visible set) and reports whether that
         /// set is unfiltered; `sync_dispatch_many_fn` sends `__sync__.now` to each id.
-        /// Any of the three empty == the route answers 503 (fail closed, nothing sent).
+        /// `sync_caller_unfiltered_fn` lets a confined caller's `__all__` be refused before it
+        /// takes the single in-flight slot or reads the fleet.
+        /// Any of the four empty == the route answers 503 (fail closed, nothing sent).
         SyncPermFn sync_perm_fn;
         SyncResolveFn sync_resolve_fn;
         SyncDispatchManyFn sync_dispatch_many_fn;
+        SyncUnfilteredFn sync_caller_unfiltered_fn;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);

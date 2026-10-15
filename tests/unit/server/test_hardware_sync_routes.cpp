@@ -53,12 +53,15 @@ struct SyncHarness {
     std::vector<std::string> dispatched;
     int dispatch_calls = 0;
     int resolve_calls = 0;
+    int precheck_calls = 0;
+    // The cheap "is this caller unfiltered" pre-check. Unset: it agrees with the resolver's answer.
+    std::optional<bool> precheck_override;
     ss::Selector last_selector;
     std::string last_username;
     // Runs inside the dispatch call, to re-enter the route while a run is in flight.
     std::function<void()> during_dispatch;
 
-    explicit SyncHarness(bool wire_dispatch = true, bool wire_resolver = true) {
+    explicit SyncHarness(bool wire_dispatch = true, bool wire_resolver = true, bool wire_precheck = true) {
         resolved.status = ss::Resolved::Status::Ok;
         resolved.caller_unfiltered = true;
 
@@ -95,6 +98,11 @@ struct SyncHarness {
                 last_selector = sel;
                 last_username = s.username;
                 return resolved;
+            };
+        if (wire_precheck)
+            deps.sync_caller_unfiltered_fn = [this](const auth::Session&) {
+                ++precheck_calls;
+                return precheck_override.value_or(resolved.caller_unfiltered);
             };
         if (wire_dispatch)
             deps.sync_dispatch_many_fn = [this](const std::vector<std::string>& ids) {
@@ -236,11 +244,81 @@ TEST_CASE("sync route: whole-fleet sync needs an unfiltered Execution:Execute", 
     CHECK(res->status == 403);
     CHECK(contains(res->body, "fleet-wide Execution:Execute"));
     CHECK(h.dispatch_calls == 0);
+    CHECK(h.resolve_calls == 0); // refused before the fleet is read
     CHECK(h.audited("denied"));
     CHECK(contains(h.audit_details.back(), "fleet_wide_required"));
     // The same operator may still sync a group or an expression within their own set.
     CHECK(h.post(R"({"scope":"group:mine"})")->status == 202);
     CHECK(h.dispatch_calls == 1);
+}
+
+TEST_CASE("sync route: a confined caller's __all__ is refused before the run guard and the fleet read",
+          "[hardware][sync_fanout][route][security]") {
+    SyncHarness h;
+    h.live(3);
+    h.resolved.caller_unfiltered = false;
+    auto res = h.post(R"({"scope":"__all__"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.precheck_calls == 1);
+    CHECK(h.resolve_calls == 0); // the resolver is what reads the fleet
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.audit_rows.back() == "inventory.sync.request|denied|Scope|__all__");
+    CHECK(contains(h.audit_details.back(), "fleet_wide_required"));
+    // The refusal took no slot and no cooldown: a legitimate run goes straight through.
+    CHECK(h.post(R"({"scope":"group:g"})")->status == 202);
+    CHECK(h.dispatch_calls == 1);
+}
+
+TEST_CASE("sync route: a refused __all__ does not occupy the in-flight slot of a run in progress",
+          "[hardware][sync_fanout][route][security]") {
+    SyncHarness h;
+    h.live(2);
+    int inner_status = 0;
+    int resolves_before = 0;
+    h.during_dispatch = [&] {
+        resolves_before = h.resolve_calls;
+        h.username = "mallory";
+        h.resolved.caller_unfiltered = false; // a confined operator asks for the fleet mid-run
+        auto r = h.post(R"({"scope":"__all__"})");
+        inner_status = r ? r->status : -1;
+        h.resolved.caller_unfiltered = true;
+        h.username = "alice";
+    };
+    REQUIRE(h.post(R"({"scope":"group:g"})")->status == 202);
+    // 403, not 409: it was refused on who it was, before the guard was even consulted.
+    CHECK(inner_status == 403);
+    CHECK(h.resolve_calls == resolves_before); // and it read nothing
+    CHECK(h.dispatch_calls == 1);
+}
+
+TEST_CASE("sync route: if the pre-check and the resolver disagree the stricter answer wins",
+          "[hardware][sync_fanout][route][security]") {
+    SyncHarness h;
+    h.live(3);
+    h.precheck_override = true;           // the pre-check admits...
+    h.resolved.caller_unfiltered = false; // ...but the resolver says the caller is confined
+    auto res = h.post(R"({"scope":"__all__"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.resolve_calls == 1);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(contains(h.audit_details.back(), "fleet_wide_required"));
+}
+
+TEST_CASE("sync route: only a fleet request asks the pre-check", "[hardware][sync_fanout][route]") {
+    SyncHarness h;
+    h.live(2);
+    REQUIRE(h.post(R"({"scope":"group:g"})")->status == 202);
+    h.username = "bob";
+    REQUIRE(h.post(R"({"scope_expression":"ostype == \"linux\""})")->status == 202);
+    h.resolved.ids = {"host-01"};
+    REQUIRE(h.post(R"({"scope":"host-01"})")->status == 202);
+    CHECK(h.precheck_calls == 0);
+    h.live(2);
+    h.username = "carol";
+    REQUIRE(h.post(R"({"scope":"__all__"})")->status == 202);
+    CHECK(h.precheck_calls == 1);
 }
 
 TEST_CASE("sync route: malformed requests are 400, audited denied, and never reach the resolver",
@@ -456,6 +534,15 @@ TEST_CASE("sync route: unwired dependencies fail closed", "[hardware][sync_fanou
         auto res = h.post(R"({"scope":"__all__"})");
         REQUIRE(res);
         CHECK(res->status == 503);
+        CHECK(h.dispatch_calls == 0);
+    }
+    {
+        SyncHarness h(/*wire_dispatch=*/true, /*wire_resolver=*/true, /*wire_precheck=*/false);
+        h.live(1);
+        auto res = h.post(R"({"scope":"__all__"})");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(h.resolve_calls == 0);
         CHECK(h.dispatch_calls == 0);
     }
 }

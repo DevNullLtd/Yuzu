@@ -170,6 +170,13 @@ struct Selector {
 /// herd. Group, scope and fleet runs take both.
 [[nodiscard]] inline bool needs_run_guard(DispatchArm arm) { return arm != DispatchArm::Ids; }
 
+/// Only a caller whose Execution:Execute is unfiltered may name the whole fleet. A
+/// confined caller asking for `__all__` is refused outright rather than silently narrowed
+/// to their own devices: the request they made is not the request that would run.
+[[nodiscard]] inline bool fleet_wide_denied(DispatchArm arm, bool caller_unfiltered) {
+    return arm == DispatchArm::Broadcast && !caller_unfiltered;
+}
+
 // ── resolution (the shapes server.cpp's resolver and dispatcher return) ───────────
 
 /// What the resolver reports. `ids` are ALREADY intersected with the caller's
@@ -227,6 +234,12 @@ struct Expansion {
     case DispatchArm::Broadcast:
         if (!ex.all_ids) {
             out.detail = "unwired";
+            return out;
+        }
+        // Only an unfiltered caller may name the fleet (`decide` refuses everyone else), so a
+        // confined caller's answer is empty and the fleet is not read at all.
+        if (fleet_wide_denied(sel.arm, out.caller_unfiltered)) {
+            out.status = Resolved::Status::Ok;
             return out;
         }
         ids = ex.all_ids();
@@ -356,13 +369,6 @@ template <class SupportsFn>
 // ── verdicts ──────────────────────────────────────────────────────────────────────
 
 enum class Verdict { Proceed, FleetWideRequired, TooMany };
-
-/// Only a caller whose Execution:Execute is unfiltered may name the whole fleet. A
-/// confined caller asking for `__all__` is refused outright rather than silently narrowed
-/// to their own devices: the request they made is not the request that would run.
-[[nodiscard]] inline bool fleet_wide_denied(DispatchArm arm, bool caller_unfiltered) {
-    return arm == DispatchArm::Broadcast && !caller_unfiltered;
-}
 
 [[nodiscard]] inline Verdict decide(DispatchArm arm, bool caller_unfiltered, const Counts& planned) {
     if (fleet_wide_denied(arm, caller_unfiltered))

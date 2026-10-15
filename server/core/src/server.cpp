@@ -18633,6 +18633,11 @@ private:
                                  [this](const std::vector<std::string>& ids) {
                                      return push_sync_now(ids, std::string(software_sync::kSource));
                                  },
+                             // Cheap pre-check for the route: no fleet read, one RBAC derivation.
+                             .sync_caller_unfiltered_fn =
+                                 [this](const auth::Session& sess) {
+                                     return !derive_exec_visible(sess).has_value();
+                                 },
                          });
 
         // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs

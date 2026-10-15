@@ -546,7 +546,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         constexpr const char* kAction = "inventory.sync.request";
         detail::ensure_correlation_id(res);
         if (!deps_.sync_perm_fn || !deps_.auth_fn || !deps_.sync_resolve_fn ||
-            !deps_.sync_dispatch_many_fn || !deps_.agent_version_fn) {
+            !deps_.sync_dispatch_many_fn || !deps_.sync_caller_unfiltered_fn ||
+            !deps_.agent_version_fn) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "sync-on-demand is unavailable on this server",
                                              {.retry_after_ms = 5000}),
@@ -575,6 +576,19 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.status = status;
             res.set_content(detail::a4_error(res, message, opts), "application/json");
         };
+        const auto refuse_fleet_wide = [&] {
+            refuse(403, "syncing the whole fleet needs a fleet-wide Execution:Execute grant",
+                   "fleet_wide_required");
+        };
+
+        // A confined caller naming the whole fleet is refused HERE: before it can take the
+        // in-flight slot below and before the resolver reads the fleet. ss::decide applies the
+        // same rule again to the resolver's own answer (defence in depth).
+        if (sel.arm == DispatchArm::Broadcast &&
+            ss::fleet_wide_denied(sel.arm, deps_.sync_caller_unfiltered_fn(*session))) {
+            refuse_fleet_wide();
+            return;
+        }
 
         // One multi-device run at a time, and one per operator per minute. The flag is held to
         // the end of the handler, so the cooldown check below and the stamp after dispatch
@@ -637,8 +651,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         switch (ss::decide(sel.arm, resolved.caller_unfiltered, plan.counts)) {
         case ss::Verdict::FleetWideRequired:
-            refuse(403, "syncing the whole fleet needs a fleet-wide Execution:Execute grant",
-                   "fleet_wide_required");
+            refuse_fleet_wide();
             return;
         case ss::Verdict::TooMany:
             refuse(413,
