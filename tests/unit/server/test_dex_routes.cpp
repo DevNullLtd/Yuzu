@@ -21,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1287,6 +1288,66 @@ TEST_CASE("DEX routes: /dex lights DEX in the sidebar and ends the breadcrumb on
     CHECK(page->body.find("<a class=\"shell-nav on\" href=\"/dex\" aria-current=\"page\">") !=
           std::string::npos);
     CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>DEX</b>") != std::string::npos);
+}
+
+// Kills: the Trends depth rules in the page shell (guardian_page_ui.cpp) going missing or turning
+// into literal colours. They sit in the baked page, not in a /fragments/dex payload, so the
+// fragment goldens never see them. Same Postgres-free harness as the sidebar test above.
+TEST_CASE("DEX routes: /dex page shell carries the Trends depth rules, tokens only",
+          "[dex][routes][ui]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, /*perm_fn=*/{}, /*store=*/nullptr, /*fleet_fn=*/{},
+                           /*audit_fn=*/{});
+
+    auto page = sink.Get("/dex");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+
+    // One rule's text, selector through closing brace, whitespace collapsed so the source's
+    // line wrapping cannot break a match.
+    auto rule = [&](const std::string& selector) {
+        const auto open = page->body.find(selector + " {");
+        REQUIRE(open != std::string::npos);
+        const auto close = page->body.find('}', open);
+        REQUIRE(close != std::string::npos);
+        std::string out;
+        for (auto i = open; i <= close; ++i) {
+            if (std::isspace(static_cast<unsigned char>(page->body[i]))) {
+                if (out.back() != ' ')
+                    out += ' ';
+            } else {
+                out += page->body[i];
+            }
+        }
+        return out;
+    };
+    auto has = [](const std::string& r, const char* decl) { return r.find(decl) != std::string::npos; };
+
+    const auto card = rule(".gp-sm");
+    CHECK(has(card, "box-shadow: var(--mds-elevation-2);"));
+    const auto lift = rule(".gp-sm:hover");
+    CHECK(has(lift, "transform: translateY(-1px);"));
+    CHECK(has(lift, "border-color: var(--line2);"));
+
+    const auto grid = rule(".gp-heat");
+    CHECK(has(grid, "gap: 2px;"));
+    const auto row = rule(".gp-heat .hrow");
+    CHECK(has(row, "gap: 2px;"));
+    const auto cell = rule(".gp-heat .hrow > i, .gp-hleg i");
+    CHECK(has(cell, "width: 16px; height: 16px;"));
+    CHECK(has(cell, "border-radius: 3px;"));
+    CHECK(has(cell, "box-shadow: inset 0 0 0 1px var(--line);"));
+    const auto hover = rule(".gp-heat .hrow > i:hover");
+    CHECK(has(hover, "outline: 2px solid var(--hl);"));
+    CHECK(has(hover, "transform: scale(1.15);"));
+
+    // Tokens only: none of these rules may carry a hex colour (or any '#').
+    for (const auto* r : {&card, &lift, &grid, &row, &cell, &hover})
+        CHECK(r->find('#') == std::string::npos);
 }
 
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") {
