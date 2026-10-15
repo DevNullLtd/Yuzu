@@ -951,3 +951,41 @@ TEST_CASE("CustomPropertiesStore: a failed statement logs the libpq error text o
               return (c < 0x20 && c != '\n') || c == 0x7F;
           }) == 0);
 }
+
+TEST_CASE("CustomPropertiesStore: an invalid stored schema regex is logged on one line",
+          "[pg][custom_props][log_injection][5513]") {
+    // upsert_schema refuses a regex that does not compile, so the only way a stored one fails to
+    // compile at validation time is a row written outside it. validate_against_schema then logs
+    // a warning that prints the schema key and the stored pattern and lets the write through.
+    // The pattern is admin-defined free text: it is folded by log_key_token, so a line break in
+    // it cannot split the line. The schema key is already limited to a safe charset by
+    // validate_key, so it passes through unchanged.
+    PROPS_SHARED(store, pool);
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO custom_properties_store.custom_property_schemas "
+            "(key, display_name, type, description, validation_regex) "
+            "VALUES ($1, 'Env', 'string', '', $2)",
+            std::vector<std::string>{"envkey", "[unclosed(\nforged_second_line"});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::LogCapture cap;
+    auto r = store.set_property("agent-1", "envkey", "anything");
+    cap.stop();
+    // The warning does not block the write.
+    REQUIRE(r.has_value());
+
+    const std::string text = cap.text();
+    CHECK(text.find("invalid regex for schema key 'envkey': [unclosed(_forged_second_line") !=
+          std::string::npos);
+    std::size_t lines = 0;
+    for (std::size_t pos = text.find("invalid regex for schema key"); pos != std::string::npos;
+         pos = text.find("invalid regex for schema key", pos + 1))
+        ++lines;
+    CHECK(lines == 1);
+    CHECK(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) == lines);
+}

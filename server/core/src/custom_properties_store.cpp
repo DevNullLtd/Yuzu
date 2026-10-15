@@ -235,8 +235,8 @@ CustomPropertiesStore::validate_against_schema(PGconn* conn, const std::string& 
     if (!validation_regex.empty()) {
         RE2 re(validation_regex, RE2::Quiet);
         if (!re.ok()) {
-            spdlog::warn("CustomPropertiesStore: invalid regex for schema key '{}': {}", key,
-                        validation_regex);
+            spdlog::warn("CustomPropertiesStore: invalid regex for schema key '{}': {}",
+                         ::yuzu::log_key_token(key), ::yuzu::log_key_token(validation_regex));
         } else if (!RE2::FullMatch(value, re)) {
             return std::unexpected("value does not match validation pattern for '" + key + "'");
         }

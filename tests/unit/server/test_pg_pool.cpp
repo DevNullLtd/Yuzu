@@ -7,9 +7,11 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <optional>
@@ -223,6 +225,32 @@ TEST_CASE("PgPool failed construction", "[pg][pool]") {
         CHECK(pool.open() == 0);
         CHECK(pool.in_use() == 0);
     }
+}
+
+TEST_CASE("PgPool logs a connect failure's libpq text on one line",
+          "[pool][log_injection][5513]") {
+    // libpq's connect error text spans several lines (a "connection to server ... failed"
+    // sentence, then a tab-indented hint) and ends in a newline. The pool wraps it in
+    // log_key_token, so one failed attempt is exactly one physical log line. Nothing listens on
+    // loopback port 9. The transaction-start failure line (BEGIN) shares the wrapper but cannot
+    // be provoked without a connection that fails on its first statement, so it has no test
+    // here; the tripwire (tests/test_guardian_spark_log_injection_tripwire.py) covers it.
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=9 dbname=nope user=nobody connect_timeout=2",
+                 .size = 1}};
+    REQUIRE(pool.valid());
+    yuzu::test::LogCapture cap;
+    auto lease = pool.acquire();
+    cap.stop();
+    CHECK_FALSE(static_cast<bool>(lease));
+
+    const std::string text = cap.text();
+    const std::string marker = "PgPool: connection attempt failed:";
+    std::size_t lines = 0;
+    for (auto pos = text.find(marker); pos != std::string::npos; pos = text.find(marker, pos + 1))
+        ++lines;
+    REQUIRE(lines >= 1);
+    CHECK(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) == lines);
+    CHECK(text.find('\t') == std::string::npos);
 }
 
 TEST_CASE("PgPool discards a connection lost mid-use", "[pg][pool][pg-smoke]") {

@@ -130,19 +130,21 @@ the wrap happens INSIDE the formatter:
     it gets flagged and a reviewer has to consciously verify the line shape
     rather than inherit a blanket pass.
 
-SECOND, SEPARATE CHECK (#5513): claimed agent ids in six named files outside the
+SECOND, SEPARATE CHECK (#5513): claimed agent ids in seven named files outside the
 Guardian/Spark basename family -- server/core/src/agent_service_impl.cpp,
 gateway_service_impl.cpp, agent_registry.cpp, custom_properties_store.cpp,
-custom_properties_routes.cpp and tag_store.cpp (AGENT_ID_FILES). It flags a spdlog:: argument that is a request-derived agent id
+custom_properties_routes.cpp, tag_store.cpp and config_routes.cpp (AGENT_ID_FILES). It flags a spdlog:: argument that is a request-derived agent id
 (`info.agent_id()`, `request->agent_id()`, `req->agent_id()`, a local alias bound from
 one of those in the same function, or the bare `agent_id` in the custom-properties
-files and tag_store.cpp, where the bare caller-supplied tag `key` is also matched) and is
+files and tag_store.cpp, where the bare caller-supplied tag `key` is also matched; the bare `key`
+and `validation_regex` in custom_properties_store.cpp and the bare path parameter `key` in
+config_routes.cpp are matched the same way) and is
 not wholly a log_id_token / log_key_token / audit_token /
 onbehalf::sanitize_for_log call or the local `safe_agent_id`. It is LEXICAL: it reads
 argument text, not data flow, so an id reaching the log through a variable it cannot
 trace to a request accessor, or a new spelling, is not seen. The exact scope and limits
 are in the block comment above find_agent_id_violations_in_text(). FILE_BASENAME_RE and
-the pattern check above are unchanged and do not apply to these six files.
+the pattern check above are unchanged and do not apply to these seven files.
 In agent_registry.cpp only the claimed ids from `info.agent_id()` (and the local
 `safe_agent_id` built from it) are in scope; the many other spdlog calls in that file print
 ids taken from the session table and are deliberately not matched.
@@ -162,17 +164,21 @@ member form `.gateway_node` (no parentheses, a session-table read) in agent_regi
 reads argument text only: a value copied into a local under another name first is not seen;
 request-metadata session ids printed before their lookup, `sync.error()`-style fixed-text
 errors and member-form session reads other than `.gateway_node` are not tracked (lexical limit).
-A sixth guard (UNSCANNED_LOGGING_FILES, the same six files as the second check) fails on any
+A sixth guard (UNSCANNED_LOGGING_FILES, the second check's files except config_routes.cpp, which
+reads the default logger's level without logging through it, plus server/core/src/pg/pg_pool.cpp)
+fails on any
 logging FORM the scanner does not parse: an `SPDLOG_TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL(`
 macro, `spdlog::log(` or `default_logger`. The rules above only understand `spdlog::<level>(`
 and `<logger>-><level>(` calls, so a different form would otherwise escape them silently;
 this makes it fail loudly instead. A new file added to the second check is covered by
 extending that tuple, not by this note.
 A third, narrower rule (PQ_ERROR_FILES) requires every spdlog:: argument that contains a
-PQerrorMessage( or PQresultErrorMessage( call in custom_properties_store.cpp and tag_store.cpp
-to be wrapped
-(libpq error text can quote the claimed agent id). It matches the call name only: a value
-copied into a local first is not seen.
+PQerrorMessage( or PQresultErrorMessage( call in custom_properties_store.cpp, tag_store.cpp and
+pg/pg_pool.cpp to be wrapped (libpq error text can quote the claimed agent id). It matches the
+call name only: a value copied into a local first is not seen, which is why pg_pool.cpp's
+connect-failure line (it prints a local `err` copied from PQerrorMessage) is wrapped by hand but
+not covered here. The same rule keyed on a store `.error()` argument covers config_routes.cpp
+(STORE_ERROR_FILES).
 
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
 same precedent shape as test_no_connless_pq_escape.py and
@@ -882,11 +888,16 @@ AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
     # Only claimed ids from `info.agent_id()` / `safe_agent_id` are matched; the file's other
     # spdlog calls print ids from the session table, which the check cannot trace and ignores.
     "server/core/src/agent_registry.cpp": (),
-    "server/core/src/custom_properties_store.cpp": ("agent_id",),
+    # `key` is the schema/property key and `validation_regex` the admin-defined pattern: the
+    # invalid-regex warning prints both. Neither name is used as a local in any other log argument.
+    "server/core/src/custom_properties_store.cpp": ("agent_id", "key", "validation_regex"),
     # `key` is the caller-supplied tag key (get_values_for_key prints it); the file has no
     # other local of that name in a log argument.
     "server/core/src/tag_store.cpp": ("agent_id", "key"),
     "server/core/src/custom_properties_routes.cpp": ("agent_id",),
+    # `key` is the URL path parameter of PUT /api/config/{key}. The store `.error()` text this
+    # file also logs is covered by STORE_ERROR_FILES below, not by this entry.
+    "server/core/src/config_routes.cpp": ("key",),
 }
 
 # Any receiver, including a chained one such as `request->info().agent_id()`: the match starts at
@@ -994,21 +1005,29 @@ def find_agent_id_violations_in_text(
 PQ_ERROR_FILES: tuple[str, ...] = (
     "server/core/src/custom_properties_store.cpp",
     "server/core/src/tag_store.cpp",
+    # The pool's BEGIN-failure and connect-failure lines (the connect line prints a local copied
+    # from PQerrorMessage, which the name-only match does not see; it is wrapped by hand).
+    "server/core/src/pg/pg_pool.cpp",
 )
+
+# Same rule, different marker: in config_routes.cpp the store's `.error()` text (which on the
+# database-failure path carries a kRuntimeConfigDbErrorPrefix plus libpq text) must be wrapped
+# wherever it is an spdlog argument.
+STORE_ERROR_FILES: tuple[str, ...] = ("server/core/src/config_routes.cpp",)
 
 
 # Name-only: the rule matches the call NAME inside the argument text. A value copied into a
 # local first (`const char* e = PQerrorMessage(c); spdlog::warn("{}", e)`) is not caught.
-def find_pq_error_violations_in_text(text: str) -> list[tuple[int, str]]:
+def find_pq_error_violations_in_text(
+    text: str, markers: tuple[str, ...] = ("PQerrorMessage(", "PQresultErrorMessage(")
+) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
     for pos, stmt in find_spdlog_statements_with_pos(text):
         parsed = parse_call(stmt)
         if parsed is None:
             continue
         for arg in split_top_level_args(parsed[1]):
-            if (
-                "PQerrorMessage(" in arg or "PQresultErrorMessage(" in arg
-            ) and not argument_is_wrapped(arg):
+            if any(m in arg for m in markers) and not argument_is_wrapped(arg):
                 out.append((text.count("\n", 0, pos) + 1, stmt))
                 break
     return out
@@ -1115,10 +1134,16 @@ def find_command_text_violations_in_text(text: str) -> list[tuple[int, str]]:
 
 
 # Sixth guard: logging forms the scanner above does not parse. find_spdlog_statements only
-# understands `spdlog::<level>(` and `<logger>-><level>(`; any other form in the six files of
+# understands `spdlog::<level>(` and `<logger>-><level>(`; any other form in the files of
 # the second check would print its arguments unexamined. They are absent today, so the guard
 # fails on any occurrence (a mention in a comment too: reword it) rather than trying to scan them.
-UNSCANNED_LOGGING_FILES: tuple[str, ...] = tuple(AGENT_ID_FILES)
+# config_routes.cpp is the one AGENT_ID_FILES member left out: it reads the default logger's LEVEL
+# (`spdlog::default_logger()->level()`, line 38) to report the effective log level and never logs
+# through it, so the guard would fail on a non-logging use. Its spdlog:: calls are all the
+# `spdlog::<level>(` form the other rules parse.
+UNSCANNED_LOGGING_FILES: tuple[str, ...] = tuple(
+    f for f in AGENT_ID_FILES if f != "server/core/src/config_routes.cpp"
+) + ("server/core/src/pg/pg_pool.cpp",)
 
 _UNSCANNED_LOGGING_FORM_RE = re.compile(
     r"\bSPDLOG_(?:TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL)\s*\("
@@ -1488,6 +1513,20 @@ def _selfcheck() -> None:
     if find_pq_error_violations_in_text(pq_res_must_not):
         raise SystemExit(f"selfcheck: unexpected PQresultErrorMessage violation: {pq_res_must_not!r}")
 
+    # 9b. The same rule keyed on a store `.error()` (config_routes.cpp).
+    store_must_match = 'spdlog::error("write failed: {}", result.error());'
+    if not find_pq_error_violations_in_text(store_must_match, (".error()",)):
+        raise SystemExit(f"selfcheck: expected a store .error() violation: {store_must_match!r}")
+    store_must_not = 'spdlog::error("write failed: {}", ::yuzu::log_key_token(result.error()));'
+    if find_pq_error_violations_in_text(store_must_not, (".error()",)):
+        raise SystemExit(f"selfcheck: unexpected store .error() violation: {store_must_not!r}")
+    path_key_must_match = 'spdlog::error("PUT /api/config/{}: failed", key);'
+    if not find_agent_id_violations_in_text(path_key_must_match, ("key",)):
+        raise SystemExit(f"selfcheck: expected a raw path-key violation: {path_key_must_match!r}")
+    regex_must_match = 'spdlog::warn("invalid regex \'{}\': {}", ::yuzu::log_key_token(key), validation_regex);'
+    if not find_agent_id_violations_in_text(regex_must_match, ("key", "validation_regex")):
+        raise SystemExit(f"selfcheck: expected a raw validation_regex violation: {regex_must_match!r}")
+
     # 10. The register-path free-text rule (find_registry_free_text_violations_in_text).
     free_must_match = [
         'spdlog::info("Agent registered: hostname=\'{}\'", info.hostname());',
@@ -1642,6 +1681,15 @@ def main() -> int:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for line_no, stmt in find_pq_error_violations_in_text(text):
+            snippet = " ".join(stmt.split())[:160]
+            agent_hits.append(f"{rel}:{line_no}: {snippet}")
+    for rel in STORE_ERROR_FILES:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            agent_hits.append(f"{rel}: file listed in STORE_ERROR_FILES does not exist")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line_no, stmt in find_pq_error_violations_in_text(text, (".error()",)):
             snippet = " ".join(stmt.split())[:160]
             agent_hits.append(f"{rel}:{line_no}: {snippet}")
     for rel in REGISTRY_FREE_TEXT_FILES:
