@@ -225,6 +225,12 @@ public:
     [[nodiscard]] std::vector<OffloadDelivery> get_deliveries(int64_t target_id,
                                                               int limit = 50) const;
 
+    /// Same read, but `nullopt` = the read FAILED (closed store, lease
+    /// timeout, query error) so a caller that renders history can tell a
+    /// failed read from a genuinely empty log. `get_deliveries` delegates here.
+    [[nodiscard]] std::optional<std::vector<OffloadDelivery>>
+    get_deliveries_checked(int64_t target_id, int limit = 50) const;
+
     /// Fire an event to all enabled, matching targets. Honours batching:
     /// when a target has `batch_size > 1`, the event is appended to an
     /// in-memory buffer keyed on `target_id`. When the buffer reaches

@@ -1122,7 +1122,7 @@ Three-tier authorization model enforced before RBAC: `readonly` (read-only tools
 
 ### 24.10 MCP Settings UI :white_check_mark: `T2`
 
-Settings page section for MCP configuration: enable/disable toggle, read-only mode toggle. API token creation supports MCP tier dropdown for creating MCP-scoped tokens.
+Settings page section for MCP configuration: enable/disable and Read-only/Full-access, one Save with a confirmation per resulting state, on **Settings → Integrations** (`/settings/integrations`; the same panel also stays on `/settings`). API token creation supports MCP tier dropdown for creating MCP-scoped tokens.
 
 ### 24.11 MCP Streamed HTTP Transport :white_check_mark: `T2` *(new row, v4.0)* *(verified 2026-09-07)*
 
