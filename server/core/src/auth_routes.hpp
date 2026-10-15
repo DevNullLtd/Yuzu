@@ -275,6 +275,13 @@ public:
                                       const std::string& securable_type,
                                       const std::string& operation);
 
+    /// `require_admin`'s own decision with the `auth.admin_required` denial row withheld for an
+    /// interactive cookie session (`denial_row_may_be_withheld`); a token or engine caller keeps
+    /// it. For a page whose panels auto-load, where a non-administrator opening the page is not
+    /// an attempt to administer anything. `res` receives the gate's 401/403. NEVER a gate for an
+    /// action route, which must keep the loud `require_admin`.
+    [[nodiscard]] bool probe_admin(const httplib::Request& req, httplib::Response& res);
+
     /// `has_permission` with the gate's own response kept: `res` receives the 401/403/503 that
     /// `require_permission` would write, so a caller can tell "denied" from "store unavailable".
     /// The denial row is withheld for an interactive cookie session only

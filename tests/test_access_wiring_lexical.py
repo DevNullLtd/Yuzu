@@ -4,7 +4,8 @@
 The Access route tests stub every dependency, so a permissive admin gate or a swapped account
 source in server.cpp would leave them all green. This gate pins the production wiring:
 
-  1. `.admin_fn` calls `require_admin(req, res)` (the loud gate) and never returns a constant.
+  1. `.admin_fn` calls `auth_routes_->probe_admin(req, res)` (the admin decision, denial row
+     withheld for cookie sessions only) and never returns a constant.
   2. `.list_users_fn` guards a null `auth_db_` with `std::unexpected` and reads
      `auth_db_->list_users()`; it maps a failure to `std::unexpected`.
   3. The block never reads the in-memory fallback (`AuthManager`, `auth_mgr_`,
@@ -54,8 +55,8 @@ def problems(src):
     out = []
     admin = re.search(r"\.admin_fn = \[this\]\(const httplib::Request& req, httplib::Response& res\) \{(.*?)\},"
                       r" \.perm_fn", b)
-    if not admin or "return require_admin(req, res);" not in admin.group(1):
-        out.append("access .admin_fn no longer returns require_admin(req, res)")
+    if not admin or "return auth_routes_->probe_admin(req, res);" not in admin.group(1):
+        out.append("access .admin_fn no longer returns auth_routes_->probe_admin(req, res)")
     elif re.search(r"return (true|false)", admin.group(1)):
         out.append("access .admin_fn returns a constant")
     lu = b.find(".list_users_fn")
@@ -78,7 +79,7 @@ def problems(src):
 
 # (pattern, replacement, expected substring of the first problem)
 MUTATIONS = [
-    (r"return require_admin\(req, res\);\n(\s*\},\n\s*\.perm_fn)", r"return true;\n\1",
+    (r"return auth_routes_->probe_admin\(req, res\);\n(\s*\},\n\s*\.perm_fn)", r"return true;\n\1",
      "admin_fn"),
     (r"auth_db_->list_users\(\)", "auth_mgr_->list_users()", "list_users_fn"),
     (r"if \(!auth_db_\)\n\s*return std::unexpected\(std::string\(\"auth store not configured\"\)\);",

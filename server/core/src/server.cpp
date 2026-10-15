@@ -15439,7 +15439,7 @@ private:
             yuzu::server::access::Deps{
                 .auth_fn = auth_fn,
                 .admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
-                    return require_admin(req, res);
+                    return auth_routes_->probe_admin(req, res);
                 },
                 .perm_fn = perm_fn,
                 .audit_fn = audit_fn,

@@ -123,6 +123,7 @@ TEST_CASE("access routes: the page redirects without a session and makes no gate
     res = h.sink.dispatch("GET", "/access/users");
     REQUIRE(res);
     CHECK(res->status == 200);
+    CHECK(res->get_header_value("Cache-Control") == "no-store");
     CHECK_THAT(res->body, ContainsSubstring("/access/users"));
     CHECK_THAT(res->body, ContainsSubstring(std::string(access::kUsersDenied)));
     // No page-level probe: the page costs no audited denial of its own.

@@ -22,7 +22,7 @@ namespace {
 
 constexpr const char* kHtml = "text/html; charset=utf-8";
 
-// Gate order matters: the loud admin gate runs BEFORE the store is read, so a denied caller
+// Gate order matters: the admin gate runs BEFORE the store is read, so a denied caller
 // never causes a read. Returns the caller's username, or nullopt after writing the response.
 std::optional<std::string> gate(const Deps& d, const httplib::Request& req, httplib::Response& res) {
     if (!d.admin_fn(req, res))
@@ -61,6 +61,7 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
         }
         // No page-level permission probe: each panel is gated by its own fragment, and a
         // refusal becomes the panel's "not available" note client-side.
+        res.set_header("Cache-Control", "no-store");
         res.set_content(kAccessUsersHtml, kHtml);
     });
 

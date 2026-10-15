@@ -5,13 +5,13 @@
 ///
 /// Routes (all GET):
 ///   /access/users                       page; 302 /login without a session
-///   /fragments/access/users/list        Users panel; loud admin gate, store read, 200 always
+///   /fragments/access/users/list        Users panel; quiet admin gate, store read, 200 always
 ///   /fragments/access/users/detail      Account panel (?username=); same gate and read
 ///   /static/yuzu-access.js              the page's client glue
 ///
 /// No mutating route is added and none is called from this page. The panels carry no
-/// success audit row (the Settings fragment they re-surface has none); a denial audits
-/// through the gate itself (`auth.admin_required`).
+/// success audit row (the Settings fragment they re-surface has none). A refused cookie
+/// session writes no denial row either (the panels auto-load); a refused token does.
 
 #include <yuzu/server/auth.hpp>
 
@@ -32,7 +32,9 @@ namespace access {
 struct Deps {
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
-    /// The LOUD gate (`require_admin`): on false it has already written the 403 and its audit row.
+    /// `AuthRoutes::probe_admin`: `require_admin`'s decision; on false it has already written the
+    /// 403. The `auth.admin_required` row is withheld for a cookie session (a page that
+    /// auto-loads its panels must not fill the audit log with denials) and kept for any token.
     using AdminFn = std::function<bool(const httplib::Request&, httplib::Response&)>;
     /// Same shape as `dashboard_api::Deps::PermFn`. Bound now so the Access PRs that follow
     /// do not each re-add it; this PR's routes do not call it.
