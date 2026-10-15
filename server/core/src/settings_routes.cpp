@@ -341,12 +341,12 @@ std::string SettingsRoutes::render_server_config_fragment() {
             "s</code></td></tr>";
     {
         const auto idle = v.at("session_inactivity_seconds").get<std::int64_t>();
-        html += "<tr><td>Dashboard idle timeout</td><td>" +
+        html += "<tr><td>Console idle timeout</td><td>" +
                 (idle > 0 ? "<code>" + std::to_string(idle) + "s</code>"
                           : std::string("Off")) +
                 "</td></tr>";
     }
-    html += "<tr><td>Dashboard session lifetime</td><td><code>" +
+    html += "<tr><td>Console session lifetime</td><td><code>" +
             std::to_string(v.at("session_absolute_lifetime_seconds").get<std::int64_t>()) +
             "s</code></td></tr>";
     html += "<tr><td>Max Agents</td><td><code>" +
