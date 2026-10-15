@@ -8650,11 +8650,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const bool has_more = events->size() > static_cast<std::size_t>(page_limit);
+                events->resize(std::min(events->size(), static_cast<std::size_t>(page_limit)));
                 JArr arr;
-                std::size_t emitted = 0;
                 for (const auto& e : *events) {
-                    if (emitted++ == static_cast<std::size_t>(page_limit))
-                        break;
                     arr.add(JObj()
                                 .add("id", e.id)
                                 .add("timestamp", e.timestamp)
