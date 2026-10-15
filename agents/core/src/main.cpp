@@ -7,8 +7,7 @@
     const char msg[] = "[DIAG] EXE static-init starting (before C++ globals)\n";
     _write(2, msg, sizeof(msg) - 1);
 }
-__declspec(allocate(".CRT$XCB"))
-[[maybe_unused]] static void(__cdecl* p_diag_init)() = diag_before_static_init;
+__declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_init)() = diag_before_static_init;
 #endif
 
 #include <yuzu/agent/updater.hpp>
@@ -35,7 +34,7 @@ __declspec(allocate(".CRT$XCB"))
 #ifdef _WIN32
 #include <win_sc_handle.hpp> // shared yuzu::win SC_HANDLE RAII owner (#1822)
 #else
-#include <fcntl.h> // O_CLOEXEC / O_NONBLOCK / FD_CLOEXEC on the shutdown self-pipe
+#include <fcntl.h>  // O_CLOEXEC / O_NONBLOCK / FD_CLOEXEC on the shutdown self-pipe
 #include <unistd.h>
 #endif
 
@@ -296,6 +295,7 @@ static void on_signal(int sig) {
     errno = saved_errno;
 }
 
+
 // Verifies preconditions and constructs the Agent. Shared by the console path and
 // the Windows service path (service_win.cpp's ServiceMain calls this on its own
 // thread, after reporting SERVICE_START_PENDING) so both go through identical
@@ -303,8 +303,8 @@ static void on_signal(int sig) {
 static std::unique_ptr<yuzu::agent::Agent> make_agent(yuzu::agent::Config cfg) {
     // Verify SQLite was compiled with thread-safety (FULLMUTEX requires SQLITE_THREADSAFE != 0)
     if (sqlite3_threadsafe() == 0) {
-        spdlog::critical("SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, "
-                         "concurrent access unsafe");
+        spdlog::critical(
+            "SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, concurrent access unsafe");
         return nullptr;
     }
 
@@ -428,6 +428,10 @@ int main(int argc, char* argv[]) {
                  "Reject plugins that have no .sig sibling file (default: allow unsigned "
                  "if --plugin-trust-bundle is set, for transitional rollouts)")
         ->envname("YUZU_PLUGIN_REQUIRE_SIGNATURE");
+    // Packaging-time verifier (deploy/packaging/macos/build-pkg.sh, build-app.py):
+    // checks one plugin's CMS sidecar against --plugin-trust-bundle with the agent's
+    // own verifier, then exits. Hidden from --help; it returns before make_agent(),
+    // so no agent, Spark or Guardian state is ever constructed on this path.
     std::filesystem::path plugin_signature_to_verify;
     app.add_option("--verify-plugin-signature", plugin_signature_to_verify,
                    "Verify one plugin CMS sidecar with --plugin-trust-bundle and exit")
@@ -592,8 +596,8 @@ int main(int argc, char* argv[]) {
                 // (pre-#1822) install that lacks the --service marker, or one whose
                 // args changed. SERVICE_NO_CHANGE preserves start type / error
                 // control / everything else.
-                svc.reset(
-                    OpenServiceW(scm.get(), yuzu::agent::win::kServiceName, SERVICE_CHANGE_CONFIG));
+                svc.reset(OpenServiceW(scm.get(), yuzu::agent::win::kServiceName,
+                                       SERVICE_CHANGE_CONFIG));
                 if (!svc) {
                     std::cerr << "Service exists but could not be opened for update\n";
                     return EXIT_FAILURE;
@@ -619,11 +623,14 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Warning: failed to set service description (" << GetLastError()
                           << ")\n";
             SERVICE_DELAYED_AUTO_START_INFO delayed = {TRUE};
-            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed))
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                                       &delayed))
                 std::cerr << "Warning: failed to set delayed auto-start (" << GetLastError()
                           << ")\n";
             SC_ACTION actions[3] = {
-                {SC_ACTION_RESTART, 60000}, {SC_ACTION_RESTART, 60000}, {SC_ACTION_RESTART, 60000}};
+                {SC_ACTION_RESTART, 60000},
+                {SC_ACTION_RESTART, 60000},
+                {SC_ACTION_RESTART, 60000}};
             SERVICE_FAILURE_ACTIONSW failure = {};
             failure.dwResetPeriod = 86400;
             failure.cActions = 3;
@@ -636,8 +643,8 @@ int main(int argc, char* argv[]) {
             // startup refusal), approximating systemd's Restart=always.
             SERVICE_FAILURE_ACTIONS_FLAG flag{TRUE};
             if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &flag))
-                std::cerr << "Warning: failed to enable recovery-on-error-exit (" << GetLastError()
-                          << ")\n";
+                std::cerr << "Warning: failed to enable recovery-on-error-exit ("
+                          << GetLastError() << ")\n";
 
             std::cout << (updated_existing ? "Service 'YuzuAgent' updated\n"
                                            : "Service 'YuzuAgent' installed successfully\n");
@@ -861,6 +868,7 @@ int main(int argc, char* argv[]) {
         ~AgentUnpublisher() { g_agent.store(nullptr, std::memory_order_release); }
     } agent_unpublisher;
 
+
 #ifndef _WIN32
     // ONLY install the handlers if the watcher is live. If it is not (pipe or thread
     // creation failed), on_signal would catch the signal, find no pipe, and RETURN —
@@ -925,8 +933,8 @@ int main(int argc, char* argv[]) {
     // once the explicit check has run to completion on the normal path (see
     // below); its destructor is a deliberately non-throwing, unlogged fallback
     // for every other path.
-    yuzu::agent::OrphanExitGuard orphan_guard{[&] { return agent->guardian_active_io_workers(); },
-                                              yuzu::agent::kOrphanDrainGrace, 3};
+    yuzu::agent::OrphanExitGuard orphan_guard{
+        [&] { return agent->guardian_active_io_workers(); }, yuzu::agent::kOrphanDrainGrace, 3};
 
     agent->run();
     // R-EXCEPTION (#4666 PR-2, accepted, out of scope): on this platform's toolchain
