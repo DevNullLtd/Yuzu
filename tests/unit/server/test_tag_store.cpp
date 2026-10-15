@@ -28,10 +28,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include "test_tag_store_pg_helper.hpp"
 
 #include <libpq-fe.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -94,6 +97,27 @@ template <typename T>
 T require_ok(const std::expected<T, TagReadError>& r) {
     REQUIRE(r.has_value());
     return *r;
+}
+
+// Log-injection helpers (#5513): number of non-overlapping occurrences of `needle`, and the count
+// of control bytes other than the single '\n' that ends each log line.
+std::size_t count_of(const std::string& text, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + 1))
+        ++n;
+    return n;
+}
+std::ptrdiff_t stray_control_bytes(const std::string& text) {
+    return std::count_if(text.begin(), text.end(), [](char ch) {
+        const auto c = static_cast<unsigned char>(ch);
+        return (c < 0x20 && c != '\n') || c == 0x7F;
+    });
+}
+void exec_ddl(const std::string& dsn, const char* sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql)};
+    REQUIRE(r.ok());
 }
 
 // Asserts a write returning std::expected<void, std::string> succeeded — a
@@ -750,4 +774,186 @@ TEST_CASE("TagStore: writes reject an agent_id with an embedded NUL (UP-2 identi
 
     // Nothing landed under the truncated identity libpq would have written.
     CHECK(require_ok(store.get_all_tags("agent")).empty());
+}
+
+// ============================================================================
+// Log lines neutralise the claimed agent id, the tag key and the libpq text (#5513)
+// ============================================================================
+//
+// The store's log lines print three kinds of untrusted text: the agent id a caller names
+// (valid_agent_id refuses only empty, over-long and NUL ids, so control bytes, spaces and '='
+// reach these lines), the tag key get_values_for_key is asked about, and libpq's error text
+// (which ends in a newline, carries "LINE 1:" continuation lines for a statement error and can
+// quote a bound value). Each is wrapped (log_id_token / log_key_token), so one failing call is
+// exactly one physical log line. Every log line this store writes carries "TagStore::" exactly
+// once and ends in one newline, so a line count that equals the newline count shows nothing
+// inside a printed value split a line.
+
+TEST_CASE("TagStore: a failed write logs the libpq error text and the claimed id on one line",
+          "[pg][tag_store][log_injection][5513]") {
+    // OWN clone: the tags table is renamed away and the clone is dropped with the test.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::tag_store_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    TagStore store{pool};
+    REQUIRE(store.is_open());
+    exec_ddl(db.dsn(), "ALTER TABLE tag_store.tags RENAME TO gone_tags");
+
+    // Passes valid_agent_id (it refuses only empty, over-long and NUL ids) yet carries a space,
+    // '=' and a newline that log_id_token must fold.
+    const std::string id = "agent x=1\nfake";
+    const std::string id_token = "agent_x_1_fake";
+
+    yuzu::test::LogCapture cap;
+    auto del = store.delete_tag(id, "k");
+    auto sync = store.sync_agent_tags(id, {{"k", "v"}});
+    auto del_all = store.delete_all_tags(id);
+    // The read sites log through process-wide samplers (the first degrade per 60 s episode, then
+    // every 100th), so whether they appear depends on earlier tests in the same process: they
+    // are exercised here for the line-count property but not asserted by name.
+    auto r1 = store.get_tag(id, "k");
+    auto r2 = store.get_all_tags(id);
+    auto r3 = store.get_tag_map(id);
+    auto r4 = store.agents_with_tag("k", "v");
+    auto r5 = store.get_values_for_keys({"k"});
+    auto r6 = store.get_compliance_gaps();
+    auto r7 = store.get_distinct_values("k");
+    auto r8 = store.get_distinct_keys();
+    cap.stop();
+
+    REQUIRE_FALSE(del.has_value());
+    CHECK(del.error() == TagReadError::kDegraded);
+    REQUIRE_FALSE(sync.has_value());
+    CHECK(sync.error().starts_with(kTagDbErrorPrefix));
+    REQUIRE_FALSE(del_all.has_value());
+    CHECK(del_all.error().starts_with(kTagDbErrorPrefix));
+    CHECK_FALSE(r1.has_value());
+    CHECK_FALSE(r2.has_value());
+    CHECK_FALSE(r3.has_value());
+    CHECK_FALSE(r4.has_value());
+    CHECK_FALSE(r5.has_value());
+    CHECK_FALSE(r6.has_value());
+    CHECK_FALSE(r7.has_value());
+    CHECK_FALSE(r8.has_value());
+
+    const std::string text = cap.text();
+    const std::size_t lines = count_of(text, "TagStore::");
+    // The three write/delete sites are unsampled and asserted by name: delete_tag (query failed),
+    // sync_agent_tags (DELETE failed) and delete_all_tags (delete failed).
+    CHECK(lines >= 3);
+    CHECK(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) == lines);
+    CHECK(text.find("TagStore::delete_tag: query failed") != std::string::npos);
+    CHECK(text.find("TagStore::sync_agent_tags: DELETE failed for " + id_token + ":") !=
+          std::string::npos);
+    CHECK(text.find("TagStore::delete_all_tags: delete failed for agent=" + id_token + ":") !=
+          std::string::npos);
+    // libpq's statement-error continuation is folded into the same line: the newline after the
+    // "ERROR: ..." sentence became '_' before "LINE 1:". The message text is the server's
+    // English "does not exist", so this assertion assumes an English lc_messages (the test
+    // container's default).
+    CHECK(text.find("does not exist_LINE 1:") != std::string::npos);
+    CHECK(text.find("agent x=1") == std::string::npos);
+    CHECK(text.find("1\nfake") == std::string::npos);
+    CHECK(stray_control_bytes(text) == 0);
+}
+
+TEST_CASE("TagStore: a failed batch upsert logs the quoted claimed id and libpq text on one line",
+          "[pg][tag_store][log_injection][5513]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::tag_store_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    TagStore store{pool};
+    REQUIRE(store.is_open());
+    // The DELETE passes (the trigger is on INSERT/UPDATE); the batch upsert then raises, and the
+    // raised message quotes the bound agent id and carries a newline of its own, the way libpq
+    // text quoting a claimed value would.
+    exec_ddl(db.dsn(),
+             "CREATE FUNCTION tag_store.yuzu_test_fault() RETURNS trigger AS $$ "
+             "BEGIN RAISE EXCEPTION E'injected\\nfault for %', NEW.agent_id; END $$ "
+             "LANGUAGE plpgsql; "
+             "CREATE TRIGGER yuzu_test_fault_trg BEFORE INSERT OR UPDATE ON tag_store.tags "
+             "FOR EACH ROW EXECUTE FUNCTION tag_store.yuzu_test_fault()");
+
+    const std::string id = "agent x=1\nfake";
+
+    yuzu::test::LogCapture cap;
+    auto sync = store.sync_agent_tags(id, {{"k", "v"}, {"k2", "v2"}});
+    cap.stop();
+
+    REQUIRE_FALSE(sync.has_value());
+    CHECK(sync.error().starts_with(kTagDbErrorPrefix));
+
+    const std::string text = cap.text();
+    CHECK(count_of(text, "TagStore::") == 1);
+    CHECK(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) == 1);
+    CHECK(text.find("TagStore::sync_agent_tags: batch upsert failed for agent_x_1_fake (2 tags): "
+                    "ERROR:") != std::string::npos);
+    // The raised message's own newline is folded (the "CONTEXT:" lines follow it the same way),
+    // and the id it quotes keeps its space and '=' (log_key_token leaves them) but loses the raw
+    // newline.
+    CHECK(text.find("injected_fault for agent x=1_fake") != std::string::npos);
+    CHECK(text.find("1\nfake") == std::string::npos);
+    CHECK(stray_control_bytes(text) == 0);
+}
+
+TEST_CASE("TagStore: sync_agent_tags logs the claimed id neutralised when it drops a service tag",
+          "[pg][tag_store][log_injection][5513]") {
+    TAGS_SHARED(store);
+
+    // Passes valid_agent_id yet carries a space and '=' (and, second, a newline) that
+    // log_id_token must fold.
+    const std::string id1 = "agent x=1 fake";
+    const std::string id2 = "agent\nFORGED y=2";
+
+    yuzu::test::LogCapture cap;
+    auto s1 = store.sync_agent_tags(id1, {{"service", "billing"}, {"k", "v"}});
+    auto s2 = store.sync_agent_tags(id2, {{"service", "billing"}, {"k", "v"}});
+    cap.stop();
+
+    REQUIRE(s1.has_value());
+    REQUIRE(s2.has_value());
+    const std::string text = cap.text();
+    CHECK(text.find("dropped agent-reported 'service' tag for agent_x_1_fake (#3289)") !=
+          std::string::npos);
+    CHECK(text.find("dropped agent-reported 'service' tag for agent_FORGED_y_2 (#3289)") !=
+          std::string::npos);
+    CHECK(text.find(id1) == std::string::npos);
+    CHECK(text.find("agent\nFORGED") == std::string::npos);
+    // Two log calls, so exactly two newlines.
+    CHECK(count_of(text, "TagStore::") == 2);
+    CHECK(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) == 2);
+    CHECK(stray_control_bytes(text) == 0);
+}
+
+TEST_CASE("TagStore: get_values_for_key logs the caller's tag key neutralised",
+          "[pg][tag_store][log_injection][5513]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::tag_store_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    TagStore store{pool};
+    REQUIRE(store.is_open());
+    exec_ddl(db.dsn(), "ALTER TABLE tag_store.tags RENAME TO gone_tags");
+
+    // get_values_for_key does not validate the key. A control byte folds, the space and quotes
+    // stay (log_key_token's contract).
+    const std::string key = "k\nFAKE x='1\x01";
+
+    // The site logs through a process-wide sampler (first degrade per 60 s episode, then every
+    // 100th call), so 100 consecutive failing calls are guaranteed to produce at least one line
+    // whatever earlier tests in the process did.
+    yuzu::test::LogCapture cap;
+    for (int i = 0; i < 100; ++i) {
+        auto r = store.get_values_for_key(key);
+        REQUIRE_FALSE(r.has_value());
+    }
+    cap.stop();
+
+    const std::string text = cap.text();
+    const std::size_t lines = count_of(text, "TagStore::get_values_for_key(");
+    CHECK(lines >= 1);
+    CHECK(static_cast<std::size_t>(std::count(text.begin(), text.end(), '\n')) == lines);
+    CHECK(text.find("TagStore::get_values_for_key('k_FAKE x='1_'): query failed: ERROR:") !=
+          std::string::npos);
+    CHECK(text.find("k\nFAKE") == std::string::npos);
+    CHECK(stray_control_bytes(text) == 0);
 }

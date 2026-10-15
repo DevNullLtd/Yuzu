@@ -130,18 +130,19 @@ the wrap happens INSIDE the formatter:
     it gets flagged and a reviewer has to consciously verify the line shape
     rather than inherit a blanket pass.
 
-SECOND, SEPARATE CHECK (#5513): claimed agent ids in five named files outside the
+SECOND, SEPARATE CHECK (#5513): claimed agent ids in six named files outside the
 Guardian/Spark basename family -- server/core/src/agent_service_impl.cpp,
-gateway_service_impl.cpp, agent_registry.cpp, custom_properties_store.cpp and
-custom_properties_routes.cpp (AGENT_ID_FILES). It flags a spdlog:: argument that is a request-derived agent id
+gateway_service_impl.cpp, agent_registry.cpp, custom_properties_store.cpp,
+custom_properties_routes.cpp and tag_store.cpp (AGENT_ID_FILES). It flags a spdlog:: argument that is a request-derived agent id
 (`info.agent_id()`, `request->agent_id()`, `req->agent_id()`, a local alias bound from
 one of those in the same function, or the bare `agent_id` in the custom-properties
-files) and is not wholly a log_id_token / log_key_token / audit_token /
+files and tag_store.cpp, where the bare caller-supplied tag `key` is also matched) and is
+not wholly a log_id_token / log_key_token / audit_token /
 onbehalf::sanitize_for_log call or the local `safe_agent_id`. It is LEXICAL: it reads
 argument text, not data flow, so an id reaching the log through a variable it cannot
 trace to a request accessor, or a new spelling, is not seen. The exact scope and limits
 are in the block comment above find_agent_id_violations_in_text(). FILE_BASENAME_RE and
-the pattern check above are unchanged and do not apply to these five files.
+the pattern check above are unchanged and do not apply to these six files.
 In agent_registry.cpp only the claimed ids from `info.agent_id()` (and the local
 `safe_agent_id` built from it) are in scope; the many other spdlog calls in that file print
 ids taken from the session table and are deliberately not matched.
@@ -161,14 +162,15 @@ member form `.gateway_node` (no parentheses, a session-table read) in agent_regi
 reads argument text only: a value copied into a local under another name first is not seen;
 request-metadata session ids printed before their lookup, `sync.error()`-style fixed-text
 errors and member-form session reads other than `.gateway_node` are not tracked (lexical limit).
-A sixth guard (UNSCANNED_LOGGING_FILES, the same five files as the second check) fails on any
+A sixth guard (UNSCANNED_LOGGING_FILES, the same six files as the second check) fails on any
 logging FORM the scanner does not parse: an `SPDLOG_TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL(`
 macro, `spdlog::log(` or `default_logger`. The rules above only understand `spdlog::<level>(`
 and `<logger>-><level>(` calls, so a different form would otherwise escape them silently;
 this makes it fail loudly instead. A new file added to the second check is covered by
 extending that tuple, not by this note.
 A third, narrower rule (PQ_ERROR_FILES) requires every spdlog:: argument that contains a
-PQerrorMessage( or PQresultErrorMessage( call in custom_properties_store.cpp to be wrapped
+PQerrorMessage( or PQresultErrorMessage( call in custom_properties_store.cpp and tag_store.cpp
+to be wrapped
 (libpq error text can quote the claimed agent id). It matches the call name only: a value
 copied into a local first is not seen.
 
@@ -881,6 +883,9 @@ AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
     # spdlog calls print ids from the session table, which the check cannot trace and ignores.
     "server/core/src/agent_registry.cpp": (),
     "server/core/src/custom_properties_store.cpp": ("agent_id",),
+    # `key` is the caller-supplied tag key (get_values_for_key prints it); the file has no
+    # other local of that name in a log argument.
+    "server/core/src/tag_store.cpp": ("agent_id", "key"),
     "server/core/src/custom_properties_routes.cpp": ("agent_id",),
 }
 
@@ -986,7 +991,10 @@ def find_agent_id_violations_in_text(
 # parameters, i.e. the claimed agent id, so in the custom-properties store every spdlog
 # argument that contains a `PQerrorMessage(` call must be wholly one wrap call. Lexical,
 # like the check above; it covers only this one file.
-PQ_ERROR_FILES: tuple[str, ...] = ("server/core/src/custom_properties_store.cpp",)
+PQ_ERROR_FILES: tuple[str, ...] = (
+    "server/core/src/custom_properties_store.cpp",
+    "server/core/src/tag_store.cpp",
+)
 
 
 # Name-only: the rule matches the call NAME inside the argument text. A value copied into a
@@ -1107,7 +1115,7 @@ def find_command_text_violations_in_text(text: str) -> list[tuple[int, str]]:
 
 
 # Sixth guard: logging forms the scanner above does not parse. find_spdlog_statements only
-# understands `spdlog::<level>(` and `<logger>-><level>(`; any other form in the five files of
+# understands `spdlog::<level>(` and `<logger>-><level>(`; any other form in the six files of
 # the second check would print its arguments unexamined. They are absent today, so the guard
 # fails on any occurrence (a mention in a comment too: reword it) rather than trying to scan them.
 UNSCANNED_LOGGING_FILES: tuple[str, ...] = tuple(AGENT_ID_FILES)
@@ -1407,6 +1415,8 @@ def _selfcheck() -> None:
         ('void F() {\n  spdlog::info("peer {}", safe_agent_id);\n}\n', ()),
         ('spdlog::info("peer {}", log_id_token(a) + info.agent_id());', ()),
         ('spdlog::warn("delete failed for agent={}", agent_id);', ("agent_id",)),
+        # The caller-supplied tag key: a bare `key` is raw in a file that lists it.
+        ('spdlog::warn("values_for_key(\'{}\') failed", key);', ("agent_id", "key")),
         (
             "void F() {\n  const auto& agent_id = request->agent_id();\n"
             '  spdlog::info("peer {}", agent_id);\n}\n',
@@ -1436,6 +1446,9 @@ def _selfcheck() -> None:
         ('spdlog::info("peer {}", ::yuzu::log_id_token(request->info().agent_id()));', ()),
         ('spdlog::warn("delete failed for agent={}", ::yuzu::log_id_token(agent_id));', ("agent_id",)),
         ('spdlog::warn("tag sync failed ({})", err);', ("agent_id",)),
+        ('spdlog::warn("values_for_key(\'{}\') failed", ::yuzu::log_key_token(key));', ("agent_id", "key")),
+        # `key` is only a bare name in a file that lists it; a method call named key() is not it.
+        ('spdlog::warn("failed", row.key());', ("agent_id", "key")),
         # A bare name with no accessor alias in scope is not request-derived as far as this
         # check can tell (session-table ids look like this).
         ('void F() {\n  std::string agent_id;\n  spdlog::info("hb {}", agent_id);\n}\n', ()),

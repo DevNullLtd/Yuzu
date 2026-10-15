@@ -8,6 +8,7 @@
 #include "service_scope_policy.hpp" // authz::is_service_tag_key — #3289
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
@@ -335,7 +336,8 @@ std::expected<bool, TagReadError> TagStore::delete_tag(const std::string& agent_
         "DELETE FROM tag_store.tags WHERE agent_id = $1 AND key = $2 RETURNING agent_id",
         std::vector<std::string>{agent_id, key});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("TagStore::delete_tag: query failed: {}", PQerrorMessage(lease.get()));
+        spdlog::warn("TagStore::delete_tag: query failed: {}",
+                     ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     return PQntuples(res.get()) > 0;
@@ -373,8 +375,8 @@ TagStore::sync_agent_tags(const std::string& agent_id,
         // the agent's next sync rather than lingering — self-healing.
         if (authz::is_service_tag_key(key)) {
             spdlog::info("TagStore::sync_agent_tags: dropped agent-reported 'service' tag for "
-                        "{} (#3289) — the service tag is operator/API-assigned only",
-                        agent_id);
+                         "{} (#3289) — the service tag is operator/API-assigned only",
+                         ::yuzu::log_id_token(agent_id));
             // Gate 5/6 hardening round: the only prior signal was this log
             // line — no counter, no audit row. A counter is the proportionate
             // in-PR addition (an audit row needs its own audit-sink design,
@@ -407,8 +409,8 @@ TagStore::sync_agent_tags(const std::string& agent_id,
             std::vector<std::string>{agent_id});
         if (del.status() != PGRES_COMMAND_OK) {
             error = std::string(kTagDbErrorPrefix) + "database write failed";
-            spdlog::warn("TagStore::sync_agent_tags: DELETE failed for {}: {}", agent_id,
-                         PQerrorMessage(c));
+            spdlog::warn("TagStore::sync_agent_tags: DELETE failed for {}: {}",
+                         ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(PQerrorMessage(c)));
             return false;
         }
         if (keys.empty())
@@ -430,7 +432,8 @@ TagStore::sync_agent_tags(const std::string& agent_id,
         if (ins.status() != PGRES_COMMAND_OK) {
             error = std::string(kTagDbErrorPrefix) + "database write failed";
             spdlog::warn("TagStore::sync_agent_tags: batch upsert failed for {} ({} tags): {}",
-                         agent_id, keys.size(), PQerrorMessage(c));
+                         ::yuzu::log_id_token(agent_id), keys.size(),
+                         ::yuzu::log_key_token(PQerrorMessage(c)));
             return false; // roll the whole sync back (UP-1)
         }
         return true;
@@ -455,8 +458,9 @@ std::expected<void, std::string> TagStore::delete_all_tags(const std::string& ag
         pg::exec_params(lease.get(), "DELETE FROM tag_store.tags WHERE agent_id = $1",
                         std::vector<std::string>{agent_id});
     if (res.status() != PGRES_COMMAND_OK) {
-        spdlog::warn("TagStore::delete_all_tags: delete failed for agent={}: {}", agent_id,
-                     PQerrorMessage(lease.get()));
+        spdlog::warn("TagStore::delete_all_tags: delete failed for agent={}: {}",
+                     ::yuzu::log_id_token(agent_id),
+                     ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(std::string(kTagDbErrorPrefix) + "database write failed");
     }
     return {};
@@ -488,7 +492,8 @@ TagStore::get_tag(const std::string& agent_id, const std::string& key) const {
         std::vector<std::string>{agent_id, key});
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_get_tag_sampler))
-            spdlog::warn("TagStore::get_tag: query failed: {}", PQerrorMessage(lease.get()));
+            spdlog::warn("TagStore::get_tag: query failed: {}",
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     if (PQntuples(res.get()) == 0)
@@ -518,7 +523,8 @@ TagStore::get_all_tags(const std::string& agent_id) const {
         std::vector<std::string>{agent_id});
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_all_tags_sampler))
-            spdlog::warn("TagStore::get_all_tags: query failed: {}", PQerrorMessage(lease.get()));
+            spdlog::warn("TagStore::get_all_tags: query failed: {}",
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     std::vector<DeviceTag> results;
@@ -556,7 +562,8 @@ TagStore::get_tag_map(const std::string& agent_id) const {
                         std::vector<std::string>{agent_id});
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_tag_map_sampler))
-            spdlog::warn("TagStore::get_tag_map: query failed: {}", PQerrorMessage(lease.get()));
+            spdlog::warn("TagStore::get_tag_map: query failed: {}",
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     std::unordered_map<std::string, std::string> result;
@@ -593,7 +600,7 @@ TagStore::agents_with_tag(const std::string& key, const std::string& value) cons
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_agents_with_tag_sampler))
             spdlog::warn("TagStore::agents_with_tag: query failed: {}",
-                         PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     std::vector<std::string> result;
@@ -630,7 +637,7 @@ TagStore::get_values_for_keys(const std::vector<std::string>& keys) const {
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_values_for_keys_sampler))
             spdlog::warn("TagStore::get_values_for_keys: query failed: {}",
-                         PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     const int rows = PQntuples(res.get());
@@ -668,7 +675,7 @@ TagStore::get_compliance_gaps() const {
     if (all_agents.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_compliance_sampler))
             spdlog::warn("TagStore::get_compliance_gaps: agent query failed: {}",
-                         PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     std::vector<std::string_view> cat_views(std::begin(kCategoryKeys), std::end(kCategoryKeys));
@@ -679,7 +686,7 @@ TagStore::get_compliance_gaps() const {
     if (present.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_compliance_sampler))
             spdlog::warn("TagStore::get_compliance_gaps: category query failed: {}",
-                         PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
 
@@ -723,7 +730,7 @@ TagStore::get_distinct_values(const std::string& key) const {
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_distinct_values_sampler))
             spdlog::warn("TagStore::get_distinct_values: query failed: {}",
-                         PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     std::vector<std::string> result;
@@ -753,7 +760,7 @@ std::expected<std::vector<std::string>, TagReadError> TagStore::get_distinct_key
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_distinct_keys_sampler))
             spdlog::warn("TagStore::get_distinct_keys: query failed: {}",
-                         PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     std::vector<std::string> result;
@@ -774,8 +781,8 @@ TagStore::get_values_for_key(const std::string& key) const {
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, g_values_for_key_sampler))
-            spdlog::warn("TagStore::get_values_for_key('{}'): no connection in time ({})", key,
-                         pool_.last_error());
+            spdlog::warn("TagStore::get_values_for_key('{}'): no connection in time ({})",
+                         ::yuzu::log_key_token(key), pool_.last_error());
         return std::unexpected(TagReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
@@ -783,8 +790,9 @@ TagStore::get_values_for_key(const std::string& key) const {
         std::vector<std::string>{key});
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_values_for_key_sampler))
-            spdlog::warn("TagStore::get_values_for_key('{}'): query failed: {}", key,
-                         PQerrorMessage(lease.get()));
+            spdlog::warn("TagStore::get_values_for_key('{}'): query failed: {}",
+                         ::yuzu::log_key_token(key),
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(TagReadError::kDegraded);
     }
     std::unordered_map<std::string, std::string> result;
