@@ -161,6 +161,36 @@ yuzu_viz_js_embed = custom_target(
   ],
 )
 
+# Page script for the System > Integrations page (/static/yuzu-integrations.js).
+# Symbol: kYuzuIntegrationsJs (std::string). Routed in integrations_routes.cpp.
+yuzu_integrations_js_embed = custom_target(
+  'yuzu_integrations_js_bundle',
+  input: 'static/yuzu-integrations.js',
+  output: 'yuzu_integrations_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuIntegrationsJs',
+  ],
+)
+
+# System pages (SYS-5): controller for the Integrations webhook / offload /
+# directory-sync panels. Symbol: kYuzuIntegrationsSyncJs (std::string).
+yuzu_integrations_sync_js_embed = custom_target(
+  'yuzu_integrations_sync_js_bundle',
+  input: 'static/yuzu-integrations-sync.js',
+  output: 'yuzu_integrations_sync_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuIntegrationsSyncJs',
+  ],
+)
+
 # PR 9-pre: per-host renderer module + vendored Cytoscape.js 3.33.3 (MIT).
 # Cytoscape ships as ESM minified (cytoscape.esm.min.mjs from the npm
 # tarball) so the importmap entry in viz_host_page_ui.cpp can resolve
@@ -478,8 +508,9 @@ yuzu_server_core_lib = static_library(
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, yuzu_access_js_embed, yuzu_tokens_js_embed,
    cytoscape_js_embed, yuzu_operate_js_embed,
-   yuzu_dialog_js_embed, yuzu_operate_extras_js_embed, yuzu_estate_js_embed,
-   yuzu_device_data_js_embed,
+   yuzu_dialog_js_embed, yuzu_integrations_js_embed,
+   yuzu_integrations_sync_js_embed, yuzu_operate_extras_js_embed,
+   yuzu_estate_js_embed, yuzu_device_data_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -505,6 +536,9 @@ yuzu_server_core_lib = static_library(
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
+    'src/integrations_render.cpp', # System Integrations: pure MCP/Gateway panels + MCP form parser
+    'src/integrations_routes.cpp',
+    'src/integrations_ui.cpp',
     'src/access_render.cpp', # Access pages (Phase 2): pure HTML renderers for /access/users
     'src/access_ui.cpp', # Access pages: the Users page template
     'src/access_routes.cpp', # Access pages: /access/users + its two fragments + static glue
@@ -720,6 +754,8 @@ yuzu_server_core_lib = static_library(
     'src/mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
+    'src/integrations_sync_render.cpp', # SYS-5: pure webhook / offload / directory-sync panel renderers
+    'src/integrations_sync_routes.cpp', # SYS-5: the six Integrations read fragments + controller JS route
     'src/discovery_routes.cpp',
     'src/discover_routes.cpp', # A2 discovery surface: /api/v1/discover/* (Issue 17.1)
     'src/settings_data_ui.cpp', # System > Data and retention page template (SYS-4)

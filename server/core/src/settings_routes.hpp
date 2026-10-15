@@ -73,9 +73,10 @@ public:
     /// see `rest_audit.hpp`'s "null/empty audit_fn is not a persistence
     /// failure" contract. Not all 8 sub-areas are wired to it: only the four
     /// judged high/mixed-high sensitivity in #4028's Evidence section
-    /// (tls, https, plugin-signing, analytics) call it; the other four
+    /// (tls, https, plugin-signing, analytics) call it; of the other four
     /// (gateway, server-config, mcp, data-retention — "nothing secret" per
-    /// the same Evidence section) issue no audit call at all, matching the
+    /// the same Evidence section) the READ routes issue no audit call at all (`POST
+    /// /api/settings/mcp` writes its audit-first `attempted` row through it), matching the
     /// unaudited posture the existing `/fragments/settings/*` HTML renderers
     /// for those four already have today.
     using AuditReadFn =

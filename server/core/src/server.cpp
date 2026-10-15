@@ -277,9 +277,11 @@
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
 #include "notification_routes.hpp"
+#include "integrations_sync_routes.hpp"
 #include "offload_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
+#include "integrations_routes.hpp" // System "Integrations" page + its page script
 #include "viz_routes.hpp"
 #include "webhook_routes.hpp"
 #include "workflow_routes.hpp"
@@ -15899,6 +15901,26 @@ private:
                              .runtime_config_store = runtime_config_store_.get(),
                          });
 
+        // System pages (SYS-5): the six Integrations read fragments (webhooks,
+        // offload targets, directory sync) and the page controller script.
+        // Reads only; every write the page makes goes to the existing JSON
+        // routes with their own gates. `admin_fn` is `require_admin`, the same
+        // gate every Settings fragment uses; `perm_fn` then adds the JSON twin's
+        // securable (Infrastructure:Read, Directory:Read) so a fragment is never
+        // wider than the route it mirrors.
+        {
+            auto sync_deps = yuzu::server::integrations::bind_stores(
+                webhook_store_.get(), offload_target_store_.get(), directory_sync_.get(),
+                rbac_store_.get());
+            sync_deps.admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
+                return require_admin(req, res);
+            };
+            sync_deps.perm_fn = perm_fn;
+            sync_deps.audit_read = audit_fn;
+            yuzu::server::integrations::register_integrations_sync_routes(inline_sink,
+                                                                           std::move(sync_deps));
+        }
+
         // System "General and appearance" page and its two UI-only fragments
         // (settings_general_routes.*). All three are admin-gated (`require_admin`, the same
         // gate `/settings` uses); the runtime form writes through the PUT above and nothing
@@ -16231,6 +16253,19 @@ private:
                 e.guardian_event_retention_days = guaranteed_state_store_->retention_days();
             return e;
         });
+
+        // System "Integrations" page + its page script (integrations_routes.*). The panels it
+        // hosts are the existing /fragments/settings/{mcp,gateway} routes, registered by
+        // SettingsRoutes; this adds the page and nothing else.
+        HttplibRouteSink integrations_sink{*web_server_};
+        yuzu::server::integrations::register_integrations_routes(
+            integrations_sink,
+            yuzu::server::integrations::Deps{
+                .admin_fn =
+                    [this](const httplib::Request& req, httplib::Response& res) {
+                        return require_admin(req, res);
+                    },
+            });
 
         // #2542 PR-12: the legacy GET /events SSE stream, extracted onto
         // the HttpRouteSink seam (legacy_events_routes.cpp) — see that
@@ -19312,18 +19347,20 @@ private:
             [this](const std::string& event_type, const httplib::Request& req,
                    const nlohmann::json& attrs,
                    const nlohmann::json& payload) { emit_event(event_type, req, attrs, payload); },
-            webhook_store_.get());
+            webhook_store_.get(), WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins});
 
         // OffloadRoutes — /api/v1/offload-targets/* (Phase 8.3, #255)
         offload_routes_ = std::make_unique<OffloadRoutes>();
         offload_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
-                                         offload_target_store_.get());
+                                         offload_target_store_.get(),
+                                         WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins});
 
         // DiscoveryRoutes — /api/directory/*, /api/patches/*, /api/deployments/*, /api/discovery/*
         discovery_routes_ = std::make_unique<DiscoveryRoutes>();
         discovery_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
                                            directory_sync_.get(), patch_manager_.get(),
-                                           deployment_store_.get(), discovery_store_.get());
+                                           deployment_store_.get(), discovery_store_.get(),
+                                           WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins});
 
         // EnrollmentDirectoryRoutes — #4031 REST v1 read twins:
         // /api/v1/directory/{users,status}, /api/v1/enrollment/{auto-approve-rules,

@@ -169,6 +169,51 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 
 ---
 
+## Settings: Integrations page
+
+**Settings → Integrations** (`/settings/integrations`, admin only; the MCP and Gateway panels also
+stay on the `/settings` page). Every panel reads through admin-only fragments that are also gated
+by the securable of the matching JSON route (Infrastructure Read for webhooks and offload
+targets, Directory Read for directory sync), so a fragment is never wider than its JSON twin.
+
+- **MCP server** enables or disables the endpoint and sets Read-only or Full access, with one
+  Save. The confirmation names the state being saved (MCP off, on in read-only mode, or on with
+  write and execute tools). A change lasts until the server restarts, then the start-up flags
+  (`--mcp-disable`, `--mcp-read-only`) apply again; a server started with `--mcp-disable` does not
+  serve MCP until it is restarted without it.
+- **Gateway** shows the upstream-service state, the listen address, the gateway mode and the
+  number of agents connected through the gateway, the flag guidance for a server where the
+  upstream service is not running, and the gateway environment-variable reference.
+- **Webhooks** lists the configured webhooks (destination host, events, last delivery) and opens
+  a delivery history. You can create and delete a webhook; the create confirmation names the
+  destination host and the data the chosen events carry. A destination with embedded
+  `user:password@`, or with control characters in the URL or event types, is refused. The
+  signing secret is write-only. There is no restriction on the destination address, and the
+  confirmation is a click-through, not an approval step.
+- **Offload targets** lists the targets (destination host, events, batch size, last delivery),
+  opens a delivery history, and creates and deletes targets under the same rules. The credential
+  is write-only. The create audit row records the name, the destination's scheme and host and a fingerprint
+  of the URL, never its path or query (see [Audit Log](audit-log.md)).
+- **Directory sync** shows the Microsoft Entra sync state (never synced, running, completed or
+  failed are separate states, and a failed read says so rather than showing an empty panel), the
+  synced user and group counts, and a form that runs a sync. The tenant, client and secret are used
+  for that one request and never stored. "Show directory users" loads the list on request, audited
+  as `directory.users.view`; it is withheld if the audit row cannot be written and shows the first
+  200 users. Group-to-role mappings are recorded for reference; nothing reads them at sign-in.
+
+**Upgrade note.** `POST /api/settings/mcp` now requires exactly one `enabled` and exactly one
+`read_only` field, each the literal `true` or `false`, and answers `400` otherwise. Scripts that
+omitted a field or sent another value must be updated. Creating a webhook or offload target with
+`user:password@` in the URL, or with a control character in the URL or event types, now answers
+`400` (existing rows are not changed). Webhook and offload-target audit rows now record the
+destination's scheme and host plus a short fingerprint, never the URL path or query; rows written by
+earlier builds still hold the full URL and should be treated like a credential. These writes (and
+directory sync, the group-mapping save and `POST /api/settings/mcp`) write an `attempted` audit row
+first and refuse with `503` if it cannot be stored, and refuse a cross-site browser request with
+`403`.
+
+---
+
 ## Configuration Files
 
 The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg` on Linux, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) and its runtime state files live on disk; the state files are written to `--data-dir` (default: the directory containing the config file). Apart from those files, the NVD cache and the `agent-updates/`/`upload-blobs/` file directories, everything — users, sessions, MFA/TOTP, SCIM and every other server store — lives in PostgreSQL (see [PostgreSQL Substrate](#postgresql-substrate)). There is no `auth.db`; legacy `*.db` files left in `--data-dir` by older releases are only probed at startup to warn, never read.
@@ -258,6 +303,19 @@ separately.
 ---
 
 ## Upgrade Notes
+
+### vNEXT - Integrations writes need a same-site Origin on a cookie session, write an `attempted` audit row first, and store no destination URL (breaking for cookie-reusing scripts)
+
+`POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync`, `PUT /api/directory/group-mappings` and `POST /api/settings/mcp` now answer `403` to a request authenticated by a **session cookie** that carries no `Origin`/`Referer`, or one naming another site. A script that reuses a login cookie jar (`curl -b`) must switch to an API token (token callers are not gated) or send a same-site `Origin`; behind a proxy that rewrites `Host`, declare the external origin with `--csrf-trusted-origin` as described above. Each of these writes also records a `result=attempted` audit row before it changes anything and answers `503` with `Sec-Audit-Failed: true` when that row cannot be stored; during an audit-store outage they are unavailable, deleting a webhook or offload target included (the MCP switches can still be turned off with `--mcp-disable` and a restart; check `/healthz` `stores.audit` and the `YuzuAuditPersistFailures` alert). SIEM rules that filter `result != success` will now also see the `attempted` rows. Webhook and offload audit rows record `url=<scheme>://<host>[:<port>] url_fp=<12 hex>` instead of the full URL, and their log lines name the host (and the webhook or target id where one exists), never the URL; rows written by earlier builds keep the full URL, so rotate any hook URL that appears in one.
+
+### vNEXT - `POST /api/settings/mcp` now refuses a body that omits or repeats `enabled` or `read_only` (breaking for scripted callers)
+
+The dashboard route behind the MCP settings form used to read the first `enabled` and `read_only`
+value it found and treat an absent one as `false`: a request carrying only `enabled=true` switched
+Read-only MCP to Full access, and an empty request switched MCP off. It now requires exactly one
+`enabled` and exactly one `read_only`, each `true` or `false`, and answers `400` with nothing
+changed otherwise. The rebuilt panel always sends both. A script that posted a single field must
+send both.
 
 ### vNEXT - `--gateway-upstream` refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs)
 
@@ -1442,7 +1500,7 @@ need no change.
 **The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
 — CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
 gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
-Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), and the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only). The dashboard renders fine and reads work; only the destructive actions
+Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only), and the Integrations page's webhook, offload-target, directory-sync, group-mapping and MCP-settings saves (`403 cross-site request refused`). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
@@ -1524,7 +1582,7 @@ bar, the 403s will continue. It is the fastest diagnosis for a mistyped entry.
 
 **What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as
 before, so an unproxied deployment sees no difference. Non-browser clients sending neither
-`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, and the two
+`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, except on the routes that gate a cookie session with `browser_write_is_cross_site` (the bell, instruction and dashboard-dispatch writes, and the Integrations writes: webhooks, offload targets, directory sync, group mappings, MCP settings), which refuse a header-less cookie request; and the two
 CA endpoints still treat both-headers-absent as cross-site. Leaving the flag unset is safe: it
 means same-host only, which is the previous behaviour.
 
