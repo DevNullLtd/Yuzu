@@ -385,14 +385,15 @@ enum class Verdict { Proceed, FleetWideRequired, TooMany };
 
 // ── cooldown ──────────────────────────────────────────────────────────────────────
 
-/// Seconds the operator still has to wait (0 = clear). A clock that stepped backwards
-/// reads as a full wait, never as a negative one.
+/// Seconds the operator still has to wait (0 = clear). A stamp from the FUTURE (the clock
+/// stepped backwards since the run) is stale, not a lock-out: it would otherwise hold the
+/// operator for the size of the step plus 60 s. The next run overwrites it (`stamp`).
 [[nodiscard]] inline std::int64_t cooldown_remaining(std::optional<std::int64_t> last_run, std::int64_t now) {
     if (!last_run)
         return 0;
     const std::int64_t elapsed = now - *last_run;
     if (elapsed < 0)
-        return kCooldownSecs;
+        return 0;
     return elapsed >= kCooldownSecs ? 0 : kCooldownSecs - elapsed;
 }
 

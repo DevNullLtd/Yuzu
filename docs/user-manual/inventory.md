@@ -624,7 +624,8 @@ place, **Hardware** and **Software**, each its own page:
     instead. One request reaches at most 500 devices (`413` above that, counted after the
     skips: narrow the scope). A group, scope or fleet run is limited to one per operator per
     60 seconds (`429` with `Retry-After`) and one at a time per server process (`409`); a
-    single device is exempt. Both limits are held in each server process, not across a
+    single device is exempt. A server clock that steps backwards cannot lock an operator out:
+    a last-run time in the future is ignored. Both limits are held in each server process, not across a
     cluster: with several active servers (active-active) each one allows its own run and
     keeps its own per-operator cooldown, and every run is still bounded by the 500-device
     cap. The request is audited as `inventory.sync.request` before

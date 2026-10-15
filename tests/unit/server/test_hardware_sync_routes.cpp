@@ -473,14 +473,20 @@ TEST_CASE("sync route: the cooldown is exactly 60 s per operator, on the injecte
     CHECK(restarted->status == 429);
     CHECK(restarted->get_header_value("Retry-After") == "59");
 
-    // A clock that stepped back reads as a full wait, never a negative one.
+    // A clock that stepped back (stamp at t+60, now t+30) is not a lock-out: the stamp from the
+    // future is stale, the run goes through, and its own stamp replaces it.
+    const int runs_before = h.dispatch_calls;
     auto back = attempt(30);
     REQUIRE(back);
-    CHECK(back->status == 429);
-    CHECK(back->get_header_value("Retry-After") == "60");
+    CHECK(back->status == 202);
+    CHECK(h.dispatch_calls == runs_before + 1);
+    auto after_back = attempt(31); // the window now counts from t+30
+    REQUIRE(after_back);
+    CHECK(after_back->status == 429);
+    CHECK(after_back->get_header_value("Retry-After") == "59");
 
     // Neither another operator nor a single named device is held by this operator's window.
-    h.clock = t0 + 61;
+    h.clock = t0 + 31;
     h.username = "bob";
     CHECK(h.post(R"({"scope":"group:g"})")->status == 202);
     h.username = "alice";

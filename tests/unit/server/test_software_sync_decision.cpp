@@ -231,7 +231,7 @@ TEST_CASE("sync decide: the cap is on what is reached, and 500 itself is allowed
 
 // ── cooldown ──────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync cooldown: 60 s per operator, boundary exact, backwards clock reads as a full wait",
+TEST_CASE("sync cooldown: 60 s per operator, boundary exact, a stamp from the future is stale",
           "[server][software_sync]") {
     CHECK(ss::kCooldownSecs == 60);
     CHECK(ss::cooldown_remaining(std::nullopt, 1000) == 0);       // never ran
@@ -240,7 +240,9 @@ TEST_CASE("sync cooldown: 60 s per operator, boundary exact, backwards clock rea
     CHECK(ss::cooldown_remaining(1000, 1059) == 1);
     CHECK(ss::cooldown_remaining(1000, 1060) == 0);               // boundary: clear at exactly 60
     CHECK(ss::cooldown_remaining(1000, 5000) == 0);
-    CHECK(ss::cooldown_remaining(1000, 900) == 60);               // clock stepped back
+    CHECK(ss::cooldown_remaining(1000, 999) == 0);                // clock stepped back by 1 s
+    CHECK(ss::cooldown_remaining(1000, 900) == 0);                // ...by 100 s: stale, not a lock-out
+    CHECK(ss::cooldown_remaining(1000, -5) == 0);
 }
 
 TEST_CASE("sync cooldown state: bounded, oldest stamp evicted, a returning operator never evicts",
