@@ -432,13 +432,41 @@ service_definition_configured() {
     grep -Eiq '^ *YUZU_TLS_SYSTEM_ROOTS = *(1|true|yes|on) *$' <<<"$environment"
 }
 
-# A flag's environment variable counts when present, whatever its value (CLI11).
+# Whether a definition makes the agent require plugin signatures, read as the
+# agent's CLI11 parser reads it: a bare --plugin-require-signature is on;
+# --plugin-require-signature=VALUE and YUZU_PLUGIN_REQUIRE_SIGNATURE are off for
+# 0/false/off/no or empty (any case) and on otherwise; the command line, last
+# occurrence, overrides the environment (PR #4482 governance g8b-3).
+# Returns 0 required, 1 not required, 2 unreadable.
+cli11_flag_value_enabled() {
+    local value
+    value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "$value" in ""|0|false|off|no) return 1 ;; esac
+    return 0
+}
+
+plugin_signatures_required_by() {
+    local plist="$1" arguments line state="" value
+    arguments="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || return 2
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in
+            --plugin-require-signature) state=on ;;
+            --plugin-require-signature=*)
+                if cli11_flag_value_enabled "${line#*=}"; then state=on; else state=off; fi ;;
+        esac
+    done <<< "$arguments"
+    [[ -z "$state" ]] || { [[ "$state" == on ]]; return; }
+    value="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:YUZU_PLUGIN_REQUIRE_SIGNATURE' "$plist" 2>/dev/null)" || return 1
+    cli11_flag_value_enabled "$value"
+}
+
+# The merged incoming definition is always readable; if it is not, assume
+# enforcement and refuse (the safe direction).
 service_definition_requires_plugin_signatures() {
-    local plist="$1" arguments environment
-    arguments="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$plist")" || return 0
-    grep -Eq '^ *--plugin-require-signature(=|$)' <<<"$arguments" && return 0
-    environment="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables' "$plist" 2>/dev/null)" || return 1
-    grep -Eq '^ *YUZU_PLUGIN_REQUIRE_SIGNATURE = ' <<<"$environment"
+    local status=0
+    plugin_signatures_required_by "$1" || status=$?
+    [[ "$status" == 0 || "$status" == 2 ]]
 }
 
 # Retained signature enforcement would reject every unsigned plugin of this

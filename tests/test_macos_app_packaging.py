@@ -1987,9 +1987,19 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
     # ── Governance pd-1: retained signature enforcement vs unsigned plugins ────
     @macos_userland
     def test_unsigned_plugins_are_refused_when_signatures_will_be_required(self) -> None:
+        # CLI11's reading (g8b-3): a bare flag is on; =VALUE and the env var are off
+        # for 0/false/off/no/empty, on otherwise; the command line overrides the env.
         cases = (([], None, False, True), (["--plugin-require-signature"], None, False, False),
                  (["--plugin-require-signature"], None, True, True),
-                 ([], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "0"}, False, False),
+                 ([], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "1"}, False, False),
+                 ([], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "TRUE"}, False, False),
+                 ([], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "0"}, False, True),
+                 ([], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "Off"}, False, True),
+                 ([], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": ""}, False, True),
+                 (["--plugin-require-signature=false"], None, False, True),
+                 (["--plugin-require-signature=yes"], None, False, False),
+                 (["--plugin-require-signature=false"], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "1"}, False, True),
+                 (["--plugin-require-signature=false", "--plugin-require-signature"], None, False, False),
                  ([], {"YUZU_PLUGIN_TRUST_BUNDLE": "/t.pem"}, False, True))
         for arguments, environment, signed, accepted in cases:
             with self.subTest(arguments=arguments, environment=environment, signed=signed), \
@@ -2003,7 +2013,8 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                     (incoming / "tar.dylib.sig").write_bytes(b"sidecar")
                 result = self._installer_harness(
                     root, "postinstall",
-                    ("service_definition_requires_plugin_signatures", "reject_unsigned_plugins_under_enforcement"),
+                    ("cli11_flag_value_enabled", "plugin_signatures_required_by",
+                     "service_definition_requires_plugin_signatures", "reject_unsigned_plugins_under_enforcement"),
                     "reject_unsigned_plugins_under_enforcement\necho ACCEPTED\n", plist="real")
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 self.assertEqual("ACCEPTED" in result.stdout, accepted)
@@ -2210,7 +2221,9 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
     @macos_userland
     def test_preinstall_refuses_unsigned_plugins_under_retained_enforcement(self) -> None:
         cases = (("1", ["--plugin-require-signature"], None, "plist", False),
-                 ("1", [], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "0"}, "plist", False),
+                 ("1", [], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "1"}, "plist", False),
+                 ("1", [], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "0"}, "plist", True),
+                 ("1", ["--plugin-require-signature=no"], {"YUZU_PLUGIN_REQUIRE_SIGNATURE": "1"}, "plist", True),
                  ("1", [], None, "plist", True),
                  ("1", ["--plugin-require-signature"], None, "unreadable", True),
                  ("1", [], None, "absent", True),
@@ -2225,7 +2238,8 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                 elif kind == "unreadable":
                     plist.parent.mkdir(parents=True)
                     plist.write_text("<plist><dict><key>ProgramArguments</key><array><string>--plugin-require-sig")
-                result = self._installer_harness(root, "preinstall", ("reject_unsigned_plugins_under_enforcement",),
+                result = self._installer_harness(root, "preinstall", ("cli11_flag_value_enabled", "plugin_signatures_required_by",
+                                                                      "reject_unsigned_plugins_under_enforcement"),
                                                  "reject_unsigned_plugins_under_enforcement\necho ACCEPTED\n",
                                                  plist="real", stubs=f"UNSIGNED_PLUGINS={unsigned}\n")
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)

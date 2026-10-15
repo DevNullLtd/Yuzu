@@ -2908,7 +2908,8 @@ test('macOS Endpoint Security app packaging',
   _python3_test,
   args: [files('test_macos_app_packaging.py')],
   suite: 'agent',
-  timeout: 30,
+  # ~25 s on the macOS CI runner with 81 cases (governance bci-2).
+  timeout: 90,
 )
 test('macOS development foundation checks',
   _python3_test,

@@ -966,14 +966,14 @@ jobs:
             exit 1
           fi
           CHAIN=(/usr/local /usr/local/lib /usr/local/lib/yuzu /usr/local/bin)
-          for d in "${CHAIN[@]}"; do [ -e "$d" ] && stat -f '%Su:%Sg %Sp %N' "$d"; done
+          for d in "${CHAIN[@]}"; do [ -e "$d" ] && /usr/bin/stat -f '%Su:%Sg %Sp %N' "$d"; done
           # The hosted image creates /usr/local/bin as runner:admin 775
           # (actions/runner-images configure-machine.sh), which the installer
           # must refuse for the loose lane before installing anything (#4482).
           loose=0
           for d in "${CHAIN[@]}"; do
             [ -e "$d" ] || continue
-            [ "$(stat -f '%u' "$d")" = 0 ] && [ $(( 8#$(stat -f '%Lp' "$d") & 8#022 )) = 0 ] || loose=1
+            [ "$(/usr/bin/stat -f '%u' "$d")" = 0 ] && [ $(( 8#$(/usr/bin/stat -f '%Lp' "$d") & 8#022 )) = 0 ] || loose=1
           done
           if [ "$loose" = 1 ]; then
             echo "Checking the refusal on the loosened /usr/local chain"
