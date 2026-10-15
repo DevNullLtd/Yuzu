@@ -636,7 +636,7 @@ place, **Hardware** and **Software**, each its own page:
       narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
       up to 256 bytes.
     - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
-      (`429` with `Retry-After`) and one at a time per server process (`409`); a single device
+      (`429` with `Retry-After`) (an attempt refused for exceeding 500 devices, or one that found nothing to reach, counts as a run) and one at a time per server process (`409`); a single device
       is exempt from both. A `409` can follow a slow agent connection: the server sends to its
       targets one after another, and a connected agent that has stopped reading holds the run
       until it reads or disconnects (a dead connection is cut by the gRPC keepalive, but no

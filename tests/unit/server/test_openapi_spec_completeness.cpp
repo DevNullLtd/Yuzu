@@ -368,6 +368,14 @@ TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out reques
     CHECK(props["scope_expression"]["maxLength"] == 1024);
     CHECK(props["source"]["enum"] == json::array({"installed_software"}));
     CHECK(props.size() == 3);
+    // Machine-readable bounds and the exactly-one-selector rule, not prose alone.
+    CHECK(props["scope"]["minLength"] == 1);
+    CHECK(props["scope"]["maxLength"] == 256);
+    CHECK(props["scope_expression"]["minLength"] == 1);
+    const auto& req_schema = op["requestBody"]["content"]["application/json"]["schema"];
+    CHECK(req_schema["oneOf"] ==
+          json::array({json{{"required", json::array({"scope"})}},
+                       json{{"required", json::array({"scope_expression"})}}}));
 
     // Every status the route can answer, no more and no fewer.
     REQUIRE(op.contains("responses"));
@@ -388,6 +396,18 @@ TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out reques
     // The 429 leg names its Retry-After and the 413 leg its cap.
     CHECK(op["responses"]["429"].value("description", "").find("Retry-After") != std::string::npos);
     CHECK(op["responses"]["413"].value("description", "").find("500") != std::string::npos);
+    // The 429 carries a typed integer Retry-After header; the 202 is a typed envelope; every
+    // refusal body is the A4 error envelope.
+    CHECK(op["responses"]["429"]["headers"]["Retry-After"]["schema"]["type"] == "integer");
+    const auto& accepted_schema =
+        op["responses"]["202"]["content"]["application/json"]["schema"];
+    CHECK(accepted_schema["required"] == json::array({"data", "meta"}));
+    for (const char* field : {"requested", "agents_reached", "skipped_offline", "skipped_version",
+                              "command_id", "source", "requested_at"})
+        CHECK(accepted_schema["properties"]["data"]["properties"].contains(field));
+    for (const char* code : {"400", "403", "409", "413", "429", "500", "503"})
+        CHECK(op["responses"][code]["content"]["application/json"]["schema"]["$ref"] ==
+              "#/components/schemas/A4ErrorEnvelope");
 }
 
 TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query parameter and "

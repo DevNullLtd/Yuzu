@@ -24,7 +24,6 @@ using nlohmann::json;
 
 namespace {
 
-ss::Candidate cand(std::string id, std::optional<std::string> v) { return {std::move(id), std::move(v)}; }
 
 bool floor_ok(std::string_view v) { return agent_supports_sync_now(v); }
 
@@ -155,17 +154,18 @@ TEST_CASE("sync request: only a group; scope or fleet run needs the run guard", 
 
 TEST_CASE("sync partition: offline; too-old and unparseable are counted; not sent",
           "[server][software_sync]") {
-    const std::vector<ss::Candidate> in = {
-        cand("a", "0.13.1"),     // exactly the floor
-        cand("b", std::nullopt), // no session on this server process: offline
-        cand("c", "0.13.0"),     // one patch below
-        cand("d", "0.14.0"),
-        cand("e", "banana"),     // unparseable: never reachable
-        cand("f", "1.0.0"),
-        cand("g", std::nullopt),
-        cand("h", ""),           // live session that reported nothing
+    const std::vector<std::string> in = {"a", "b", "c", "d", "e", "f", "g", "h"};
+    const std::unordered_map<std::string, std::optional<std::string>> versions = {
+        {"a", "0.13.1"},       // exactly the floor
+        {"b", std::nullopt},   // no session on this server process: offline
+        {"c", "0.13.0"},       // one patch below
+        {"d", "0.14.0"},
+        {"e", "banana"},       // unparseable: never reachable
+        {"f", "1.0.0"},
+        {"g", std::nullopt},
+        {"h", ""},             // live session that reported nothing
     };
-    const auto p = ss::partition(in, floor_ok);
+    const auto p = ss::partition(in, [&](const std::string& id) { return versions.at(id); }, floor_ok);
     CHECK(p.targets == std::vector<std::string>{"a", "d", "f"}); // input order preserved
     CHECK(p.counts.requested == 8);
     CHECK(p.counts.reached == 3);
@@ -173,13 +173,36 @@ TEST_CASE("sync partition: offline; too-old and unparseable are counted; not sen
     CHECK(p.counts.skipped_version == 3);
     CHECK(p.counts.requested ==
           p.counts.reached + p.counts.skipped_offline + p.counts.skipped_version);
+    CHECK_FALSE(p.over_cap);
 }
 
 TEST_CASE("sync partition: nothing in; nothing out", "[server][software_sync]") {
-    const auto p = ss::partition({}, floor_ok);
+    const auto p = ss::partition({}, [](const std::string&) { return std::optional<std::string>{}; }, floor_ok);
     CHECK(p.targets.empty());
     CHECK(p.counts.requested == 0);
     CHECK(p.counts.reached == 0);
+}
+
+TEST_CASE("sync partition: stops at the first reachable target past the cap", "[server][software_sync]") {
+    std::vector<std::string> in;
+    for (std::size_t i = 0; i < ss::kMaxTargets + 200; ++i)
+        in.push_back("d" + std::to_string(i));
+    std::size_t lookups = 0;
+    const auto p = ss::partition(
+        in,
+        [&](const std::string&) {
+            ++lookups;
+            return std::optional<std::string>("0.13.1");
+        },
+        floor_ok);
+    CHECK(p.over_cap);
+    CHECK(p.targets.size() == ss::kMaxTargets + 1);
+    CHECK(lookups == ss::kMaxTargets + 1);
+    // Exactly the cap is not over it.
+    in.resize(ss::kMaxTargets);
+    CHECK_FALSE(ss::partition(in, [](const std::string&) { return std::optional<std::string>("0.13.1"); },
+                              floor_ok)
+                    .over_cap);
 }
 
 TEST_CASE("sync finalize: a refused send moves a target to skipped_offline", "[server][software_sync]") {

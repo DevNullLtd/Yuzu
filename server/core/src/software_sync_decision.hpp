@@ -324,14 +324,6 @@ template <class MintId, class Prepare, class SendOne>
 
 // ── partition ─────────────────────────────────────────────────────────────────────
 
-struct Candidate {
-    std::string id;
-    /// nullopt == no live session on THIS server process. That is all this route can know: a
-    /// device attached to another replica of an active-active deployment looks the same as a
-    /// disconnected one, and is counted with it (see `Counts::skipped_offline`).
-    std::optional<std::string> version;
-};
-
 struct Counts {
     std::size_t requested{0};
     std::size_t reached{0};
@@ -352,23 +344,35 @@ struct Counts {
 struct Plan {
     std::vector<std::string> targets; // the live, new-enough subset, in input order
     Counts counts;
+    /// The walk stopped because a reachable target past `kMaxTargets` was found: `counts` is
+    /// then partial (the answer is 413 whatever the rest holds).
+    bool over_cap{false};
 };
 
-/// Split candidates into targets / offline / too-old. `supports(version)` is the sync-now
-/// version floor (`agent_supports_sync_now`: 0.13.1+); an unparseable version fails it, so it
-/// counts as too old, never as reachable. Only a device with a session on THIS process is a
-/// target; one with none is counted offline, including a device attached to another replica.
-template <class SupportsFn>
-[[nodiscard]] Plan partition(const std::vector<Candidate>& candidates, SupportsFn&& supports) {
+/// Split ids into targets / offline / too-old. `version_of(id)` is the agent version of a
+/// session on THIS process or nullopt (a device attached to another replica looks the same as a
+/// disconnected one, and is counted with it - see `Counts::skipped_offline`); `supports(version)`
+/// is the sync-now version floor (`agent_supports_sync_now`: 0.13.1+), and an unparseable version
+/// fails it, so it counts as too old, never as reachable. The walk stops at the first reachable
+/// target past `kMaxTargets` (`Plan::over_cap`), so an `__all__` over a huge fleet costs at most
+/// `kMaxTargets + 1` session lookups plus the offline ones, not one lookup per device.
+template <class VersionFn, class SupportsFn>
+[[nodiscard]] Plan partition(const std::vector<std::string>& ids, VersionFn&& version_of,
+                             SupportsFn&& supports) {
     Plan p;
-    p.counts.requested = candidates.size();
-    for (const auto& c : candidates) {
-        if (!c.version) {
+    p.counts.requested = ids.size();
+    for (const auto& id : ids) {
+        const std::optional<std::string> version = version_of(id);
+        if (!version) {
             ++p.counts.skipped_offline;
-        } else if (!supports(std::string_view(*c.version))) {
+        } else if (!supports(std::string_view(*version))) {
             ++p.counts.skipped_version;
         } else {
-            p.targets.push_back(c.id);
+            p.targets.push_back(id);
+            if (p.targets.size() > kMaxTargets) {
+                p.over_cap = true;
+                break;
+            }
         }
     }
     p.counts.reached = p.targets.size();

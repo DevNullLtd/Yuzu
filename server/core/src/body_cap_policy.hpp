@@ -60,11 +60,13 @@
 /// `Content-Length` — is REFUSED outright rather than admitted up to the
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
-/// DEFAULTS OFF and is opted into per class, not per table. It is ON only
-/// for `/mcp/`: that surface's own protocol/client contract already requires
-/// `Content-Length` on every framed body (see `web_utils.hpp:577`'s
-/// `mcp_body_unmeasurable` rationale), so refusing an unmeasurable MCP body
-/// costs a conforming client nothing. Every other class below — public REST
+/// DEFAULTS OFF and is opted into per class, not per table. It is ON for
+/// three classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
+/// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
+/// costs a conforming client nothing), `upload_session`, and `hardware` (the
+/// Hardware CI routes carry only a tiny JSON body from the dashboard and API
+/// callers). Every other class below — public REST
 /// (bundles), SCIM, certificate import (REST + dashboard), the plugin trust
 /// bundle, product-pack/workflow authoring, and the OTA upload — keeps it
 /// OFF and falls back to httplib's 100 MiB backstop for a body it cannot

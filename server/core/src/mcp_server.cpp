@@ -15315,13 +15315,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // retry-hint-exempt: the scope expression is a client-input error
                     res.set_content(error_response(id, kInvalidParams, out.message), "application/json");
                     return;
+                case ss::Status::TooMany:
+                    // retry-hint-exempt: over the 500-device cap, narrowing the scope is the fix
+                    res.set_content(error_response(id, kInvalidParams, out.message), "application/json");
+                    return;
                 case ss::Status::FleetWideRequired:
                     // retry-hint-exempt: a missing grant is not cured by retrying
                     res.set_content(a4_error(kPermissionDenied, out.message), "application/json");
                     return;
                 default:
-                    // Cooldown, in-flight, unresolved scope, audit unavailable, nothing reachable,
-                    // over the cap: the Runner supplies the hint where retrying can help.
+                    // Cooldown, in-flight, unresolved scope, audit unavailable, nothing reachable:
+                    // the Runner supplies the hint where retrying can help.
                     res.set_content(a4_error(kInternalError, out.message, {}, out.retry_after_ms.value_or(-1)),
                                     "application/json");
                     return;

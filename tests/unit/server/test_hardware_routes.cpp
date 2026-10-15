@@ -82,6 +82,7 @@ struct HwHarness {
     bool unwire_agent_version_fn = false;
     bool audit_should_fail = false; // simulates an audit-store degrade (AuditFn returns false)
     int sync_dispatch_calls = 0;
+    std::string auth_source; // what the same-site gate sees for the caller ("api_token", ...)
 
     // Quarantine pill (es-1): `quarantine_rows` unset = the list closure is left unwired.
     // The pill uses ONE Security:Read list-gate decision per render (never a per-record probe).
@@ -242,6 +243,12 @@ struct HwHarness {
         };
         deps.sync_dispatch_fn = unwire_sync_dispatch ? HardwareRoutes::SyncDispatchFn{} : sync_fn;
         deps.agent_version_fn = unwire_agent_version_fn ? HardwareRoutes::AgentVersionFn{} : version_fn;
+        deps.write_gate.resolve_session = [this](const httplib::Request&) {
+            auth::Session sess;
+            sess.username = "alice";
+            sess.auth_source = auth_source;
+            return std::optional<auth::Session>(sess);
+        };
         // A browser sends these on every same-origin write; the per-device sync POST refuses a
         // cookie-session write without them.
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
@@ -703,6 +710,45 @@ TEST_CASE("route: POST .../sync — non-string source is a 400, not an uncaught 
         if (a == "inventory.sync.request|denied")
             denied = true;
     REQUIRE(denied);
+}
+
+TEST_CASE("route: POST .../sync — a cross-site, foreign-origin or header-less cookie write is 403",
+          "[hardware][route][rest][security]") {
+    const std::vector<std::unordered_map<std::string, std::string>> bad = {
+        {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}},
+        {{"Host", "yuzu.test"}, {"Referer", "https://evil.example/x"}},
+        {{"Host", "yuzu.test"}},
+    };
+    for (const auto& headers : bad) {
+        HwHarness h;
+        h.sink.default_headers = headers;
+        auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", "");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.sync_dispatch_calls == 0);
+        REQUIRE_FALSE(h.audits.empty());
+        CHECK(h.audits.back() == "csrf.denied|denied");
+    }
+    // Admission first: a caller without Execute keeps the plain 403 and leaves no csrf row.
+    {
+        HwHarness h;
+        h.allow_scoped_perm = false; // the route's scoped Execution:Execute gate is this closure
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+        auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", "");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(std::find(h.audits.begin(), h.audits.end(), "csrf.denied|denied") == h.audits.end());
+    }
+    // Token callers send no Origin and are exempt.
+    for (const char* source : {"api_token", "mcp_token"}) {
+        HwHarness h;
+        h.auth_source = source;
+        h.sink.default_headers = {{"Host", "yuzu.test"}};
+        auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", "");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(h.sync_dispatch_calls == 1);
+    }
 }
 
 TEST_CASE("route: POST .../sync — agent below the sync-now version floor is 409",

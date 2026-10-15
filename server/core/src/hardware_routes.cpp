@@ -186,8 +186,6 @@ void HardwareRoutes::register_routes(httplib::Server& svr, Deps deps) {
 void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     deps_ = std::move(deps);
 
-    sync_runner_ = deps_.sync_runner;
-
     // -- Page shells (auth-only chrome; fragments carry the real gates) --
     sink.Get("/hardware", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = deps_.auth_fn(req, res);
@@ -569,7 +567,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         namespace ss = software_sync;
         constexpr const char* kAction = "inventory.sync.request";
         detail::ensure_correlation_id(res);
-        if (!deps_.sync_perm_fn || !deps_.auth_fn || !sync_runner_) {
+        if (!deps_.sync_perm_fn || !deps_.auth_fn || !deps_.sync_runner) {
             // The derivation of "which devices may this caller sync" is this route's only
             // per-device authorization, so a missing dependency is a server misconfiguration
             // (500), not a transient outage, and it is audited. Nothing here may use the
@@ -610,7 +608,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return detail::emit_behavioral_audit(deps_.audit_fn, req, res, kAction, std::string(result),
                                                  std::string(type), id, detail_text);
         };
-        const auto out = sync_runner_->run(*session, *parsed, audit);
+        const auto out = deps_.sync_runner->run(*session, *parsed, audit);
         if (out.status != ss::Status::Accepted) {
             if (out.status == ss::Status::Cooldown)
                 res.set_header("Retry-After", std::to_string(*out.retry_after_ms / 1000));

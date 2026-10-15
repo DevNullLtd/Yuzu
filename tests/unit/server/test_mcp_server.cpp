@@ -35618,6 +35618,9 @@ TEST_CASE("MCP sync_hardware_software: refuses a service-scoped token, bad argum
         ts.start("");
         auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
         REQUIRE(res);
-        CHECK(nlohmann::json::parse(res->body).contains("error"));
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().find("not configured") != std::string::npos);
     }
 }

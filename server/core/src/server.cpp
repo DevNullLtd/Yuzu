@@ -12379,22 +12379,24 @@ private:
     /// the agent ignores stagger for this action, so the caller bounds the herd. `sent`
     /// counts sessions that accepted the frame; a command that cannot be classified sends
     /// nothing and returns the empty result (no command id).
+    [[nodiscard]] static std::string mint_sync_now_command_id() {
+        const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        return "__sync__-now-" + std::to_string(now_s) + "-" +
+               auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+    }
+
+    [[nodiscard]] auto build_sync_now_command(const std::string& command_id, const std::string& source) {
+        return build_classified_command(yuzu::server::DispatchCaller{.system = true}, "__sync__", "now",
+                                        command_id, /*parameters=*/{{"source", source}});
+    }
+
     [[nodiscard]] yuzu::server::software_sync::DispatchResult
     push_sync_now(const std::vector<std::string>& ids, const std::string& source) {
         auto out = yuzu::server::software_sync::fan_out(
-            ids,
-            [] {
-                const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
-                                       std::chrono::system_clock::now().time_since_epoch())
-                                       .count();
-                return "__sync__-now-" + std::to_string(now_s) + "-" +
-                       auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
-            },
-            [&](const std::string& command_id) {
-                return build_classified_command(yuzu::server::DispatchCaller{.system = true},
-                                                "__sync__", "now", command_id,
-                                                /*parameters=*/{{"source", source}});
-            },
+            ids, [] { return mint_sync_now_command_id(); },
+            [&](const std::string& command_id) { return build_sync_now_command(command_id, source); },
             [&](const std::string& id, const detail::ClassifiedCommand& cmd) {
                 return send_system_reserved(id, cmd,
                                             yuzu::server::SystemReservedPush::inventory_sync_now);
@@ -12409,62 +12411,60 @@ private:
     [[nodiscard]] yuzu::server::software_sync::Resolved
     software_sync_resolve(const auth::Session& sess, const yuzu::server::software_sync::Selector& sel) {
         namespace software_sync = yuzu::server::software_sync;
-                                     // Only the store reads live here; the confinement and every
-                                     // fail-closed branch are software_sync::resolve_targets.
-                                     software_sync::Expansion ex;
-                                     ex.all_ids = [this] { return registry_.all_ids(); };
-                                     ex.group_members =
-                                         [this](const std::string& group_id)
-                                         -> std::optional<std::vector<std::string>> {
-                                         if (!mgmt_group_store_)
-                                             return std::nullopt;
-                                         const auto members = mgmt_group_store_->get_members_checked(group_id);
-                                         if (!members)
-                                             return std::nullopt;
-                                         std::vector<std::string> ids;
-                                         ids.reserve(members->size());
-                                         for (const auto& m : *members)
-                                             ids.push_back(m.agent_id);
-                                         return ids;
-                                     };
-                                     ex.scope_matches =
-                                         [this, &sess](const std::string& expression)
-                                         -> software_sync::ScopeExpansion {
-                                         // The same ladder a real dispatch uses (alias -> owner
-                                         // check -> parse -> registry evaluation, fail closed).
-                                         const std::string role = auth::role_to_string(sess.role);
-                                         const std::string ref_id =
-                                             "__sync__-scope-" + auth::AuthManager::bytes_to_hex(
-                                                                     auth::AuthManager::random_bytes(8));
-                                         yuzu::server::ScopeLadderAudit audit;
-                                         audit.resolution_failed = [&](const std::string& ref) {
-                                             audit_scope_resolution_failed(sess.username, role, ref_id, ref);
-                                         };
-                                         audit.evaluation_aborted = [&](const std::string& reason) {
-                                             audit_scope_evaluation_aborted(sess.username, role, ref_id,
-                                                                            reason);
-                                         };
-                                         auto ladder = yuzu::server::resolve_scope_targets(
-                                             expression, sess.username, result_set_store_.get(),
-                                             [&](const yuzu::scope::Expression& parsed) {
-                                                 return registry_.evaluate_scope(
-                                                     parsed, tag_store_.get(),
-                                                     custom_properties_store_.get(),
-                                                     result_set_store_.get(), sess.username);
-                                             },
-                                             audit);
-                                         software_sync::ScopeExpansion out;
-                                         out.parse_error = std::move(ladder.parse_error);
-                                         out.matched = std::move(ladder.matched);
-                                         if (!out.matched && !out.parse_error)
-                                             out.abort_detail = ladder.abort_reason
-                                                                    ? to_string(*ladder.abort_reason)
-                                                                    : "unknown";
-                                         return out;
-                                     };
-                                     return software_sync::resolve_targets(sel, derive_exec_visible(sess),
-                                                                            ex);
-                                 }
+        software_sync::Expansion ex;
+        ex.all_ids = [this] { return registry_.all_ids(); };
+        ex.group_members =
+            [this](const std::string& group_id)
+            -> std::optional<std::vector<std::string>> {
+            if (!mgmt_group_store_)
+                return std::nullopt;
+            const auto members = mgmt_group_store_->get_members_checked(group_id);
+            if (!members)
+                return std::nullopt;
+            std::vector<std::string> ids;
+            ids.reserve(members->size());
+            for (const auto& m : *members)
+                ids.push_back(m.agent_id);
+            return ids;
+        };
+        ex.scope_matches =
+            [this, &sess](const std::string& expression)
+            -> software_sync::ScopeExpansion {
+            // The same ladder a real dispatch uses (alias -> owner
+            // check -> parse -> registry evaluation, fail closed).
+            const std::string role = auth::role_to_string(sess.role);
+            const std::string ref_id =
+                "__sync__-scope-" + auth::AuthManager::bytes_to_hex(
+                                        auth::AuthManager::random_bytes(8));
+            yuzu::server::ScopeLadderAudit audit;
+            audit.resolution_failed = [&](const std::string& ref) {
+                audit_scope_resolution_failed(sess.username, role, ref_id, ref);
+            };
+            audit.evaluation_aborted = [&](const std::string& reason) {
+                audit_scope_evaluation_aborted(sess.username, role, ref_id,
+                                               reason);
+            };
+            auto ladder = yuzu::server::resolve_scope_targets(
+                expression, sess.username, result_set_store_.get(),
+                [&](const yuzu::scope::Expression& parsed) {
+                    return registry_.evaluate_scope(
+                        parsed, tag_store_.get(),
+                        custom_properties_store_.get(),
+                        result_set_store_.get(), sess.username);
+                },
+                audit);
+            software_sync::ScopeExpansion out;
+            out.parse_error = std::move(ladder.parse_error);
+            out.matched = std::move(ladder.matched);
+            if (!out.matched && !out.parse_error)
+                out.abort_detail = ladder.abort_reason
+                                       ? to_string(*ladder.abort_reason)
+                                       : "unknown";
+            return out;
+        };
+        return software_sync::resolve_targets(sel, derive_exec_visible(sess),
+                                               ex);
+    }
 
     /// The ONE fleet-run instance, shared by `POST /api/v1/hardware/sync` and the MCP tool
     /// `sync_hardware_software`, so the per-operator cooldown and the single in-flight slot bind
@@ -12506,20 +12506,13 @@ private:
         yuzu::server::software_sync::DispatchResult out;
         if (ids.empty())
             return out;
-        const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
-        const std::string command_id =
-            "__sync__-now-" + std::to_string(now_s) + "-" +
-            auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
-        auto cmd = build_classified_command(yuzu::server::DispatchCaller{.system = true}, "__sync__",
-                                            "now", command_id,
-                                            /*parameters=*/{{"source", source}});
+        const std::string command_id = mint_sync_now_command_id();
+        auto cmd = build_sync_now_command(command_id, source);
         if (!cmd)
             return out; // a command that cannot be classified sends nothing and reports no id
         out.command_id = command_id;
         const auto result = yuzu::server::dispatch_system_reserved_ids(
-            yuzu::server::SystemReservedPush::inventory_sync_now, ids, derive_exec_visible(sess),
+            ids, derive_exec_visible(sess),
             [this, &cmd](const std::string& id) {
                 return send_system_reserved(id, *cmd,
                                             yuzu::server::SystemReservedPush::inventory_sync_now);

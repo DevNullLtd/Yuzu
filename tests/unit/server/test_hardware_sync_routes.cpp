@@ -286,8 +286,8 @@ TEST_CASE("sync route: nothing live to reach is 202 with reached 0; audited no_a
     CHECK(d["skipped_offline"] == 3);
     CHECK(h.dispatch_calls == 0);
     CHECK(h.audited("no_agents"));
-    // Nothing happened, so the operator's cooldown is not spent.
-    CHECK(h.post(R"({"scope":"group:g"})")->status == 202);
+    // The resolve and the lookups were paid for, so the operator's cooldown is spent.
+    CHECK(h.post(R"({"scope":"group:g"})")->status == 429);
 }
 
 // ── refusals: nothing is ever sent ────────────────────────────────────────────────
@@ -503,9 +503,9 @@ TEST_CASE("sync route: 501 reachable devices is 413; 500 is allowed",
         CHECK(h.dispatch_calls == 0);
         CHECK(h.audited("denied"));
         CHECK(contains(h.audit_details.back(), "over_cap"));
-        // A refusal for size does not start the operator's cooldown.
+        // A refusal for size cost a fleet-sized walk, so it spends the operator's cooldown.
         h.live(2);
-        CHECK(h.post(R"({"scope":"__all__"})")->status == 202);
+        CHECK(h.post(R"({"scope":"__all__"})")->status == 429);
     }
     {
         SyncHarness h;

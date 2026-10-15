@@ -343,8 +343,6 @@ private:
 
     Deps deps_;
 
-    /// `Deps::sync_runner`: the fleet-run sequence and its per-process cooldown / in-flight state.
-    std::shared_ptr<software_sync::Runner> sync_runner_;
 };
 
 } // namespace yuzu::server

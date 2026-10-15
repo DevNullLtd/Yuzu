@@ -6,10 +6,11 @@
 /// state it needs (the per-operator cooldown and the single in-flight slot), live here so that a
 /// second surface cannot be used to dodge either bound.
 ///
-///   preflight 403 -> cooldown 429 -> slot 409 -> resolve -> partition + cap 413 -> decide ->
-///   audit (fail closed) -> dispatch -> stamp
+///   preflight 403 -> cooldown 429 -> slot 409 -> resolve -> stamp cooldown -> partition + cap 413
+///   -> decide -> audit (fail closed) -> dispatch
 ///
-/// What it does NOT own: HTTP / JSON-RPC shaping (the caller maps an `Outcome`), authorization
+/// What it does NOT own: the response BODY shaping (`Outcome` carries the HTTP status for REST and
+/// a `Status` for MCP; the caller writes the envelope), authorization
 /// of the CALLER (the surface's type-level Execution:Execute gate and, for a browser, the
 /// same-site gate run first), and WHO IS REACHED. Reach is decided in `dispatch_confined_arms`
 /// (the `dispatch` seam below is wired to its system-reserved arm, which intersects the id list
@@ -161,6 +162,17 @@ public:
         }
 
         const auto resolved = env_.resolve(session, sel);
+        // The cooldown is spent by every attempt that did fleet-sized work but sent nothing (over
+        // the cap, no live target) as well as by a run that sent, so neither can be repeated back
+        // to back. Not spent: a malformed expression (a cheap parse error) and a degraded scope
+        // read, audit store or fully refused send (the 5 s / 30 s retry hint is the cure).
+        const auto spend_cooldown = [&] {
+            if (!guarded)
+                return;
+            const auto stamp_at = now(); // the clock is read outside the lock
+            std::lock_guard<std::mutex> lk(mu_);
+            stamp(last_run_, session.username, stamp_at);
+        };
         if (resolved.status == Resolved::Status::InvalidScope)
             return refuse(Status::BadScope, 400, "invalid scope: " + resolved.detail, "invalid_scope");
         if (resolved.status != Resolved::Status::Ok) {
@@ -175,36 +187,21 @@ public:
         }
 
         // Partition, stopping as soon as the reachable count passes the cap: past the cap the
-        // answer is 413 whatever the rest holds, so a huge `__all__` costs at most kMaxTargets+1
-        // session lookups, not one per device in the fleet.
-        Plan plan;
-        plan.counts.requested = resolved.ids.size();
-        bool over_cap = false;
-        for (const auto& id : resolved.ids) {
-            const auto version = env_.agent_version(id); // a session on THIS process, or nullopt
-            if (!version) {
-                ++plan.counts.skipped_offline;
-            } else if (!agent_supports_sync_now(*version)) {
-                ++plan.counts.skipped_version;
-            } else {
-                plan.targets.push_back(id);
-                if (plan.targets.size() > kMaxTargets) {
-                    over_cap = true;
-                    break;
-                }
-            }
-        }
-        plan.counts.reached = plan.targets.size();
+        // answer is 413 whatever the rest holds.
+        const auto plan = partition(
+            resolved.ids, env_.agent_version, [](std::string_view v) { return agent_supports_sync_now(v); });
 
         const auto verdict = decide(sel.arm, resolved.caller_unfiltered, plan.counts);
-        if (over_cap || verdict == Verdict::TooMany)
+        if (verdict == Verdict::FleetWideRequired)
+            return refuse_fleet_wide();
+        if (plan.over_cap) {
+            spend_cooldown();
             return refuse(Status::TooMany, 413,
                           "this would reach more than " + std::to_string(kMaxTargets) +
                               " devices; the limit is " + std::to_string(kMaxTargets) +
                               " per request - narrow the scope",
                           "over_cap cap=" + std::to_string(kMaxTargets));
-        if (verdict == Verdict::FleetWideRequired)
-            return refuse_fleet_wide();
+        }
 
         // Audit BEFORE dispatch and fail closed - same contract as the per-device route.
         if (!audit.persist(audit_result(plan.counts), type, target_id, audit_detail(sel, plan.counts))) {
@@ -225,11 +222,8 @@ public:
             out.retry_after_ms = 30000;
             return out;
         }
-        if (guarded && sent.sent > 0) {
-            const auto stamp_at = now(); // the clock is read outside the lock
-            std::lock_guard<std::mutex> lk(mu_);
-            stamp(last_run_, session.username, stamp_at);
-        }
+        if (plan.targets.empty() || sent.sent > 0)
+            spend_cooldown();
         out.status = Status::Accepted;
         out.http = 202;
         out.summary = summary_json(finalize(plan.counts, sent.sent), sent.command_id, now());

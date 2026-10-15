@@ -44,7 +44,6 @@ using yuzu::server::dispatch_confined_arms;
 using yuzu::server::DispatchArm;
 using yuzu::server::DispatchResolvers;
 using yuzu::server::dispatch_system_reserved_ids;
-using yuzu::server::SystemReservedPush;
 using yuzu::server::resolve_and_dispatch_confined;
 using yuzu::server::resolve_scope_targets;
 using yuzu::server::ScopeAbortReason;    // #4981 PR-1
@@ -178,7 +177,7 @@ TEST_CASE("system-reserved ids: unfiltered authority sends to exactly the named 
     RecordingSink sink;
     std::vector<std::string> sent_to;
     const auto r = dispatch_system_reserved_ids(
-        SystemReservedPush::inventory_sync_now, kThree, unfiltered(), [&](const std::string& id) {
+        kThree, unfiltered(), [&](const std::string& id) {
             sent_to.push_back(id);
             return true;
         });
@@ -191,7 +190,7 @@ TEST_CASE("system-reserved ids: a device outside the caller's visible set is nev
           "[server][dispatch][scope][security][sync_fanout]") {
     std::vector<std::string> sent_to;
     const auto r = dispatch_system_reserved_ids(
-        SystemReservedPush::inventory_sync_now, kThree, only({"dev-B"}), [&](const std::string& id) {
+        kThree, only({"dev-B"}), [&](const std::string& id) {
             sent_to.push_back(id);
             return true;
         });
@@ -202,8 +201,7 @@ TEST_CASE("system-reserved ids: a device outside the caller's visible set is nev
 TEST_CASE("system-reserved ids: a present-EMPTY visible set reaches NOBODY",
           "[server][dispatch][scope][security][sync_fanout]") {
     int calls = 0;
-    const auto r = dispatch_system_reserved_ids(SystemReservedPush::inventory_sync_now, kThree,
-                                                deny_all(), [&](const std::string&) {
+    const auto r = dispatch_system_reserved_ids(kThree, deny_all(), [&](const std::string&) {
                                                     ++calls;
                                                     return true;
                                                 });
@@ -216,7 +214,7 @@ TEST_CASE("system-reserved ids: the control-plane exemption still reaches a quar
     // A contained device keeps answering the read-only sync: no containment gate applies here.
     std::vector<std::string> sent_to;
     const auto r = dispatch_system_reserved_ids(
-        SystemReservedPush::inventory_sync_now, {"dev-Q"}, unfiltered(), [&](const std::string& id) {
+        {"dev-Q"}, unfiltered(), [&](const std::string& id) {
             sent_to.push_back(id);
             return true;
         });

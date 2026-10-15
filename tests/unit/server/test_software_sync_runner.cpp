@@ -8,9 +8,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server;
@@ -154,8 +157,12 @@ TEST_CASE("sync runner: a huge fleet costs at most cap+1 session lookups and is 
     CHECK(out.http == 413);
     CHECK(rig.version_lookups == static_cast<int>(ss::kMaxTargets) + 1);
     CHECK(rig.dispatch_calls == 0);
-    // A 413 is not a run: the operator may retry with a narrower scope at once.
+    // The walk was paid for, so the 413 spends the cooldown; after it the operator may narrow.
     rig.resolved_ids = {"d0"};
+    const auto again = runner.run(session_of("alice"), kFleet, rig.audit());
+    CHECK(again.status == ss::Status::Cooldown);
+    CHECK(rig.version_lookups == static_cast<int>(ss::kMaxTargets) + 1); // the repeat read nothing
+    rig.wall += 61;
     CHECK(runner.run(session_of("alice"), kFleet, rig.audit()).status == ss::Status::Accepted);
 }
 
@@ -175,4 +182,96 @@ TEST_CASE("sync runner: a confined caller naming the whole fleet is refused befo
     CHECK(out.http == 403);
     CHECK(resolves == 0);
     CHECK(rig.dispatch_calls == 0);
+}
+
+TEST_CASE("sync runner: which refused attempts spend the cooldown", "[server][software_sync][runner]") {
+    // No live target: the resolve and the lookups were paid for, so it is spent.
+    {
+        Rig rig;
+        auto env = rig.env();
+        env.agent_version = [](const std::string&) { return std::optional<std::string>{}; };
+        ss::Runner runner(std::move(env));
+        CHECK(runner.run(session_of("alice"), kFleet, rig.audit()).status == ss::Status::Accepted);
+        CHECK(rig.dispatch_calls == 0);
+        CHECK(runner.run(session_of("alice"), kFleet, rig.audit()).status == ss::Status::Cooldown);
+    }
+    // Not spent: a malformed expression, a degraded scope read, an audit that would not persist,
+    // and a send every session refused - the retry hint is the cure for each.
+    {
+        Rig rig;
+        auto env = rig.env();
+        ss::Resolved::Status next = ss::Resolved::Status::InvalidScope;
+        env.resolve = [&](const auth::Session&, const ss::Selector&) {
+            ss::Resolved r;
+            r.status = next;
+            r.caller_unfiltered = true;
+            r.ids = {"d0"};
+            return r;
+        };
+        ss::Runner runner(std::move(env));
+        const ss::Selector expr{DispatchArm::Scope, "ostype == \"linux\""};
+        CHECK(runner.run(session_of("alice"), expr, rig.audit()).status == ss::Status::BadScope);
+        next = ss::Resolved::Status::Aborted;
+        CHECK(runner.run(session_of("alice"), expr, rig.audit()).status == ss::Status::ScopeUnresolved);
+        next = ss::Resolved::Status::Ok;
+        rig.persist_ok = false;
+        CHECK(runner.run(session_of("alice"), expr, rig.audit()).status == ss::Status::AuditUnavailable);
+        rig.persist_ok = true;
+        CHECK(runner.run(session_of("alice"), expr, rig.audit()).status == ss::Status::Accepted);
+    }
+    {
+        Rig rig;
+        auto env = rig.env();
+        env.dispatch = [](const auth::Session&, const std::vector<std::string>&) {
+            return ss::DispatchResult{0, "x"};
+        };
+        ss::Runner runner(std::move(env));
+        CHECK(runner.run(session_of("alice"), kFleet, rig.audit()).status == ss::Status::NoneReachable);
+        CHECK(runner.run(session_of("alice"), kFleet, rig.audit()).status == ss::Status::NoneReachable);
+    }
+}
+
+TEST_CASE("sync runner: an expired holder's late release cannot clear the live successor's lease",
+          "[server][software_sync][runner]") {
+    Rig rig;
+    std::mutex mu;
+    std::condition_variable cv;
+    int in_dispatch = 0;
+    bool release_a = false, release_b = false;
+    auto env = rig.env();
+    env.dispatch = [&](const auth::Session&, const std::vector<std::string>& ids) {
+        std::unique_lock<std::mutex> lk(mu);
+        const int me = ++in_dispatch; // 1 = the first (expiring) holder, 2 = its successor
+        cv.notify_all();
+        cv.wait(lk, [&] { return me == 1 ? release_a : release_b; });
+        return ss::DispatchResult{ids.size(), "__sync__-lease"};
+    };
+    ss::Runner runner(std::move(env));
+    const auto wait_for = [&](int n) {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return in_dispatch >= n; });
+    };
+
+    ss::Outcome a_out, b_out;
+    std::thread a([&] { a_out = runner.run(session_of("alice"), kFleet, rig.audit()); });
+    wait_for(1);
+    rig.mono += ss::kSlotLeaseMs + 1; // A has now held the slot past its lease
+    std::thread b([&] { b_out = runner.run(session_of("bob"), kFleet, rig.audit()); });
+    wait_for(2); // B took the slot over and is in its send
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        release_a = true;
+    }
+    cv.notify_all();
+    a.join(); // A has now unwound; its release must not have cleared B's lease
+    CHECK(runner.run(session_of("carol"), kFleet, rig.audit()).status == ss::Status::InFlight);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        release_b = true;
+    }
+    cv.notify_all();
+    b.join();
+    CHECK(a_out.status == ss::Status::Accepted);
+    CHECK(b_out.status == ss::Status::Accepted);
+    CHECK(runner.run(session_of("carol"), kFleet, rig.audit()).status == ss::Status::Accepted);
 }

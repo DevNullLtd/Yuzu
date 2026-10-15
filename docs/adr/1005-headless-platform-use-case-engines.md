@@ -515,11 +515,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        NOT part of this gap — they reuse the pre-existing generic
        live-info/bundle dispatch mechanism, which already has its own MCP
        reachability via `execute_instruction`, unaffected by this row.
-     - Scoping and building the list/detail/sync-dispatch MCP twin (including the
-       fleet/group/scope fan-out route `POST /api/v1/hardware/sync`, whose MCP
-       twin `sync_hardware_software` now exists) is out of scope for this PR;
-       tracked as **#4456**. Until it lands, this row
-       stands as the open exception.
+     - The fleet/group/scope fan-out route `POST /api/v1/hardware/sync` has its MCP twin
+       `sync_hardware_software` (owner ruling 2026-10-15: the twin is required, not an
+       exception), sharing the route's cooldown and single in-flight run. Scoping and building
+       the list/detail/per-device-sync MCP twins is out of scope for this PR; tracked as
+       **#4456**. Until it lands, this row stands as the open exception for those routes.
      - Full design record: the round-3 hardware-ci-view plan
        (`docs/user-manual/inventory.md`'s Dashboard section describes the
        shipped REST/HTMX surface); wire reference:

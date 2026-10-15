@@ -869,8 +869,10 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
 /// id list. Who is reached is decided HERE like every other operator dispatch surface: the id
 /// list is intersected with the caller's `exec_visible` set at send time (`nullopt`/present-empty
 /// semantics as in `dispatch_confined_arms`), so a hidden device is never sent to whatever the
-/// caller's own resolver returned. The containment gate is the one bypass the closed
-/// `SystemReservedPush` enumeration documents; `plugin_missing` and `os_kill_switched` stay empty
+/// caller's own resolver returned. This arm serves `SystemReservedPush::inventory_sync_now` ONLY,
+/// which is why it takes no push argument: it applies the containment-gate bypass that push
+/// documents (a contained device still answers the read-only sync), and a second push must not
+/// inherit that bypass by being passed in - give it its own arm. `plugin_missing` and `os_kill_switched` stay empty
 /// because a system-reserved command is not a plugin an agent advertises (the registry still
 /// enforces the per-OS kill switch at send time).
 ///
@@ -878,8 +880,8 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
 /// stays with the caller. Only an `Ids` arm exists: a system-reserved fan-out never names `__all__`
 /// to this function (the caller expands the selector first and bounds the count).
 [[nodiscard]] inline ArmDispatchResult
-dispatch_system_reserved_ids(SystemReservedPush /*push: the closed set this bypass is for*/,
-                             const std::vector<std::string>& ids, const authz::VisibleSet& exec_visible,
+dispatch_system_reserved_ids(const std::vector<std::string>& ids,
+                             const authz::VisibleSet& exec_visible,
                              std::function<bool(const std::string&)> send_to) {
     ConfinedDispatchSink sink;
     sink.send_to = std::move(send_to);
