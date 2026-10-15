@@ -59,7 +59,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 **What to check.**
 
 - A monitor that expected `301` on the plain port, or followed it to the TLS listener, now sees a probe answer. Point it at `https://<host>:8443/readyz`, or run `yuzu-server --healthcheck` in the container.
-- A Kubernetes `httpGet` probe on the plain port counts any `3xx` as success, so it reported healthy whatever the server's state. It now sees the real `/readyz`, including `503 draining`: check its `failureThreshold` before you upgrade.
+- A Kubernetes `httpGet` probe on the plain port needs no change. The kubelet follows a redirect to the same host name (it ignores the port), so it was already reading the TLS listener's answer with the certificate unverified; it now reads the plain port's own answer, where a stopped HTTPS listener is a `503` instead of a refused connection.
 - Port 8080 now serves health data without encryption or authentication. Publish it only to the orchestrator network, bind it to loopback with `--web-address 127.0.0.1`, or set `--no-https-redirect`.
 - Images built before this change are unchanged: they redirect, and have no `--healthcheck`.
 
