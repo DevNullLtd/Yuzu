@@ -121,6 +121,21 @@ constexpr std::string_view kSearchButton =
 // Hidden until the first /api/health answer fills the count (kShellScript).
 constexpr std::string_view kOnlineCounter =
     R"(<span class="shell-live" id="shell-online" hidden><i></i><b id="shell-online-n"></b> online</span>)";
+// Header notifications bell: reads the existing GET /api/notifications JSON route and acts
+// through POST /api/notifications/{id}/read|dismiss (no new route). Hidden until the first
+// valid answer, and hidden again for a caller the server refuses (kBellScript). Every
+// server string is placed with textContent only.
+constexpr std::string_view kBell =
+    R"(<details class="shell-pop" id="shell-bell" hidden>)"
+    R"(<summary id="shell-bell-sum" aria-label="Notifications">)"
+    R"(<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a6 6 0 1112 0c0 7 3 9 3 9H3s3-2 3-9z M10 21a2 2 0 004 0"/></svg>)"
+    R"(<span class="shell-cnt" id="shell-bell-n" aria-hidden="true" hidden></span></summary>)"
+    R"(<div class="shell-pop-p" id="shell-bell-panel">)"
+    R"(<div class="shell-pop-h"><span>Notifications</span><span class="shell-pop-s">Shared by all operators</span></div>)"
+    R"(<div id="shell-bell-list" role="list"></div>)"
+    R"(<p class="shell-pop-note" id="shell-bell-note" role="status" hidden></p>)"
+    R"(</div></details>)";
+
 constexpr std::string_view kUserIcon =
     R"(<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 100-8 4 4 0 000 8z M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>)";
 
@@ -166,7 +181,7 @@ void append_nav_item(std::string& out, const NavItem& it, std::string_view activ
 }
 
 void append_sidebar(std::string& out, std::string_view active) {
-    out += R"(<aside class="shell-side"><a class="shell-brand" href="/" aria-label="Yuzu home">Yuzu<i></i></a>)"
+    out += R"(<aside class="shell-side"><a class="shell-brand" href="/home" aria-label="Yuzu home">Yuzu<i></i></a>)"
            R"(<nav aria-label="Primary">)";
     for (const auto& g : kGroups) {
         out += R"(<div class="shell-grp"><div class="shell-gt">)";
@@ -193,6 +208,7 @@ void append_header(std::string& out, const ShellCtx& ctx) {
     out += "</nav>";
     out += kSearchButton;
     out += kOnlineCounter;
+    out += kBell;
     out += R"(<div class="shell-acct"><span class="shell-user">)";
     out += kUserIcon;
     out += R"(<span id="context-user"></span></span>)"
@@ -258,6 +274,155 @@ html body{padding-left:0}
 .toast-container{top:auto;bottom:var(--sp-4)}
 }
 </style>)CSS";
+
+// The bell's own style block, a separate literal beside kShellCss (MSVC C2026). The one
+// box-shadow is the pop-over shadow (--shadow is for pop-overs and menus alone).
+constexpr std::string_view kBellCss = R"CSS(<style>
+.shell-pop{position:relative}
+.shell-pop[hidden]{display:none}
+.shell-pop>summary{list-style:none;cursor:pointer;height:var(--ctl);min-width:var(--ctl);display:flex;align-items:center;justify-content:center;gap:8px;padding:0 10px;border-radius:var(--rad-ctl);border:1px solid var(--line2);background:var(--bg);color:var(--ink2);font-size:13px}
+.shell-pop>summary::-webkit-details-marker{display:none}
+.shell-pop>summary:hover,.shell-pop[open]>summary{background:var(--surface2);color:var(--ink)}
+.shell-pop>summary:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+.shell-pop>summary svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.shell-cnt{font-size:12px;font-weight:600;background:var(--warn);color:var(--bg);border-radius:3px;padding:0 5px}
+.shell-pop-p{position:absolute;right:0;top:calc(100% + 6px);width:380px;max-width:calc(100vw - 32px);background:var(--raise);border:1px solid var(--line2);border-radius:var(--rad-over);box-shadow:var(--shadow);z-index:60;overflow:hidden}
+.shell-pop-h{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line);font-weight:600}
+.shell-pop-s{color:var(--mut);font-size:12.5px;font-weight:400}
+#shell-bell-list{max-height:min(60vh,480px);overflow-y:auto}
+.shell-pop-i{padding:11px 14px;border-bottom:1px solid var(--line)}
+.shell-pop-t{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.shell-pop-m{margin:2px 0 4px;color:var(--mut);font-size:13px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+.shell-pop-i small{display:block;color:var(--faint);font-size:12px}
+.shell-pop-r{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.shell-pop-c{margin:8px 0 0;color:var(--ink2);font-size:12.5px}
+.shell-pop-note,.shell-pop-empty{margin:0;padding:11px 14px;border-bottom:1px solid var(--line);color:var(--mut);font-size:13px}
+.shell-pop-note[hidden]{display:none}
+@media (max-width:820px){
+.shell-pop{position:static}
+.shell-pop-p{left:16px;right:16px;width:auto;max-width:none}
+}
+</style>)CSS";
+
+// The bell's own behaviour, a separate literal and its own IIFE. Polls every 60 s while
+// the tab is visible, the panel is closed and there was input in the last 5 minutes (the
+// poll is credentialed, so it renews the session idle window like any request). Mark read
+// and Dismiss both take a two-click inline confirm: each hides the item for every operator
+// and neither can be undone from the console.
+constexpr std::string_view kBellScript = R"JS(<script>
+(function(){
+  var POLL_MS=60000, IDLE_MS=300000, TIMEOUT_MS=5000, LIMIT=10, CONFIRM_MS=3000, MSG_MAX=500;
+  var LV={success:'s-on',warn:'s-w',error:'s-bad',info:'s-off'};
+  var CONS={read:'Marks this read for every operator. It leaves the unread list and cannot be undone from the console.',
+            dismiss:'Dismisses this for every operator. The dismissal is recorded in the audit log and cannot be undone from the console.'};
+  function el(i){return document.getElementById(i);}
+  function mk(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;}
+  function txt(v){return v==null?'':String(v);}
+  var root=el('shell-bell'); if(!root)return;
+  var sum=el('shell-bell-sum'), chip=el('shell-bell-n'), list=el('shell-bell-list'), note=el('shell-bell-note');
+  var inflight=false, stopped=false, readOnly=false, xsite=false, failed=false, actErr=false, shown=0, total=0, armed=null, armTimer=0, last=Date.now(), paused=false;
+
+  function when(ts){
+    var s=Math.floor((Date.now()-ts)/1000);
+    if(s<60)return 'just now';
+    if(s<3600)return Math.floor(s/60)+' min ago';
+    if(s<86400)return Math.floor(s/3600)+' h ago';
+    return new Date(ts).toLocaleDateString();
+  }
+  function setChip(n){
+    if(n>0){chip.textContent=n>99?'99+':String(n);chip.hidden=false;}else{chip.textContent='';chip.hidden=true;}
+    sum.setAttribute('aria-label',n>0?'Notifications, '+n+' unread':'Notifications');
+  }
+  function refreshNote(){
+    var p=[];
+    if(failed)p.push('Notifications could not be refreshed.');
+    if(actErr)p.push('Could not update that notification. Try again.');
+    if(readOnly)p.push('Your account can view notifications but not change them.');
+    if(xsite)p.push('That change was refused as cross-site. Ask an administrator to check the --csrf-trusted-origin setting.');
+    if(!failed&&total>shown)p.push('Showing the newest '+shown+' of '+total.toLocaleString('en-GB')+' unread.');
+    note.textContent=p.join(' ');note.hidden=p.length===0;
+  }
+  function disarm(){
+    if(armTimer){clearTimeout(armTimer);armTimer=0;}
+    if(armed){armed.btn.textContent=armed.label;armed.btn.classList.remove('btn-confirming');
+      if(armed.cons&&armed.cons.parentNode)armed.cons.parentNode.removeChild(armed.cons);}
+    armed=null;
+  }
+  function act(n,kind,itemEl){
+    disarm();actErr=false;xsite=false;
+    fetch('/api/notifications/'+n.id+'/'+(kind==='read'?'read':'dismiss'),{method:'POST',signal:AbortSignal.timeout(TIMEOUT_MS)}).then(function(r){
+      if(r.status===401){root.hidden=true;stopped=true;return;}
+      if(r.status===403){return r.json().catch(function(){return null;}).then(function(j){
+        if(j&&j.error&&/cross-site/.test(j.error.message||''))xsite=true;
+        else{readOnly=true;[].forEach.call(list.querySelectorAll('button'),function(b){b.disabled=true;});}
+        refreshNote();});}
+      if(r.ok||r.status===404){
+        var nx=itemEl.nextElementSibling;itemEl.remove();shown=Math.max(0,shown-1);total=Math.max(0,total-1);setChip(total);
+        if(!list.children.length)empty();
+        var f=nx&&nx.querySelector('button');(f||sum).focus();poll(true);return;
+      }
+      throw new Error('http');
+    }).catch(function(){actErr=true;refreshNote();});
+  }
+  function btn(n,kind,label,itemEl){
+    var b=mk('button','btn sm',label);b.type='button';b.disabled=readOnly;
+    b.addEventListener('click',function(){
+      if(armed&&armed.btn===b){act(n,kind,itemEl);return;}
+      disarm();
+      var c=mk('p','shell-pop-c',CONS[kind]);itemEl.appendChild(c);
+      armed={btn:b,label:label,cons:c};b.textContent='Confirm '+label.toLowerCase();b.classList.add('btn-confirming');
+      armTimer=setTimeout(disarm,CONFIRM_MS);
+    });
+    return b;
+  }
+  function empty(){list.textContent='';list.appendChild(mk('p','shell-pop-empty','No unread notifications.'));}
+  function render(d){
+    disarm();var held=list.contains(document.activeElement);list.textContent='';
+    shown=d.notifications.length;total=d.unread_count;
+    if(!shown)empty();
+    d.notifications.forEach(function(n){
+      var lv=Object.prototype.hasOwnProperty.call(LV,n.level)?n.level:'info';
+      var it=mk('div','shell-pop-i');it.setAttribute('role','listitem');it.setAttribute('data-level',lv);
+      var t=mk('b','shell-pop-t');t.appendChild(mk('i','sd '+LV[lv]));t.appendChild(document.createTextNode(txt(n.title)));
+      var msg=txt(n.message).slice(0,MSG_MAX);
+      var m=mk('p','shell-pop-m',msg);m.setAttribute('title',msg);
+      var s=mk('small',null,when(n.timestamp));s.setAttribute('title',new Date(n.timestamp).toLocaleString());
+      it.appendChild(t);it.appendChild(m);it.appendChild(s);
+      if(Number.isSafeInteger(n.id)&&n.id>0){
+        var r=mk('div','shell-pop-r');r.appendChild(btn(n,'read','Mark read',it));r.appendChild(btn(n,'dismiss','Dismiss',it));it.appendChild(r);
+      }
+      list.appendChild(it);
+    });
+    setChip(total);failed=false;refreshNote();root.hidden=false;
+    if(held)sum.focus();
+  }
+  function poll(force){
+    if(stopped||inflight||(!force&&(document.hidden||root.open)))return;
+    if(!force&&Date.now()-last>IDLE_MS){paused=true;return;}
+    inflight=true;
+    fetch('/api/notifications?limit='+LIMIT,{signal:AbortSignal.timeout(TIMEOUT_MS)}).then(function(r){
+      if(r.status===401||r.status===403){root.hidden=true;stopped=true;return null;}
+      if(!r.ok)throw new Error('http');
+      return r.json();
+    }).then(function(d){
+      if(d===null)return;
+      if(!d||!Array.isArray(d.notifications)||typeof d.unread_count!=='number')throw new Error('payload');
+      render(d);
+    }).catch(function(){
+      if(!root.hidden){failed=true;setChip(0);list.textContent='';shown=total=0;refreshNote();}
+    }).then(function(){inflight=false;});
+  }
+  /* No polling after IDLE_MS without input (the poll renews the session idle window); the next input resumes and fetches at once. */
+  function input(){last=Date.now();if(paused){paused=false;poll(false);}}
+  ['keydown','pointerdown','pointermove','scroll'].forEach(function(e){document.addEventListener(e,input,{passive:true});});
+  setInterval(function(){poll(false);},POLL_MS);
+  document.addEventListener('visibilitychange',function(){poll(false);});
+  root.addEventListener('toggle',function(){if(root.open)poll(true);else disarm();});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape'&&root.open){root.open=false;sum.focus();}});
+  document.addEventListener('click',function(e){if(root.open&&!root.contains(e.target))root.open=false;});
+  poll(false);
+})();
+</script>)JS";
 
 // The shell's own behaviour on every page: fill the signed-in user and hide Settings
 // from non-admins (the Settings group is hidden with its entry so no empty heading is
@@ -400,9 +565,11 @@ std::string render_shell(const ShellCtx& ctx) {
     out.reserve(9000);
     out += kShellBegin;
     out += kShellCss;
+    out += kBellCss;
     append_sidebar(out, ctx.active_key);
     append_header(out, ctx);
     out += kShellScript;
+    out += kBellScript;
     out += kShellEnd;
     return out;
 }

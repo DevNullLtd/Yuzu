@@ -1159,6 +1159,10 @@ TEST_CASE("is_login_exempt_path: unrelated API paths are NOT exempt",
 
 TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",
           "[web_utils][login_exempt][regression]") {
+    // The landing and sign-in page renders for a visitor with no session.
+    CHECK(is_login_exempt_path("/home"));
+    CHECK_FALSE(is_login_exempt_path("/home/"));
+    CHECK_FALSE(is_login_exempt_path("/homes"));
     CHECK(is_login_exempt_path("/login"));
     CHECK(is_login_exempt_path("/login/mfa"));
     CHECK(is_login_exempt_path("/login/mfa/enroll"));

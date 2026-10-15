@@ -168,6 +168,14 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/dashboard/policies",
+    "capability_id": "get.fragments-dashboard-policies",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-compliance,get.api-policies"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/settings/nvd",
     "capability_id": "get.fragments-settings-nvd",
     "rest_v1_twin": null,
