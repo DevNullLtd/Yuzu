@@ -375,7 +375,9 @@ const { execSync } = require('child_process');
       console.log(`${RED}FATAL: Login failed${RESET}`);
       process.exit(1);
     }
-    console.log(`${GREEN}[login]${RESET} Dashboard loaded at ${page.url()}`);
+    console.log(`${GREEN}[login]${RESET} Signed in; the landing page loaded at ${page.url()}`);
+    // Sign-in stays on the landing page (/home); the console lives on the Dashboard at /.
+    await page.goto(`${BASE_URL}/`, { waitUntil: 'networkidle2', timeout: 15_000 });
 
     // Wait for scope list to populate
     await page.waitForSelector('#scope-list', { timeout: 10_000 });

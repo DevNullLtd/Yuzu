@@ -504,6 +504,25 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     return false;
 }
 
+/// Same-site gate for a dashboard-called MUTATION. Cookie sessions are ambient credentials a
+/// cross-site page can ride, so a browser write must carry an Origin (or Referer) naming this
+/// site: unlike `origin_is_same_site`, whose empty-header case is "a curl/automation client",
+/// a header-less request authorised by a SESSION COOKIE is refused here, because browsers always
+/// send one on a write and a stripped header must not turn the control off. A request
+/// authenticated by an API/MCP/engine TOKEN is not riding a cookie, so it is not gated.
+/// `auth_source` is the resolved session's source ("local"/"oidc"/"saml" for cookie sessions);
+/// an unresolved one (empty) is treated as a cookie session. Returns true when the write must
+/// be refused.
+[[nodiscard]] inline bool browser_write_is_cross_site(
+    std::string_view auth_source, std::string_view host, std::string_view origin,
+    std::string_view referer, std::span<const std::string> trusted_origins = {}) {
+    if (auth_source == "api_token" || auth_source == "mcp_token" || auth_source == "engine_token")
+        return false;
+    if (origin.empty() && referer.empty())
+        return true;
+    return !origin_is_same_site(host, origin, referer, trusted_origins);
+}
+
 /// The MCP transport body-cap decision for the server's pre-routing handler
 /// (#2437) — extracted from `server.cpp`'s `set_pre_routing_handler` lambda
 /// for exactly the reason `is_login_exempt_path` below was: so the decision
@@ -718,8 +737,9 @@ template <typename Req>
 /// handler (H1, 2026-07-08 SCIM review) — extracted from `server.cpp`'s
 /// `set_pre_routing_handler` lambda so the login/SSO/health/PKI/SCIM
 /// exemption list has direct unit coverage instead of only being exercised
-/// by booting a real server. Every existing exempt path is unchanged; the
-/// only addition is the `/scim/v2/` prefix (see below).
+/// by booting a real server. Additions since: the `/scim/v2/` prefix (see
+/// below) and `/home`, the landing and sign-in page a signed-out request is
+/// redirected to.
 ///
 /// Caller contract: this MUST be consulted AFTER the rate limiter and
 /// (once it lands) any on-behalf-of/ADR-1005 rejection in the pre-routing
@@ -727,7 +747,11 @@ template <typename Req>
 /// must stay in effect for every path this allows through unauthenticated.
 /// Returns true iff `path` should skip session/bearer resolution entirely.
 inline bool is_login_exempt_path(std::string_view path) {
-    return path == "/login" || path == "/login/mfa" || path == "/login/mfa/enroll" ||
+    // `/home` is the landing and sign-in page: it must render for a visitor with
+    // no session (it IS where the chokepoint below sends them), and it shows the
+    // signed-in panel itself when a session exists.
+    return path == "/home" || path == "/login" || path == "/login/mfa" ||
+           path == "/login/mfa/enroll" ||
            path == "/health" || path == "/api/health" || path == "/auth/oidc/start" ||
            path == "/auth/callback" ||
            // #2057: /api/v1/openapi.json used to be listed here as
@@ -887,7 +911,7 @@ inline std::string truncate_utf8(std::string_view s, std::size_t max_chars) {
 // scope) the bar renders a single hatched/empty cell so the row doesn't look
 // like a successful zero-agent run.
 //
-// Color tokens: Cisco Momentum success/error/stable/text-tertiary. Theme-
+// Color tokens: Cisco Momentum success/error/info/text-tertiary. Theme-
 // agnostic — light and dark mode both read the same SVG via CSS vars.
 // ============================================================================
 
@@ -936,7 +960,7 @@ inline std::string render_status_sparkbar(int succeeded, int failed,
     Seg segs[4] = {
         {succeeded, "var(--mds-color-bg-success-emphasis,var(--green))"},
         {failed,    "var(--mds-color-theme-indicator-error,var(--red))"},
-        {running,   "var(--mds-color-theme-indicator-stable,var(--accent))"},
+        {running,   "var(--mds-color-theme-indicator-info,var(--info))"},
         {pending,   "var(--mds-color-theme-text-tertiary,var(--muted))"},
     };
     int widths[4] = {0, 0, 0, 0};

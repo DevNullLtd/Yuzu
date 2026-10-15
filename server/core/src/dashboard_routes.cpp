@@ -2,7 +2,10 @@
 
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
+#include "scope_attribute_guard.hpp" // E-1: unknown-attribute refusal for expression sends
+#include "mcp_input_bounds.hpp"    // kExecInstrScopeMaxLen
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
+#include "rest_audit.hpp" // detail::try_persist_audit (E-1: audit-before-dispatch)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
 #include "tar_tree_routes.hpp" // TarRetentionPausedScan/TarPausedSourceRow/tar_retention_paused_json (#4027)
 
@@ -150,6 +153,25 @@ parse_instruction_params(const std::string& text) {
         }
     }
     return {command, params};
+}
+
+bool DashboardRoutes::refuse_cross_site_write(const httplib::Request& req,
+                                              httplib::Response& res) const {
+    const auto session = auth_fn_(req, res); // writes its own 401 when there is no session
+    if (!session)
+        return true;
+    if (!browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"),
+                                     req.get_header_value("Referer"), csrf_trusted_origins_))
+        return false;
+    audit_fn_(req, "csrf.denied", "denied", "Endpoint", "dashboard",
+              "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
+                    " class=\"result-context is-error\" data-reason=\"csrf_cross_origin\">"
+                    "Cross-site request refused. Nothing was sent.</span>",
+                    "text/html; charset=utf-8");
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +752,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     sink.Post("/api/dashboard/execute",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
+                 if (refuse_cross_site_write(req, res)) return;
 
                  auto instruction = extract_form_value(req.body, "instruction");
 
@@ -755,6 +778,69 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          "No instruction entered.</span>",
                          "text/html; charset=utf-8");
                      return;
+                 }
+
+                 // E-1 (operate-extras 6.2): an OPTIONAL `scope_expression` targets the send
+                 // at a scope expression. Decoded param first, raw body second, for the same
+                 // percent-encoded-field-name reason as `scope` above. Absent = no change.
+                 std::string target_expression;
+                 const bool expression_supplied =
+                     req.has_param("scope_expression") ||
+                     form_value_supplied(req.body, "scope_expression");
+                 if (expression_supplied) {
+                     target_expression = req.get_param_value("scope_expression");
+                     if (target_expression.empty())
+                         target_expression = extract_form_value(req.body, "scope_expression");
+                     // A refusal is a 400 (htmx surfaces it through htmx:responseError) that
+                     // names its reason and writes one denied audit row. Nothing dispatches.
+                     auto refuse_expression = [&](const char* reason, const std::string& text) {
+                         audit_fn_(req, "command.dispatch", "denied", "command", "",
+                                   std::string("reason=") + reason);
+                         res.status = 400;
+                         res.set_content(
+                             "<span id=\"result-context\" hx-swap-oob=\"true\""
+                             " class=\"result-context is-error\" data-reason=\"" +
+                                 std::string(reason) + "\">" + html_escape(text) + "</span>",
+                             "text/html; charset=utf-8");
+                     };
+                     if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
+                         // Never pick one silently. The Console's hidden scope=__all__ is why
+                         // the page disables and omits it when the expression is chosen (S8).
+                         refuse_expression("target_conflict",
+                                           "Choose either a picked target or a scope "
+                                           "expression, not both.");
+                         return;
+                     }
+                     if (target_expression.empty()) {
+                         // CDX-R8-01 class: a supplied-but-empty value is never the fleet.
+                         refuse_expression("scope_expression_empty",
+                                           "The scope expression is empty. Nothing was sent.");
+                         return;
+                     }
+                     if (target_expression.size() > yuzu::server::mcp::kExecInstrScopeMaxLen) {
+                         refuse_expression("scope_expression_too_long",
+                                           "The scope expression is too long. Nothing was sent.");
+                         return;
+                     }
+                     auto parsed = yuzu::scope::parse(target_expression);
+                     if (!parsed) {
+                         refuse_expression("scope_expression_invalid",
+                                           "The scope expression is not valid, so nothing was "
+                                           "sent: " + parsed.error());
+                         return;
+                     }
+                     // G1/S4: the resolver answers "" for an unknown attribute and `!=`/NOT
+                     // invert that into "everyone", so a typo would fan out fleet-wide.
+                     std::vector<std::string> kinds;
+                     for (const auto& k : yuzu::server::detail::scope_kind_catalog())
+                         kinds.push_back(k.kind);
+                     if (auto bad = yuzu::server::first_unknown_scope_attribute(*parsed, kinds)) {
+                         refuse_expression("scope_unknown_attribute",
+                                           "Unknown attribute '" + *bad +
+                                               "'. Nothing was sent. Check the spelling "
+                                               "against Scope kinds.");
+                         return;
+                     }
                  }
 
                  // Parse CLI-style key=value parameters from instruction text
@@ -890,7 +976,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // the fleet is reached by NAME, never inferred from emptiness.
                  std::vector<std::string> agent_ids;
                  std::string scope_expr;
-                 if (!scope.empty() && scope.starts_with("group:")) {
+                 if (expression_supplied) {
+                     scope_expr = target_expression;
+                 } else if (!scope.empty() && scope.starts_with("group:")) {
                      scope_expr = scope;
                  } else if (!scope.empty() && scope != yuzu::server::kBroadcastScope) {
                      agent_ids.push_back(scope);
@@ -1122,17 +1210,54 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
+                 // ADR-0033 section 9, "no audit row, no mutation": an expression-targeted
+                 // send is a new fan-out surface, so its `attempted` row is stored BEFORE the
+                 // dispatch and a row that is not stored (or a sink that is not wired) refuses
+                 // the send with a 503 and dispatches nothing. Every refusal above returned
+                 // before this point, so a rejected request burns no `attempted` row. The
+                 // outcome row ("success"/"failure") follows the dispatch.
+                 if (expression_supplied) {
+                     const bool stored =
+                         persist_audit_fn_ &&
+                         yuzu::server::detail::try_persist_audit(
+                             persist_audit_fn_, req, "command.dispatch", "attempted", "command",
+                             "",
+                             plugin + ":" + action + " scope_expression=" +
+                                 onbehalf::sanitize_for_log(target_expression, 256));
+                     if (!stored) {
+                         res.status = 503;
+                         res.set_header("Sec-Audit-Failed", "true");
+                         res.set_content(
+                             "<span id=\"result-context\" hx-swap-oob=\"true\""
+                             " class=\"result-context is-error\""
+                             " data-reason=\"audit_unavailable\">The audit record could not "
+                             "be stored, so nothing was sent. Retry once the audit store "
+                             "recovers.</span>",
+                             "text/html; charset=utf-8");
+                         return;
+                     }
+                 }
+
                  auto dispatch_outcome =
                      dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
                  if (sent == 0) {
+                     if (expression_supplied)
+                         audit_fn_(req, "command.dispatch", "failure", "command", command_id,
+                                   "reason=no_agents_reached scope_expression=" +
+                                       onbehalf::sanitize_for_log(target_expression, 256));
                      // #3424/#3511: don't blame connectivity for a fail-closed
                      // containment gate, a quarantine denial, or a withheld
                      // plugin-absent dispatch — same discrimination /api/command
                      // already surfaces, so the operator reading THIS console
                      // isn't pointed at the wrong remediation.
-                     const char* message = "No agents connected. Cannot dispatch command.";
+                     // An expression that matched nothing is not a connectivity fact: agents may
+                     // be connected, none of them matched.
+                     const char* message =
+                         expression_supplied
+                             ? "The expression matched no connected agent. Nothing was sent."
+                             : "No agents connected. Cannot dispatch command.";
                      if (dispatch_outcome.scope_parse_error) {
                          // #3424/#3511 PR review fix round: this console
                          // accepts a scope expression (scope_expr, above)
@@ -1260,6 +1385,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      "{\"showToast\":{\"message\":\"Command sent to " +
                      std::to_string(sent) +
                      " agent(s)\",\"level\":\"success\"}}");
+                 // The one marker that a send was dispatched. Every refusal above also answers
+                 // 200 (the console swaps fragments and a 4xx body would be dropped), so the
+                 // page cannot tell a send from a refusal by status: its History list adds a row
+                 // only when this header is present.
+                 res.set_header("X-Yuzu-Dispatched", std::to_string(sent));
 
                  // Closes governance CP-2 / C-16: append definition_id when
                  // the reverse-lookup resolved one, so SIEM correlation
@@ -1269,6 +1399,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      plugin + ":" + action + " -> " + std::to_string(sent) + " agent(s)";
                  if (!def_id.empty())
                      detail += " definition_id=" + def_id;
+                 if (expression_supplied)
+                     detail += " scope_expression=" + onbehalf::sanitize_for_log(target_expression, 256);
                  audit_fn_(req, "command.dispatch", "success", "command", command_id, detail);
 
                  res.set_content(html, "text/html; charset=utf-8");
@@ -1278,6 +1410,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     sink.Post("/api/dashboard/tar-execute",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
+                 if (refuse_cross_site_write(req, res)) return;
 
                  auto sql = req.get_param_value("sql");
                  if (sql.empty()) {
@@ -3240,13 +3373,13 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // (corruption / tampering / pre-tri-state agent) instead of the source
         // being silently absent from the list.
         if (r.value_error) {
-            html += "<td><span class=\"source-pill\">" + html_escape(r.source) +
+            html += "<td><span class=\"badge badge-warning\">" + html_escape(r.source) +
                     "</span> <span class=\"badge badge-danger\" title=\"agent reported "
                     "&#39;" + html_escape(r.enabled_raw) +
                     "&#39; for this source's enabled flag — expected true/false; check the "
                     "agent's tar.db\">value error</span></td>";
         } else {
-            html += "<td><span class=\"source-pill\">" + html_escape(r.source) + "</span></td>";
+            html += "<td><span class=\"badge badge-warning\">" + html_escape(r.source) + "</span></td>";
         }
         // #558 — an agent that reported the source disabled but no paused_at
         // (paused_at == 0) is a pre-v0.12.0 agent that lacks the field. Render an

@@ -188,6 +188,16 @@ enum class SsoOnlyLocalGate : std::uint8_t {
                       ///< state could not be read — fail CLOSED): never evaluate PBKDF2
 };
 
+/// Whether a probe may withhold this caller's denial rows. Only an interactive cookie session
+/// qualifies (local, OIDC or SAML sign-in); an API/MCP/engine token or an engine principal that
+/// reaches a panel URL is anomalous and keeps the auditing behaviour, so a revoked or
+/// low-tier machine credential probing the Dashboard still leaves its row (PR #5859 review).
+[[nodiscard]] inline bool denial_row_may_be_withheld(const auth::Session& s) noexcept {
+    if (s.principal_kind == "engine")
+        return false;
+    return s.auth_source == "local" || s.auth_source == "oidc" || s.auth_source == "saml";
+}
+
 /// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
 ///
 /// AuthRoutes owns the core authentication/authorization/audit primitives that
@@ -252,6 +262,42 @@ public:
     /// RBAC-aware permission check. Falls back to legacy admin/user check if RBAC is disabled.
     bool require_permission(const httplib::Request& req, httplib::Response& res,
                             const std::string& securable_type, const std::string& operation);
+
+    /// Whether the caller holds `securable_type:operation`, for deciding what to DRAW. It runs
+    /// `require_permission`'s own decision path (elevation, engine principals, MCP tier,
+    /// service scope, RBAC, legacy role), so the answer cannot drift from the gate's, but it
+    /// writes no response and no `auth.permission_required` denial row: nobody attempted
+    /// anything, and a page that refreshes every few seconds would otherwise fill the audit
+    /// log with denials. NEVER a gate: an action must still pass `require_permission` (or a
+    /// scoped variant) on the request that performs it. (#5792 asks for this on the shared
+    /// auth seam; callers that still probe with the loud gate are listed there and in #5830.)
+    [[nodiscard]] bool has_permission(const httplib::Request& req,
+                                      const std::string& securable_type,
+                                      const std::string& operation);
+
+    /// `has_permission` with the gate's own response kept: `res` receives the 401/403/503 that
+    /// `require_permission` would write, so a caller can tell "denied" from "store unavailable".
+    /// The denial row is withheld for an interactive cookie session only
+    /// (`denial_row_may_be_withheld`); a token or engine caller keeps it. The decision is the
+    /// gate's own, so a route that binds this instead of `require_permission` accepts that a
+    /// refused cookie session leaves no `auth.permission_required` row. The Dashboard panels
+    /// do, by decision; an action route must not.
+    [[nodiscard]] bool probe_permission(const httplib::Request& req, httplib::Response& res,
+                                        const std::string& securable_type,
+                                        const std::string& operation);
+
+    /// `has_permission`'s twin for the fleet-read gate: `require_fleet_read`'s own decision path
+    /// (so the verdict and the scope cannot drift from the gate's), with its
+    /// `auth.fleet_read_required` denial rows withheld. For a page that decides what to DRAW from
+    /// the caller's scope. The decision is the gate's own; the row is withheld for an interactive
+    /// cookie session only (`denial_row_may_be_withheld`), and a caller that uses this instead of
+    /// the loud gate accepts that a refused cookie session leaves no `auth.fleet_read_required`
+    /// row. Store-outage rows on this path are withheld too (the 503 and the
+    /// `yuzu_server_rbac_read_degrade_total` counter remain).
+    /// `res` receives the gate's 401/403/503 and is meant to be a scratch response.
+    [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
+    probe_fleet_read(const httplib::Request& req, httplib::Response& res,
+                     const std::string& securable_type, const std::string& operation);
 
     /// The MCP tier/approval belt (#5047) — extracted verbatim from
     /// `require_permission`'s `mcp_tier` branch so a route that has its OWN

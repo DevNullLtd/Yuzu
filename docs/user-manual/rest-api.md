@@ -142,7 +142,7 @@ Every request must be authenticated using one of three methods:
 | Bearer token | `Authorization: Bearer <token>` | `Authorization: Bearer yzt_a1b2c3d4...` |
 | X-Yuzu-Token header | `X-Yuzu-Token: <token>` | `X-Yuzu-Token: yzt_a1b2c3d4...` |
 
-Unauthenticated browser requests are redirected to `/login`. Unauthenticated API requests receive a `401 Unauthorized` response.
+Unauthenticated browser requests are redirected to `/home` (the sign-in landing page; `/login` forwards there). Unauthenticated API requests receive a `401 Unauthorized` response.
 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
 
@@ -3247,7 +3247,7 @@ List all instruction definitions.
 
 #### `GET /api/v1/instructions/{id}`
 
-(#4029) Single-definition detail — the RECONCILED SUPERSET of the legacy `GET /api/instructions/{id}` fragment's fields (`gather_ttl_seconds`/`response_ttl_days`/`created_by`/timestamps) and MCP `get_definition`'s pre-existing fields (`approval_mode`/`parameter_schema`/`result_schema`/`yaml_source`) — both surfaces call the same builder (`instruction_definition_detail_json`) now, closing the field-set drift that existed between them before this issue.
+(#4029) Single-definition detail — the RECONCILED SUPERSET of the legacy `GET /api/instructions/{id}` fragment's fields (`gather_ttl_seconds`/`response_ttl_days`/`created_by`/timestamps) and MCP `get_definition`'s pre-existing fields (`approval_mode`/`parameter_schema`/`result_schema`/`yaml_source`) — both surfaces call the same builder (`instruction_definition_detail_json`) now, closing the field-set drift that existed between them before this issue. The detail also carries `secret_params`, the parameter names a client must render as write-only inputs (today `grant_secret` and `grant_id`, the server's one shared list); it is a client hint and is not part of the export.
 
 **Permission:** `InstructionDefinition:Read`
 
@@ -3408,7 +3408,7 @@ Fetch a single template. The reserved id `__default__` always returns the synthe
 
 #### `POST /api/v1/definitions/{id}/response-templates`
 
-Create a new template. Returns the canonicalised template (with auto-assigned `id` when omitted) and 201.
+Create a new template. Like `PUT`/`DELETE` below, it is applied only to the definition version it read: a concurrent edit of the definition returns `409`. A browser (session-cookie) caller must send a same-site `Origin` or `Referer` (`403` otherwise); token callers are exempt. Returns the canonicalised template (with auto-assigned `id` when omitted) and 201.
 
 **Permission:** `InstructionDefinition:Write`
 
@@ -3652,7 +3652,8 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058) — distinct from `denied`, since an infra degrade is not an operator denial. |
 | `instruction.update` | Instruction definition updated via `PUT /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A plain 400 validation error is not audited (matches `instruction.create`'s equivalent branch). |
 | `instruction.delete` | Instruction definition deleted via `DELETE /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). |
-| `instruction_set.delete` | Instruction set deleted via `DELETE /api/instruction-sets/{id}`. `result` ∈ {`denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). Success is not audited (`create_set`/`delete_set` predate any audit coverage on this pair — tracked separately, #3598 — the 404/503 denial branches above are new with ADR-0058 and audited from the start rather than shipped asymmetrically). |
+| `instruction_set.create` | Instruction set created via `POST /api/instruction-sets`. Every create first writes `result=attempted` (before the change; if that row cannot be stored the request is refused with 503 and `Sec-Audit-Failed: true` and no set is created), then the outcome. `result` ∈ {`attempted`, `success`, `denied`, `error`}. `success` carries `target_id=<set id>` and the set name as detail. Denied detail values: `conflict` (409, duplicate id), `invalid` (400, rejected input). `error` detail `db_error` on a genuine DB/lease failure (503). A failed audit write sets `Sec-Audit-Failed: true` on the response. |
+| `instruction_set.delete` | Instruction set deleted via `DELETE /api/instruction-sets/{id}`. Every delete first writes `result=attempted` (target_id = the set id) and is refused with 503 and `Sec-Audit-Failed: true`, with nothing deleted, when that row cannot be stored. `result` ∈ {`attempted`, `success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A failed audit write on `success` sets `Sec-Audit-Failed: true`. |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
 | `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>`/`tag:<key>` bulk preload against the custom-properties/tag store could not answer — ADR-0045; all abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows; as of #4981 PR-1 this ALSO fires, with its own paired per-ref row, when the set was deleted in the window between the pre-dispatch owner-check gate and the registry's own later membership read — a TOCTOU case the pre-#4981 code could not detect at all, see ADR-0036's 2026-09-26 Update), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator), `presence_degraded` (#4981 PR-1 — the cross-replica presence read backing fleet-wide scope evaluation could not answer), `unresolvable` (a `from_result_set:`/`props.<key>` atom referenced a store that was never wired at this call site — unreachable on the real production dispatch ladder, both stores are always wired there, but a defensively-labelled case rather than a misleading `db_degraded`). `target_type` on the audit row is `result_set` for `owner_check_failed` (the only reason actually about a specific result set) and `scope` for every other reason. Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
@@ -7297,7 +7298,7 @@ Delete a result set.
 
 Page through a result set's member device ids.
 
-**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+**Permission:** Session-authenticated (owner-scoped, `load_owned`), and `Infrastructure:Read` through the admit-then-filter fleet-read gate. Ownership says whose set it is, not which devices the owner can still see: the owner's *current* management-group scope is applied in the query before the page limit, so a device they can no longer see is not listed, does not use up a page slot, and is never reached by the cursor. A set whose devices have all left the caller's scope answers `{"device_ids": [], "next_cursor": ""}`. The dashboard fragment `GET /fragments/result-sets/{id}/members` and the MCP tool `get_result_set_members` apply the same gate.
 
 **Query parameters:**
 
@@ -7312,9 +7313,9 @@ Page through a result set's member device ids.
 
 | Status | Reason |
 |---|---|
-| 403 | Service-scoped API token |
+| 403 | Service-scoped API token, or the caller lacks `Infrastructure:Read` |
 | 404 | No such set, or not owned by the caller |
-| 503 | Result-set store unavailable |
+| 503 | Result-set store unavailable, or the visibility check is unavailable |
 
 #### `GET /api/v1/result-sets/{id}/lineage`
 
@@ -8321,7 +8322,7 @@ The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` 
 
 Browser-facing page that renders the 3D fleet topology. The page itself is auth-gated only; per-request RBAC enforcement happens when the page's JS hits `GET /api/v1/viz/fleet/topology` (see below).
 
-**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/login` first).
+**Permission:** Session auth only (`require_auth`); redirects to `/home` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/home` first).
 
 **Browser requirements:** the dashboard stylesheet needs Chrome 111+, Edge 111+, Firefox 121+ or Safari 16.2+ (`color-mix()` and `:has()`), and this page also requires importmap support (Safari 16.4+; the other browsers already meet it). On a browser without importmap the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
 
@@ -8338,7 +8339,7 @@ Browser-facing page that renders the 3D fleet topology. The page itself is auth-
 
 **Renderer behaviour (PR 6):**
 
-The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear above each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
+The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear below each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
 
 **Renderer behaviour (PR 7):**
 
@@ -8534,7 +8535,7 @@ the JSON route above.
 
 Browser-facing per-host drill-down page (the 2D Cytoscape IPC graph above
 the TAR process tree), opened by double-clicking a cube in `/viz/fleet`.
-Auth-gated only (`require_auth`); redirects to `/login` on no session.
+Auth-gated only (`require_auth`); redirects to `/home` on no session.
 The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` — any
 other character returns `400` — before it is templated into the page
 shell. Per-request RBAC is enforced when the page's JS fetches
@@ -9717,6 +9718,25 @@ Because that surface answers htmx fragments rather than the A4 JSON envelope, it
 `200` carrying the message in the console's result line, not a `400`/`404`. `POST
 /api/instructions/{id}/execute` and MCP `execute_bundle` do not yet enforce this gate.
 
+**Targeting the console by scope expression.** `POST /api/dashboard/execute` also accepts an
+optional form field `scope_expression`, so a send can target the devices an expression matches.
+Absent, the route behaves exactly as above. Present, it is refused with a `400` (the body is the
+console's result-line span, with the reason in its `data-reason` attribute, and a `command.dispatch`
+`denied` audit row with `reason=<reason>`) when:
+
+| `reason` | Cause |
+|---|---|
+| `target_conflict` | `scope` was also supplied, even empty. The route never picks one silently. |
+| `scope_expression_empty` | The field was supplied but empty. It is never widened to the fleet. |
+| `scope_expression_too_long` | Longer than 8192 bytes. |
+| `scope_expression_invalid` | The expression does not parse (a bare `tag:finance`, `__all__` and `group:<id>` are not expressions). |
+| `scope_unknown_attribute` | An attribute outside the scope kinds catalogue. The resolver answers an empty string for an unknown name, and `!=` and `NOT` turn that into every device, so a one-letter typo would otherwise fan out fleet-wide. |
+
+An expression target is never a named agent, so a Destructive-classified instruction is still
+refused as `destructive_untargeted`. A successful send is audited as `command.dispatch` with
+`scope_expression=<text>` appended to its detail. The Console disables its picker field and sends
+the expression only after a Preview of the same text, or after the operator retypes it.
+
 Scheduled and background dispatch is deliberately **not** covered by it. A schedule targets by
 scope expression by construction (it has no `agent_ids`), so a scheduled destructive instruction
 keeps working exactly as before; it is gated instead by the schedule's own fire-time
@@ -9882,7 +9902,7 @@ Import an InstructionDefinition (JSON envelope). Requires `InstructionDefinition
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `id`, `name`, `type`, `plugin`, `action`, etc. | various | yes | Standard `InstructionDefinition` fields. |
-| `yaml_source` | string | yes (when signed) | The verbatim YAML source — this is the signed-content carrier. Every persisted column is derived from it on the canonical path; signing `yaml_source` transitively covers the dispatch. |
+| `yaml_source` | string | yes (when signed) | The verbatim YAML source — this is the signed-content carrier. The signature covers these bytes only. `plugin`, `action`, `type`, `approval_mode` and `concurrency_mode` are taken from the verified YAML (an envelope value that disagrees is refused with `400`, and a signed YAML must declare `plugin` and `action`). `enabled`, `instruction_set_id`, TTLs, schemas, templates and the other columns are **not** expressible in YAML and are not signed. |
 | `signature` | string | optional | Hex-encoded Ed25519 signature over `yaml_source`'s bytes. |
 | `publicKey` | string | optional | Hex-encoded Ed25519 public key (64 hex chars). |
 
@@ -10039,13 +10059,16 @@ server-generated (this route does not accept a caller-supplied `id`), so the `40
 is not reachable via normal use of this endpoint today — documented for API-contract
 consistency with the sibling `POST /api/instructions` route, not because it fires in practice.
 
-**Response (400):** Validation error.
+**Response (400):** Validation error, including a `name` over 128 characters or a `description` over 512.
 
 **Response (409):** A set with that id already exists (gov Gate 4/6, fixed to match
 `POST /api/instructions`'s equivalent branch — the response no longer leaks the raw internal
 `conflict:` prefix).
 
-**Response (503):** A genuine database/lease failure (ADR-0058).
+**Response (503):** A genuine database/lease failure (ADR-0058), or the `attempted` audit row could not be stored (`Sec-Audit-Failed: true`; no set created).
+
+**Audit:** `instruction_set.create` writes `attempted` first, then an outcome on every path (`success`, `denied` detail `conflict` or
+`invalid`, `error` detail `db_error`); see the audit table entry above.
 
 #### `DELETE /api/instruction-sets/{id}`
 
@@ -10059,11 +10082,11 @@ Delete an instruction set. Definitions that referenced the deleted set have thei
 **Response (404):** Unknown id. **Breaking change (ADR-0058):** prior to this store's
 PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404.
 
-**Response (503):** A genuine database/lease failure (ADR-0058).
+**Response (503):** A genuine database/lease failure (ADR-0058), or the `attempted` audit row could not be stored (`Sec-Audit-Failed: true`; nothing deleted).
 
-**Audit:** `instruction_set.delete` on the 404 (`result=denied` detail `not_found`) and 503
-(`result=error` detail `db_error`) branches; the 200 success path is not audited (see the audit
-table entry above).
+**Audit:** `instruction_set.delete` writes `attempted` first, then an outcome: the 200 success (`result=success`), the 404
+(`result=denied` detail `not_found`) and 503 (`result=error` detail `db_error`) branches (see the
+audit table entry above).
 
 ---
 
@@ -10912,7 +10935,7 @@ data: {"execution_id":"exec-abc123","event_id":119,"timestamp_ms":...,"type":"ag
 
 Execute a TAR warehouse SQL query against targeted agents. Returns HTMX HTML fragments: a `thead` OOB swap with dynamic column headers and sets up an SSE stream for result rows.
 
-**Permission:** `Execution:Execute`
+**Permission:** `Execution:Execute`. A browser (session-cookie) caller must also send a same-site `Origin` or `Referer` naming the console; one without either, or from another site, is answered `403` and audited as `csrf.denied` before anything is parsed or dispatched. Token callers are exempt. The same rule applies to `POST /api/dashboard/execute`.
 
 **Request body (form-encoded):**
 
@@ -10926,6 +10949,7 @@ Execute a TAR warehouse SQL query against targeted agents. Returns HTMX HTML fra
 ```bash
 curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
   -H "Cookie: yuzu_session=abc123" \
+  -H "Origin: https://yuzu.example.com" \
   -d "sql=SELECT name, pid FROM \$Process_Live LIMIT 10" \
   -d "scope=__all__"
 ```
@@ -10940,7 +10964,7 @@ curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
 
 #### `GET /tar`
 
-Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list, the ad-hoc TAR SQL frame, and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`).
+Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/home` otherwise). The page hosts the retention-paused source list, the capture sources frame and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`). The Ad-hoc TAR SQL form is no longer on this page: a short note links to the Result sets page, where **From TAR query** takes the same parent scope, SQL, name and include-empty fields.
 
 **Permission:** Session-only (the page itself; embedded fragment endpoints carry their own permission gates — see below).
 
@@ -11972,6 +11996,51 @@ formed `saml_identity_links` row). See
 scope of what each half (login-time vs. deprovision-time) can and cannot
 attribute, and `docs/user-manual/metrics.md` "SCIM deprovision-linkage
 metrics" for the operator-facing description.
+
+---
+
+## Notifications feed
+
+The dashboard header bell reads and acts on the notification store through three dashboard JSON routes. They are not part of REST v1 and have no MCP twin (ADR-1005 grandfathers them as a settings-plane exception).
+
+#### `GET /api/notifications`
+
+Returns the unread feed, newest first. Requires `Infrastructure:Read`.
+
+| Query | Meaning |
+|---|---|
+| `limit` | Rows to return, default 50 (the bell sends 10). No server-side upper bound. |
+| `all=true` | Include read and dismissed rows. |
+| `offset` | Row offset; only applied together with `all=true`. |
+
+```json
+{
+  "notifications": [
+    { "id": 4801, "timestamp": 1760000000000, "level": "warn",
+      "title": "DEX alert: ...", "message": "...", "read": false, "dismissed": false }
+  ],
+  "unread_count": 1
+}
+```
+
+`timestamp` is epoch milliseconds. `level` is a free string (`success`, `warn`, `error` and `info` in practice). `title` and `message` can contain agent-supplied text; render them as text only. `503` (A4 envelope, `retry_after_ms` 5000) is returned when the store is closed or a read fails, including a database connection timeout; an empty `notifications` array therefore means nothing is waiting. A negative `limit` or `offset` answers `400` (A4 envelope), with or without `all=true`.
+
+#### `POST /api/notifications/{id}/read`
+
+Marks one notification read. Requires `Infrastructure:Write`. `200 {"status":"ok"}`; `404` when no row matches. A browser (session-cookie) call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else `403` `cross-site request refused` (audit `csrf.denied`); token callers are exempt. Audit-first: a `notification.mark_read` row with result `attempted` is written before the change and the call answers `503` with `Sec-Audit-Failed: true` if it cannot be written; a `success` or `failure` row follows. `503` also when the database write fails.
+
+#### `POST /api/notifications/{id}/dismiss`
+
+Soft-deletes one notification. Requires `Infrastructure:Write`. `200`; `404` when no row matches. Same-site rule, audit-first order and `503` behaviour as `read`, with the audit action `notification.dismiss`.
+
+Behaviour to know:
+
+- **State is global.** Read and dismissed state is stored on the row, not per user: one operator's action changes the feed for everyone. There is no route that restores a read or dismissed row.
+- **No retention and no coalescing.** Rows are kept indefinitely and a fleet-wide failing instruction produces one row per device, so a large fleet can sit at 100 or more unread.
+- **Audience.** With RBAC off every signed-in user can read the feed and only administrators can act. With RBAC on only global Administrator and ITServiceOwner assignments pass; Operators, Viewers and management-group-confined users get `403` and the bell stays hidden.
+- **Audit.** Both mutations are audited (`notification.mark_read`, `notification.dismiss`; see above), and a refused caller writes one `auth.permission_required` row per request.
+
+The header bell polls `GET /api/notifications?limit=10` with the session cookie every 60 seconds while the tab is visible and the panel is closed, and only within five minutes of the last keyboard, pointer or scroll input, because each request renews the session idle window.
 
 ---
 

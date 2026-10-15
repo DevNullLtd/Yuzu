@@ -34,6 +34,22 @@ TEST_CASE("redact_sensitive_instruction_params strips grant_secret and grant_id"
     CHECK(redacted.at("path") == "/tmp/file.bin");
 }
 
+TEST_CASE("client_secret (the shipped Entra directory-sync parameter) is classified like the "
+          "grant keys: redacted from a persisted copy and refused in a schedule",
+          "[server][sensitive_params]") {
+    std::unordered_map<std::string, std::string> params{{"tenant_id", "t"},
+                                                         {"client_id", "c"},
+                                                         {"client_secret", "s3cret"}};
+    auto redacted = redact_sensitive_instruction_params(params);
+    CHECK(redacted.count("client_secret") == 0);
+    CHECK(redacted.count("tenant_id") == 1);
+    CHECK(redacted.count("client_id") == 1);
+    CHECK(is_redacted_instruction_param_key("client_secret"));
+    CHECK_FALSE(is_redacted_instruction_param_key("oidc_client_secret")); // exact keys only
+    const std::string entra_schedule_params = R"({"tenant_id":"t","client_secret":"s3cret"})";
+    CHECK(schedule_params_contain_sensitive_key(entra_schedule_params));
+}
+
 TEST_CASE("redact_sensitive_instruction_params is a no-op when no sensitive key is present",
          "[server][sensitive_params]") {
     std::unordered_map<std::string, std::string> params{{"path", "/tmp/file.bin"},

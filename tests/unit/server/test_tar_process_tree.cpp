@@ -664,10 +664,11 @@ TEST_CASE("TAR page: the capture-sources push bar stays hidden until a change is
     CHECK(page.find(".apply-bar[hidden] { display: none; }") != std::string::npos);
 }
 
-TEST_CASE("TAR page: cell colour rules are table-prefixed so they outrank the td default",
+TEST_CASE("TAR page CSS declares the table-prefixed cell colour selectors",
           "[tar][page]") {
-    // `.tar-frame-body td { color: var(--ink2) }` has specificity (0,1,1); a bare single-class
-    // cell rule (0,1,0) loses to it and the support-state / ARP-type colours never apply.
+    // yuzu.css's `:is(.panel table, .tw table) td { color: var(--ink2) }` has specificity (0,1,2);
+    // a bare single-class cell rule loses to it, so these selectors carry a table / id prefix.
+    // This pins that the selectors are declared, not their computed outcome.
     const std::string page = kTarPageHtml;
     CHECK(page.find("#capTable .os-ok { color: var(--ok); }") != std::string::npos);
     CHECK(page.find("#capTable .os-con { color: var(--warn); }") != std::string::npos);

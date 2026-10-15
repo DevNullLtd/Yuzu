@@ -211,6 +211,21 @@ yuzu_operate_js_embed = custom_target(
   ],
 )
 
+# Operate extras page controllers (Instructions, Dashboard, Result sets). Served at
+# /static/yuzu-operate-extras.js with no-cache, like the other operate scripts.
+yuzu_operate_extras_js_embed = custom_target(
+  'yuzu_operate_extras_js_bundle',
+  input: 'static/yuzu-operate-extras.js',
+  output: 'yuzu_operate_extras_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuOperateExtrasJs',
+  ],
+)
+
 # Device containment / estate controls (window-level delegated listener). Symbol: kYuzuEstateJs.
 yuzu_estate_js_embed = custom_target(
   'yuzu_estate_js_bundle',
@@ -434,7 +449,7 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
-   yuzu_dialog_js_embed, yuzu_estate_js_embed,
+   yuzu_dialog_js_embed, yuzu_operate_extras_js_embed, yuzu_estate_js_embed,
    yuzu_device_data_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
@@ -499,6 +514,8 @@ yuzu_server_core_lib = static_library(
     'src/execution_model.cpp',
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
+    'src/home_panels_render.cpp',
+    'src/home_panels_routes.cpp',
     'src/leader_elector.cpp',
     'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
@@ -516,9 +533,13 @@ yuzu_server_core_lib = static_library(
     'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
     'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
+    'src/home_ui.cpp',     # Home (/home): the sign-in landing page, rendered per request
+    'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
+    'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
+    'src/result_set_extras_render.cpp',
     'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
     'src/approvals_ui.cpp',
     'src/executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
@@ -654,6 +675,7 @@ yuzu_server_core_lib = static_library(
     'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
     'src/legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
     'src/instruction_fragment_routes.cpp', # #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
+    'src/instruction_extras_render.cpp', # Instructions extras: YAML-save merge + library fragment helpers
     'src/approvals_fragment_routes.cpp', # #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
     'src/mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
     'src/webhook_routes.cpp',
