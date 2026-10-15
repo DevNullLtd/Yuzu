@@ -267,7 +267,7 @@ Routes that parse strictly (the response routes are listed in
 |---|---|
 | Execution statistics | `GET /api/v1/execution-statistics/agents` and `/definitions`: `since`, `limit` (a negative `since` is `400` too, and so is a `limit` below 1, which the MCP twins also reject with `-32602`) |
 | Executions | `GET /api/executions`, `GET /api/v1/executions`: `limit`; `GET /api/v1/executions/{id}/visualization`: `index` |
-| Audit | `GET /api/v1/audit`: `limit`; `GET /api/audit`: `since`, `until`, `limit`, `offset`; `GET /api/analytics/recent`: `limit` (a malformed value used to be ignored) |
+| Audit | `GET /api/v1/audit`: `since`, `until`, `limit`, `offset`; `GET /api/audit`: `since`, `until`, `limit`, `offset`; `GET /api/analytics/recent`: `limit` (a malformed value used to be ignored) |
 | Instructions, product packs, workflows | `GET /api/instructions`, `GET /api/v1/instructions`, `GET /api/v1/product-packs`, `GET /api/product-packs`, `GET /api/workflows`, `GET /api/v1/workflows`: `limit` |
 | Compliance | `GET /api/policy-fragments`, `GET /api/policies`, `GET /api/v1/policy-fragments`, `GET /api/v1/policies`: `limit`. On the two legacy routes (`/api/policy-fragments`, `/api/policies`) a negative `limit` is `400` too: it used to reach Postgres as `LIMIT -1`, fail, and answer `503`. The `/api/v1/` routes clamp `limit` to 1..1000 as before |
 | Patches | `GET /api/patches`, `GET /api/patches/deployments`: `limit` (a malformed value used to be ignored; a negative `limit` is `400` too, where the store answered an empty `200`) |

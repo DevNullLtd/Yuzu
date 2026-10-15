@@ -8354,8 +8354,9 @@ void RestApiV1::register_routes(
                      bad_request("since must be <= until");
                      return;
                  }
-                 if (const auto off = req.get_param_value("offset"); !off.empty()) {
-                     const auto v = parse_query_int<int>(off);
+                 if (req.has_param("offset")) {
+                     // Present-but-empty is malformed, like `limit`, `since` and `until` here.
+                     const auto v = parse_query_int<int>(req.get_param_value("offset"));
                      if (!v || *v < 0 || *v > kAuditMaxOffset) {
                          bad_request("offset must be 0..10000");
                          return;

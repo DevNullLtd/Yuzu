@@ -1161,8 +1161,8 @@ TEST_CASE("SettingsRoutes POST api-tokens: an empty or literal-zero ttl_hours st
 }
 
 // The auto-approve rule index is a `(\d+)` path segment: a 21-digit value made `stoul` THROW (a
-// 500). It cannot name a rule, so the engine reports "not found" (the page re-renders) and the
-// rule list is untouched.
+// 500). It cannot name a rule, so the engine reports "not found": the page re-renders (200), a
+// denied `rule_not_found` row is audited, and the rule list is untouched.
 TEST_CASE("SettingsRoutes auto-approve: a rule index that overflows is not a 500 and changes nothing",
           "[pg][settings][numeric_params]") {
     SettingsAdr2001Harness h;
@@ -1171,11 +1171,16 @@ TEST_CASE("SettingsRoutes auto-approve: a rule index that overflows is not a 500
     auto toggle = h.sink.Post("/api/settings/auto-approve/99999999999999999999/toggle", "",
                               "application/x-www-form-urlencoded");
     REQUIRE(toggle);
-    CHECK(toggle->status < 500);
+    CHECK(toggle->status == 200);
     auto del = h.sink.Delete("/api/settings/auto-approve/99999999999999999999");
     REQUIRE(del);
-    CHECK(del->status < 500);
+    CHECK(del->status == 200);
     CHECK(h.auto_approve.list_rules().size() == before);
+    std::size_t not_found_rows = 0;
+    for (const auto& c : h.audit_calls)
+        if (c.result == "denied" && c.detail.find("rule_not_found") != std::string::npos)
+            ++not_found_rows;
+    CHECK(not_found_rows == 2);
 }
 
 // ── #4966: the last-Administrator guard on the dashboard delete and role routes ──────────────
