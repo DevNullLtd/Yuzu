@@ -16,8 +16,24 @@ if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
     [[ ! -L "$TRANSITION_LOCK" ]] || { echo "ERROR: refusing a symlinked transition lock" >&2; exit 1; }
     (umask 077; : >> "$TRANSITION_LOCK")
     chmod 600 "$TRANSITION_LOCK"
-    exec /usr/bin/lockf -k -t 600 "$TRANSITION_LOCK" \
-        /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
+    # Lock this shell's own descriptor, so the lock lasts exactly as long as
+    # this script: with a separate lockf wrapper process, killing the wrapper
+    # released the lock while the script ran on (governance uh8-6). An older
+    # lockf without the descriptor form fails with another status; the wrapper
+    # form is the fallback there. 75 is lockf's timeout, kept well under
+    # Installer's own 600 s script limit so this message can appear (sre8-2).
+    exec 9>>"$TRANSITION_LOCK"
+    lock_status=0
+    /usr/bin/lockf -s -t 120 9 2>/dev/null || lock_status=$?
+    if [[ "$lock_status" == 75 ]]; then
+        echo "ERROR: another Yuzu Agent package transition did not finish within 2 minutes; retry" >&2
+        exit 1
+    fi
+    if [[ "$lock_status" != 0 ]]; then
+        exec 9>&-
+        exec /usr/bin/lockf -k -t 120 "$TRANSITION_LOCK" \
+            /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
+    fi
 fi
 
 DATA_DIR="/Library/Application Support/Yuzu"
@@ -59,6 +75,8 @@ require_trusted_directory() {
     mode="$(stat -f '%Lp' "$path")"
     [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || {
         echo "ERROR: package directory must be root-owned and not group/world writable: $path" >&2; exit 1; }
+    ! acl_grants_write "$path" || {
+        echo "ERROR: an access control list lets another account modify $path; remove it (chmod -N) and retry" >&2; exit 1; }
 }
 
 ensure_state_dir() {
@@ -302,7 +320,8 @@ retire_legacy_app() {
     quarantine_legacy_app "$retired"   # a leftover from an interrupted earlier run
     mv "$LEGACY_APP" "$retired"
     if legacy_app_is_managed "$retired"; then
-        rm -rf "$retired"
+        rm -rf "${retired:?}"
+        echo "Removed the retired development YuzuAgent.app from $DATA_DIR (its identity was verified)" >&2
     else
         # The replacement daemon has already passed health observation: do not
         # roll back a healthy install because of code the package does not own.
@@ -310,23 +329,32 @@ retire_legacy_app() {
     fi
 }
 
-# A listed plugin whose bytes no longer match the recorded hash belongs to the
-# operator, not the package, and is kept (PR #4482 governance sec-3). Manifests
-# from packages that recorded no hashes still remove by name.
+# Every hash file given is a package's record (the old one, the new one, their
+# snapshot copies): a listed plugin is package-owned if its bytes match ANY of
+# them. Recovery after an interruption between moving the new manifest and the
+# new hashes would otherwise keep the new package's plugin (governance uh8-1).
 remove_managed_plugins() {
-    local manifest="$1" hashes="${2:-}" relative plugin
+    local manifest="$1" relative plugin hashes recorded owned
+    shift
     [[ -f "$manifest" ]] || return 0
     while IFS= read -r relative; do
         [[ "$relative" == plugins/* ]] || continue
         plugin="${relative#plugins/}"
         [[ -n "$plugin" && "$plugin" != */* && "$plugin" != .* ]] || {
             echo "ERROR: invalid package plugin manifest entry" >&2; return 1; }
-        if [[ -n "$hashes" && -f "$hashes" && -e "$PLUGIN_DIR/$plugin" ]] && \
-           ! plugin_hash_matches "$plugin" "$hashes"; then
-            echo "WARNING: kept $PLUGIN_DIR/$plugin: its bytes differ from the package's, so it is not package-owned" >&2
-            continue
+        if [[ -e "$PLUGIN_DIR/$plugin" ]]; then
+            recorded=0 owned=0
+            for hashes in "$@"; do
+                [[ -n "$hashes" && -f "$hashes" ]] || continue
+                recorded=1
+                if plugin_hash_matches "$plugin" "$hashes"; then owned=1; break; fi
+            done
+            if [[ "$recorded" == 1 && "$owned" != 1 ]]; then
+                echo "WARNING: kept $PLUGIN_DIR/$plugin: its bytes differ from the package's, so it is not package-owned" >&2
+                continue
+            fi
         fi
-        rm -f "$PLUGIN_DIR/$plugin" "$PLUGIN_DIR/$plugin.sig"
+        rm -f "${PLUGIN_DIR:?}/${plugin:?}" "${PLUGIN_DIR:?}/${plugin:?}.sig"
     done < "$manifest"
 }
 
@@ -468,10 +496,26 @@ service_definition_configured() {
 # 0/false/off/no or empty (any case) and on otherwise; the command line, last
 # occurrence, overrides the environment (PR #4482 governance g8b-3).
 # Returns 0 required, 1 not required, 2 unreadable.
+# CLI11 2.6's to_flag_value, which the agent links: 1-9/t/y/+ and
+# true/on/yes/enable are on; 0/f/n/- and false/off/no/disable are off; other
+# integers are on when positive; an empty inline value (`--flag=`) is the flag
+# itself (on), an empty environment value is off. Anything CLI11 would reject
+# counts as on, so the installer refuses rather than guesses (con8-1).
 cli11_flag_value_enabled() {
-    local value
+    local value source="$2"
     value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-    case "$value" in ""|0|false|off|no) return 1 ;; esac
+    if [[ -z "$value" ]]; then
+        [[ "$source" == argument ]]
+        return
+    fi
+    case "$value" in
+        0|f|n|-|false|off|no|disable) return 1 ;;
+        [1-9]|t|y|+|true|on|yes|enable) return 0 ;;
+    esac
+    if [[ "$value" =~ ^[+-]?[0-9]+$ ]]; then
+        [[ "$value" != -* && ! "$value" =~ ^[+]?0+$ ]]
+        return
+    fi
     return 0
 }
 
@@ -483,12 +527,12 @@ plugin_signatures_required_by() {
         case "$line" in
             --plugin-require-signature) state=on ;;
             --plugin-require-signature=*)
-                if cli11_flag_value_enabled "${line#*=}"; then state=on; else state=off; fi ;;
+                if cli11_flag_value_enabled "${line#*=}" argument; then state=on; else state=off; fi ;;
         esac
     done <<< "$arguments"
     [[ -z "$state" ]] || { [[ "$state" == on ]]; return; }
     value="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:YUZU_PLUGIN_REQUIRE_SIGNATURE' "$plist" 2>/dev/null)" || return 1
-    cli11_flag_value_enabled "$value"
+    cli11_flag_value_enabled "$value" environment
 }
 
 # The merged incoming definition is always readable; if it is not, assume
@@ -562,6 +606,11 @@ restart_restored_service() {
     fi
     launchctl enable "system/com.yuzu.agent" >/dev/null 2>&1 || true
     if launchctl bootstrap system "$PLIST" && require_started; then
+        # An administrator's disable override is put back for the next boot (sre8-3).
+        if [[ -e "$recovery/service-was-disabled" ]]; then
+            launchctl disable "system/com.yuzu.agent" ||
+                echo "WARNING: could not restore the administrator's disable override; run: launchctl disable system/com.yuzu.agent" >&2
+        fi
         return 0
     fi
     echo "WARNING: restored the previous agent, but it did not stay running. Installing a package is the remedy; recovery is complete." >&2
@@ -586,8 +635,10 @@ restore_previous() {
     # Clear both lanes and the generated plist first: recovery must restore an
     # exact prior package state, including the prior "no installed agent" case.
     rm -f "$PLIST" "$MODE_FILE" "$INCOMING_BUNDLE_ARCHIVE"
-    remove_managed_plugins "$MANIFEST" "$HASHES"
-    remove_managed_plugins "$INCOMING_MANIFEST" "$INCOMING_HASHES"
+    remove_managed_plugins "$MANIFEST" "$HASHES" "$INCOMING_HASHES" \
+        "$recovery/incoming-package-files.sha256" "$recovery/package-files.sha256"
+    remove_managed_plugins "$INCOMING_MANIFEST" "$HASHES" "$INCOMING_HASHES" \
+        "$recovery/incoming-package-files.sha256" "$recovery/package-files.sha256"
     rm -f "$MANIFEST" "$HASHES"
     rm -rf "$APP" "$INCOMING_APP"
     rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib \
@@ -722,14 +773,22 @@ recovery="$(recovery_path)" || {
 if [[ -f "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]]; then
     merge_args=(--previous "$recovery/LaunchDaemons/com.yuzu.agent.plist" --destination "$INCOMING_PLIST")
     [[ "$MODE" != "bundle" ]] || merge_args+=(--force-no-auto-update)
-    /usr/bin/osascript -l JavaScript "$SCRIPT_SRC/merge-launchd-plist.js" "${merge_args[@]}" || {
+    merge_result="$(/usr/bin/osascript -l JavaScript "$SCRIPT_SRC/merge-launchd-plist.js" "${merge_args[@]}")" || {
         echo "ERROR: could not merge the existing service settings; the active service was left unchanged" >&2; exit 1; }
 fi
+# The merge reports when the existing definition could not be read, so its
+# settings were lost (con8-2): a running agent is then not health-gated.
+prior_definition_lost=0
+[[ "${merge_result:-}" != *prior-unreadable* ]] || prior_definition_lost=1
 reject_unsigned_plugins_under_enforcement || exit 1
 # Record what is being replaced: only a running service is health-gated and
 # restarted by recovery.
 if service_running_stably; then : > "$recovery/service-was-running"; else rm -f "$recovery/service-was-running"; fi
+if service_disabled; then : > "$recovery/service-was-disabled"; else rm -f "$recovery/service-was-disabled"; fi
 
+# Recovery needs this package's hash record even if the promotion below is cut
+# short between moving the manifest and moving the hashes (uh8-1).
+[[ ! -f "$INCOMING_HASHES" ]] || ditto "$INCOMING_HASHES" "$recovery/incoming-package-files.sha256"
 printf 'promoting\n' > "$recovery/.phase.new"
 mv -f "$recovery/.phase.new" "$recovery/phase"
 sync
@@ -795,7 +854,8 @@ sync
 # definition and leave it stopped anyway (g8ch-M1).
 was_disabled=0
 if service_disabled; then was_disabled=1; fi
-if [[ -e "$recovery/service-was-running" ]] && service_definition_configured "$PLIST"; then
+if [[ -e "$recovery/service-was-running" && "$prior_definition_lost" == 0 ]] && \
+   service_definition_configured "$PLIST"; then
     launchctl enable "system/com.yuzu.agent"
     launchctl bootstrap system "$PLIST"
     require_started
@@ -812,7 +872,7 @@ elif service_definition_configured "$PLIST"; then
     if launchctl bootstrap system "$PLIST" && require_started; then
         outcome="Yuzu Agent installed and started."
     else
-        outcome="Yuzu Agent installed. It was started but did not stay running; see $LOG_DIR/yuzu-agent.log."
+        outcome="Yuzu Agent installed. It was started but did not stay running; see $LOG_DIR/yuzu-agent.stderr.log and $LOG_DIR/yuzu-agent.log."
     fi
 else
     outcome="Yuzu Agent installed but not started: no server trust anchor is configured. Add --server and one of --ca-cert, --tls-system-roots (or install $DEFAULT_CA) to $PLIST, then run: launchctl bootstrap system $PLIST"
@@ -821,8 +881,10 @@ fi
 # that package-owned child after the replacement is in place; recovery retains
 # a copy until this transition is fully durable.
 retire_legacy_app
+upgraded=0
+[[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || upgraded=1
 PROMOTION_ARMED=0
 finish_recovery "$recovery"
 INSTALL_COMPLETED=1
 echo "$outcome"
-echo "Data, logs, and trust anchors were preserved."
+[[ "$upgraded" != 1 ]] || echo "Existing data, logs, trust anchors and service settings were preserved."

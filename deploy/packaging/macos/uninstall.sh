@@ -14,8 +14,24 @@ if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
     [[ ! -L "$TRANSITION_LOCK" ]] || { echo "ERROR: refusing a symlinked transition lock" >&2; exit 1; }
     (umask 077; : >> "$TRANSITION_LOCK")
     chmod 600 "$TRANSITION_LOCK"
-    exec /usr/bin/lockf -k -t 600 "$TRANSITION_LOCK" \
-        /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
+    # Lock this shell's own descriptor, so the lock lasts exactly as long as
+    # this script: with a separate lockf wrapper process, killing the wrapper
+    # released the lock while the script ran on (governance uh8-6). An older
+    # lockf without the descriptor form fails with another status; the wrapper
+    # form is the fallback there. 75 is lockf's timeout, kept well under
+    # Installer's own 600 s script limit so this message can appear (sre8-2).
+    exec 9>>"$TRANSITION_LOCK"
+    lock_status=0
+    /usr/bin/lockf -s -t 120 9 2>/dev/null || lock_status=$?
+    if [[ "$lock_status" == 75 ]]; then
+        echo "ERROR: another Yuzu Agent package transition did not finish within 2 minutes; retry" >&2
+        exit 1
+    fi
+    if [[ "$lock_status" != 0 ]]; then
+        exec 9>&-
+        exec /usr/bin/lockf -k -t 120 "$TRANSITION_LOCK" \
+            /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
+    fi
 fi
 
 PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
@@ -89,7 +105,8 @@ quarantine_legacy_app() {
 retire_legacy_app() {
     [[ ! -e "$LEGACY_APP" && ! -L "$LEGACY_APP" ]] && return 0
     if legacy_app_is_managed "$LEGACY_APP"; then
-        rm -rf "$LEGACY_APP"
+        rm -rf "${LEGACY_APP:?}"
+        echo "Removed the retired development YuzuAgent.app (its identity was verified)" >&2
     else
         quarantine_legacy_app "$LEGACY_APP"
     fi
@@ -104,22 +121,32 @@ plugin_hash_matches() {
     [[ "${actual%% *}" == "$recorded" ]]
 }
 
-# A listed plugin whose bytes no longer match the recorded hash belongs to the
-# operator and is kept (PR #4482 governance sec-3).
+# Every hash file given is a package's record (the old one, the new one, their
+# snapshot copies): a listed plugin is package-owned if its bytes match ANY of
+# them. Recovery after an interruption between moving the new manifest and the
+# new hashes would otherwise keep the new package's plugin (governance uh8-1).
 remove_managed_plugins() {
-    local manifest="$1" hashes="${2:-}" relative plugin
+    local manifest="$1" relative plugin hashes recorded owned
+    shift
     [[ -f "$manifest" ]] || return 0
     while IFS= read -r relative; do
         [[ "$relative" == plugins/* ]] || continue
         plugin="${relative#plugins/}"
         [[ -n "$plugin" && "$plugin" != */* && "$plugin" != .* ]] || {
             echo "ERROR: invalid package plugin manifest entry" >&2; return 1; }
-        if [[ -n "$hashes" && -f "$hashes" && -e "$PLUGIN_DIR/$plugin" ]] && \
-           ! plugin_hash_matches "$plugin" "$hashes"; then
-            echo "WARNING: kept $PLUGIN_DIR/$plugin: its bytes differ from the package's, so it is not package-owned" >&2
-            continue
+        if [[ -e "$PLUGIN_DIR/$plugin" ]]; then
+            recorded=0 owned=0
+            for hashes in "$@"; do
+                [[ -n "$hashes" && -f "$hashes" ]] || continue
+                recorded=1
+                if plugin_hash_matches "$plugin" "$hashes"; then owned=1; break; fi
+            done
+            if [[ "$recorded" == 1 && "$owned" != 1 ]]; then
+                echo "WARNING: kept $PLUGIN_DIR/$plugin: its bytes differ from the package's, so it is not package-owned" >&2
+                continue
+            fi
         fi
-        rm -f "$PLUGIN_DIR/$plugin" "$PLUGIN_DIR/$plugin.sig"
+        rm -f "${PLUGIN_DIR:?}/${plugin:?}" "${PLUGIN_DIR:?}/${plugin:?}.sig"
     done < "$manifest"
 }
 
@@ -135,6 +162,36 @@ stop_service() {
         sleep 0.5
         waited=$((waited + 1))
     done
+}
+
+# After a fleet rollback to a package without a manifest (governance rd-2),
+# this package's manifest and hashes are stale and would disown the older
+# package's plugins; with no manifest at all only the receipt names them.
+# Either way they are removed by name, from the manifest and from the
+# Installer receipt (con8-4).
+manifest_is_stale() {
+    local recorded installed
+    [[ -f "$MANIFEST" ]] || return 1
+    recorded="$(awk 'NR == 1 && $1 == "#" && $2 == "package-version" {print $3}' "$MANIFEST")"
+    [[ -n "$recorded" ]] || return 1
+    installed="$(/usr/sbin/pkgutil --pkg-info com.yuzu.agent 2>/dev/null)" || return 1
+    installed="$(awk '/^version: / {print $2; exit}' <<<"$installed")"
+    [[ -n "$installed" && "$installed" != "$recorded" ]]
+}
+
+remove_receipted_plugins() {
+    local receipt relative name
+    receipt="$(/usr/sbin/pkgutil --files com.yuzu.agent 2>/dev/null)" || return 0
+    while IFS= read -r relative; do
+        case "$relative" in
+            usr/local/lib/yuzu/plugins/._*) ;;
+            usr/local/lib/yuzu/plugins/*.dylib)
+                name="${relative#usr/local/lib/yuzu/plugins/}"
+                [[ "$name" != .* && "$name" != */* && "$name" != *[!a-zA-Z0-9_.-]* ]] || continue
+                rm -f "${PLUGIN_DIR:?}/${name:?}" "${PLUGIN_DIR:?}/${name:?}.sig"
+                ;;
+        esac
+    done <<< "$receipt"
 }
 
 # Interrupted-install state is cleared FIRST, pointer before snapshots: with no
@@ -154,7 +211,15 @@ ensure_state_dir
 clear_recovery_state
 stop_service || echo "WARNING: Yuzu Agent is still unloading; its code is removed anyway" >&2
 retire_legacy_app
-remove_managed_plugins "$MANIFEST" "$HASHES"
+if [[ ! -f "$MANIFEST" ]]; then
+    remove_receipted_plugins
+elif manifest_is_stale; then
+    echo "WARNING: the package manifest predates the installed package (a rollback); removing its plugins by name" >&2
+    remove_managed_plugins "$MANIFEST"
+    remove_receipted_plugins
+else
+    remove_managed_plugins "$MANIFEST" "$HASHES"
+fi
 # Both lanes are package-owned. Remove both so a loose-to-bundle (or reverse)
 # transition cannot leave executable code behind, including an updater rollback
 # file that would otherwise be promoted on a later install (ch-4).
@@ -181,4 +246,5 @@ if [[ -d "$STATE_DIR/quarantine" ]] && [[ -n "$(ls -A "$STATE_DIR/quarantine")" 
 else
     rm -rf "$STATE_DIR"
 fi
-echo "Yuzu Agent code removed. Data, logs, configuration, and trust anchors were preserved."
+echo "Yuzu Agent code and its service definition were removed. Data, logs, /etc/yuzu-agent and trust anchors were preserved;"
+echo "the server address and other settings in the removed definition were not, so re-apply them after a reinstall."

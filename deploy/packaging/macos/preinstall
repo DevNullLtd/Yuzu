@@ -14,8 +14,24 @@ if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
     [[ ! -L "$TRANSITION_LOCK" ]] || { echo "ERROR: refusing a symlinked transition lock" >&2; exit 1; }
     (umask 077; : >> "$TRANSITION_LOCK")
     chmod 600 "$TRANSITION_LOCK"
-    exec /usr/bin/lockf -k -t 600 "$TRANSITION_LOCK" \
-        /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
+    # Lock this shell's own descriptor, so the lock lasts exactly as long as
+    # this script: with a separate lockf wrapper process, killing the wrapper
+    # released the lock while the script ran on (governance uh8-6). An older
+    # lockf without the descriptor form fails with another status; the wrapper
+    # form is the fallback there. 75 is lockf's timeout, kept well under
+    # Installer's own 600 s script limit so this message can appear (sre8-2).
+    exec 9>>"$TRANSITION_LOCK"
+    lock_status=0
+    /usr/bin/lockf -s -t 120 9 2>/dev/null || lock_status=$?
+    if [[ "$lock_status" == 75 ]]; then
+        echo "ERROR: another Yuzu Agent package transition did not finish within 2 minutes; retry" >&2
+        exit 1
+    fi
+    if [[ "$lock_status" != 0 ]]; then
+        exec 9>&-
+        exec /usr/bin/lockf -k -t 120 "$TRANSITION_LOCK" \
+            /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
+    fi
 fi
 
 PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
@@ -42,6 +58,10 @@ require_trusted_directory() {
     mode="$(stat -f '%Lp' "$path")"
     [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || {
         echo "ERROR: package payload parent must be root-owned and not group/world writable: $path" >&2; exit 1; }
+    # The bundle lane's code root and its parents get the same ACL rule as the
+    # /usr/local chain (governance con8-3, G8-S7).
+    ! acl_grants_write "$path" || {
+        echo "ERROR: an access control list lets another account modify $path; remove it (chmod -N) and retry" >&2; exit 1; }
 }
 
 # Mode bits are not the whole story: a macOS ACL can grant another account
@@ -132,6 +152,7 @@ secure_payload_parent() {
     mkdir -p "$path"
     [[ ! -L "$path" ]] || { echo "ERROR: refusing symlinked package payload parent: $path" >&2; exit 1; }
     chown root:wheel "$path"
+    chmod -N "$path"
     chmod "$mode" "$path"
 }
 
@@ -167,8 +188,8 @@ require_recovery_directory() {
 # Prints the pending snapshot, or nothing when there is none usable. The state
 # root is root:wheel 700 (ensure_state_dir), so only root wrote the pointer: a
 # torn or dangling one is an interrupted cleanup, not tampering. It is reported
-# and dropped (the snapshot it names, if any, is left in place) instead of
-# failing every later install (PR #4482 governance uh-1).
+# and dropped (the snapshot it names, if any, is later collected as an orphan)
+# instead of failing every later install (PR #4482 governance uh-1).
 read_recovery_path() {
     local pending
     if [[ -f "$RECOVERY_FILE" && ! -L "$RECOVERY_FILE" ]]; then
@@ -229,34 +250,6 @@ require_trusted_log_directory() {
         return 1; }
 }
 
-PACKAGE_MODE="$(awk -F= '$1 == "mode" {print $2}' "$SCRIPT_SRC/package-info" 2>/dev/null || true)"
-UNSIGNED_PLUGINS="$(awk -F= '$1 == "unsigned_plugins" {print $2}' "$SCRIPT_SRC/package-info" 2>/dev/null || true)"
-[[ ( "$PACKAGE_MODE" == loose || "$PACKAGE_MODE" == bundle ) && -f "$SCRIPT_SRC/package-files.list" ]] || {
-    echo "ERROR: the package is missing its package-info or plugin list" >&2; exit 1; }
-if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
-    [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || {
-        echo "ERROR: data path is not a real directory: $DATA_DIR" >&2; exit 1; }
-    require_trusted_data_directory || exit 1
-fi
-require_trusted_log_directory || exit 1
-# Configuration and trust anchors: postinstall requires them root-owned and not
-# group/world writable; refuse here, before the payload (rd-r2-3). /etc is the
-# platform alias of /private/etc.
-for configuration_dir in /private/etc/yuzu-agent /private/etc/yuzu-agent/certs; do
-    [[ -e "$configuration_dir" || -L "$configuration_dir" ]] || continue
-    require_trusted_directory "$configuration_dir"
-done
-# Both lanes deliver code below /usr/local/lib/yuzu and the loose lane into
-# /usr/local/bin, so the chain this package's lane uses, and everything already
-# in it, must be trusted before the payload lands (governance sec-2, ch-4,
-# ch-5, G8-S1).
-require_trusted_code_tree "$PACKAGE_MODE" || exit 1
-secure_payload_parent "$APP_ROOT" 755
-secure_payload_parent "$YUZU_LIB" 755
-if [[ -e "$PLUGIN_DIR" || -L "$PLUGIN_DIR" ]]; then
-    require_trusted_directory "$PLUGIN_DIR"
-fi
-ensure_state_dir
 
 
 # Exit 0: the file's SHA-256 equals the hash recorded at build time.
@@ -297,10 +290,26 @@ reject_unmanaged_plugin_collisions() {
 # 0/false/off/no or empty (any case) and on otherwise; the command line, last
 # occurrence, overrides the environment (PR #4482 governance g8b-3).
 # Returns 0 required, 1 not required, 2 unreadable.
+# CLI11 2.6's to_flag_value, which the agent links: 1-9/t/y/+ and
+# true/on/yes/enable are on; 0/f/n/- and false/off/no/disable are off; other
+# integers are on when positive; an empty inline value (`--flag=`) is the flag
+# itself (on), an empty environment value is off. Anything CLI11 would reject
+# counts as on, so the installer refuses rather than guesses (con8-1).
 cli11_flag_value_enabled() {
-    local value
+    local value source="$2"
     value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-    case "$value" in ""|0|false|off|no) return 1 ;; esac
+    if [[ -z "$value" ]]; then
+        [[ "$source" == argument ]]
+        return
+    fi
+    case "$value" in
+        0|f|n|-|false|off|no|disable) return 1 ;;
+        [1-9]|t|y|+|true|on|yes|enable) return 0 ;;
+    esac
+    if [[ "$value" =~ ^[+-]?[0-9]+$ ]]; then
+        [[ "$value" != -* && ! "$value" =~ ^[+]?0+$ ]]
+        return
+    fi
     return 0
 }
 
@@ -312,12 +321,12 @@ plugin_signatures_required_by() {
         case "$line" in
             --plugin-require-signature) state=on ;;
             --plugin-require-signature=*)
-                if cli11_flag_value_enabled "${line#*=}"; then state=on; else state=off; fi ;;
+                if cli11_flag_value_enabled "${line#*=}" argument; then state=on; else state=off; fi ;;
         esac
     done <<< "$arguments"
     [[ -z "$state" ]] || { [[ "$state" == on ]]; return; }
     value="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:YUZU_PLUGIN_REQUIRE_SIGNATURE' "$plist" 2>/dev/null)" || return 1
-    cli11_flag_value_enabled "$value"
+    cli11_flag_value_enabled "$value" environment
 }
 
 reject_unsigned_plugins_under_enforcement() {
@@ -328,21 +337,32 @@ reject_unsigned_plugins_under_enforcement() {
     return 1
 }
 
-# See postinstall: an operator-modified listed plugin is kept (sec-3).
+# Every hash file given is a package's record (the old one, the new one, their
+# snapshot copies): a listed plugin is package-owned if its bytes match ANY of
+# them. Recovery after an interruption between moving the new manifest and the
+# new hashes would otherwise keep the new package's plugin (governance uh8-1).
 remove_managed_plugins() {
-    local manifest="$1" hashes="${2:-}" relative plugin
+    local manifest="$1" relative plugin hashes recorded owned
+    shift
     [[ -f "$manifest" ]] || return 0
     while IFS= read -r relative; do
         [[ "$relative" == plugins/* ]] || continue
         plugin="${relative#plugins/}"
         [[ -n "$plugin" && "$plugin" != */* && "$plugin" != .* ]] || {
             echo "ERROR: invalid package plugin manifest entry" >&2; return 1; }
-        if [[ -n "$hashes" && -f "$hashes" && -e "$PLUGIN_DIR/$plugin" ]] && \
-           ! plugin_hash_matches "$plugin" "$hashes"; then
-            echo "WARNING: kept $PLUGIN_DIR/$plugin: its bytes differ from the package's, so it is not package-owned" >&2
-            continue
+        if [[ -e "$PLUGIN_DIR/$plugin" ]]; then
+            recorded=0 owned=0
+            for hashes in "$@"; do
+                [[ -n "$hashes" && -f "$hashes" ]] || continue
+                recorded=1
+                if plugin_hash_matches "$plugin" "$hashes"; then owned=1; break; fi
+            done
+            if [[ "$recorded" == 1 && "$owned" != 1 ]]; then
+                echo "WARNING: kept $PLUGIN_DIR/$plugin: its bytes differ from the package's, so it is not package-owned" >&2
+                continue
+            fi
         fi
-        rm -f "$PLUGIN_DIR/$plugin" "$PLUGIN_DIR/$plugin.sig"
+        rm -f "${PLUGIN_DIR:?}/${plugin:?}" "${PLUGIN_DIR:?}/${plugin:?}.sig"
     done < "$manifest"
 }
 
@@ -354,7 +374,7 @@ remove_managed_plugins() {
 # still match its recorded hash. The result records names only.
 discard_stale_manifest() {
     local manifest="$YUZU_LIB/package-files.list" hashes="$YUZU_LIB/package-files.sha256"
-    local recorded installed kept digest relative name actual
+    local recorded installed kept combined combined_hashes digest relative name actual status=0
     [[ -f "$manifest" && ! -L "$manifest" ]] || return 0
     recorded="$(awk 'NR == 1 && $1 == "#" && $2 == "package-version" {print $3}' "$manifest")"
     [[ -n "$recorded" ]] || return 0
@@ -363,6 +383,8 @@ discard_stale_manifest() {
     [[ -n "$installed" && "$installed" != "$recorded" ]] || return 0
     echo "WARNING: the package manifest was written by $recorded but the installed package is $installed; re-deriving plugin ownership" >&2
     kept="$(mktemp "$YUZU_LIB/.still-owned.XXXXXX")"
+    combined="$(mktemp "$YUZU_LIB/.rederived-manifest.XXXXXX")"
+    combined_hashes="$(mktemp "$YUZU_LIB/.rederived-hashes.XXXXXX")"
     if [[ -f "$hashes" ]]; then
         while read -r digest relative; do
             [[ "$relative" == plugins/* ]] || continue
@@ -373,14 +395,28 @@ discard_stale_manifest() {
             [[ "${actual%% *}" != "$digest" ]] || printf '%s\n' "$relative" >> "$kept"
         done < "$hashes"
     fi
-    rm -f "$manifest" "$hashes"
-    adopt_receipted_plugins || { rm -f "$kept"; return 1; }
+    receipt_plugin_entries "$combined" || status=$?
+    if [[ "$status" == 1 ]]; then
+        rm -f "${kept:?}" "${combined:?}" "${combined_hashes:?}"
+        return 1
+    fi
     while IFS= read -r relative; do
-        [[ -f "$manifest" ]] && grep -Fqx -- "$relative" "$manifest" && continue
-        printf '%s\n' "$relative" >> "$manifest"
+        grep -Fqx -- "$relative" "$combined" || printf '%s\n' "$relative" >> "$combined"
     done < "$kept"
-    rm -f "$kept"
-    [[ ! -f "$manifest" ]] || chmod 644 "$manifest"
+    rm -f "${kept:?}"
+    # Record the bytes now present for every re-derived plugin, so the new
+    # manifest and its hashes agree. The hashes move first: a stop between the
+    # two moves leaves the stale, version-stamped manifest, and the next run
+    # re-derives again (governance uh8-4). Neither file is ever half-written.
+    while IFS= read -r relative; do
+        name="${relative#plugins/}"
+        [[ -f "$PLUGIN_DIR/$name" && ! -L "$PLUGIN_DIR/$name" ]] || continue
+        actual="$(shasum -a 256 "$PLUGIN_DIR/$name")" || continue
+        printf '%s  %s\n' "${actual%% *}" "$relative" >> "$combined_hashes"
+    done < "$combined"
+    chmod 644 "$combined" "$combined_hashes"
+    mv -f "$combined_hashes" "$hashes"
+    mv -f "$combined" "$manifest"
 }
 
 copy_if_present() {
@@ -390,13 +426,11 @@ copy_if_present() {
     ditto "$source" "$destination"
 }
 
-adopt_receipted_plugins() {
-    local manifest="$YUZU_LIB/package-files.list" receipt relative name temporary
-    [[ ! -e "$manifest" && ! -L "$manifest" ]] || return 0
-    # Older loose packages had no manifest. The root-owned Installer database,
-    # not a plugin-directory scan, establishes their package ownership.
-    receipt="$(/usr/sbin/pkgutil --files com.yuzu.agent 2>/dev/null)" || return 0
-    temporary="$(mktemp "$YUZU_LIB/.legacy-manifest.XXXXXX")"
+# Writes the Installer receipt's plugin entries to $1. Returns 2 when there is
+# no receipt and 1 on an unsafe entry.
+receipt_plugin_entries() {
+    local output="$1" receipt relative name
+    receipt="$(/usr/sbin/pkgutil --files com.yuzu.agent 2>/dev/null)" || return 2
     while IFS= read -r relative; do
         case "$relative" in
             usr/local/lib/yuzu/plugins/._*)
@@ -405,12 +439,25 @@ adopt_receipted_plugins() {
             usr/local/lib/yuzu/plugins/*.dylib)
                 name="${relative#usr/local/lib/yuzu/plugins/}"
                 [[ "$name" != .* && "$name" != */* && "$name" != *[!a-zA-Z0-9_.-]* ]] || {
-                    rm -f "$temporary"
                     echo "ERROR: unsafe plugin path in legacy Installer receipt" >&2; return 1; }
-                printf 'plugins/%s\n' "$name" >> "$temporary"
+                printf 'plugins/%s\n' "$name" >> "$output" || return 1
                 ;;
         esac
     done <<< "$receipt"
+}
+
+adopt_receipted_plugins() {
+    local manifest="$YUZU_LIB/package-files.list" temporary status=0
+    [[ ! -e "$manifest" && ! -L "$manifest" ]] || return 0
+    # Older loose packages had no manifest. The root-owned Installer database,
+    # not a plugin-directory scan, establishes their package ownership.
+    temporary="$(mktemp "$YUZU_LIB/.legacy-manifest.XXXXXX")"
+    receipt_plugin_entries "$temporary" || status=$?
+    if [[ "$status" != 0 ]]; then
+        rm -f "${temporary:?}"
+        [[ "$status" == 2 ]] && return 0
+        return 1
+    fi
     chmod 644 "$temporary"
     mv "$temporary" "$manifest"
 }
@@ -476,6 +523,11 @@ restart_restored_service() {
     fi
     launchctl enable "system/com.yuzu.agent" >/dev/null 2>&1 || true
     if launchctl bootstrap system "$PLIST" && require_started; then
+        # An administrator's disable override is put back for the next boot (sre8-3).
+        if [[ -e "$recovery/service-was-disabled" ]]; then
+            launchctl disable "system/com.yuzu.agent" ||
+                echo "WARNING: could not restore the administrator's disable override; run: launchctl disable system/com.yuzu.agent" >&2
+        fi
         return 0
     fi
     echo "WARNING: restored the previous agent, but it did not stay running. This installation continues; it is the remedy." >&2
@@ -484,8 +536,12 @@ restart_restored_service() {
 recover_interrupted_promotion() {
     local recovery="$1"
     stop_service || echo "WARNING: Yuzu Agent is still unloading; restoring anyway" >&2
-    remove_managed_plugins "$YUZU_LIB/package-files.list" "$YUZU_LIB/package-files.sha256"
-    remove_managed_plugins "$YUZU_LIB/.package-files.incoming" "$YUZU_LIB/.package-files.sha256.incoming"
+    remove_managed_plugins "$YUZU_LIB/package-files.list" "$YUZU_LIB/package-files.sha256" \
+        "$YUZU_LIB/.package-files.sha256.incoming" "$recovery/incoming-package-files.sha256" \
+        "$recovery/package-files.sha256"
+    remove_managed_plugins "$YUZU_LIB/.package-files.incoming" "$YUZU_LIB/package-files.sha256" \
+        "$YUZU_LIB/.package-files.sha256.incoming" "$recovery/incoming-package-files.sha256" \
+        "$recovery/package-files.sha256"
     rm -f "$PLIST" "$YUZU_LIB/package-mode" "$YUZU_LIB/package-files.list" "$YUZU_LIB/package-files.sha256"
     rm -rf "$APP_ROOT/YuzuAgent.app"
     rm -f "$LOOSE_BIN/yuzu-agent" "$LOOSE_BIN/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib \
@@ -560,6 +616,11 @@ discard_recovery() {
     rm -rf "$recovery"
 }
 
+# An interrupted earlier install is recovered first, so a refusal below never
+# leaves a half-promoted host behind and its message stays true (governance
+# uh8-7). Recovery restarts only what was running, and only from a trusted
+# code directory.
+ensure_state_dir
 if [[ -e "$RECOVERY_FILE" || -L "$RECOVERY_FILE" ]]; then
     pending="$(read_recovery_path)"
     if [[ -n "$pending" ]]; then
@@ -593,6 +654,36 @@ for orphan in "$STATE_DIR"/install-recovery.*; do
     require_recovery_directory "$orphan" 2>/dev/null && rm -rf "$orphan"
 done
 
+PACKAGE_MODE="$(awk -F= '$1 == "mode" {print $2}' "$SCRIPT_SRC/package-info" 2>/dev/null || true)"
+UNSIGNED_PLUGINS="$(awk -F= '$1 == "unsigned_plugins" {print $2}' "$SCRIPT_SRC/package-info" 2>/dev/null || true)"
+[[ ( "$PACKAGE_MODE" == loose || "$PACKAGE_MODE" == bundle ) && -f "$SCRIPT_SRC/package-files.list" ]] || {
+    echo "ERROR: the package is missing its package-info or plugin list" >&2; exit 1; }
+if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
+    [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || {
+        echo "ERROR: data path is not a real directory: $DATA_DIR" >&2; exit 1; }
+    require_trusted_data_directory || exit 1
+fi
+require_trusted_log_directory || exit 1
+# Configuration and trust anchors: postinstall requires them root-owned and not
+# group/world writable; refuse here, before the payload (rd-r2-3). /etc is the
+# platform alias of /private/etc.
+for configuration_dir in /private/etc/yuzu-agent /private/etc/yuzu-agent/certs; do
+    [[ -e "$configuration_dir" || -L "$configuration_dir" ]] || continue
+    require_trusted_directory "$configuration_dir"
+done
+# Both lanes deliver code below /usr/local/lib/yuzu and the loose lane into
+# /usr/local/bin, so the chain this package's lane uses, and everything already
+# in it, must be trusted before the payload lands (governance sec-2, ch-4,
+# ch-5, G8-S1).
+require_trusted_code_tree "$PACKAGE_MODE" || exit 1
+secure_payload_parent "$APP_ROOT" 755
+secure_payload_parent "$YUZU_LIB" 755
+# Leftovers of an interrupted manifest re-derivation (governance uh8-4).
+rm -f "${YUZU_LIB:?}"/.rederived-manifest.* "${YUZU_LIB:?}"/.rederived-hashes.* \
+      "${YUZU_LIB:?}"/.still-owned.* "${YUZU_LIB:?}"/.legacy-manifest.*
+if [[ -e "$PLUGIN_DIR" || -L "$PLUGIN_DIR" ]]; then
+    require_trusted_directory "$PLUGIN_DIR"
+fi
 RECOVERY="$(mktemp -d "${STATE_DIR}/install-recovery.XXXXXX")"
 chmod 700 "$RECOVERY"
 

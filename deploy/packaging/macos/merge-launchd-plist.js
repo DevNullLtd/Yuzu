@@ -96,7 +96,8 @@ function run(argv) {
         console.log('merge-launchd-plist: WARNING: the existing service definition cannot be read (' +
             error.message + '); installing the package default, so earlier --server and other ' +
             'settings must be re-applied');
-        return;
+        // On stdout, for postinstall: the running agent's settings were lost.
+        return 'prior-unreadable';
     }
     const result = merge(prior, generated, force);
     const error = Ref();
