@@ -18,6 +18,7 @@
 #include <functional>
 #include <cstdint>
 #include <cstdio>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -51,6 +52,7 @@
 #ifdef _WIN32
 // clang-format off
 #include <winsock2.h> // WSADuplicateSocketW / WSASocketW for RequestDeadlineWatchdog
+#include <ws2tcpip.h> // GetAddrInfoExW / FreeAddrInfoExW for the egress resolver
 #include <windows.h>
 #include <bcrypt.h>
 #include <winhttp.h>
@@ -846,6 +848,120 @@ OidcProvider::ResolverForTest& test_resolver_slot() {
     return r;
 }
 
+// One resolved address: its family and raw network-order bytes (4 or 16 used).
+struct ResolvedAddress {
+    int family{};
+    std::array<unsigned char, 16> bytes{};
+};
+
+// Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses within about
+// `timeout_sec` seconds. False when the name did not resolve or the lookup timed out. Own
+// function per platform because httplib's helper cannot be consumed generically: on Windows it
+// returns a GetAddrInfoExW result cast to `addrinfo`, whose layout differs after ai_addr (the
+// blob, blob length and provider fields precede ai_next) and which must be released with
+// FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it with freeaddrinfo
+// is the wrong deleter.
+#ifdef _WIN32
+bool resolve_host_addresses(const std::string& host, int timeout_sec,
+                            std::vector<ResolvedAddress>& out) {
+    struct Request {
+        OVERLAPPED overlapped{};
+        PADDRINFOEXW result{};
+        HANDLE cancel{};
+        std::wstring name;
+        ~Request() {
+            if (result != nullptr)
+                ::FreeAddrInfoExW(result);
+            if (overlapped.hEvent != nullptr)
+                ::CloseHandle(overlapped.hEvent);
+        }
+    };
+    const int wide_len =
+        ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host.c_str(), -1, nullptr, 0);
+    if (wide_len <= 1)
+        return false;
+    auto request = std::make_unique<Request>();
+    request->name.assign(static_cast<std::size_t>(wide_len), L'\0');
+    if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host.c_str(), -1, request->name.data(),
+                              wide_len) <= 0)
+        return false;
+    request->overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (request->overlapped.hEvent == nullptr)
+        return false;
+
+    ADDRINFOEXW hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc =
+        ::GetAddrInfoExW(request->name.c_str(), L"0", NS_DNS, nullptr, &hints, &request->result,
+                         nullptr, &request->overlapped, nullptr, &request->cancel);
+    if (rc == WSA_IO_PENDING) {
+        if (::WaitForSingleObject(request->overlapped.hEvent,
+                                  static_cast<DWORD>(timeout_sec) * 1000U) != WAIT_OBJECT_0) {
+            ::GetAddrInfoExCancel(&request->cancel);
+            // The cancelled lookup still completes into `overlapped` and `result`; they must
+            // outlive that completion. It follows a cancel promptly, so wait for it briefly; if it
+            // does not arrive, LEAK the request (one small allocation) rather than free memory the
+            // resolver may still write to.
+            if (::WaitForSingleObject(request->overlapped.hEvent, 5000) != WAIT_OBJECT_0)
+                (void)request.release();
+            return false;
+        }
+        rc = ::GetAddrInfoExOverlappedResult(&request->overlapped);
+    }
+    if (rc != NO_ERROR || request->result == nullptr)
+        return false;
+    // Walk the REAL list type: ADDRINFOEXW, whose ai_next sits after the blob fields.
+    for (const ADDRINFOEXW* ai = request->result; ai != nullptr; ai = ai->ai_next) {
+        ResolvedAddress address;
+        if (ai->ai_family == AF_INET && ai->ai_addr != nullptr) {
+            address.family = AF_INET;
+            std::memcpy(address.bytes.data(),
+                        &reinterpret_cast<const sockaddr_in*>(ai->ai_addr)->sin_addr, 4);
+            out.push_back(address);
+        } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr) {
+            address.family = AF_INET6;
+            std::memcpy(address.bytes.data(),
+                        &reinterpret_cast<const sockaddr_in6*>(ai->ai_addr)->sin6_addr, 16);
+            out.push_back(address);
+        }
+    }
+    return true;
+}
+#else
+bool resolve_host_addresses(const std::string& host, int timeout_sec,
+                            std::vector<ResolvedAddress>& out) {
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* result = nullptr;
+    if (::httplib::detail::getaddrinfo_with_timeout(host.c_str(), "0", &hints, &result,
+                                                    static_cast<time_t>(timeout_sec)) != 0 ||
+        result == nullptr)
+        return false;
+    struct Freer {
+        struct addrinfo* p;
+        ~Freer() { ::freeaddrinfo(p); }
+    } freer{result};
+    for (const struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
+        ResolvedAddress address;
+        if (ai->ai_family == AF_INET && ai->ai_addr != nullptr) {
+            address.family = AF_INET;
+            std::memcpy(address.bytes.data(),
+                        &reinterpret_cast<const sockaddr_in*>(ai->ai_addr)->sin_addr, 4);
+            out.push_back(address);
+        } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr) {
+            address.family = AF_INET6;
+            std::memcpy(address.bytes.data(),
+                        &reinterpret_cast<const sockaddr_in6*>(ai->ai_addr)->sin6_addr, 16);
+            out.push_back(address);
+        }
+    }
+    return true;
+}
+#endif
+
 std::expected<std::vector<std::string>, const char*>
 vet_egress_target(const std::string& host, bool allow_private, int dns_timeout_ms) {
     namespace egress = ::yuzu::server::oidc::egress;
@@ -886,36 +1002,24 @@ vet_egress_target(const std::string& host, bool allow_private, int dns_timeout_m
             if (const auto cls = egress::classify_literal(text))
                 consider(*cls, text.c_str());
     } else {
-        struct addrinfo hints;
-        std::memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        struct addrinfo* result = nullptr;
-        const time_t dns_timeout_sec =
-            static_cast<time_t>(std::max(1, (dns_timeout_ms + 999) / 1000));
-        if (::httplib::detail::getaddrinfo_with_timeout(host.c_str(), "0", &hints, &result,
-                                                        dns_timeout_sec) != 0 ||
-            result == nullptr)
+        std::vector<ResolvedAddress> resolved;
+        const int dns_timeout_sec = std::max(1, (dns_timeout_ms + 999) / 1000);
+        if (!resolve_host_addresses(host, dns_timeout_sec, resolved) || resolved.empty())
             return std::unexpected(kEgressUnresolvedReason);
-        struct Freer {
-            struct addrinfo* p;
-            ~Freer() { ::freeaddrinfo(p); }
-        } freer{result};
-
-        for (const struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
+        for (const auto& address : resolved) {
             char text[INET6_ADDRSTRLEN] = {};
-            if (ai->ai_family == AF_INET && ai->ai_addr != nullptr) {
-                egress::Ipv4 bytes{};
-                const auto* sin = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
-                std::memcpy(bytes.data(), &sin->sin_addr, bytes.size());
-                if (::inet_ntop(AF_INET, &sin->sin_addr, text, sizeof(text)) != nullptr)
+            if (address.family == AF_INET) {
+                if (::inet_ntop(AF_INET, address.bytes.data(), text, sizeof(text)) != nullptr) {
+                    egress::Ipv4 bytes{};
+                    std::memcpy(bytes.data(), address.bytes.data(), bytes.size());
                     consider(egress::classify_ipv4(bytes), text);
-            } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr) {
-                egress::Ipv6 bytes{};
-                const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(ai->ai_addr);
-                std::memcpy(bytes.data(), &sin6->sin6_addr, bytes.size());
-                if (::inet_ntop(AF_INET6, &sin6->sin6_addr, text, sizeof(text)) != nullptr)
+                }
+            } else if (address.family == AF_INET6) {
+                if (::inet_ntop(AF_INET6, address.bytes.data(), text, sizeof(text)) != nullptr) {
+                    egress::Ipv6 bytes{};
+                    std::memcpy(bytes.data(), address.bytes.data(), bytes.size());
                     consider(egress::classify_ipv6(bytes), text);
+                }
             }
             // any other address family is never connected to
         }

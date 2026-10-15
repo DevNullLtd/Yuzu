@@ -123,6 +123,30 @@ TEST_CASE("OIDC egress: link-local and cloud-metadata targets are refused even w
     }
 }
 
+TEST_CASE("OIDC egress: a real host name goes through the OS resolver, no test seam",
+          "[oidc][oidc_egress][security]") {
+    // Every other name test installs the resolver seam, so on a platform whose OS resolver
+    // needs its own handling (Windows: GetAddrInfoExW with its own list type and deleter) the
+    // real path would otherwise never run. "localhost" resolves everywhere without DNS.
+    MockIdp idp;
+    const std::string issuer = "http://localhost:" + std::to_string(idp.port);
+    idp.with([&](MockIdp& m) { m.discovery_issuer = issuer; });
+
+    // Loopback is a refused class by default: the name resolves, the answer is classified, and
+    // the fetch is refused before any request reaches the mock IdP.
+    auto refused = OidcProvider::fetch_discovery_document(issuer, false, false, 5000);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find(kRefused) != std::string::npos);
+    CHECK(idp.discovery_calls.load() == 0);
+
+    // With the switch it connects to a pinned loopback address (::1 first on some systems; the
+    // mock listens on 127.0.0.1 only, so the second address is the one that works). Windows takes
+    // about 2 s to refuse a closed loopback port, hence the generous budget.
+    auto allowed = OidcProvider::fetch_discovery_document(issuer, false, true, 10000);
+    REQUIRE(allowed.has_value());
+    CHECK(idp.discovery_calls.load() == 1);
+}
+
 TEST_CASE("OIDC egress: a name is resolved, every answer classified, and the connect is pinned",
           "[oidc][oidc_egress][security]") {
     MockIdp idp;
