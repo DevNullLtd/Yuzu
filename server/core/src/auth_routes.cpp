@@ -4744,6 +4744,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
         const bool eligible = body["eligible"].get<bool>();
+        // Granting eligibility is a STANDING right to elevate: an elevated session (admin only
+        // through its own temporary elevation) must not extend it to another account. Revoking
+        // stays open to an elevated session, since that only removes access.
+        if (eligible && session->role != auth::Role::admin) {
+            audit_log(req, "user.elevation_eligibility.set", "denied", "User", target,
+                      "elevated_session_eligibility_grant_blocked");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "granting elevation eligibility needs your "
+                                                       "own administrator role, not an elevation",
+                                                  cid, "another administrator must grant it"),
+                            "application/json");
+            return;
+        }
         if (auto r = db->set_elevation_eligible(target, eligible); !r) {
             const auto err = r.error();
             const int code = err == AuthDBError::UserNotFound ? 404 : 500;

@@ -613,6 +613,10 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   gains elevation rights silently. **Self-grant is blocked** (an operator — even
   one acting under an active elevation — cannot set their own eligibility, so a
   temporary admin window can't manufacture a durable self-elevation right).
+  **Granting is also refused to an elevated session**: `eligible=true` needs the caller's
+  own `session->role == admin` (`403`, audit `elevated_session_eligibility_grant_blocked`);
+  revoking stays open. The same rule bars `POST /api/settings/users/{username}/role`
+  (`elevated_session_role_change_blocked`).
   **Revoking eligibility immediately terminates any in-flight elevation** for
   that user (`AuthManager::revoke_user_elevations`, symmetric with the session
   wipe on demote/delete) — an incident-response "revoke now" drops admin access
@@ -666,7 +670,8 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   `is_elevated(session)` holds, else the base `role`. THE authorization functions
   gate on it: `require_admin` checks `effective_role`, and
   `require_permission`/`require_scoped_permission` **short-circuit to allow** an
-  elevated session (full admin for the window). Since HA WS-1/1a (ADR-2002 §4)
+  elevated session (full admin for the window), except role changes and eligibility grants,
+  which need the caller's own account (or IdP-mapped) admin role. Since HA WS-1/1a (ADR-2002 §4)
   `elevated_until`/`elevation_issued_ms` are **durably persisted** to
   `SessionStore` and authored from Postgres `now()` (#3715), so the elevation
   **survives a server restart** and adjudicates identically on any replica.
