@@ -189,9 +189,9 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
                                     ? "elevated_session_oidc_setting_blocked"
                                     : "admin_role_required_oidc_setting_blocked");
             res.status = 403;
-            res.set_content(
-                R"({"error":{"code":403,"message":"changing sign-in provider settings needs your own administrator role"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "changing sign-in provider settings needs your own "
+                                                  "administrator role"),
+                            "application/json");
             return;
         }
 

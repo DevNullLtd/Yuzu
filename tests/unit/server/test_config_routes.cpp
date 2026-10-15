@@ -731,6 +731,12 @@ TEST_CASE("config_routes: an elevated-only session cannot write any oidc_* key; 
         REQUIRE(res);
         CHECK(res->status == 403);
         CHECK(res->body.find("own administrator role") != std::string::npos);
+        // The standard error envelope: a correlation id in the body and in the header.
+        const auto refused = body(res->body);
+        CHECK(refused["error"]["code"] == 403);
+        CHECK(refused["error"].contains("correlation_id"));
+        CHECK(refused["error"].contains("retry_after_ms"));
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
         REQUIRE(h.audits.size() == 1);
         CHECK(h.audits[0].action == "config.update");
         CHECK(h.audits[0].result == "denied");
@@ -754,6 +760,7 @@ TEST_CASE("config_routes: a non-administrator Infrastructure:Write holder and an
     auto res = h.sink.Put("/api/config/oidc_admin_group", R"({"value":"g"})");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(body(res->body)["error"].contains("correlation_id"));
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].detail == "admin_role_required_oidc_setting_blocked");
 
