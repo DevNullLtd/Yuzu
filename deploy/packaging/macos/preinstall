@@ -141,6 +141,23 @@ adopt_receipted_plugins() {
     mv "$temporary" "$manifest"
 }
 
+# An app that fails the legacy-ownership check is never run, restored or deleted:
+# it is moved to a root-only quarantine OUTSIDE the data root and the recovery
+# snapshot, and reported. Keeping it inside the recovery snapshot (as before)
+# blocked every later recovery and install permanently (PR #4482 review).
+quarantine_legacy_app() {
+    local source="$1" quarantine destination
+    [[ -e "$source" || -L "$source" ]] || return 0
+    quarantine="$STATE_DIR/quarantine"
+    if [[ ! -d "$quarantine" ]]; then
+        mkdir -m 700 "$quarantine"
+        chown root:wheel "$quarantine"
+    fi
+    destination="$(mktemp -d "$quarantine/legacy-YuzuAgent.XXXXXX")"
+    mv "$source" "$destination/YuzuAgent.app"
+    echo "WARNING: quarantined an unrecognized legacy YuzuAgent.app at $destination; it was not run, restored or deleted" >&2
+}
+
 legacy_app_is_managed() {
     local candidate="${1:-$LEGACY_APP}"
     [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
@@ -195,15 +212,16 @@ recover_interrupted_promotion() {
         ditto "$recovery/package-files.list" "$YUZU_LIB/package-files.list"
     [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$YUZU_LIB/plugins"
     [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$YUZU_LIB/plugins"
-    if [[ -d "$recovery/legacy-retired.app" ]]; then
-        echo "ERROR: retained legacy app in root-owned recovery; service was not bootstrapped" >&2
-        return 1
-    fi
+    quarantine_legacy_app "$recovery/legacy-retired.app"
     if [[ -e "$PLIST" ]]; then
         if /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST" 2>/dev/null | \
            grep -Fq -- "$LEGACY_APP/Contents/MacOS/yuzu-agent"; then
-            echo "ERROR: recovered legacy service was preserved but not bootstrapped from non-package-owned data" >&2
-            return 1
+            # Never start code from the non-package-owned data root. The restore is
+            # complete, so report and return success: the pending installation (or
+            # the next one) then installs a package-owned agent instead of failing
+            # on this same check forever.
+            echo "WARNING: restored the previous legacy service definition but did not start it from non-package-owned data" >&2
+            return 0
         fi
         launchctl bootstrap system "$PLIST"
         require_started

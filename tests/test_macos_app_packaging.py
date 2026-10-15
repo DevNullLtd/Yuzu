@@ -293,7 +293,7 @@ launchctl() { :; }
 require_started() { :; }
 ditto() { if [[ -d "$1" ]]; then cp -R "$1/." "$2/"; else cp "$1" "$2"; fi; }
 '''
-            harness += "\n".join(function(pre, name) for name in ("remove_managed_plugins", "recover_interrupted_promotion"))
+            harness += "\n".join(function(pre, name) for name in ("quarantine_legacy_app", "remove_managed_plugins", "recover_interrupted_promotion"))
             harness += "\n" + "\n".join(function(post, name) for name in ("was_managed_plugin", "reject_unmanaged_plugin_collisions"))
             harness = harness.replace("/usr/local/bin", str(root / "bin")).replace("/usr/local/lib", str(root / "lib"))
             harness += '''
@@ -314,6 +314,82 @@ reject_unmanaged_plugin_collisions
             self.assertFalse((root / "lib/plugins/new.dylib").exists())
             self.assertEqual((root / "lib/plugins/old.dylib").read_bytes(), b"old generation")
             self.assertEqual((root / "lib/plugins/third-party.dylib").read_bytes(), b"unmanaged")
+
+    # ── PR #4482 review (Doomgoose blocker 1): an unrecognized legacy app must never
+    # deadlock recovery. Before the fix it stayed in the recovery snapshot, both
+    # recovery paths returned 1 before restarting the service, and every later
+    # install failed the same way.
+    @staticmethod
+    def _script_function(source: str, name: str) -> str:
+        start = source.index("\n" + name + "() {") + 1
+        return source[start:source.index("\n}\n", start) + 3]
+
+    def _legacy_harness(self, root: Path, script: str, names: tuple[str, ...], body: str,
+                        plist_points_to_legacy: bool = False) -> subprocess.CompletedProcess:
+        source = (BUILD_PKG.parent / script).read_text()
+        program = "\n".join(self._script_function(source, name) for name in names)
+        program = (program.replace("/usr/local/bin", str(root / "bin")).replace("/usr/local/lib", str(root / "lib"))
+                   .replace("/usr/libexec/PlistBuddy", "plist_buddy"))
+        legacy = root / "data/YuzuAgent.app"
+        stubs = f"""set -eu
+launchctl() {{ echo "$*" >> "{root}/launchctl.log"; }}
+require_started() {{ :; }}
+chown() {{ :; }}
+legacy_app_is_managed() {{ return 1; }}
+plist_buddy() {{ {"echo " + str(legacy) + "/Contents/MacOS/yuzu-agent" if plist_points_to_legacy else "echo /usr/local/bin/yuzu-agent"}; }}
+ditto() {{ if [[ -d "$1" ]]; then mkdir -p "$2"; cp -R "$1/." "$2/"; else cp "$1" "$2"; fi; }}
+STATE_DIR="{root}/state"; LEGACY_APP="{legacy}"; YUZU_LIB="{root}/lib"; APP_ROOT="{root}/app"; APP="{root}/app/YuzuAgent.app"
+PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/lib/plugins"; MANIFEST="{root}/lib/package-files.list"
+MODE_FILE="{root}/lib/package-mode"; recovery="{root}/state/install-recovery.TEST"
+"""
+        return subprocess.run([PKG_SHELL, "-c", stubs + program + "\n" + body], text=True, capture_output=True)
+
+    def _legacy_layout(self, root: Path) -> Path:
+        for folder in ("state/install-recovery.TEST/LaunchDaemons", "data/YuzuAgent.app/Contents",
+                       "LaunchDaemons", "app", "lib/plugins", "bin"):
+            (root / folder).mkdir(parents=True, exist_ok=True)
+        (root / "state/install-recovery.TEST/LaunchDaemons/com.yuzu.agent.plist").write_text("previous")
+        return root / "state/install-recovery.TEST"
+
+    def test_unrecognized_legacy_app_is_quarantined_without_rolling_back_a_healthy_install(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_retire_") as temporary:
+            root = Path(temporary)
+            recovery = self._legacy_layout(root)
+            result = self._legacy_harness(root, "postinstall", ("quarantine_legacy_app", "retire_legacy_app"),
+                                          "retire_legacy_app && echo RETIRED")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("RETIRED", result.stdout)
+            self.assertIn("quarantined an unrecognized legacy", result.stderr)
+            self.assertFalse((root / "data/YuzuAgent.app").exists())
+            self.assertFalse((recovery / "legacy-retired.app").exists())
+            self.assertEqual(len(list((root / "state/quarantine").glob("legacy-YuzuAgent.*/YuzuAgent.app"))), 1)
+
+    def test_recovery_with_a_retained_legacy_app_restarts_the_previous_service(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_recover_") as temporary:
+            root = Path(temporary)
+            recovery = self._legacy_layout(root)
+            (recovery / "legacy-retired.app/Contents").mkdir(parents=True)
+            for _attempt in (1, 2):    # recovery must also be repeatable, never a dead end
+                result = self._legacy_harness(root, "preinstall",
+                                              ("quarantine_legacy_app", "remove_managed_plugins", "recover_interrupted_promotion"),
+                                              f'recover_interrupted_promotion "{recovery}" && echo RECOVERED')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("RECOVERED", result.stdout)
+            self.assertFalse((recovery / "legacy-retired.app").exists())
+            self.assertIn("bootstrap system", (root / "launchctl.log").read_text())
+
+    def test_recovery_never_starts_a_legacy_data_root_service_but_does_not_block(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_plist_") as temporary:
+            root = Path(temporary)
+            recovery = self._legacy_layout(root)
+            result = self._legacy_harness(root, "preinstall",
+                                          ("quarantine_legacy_app", "remove_managed_plugins", "recover_interrupted_promotion"),
+                                          f'recover_interrupted_promotion "{recovery}" && echo RECOVERED',
+                                          plist_points_to_legacy=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("did not start it from non-package-owned data", result.stderr)
+            log = root / "launchctl.log"
+            self.assertNotIn("bootstrap", log.read_text() if log.exists() else "")
 
     @unittest.skipUnless(sys.platform == "darwin", "native macOS archive/plist integration")
     def test_two_stage_final_output_cms_policy_is_verified_before_publication(self) -> None:
@@ -493,10 +569,11 @@ reject_unmanaged_plugin_collisions
         self.assertIn('codesign -dvv "$candidate"', preinstall)
         self.assertIn('legacy-retired.app', postinstall)
         self.assertIn('retire_legacy_app', postinstall)
-        self.assertIn('preserved but not bootstrapped from non-package-owned data', preinstall)
-        self.assertIn('preserved but not bootstrapped from non-package-owned data', postinstall)
-        self.assertIn('retained legacy app in root-owned recovery; service was not bootstrapped', preinstall)
-        self.assertIn('retained legacy app in root-owned recovery; service was not bootstrapped', postinstall)
+        self.assertIn('did not start it from non-package-owned data', preinstall)
+        self.assertIn('did not start it from non-package-owned data', postinstall)
+        self.assertIn('quarantine_legacy_app "$recovery/legacy-retired.app"', preinstall)
+        self.assertIn('quarantine_legacy_app "$recovery/legacy-retired.app"', postinstall)
+        self.assertNotIn('retained legacy app in root-owned recovery', preinstall + postinstall)
         self.assertIn('copy_if_present "$LEGACY_APP" "$RECOVERY/legacy/YuzuAgent.app"', preinstall)
         self.assertIn('retire_legacy_app', postinstall)
         self.assertNotIn('recovery/legacy/YuzuAgent.app', postinstall)
