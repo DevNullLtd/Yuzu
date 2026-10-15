@@ -786,3 +786,35 @@ TEST_CASE("home_routes: wiring -- server.cpp registers DashboardSummaryRoutes an
           ".enrolment_fn"})
         CHECK(has(block, seam));
 }
+
+// Kills: the PR #5859 review's two production regressions that every helper test above survives:
+// (1) the Estate closure going back to the clamp (a live fleet read as "no devices"), and
+// (2) the Dashboard fragments going back to the AUDITING gates (a Viewer's page load writing
+// denial rows). The helpers are unit-tested directly; this pins that the real wiring uses them.
+TEST_CASE("home_routes: wiring -- the estate closure uses fleet_estate_reading and the Dashboard "
+          "fragments bind the non-auditing gates",
+          "[home][route]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+
+    // (1) the estate seam
+    const auto est = src.find(".fleet_estate_fn =");
+    REQUIRE(est != std::string::npos);
+    const std::string estate = src.substr(est, 2200);
+    CHECK(has(estate, "fleet_estate_reading("));
+    CHECK_FALSE(has(estate, "partition_fleet_state("));
+
+    // (2) the draw-time bindings are the probe-backed closures
+    CHECK(has(src, "return probe_fleet_read(req, res, type, op);"));
+    CHECK(has(src, "auth_routes_->probe_permission(req, res, type, op)"));
+    const auto sum = src.find("dashboard_summary_routes_->register_routes(");
+    REQUIRE(sum != std::string::npos);
+    const std::string summary = src.substr(sum, 1200);
+    CHECK(has(summary, ".fleet_read_fn = draw_fleet_read_fn"));
+    CHECK(has(summary, ".perm_fn = draw_perm_fn"));
+    CHECK(has(src, "hp.fleet_read_fn = draw_fleet_read_fn;"));
+    CHECK(has(src, "hp.perm_fn = draw_perm_fn;"));
+    CHECK(has(src, ".fleet_read_fn = draw_fleet_read_fn, // HM-2 /fragments/dashboard/health"));
+}
+

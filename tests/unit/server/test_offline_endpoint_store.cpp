@@ -82,6 +82,7 @@ std::vector<OfflineEndpoint> stale_ok(OfflineEndpointStore& s, std::chrono::seco
 using yuzu::server::FleetPlatform;
 using yuzu::server::fleet_platform_of;
 using yuzu::server::partition_fleet_state;
+using yuzu::server::fleet_estate_reading;
 using yuzu::server::reconcile_fleet_estate;
 
 TEST_CASE("fleet_platform_of puts every spelling in exactly one bucket", "[offline][fleet]") {
@@ -163,6 +164,39 @@ TEST_CASE("reconcile_fleet_estate: a connected agent is never reported as an emp
         const auto r = reconcile_fleet_estate(-4, -1, -2);
         CHECK(r.total == 0);
         CHECK(r.online == 0);
+        CHECK_FALSE(r.lower_bound);
+    }
+}
+
+TEST_CASE("fleet_estate_reading: the Dashboard's production input never reads a live fleet as "
+          "empty",
+          "[offline][fleet]") {
+    yuzu::server::FleetStateCounts c;
+    SECTION("registry ahead of an empty store: widened and flagged (the PR #5859 blocker)") {
+        c.total = 0;
+        c.live = 0;
+        c.stale = 0;
+        const auto r = fleet_estate_reading(c, std::size_t{1});
+        CHECK(r.total == 1);
+        CHECK(r.online == 1);
+        CHECK(r.lower_bound);
+    }
+    SECTION("registry unavailable: the SQL durable-live count stands in") {
+        c.total = 10;
+        c.live = 7;
+        c.stale = 2;
+        const auto r = fleet_estate_reading(c, std::nullopt);
+        CHECK(r.total == 10);
+        CHECK(r.online == 7);
+        CHECK_FALSE(r.lower_bound);
+    }
+    SECTION("registry agrees with the store: passed through unflagged") {
+        c.total = 10;
+        c.live = 7;
+        c.stale = 2;
+        const auto r = fleet_estate_reading(c, std::size_t{8});
+        CHECK(r.online == 8);
+        CHECK(r.online + r.not_seen + r.offline == r.total);
         CHECK_FALSE(r.lower_bound);
     }
 }

@@ -31,6 +31,7 @@
 /// instead; `set_metrics()` went with it — this store's `metrics_` pointer
 /// had no other consumer.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -114,7 +115,18 @@ public:
     [[nodiscard]] std::expected<bool, std::string> mark_read_checked(int64_t id);
     [[nodiscard]] std::expected<bool, std::string> dismiss_checked(int64_t id);
 
+    /// Test seam: shorten the bounded lease wait so a held-lease failure test does not sit out
+    /// the 2 s production timeout. Not for production use.
+    void set_acquire_timeout_for_test(std::chrono::milliseconds t) noexcept {
+        read_timeout_ = t;
+        write_timeout_ = t;
+    }
+
 private:
+    /// Bounded wait for a pooled connection; a display path must not pin an HTTP worker.
+    static constexpr std::chrono::milliseconds kDefaultAcquireTimeout{2000};
+    std::chrono::milliseconds read_timeout_{kDefaultAcquireTimeout};
+    std::chrono::milliseconds write_timeout_{kDefaultAcquireTimeout};
     pg::PgPool& pool_;
     bool open_{false};
 };

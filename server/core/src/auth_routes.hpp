@@ -275,7 +275,8 @@ public:
     /// `has_permission`'s twin for the fleet-read gate: `require_fleet_read`'s own decision path
     /// (so the verdict and the scope cannot drift from the gate's), with its
     /// `auth.fleet_read_required` denial rows withheld. For a page that decides what to DRAW from
-    /// the caller's scope; the request that returns the data still passes the loud gate.
+    /// the caller's scope. The decision is the gate's own; a caller that uses this instead of
+    /// the loud gate accepts that a refusal leaves no `auth.fleet_read_required` row.
     /// `res` receives the gate's 401/403/503 and is meant to be a scratch response.
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     probe_fleet_read(const httplib::Request& req, httplib::Response& res,

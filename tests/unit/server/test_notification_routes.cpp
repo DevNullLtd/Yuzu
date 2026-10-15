@@ -42,6 +42,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -292,7 +293,7 @@ TEST_CASE("GET /api/notifications: all=true serves list_all (dismissed rows incl
     CHECK(j["notifications"][0]["dismissed"] == true);
 }
 
-TEST_CASE("POST /api/notifications/:id/read: unknown id 404s, audit-first (attempted, then failure)",
+TEST_CASE("POST /api/notifications/:id/read: unknown id 404s; audit-first (attempted then failure)",
           "[notification_routes][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
     PgWired w{db.dsn()};
@@ -336,7 +337,7 @@ TEST_CASE("POST /api/notifications/:id/read: happy path marks read and audits at
     CHECK(unread.empty()); // confirms the mutation actually landed, not just the 200
 }
 
-TEST_CASE("POST /api/notifications/:id/dismiss: unknown id 404s, audits attempted then failure",
+TEST_CASE("POST /api/notifications/:id/dismiss: unknown id 404s; audits attempted then failure",
           "[notification_routes][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
     PgWired w{db.dsn()};
@@ -471,24 +472,53 @@ TEST_CASE("bell POSTs: when the attempted row cannot be written the mutation is 
 
 // ── A read failure is an error, not an empty bell (PR #5859 review item 6) ─
 
-TEST_CASE("GET /api/notifications: a store read that fails answers 503, never an empty list "
-          "(mutation: use the display-only readers and this returns 200 with none)",
+TEST_CASE("bell routes: a store that cannot get a connection answers 503 with the retry hint "
+          "on every verb and never an empty list (mutation: use the display-only readers)",
           "[notification_routes][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
     pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     NotificationStore store{pool};
     REQUIRE(store.is_open());
-    REQUIRE(store.create("info", "t", "m") > 0);
+    const auto id = store.create("info", "t", "m");
+    REQUIRE(id > 0);
     NotificationHarness h;
     h.store = &store;
     h.wire();
 
-    // Hold the only connection so the store's bounded acquire gives up: a real lease timeout.
-    auto held = pool.acquire();
+    store.set_acquire_timeout_for_test(std::chrono::milliseconds{50});
+    auto held = pool.acquire(); // the only connection: a real lease timeout, no sleeping
     REQUIRE(held);
-    auto res = h.sink.Get("/api/notifications");
-    REQUIRE(res);
-    CHECK(res->status == 503);
-    CHECK(body(res->body)["error"]["code"] == 503);
-    CHECK(res->body.find("\"notifications\"") == std::string::npos);
+
+    auto expect_503_with_retry = [](const auto& res) {
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        const auto j = body(res->body);
+        CHECK(j["error"]["code"] == 503);
+        CHECK(j["error"]["retry_after_ms"] == 5000);
+        CHECK(j["error"]["remediation"] == "retry the request");
+        CHECK_FALSE(j.contains("notifications"));
+    };
+
+    SECTION("GET unread and GET all=true") {
+        expect_503_with_retry(h.sink.Get("/api/notifications"));
+        expect_503_with_retry(h.sink.Get("/api/notifications?all=true"));
+    }
+
+    SECTION("POST read and dismiss: 503 not 404; attempted then failure; nothing changed") {
+        for (const char* verb : {"read", "dismiss"}) {
+            INFO(verb);
+            h.audit_calls.clear();
+            expect_503_with_retry(
+                h.sink.Post("/api/notifications/" + std::to_string(id) + "/" + verb, ""));
+            REQUIRE(h.audit_calls.size() == 2);
+            CHECK(h.audit_calls[0].result == "attempted");
+            CHECK(h.audit_calls[1].result == "failure");
+            CHECK(h.audit_calls[1].detail == "store error");
+        }
+        held = {}; // release, then confirm the row was never touched
+        auto still = store.list_unread();
+        REQUIRE(still.size() == 1);
+        CHECK_FALSE(still[0].read);
+        CHECK_FALSE(still[0].dismissed);
+    }
 }

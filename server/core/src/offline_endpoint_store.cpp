@@ -155,6 +155,13 @@ FleetEstateReading reconcile_fleet_estate(std::int64_t total, std::int64_t onlin
     return r;
 }
 
+FleetEstateReading fleet_estate_reading(const FleetStateCounts& counts,
+                                        std::optional<std::size_t> registry_known) noexcept {
+    const std::int64_t online =
+        registry_known ? static_cast<std::int64_t>(*registry_known) : counts.live;
+    return reconcile_fleet_estate(counts.total, online, counts.stale);
+}
+
 OfflineEndpointStore::OfflineEndpointStore(pg::PgPool& pool) : pool_(pool) {
     auto lease = pool_.acquire();
     if (!lease) {

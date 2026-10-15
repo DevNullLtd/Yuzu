@@ -12112,9 +12112,11 @@ private:
         return {true, result->visible_for_query()};
     }
 
-    /// `require_fleet_read` for a page that only decides what to DRAW (the Dashboard panels):
-    /// the same decision and scope, but the denial row is withheld (`AuthRoutes::probe_fleet_read`),
-    /// so a Viewer's page load does not fill the audit log. Never the gate for a data request.
+    /// `require_fleet_read` for the Dashboard panel fragments: the same decision and scope, with
+    /// the denial row withheld (`AuthRoutes::probe_fleet_read`), so a Viewer's page load does not
+    /// fill the audit log. A refused account is shown a note instead of the figure, and a direct
+    /// request to a panel URL by a refused account likewise leaves no denial row (the PR #5859
+    /// review's ask). Not for a route whose denial must stay on the audit record.
     yuzu::server::authz::FleetReadGate probe_fleet_read(const httplib::Request& req,
                                                          httplib::Response& res,
                                                          const std::string& securable_type,
@@ -15313,9 +15315,10 @@ private:
                                     const std::string& op) -> yuzu::server::authz::FleetReadGate {
             return require_fleet_read(req, res, type, op);
         };
-        // Draw-time variants for the Dashboard: same decision path, no denial audit row
-        // (a page that renders panels per caller must not write rows for what it merely
-        // chose not to draw). The loud `fleet_read_fn`/`perm_fn` stay on every data request.
+        // Panel variants for the Dashboard fragments: same decision path, no denial audit
+        // row (a page that renders panels per caller must not write rows for figures it
+        // merely chose not to draw). The decision is identical to the loud gate's; only the
+        // row is withheld. The bell and the approvals badge keep the loud gates.
         auto draw_fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
                                          const std::string& type, const std::string& op)
             -> yuzu::server::authz::FleetReadGate { return probe_fleet_read(req, res, type, op); };
@@ -18364,15 +18367,14 @@ private:
                         std::chrono::milliseconds(kHardwareStaleAfterMs), cfg_.session_timeout);
                     if (!c)
                         return std::nullopt;
-                    std::int64_t online = c->live;
-                    if (auto known = registry_.known_agent_count())
-                        online = static_cast<std::int64_t>(*known);
-                    // The registry can know agents the store has no row for; widen rather
-                    // than clamp, or a live fleet reads as "no devices" (and is cached).
-                    const auto r = reconcile_fleet_estate(c->total, online, c->stale);
-                    home::EstateCounts e{r.total, r.online, r.not_seen, r.offline};
-                    e.at_least = r.lower_bound;
-                    return e;
+                    // The registry can know agents the store has no row for; the adapter
+                    // widens rather than clamps, or a live fleet reads as "no devices" (and
+                    // is cached). Registry count when it can answer, else the SQL live count.
+                    const auto known = registry_.known_agent_count();
+                    const auto r = fleet_estate_reading(
+                        *c, known ? std::optional<std::size_t>{*known} : std::nullopt);
+                    return home::EstateCounts{r.total, r.online, r.not_seen, r.offline,
+                                              r.lower_bound};
                 },
                 .compliance_fn = [compliance_api]() -> std::optional<home::ComplianceFigure> {
                     if (!compliance_api)

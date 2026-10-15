@@ -26,8 +26,8 @@ constexpr const char* kStoreName = "notification_store";
 // short enough that a saturated pool never stalls that thread. Reads/other
 // writes are dashboard HTTP handlers and can wait a little longer.
 constexpr std::chrono::milliseconds kCreateAcquireTimeout{500};
-constexpr std::chrono::milliseconds kReadAcquireTimeout{2000};
-constexpr std::chrono::milliseconds kWriteAcquireTimeout{2000};
+// Reads and non-create writes use NotificationStore::kDefaultAcquireTimeout (header; settable
+// for tests).
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
@@ -120,7 +120,7 @@ std::expected<std::vector<Notification>, std::string>
 NotificationStore::list_unread_checked(int limit) {
     if (!open_)
         return std::unexpected("notification store is not open");
-    auto lease = pool_.try_acquire_for(kReadAcquireTimeout);
+    auto lease = pool_.try_acquire_for(read_timeout_);
     if (!lease) {
         spdlog::debug("NotificationStore: list_unread skipped, no connection in time ({})",
                       pool_.last_error());
@@ -152,7 +152,7 @@ std::expected<std::vector<Notification>, std::string>
 NotificationStore::list_all_checked(int limit, int offset) {
     if (!open_)
         return std::unexpected("notification store is not open");
-    auto lease = pool_.try_acquire_for(kReadAcquireTimeout);
+    auto lease = pool_.try_acquire_for(read_timeout_);
     if (!lease) {
         spdlog::debug("NotificationStore: list_all skipped, no connection in time ({})",
                       pool_.last_error());
@@ -183,7 +183,7 @@ std::vector<Notification> NotificationStore::list_all(int limit, int offset) {
 std::expected<bool, std::string> NotificationStore::mark_read_checked(int64_t id) {
     if (!open_)
         return std::unexpected("notification store is not open");
-    auto lease = pool_.try_acquire_for(kWriteAcquireTimeout);
+    auto lease = pool_.try_acquire_for(write_timeout_);
     if (!lease) {
         spdlog::debug("NotificationStore: mark_read skipped, no connection in time ({})",
                       pool_.last_error());
@@ -208,7 +208,7 @@ bool NotificationStore::mark_read(int64_t id) { return mark_read_checked(id).val
 std::expected<bool, std::string> NotificationStore::dismiss_checked(int64_t id) {
     if (!open_)
         return std::unexpected("notification store is not open");
-    auto lease = pool_.try_acquire_for(kWriteAcquireTimeout);
+    auto lease = pool_.try_acquire_for(write_timeout_);
     if (!lease) {
         spdlog::debug("NotificationStore: dismiss skipped, no connection in time ({})",
                       pool_.last_error());
@@ -230,7 +230,7 @@ bool NotificationStore::dismiss(int64_t id) { return dismiss_checked(id).value_o
 std::expected<std::size_t, std::string> NotificationStore::count_unread_checked() {
     if (!open_)
         return std::unexpected("notification store is not open");
-    auto lease = pool_.try_acquire_for(kReadAcquireTimeout);
+    auto lease = pool_.try_acquire_for(read_timeout_);
     if (!lease) {
         spdlog::debug("NotificationStore: count_unread skipped, no connection in time ({})",
                       pool_.last_error());

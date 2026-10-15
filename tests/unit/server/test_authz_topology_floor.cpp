@@ -456,7 +456,7 @@ TEST_CASE("has_permission: gives require_permission's verdict and writes no deni
     }
 }
 
-TEST_CASE("probe_fleet_read / probe_permission: the gate's verdict, no denial row (PR #5859 "
+TEST_CASE("probe_fleet_read / probe_permission: the gate's verdict with no denial row (PR #5859 "
           "review; mutation: drop the AuditProbeScope in either and the row counts fail)",
           "[pg][authz][probe]") {
     FloorFixture fix;

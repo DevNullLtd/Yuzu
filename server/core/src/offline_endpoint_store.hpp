@@ -41,7 +41,9 @@
 /// `RETURNING` (the #1033-banning idiom), never `sqlite3_changes()`.
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <expected>
 #include <functional>
 #include <string>
@@ -169,6 +171,13 @@ struct FleetEstateReading {
 };
 [[nodiscard]] FleetEstateReading reconcile_fleet_estate(std::int64_t total, std::int64_t online,
                                                         std::int64_t stale) noexcept;
+
+/// The production counts-to-figure adapter behind the Dashboard's unrestricted Estate figure:
+/// `online` is the registry's union count when it can answer, else the SQL durable-live count,
+/// and the result goes through `reconcile_fleet_estate`. A free function (not a lambda in
+/// server.cpp) so the registry-ahead-of-store case is a unit test on the real wiring input.
+[[nodiscard]] FleetEstateReading fleet_estate_reading(const FleetStateCounts& counts,
+                                                      std::optional<std::size_t> registry_known) noexcept;
 
 class OfflineEndpointStore {
 public:
