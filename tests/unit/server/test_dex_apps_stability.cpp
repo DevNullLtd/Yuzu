@@ -38,6 +38,11 @@ DexAppStabilityRow total_row(const std::string& subject, int64_t crashes, int64_
     r.crashes = crashes;
     r.hangs = hangs;
     r.affected_devices = affected;
+    // Default fixture: every affected device is online, so the online figures
+    // equal the window-wide ones; the churn cases below override them.
+    r.affected_online = affected;
+    r.crashes_online = crashes;
+    r.hangs_online = hangs;
     r.capped_crashes = cc;
     r.capped_hangs = ch;
     r.version_count = version_count;
@@ -135,6 +140,8 @@ TEST_CASE("apps model: unknown or zero population gives no share, no rate, no sc
     }
 }
 
+// The store draws the numerator from the online ids, so this cannot happen
+// through the real read; a caller that breaks that contract is refused, not clamped.
 TEST_CASE("apps model: more devices affected than online is a refusal, not a clamp",
           "[dex][apps_model]") {
     const auto m = dex_apps_model_from_rows("30d", {total_row("a.exe", 9, 0, 9, 9, 0)}, 5, def());
@@ -218,7 +225,8 @@ TEST_CASE("apps model: a per-image override changes one application's band only"
 // The invalid-policy arm needs an open store to discriminate, so it lives in
 // test_dex_api.cpp; a null store degrades regardless of the policy.
 TEST_CASE("apps builder: a null store degrades, never scores", "[dex][apps_model]") {
-    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z", 50, def());
+    const auto m = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z",
+                                       std::vector<std::string>(50, "id"), def());
     CHECK(m.degraded);
     CHECK(m.apps.empty());
 }
@@ -227,7 +235,8 @@ TEST_CASE("apps json: exact golden for the unknown-population model", "[dex][app
     const auto m = dex_apps_model_from_rows(
         "7d", {total_row("a.exe", 2, 1, 2, 2, 1), version_row("a.exe", "1.0", 2, 1, 2)}, std::nullopt, def());
     const std::string fig =
-        R"("crashes":2,"distinct_devices":2,"hangs":1,"last_seen":"2026-10-14T00:00:00Z",)"
+        R"("crashes":2,"distinct_devices":2,"distinct_devices_online":2,"hangs":1,)"
+        R"("last_seen":"2026-10-14T00:00:00Z",)"
         R"("rate_per_1000":null,"score":{"band":null,"deductions":[],"score":null,"withheld":"no_population"},)"
         R"("share_affected":null)";
     const std::string expect =
@@ -251,12 +260,13 @@ TEST_CASE("apps json: pre-existing keys survive and the key set is the documente
     CHECK(a["crashes"] == 12);
     CHECK(a["hangs"] == 3);
     CHECK(a["distinct_devices"] == 7);
+    CHECK(a["distinct_devices_online"] == 7);
     CHECK(a["last_seen"] == "2026-10-14T00:00:00Z");
     std::set<std::string> keys;
     for (auto it = a.begin(); it != a.end(); ++it)
         keys.insert(it.key());
-    CHECK(keys == std::set<std::string>{"subject", "crashes", "hangs", "distinct_devices", "last_seen",
-                                        "share_affected", "rate_per_1000", "score", "versions",
+    CHECK(keys == std::set<std::string>{"subject", "crashes", "hangs", "distinct_devices",
+                                        "distinct_devices_online", "last_seen", "share_affected", "rate_per_1000", "score", "versions",
                                         "version_count", "versions_truncated"});
     CHECK(a["score"]["score"] == Approx(90.7));
     CHECK(a["score"]["band"] == "excellent");
@@ -304,4 +314,46 @@ TEST_CASE("apps json: a populated row carries the score object, rate and both ca
     CHECK(a["score"]["deductions"][0].at("points").get<double>() == Approx(8.4)); // 60 * 7 / 50
     CHECK(a["score"]["deductions"][0].at("assessed") == true);
     CHECK(a["versions"][0]["version"] == "1.0");
+}
+
+// Churn: seven devices crashed and went offline while fifty others are online.
+// The counts keep the seven; the share, rate and score are over the online
+// population, whose members none of the seven are, so they read zero affected.
+TEST_CASE("apps model: devices that crashed and went offline are in the counts, not the share",
+          "[dex][apps_model]") {
+    auto r = total_row("a.exe", 12, 3, 7, 0, 0);
+    r.affected_online = 0;
+    r.crashes_online = 0;
+    r.hangs_online = 0;
+    const auto m = dex_apps_model_from_rows("7d", {r}, 50, def());
+    const auto& f = m.apps[0].figures;
+    CHECK(f.crashes == 12);
+    CHECK(f.hangs == 3);
+    CHECK(f.distinct_devices == 7);
+    CHECK(f.distinct_devices_online == 0);
+    REQUIRE(f.share_affected);
+    CHECK(f.share_affected->estimate == Approx(0.0));
+    REQUIRE(f.rate_per_1000);
+    CHECK(f.rate_per_1000->estimate == Approx(0.0));
+    REQUIRE(f.score.score);
+    CHECK(*f.score.score == Approx(100.0));
+}
+
+TEST_CASE("apps model: share, rate and score use the online figures only", "[dex][apps_model]") {
+    // 7 devices affected in the window; 2 of them are online, with 3 crashes + 1 hang.
+    auto r = total_row("a.exe", 12, 3, 7, 3, 1);
+    r.affected_online = 2;
+    r.crashes_online = 3;
+    r.hangs_online = 1;
+    const auto m = dex_apps_model_from_rows("7d", {r}, 50, def());
+    const auto& f = m.apps[0].figures;
+    CHECK(f.distinct_devices == 7);
+    CHECK(f.distinct_devices_online == 2);
+    REQUIRE(f.share_affected);
+    CHECK(f.share_affected->estimate == Approx(2.0 / 50.0));
+    REQUIRE(f.rate_per_1000);
+    CHECK(f.rate_per_1000->estimate == Approx(80.0)); // 4 events / (50 / 1000)
+    // 100 - (60*2/50 + 20*3/(50*5) + 8*1/(50*5)) = 100 - (2.4 + 0.24 + 0.032)
+    REQUIRE(f.score.score);
+    CHECK(*f.score.score == Approx(97.328));
 }

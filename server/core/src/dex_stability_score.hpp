@@ -83,7 +83,9 @@
  *   devices that reported THIS application/version in the window; the Apps list
  *   read (DexApi::apps) is the one caller for which it is the fleet reporting
  *   population (Windows devices online now), since a per-application reporting
- *   count is not available there.
+ *   count is not available there. That caller draws `devices_affected` and the
+ *   event sums from the same online ids, so the numerator is a subset of this
+ *   population by construction.
  * - Missing or contradictory population data is withheld (score and band
  *   empty, `withheld` names why), never shown as 0 or 100. A missing or
  *   unusable rate_ratio is NOT withheld: the result is scored with an

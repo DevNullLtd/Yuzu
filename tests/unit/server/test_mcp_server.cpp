@@ -8395,8 +8395,9 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         const auto interval_req = nlohmann::json::array({"estimate", "lower", "upper", "reliable"});
         const auto deduction_req = nlohmann::json::array({"name", "points", "assessed"});
         CHECK(row["versions"]["items"]["required"] ==
-              nlohmann::json::array({"version", "crashes", "hangs", "distinct_devices", "last_seen",
-                                     "share_affected", "rate_per_1000", "score"}));
+              nlohmann::json::array({"version", "crashes", "hangs", "distinct_devices",
+                                     "distinct_devices_online", "last_seen", "share_affected",
+                                     "rate_per_1000", "score"}));
         for (const auto* node : {&row, &row["versions"]["items"]["properties"]}) {
             const auto obj_null = nlohmann::json::array({"object", "null"});
             CHECK((*node)["share_affected"]["type"] == obj_null);

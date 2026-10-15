@@ -53,6 +53,12 @@ constexpr std::chrono::milliseconds kDexReadTimeout{3000};
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// The Applications stability read holds one lease for its whole multi-second
+// 30-day aggregation, so it gets its own in-flight budget (the default pool is
+// 16 and the per-principal cap is also 16): a request over the budget is
+// refused at once with this reason and the caller's retryable 503, instead of
+// queueing behind the pool.
+constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // JC-8 (coordinator review): label parity with InventoryStore's
 // yuzu_inventory_read_degrade_total{reason, source} family — a constant
 // "source" so a future second Guardian-adjacent read-degrade emitter stays
@@ -1247,26 +1253,48 @@ std::vector<DexAppCrashCount> GuaranteedStateStore::dex_top_apps(const std::stri
 std::optional<std::vector<DexAppStabilityRow>>
 GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const std::string& platform,
                                                 int app_limit, int version_limit,
-                                                std::int64_t per_device_cap) const {
+                                                std::int64_t per_device_cap,
+                                                const std::vector<std::string>& online_agent_ids) const {
     static DegradeSampler sampler;
+    struct Slot {
+        std::atomic<int>& n;
+        ~Slot() { n.fetch_sub(1, std::memory_order_relaxed); }
+    };
+    const Slot slot{apps_reads_in_flight_};
+    if (apps_reads_in_flight_.fetch_add(1, std::memory_order_relaxed) >= apps_read_budget_.load()) {
+        if (const auto d = note_read_degrade(metrics_, kReasonConcurrencyBudget, kDegradeSource, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::dex_app_stability: concurrency budget ({}) reached",
+                         apps_read_budget_.load());
+        return std::nullopt;
+    }
+    std::vector<std::string_view> online_views;
+    online_views.reserve(online_agent_ids.size());
+    for (const auto& a : online_agent_ids)
+        online_views.emplace_back(a);
+    const std::string online_array = pg::to_text_array(online_views);
     return dex_read_checked<std::vector<DexAppStabilityRow>>(
         open_, pool_, metrics_, "dex_app_stability", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<DexAppStabilityRow>> {
-            // d: per (subject, version, device). tc/top: membership is the
+            // d: per (subject, version, device), with o = the device is in the
+            // caller's online set ($6; the share, rate and score numerators are
+            // members of the population they are divided by). tc/top: membership is the
             // app_limit applications affecting the most devices (then events,
             // then name, byte order); the published activity order is the
             // assembler's. top.total counts every qualifying application before
             // the cut. ad: per (subject, device) across versions, so a device in
             // two versions counts once in the application total. The application
             // rows (ad JOIN vc JOIN top) and the capped version rows (ranked,
-            // rn <= $4) are UNIONed.
+            // rn <= $4) are UNIONed. Online figures are COALESCEd: FILTER over
+            // no rows is NULL.
             pg::PgResult res = pg::exec_params(
                 conn,
                 "WITH d AS ("
                 " SELECT subject, version, agent_id,"
                 "  COUNT(*) FILTER (WHERE obs_type = 'process.crashed') AS c,"
                 "  COUNT(*) FILTER (WHERE obs_type = 'process.hung') AS h,"
-                "  MAX(observed_at) AS ls"
+                "  MAX(observed_at) AS ls,"
+                "  bool_or(agent_id = ANY($6::text[])) AS o"
                 " FROM guaranteed_state_store.guardian_observations"
                 " WHERE obs_type IN ('process.crashed', 'process.hung')"
                 "  AND observed_at >= $1 AND platform = $2"
@@ -1278,28 +1306,38 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 " SELECT subject, COUNT(*) OVER () AS total FROM tc"
                 " ORDER BY dev DESC, ev DESC, subject COLLATE \"C\" ASC LIMIT $3::bigint),"
                 "ad AS ("
-                " SELECT d.subject, d.agent_id, SUM(d.c) AS c, SUM(d.h) AS h, MAX(d.ls) AS ls"
+                " SELECT d.subject, d.agent_id, SUM(d.c) AS c, SUM(d.h) AS h, MAX(d.ls) AS ls,"
+                "  bool_or(d.o) AS o"
                 " FROM d JOIN top USING (subject) GROUP BY d.subject, d.agent_id),"
                 "ranked AS ("
                 " SELECT d.subject, d.version, SUM(d.c) AS c, SUM(d.h) AS h, COUNT(*) AS a,"
-                "  SUM(LEAST(d.c, $5::bigint)) AS cc, SUM(LEAST(d.h, $5::bigint)) AS ch,"
+                "  COUNT(*) FILTER (WHERE d.o) AS ao,"
+                "  COALESCE(SUM(d.c) FILTER (WHERE d.o), 0) AS co,"
+                "  COALESCE(SUM(d.h) FILTER (WHERE d.o), 0) AS ho,"
+                "  COALESCE(SUM(LEAST(d.c, $5::bigint)) FILTER (WHERE d.o), 0) AS cc,"
+                "  COALESCE(SUM(LEAST(d.h, $5::bigint)) FILTER (WHERE d.o), 0) AS ch,"
                 "  MAX(d.ls) AS ls, COUNT(*) OVER (PARTITION BY d.subject) AS n,"
                 "  ROW_NUMBER() OVER (PARTITION BY d.subject"
                 "   ORDER BY COUNT(*) DESC, d.version COLLATE \"C\" ASC) AS rn"
                 " FROM d JOIN top USING (subject) GROUP BY d.subject, d.version),"
                 "vc AS (SELECT subject, MAX(n) AS n FROM ranked GROUP BY subject) "
                 "SELECT ad.subject, NULL::text AS version, SUM(ad.c)::bigint, SUM(ad.h)::bigint,"
-                " COUNT(*)::bigint, SUM(LEAST(ad.c, $5::bigint))::bigint,"
-                " SUM(LEAST(ad.h, $5::bigint))::bigint, MAX(ad.ls), MAX(vc.n)::bigint,"
-                " MAX(top.total)::bigint "
+                " COUNT(*)::bigint,"
+                " COALESCE(SUM(LEAST(ad.c, $5::bigint)) FILTER (WHERE ad.o), 0)::bigint,"
+                " COALESCE(SUM(LEAST(ad.h, $5::bigint)) FILTER (WHERE ad.o), 0)::bigint,"
+                " MAX(ad.ls), MAX(vc.n)::bigint, MAX(top.total)::bigint,"
+                " (COUNT(*) FILTER (WHERE ad.o))::bigint,"
+                " COALESCE(SUM(ad.c) FILTER (WHERE ad.o), 0)::bigint,"
+                " COALESCE(SUM(ad.h) FILTER (WHERE ad.o), 0)::bigint "
                 "FROM ad JOIN vc USING (subject) JOIN top USING (subject) GROUP BY ad.subject "
                 "UNION ALL "
                 "SELECT subject, version, c::bigint, h::bigint, a::bigint, cc::bigint, ch::bigint,"
-                " ls, 0::bigint, 0::bigint FROM ranked WHERE rn <= $4::bigint",
+                " ls, 0::bigint, 0::bigint, ao::bigint, co::bigint, ho::bigint "
+                "FROM ranked WHERE rn <= $4::bigint",
                 std::vector<std::string>{since, platform,
                                          std::to_string(std::clamp(app_limit, 0, kMaxEventsLimit)),
                                          std::to_string(std::clamp(version_limit, 0, kMaxEventsLimit)),
-                                         std::to_string(per_device_cap)});
+                                         std::to_string(per_device_cap), online_array});
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             std::vector<DexAppStabilityRow> out;
@@ -1318,6 +1356,9 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 r.last_seen = text_col(res.get(), i, 7);
                 r.version_count = to_i64(PQgetvalue(res.get(), i, 8));
                 r.apps_total = to_i64(PQgetvalue(res.get(), i, 9));
+                r.affected_online = to_i64(PQgetvalue(res.get(), i, 10));
+                r.crashes_online = to_i64(PQgetvalue(res.get(), i, 11));
+                r.hangs_online = to_i64(PQgetvalue(res.get(), i, 12));
                 out.push_back(std::move(r));
             }
             return out;

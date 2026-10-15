@@ -56,11 +56,19 @@ public:
     }
 
     [[nodiscard]] DexAppsModel apps(const std::string& window) const override {
-        // Absent FleetFn = unknown population (nullopt), not zero.
-        return build_dex_apps_model(
-            store_, window, since_of(window),
-            fleet_fn_ ? std::optional<int64_t>{fleet_fn_().windows_online} : std::nullopt,
-            policy_fn_ ? policy_fn_() : dex_default_score_policy());
+        // Absent FleetFn = unknown population (nullopt), not zero. The population
+        // is the connected Windows agents' own ids, so the store draws the share
+        // numerators from the same set it is divided by.
+        std::optional<std::vector<std::string>> online;
+        if (fleet_fn_) {
+            DexFleet snapshot = fleet_fn_();
+            online.emplace();
+            for (auto& [id, os] : snapshot.connected_agents)
+                if (os == "windows")
+                    online->push_back(std::move(id));
+        }
+        return build_dex_apps_model(store_, window, since_of(window), online,
+                                    policy_fn_ ? policy_fn_() : dex_default_score_policy());
     }
 
     [[nodiscard]] DexCatalogueModel catalogue(const std::string& os_filter,

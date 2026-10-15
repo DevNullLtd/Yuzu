@@ -63,8 +63,8 @@ and perf identity already share on Windows/Linux — an exact match, not a
 name-normalized guess. Attribution of repository/install/service signals to the
 originating app is a follow-on slice; the Apps tab today scopes to crash and
 hang signals only. The Apps API (`GET /api/v1/dex/apps`) now also carries per-version
-figures, the reporting population, exact intervals and the stability score with its
-decomposition; the tab itself follows in a later change. Tab counts are all platforms; the API counts Windows devices only and keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut), so the same application can show different crashes and devices on the two surfaces until the tab is rewired. Per-version crash/hang *counts* on the performance trend
+figures, the Windows devices online now as the population, exact intervals and the stability score with its
+decomposition (the share, rate and score count only affected devices that are online now, so one population on both sides, while the crash and device counts cover the whole window); the tab itself follows in a later change. Tab counts are all platforms; the API counts Windows devices only and keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut), so the same application can show different crashes and devices on the two surfaces until the tab is rewired. Per-version crash/hang *counts* on the performance trend
 (as opposed to the per-app crash/hang totals already shown here) are not
 rendered on the Apps tab; `GET /api/v1/dex/perf/app` carries them per version
 — see "Fleet-wide application performance" under Drill-downs.

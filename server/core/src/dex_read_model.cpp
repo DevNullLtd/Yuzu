@@ -181,20 +181,24 @@ namespace {
 
 DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int64_t> population,
                                  const DexEffectivePolicy& eff) {
-    const int64_t crashes = r.crashes, hangs = r.hangs, affected = r.affected_devices;
+    // Counts are window-wide; share, rate and score use the online-device
+    // figures only, so numerator and denominator are one population.
+    const int64_t affected = r.affected_online;
+    const int64_t events = r.crashes_online + r.hangs_online;
     DexStabilityFigures f;
-    f.crashes = crashes;
-    f.hangs = hangs;
-    f.distinct_devices = affected;
+    f.crashes = r.crashes;
+    f.hangs = r.hangs;
+    f.distinct_devices = r.affected_devices;
+    f.distinct_devices_online = affected;
     f.last_seen = r.last_seen;
-    // An unknown or zero population nulls both share and rate; so does
-    // affected > population (the window outlives the devices online, the same
-    // denominator mismatch that withholds the score as inconsistent). A
-    // refusal, not a failure.
+    // An unknown or zero population nulls both share and rate. affected >
+    // population cannot happen when the numerator is drawn from the
+    // population's own ids; if a caller breaks that, the share is withheld
+    // and the score reads `inconsistent`. A refusal, not a failure.
     if (population && *population > 0 && affected >= 0 && affected <= *population) {
         f.share_affected = dex_proportion(affected, *population);
-        if (crashes + hangs >= 0)
-            f.rate_per_1000 = dex_rate(crashes + hangs, static_cast<double>(*population) / 1000.0);
+        if (events >= 0)
+            f.rate_per_1000 = dex_rate(events, static_cast<double>(*population) / 1000.0);
     }
     StabilityInputs in;
     in.reporting_devices = population.value_or(0);
@@ -226,6 +230,7 @@ json figures_json(const DexStabilityFigures& f) {
     return {{"crashes", f.crashes},
             {"hangs", f.hangs},
             {"distinct_devices", f.distinct_devices},
+            {"distinct_devices_online", f.distinct_devices_online},
             {"last_seen", f.last_seen},
             {"share_affected", interval_or_null(f.share_affected)},
             {"rate_per_1000", interval_or_null(f.rate_per_1000)},
@@ -286,7 +291,8 @@ DexAppsModel dex_apps_model_from_rows(const std::string& window,
 }
 
 DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string& window,
-                                  const std::string& since, std::optional<int64_t> population,
+                                  const std::string& since,
+                                  const std::optional<std::vector<std::string>>& online_windows,
                                   const DexScorePolicy& policy) {
     DexAppsModel m;
     m.window = window;
@@ -301,14 +307,21 @@ DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string
         m.degraded = true;
         return m;
     }
-    // Windows-scoped numerator to match the Windows-online population.
+    // Windows-scoped, and the share numerators drawn from the same online ids
+    // whose count is the population.
+    static const std::vector<std::string> kNoIds;
     const auto rows = store->dex_app_stability_checked(since, "windows", kDexAppsLimit, kDexAppsVersionCap,
-                                                       kStabilityPerDeviceEventCap);
+                                                       kStabilityPerDeviceEventCap,
+                                                       online_windows ? *online_windows : kNoIds);
     if (!rows) {
         m.degraded = true;
         return m;
     }
-    return dex_apps_model_from_rows(window, *rows, population, policy);
+    return dex_apps_model_from_rows(
+        window, *rows,
+        online_windows ? std::optional<int64_t>{static_cast<int64_t>(online_windows->size())}
+                       : std::nullopt,
+        policy);
 }
 
 std::string dex_apps_json(const DexAppsModel& model) {

@@ -222,6 +222,14 @@ public:
     /// unit tests) disables emission; every emit site is null-guarded.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
+    /// How many `dex_app_stability_checked` reads may run at once. Each holds a
+    /// lease for its whole multi-second aggregation, so without a budget a
+    /// handful of callers hold every lease of the shared pool.
+    static constexpr int kDexAppsConcurrentReads = 4;
+    /// Test seam: a budget of 0 refuses every Apps read, so the refusal path is
+    /// reachable without holding real concurrent queries.
+    void set_apps_read_budget_for_test(int n) noexcept { apps_read_budget_ = n; }
+
     // Rule CRUD. Mutating methods return `std::expected<void, std::string>`
     // (fail-hard — ADR-0038 posture). Duplicate-UNIQUE collisions (name or
     // rule_id) are reported as an error prefixed with `kConflictPrefix` so
@@ -285,14 +293,20 @@ public:
     /// qualifying application before the cut) and up to `version_limit`
     /// version rows (most devices affected first). `per_device_cap` caps each
     /// device's events in the `capped_*` sums (the stability score's caller
-    /// duty). `std::nullopt` on a degraded read (store-not-open / pool-timeout /
-    /// query-error), never collapsed into an empty vector, same contract as
-    /// `dex_signal_summary_checked`. Row order is unspecified (no ORDER BY):
+    /// duty). `online_agent_ids` is the population the share, rate and score are
+    /// divided by: the `*_online` row figures and `capped_*` cover only those
+    /// devices (so they are members of it), while `crashes`, `hangs` and
+    /// `affected_devices` stay window-wide. At most `kDexAppsConcurrentReads`
+    /// run at once (each holds a lease for seconds); one over the budget is
+    /// refused at once. `std::nullopt` on a degraded read (store-not-open /
+    /// pool-timeout / query-error / concurrency-budget), never collapsed into an
+    /// empty vector, same contract as `dex_signal_summary_checked`. Row order is unspecified (no ORDER BY):
     /// `dex_apps_model_from_rows` owns the published ranking. `app_limit` 0 returns
     /// no rows, so `apps_total` is unreportable; callers pass a positive limit.
     std::optional<std::vector<DexAppStabilityRow>>
     dex_app_stability_checked(const std::string& since, const std::string& platform, int app_limit,
-                              int version_limit, std::int64_t per_device_cap) const;
+                              int version_limit, std::int64_t per_device_cap,
+                              const std::vector<std::string>& online_agent_ids) const;
     std::vector<DexAppCrashCount> dex_device_top_apps(const std::string& agent_id,
                                                       const std::string& since = "",
                                                       int limit = 50) const;
@@ -441,6 +455,8 @@ private:
     int retention_days_;
     std::function<int64_t()> now_fn_; // test seam only; see ctor doc
     yuzu::MetricsRegistry* metrics_{nullptr};
+    mutable std::atomic<int> apps_reads_in_flight_{0};
+    std::atomic<int> apps_read_budget_{kDexAppsConcurrentReads};
 
     std::atomic<uint64_t> events_written_{0};
     std::atomic<uint64_t> events_reaped_{0};

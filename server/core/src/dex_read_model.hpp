@@ -114,14 +114,18 @@ std::string dex_app_json(const DexAppModel& model, bool audit_persisted = true);
 // /fragments/dex/apps tab still reads dex_top_apps until it is rewired) ──
 
 /// Figures published for one application or one version of it. Counts are
-/// Windows-scoped so they match the population (devices online now).
+/// Windows-scoped and window-wide. The share, rate and score are over ONE
+/// population, the Windows devices online now: their numerators count only
+/// devices in that set (`distinct_devices_online` is the share's numerator), so
+/// a device that crashed and went offline is in the counts but not in the share.
 struct DexStabilityFigures {
     int64_t crashes{0};
     int64_t hangs{0};
     int64_t distinct_devices{0};
+    int64_t distinct_devices_online{0}; ///< of distinct_devices, those online now (the share's numerator)
     std::string last_seen;
-    std::optional<DexInterval> share_affected; ///< Wilson; null when no population / affected > population
-    std::optional<DexInterval> rate_per_1000;  ///< exact; events per 1,000 reporting devices
+    std::optional<DexInterval> share_affected; ///< Wilson; null when no population
+    std::optional<DexInterval> rate_per_1000;  ///< exact; online-device events per 1,000 online devices
     StabilityScore score;
 };
 

@@ -2866,6 +2866,10 @@ groups:
             saturation or outage; store_not_open means the store failed to
             open at boot (should not be reachable post-boot given fail-closed
             construction - investigate as a possible regression if seen).
+            reason="concurrency_budget" is not a substrate fault: the Apps
+            list read (GET /api/v1/dex/apps, list_dex_apps) was refused with a
+            retryable 503 because four were already running; look for a
+            caller polling it in parallel.
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
