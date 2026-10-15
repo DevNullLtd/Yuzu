@@ -57,6 +57,7 @@ run() {
   set -e
 }
 rc() { cat "$CAP/$1.rc"; }
+same_bytes() { [ "$(od -An -tx1 -v "$1")" = "$(od -An -tx1 -v "$2")" ]; }
 
 PORT=$((20000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 40000))
 
@@ -121,8 +122,8 @@ run f --config "$(winpath "$BADCFG")" --data-dir "$(winpath "$WORK/data")" \
   --healthcheck --no-https --web-address 127.0.0.1 --web-port "$PORT"
 check "F rc is 1" "$([ "$(rc f)" = 1 ]; echo $?)"
 check "F stdout is empty" "$([ ! -s "$CAP/f.out" ]; echo $?)"
-check "F diagnostic is identical to A's" "$(cmp -s "$CAP/f.err" "$CAP/a.err"; echo $?)"
-check "F config file is byte-identical" "$(cmp -s "$BADCFG" "$CAP/invalid-yuzu-server.orig"; echo $?)"
+check "F diagnostic is identical to A's" "$(same_bytes "$CAP/f.err" "$CAP/a.err"; echo $?)"
+check "F config file is byte-identical" "$(same_bytes "$BADCFG" "$CAP/invalid-yuzu-server.orig"; echo $?)"
 check "F wrote no files" "$([ -z "$(find "$WORK" -type f)" ]; echo $?)"
 
 exit "$fail"
