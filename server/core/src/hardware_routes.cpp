@@ -611,8 +611,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // dispatch. One multi-device run at a time and one per operator per minute, both per
         // server process. The cooldown is read BEFORE the slot so a 429 never occupies it, and
         // the slot is held to the end of the handler, so the stamp after dispatch cannot
-        // interleave with another run. Note the dispatch loop is sequential: a stalled agent
-        // stream holds the slot (a concurrent run gets 409) until its write fails.
+        // interleave with another run. Note the dispatch loop is sequential: a connected agent
+        // that has stopped reading holds the slot (a concurrent run gets 409) until it reads or
+        // disconnects; no clear time is promised.
         struct RunGuard {
             RunGuard() = default;
             RunGuard(const RunGuard&) = delete; // a copy would release the slot twice

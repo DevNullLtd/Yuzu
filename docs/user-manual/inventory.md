@@ -639,8 +639,9 @@ place, **Hardware** and **Software**, each its own page:
     - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
       (`429` with `Retry-After`) and one at a time per server process (`409`); a single device
       is exempt from both. A `409` can follow a slow agent connection: the server sends to its
-      targets one after another, and a stalled agent stream holds the run until its write fails
-      (bounded by the gRPC keepalive, about 80 seconds). A server clock that steps backwards
+      targets one after another, and a connected agent that has stopped reading holds the run
+      until it reads or disconnects (a dead connection is cut by the gRPC keepalive, but no
+      clear time is promised for a stalled one). A server clock that steps backwards
       cannot lock an operator out: a last-run time in the future is ignored. Both limits are
       held in each server process, not across a cluster: with several active servers every
       one allows its own run and keeps its own per-operator cooldown, and each run is still
