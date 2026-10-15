@@ -327,7 +327,7 @@ TEST_CASE("app shell: each raw literal in the renderer stays under MSVC's string
             CHECK(e + close.size() - b < 16000);
             ++blocks;
         }
-        CHECK(blocks == 2); // shell + bell
+        CHECK(blocks == (open == "<script>" ? 3u : 2u)); // shell + bell, and the theme boot script
     }
 }
 
@@ -427,9 +427,28 @@ TEST_CASE("app shell: re-baking keeps exactly one bell, style and script", "[nav
     CHECK(count_of(twice, "id=\"shell-bell\"") == 1);
     CHECK(count_of(twice, "(function(){\n  var POLL_MS=") == 1);
     CHECK(count_of(twice, "<style>") == 2);
-    CHECK(count_of(twice, "<script>") == 2);
+    CHECK(count_of(twice, "<script>") == 3); // theme boot, identity/online, header bell
+    CHECK(count_of(twice, "localStorage.getItem('yuzu-theme')") == 1);
     // The bell script sits inside the marker pair, before the end marker.
     CHECK(twice.find("var POLL_MS=") < twice.find(kShellEnd));
+}
+
+TEST_CASE("app shell: the colour-scheme boot script runs first, whitelisted and guarded",
+          "[nav][shell][theme]") {
+    const auto html = render_shell({});
+    // First thing inside the chrome: before the shell CSS and sidebar, so a saved scheme is
+    // applied before any content paints.
+    const auto boot = html.find("<script>try{var t=localStorage.getItem('yuzu-theme');");
+    REQUIRE(boot != std::string::npos);
+    CHECK(boot == kShellBegin.size());
+    CHECK(boot < html.find("<style>"));
+    CHECK(boot < html.find("<nav"));
+    // Exact-match whitelist of the six schemes, a try/catch around the store, and the attribute
+    // goes on <html> (the :root element the token aliases resolve on).
+    CHECK_THAT(html, ContainsSubstring("/^(slate|navy|jade|light|light-baby|light-hot)$/.test(t)"));
+    CHECK_THAT(html, ContainsSubstring("document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>"));
+    // Nothing else reads the key: one boot per shell render.
+    CHECK(count_of(html, "yuzu-theme") == 1);
 }
 
 TEST_CASE("app shell: bell requests use the three existing routes, credentialed, bounded",
@@ -478,11 +497,16 @@ TEST_CASE("app shell: bell polling is gated on recent input", "[nav][shell][bell
 TEST_CASE("app shell: bell renders server text as text only", "[nav][shell][bell]") {
     const auto html = render_shell({});
     for (const auto* banned : {"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(",
-                               "new Function", " onclick=", "hx-on", "localStorage", "sessionStorage",
-                               "__bellRefresh"}) {
+                               "new Function", " onclick=", "hx-on", "sessionStorage", "__bellRefresh"}) {
         INFO(banned);
         CHECK_THAT(html, !ContainsSubstring(banned));
     }
+    // The colour-scheme boot (the first script, right after the marker) is the shell's only
+    // localStorage read; nothing after it, bell included, touches the store.
+    const auto boot_end = html.find("</script>");
+    REQUIRE(boot_end != std::string::npos);
+    CHECK_THAT(html.substr(0, boot_end), ContainsSubstring("localStorage.getItem('yuzu-theme')"));
+    CHECK_THAT(html.substr(boot_end), !ContainsSubstring("localStorage"));
     CHECK_THAT(html, ContainsSubstring("textContent"));
     // The message is clamped before it reaches the paragraph or the title attribute.
     const auto clamp = html.find("txt(n.message).slice(0,MSG_MAX)");
