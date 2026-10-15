@@ -7,7 +7,7 @@
     - agent code or plugins there could have been written by another account;
     - the data directory is not owned by root or `_yuzu`;
     - a retained signed-plugin requirement meets an unsigned package.
-  - A planted `yuzu-agent.old` is never promoted by an OTA rollback.
+  - On every POSIX platform, the agent's startup OTA rollback now promotes `<exe>.old` only if it is a regular, singly-linked file owned by the agent's own account with no group or world write bit; anything else is refused, logged and removed.
   - See *Behaviour change: the macOS agent package installs transactionally* in `docs/user-manual/upgrading.md` and the new *Deploying with MDM* runbook.
   - Released macOS agents still use the process poll, not Endpoint Security.
 - **`--no-auto-update` now also disables the agent's startup OTA rollback, its `.old` cleanup and the post-update verification marker, on every platform.** A disabled updater writes nothing beside the agent executable, which the signed macOS app bundle requires. After OTA is re-enabled on an agent that ran disabled, the first update can be rolled back once at the next restart and then re-applied; it settles after one cycle.

@@ -50,8 +50,13 @@ struct TempUpdaterDir {
 
 /// Helper: write a small file to simulate a binary.
 void write_fake_binary(const fs::path& path) {
-    std::ofstream out(path, std::ios::binary);
-    out << "fake-binary-content";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "fake-binary-content";
+    }
+    // As the updater writes binaries: owner-only, whatever the test's umask.
+    std::error_code ec;
+    fs::permissions(path, fs::perms::owner_all, fs::perm_options::replace, ec);
 }
 
 } // anonymous namespace
@@ -216,6 +221,12 @@ TEST_CASE("rollback_if_needed refuses a writable or symlinked .old",
         auto target = dir / "planted";
         write_fake_binary(target);
         fs::create_symlink(target, old_path);
+        REQUIRE_FALSE(updater.rollback_if_needed());
+    }
+    SECTION("a hard link to another file") {
+        auto target = dir / "planted";
+        write_fake_binary(target);
+        fs::create_hard_link(target, old_path);
         REQUIRE_FALSE(updater.rollback_if_needed());
     }
     // The executable was not replaced.

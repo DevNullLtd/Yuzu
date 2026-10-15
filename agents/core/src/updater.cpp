@@ -1057,12 +1057,21 @@ bool Updater::rollback_if_needed() {
     // Only this process's own account may have written it: a planted file left
     // in a once-writable directory would otherwise be promoted to the daemon
     // (PR #4482 governance ch-4). lstat, so a symlink is refused, not followed.
+    // A second link means the bytes are shared with another path, such as a
+    // hard link to some other file this account owns (governance g8c-2).
     struct stat old_st {};
-    if (::lstat(old_path.c_str(), &old_st) != 0 || !S_ISREG(old_st.st_mode) ||
-        old_st.st_uid != ::geteuid() || (old_st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
-        spdlog::error("Refusing rollback: '{}' is not a regular file owned by this account "
-                      "and writable only by it",
-                      old_path.string());
+    if (::lstat(old_path.c_str(), &old_st) != 0) {
+        spdlog::error("Refusing rollback: cannot inspect '{}'", old_path.string());
+        return false;
+    }
+    if (!S_ISREG(old_st.st_mode) || old_st.st_uid != ::geteuid() || old_st.st_nlink != 1 ||
+        (old_st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        spdlog::error("Refusing rollback: '{}' is not a singly-linked regular file owned by this "
+                      "account and writable only by it (uid {}, mode {:o}, links {}, inode {})",
+                      old_path.string(), static_cast<unsigned long>(old_st.st_uid),
+                      static_cast<unsigned>(old_st.st_mode & 07777),
+                      static_cast<unsigned long>(old_st.st_nlink),
+                      static_cast<unsigned long long>(old_st.st_ino));
         return false;
     }
 #endif
