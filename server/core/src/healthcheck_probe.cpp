@@ -2,8 +2,12 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include <condition_variable>
+#include <cstdlib>
+#include <mutex>
 #include <ostream>
 #include <string>
+#include <thread>
 
 namespace yuzu::server::healthcheck {
 
@@ -57,10 +61,10 @@ HealthcheckOutcome probe_once(const HealthcheckTarget& t, int max_total_ms) {
         client = std::make_unique<httplib::ClientImpl>(t.host, t.port);
         client->set_follow_location(false);
     }
-    // Deadline composition: TCP connect <= 1 s, each TLS handshake select <= 1 s, and the
-    // request phase <= max_total_ms (3 s by default) as a whole (httplib.h:9906-9950);
-    // make_tls_client's quiet shutdown means no close_notify wait follows. No single knob
-    // covers all of these in 0.37.1; the sum is sized to stay under compose's 5 s on loopback.
+    // Per-phase knobs: TCP connect <= 1 s, each TLS handshake select <= 1 s, request phase
+    // <= max_total_ms (httplib.h:9906-9950). The handshake loop (httplib.h:16517-16553) is
+    // bounded per select, never in total, and nothing bounds name resolution, so
+    // run_healthcheck runs this under probe_bounded's absolute kProbeDeadline.
     constexpr int kConnectSec = 1;
     constexpr int kWriteSec = 1;
     constexpr int kReadSec = 2;
@@ -85,6 +89,39 @@ HealthcheckOutcome probe_once(const HealthcheckTarget& t, int max_total_ms) {
     return out;
 }
 
+std::optional<HealthcheckOutcome> probe_bounded(std::chrono::milliseconds deadline,
+                                                std::function<HealthcheckOutcome()> probe) {
+    // Everything the worker touches lives in `st`, which the worker co-owns: an abandoned
+    // worker (deadline first) can finish long after this frame is gone.
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done{false};
+        HealthcheckOutcome outcome;
+    };
+    auto st = std::make_shared<State>();
+    std::thread worker([st, probe = std::move(probe)] {
+        auto out = probe();
+        {
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->outcome = std::move(out);
+            st->done = true;
+        }
+        st->cv.notify_one();
+    });
+    bool finished = false;
+    {
+        std::unique_lock<std::mutex> lk(st->mu);
+        finished = st->cv.wait_for(lk, deadline, [&] { return st->done; });
+    }
+    if (!finished) {
+        worker.detach();
+        return std::nullopt;
+    }
+    worker.join();
+    return std::move(st->outcome);
+}
+
 int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     constexpr bool kTlsSupported = true;
@@ -93,10 +130,22 @@ int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag
 #endif
     const auto target =
         resolve_healthcheck_target(cfg, path, auth::default_cert_dir(), kTlsSupported);
-    const auto outcome = probe_once(target);
-    const int code = healthcheck_exit_code(outcome);
+    // Absolute cap over the whole probe, name resolution and handshake included; 1 s of
+    // headroom under compose's 5 s covers exec, CLI parse, the diagnostic write and exit.
+    constexpr std::chrono::milliseconds kProbeDeadline{4000};
+    const auto outcome = probe_bounded(kProbeDeadline, [target] { return probe_once(target); });
+    if (!outcome) {
+        const HealthcheckOutcome timed_out{
+            .status = 0,
+            .error = "timed out after " + std::to_string(kProbeDeadline.count()) + " ms"};
+        diag << healthcheck_diagnostic(target, timed_out) << '\n';
+        diag.flush();
+        // The abandoned worker is blocked in httplib/OpenSSL: skip static destructors.
+        std::_Exit(healthcheck_exit_code(timed_out));
+    }
+    const int code = healthcheck_exit_code(*outcome);
     if (code != 0)
-        diag << healthcheck_diagnostic(target, outcome) << '\n';
+        diag << healthcheck_diagnostic(target, *outcome) << '\n';
     return code;
 }
 

@@ -162,6 +162,70 @@ TEST_CASE("healthcheck: the diagnostic is one line, names target and anchor, nev
           std::string::npos);
 }
 
+TEST_CASE("healthcheck: control bytes in the target never split the diagnostic line",
+          "[server][healthcheck]") {
+    HealthcheckTarget t;
+    t.tls = true;
+    t.host = "bad\nhost";
+    t.port = 8443;
+    t.path = "/readyz";
+    t.trust_anchor = fs::path{"/certs/an\rchor\x7f.pem"};
+
+    const auto line = healthcheck_diagnostic(t, {0, "Conn\nection"});
+    CHECK(line.find('\n') == std::string::npos);
+    CHECK(line.find('\r') == std::string::npos);
+    CHECK(line.find('\x7f') == std::string::npos);
+    // The printable parts survive, so the line still names the target and the anchor.
+    CHECK(line.find("healthcheck: GET https://bad?host:8443/readyz") != std::string::npos);
+    CHECK(line.find("Conn?ection") != std::string::npos);
+    CHECK(line.find("(trust anchor: /certs/an?chor?.pem)") != std::string::npos);
+}
+
+namespace {
+/// Shared with the worker probe_bounded may abandon, so the worker owns what it touches.
+struct Gate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool released{false};
+    void release() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            released = true;
+        }
+        cv.notify_all();
+    }
+};
+} // namespace
+
+TEST_CASE("healthcheck: probe_bounded abandons a probe that outlives the deadline",
+          "[server][healthcheck]") {
+    auto gate = std::make_shared<Gate>();
+    // ONE wait that ends by itself after 2 s: a probe_bounded that waited for the probe would
+    // return a value here and fail CHECK_FALSE below, instead of hanging the suite.
+    auto probe = [gate] {
+        std::unique_lock<std::mutex> lk(gate->mu);
+        gate->cv.wait_for(lk, std::chrono::seconds(2), [&] { return gate->released; });
+        return HealthcheckOutcome{.status = 200, .error = {}};
+    };
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto out = probe_bounded(std::chrono::milliseconds(50), probe);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    gate->release(); // let the abandoned worker finish
+
+    CHECK_FALSE(out.has_value());
+    CHECK(elapsed < std::chrono::seconds(2)); // upper bound only, never a lower bound
+}
+
+TEST_CASE("healthcheck: probe_bounded returns the outcome of a probe that finishes in time",
+          "[server][healthcheck]") {
+    const auto out = probe_bounded(std::chrono::seconds(2), [] {
+        return HealthcheckOutcome{.status = 200, .error = {}};
+    });
+    REQUIRE(out.has_value());
+    CHECK(out->status == 200);
+}
+
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 TEST_CASE("healthcheck: a TLS target with no trust anchor is refused, never probed against the "
           "system store",

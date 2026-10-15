@@ -9,8 +9,11 @@
 
 #include <httplib.h>
 
+#include <chrono>
+#include <functional>
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 namespace yuzu::server::healthcheck {
@@ -25,13 +28,24 @@ namespace yuzu::server::healthcheck {
 #endif
 
 /// One GET against `target`. Never throws; a transport or TLS failure is
-/// reported as status 0 plus a reason. `max_total_ms` is the whole-request
-/// ceiling handed to httplib::set_max_timeout.
+/// reported as status 0 plus a reason. `max_total_ms` is the request-phase
+/// ceiling handed to httplib::set_max_timeout; it does not cover name
+/// resolution or the TLS handshake (see probe_bounded).
 [[nodiscard]] HealthcheckOutcome probe_once(const HealthcheckTarget& target,
                                             int max_total_ms = 3000);
 
+/// Runs `probe` on a worker thread and waits up to `deadline` for it. Returns
+/// its outcome if it finished, or nullopt if the deadline came first, in which
+/// case the worker is detached: it is blocked inside httplib/OpenSSL, which
+/// offers no cancellation. The caller must not return into code that tears
+/// down process state (exit via std::_Exit); the worker owns everything it
+/// touches, so abandoning it is safe until then.
+[[nodiscard]] std::optional<HealthcheckOutcome>
+probe_bounded(std::chrono::milliseconds deadline, std::function<HealthcheckOutcome()> probe);
+
 /// Entry point for `yuzu-server --healthcheck`. Writes one diagnostic line to
-/// `diag` on failure and nothing on success; returns the process exit code.
+/// `diag` on failure and nothing on success; returns the process exit code. The
+/// whole probe is cut off at 4 s (a timeout exits the process directly).
 [[nodiscard]] int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag);
 
 } // namespace yuzu::server::healthcheck

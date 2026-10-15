@@ -85,6 +85,17 @@ resolve_healthcheck_target(const Config& cfg, std::string_view path,
     return o.status == 200 ? 0 : 1;
 }
 
+/// Control bytes (< 0x20 and 0x7f) become '?', so an operator-supplied host or path
+/// containing a line break cannot split the diagnostic into several lines.
+[[nodiscard]] inline std::string one_line(std::string s) {
+    for (char& c : s) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7f)
+            c = '?';
+    }
+    return s;
+}
+
 /// Empty on success, otherwise ONE line. Names the target, the status or the
 /// transport/TLS reason, and the trust anchor; never the private-key path and
 /// never any response body.
@@ -92,11 +103,12 @@ resolve_healthcheck_target(const Config& cfg, std::string_view path,
                                                         const HealthcheckOutcome& o) {
     if (healthcheck_exit_code(o) == 0)
         return {};
-    return "healthcheck: GET " + healthcheck_url(t) + " -> " +
-           (o.status != 0 ? std::to_string(o.status)
-                          : (o.error.empty() ? std::string{"no response"} : o.error)) +
-           " (trust anchor: " +
-           (t.trust_anchor.empty() ? std::string{"none"} : t.trust_anchor.string()) + ")";
+    return one_line(
+        "healthcheck: GET " + healthcheck_url(t) + " -> " +
+        (o.status != 0 ? std::to_string(o.status)
+                       : (o.error.empty() ? std::string{"no response"} : o.error)) +
+        " (trust anchor: " +
+        (t.trust_anchor.empty() ? std::string{"none"} : t.trust_anchor.string()) + ")");
 }
 
 } // namespace yuzu::server::healthcheck
