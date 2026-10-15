@@ -44,6 +44,43 @@ TEST_CASE("url policy: scheme+host drops userinfo path query and fragment", "[in
     CHECK(url_scheme_host("host.example/path").empty());
 }
 
+TEST_CASE("url audit detail: scheme+host and a fingerprint, never the path or query",
+          "[integrations][url][security]") {
+    const std::string secret = "https://hooks.example.invalid/services/T0/B0/SECRET?key=SECRET2";
+    const auto d = url_audit_detail(secret);
+    CHECK(d.starts_with("url=https://hooks.example.invalid url_fp="));
+    CHECK(d.find("SECRET") == std::string::npos);
+    CHECK(d.size() == std::string("url=https://hooks.example.invalid url_fp=").size() + 12);
+    // Same URL, same fingerprint; any change to the path or query changes it.
+    CHECK(d == url_audit_detail(secret));
+    CHECK(d != url_audit_detail(secret + "x"));
+    CHECK(url_fingerprint("https://siem.example.com/ingest") == "37e8a3290af1");
+    // Control bytes (an unvalidated value) never echo; an unparseable value reports the
+    // fingerprint alone.
+    CHECK(url_audit_detail(std::string("https://h.example/\r\nforged=1")).starts_with("url_fp="));
+    CHECK(url_audit_detail("no-scheme/path").starts_with("url_fp="));
+}
+
+TEST_CASE("url delivery parts: the authority ends at '/', '?' or '#'",
+          "[integrations][url]") {
+    auto parts = url_delivery_parts("https://hooks.example?token=x");
+    CHECK(parts.scheme == "https");
+    CHECK(parts.host_port == "hooks.example");
+    CHECK(parts.path == "/?token=x");
+    parts = url_delivery_parts("http://h.example:8080/a/b?c=d#frag");
+    CHECK(parts.scheme == "http");
+    CHECK(parts.host_port == "h.example:8080");
+    CHECK(parts.path == "/a/b?c=d"); // the fragment is never sent
+    parts = url_delivery_parts("https://h.example#frag");
+    CHECK(parts.host_port == "h.example");
+    CHECK(parts.path == "/");
+    parts = url_delivery_parts("https://h.example");
+    CHECK(parts.path == "/");
+    // Validation and delivery agree on where the host ends.
+    CHECK(detail::url_authority("https://hooks.example?token=x") ==
+          url_delivery_parts("https://hooks.example?token=x").host_port);
+}
+
 TEST_CASE("mapping audit detail: pairs, removal marker, count", "[integrations][audit]") {
     const auto d = integrations::mapping_audit_chunks({{"g-1", "Operator"}, {"g-2", ""}});
     REQUIRE(d.size() == 1);

@@ -2,14 +2,20 @@
 
 /// @file outbound_url_policy.hpp
 /// Pure checks for operator-supplied outbound destination URLs (webhooks and
-/// offload targets). Header-only and dependency-free so the stores, routes and
-/// unit tests share one definition.
+/// offload targets). Header-only (OpenSSL's EVP digest is the only dependency,
+/// for the audit fingerprint) so the stores, routes and unit tests share one
+/// definition.
 ///
-/// A destination URL is a bearer secret in practice (Slack-style hooks) and is
-/// echoed into audit rows and the analytics stream, so two shapes are refused
-/// at create time: embedded userinfo (`https://user:pass@host`) and control
-/// bytes (CR/LF/NUL would split an audit row). Existing rows are not rewritten.
+/// A destination URL is a bearer secret in practice (Slack-style hooks), so it
+/// must never reach a Postgres audit column or the analytics stream in full
+/// (ADR-0010 Decision 4): audit rows and events carry `url_audit_detail()`
+/// (scheme, host and a fingerprint) instead. Two shapes are also refused at
+/// create time: embedded userinfo (`https://user:pass@host`) and control bytes
+/// (CR/LF/NUL would split an audit row). Existing rows are not rewritten.
 
+#include <openssl/evp.h>
+
+#include <array>
 #include <string>
 #include <string_view>
 
@@ -55,6 +61,67 @@ namespace detail {
         authority = authority.substr(at + 1);
     std::string out(url.substr(0, scheme_end + 3));
     out.append(authority);
+    return out;
+}
+
+/// The pieces delivery connects with. The authority ends at the first '/', '?' or '#' (as
+/// `url_authority` reads it), so `https://hooks.example?token=x` connects to `hooks.example` and
+/// requests `/?token=x`; splitting at '/' alone made the query part of the host. The fragment is
+/// never sent. A value with no "http(s)://" prefix keeps the historical http default.
+struct UrlDeliveryParts {
+    std::string scheme;    ///< "http" or "https"
+    std::string host_port; ///< authority as written (userinfo is refused at create time)
+    std::string path;      ///< request target: path and query, always starting with '/'
+};
+
+[[nodiscard]] inline UrlDeliveryParts url_delivery_parts(std::string_view url) {
+    UrlDeliveryParts out{"http", {}, "/"};
+    if (url.starts_with("https://")) {
+        out.scheme = "https";
+        url.remove_prefix(8);
+    } else if (url.starts_with("http://")) {
+        url.remove_prefix(7);
+    }
+    const auto end = url.find_first_of("/?#");
+    out.host_port = std::string(url.substr(0, end));
+    if (end == std::string_view::npos)
+        return out;
+    auto rest = url.substr(end);
+    if (const auto frag = rest.find('#'); frag != std::string_view::npos)
+        rest = rest.substr(0, frag);
+    if (!rest.empty())
+        out.path = rest.front() == '/' ? std::string(rest) : "/" + std::string(rest);
+    return out;
+}
+
+/// First 12 lowercase hex characters (48 bits) of SHA-256 over the whole URL:
+/// enough to tell whether two audit rows, or a row and a candidate URL, name the
+/// same destination, too little to recover the secret. Empty if the digest fails.
+[[nodiscard]] inline std::string url_fingerprint(std::string_view url) {
+    std::array<unsigned char, EVP_MAX_MD_SIZE> md{};
+    unsigned int len = 0;
+    if (EVP_Digest(url.data(), url.size(), md.data(), &len, EVP_sha256(), nullptr) != 1)
+        return {};
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    for (unsigned int i = 0; i < 6 && i < len; ++i) {
+        out.push_back(kHex[md[i] >> 4]);
+        out.push_back(kHex[md[i] & 0x0f]);
+    }
+    return out;
+}
+
+/// The audit-row form of a destination URL: `url=<scheme://host[:port]>
+/// url_fp=<fingerprint>`. Keeps "where did the data go" answerable by host and
+/// by exact-URL comparison without storing the path or query, where a
+/// Slack-style token lives. An unparseable value reports the fingerprint only.
+[[nodiscard]] inline std::string url_audit_detail(std::string_view url) {
+    std::string out;
+    // A value with control bytes (not yet validated on the audit-first path) is never echoed.
+    if (const auto host = url_has_control_bytes(url) ? std::string{} : url_scheme_host(url);
+        !host.empty())
+        out = "url=" + host + " ";
+    out += "url_fp=" + url_fingerprint(url);
     return out;
 }
 

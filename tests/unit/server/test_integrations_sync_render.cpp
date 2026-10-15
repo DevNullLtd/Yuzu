@@ -398,6 +398,14 @@ TEST_CASE("directory users: rows, escaping, group truncation, caps and states",
     std::vector<DirectoryUser> many(250, u);
     const auto capped = render_directory_users(many, 250);
     CHECK_THAT(capped, ContainsSubstring("Showing 200 of 250 users."));
+
+    // A failed COUNT never becomes a number: the read ran past the cap, so say that more exist.
+    const auto unknown = render_directory_users(many, std::nullopt);
+    CHECK_THAT(unknown, ContainsSubstring("Showing 200 users; more exist (total unavailable)."));
+    CHECK_THAT(unknown, !ContainsSubstring(" of "));
+    // ... and below the cap there is nothing to qualify.
+    const auto few = render_directory_users(std::vector<DirectoryUser>{u}, std::nullopt);
+    CHECK_THAT(few, !ContainsSubstring("Showing"));
 }
 
 TEST_CASE("withheld and not-found notes", "[integrations][render]") {

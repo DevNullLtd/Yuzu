@@ -5,7 +5,7 @@
 #include "web_utils.hpp"      // html_escape
 
 #include <algorithm>
-#include <cstdio>
+#include <format>
 
 namespace yuzu::server::integrations {
 
@@ -132,11 +132,8 @@ std::string format_utc(std::int64_t t) {
     const unsigned m = mp < 10 ? mp + 3 : mp - 9;
     if (m <= 2)
         ++y;
-    char buf[40];
-    std::snprintf(buf, sizeof(buf), "%04lld-%02u-%02u %02lld:%02lld UTC", static_cast<long long>(y),
-                  m, d, static_cast<long long>(secs / 3600),
-                  static_cast<long long>((secs % 3600) / 60));
-    return buf;
+    return std::format("{:04}-{:02}-{:02} {:02}:{:02} UTC", y, m, d, secs / 3600,
+                       (secs % 3600) / 60);
 }
 
 std::string clip_text(const std::string& s, std::size_t max_bytes) {
@@ -494,16 +491,21 @@ std::string render_directory_panel(const DirectoryView& v) {
 
 std::string
 render_directory_users(const std::expected<std::vector<DirectoryUser>, ReadError>& users,
-                       std::int64_t total) {
+                       std::optional<std::int64_t> total) {
     if (!users)
         return failure_box("Directory users", users.error());
     if (users->empty())
         return "<div class=\"note\" data-state=\"empty\">No synced users.</div>";
     std::string out;
     const auto shown = std::min<std::size_t>(users->size(), kUsersShown);
-    if (static_cast<std::int64_t>(shown) < total || users->size() > kUsersShown) {
+    if (!total) {
+        // The count failed: say what was read, and whether the read itself ran past the cap.
+        if (users->size() > kUsersShown)
+            out += "<div class=\"note\" data-state=\"truncated\">Showing " +
+                   std::to_string(shown) + " users; more exist (total unavailable).</div>";
+    } else if (static_cast<std::int64_t>(shown) < *total || users->size() > kUsersShown) {
         out += "<div class=\"note\" data-state=\"truncated\">Showing " + std::to_string(shown) +
-               " of " + std::to_string(std::max<std::int64_t>(total, users->size())) +
+               " of " + std::to_string(std::max<std::int64_t>(*total, users->size())) +
                " users.</div>";
     }
     out += "<div class=\"tw\"><table><thead><tr><th>User</th><th>Email</th><th>UPN</th><th>State</th>"

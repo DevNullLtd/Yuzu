@@ -623,25 +623,8 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
 
     try {
         // Parse the URL to extract scheme, host, port, path
-        std::string url = wh.url;
-        std::string scheme = "http";
-        std::string host_port;
-        std::string path = "/";
-
-        if (url.starts_with("https://")) {
-            scheme = "https";
-            url = url.substr(8);
-        } else if (url.starts_with("http://")) {
-            url = url.substr(7);
-        }
-
-        auto path_pos = url.find('/');
-        if (path_pos != std::string::npos) {
-            host_port = url.substr(0, path_pos);
-            path = url.substr(path_pos);
-        } else {
-            host_port = url;
-        }
+        // One parser for validation and delivery (outbound_url_policy.hpp).
+        const auto [scheme, host_port, path] = url_delivery_parts(wh.url);
 
         httplib::Client cli(scheme + "://" + host_port);
         cli.set_connection_timeout(5);

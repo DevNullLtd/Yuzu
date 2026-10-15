@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -102,9 +103,11 @@ render_offload_deliveries(const std::expected<std::vector<OffloadDelivery>, Read
 
 [[nodiscard]] std::string render_directory_panel(const DirectoryView& view);
 
+/// `total` is nullopt when the COUNT failed: the note then says more users exist (when the read
+/// returned past the cap) and that the total is unavailable, never a number it did not read.
 [[nodiscard]] std::string
 render_directory_users(const std::expected<std::vector<DirectoryUser>, ReadError>& users,
-                       std::int64_t total);
+                       std::optional<std::int64_t> total);
 
 /// The "withheld because the audit row could not be written" box for the
 /// directory-users fragment (PII is never shown without durable evidence).

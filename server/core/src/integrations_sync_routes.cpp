@@ -321,7 +321,8 @@ void register_integrations_sync_routes(HttpRouteSink& sink, SyncDeps deps) {
                  // whole directory (the count above is a separate COUNT).
                  auto users = d->directory_users(static_cast<int>(kUsersShown) + 1);
                  auto total = d->directory_user_count();
-                 send_html(res, render_directory_users(users, total ? *total : 0));
+                 send_html(res, render_directory_users(users, total ? std::optional<std::int64_t>(*total)
+                                                              : std::nullopt));
              });
 
     sink.Get("/static/yuzu-integrations-sync.js", [](const httplib::Request&, httplib::Response& res) {

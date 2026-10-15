@@ -1,0 +1,1 @@
+- **The Integrations directory user list no longer invents a total when the count fails.** If the user COUNT could not be read, the note said "Showing 200 of 201 users"; it now says "Showing 200 users; more exist (total unavailable)." The timestamp renderer also uses `std::format` instead of a fixed buffer.
