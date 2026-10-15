@@ -135,8 +135,7 @@ namespace {
 // `maxLength` of query_audit_log's string filters: published in its schema (A5) and enforced by the
 // handler in characters (UTF-8 code points), as JSON Schema counts them. Keep the schema literal in
 // step with these.
-constexpr std::size_t kAuditFilterMaxLen = 256;
-constexpr std::size_t kAuditTargetIdMaxLen = 512;
+constexpr std::size_t kAuditFilterMaxLen = 1024; // an SSO principal (oidc:<iss>#<sub>) reaches ~516
 
 /// UTF-8 code points in `v` (every byte that is not a continuation byte starts one).
 inline std::size_t utf8_length(const std::string& v) {
@@ -617,11 +616,13 @@ static const ToolDef kTools[] = {
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries (newest first, rows with "
      "equal timestamps in a fixed order) showing who did what, when. Paging: a page shorter "
-     "than `limit` is the last one, and `has_more` is true when more matching rows exist past "
-     "this page; walk with `offset`. The log is live, so a walk by offset can repeat a row "
+     "than `limit` is the last one, and `has_more` (in structuredContent; the text content is the "
+     "bare entries array) is true when more matching rows exist past "
+     "this page; walk with `offset` (0..10000; past that, set `until` to the oldest "
+     "`timestamp` seen and restart at offset 0). The log is live, so a walk by offset can repeat a row "
      "when newer rows arrive and can skip one when retention deletes rows; de-duplicate on the "
      "entry `id`. A store fault is retryable (retry_after_ms); a bad filter is not.",
-     R"({"type":"object","properties":{"principal":{"type":"string","maxLength":256,"description":"Exact principal name"},"action":{"type":"string","maxLength":256,"description":"Exact audit action, e.g. auth.permission_required"},"target_type":{"type":"string","maxLength":256,"description":"Exact target type"},"target_id":{"type":"string","maxLength":512,"description":"Exact target id; requires target_type"},"since":{"type":"integer","minimum":0,"description":"Unix epoch lower bound, inclusive"},"until":{"type":"integer","minimum":0,"description":"Unix epoch upper bound, inclusive"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500,"description":"Entries per page"},"offset":{"type":"integer","default":0,"minimum":0,"maximum":10000,"description":"Entries to skip before this page"}}})",
+     R"({"type":"object","properties":{"principal":{"type":"string","maxLength":1024,"description":"Exact principal name"},"action":{"type":"string","maxLength":1024,"description":"Exact audit action, e.g. auth.permission_required"},"target_type":{"type":"string","maxLength":1024,"description":"Exact target type"},"target_id":{"type":"string","maxLength":1024,"description":"Exact target id; requires target_type"},"since":{"type":"integer","minimum":0,"description":"Unix epoch lower bound, inclusive; 0 or absent = unbounded"},"until":{"type":"integer","minimum":0,"description":"Unix epoch upper bound, inclusive; 0 or absent = unbounded"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500,"description":"Entries per page"},"offset":{"type":"integer","default":0,"minimum":0,"maximum":10000,"description":"Entries to skip before this page"}}})",
      R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}},"has_more":{"type":"boolean","description":"More matching rows exist past this page"}},"required":["entries","has_more"]})j"},
 
     {"list_definitions",
@@ -8580,7 +8581,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             a4_error(kInvalidParams,
                                      "string filters are limited to " +
                                          std::to_string(kAuditFilterMaxLen) + " characters",
-                                     "pass the exact value, which is shorter"),
+                                     "narrow by action, time window or another filter; GET /api/v1/audit has no length bound"),
                             "application/json");
                         return;
                     }
@@ -8617,12 +8618,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                if (utf8_length(*target_id_opt) > kAuditTargetIdMaxLen) {
+                if (utf8_length(*target_id_opt) > kAuditFilterMaxLen) {
                     res.set_content(
                         a4_error(kInvalidParams,
-                                 "target_id is limited to " + std::to_string(kAuditTargetIdMaxLen) +
+                                 "target_id is limited to " + std::to_string(kAuditFilterMaxLen) +
                                      " characters",
-                                 "pass the exact id, which is shorter"),
+                                 "narrow by action, time window or another filter; GET /api/v1/audit has no length bound"),
                         "application/json");
                     return;
                 }

@@ -3605,7 +3605,8 @@ same row set as this route.
 
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
 less than 1, `since`/`until` is not a non-negative integer, `since` is
-greater than `until`, `offset` is not an integer in `0..10000`, or
+greater than `until`, `offset` is not an integer in `0..10000`, a string
+filter holds a NUL or invalid UTF-8, or
 `target_id` is given without `target_type` (the index leads with
 `target_type`, so a bare `target_id` would scan the table); `503` — the
 audit store is unavailable or the query degraded (ADR-0040 deny-on-degrade —

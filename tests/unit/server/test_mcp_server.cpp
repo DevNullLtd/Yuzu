@@ -17582,10 +17582,10 @@ TEST_CASE("MCP query_audit_log: the published schema carries its bounds and desc
     nlohmann::json props = tool["inputSchema"]["properties"];
     for (const char* f : {"principal", "action", "target_type"}) {
         INFO(f);
-        CHECK(props[f]["maxLength"] == 256);
+        CHECK(props[f]["maxLength"] == 1024);
         CHECK_FALSE(props[f]["description"].get<std::string>().empty());
     }
-    CHECK(props["target_id"]["maxLength"] == 512);
+    CHECK(props["target_id"]["maxLength"] == 1024);
     for (const char* f : {"since", "until", "limit", "offset"}) {
         INFO(f);
         CHECK_FALSE(props[f]["description"].get<std::string>().empty());
@@ -17642,6 +17642,11 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
     SECTION("has_more is true exactly when more rows exist past the page") {
         auto first = page(R"(,"limit":2)");
         CHECK(first["entries"].size() == 2);
+        // The text channel stays the bare array: has_more lives in structuredContent only.
+        auto raw = call("{" + base + R"(,"limit":2})");
+        auto text = nlohmann::json::parse(raw["result"]["content"][0]["text"].get<std::string>());
+        CHECK(text.is_array());
+        CHECK(text.size() == 2);
         CHECK(first["has_more"] == true);
         auto exact = page(R"(,"limit":3)");
         CHECK(exact["entries"].size() == 3);
@@ -17657,10 +17662,10 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
     SECTION("refusals carry the A4 envelope with a remediation and no retry hint") {
         const std::vector<std::string> bads = {
             R"({"offset":-1})", R"({"principal":42})", R"({"target_id":"x"})" /* no target_type */,
-            R"({"principal":")" + std::string(257, 'p') + R"("})",
-            R"({"action":")" + std::string(257, 'a') + R"("})",
-            R"({"target_type":")" + std::string(257, 't') + R"("})",
-            R"({"target_type":"t","target_id":")" + std::string(513, 'i') + R"("})",
+            R"({"principal":")" + std::string(1025, 'p') + R"("})",
+            R"({"action":")" + std::string(1025, 'a') + R"("})",
+            R"({"target_type":")" + std::string(1025, 't') + R"("})",
+            R"({"target_type":"t","target_id":")" + std::string(1025, 'i') + R"("})",
             R"({"since":9,"until":3})", R"({"principal":"a\u0000b"})", R"({"target_id":7})",
             R"({"target_type":"T","target_id":"a\u0000b"})"};
         for (const std::string& bad : bads) {
@@ -17675,10 +17680,10 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
         }
     }
 
-    SECTION("the limits count characters, not bytes: 256 two-byte characters are accepted") {
+    SECTION("the limit counts characters, not bytes: 1024 two-byte characters are accepted") {
         std::string wide;
-        for (int i = 0; i < 256; ++i)
-            wide += "\xC3\xA9"; // U+00E9, two bytes each: 512 bytes, 256 characters
+        for (int i = 0; i < 1024; ++i)
+            wide += "\xC3\xA9"; // U+00E9, two bytes each: 2048 bytes, 1024 characters
         auto ok = call(R"({"principal":")" + wide + R"("})");
         CHECK(ok.contains("result"));
         auto over = call(R"({"principal":")" + wide + "\xC3\xA9" + R"("})");
@@ -17686,10 +17691,10 @@ TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; 
         CHECK(over["error"]["code"] == -32602);
     }
 
-    SECTION("the filter limits are inclusive: 256 and 512 characters are accepted") {
-        auto ok = call(R"({"principal":")" + std::string(256, 'p') + R"("})");
+    SECTION("the filter limit is inclusive: 1024 characters are accepted") {
+        auto ok = call(R"({"principal":")" + std::string(1024, 'p') + R"("})");
         CHECK(ok.contains("result"));
-        auto ok2 = call(R"({"target_type":"t","target_id":")" + std::string(512, 'i') + R"("})");
+        auto ok2 = call(R"({"target_type":"t","target_id":")" + std::string(1024, 'i') + R"("})");
         CHECK(ok2.contains("result"));
     }
 

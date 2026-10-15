@@ -3011,7 +3011,7 @@ Three `AuthRoutes` methods answer a permission question without writing a denial
 that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
 with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable) and
 `probe_fleet_read` (`require_fleet_read`'s decision and scope). Each runs the gate's own code
-under the thread-local `AuditProbeScope`, which makes `audit_log` a no-op, and withholds the
+under the thread-local `AuditProbeScope`, which makes `audit_log` a no-op (the `role.elevation.expired` lifecycle row, written through `audit_log_for_principal`, is still written), and withholds the
 denial row **only for an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
 `oidc` or `saml` and not an engine principal). A token or engine caller that reaches such a route
 keeps its row.

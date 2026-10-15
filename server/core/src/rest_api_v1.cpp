@@ -8274,8 +8274,11 @@ void RestApiV1::register_routes(
                  auto events = audit_store->query(q);
                  if (!events) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "audit store degraded"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "audit store degraded",
+                                          detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                              .remediation = "retry shortly"}),
+                         "application/json");
                      return;
                  }
                  JArr arr;
