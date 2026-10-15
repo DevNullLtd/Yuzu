@@ -4,6 +4,7 @@
 
 #include "settings_routes.hpp"
 
+#include "cert_upload_files.hpp"
 #include "ota_signature_sidecar.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
 
@@ -4358,9 +4359,9 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto cert_dir = auth::default_cert_dir();
+        auto cert_dir = cert_dir_override_.empty() ? auth::default_cert_dir() : cert_dir_override_;
         std::error_code ec;
-        std::filesystem::create_directories(cert_dir, ec);
+        cert_upload::create_cert_dir(cert_dir, ec);
         if (ec) {
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot create cert directory.</span>",
@@ -4383,15 +4384,12 @@ void SettingsRoutes::register_routes(
         }
 
         auto out_path = cert_dir / out_name;
-        {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.upload", "failure", "Certificate", type, "write failed");
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
 
         if (type == "cert")
@@ -4400,14 +4398,6 @@ void SettingsRoutes::register_routes(
             cfg_->tls_server_key = out_path;
         else if (type == "ca")
             cfg_->tls_ca_cert = out_path;
-
-#ifndef _WIN32
-        if (type == "key") {
-            std::filesystem::permissions(
-                out_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                std::filesystem::perm_options::replace);
-        }
-#endif
 
         spdlog::info("Certificate uploaded: {} -> {}", type, out_path.string());
         audit_fn_(req, "cert.upload", "success", "Certificate", type, "");
@@ -4472,9 +4462,9 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto cert_dir = auth::default_cert_dir();
+        auto cert_dir = cert_dir_override_.empty() ? auth::default_cert_dir() : cert_dir_override_;
         std::error_code ec;
-        std::filesystem::create_directories(cert_dir, ec);
+        cert_upload::create_cert_dir(cert_dir, ec);
         if (ec) {
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot create cert directory.</span>",
@@ -4483,24 +4473,13 @@ void SettingsRoutes::register_routes(
         }
 
         auto out_path = cert_dir / out_name;
-        {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.paste", "failure", "Certificate", type, "write failed");
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
-
-#ifndef _WIN32
-        if (type == "key") {
-            std::filesystem::permissions(
-                out_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                std::filesystem::perm_options::replace);
-        }
-#endif
 
         if (type == "cert")
             cfg_->tls_server_cert = out_path;
