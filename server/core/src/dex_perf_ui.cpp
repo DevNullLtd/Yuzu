@@ -92,8 +92,8 @@ std::string delta_pill(const std::optional<DexPerfStat>& cohort,
     if (!cohort || !fleet || fleet->p50 < 1e-9)
         return {};
     const double pct = (cohort->p50 - fleet->p50) / fleet->p50 * 100.0;
-    const char* color = pct > 5.0 ? "var(--red)" : pct < -5.0 ? "var(--green)" : "var(--muted)";
-    return " <span style=\"font-size:.85em;color:" + std::string(color) + ";\">" +
+    const char* tone = pct > 5.0 ? "gp-err" : pct < -5.0 ? "gp-ok" : "gp-mute";
+    return " <span class=\"" + std::string(tone) + "\">" +
            std::format("{}{:.0f}%", pct > 0 ? "+" : "", pct) + "</span>";
 }
 
@@ -174,7 +174,7 @@ std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
         {"Memory commit", &ctx.commit, false},
         {"Disk I/O latency", &ctx.disk_lat, true},
     };
-    h += "<div style=\"border:1px solid var(--border);border-radius:.55rem;padding:.6rem 1rem\">";
+    h += "<div class=\"dx-strips\">";
     for (const auto& s : strips) {
         if (!s.m->value || !s.m->fleet)
             continue; // device or fleet lacks this metric — skip the row, no fake bar
@@ -189,20 +189,13 @@ std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
                          std::to_string(s.m->fleet_pctile) + "th</b> pctile";
         if (s.m->cohort_pctile >= 0)
             pv += " &middot; cohort <b>" + std::to_string(s.m->cohort_pctile) + "th</b>";
-        h += "<div style=\"display:grid;grid-template-columns:9rem 1fr 17rem;gap:.8rem;"
-             "align-items:center;margin:.45rem 0;font-size:.85rem\">"
-             "<span>" + std::string(s.label) + "</span>"
-             "<span style=\"position:relative;display:block;height:12px;border-radius:4px;"
-             "background:var(--surface2,#243553)\">"
-             "<span style=\"position:absolute;top:0;bottom:0;left:" +
+        h += "<div class=\"dx-strip\"><span>" + std::string(s.label) + "</span>"
+             "<span class=\"dx-track\"><span class=\"band\" style=\"left:" +
              std::format("{:.1f}", x(f.p50)) + "%;width:" +
              std::format("{:.1f}", (std::max)(0.5, x(f.p90) - x(f.p50))) +
-             "%;background:rgba(0,188,235,.22);border-left:1px solid rgba(0,188,235,.5);"
-             "border-right:1px solid rgba(0,188,235,.5)\"></span>"
-             "<span style=\"position:absolute;top:-2px;bottom:-2px;width:3px;border-radius:2px;"
-             "left:" + std::format("{:.1f}", x(*s.m->value)) + "%;background:" +
-             (hot ? "var(--red,#ff5765)" : "var(--yellow,#ffcc00)") + "\"></span></span>"
-             "<span class=\"gp-mute\" style=\"text-align:right\">" + pv + "</span></div>";
+             "%\"></span><span class=\"mark" + (hot ? " hot" : "") + "\" style=\"left:" +
+             std::format("{:.1f}", x(*s.m->value)) + "%\"></span></span>"
+             "<span class=\"pv\">" + pv + "</span></div>";
     }
     h += "</div>";
 
@@ -222,7 +215,7 @@ std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
         h += "<div class=\"gp-note\">band = fleet p50&ndash;p90 &middot; marker = this device "
              "(red when above fleet p90). Cohort comparison withheld &mdash; " +
              (ctx.cohort_n < kDexCohortFloor
-                  ? "this device's cohort has only " + std::to_string(ctx.cohort_n) +
+                  ? "this device's cohort has " + std::to_string(ctx.cohort_n) +
                         " reporting devices (floor " + std::to_string(kDexCohortFloor) + ")"
                   : std::string("no cohort resolved")) +
              ".</div>";
@@ -301,9 +294,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
     // Key picker — htmx submits the select's own name=value on change.
     h += "<div class=\"gp-note\">cohort by tag key: <select name=\"key\" "
          "hx-get=\"/fragments/dex/perf?window=" + w + "\" hx-target=\"#guardian-detail\" "
-         "hx-swap=\"innerHTML\" hx-trigger=\"change\" "
-         "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-         "border-radius:.35rem;padding:.15rem .4rem;\">";
+         "hx-swap=\"innerHTML\" hx-trigger=\"change\" class=\"dx-ctl\">";
     bool key_listed = false;
     for (const auto& k : snap.available_keys) {
         const bool on = (k == snap.cohort_key);
@@ -333,7 +324,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
         h += "<tr><td>" + drill("/fragments/dex/perf/devices?" + qs, label) + "</td><td>" +
              std::to_string(c.devices) + "</td>";
         if (c.suppressed) {
-            h += "<td colspan=\"3\" class=\"gp-mute\">&mdash; (n too small: fewer than " +
+            h += "<td colspan=\"3\" class=\"gp-mute\">&mdash; (n too small: below the floor of " +
                  std::to_string(kDexCohortFloor) + " reporting devices)</td>";
         } else {
             h += "<td>" + cohort_cell(c.cpu, false, now.cpu) + "</td><td>" +
@@ -344,9 +335,9 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
     }
     h += "</tbody></table>";
     h += "<div class=\"gp-note\">Percentiles compare within the chosen key&rsquo;s cohorts; the "
-         "&Delta; against the fleet p50 marks cohorts running hot. Cohorts under " +
+         "&Delta; against the fleet p50 marks cohorts running hot. Cohorts below the floor of " +
          std::to_string(kDexCohortFloor) +
-         " reporting devices withhold percentiles (statistical floor); devices without the key "
+         " reporting devices withhold percentiles; devices without the key "
          "always appear as the explicit (untagged) residual.</div>";
 
     // ── Compare two cohorts (F2c, BRD 99/103) ── the head-to-head A-vs-B diff,
@@ -366,8 +357,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
             std::string s = "<select name=\"" + std::string(nm) + "\" hx-get=\"" + base +
                             "\" hx-trigger=\"change\" hx-include=\"#dex-cohort-pick\" "
                             "hx-target=\"#dex-cohort-diff\" hx-swap=\"innerHTML\" "
-                            "style=\"background:var(--surface);color:var(--fg);border:1px solid "
-                            "var(--border);border-radius:.35rem;padding:.15rem .4rem;\">";
+                            "class=\"dx-ctl\">";
             for (const auto& c : cohorts) {
                 const std::string lbl = c.cohort.empty() ? "(untagged)" : esc(c.cohort);
                 s += "<option value=\"" + esc(c.cohort) + "\"" +
@@ -405,8 +395,8 @@ std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
     auto delta = [](const std::optional<double>& dv) {
         if (!dv)
             return std::string("&mdash;");
-        const char* color = *dv > 5.0 ? "var(--red)" : *dv < -5.0 ? "var(--green)" : "var(--muted)";
-        return "<span style=\"color:" + std::string(color) + ";\">" +
+        const char* tone = *dv > 5.0 ? "gp-err" : *dv < -5.0 ? "gp-ok" : "gp-mute";
+        return "<span class=\"" + std::string(tone) + "\">" +
                std::format("{}{:.0f}%", *dv > 0 ? "+" : "", *dv) + "</span>";
     };
     auto row = [&](const char* name, const std::optional<DexPerfStat>& sa,
@@ -430,8 +420,8 @@ std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
     h += "<div class=\"gp-note\">A = <b>" + label(cohort_a) + "</b> (" + pop(d.found_a, d.a) +
          "), B = <b>" + label(cohort_b) + "</b> (" + pop(d.found_b, d.b) +
          "). &Delta; is A&rsquo;s p50 relative to B&rsquo;s (B the baseline); a positive value "
-         "means A runs hotter. A metric is compared only where both cohorts clear the " +
-         std::to_string(kDexCohortFloor) + "-device floor.</div>";
+         "means A runs hotter. A metric is compared only where both cohorts clear the floor of " +
+         std::to_string(kDexCohortFloor) + " reporting devices.</div>";
     return h;
 }
 

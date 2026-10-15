@@ -1063,10 +1063,12 @@ TEST_CASE("REAL AgentHealthStore: guardian journal tags sum into unlabelled flee
     beat("j1", {{"yuzu.guardian_journal_stage_dropped", "1"},
                 {"yuzu.guardian_journal_batches_written", "10"},
                 {"yuzu.guardian_journal_evicted_no_send_evidence", "2"},
-                {"yuzu.guardian_journal_bytes", "4096"}});
+                {"yuzu.guardian_journal_bytes", "4096"},
+                {"yuzu.guardian_send_order_hold_releases", "2"}});
     beat("j2", {{"yuzu.guardian_journal_stage_dropped", "4"},
                 {"yuzu.guardian_journal_batches_written", "20"},
-                {"yuzu.guardian_journal_bytes", "8192"}});
+                {"yuzu.guardian_journal_bytes", "8192"},
+                {"yuzu.guardian_send_order_hold_releases", "3"}});
     // ...and one whose journal is quiescent or inert (prefer_spark off): the writer is
     // sparse, so it ships NO journal tag. It must contribute nothing - not a 0 that
     // drags a family into existence.
@@ -1079,6 +1081,8 @@ TEST_CASE("REAL AgentHealthStore: guardian journal tags sum into unlabelled flee
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_stage_dropped") == 5.0);
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_batches_written") == 30.0);
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_bytes") == 12288.0);
+    // #3972: the order-hold release counter is a table row like the rest (no _journal_ infix).
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_send_order_hold_releases") == 5.0);
     // Only one agent reported the integrity-gap counter - it still publishes, at ITS value.
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_evicted_no_send_evidence") == 2.0);
 

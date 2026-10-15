@@ -1,0 +1,1 @@
+- **`POST /api/export/json-to-csv` no longer crashes on deeply nested input and keeps numbers intact.** A body nested deeper than 32 levels is refused with 400 before parsing. Non-string cells (numbers, booleans, nested objects) are RFC 4180 quoted without formula neutralisation, so `-5` stays `-5` and a nested object with commas stays in one cell.

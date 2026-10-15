@@ -312,6 +312,30 @@ TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave
     CHECK(description.find("all-time") == std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the retry semantics",
+          "[openapi][rbac]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& paths = spec["paths"];
+
+    auto response_keys = [](const json& op) {
+        std::set<std::string> keys;
+        for (auto it = op["responses"].begin(); it != op["responses"].end(); ++it)
+            keys.insert(it.key());
+        return keys;
+    };
+
+    REQUIRE(paths.contains("/rbac/roles"));
+    const auto& roles = paths["/rbac/roles"]["get"];
+    CHECK(response_keys(roles) == std::set<std::string>{"200", "403", "503"});
+    CHECK(roles.value("description", "").find("retry_after_ms") != std::string::npos);
+
+    REQUIRE(paths.contains("/rbac/roles/{role}/permissions"));
+    const auto& perms = paths["/rbac/roles/{role}/permissions"]["get"];
+    CHECK(response_keys(perms) == std::set<std::string>{"200", "403", "404", "503"});
+    CHECK(perms.value("description", "").find("retry_after_ms") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query parameter and "
           "response shape (#5294)",
           "[openapi][plugin_config][5294]") {
@@ -338,6 +362,26 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
         const std::string ok = op["responses"]["200"].value("description", "");
         CHECK(ok.find("os") != std::string::npos);
         CHECK(ok.find("source") != std::string::npos);
+
+        // The protective-set caveat is part of the published contract.
+        const std::string desc = op.value("description", "");
+        CHECK(desc.find("__guard__.push_rules") != std::string::npos);
+        CHECK(desc.find("unquarantine") != std::string::npos);
+        CHECK(desc.find(std::string(method) == "get" ? "dispatch still proceeds"
+                                                      : "no dispatch effect") !=
+              std::string::npos);
+
+        // ...and so are the parameter-level caveats: GET's `os` description and PUT's
+        // `enabled` property.
+        if (std::string(method) == "get") {
+            const std::string os_desc = (*os_param).value("description", "");
+            CHECK(os_desc.find("never gates dispatch") != std::string::npos);
+        } else {
+            const auto& enabled =
+                op["requestBody"]["content"]["application/json"]["schema"]["properties"]["enabled"];
+            const std::string enabled_desc = enabled.value("description", "");
+            CHECK(enabled_desc.find("no dispatch effect") != std::string::npos);
+        }
     }
 }
 

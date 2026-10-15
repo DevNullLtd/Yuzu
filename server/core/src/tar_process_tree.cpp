@@ -1249,7 +1249,7 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     };
 
     std::string h = "<div class=\"cat-filter\" id=\"capFilter\"><span class=\"filter-label\">"
-                    "Category</span><a class=\"tar-chip on\" onclick=\"filterCap(this,'all')\">All</a>";
+                    "Category</span><span class=\"tar-seg\"><a class=\"tar-chip on\" onclick=\"filterCap(this,'all')\">All</a>";
     static const std::array<std::pair<const char*, const char*>, 5> kChips = {
         {{"Processes", "Processes"},
          {"Network connections", "Network"},
@@ -1259,7 +1259,7 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     for (const auto& [cat, label] : kChips)
         h += std::string("<a class=\"tar-chip\" onclick=\"filterCap(this,'") + cat + "')\">" + label +
              "</a>";
-    h += "</div>";
+    h += "</span></div>";
 
     h += "<table id=\"capTable\" data-device=\"" + html_escape(device) +
          "\"><thead><tr><th>Source</th><th>Category</th><th>Table</th><th>State</th>"
@@ -1304,7 +1304,7 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     h += "</tbody></table>";
     if (rendered == 0)
         return "<div class=\"devnet-empty\">No capture sources reported by this device.</div>";
-    h += "<div class=\"apply-bar\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"
+    h += "<div class=\"apply-bar note warn\" id=\"capApplyBar\" hidden><span class=\"apply-icon\">&#9888;</span>"
          "<span id=\"capApplyMsg\">0 pending changes</span><span class=\"apply-spacer\"></span>"
          "<button class=\"btn-secondary\" onclick=\"discardCapChanges()\">Discard</button>"
          "<button class=\"apply-push\" onclick=\"pushCapChanges()\">Push changes &#8594;</button></div>";

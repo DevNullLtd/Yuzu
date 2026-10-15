@@ -5,7 +5,7 @@
  *    latency, nullopt on inf/nan/negative/garbage) + the nearest-rank pin
  *    (n=2 → p90 = MAX, the A4 grill fix — shared with recompute_metrics).
  *  - fleet_now: absent-not-zero (no reporters → nullopt stats, never 0).
- *  - cohorts: n≥10 floor suppression, "(untagged)" residual sorts last,
+ *  - cohorts: empty-cohort suppression at the one-device floor, "(untagged)" residual sorts last,
  *    population-descending order.
  *  - device_list: worst-first sort, not-reporting complement (Windows only),
  *    cohort filter incl. the untagged residual, limit cap.
@@ -205,9 +205,10 @@ TEST_CASE("fleet_now: partial reporters count once, per-metric n varies",
 
 // ── cohorts ──────────────────────────────────────────────────────────────────
 
-TEST_CASE("cohorts: floor suppression + untagged residual last + population sort",
+TEST_CASE("cohorts: one-device floor publishes a small cohort + untagged residual last + "
+          "population sort",
           "[dex][perf][model][cohorts]") {
-    auto snap = two_cohorts(12, 4); // "a" above floor, "b" below
+    auto snap = two_cohorts(12, 4); // "b" (4 devices) was below the old floor of 10
     snap.devices.push_back(dev("u-1", 5.0, 40.0, 0.5, ""));
     snap.devices.push_back(dev("u-2", 6.0, 41.0, 0.6, ""));
     snap.devices.push_back(dev("idle", std::nullopt, std::nullopt, std::nullopt, "a"));
@@ -222,10 +223,12 @@ TEST_CASE("cohorts: floor suppression + untagged residual last + population sort
     CHECK(rows[0].cpu->n == 12);
     CHECK(rows[1].cohort == "b");
     CHECK(rows[1].devices == 4);
-    CHECK(rows[1].suppressed); // below kDexCohortFloor — population shown, stats withheld
-    CHECK_FALSE(rows[1].cpu);
+    CHECK_FALSE(rows[1].suppressed); // 4 >= kDexCohortFloor (1): published, stats present
+    REQUIRE(rows[1].cpu);
+    CHECK(rows[1].cpu->n == 4);
     CHECK(rows[2].cohort == ""); // the residual
     CHECK(rows[2].devices == 2);
+    CHECK_FALSE(rows[2].suppressed); // 2 devices: published too
 }
 
 // ── device_list ──────────────────────────────────────────────────────────────
@@ -293,16 +296,34 @@ TEST_CASE("metric token round-trip + unknown falls back to cpu", "[dex][perf][mo
 
 // ── renderers ────────────────────────────────────────────────────────────────
 
-TEST_CASE("perf fragment: real aggregations, suppression text, Performance tab",
+TEST_CASE("perf fragment: real aggregations, no suppression at the one-device floor, "
+          "Performance tab",
           "[dex][perf][render]") {
     auto snap = two_cohorts(12, 4);
     auto html = render_dex_perf_fragment(snap, 7);
     CHECK(html.find("Fleet performance") != std::string::npos);
     CHECK(html.find("Performance") != std::string::npos); // the 5th subnav tab
-    CHECK(html.find("n too small") != std::string::npos); // cohort "b" suppressed
+    CHECK(html.find("n too small") == std::string::npos); // cohort "b" (4) is published
+    CHECK(html.find("below the floor of 1 reporting devices") != std::string::npos);
     CHECK(html.find("Windows and Linux") != std::string::npos); // coverage honesty (C1)
     CHECK(html.find("of 16 perf-capable online") != std::string::npos);
     CHECK(html.find("/fragments/dex/perf/devices?metric=cpu") != std::string::npos); // drill
+}
+
+namespace {
+// Exactly one <style> block, and it carries the DEX sheet (a known .dx- rule).
+bool one_dx_style(const std::string& h) {
+    const auto open = h.find("<style>");
+    if (open == std::string::npos || h.find("<style>", open + 1) != std::string::npos)
+        return false;
+    const auto close = h.find("</style>", open);
+    const auto rule = h.find(".dx-ctl{", open);
+    return close != std::string::npos && rule != std::string::npos && rule < close;
+}
+} // namespace
+
+TEST_CASE("perf fragment: carries exactly one DEX style block", "[dex][perf][render]") {
+    CHECK(one_dx_style(render_dex_perf_fragment(two_cohorts(12, 4), 7)));
 }
 
 TEST_CASE("perf fragment: App Performance is a top-level tab, and the buried "
@@ -461,25 +482,41 @@ TEST_CASE("device_context: pctiles, cohort floor, honest absence", "[dex][perf][
         REQUIRE(ctx.cpu.cohort);
         CHECK(ctx.cpu.cohort->n == 12);
     }
-    SECTION("sub-floor cohort withholds the cohort comparison — floor applies everywhere") {
+    SECTION("four-device cohort gets the cohort comparison — the floor is one device") {
         auto ctx = dex_perf_device_context(snap, "b-0");
         CHECK(ctx.cohort == "b");
         CHECK(ctx.cohort_n == 4);
         CHECK(ctx.cpu.fleet_pctile > 0);
-        CHECK(ctx.cpu.cohort_pctile == -1);
-        CHECK_FALSE(ctx.cpu.cohort);
+        CHECK(ctx.cpu.cohort_pctile == 25); // 1 of 4 values <= 40 (withheld at the old floor of 10)
+        REQUIRE(ctx.cpu.cohort);
+        CHECK(ctx.cpu.cohort->n == 4);
     }
     SECTION("offline device: found=false") {
         auto ctx = dex_perf_device_context(snap, "nope");
         CHECK_FALSE(ctx.found);
     }
-    SECTION("floor boundary: n=9 withholds, n=10 grants (the off-by-one pin)") {
+    SECTION("floor boundary: n=0 withholds, n=1 and n=9 grant (the off-by-one pin)") {
+        auto zero = two_cohorts(0, 0); // the device itself does not report: cohort_n 0
+        zero.devices.push_back(dev("idle", std::nullopt, std::nullopt, std::nullopt, "a"));
+        auto c0 = dex_perf_device_context(zero, "idle");
+        CHECK(c0.found);
+        CHECK(c0.cohort_n == 0);
+        CHECK(c0.cpu.cohort_pctile == -1);
+        CHECK_FALSE(c0.cpu.cohort);
+
+        auto one = two_cohorts(1, 0);
+        auto c1 = dex_perf_device_context(one, "a-0");
+        CHECK(c1.cohort_n == 1);
+        CHECK(c1.cpu.cohort_pctile == 100);
+        REQUIRE(c1.cpu.cohort);
+        CHECK_FALSE(dex_perf_cohorts(one)[0].suppressed);
+
         auto nine = two_cohorts(9, 0);
         auto c9 = dex_perf_device_context(nine, "a-0");
         CHECK(c9.cohort_n == 9);
-        CHECK(c9.cpu.cohort_pctile == -1);
-        CHECK_FALSE(c9.cpu.cohort);
-        CHECK(dex_perf_cohorts(nine)[0].suppressed);
+        CHECK(c9.cpu.cohort_pctile >= 0);
+        REQUIRE(c9.cpu.cohort);
+        CHECK_FALSE(dex_perf_cohorts(nine)[0].suppressed); // suppressed at the old floor of 10
 
         auto ten = two_cohorts(10, 0);
         auto c10 = dex_perf_device_context(ten, "a-0");
@@ -487,6 +524,15 @@ TEST_CASE("device_context: pctiles, cohort floor, honest absence", "[dex][perf][
         CHECK(c10.cpu.cohort_pctile >= 0);
         REQUIRE(c10.cpu.cohort);
         CHECK_FALSE(dex_perf_cohorts(ten)[0].suppressed);
+    }
+    SECTION("no cohort comparison: only a cohort under the floor is called out") {
+        DexPerfDeviceContext ctx;
+        ctx.found = true;
+        ctx.reporting = true;
+        ctx.cohort_n = 3; // cleared the one-device floor but nothing resolved to compare
+        CHECK(render_dex_device_perf_context(ctx, "model", "7d").find("(floor") == std::string::npos);
+        ctx.cohort_n = 0;
+        CHECK(render_dex_device_perf_context(ctx, "model", "7d").find("(floor 1)") != std::string::npos);
     }
     SECTION("online but not reporting: found, not reporting, no pctiles") {
         snap.devices.push_back(dev("quiet", std::nullopt, std::nullopt, std::nullopt, "a"));
@@ -523,7 +569,7 @@ TEST_CASE("device context strips render: honest notes + cohort drill + escape",
         CHECK(html.find("Memory commit") == std::string::npos);   // no value → no bar
         CHECK(html.find("Disk I/O latency") == std::string::npos);
     }
-    SECTION("sub-floor cohort: comparison withheld with the floor named") {
+    SECTION("one-device cohort: comparison shown (the floor is one device), label escaped") {
         // NB: not named `small` — windows headers #define small to char.
         auto tiny = two_cohorts(0, 4);
         tiny.devices.push_back(
@@ -532,7 +578,8 @@ TEST_CASE("device context strips render: honest notes + cohort drill + escape",
             tiny.devices.push_back(dev("f-" + std::to_string(i), 10.0, 40.0, 1.0, "other"));
         auto html = render_dex_device_perf_context(dex_perf_device_context(tiny, "solo"),
                                                    "model", "7d");
-        CHECK(html.find("Cohort comparison withheld") != std::string::npos);
+        CHECK(html.find("Cohort comparison withheld") == std::string::npos); // withheld at 10
+        CHECK(html.find("1 reporting devices") != std::string::npos);
         CHECK(html.find("<i>x</i>") == std::string::npos); // never unescaped
     }
 }
@@ -656,11 +703,12 @@ TEST_CASE("procperf render: app drill links + escape + the soft empty state",
 
 // ── PR3: per-cohort Prometheus export ────────────────────────────────────────
 
-TEST_CASE("cohort gauge export: floor, untagged label, clipped visibility, absent on disable",
+TEST_CASE("cohort gauge export: one-device floor, untagged label, clipped visibility, absent "
+          "on disable",
           "[dex][perf][export]") {
     yuzu::MetricsRegistry metrics;
-    auto snap = two_cohorts(12, 4); // "a" exports, "b" is sub-floor
-    for (int i = 0; i < 11; ++i)    // 11 untagged → above floor, exports as "(untagged)"
+    auto snap = two_cohorts(12, 4); // both export: "b" (4) was sub-floor at the old 10
+    for (int i = 0; i < 11; ++i)    // 11 untagged → exports as "(untagged)"
         snap.devices.push_back(dev("u-" + std::to_string(i), 5.0, 40.0, 0.5, ""));
 
     dex_perf_export_cohort_gauges(metrics, dex_perf_cohorts(snap));
@@ -669,7 +717,7 @@ TEST_CASE("cohort gauge export: floor, untagged label, clipped visibility, absen
           std::string::npos);
     CHECK(text.find("yuzu_fleet_perf_cohort_reporting{cohort=\"a\"} 12") != std::string::npos);
     CHECK(text.find("cohort=\"(untagged)\"") != std::string::npos);
-    CHECK(text.find("cohort=\"b\"") == std::string::npos); // sub-floor — withheld
+    CHECK(text.find("yuzu_fleet_perf_cohort_reporting{cohort=\"b\"} 4") != std::string::npos);
     CHECK(text.find("yuzu_fleet_perf_cohort_clipped 0") != std::string::npos); // measured zero
 
     SECTION("clear → every cohort series goes absent (never stale)") {
@@ -878,8 +926,9 @@ TEST_CASE("REST /dex/perf/cohorts: floor + suppression + untagged in the JSON",
     CHECK(cohorts[0]["suppressed"] == false);
     CHECK(cohorts[0]["cpu_pct"]["n"] == 12);
     CHECK(cohorts[1]["cohort"] == "b");
-    CHECK(cohorts[1]["suppressed"] == true); // population visible, stats withheld
-    CHECK_FALSE(cohorts[1].contains("cpu_pct"));
+    CHECK(cohorts[1]["suppressed"] == false); // 4 devices: published (withheld at the old 10)
+    REQUIRE(cohorts[1].contains("cpu_pct"));
+    CHECK(cohorts[1]["cpu_pct"]["n"] == 4);
     CHECK(cohorts[2]["cohort"] == ""); // the untagged residual, last
     CHECK(cohorts[2]["devices"] == 10);
 
@@ -1238,18 +1287,18 @@ TEST_CASE("cohort_diff: a missing cohort yields not-found and no deltas",
     CHECK_FALSE(d.disk_lat_delta_pct.has_value());
 }
 
-TEST_CASE("cohort_diff: a sub-floor cohort shows population but withholds deltas",
+TEST_CASE("cohort_diff: a three-device cohort is published and compared at the one-device floor",
           "[dex][perf][cohort_diff]") {
-    auto d = dex_perf_cohort_diff(diff_snap(12, 3), "a", "b"); // "b" below kDexCohortFloor
+    auto d = dex_perf_cohort_diff(diff_snap(12, 3), "a", "b"); // "b" was below the old floor of 10
     REQUIRE(d.found_a);
     REQUIRE(d.found_b);
     CHECK_FALSE(d.a.suppressed);
-    CHECK(d.b.suppressed);
-    CHECK(d.b.devices == 3); // population still reported
-    // b is suppressed (no stats) → no metric can diff.
-    CHECK_FALSE(d.cpu_delta_pct.has_value());
-    CHECK_FALSE(d.commit_delta_pct.has_value());
-    CHECK_FALSE(d.disk_lat_delta_pct.has_value());
+    CHECK_FALSE(d.b.suppressed);
+    CHECK(d.b.devices == 3);
+    // b carries stats → every metric can diff.
+    CHECK(d.cpu_delta_pct.has_value());
+    CHECK(d.commit_delta_pct.has_value());
+    CHECK(d.disk_lat_delta_pct.has_value());
 }
 
 TEST_CASE("cohort_diff: A==B is degenerate but safe (zero deltas)", "[dex][perf][cohort_diff]") {
@@ -1276,11 +1325,11 @@ TEST_CASE("cohort_diff render: comparison table + populated delta", "[dex][perf]
     CHECK(html.find("12 reporting") != std::string::npos); // population in the note
 }
 
-TEST_CASE("cohort_diff render: suppressed cohort shows 'n too small', delta withheld",
+TEST_CASE("cohort_diff render: a three-device cohort renders its p50, never 'n too small'",
           "[dex][perf][cohort_diff][render]") {
     auto html = render_dex_perf_cohort_diff_fragment(diff_snap(12, 3), "a", "b", 7);
-    CHECK(html.find("n too small") != std::string::npos); // B below the floor
-    CHECK(html.find("&mdash;") != std::string::npos);     // delta dash (no comparison)
+    CHECK(html.find("n too small") == std::string::npos); // B (3) clears the one-device floor
+    CHECK(html.find("3 reporting") != std::string::npos);  // population in the note
 }
 
 TEST_CASE("Performance tab carries the CSP-safe 'Compare two cohorts' pickers",

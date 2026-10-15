@@ -468,7 +468,7 @@ The old three-tab **Inventory** dashboard is gone. `/inventory` itself still exi
 route, but it now just **302-redirects to `/hardware`** (auth still gates first, so an
 unauthenticated visitor lands on `/login`, never in a redirect loop through an
 authed-only destination) — old bookmarks and links keep working, nothing to change on
-your end beyond expecting a redirect. The top nav carries two separate links in its
+your end beyond expecting a redirect. The sidebar's **Estate** group carries two separate links in its
 place, **Hardware** and **Software**, each its own page:
 
 - **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
@@ -485,7 +485,12 @@ place, **Hardware** and **Software**, each its own page:
   device in one action — under the hood it loops the existing single-device tag routes,
   so each device still runs its own `Tag:Write` gate and its own `tag.set`/`tag.delete`
   audit row; nothing is bulk-authorized. The KPI strip (Total CIs / Online / Offline /
-  Stale / CI coverage) is computed over the same rows the table shows. **The list is
+  Stale / CI coverage) is computed over the same rows the table shows. Two readouts sit
+  beside it: **Median memory** (over the devices that have synced a positive RAM figure,
+  with that device count in the label) and a **By manufacturer** line (case-folded, the
+  top eight and an "Other" tail). Both are computed from the devices you can see before
+  any search or filter narrows the table, and both are hidden when no device has synced
+  the figure or the CI columns are degraded. **The list is
   gated on the global `Inventory:Read`, but — unlike the old Devices tab, whose
   management-group confinement this doc used to flag as "designed for, not yet verified
   effective" — it is wired as a live caller of the real ADR-0017 admit-then-filter
@@ -515,8 +520,30 @@ place, **Hardware** and **Software**, each its own page:
     `inventory.device.software`), now with its own filter box and, for the first time,
     rendered **Signature** and **Ecosystem** columns. Carries the same **Sync now**
     affordance, scoped to the `installed_software` source.
-  - **Tags** — inline add/remove via the existing tag routes, shown only when a
-    `Tag:Write` probe passes for the device.
+  - **Tags and properties** — inline add/remove via the existing tag routes. Add is
+    shown when a `Tag:Write` probe passes for the device; Remove needs its own
+    `Tag:Delete` probe (a different permission), taken only when this lens is open. The
+    lens also hosts **Custom properties** (the device's `props.<key>` values, read from
+    `GET /api/agents/{id}/properties`, gated on scoped `Infrastructure:Read`; edit
+    controls need `Infrastructure:Write`) and **Property schemas** (fleet-wide, read from
+    `GET /api/property-schemas`, so a management-group-confined operator sees a note
+    naming the missing fleet-wide `Infrastructure:Read` grant instead). Both load in one
+    fragment, `GET /fragments/hardware/ci/properties?id=`; a degraded store reads
+    "could not be read", never "No properties set." Property values are written to the
+    audit log (`custom_property.set`) and take part in scope expressions.
+    Add tag, Remove tag, Add or edit property, Delete property and Save schema open a
+    dialog (`static/yuzu-device-data.js` on the shared dialog module); removing or setting
+    the `service` tag says that it decides which service-scoped API tokens can reach the
+    device. The **environment** tag accepts only `Dev`, `UAT` or `Production`, exact case.
+  - **Installed software** also shows "N applications, last synced <time>" (a device that
+    never synced and a degraded read are worded differently), and two **click-to-load**
+    panels: **Application usage** (hours and runs over the last 30 days, first and last
+    seen, the first 200 executables by hours; scoped `Forensics:Read`, audit verb
+    `app_usage.agent.view`) and **Detected licences** (scoped `SoftwareLicensing:Read`,
+    audit verb `sle.agent.view`; no per-user column). Both write the audit row before
+    reading and, when it cannot persist, show "withheld" with `Sec-Audit-Failed: true`
+    and no data. They are the HTML twins of `GET /api/v1/forensics/agents/{id}/app-usage`
+    and `GET /api/v1/sle/agents/{id}`.
   - **DEX**, **Guardian**, **Live** — not reimplemented: these mount the *same*
     `/fragments/device/*` fragments the (now-redirected) device page used, each gated on
     scoped `GuaranteedState:Read` as before. **Live** additionally carries the ten
@@ -540,42 +567,80 @@ place, **Hardware** and **Software**, each its own page:
     records that the *result view* was shown to the operator, not whether the
     underlying action itself succeeded) — see [Audit log](audit-log.md).
 
-- **`/software`** — the fleet software catalogue. A background thread still precomputes
-  the per-title/per-version counts hourly (the mechanics changed — see "Catalogue rollup
-  grain and KPIs" under the rollup metrics below), the KPI strip still shows Titles /
-  Devices reporting / Stale / an "updated N ago" (or "building") stamp for the catalogue,
-  and the counts are still **fleet-wide, not management-group scoped** — the same ADR-0017
-  gap the REST/MCP section above describes. Three things changed:
-  - The search box is now a **real server round-trip matching title, publisher, ecosystem or source**
-    (was client-side and title-only), using the same debounced/narrow-swap-target
-    pattern as the Hardware list's search box.
-  - Each row grows a **"devices ›"** control that expands inline — independent of the
-    row's own click-to-drill-into-**installs-per-version** action — to list every device
-    running that title: hostname (linking to its Hardware CI record), version,
-    publisher, install date, signature status, ecosystem, and architecture, with its own
-    client-side filter for a popular title with many installs. The expansion carries a
-    per-row management-group drop, a 1000-row cap and the `inventory.software.query`
-    audit verb, but that per-row filter does not narrow the result today: the page sits
-    behind the global `Inventory:Read` gate, so a group-confined operator is denied before
-    the filter runs and a global operator's filter is a no-op. The page says so in its
-    own scope caveat.
+- **`/software`** — installed software by application, version and device, rebuilt on the
+  catalogue model that the REST and MCP twins (`GET /api/v1/inventory/software/catalogue`,
+  `query_software_catalogue`) share, so the page, the API and the agent tools cannot
+  disagree.
+  - **Metrics strip.** Inventory coverage (devices reporting software, devices connected
+    now, devices not seen in 48 hours), Titles and publishers, Installs with a
+    Windows/macOS/Linux bar and the average per device, Stay current (installs on their
+    title's newest version seen in the fleet, a proxy and not a vendor feed), Version
+    sprawl (titles on three or more versions; click it to filter to just those) and
+    Unsigned packages (rpm only). Figures that cannot be computed show a dash, never a
+    guess. A link under the strip reveals five faded tiles for metrics that need data
+    Yuzu does not hold yet (end-of-support, unused, unauthorised, new titles,
+    normalisation). The strip is the fleet-wide hourly rollup and does not change with
+    the filters.
+  - **Inventory sources.** A panel under the results lists each collector that has
+    written inventory (Source, Devices, Last collected). It is the HTML twin of
+    `GET /api/v1/inventory/tables` and needs the fleet-wide `Inventory:Read` grant; a
+    caller without it sees a note, a degraded store says so, and an empty store says no
+    inventory has been collected yet.
+  - **Search and filters.** One search box matches title, publisher, ecosystem or the
+    source that found the software; chips narrow by kind, ecosystem and found-by; a host
+    type-ahead shows a single device's software. The type-ahead lists the first 1,000
+    named hosts by name and says so when the fleet has more; a name it does not list
+    cannot be selected, so open that device from Hardware instead. Two devices that share a
+    hostname resolve to the first one listed; open the other from Hardware. Active filters appear
+    as pills with a Clear all, the URL hash carries them (so a view can be bookmarked or shared), and the
+    exact REST call the view corresponds to is shown with a copy button. The filter box on an
+    expanded devices table filters only the rows already loaded; the catalogue search
+    and chips are server-side.
+  - **The table** lists titles most-installed first, 100 at a time with a keyset
+    **Load more**. **Installs** is the exact number of distinct devices carrying the
+    title under the active filters (a device carrying one title through two sources
+    counts once), and the count line gives the exact totals across every page. Click a
+    row for **installs per version** (share bars and a "newest in fleet" mark; the 200 most-installed versions, and the table says when a title may have more) inline, and
+    **devices** on a title or on one version for the hosts running it. The devices table
+    links each host to its Hardware record and shows OS, version, ecosystem and source,
+    install date and **Last synced** — the device's installed-software sync time, the same
+    value the Hardware record and `GET /api/v1/hardware/{id}` show. It pages 100 at a
+    time and gains a filter box once more than eight hosts are loaded; the filter applies
+    to the loaded rows only.
+  - **Exports** are plain download links to the REST routes: the matching install rows as
+    JSON or CSV (up to 10,000; the file says if it was cut off) and the titles as CSV.
+    The sprawl filter is not applied to install exports.
+  - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
+    a management group, so the fleet view, the strip and the version counts need an
+    unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
+    (audited as denied); the notice points to Hardware and carries a
+    **Clear all filters and reload** link. A scoped account can still use the host view
+    and the devices tables for devices in its scope, but only through a hand-typed
+    `/software#host=<agent_id>` address, which has no host-name type-ahead; there the "newest in fleet" mark is
+    blanked, no fleet
+    figures are read, and device counts omit "of M". A scope wider than 10,000 devices is
+    applied after the read in at most four bounded reads, so a devices page can come back short or
+    even empty while **Load more** is still offered; keep loading. Service-scoped API
+    tokens are denied outright.
+  - **Audit.** Every call that serves data (or is refused on scope) is audited, not only the first page: `inventory.software.catalog`
+    (title pages), `inventory.software.versions` and `inventory.software.query` (devices
+    tables). A continuation page is tagged `page=continuation`; a degraded read is
+    `failure`; a refused caller is `denied`, as is a devices page that drops devices through the
+    scope post-filter or names an `agent_id` outside the caller's scope. See [Audit log](audit-log.md).
+  - **Degraded or refused.** A store that cannot answer shows an unavailable banner with
+    a Retry button on the catalogue and a plain retry notice on the version and device tables, never an empty table. A malformed filter in the URL shows a notice
+    and reads nothing; use the **Clear all filters and reload** link, which drops the
+    stored filters. A Load-more token from a different filter set or from before the
+    latest hourly refresh shows a notice and reads nothing; reload the page to restart
+    from the first page.
+  - **Removed routes.** The standalone **Find software** tab and the old Devices-tab
+    fragments are gone: `/fragments/inventory/find`, `/fragments/inventory/find/results`,
+    `/fragments/inventory/devices` and `/fragments/inventory/device` return `404` for an
+    authenticated caller (an unauthenticated request is redirected to the login page
+    first, like any other dashboard path); `/inventory` itself still redirects (`302`) to
+    `/hardware`.
 
-  The expansion replaces the standalone **Find software** tab and the old Devices-tab
-  fragments. Their routes (`/fragments/inventory/find`, `/fragments/inventory/find/results`,
-  `/fragments/inventory/devices`, `/fragments/inventory/device`) were removed and now
-  return `404` for an authenticated caller (an unauthenticated request is redirected to
-  the login page first, like any other dashboard path); `/inventory` itself still
-  redirects (`302`) to `/hardware`.
-
-  - The catalogue store now serves exact numbers under filters: **Installs is the exact
-    number of distinct devices** carrying the title under any kind/ecosystem/source
-    filter combination the store is given (a device carrying one title through two sources
-    counts once), and **search selects titles** — a matched title keeps its whole filtered slice. `%` and `_` in a
-    search term are literal characters, the term is clamped to 128 bytes, and a search that
-    exceeds its 5 s execution bound reports the catalogue as unavailable rather than showing
-    an empty table. The store's version drill now accepts the catalogue filters and a host.
-
-**On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
+**On store degradation** the **`/software`** catalogue, its inline version and devices tables, and
 the CI record's **Installed software** lens — the *authoritative* reads — show an
 explicit **"unavailable"** banner rather than an empty table, because an empty table
 would read as "installed nowhere", the fail-open the authoritative-read contract
@@ -602,9 +667,17 @@ conflated.
 
 The Hardware list and its KPI strip serve at most the 100,000 most recently seen
 endpoints within the 30-day window; a fleet above that sees a capped list without a
-warning (a truncation signal is tracked in #5712). The per-device record's offline
+warning (a truncation signal is tracked in #5712). The cap counts distinct enrolled
+`agent_id`s seen in the window: a device that disconnects cleanly stays listed as
+Offline for the full 30 days (#5678), and a device re-enrolled under a new `agent_id`
+appears as two rows until the old one ages out. The per-device record's offline
 identity fallback reads the same capped set, so an offline device outside it shows no
 identity and, with nothing else synced, reads as not found.
+
+A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
+deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates
+it. A device that is never decommissioned stays listed as Offline for the 30-day window,
+and its stored record is deleted 37 days after its last contact.
 
 ## Access control
 

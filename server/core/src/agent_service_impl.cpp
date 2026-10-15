@@ -32,7 +32,8 @@
 #include "device_ci_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
-#include "offline_endpoint_store.hpp" // HA WS-5: remove_if_session on disconnect
+#include "offline_endpoint_store.hpp" // HA WS-5: presence session clear on disconnect
+#include "presence_departure.hpp"
 #include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "software_inventory_store.hpp"
@@ -1546,23 +1547,15 @@ grpc::Status AgentServiceImpl::Subscribe(
     // handler doesn't clobber a newer connection from the same agent_id.
     registry_.clear_stream_if_session(agent_id, session_id);
     const bool removed_current_session = registry_.remove_agent_if_session(agent_id, session_id);
-    // HA WS-5 (ADR-2002 §7a): mirror the departure into the durable presence
-    // row too, session-guarded — so a graceful disconnect on a single
-    // replica leaves scope-evaluation's outcome unchanged from pre-WS-5
-    // behavior (the row would otherwise linger, matched, until the presence
-    // TTL expires; see evaluate_scope's presence merge in agent_registry.cpp).
-    //
-    // Gated on removed_current_session (external review finding, 2026-09-22):
-    // the durable row's session_id is heartbeat-driven, not registration-
-    // driven (heartbeat_ingestion.cpp), so on an ordinary same-replica
-    // reconnect (this session S1 superseded locally by a new S2 that hasn't
-    // heartbeated yet) the row can still read S1's session_id — an
-    // unconditional delete here would remove a LIVE agent's presence row.
-    // A false (session mismatch — S1 already superseded) means this
-    // disconnect notice is stale and must NOT touch the durable row at all.
-    if (removed_current_session && heartbeat_ingestion_)
-        if (auto* offline = heartbeat_ingestion_->offline_endpoint_store())
-            offline->remove_if_session(agent_id, session_id);
+    // HA WS-5 (ADR-2002 §7a): mirror the departure into durable presence
+    // (session clear, row kept for the roster, #5678) via the helper both
+    // disconnect paths share — it carries the removed_current_session gate
+    // and its false-negative rationale (a stale disconnect must not touch a
+    // live agent's row).
+    mirror_departure_to_presence(
+        removed_current_session,
+        heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr, agent_id,
+        session_id);
     // PR 10 hardening — evict pushed-snapshot slot too (sec-M4 / UP-5).
     // Without this, deregistered agents render as ghost cubes
     // indefinitely from the cached last-known-good snapshot.

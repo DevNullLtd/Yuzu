@@ -37,6 +37,7 @@
 #include "authz_model.hpp"           // authz::VisibleSet
 #include "deployment_engine.hpp"     // deployment::PollFn / DispatchFn / EngineDeps
 #include "deployment_run_store.hpp"  // DeploymentRow / DeploymentDeviceRow
+#include "deployments_render.hpp"    // deployment_state / read-only list + detail renderers
 #include "device_routes.hpp"         // DeviceRow
 #include "dex_routes.hpp"            // DexRoutes::AuditFn
 
@@ -69,6 +70,52 @@ std::string render_deploy_config(const std::string& run_id, const std::string& r
 /// Rule 1).
 nlohmann::json deploy_preview_json(const std::string& run_id, const std::string& run_name,
                                    int go_count, int warn_count);
+
+// ── Read-only list/detail twins (REST v1 + MCP + fragments) ──────────────────
+
+/// List page size: default / ceiling for `GET /api/v1/deployments` and MCP
+/// `list_deployments` (mirrors `/api/v1/preflight/runs`: 1..100).
+inline constexpr int kDeploymentListDefault = 20;
+inline constexpr int kDeploymentListMax = 100;
+// Upper bound on an MCP get_deployment id (ids are 16 hex characters; the slack is deliberate).
+// Published in the tool schema and enforced in the handler.
+inline constexpr std::size_t kDeploymentIdMaxLen = 64;
+/// Detail device-grid page: default / ceiling for `GET /api/v1/deployments/{id}`
+/// and MCP `get_deployment`. The run row carries the exact totals regardless.
+inline constexpr int kDeploymentDeviceDefault = 500;
+inline constexpr int kDeploymentDeviceMax = 5000;
+
+/// PURE: one deployment as the shared JSON row. `artifact_url` and `exec_args` are
+/// NEVER included (either can carry a signed-URL token or a licence key); a
+/// `has_args` flag says whether installer arguments are set. REST, MCP and the
+/// fragment renderers all derive their state from `deployment_state()`, so the
+/// vocabulary cannot drift (api-twin-recipe.md Rule 1).
+nlohmann::json deployment_row_json(const DeploymentRow& d);
+
+/// PURE: one device row of a deployment (frozen identity + current step).
+nlohmann::json deployment_device_json(const DeploymentDeviceRow& d);
+
+/// PURE: the detail object, `deployment_row_json` plus `devices[]`, `device_limit`
+/// and `truncated` (the grid holds fewer rows than the run's exact `total`).
+nlohmann::json deployment_detail_json(const DeploymentRow& d,
+                                      const std::vector<DeploymentDeviceRow>& devices,
+                                      int device_limit);
+
+/// Outcome of the shared detail read. A store fault is NOT a miss: not-found and
+/// not-yours read identically (no existence oracle), a fault is a retryable error.
+struct DeploymentDetailRead {
+    enum class Outcome { kOk, kNotFound, kStoreFault } outcome = Outcome::kStoreFault;
+    DeploymentRow deployment;
+    std::vector<DeploymentDeviceRow> devices;
+    int device_limit = kDeploymentDeviceDefault;
+};
+
+/// The ONE detail reader REST, MCP and the fragment call. Owner-scoped to `viewer`
+/// at the store seam; reads the run row first so the device grid is only fetched
+/// for a deployment the caller owns. Never advances the engine, never audits.
+DeploymentDetailRead read_deployment_detail(DeploymentRunStore& store,
+                                            const std::string& deployment_id,
+                                            const std::string& viewer, int device_limit);
 
 /// The deployment progress, AGGREGATE-FIRST: a KPI strip (targeted / succeeded /
 /// executing / in-flight / failed / skipped) + a progress bar, then the device

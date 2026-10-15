@@ -17,6 +17,7 @@
 #include "settings_model.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 
 #include <yuzu/server/server.hpp>
 
@@ -399,6 +400,75 @@ TEST_CASE("build_data_retention_settings reflects Config verbatim", "[settings][
     CHECK(j.at("audit_retention_days").get<int>() == 365);
 }
 
+TEST_CASE("build_data_retention_settings carries Guardian events and the enforced block",
+          "[settings][settings_model][retention]") {
+    Config cfg;
+    cfg.response_retention_days = 400; // stored, not in force
+    cfg.audit_retention_days = 365;
+    cfg.guardian_event_retention_days = 30;
+
+    sm::RetentionEnforced e;
+    e.response_retention_days = 90;
+    e.audit_retention_days = 365;
+    // guardian left unset: store absent or not open
+
+    auto j = sm::build_data_retention_settings(cfg, e);
+
+    CHECK(j.at("response_retention_days").get<int>() == 400);
+    CHECK(j.at("guardian_event_retention_days").get<int>() == 30);
+    CHECK(j.at("enforced").at("response_retention_days").get<int>() == 90);
+    CHECK(j.at("enforced").at("audit_retention_days").get<int>() == 365);
+    CHECK(j.at("enforced").at("guardian_event_retention_days").is_null());
+
+    // Default argument: nothing verified -> every window null, never a number.
+    auto none = sm::build_data_retention_settings(cfg);
+    CHECK(none.at("enforced").at("audit_retention_days").is_null());
+}
+
+TEST_CASE("render_retention_table: days, no expiry, unknown, and stored-not-in-force",
+          "[settings][settings_model][retention]") {
+    Config cfg;
+    cfg.response_retention_days = 400;
+    cfg.audit_retention_days = 0;
+    cfg.guardian_event_retention_days = 1;
+
+    sm::RetentionEnforced e;
+    e.response_retention_days = 90; // differs from the stored 400
+    e.audit_retention_days = 0;     // never expires
+    // guardian unknown
+
+    const auto html = sm::render_retention_table(sm::build_data_retention_settings(cfg, e));
+
+    CHECK(html.find("Instruction responses") != std::string::npos);
+    CHECK(html.find("90 days") != std::string::npos);
+    CHECK(html.find("Stored value 400 days is not in force") != std::string::npos);
+    CHECK(html.find("Restarting does not apply it.") != std::string::npos);
+    CHECK(html.find("Set the startup option to 400 and restart, or set the stored value back to 90.") !=
+          std::string::npos);
+    CHECK(html.find("No expiry") != std::string::npos);
+    CHECK(html.find("Unknown") != std::string::npos);
+    // An unknown window is never printed as a number.
+    CHECK(html.find(">0 days") == std::string::npos);
+    CHECK(html.find("--guardian-event-retention-days") != std::string::npos);
+    CHECK(html.find("25,000 per cleanup pass") != std::string::npos);
+}
+
+TEST_CASE("render_retention_table: a matching stored value adds no warning and 1 is singular",
+          "[settings][settings_model][retention]") {
+    Config cfg;
+    cfg.response_retention_days = 1;
+    cfg.audit_retention_days = 365;
+    cfg.guardian_event_retention_days = 30;
+    sm::RetentionEnforced e{1, 365, 30};
+
+    const auto html = sm::render_retention_table(sm::build_data_retention_settings(cfg, e));
+
+    CHECK(html.find("1 day<") != std::string::npos);
+    CHECK(html.find("365 days") != std::string::npos);
+    CHECK(html.find("not in force") == std::string::npos);
+    CHECK(html.find("Unknown") == std::string::npos);
+}
+
 TEST_CASE("build_server_config_settings reflects Config verbatim", "[settings][settings_model]") {
     Config cfg;
     cfg.listen_address = "0.0.0.0:50051";
@@ -407,8 +477,10 @@ TEST_CASE("build_server_config_settings reflects Config verbatim", "[settings][s
     cfg.web_port = 8080;
     cfg.max_agents = 12345;
     cfg.rate_limit = 100;
+    cfg.session_timeout = std::chrono::seconds(45);
+    cfg.session_inactivity_secs = 900;
 
-    auto j = sm::build_server_config_settings(cfg);
+    auto j = sm::build_server_config_settings(cfg, 28800);
 
     CHECK(j.at("agent_grpc_address").get<std::string>() == "0.0.0.0:50051");
     CHECK(j.at("management_grpc_address").get<std::string>() == "0.0.0.0:50052");
@@ -416,6 +488,11 @@ TEST_CASE("build_server_config_settings reflects Config verbatim", "[settings][s
     CHECK(j.at("web_port").get<int>() == 8080);
     CHECK(j.at("max_agents").get<std::int64_t>() == 12345);
     CHECK(j.at("rate_limit_per_ip").get<int>() == 100);
+    // The agent heartbeat window keeps its frozen key; the sign-in limits are separate fields.
+    CHECK(j.at("session_timeout_seconds").get<std::int64_t>() == 45);
+    CHECK(j.at("session_inactivity_seconds").get<std::int64_t>() == 900);
+    // A caller input, not a Config field (the builder has no auth dependency).
+    CHECK(j.at("session_absolute_lifetime_seconds").get<std::int64_t>() == 28800);
 }
 
 // ── build_plugin_signing_settings ─────────────────────────────────────────

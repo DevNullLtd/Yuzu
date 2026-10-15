@@ -113,9 +113,9 @@ identity different from the row it ends up stored under.
 ### Fail-closed kill-switch evaluation
 
 `PluginConfigStore::action_allowed(plugin, action)` is **the** chokepoint every dispatch-gating
-caller must use — never `get_kill_switch` (the display/inspection accessor the REST GET route
-uses) for a go/no-go decision. Resolution order: action-level row wins over a plugin-level row;
-no row at either level defaults to "not killed" (`true`). **Any** store error — closed store,
+caller of a non-protective pair must use — never `get_kill_switch` (the display/inspection
+accessor the REST GET route uses) for a go/no-go decision. Resolution order: action-level row
+wins over a plugin-level row; no row at either level defaults to "not killed" (`true`). **Any** store error — closed store,
 lease timeout, query failure — collapses to `false` (disabled), inside `action_allowed` itself,
 in the one place every caller shares. This is the ADR-0036 rule applied directly: a
 silently-empty/false-collapsed kill-switch read is exactly the fail-open shape that rule exists to
@@ -154,6 +154,22 @@ kill-switchable like any ordinary plugin.action — an operator can still explic
 `__guard__.push_rules` (whole-plugin or action-level) via
 `PUT /api/v1/plugin-config/__guard__/kill-switch` (`?action=push_rules`) or the MCP twin
 `set_plugin_kill_switch`, and that switch is honored exactly as for any other capability.
+
+### Update (2026-10-12) — `__guard__.push_rules` is protective
+
+The paragraph above is superseded for `__guard__.push_rules`. It stays kill-switch-ADDRESSABLE
+(a row can still be stored and read back, so #3265's reachability fix stands) but is no longer
+kill-switch-REFUSABLE: it joins the quarantine plugin's four actions as a protective action
+(`yuzu::protective::is_protective_action`, `common/include/yuzu/protective_actions.hpp`) that no
+plugin-enablement gate may refuse — the all-OS kill switch, the per-OS withhold and its presence
+read, the plugin-presence filter and a degraded store. The four quarantine actions were exempt
+only from the containment gate before; this change newly exempts them from every enablement gate
+too, and the Fail-closed rule above applies to non-protective pairs only. A contained device must
+keep receiving the rules that make containment meaningful. The operator lever for stopping rule
+delivery is disabling or removing the rules (state-only: the agent disarms them on its next
+reconcile). Refusing a kill-switch write for a protective pair is deferred until ADR-3006 D3's
+enablement catalogue replaces the kill-switch write surface; until then a stored row is
+informational only.
 
 ### Update (2026-10-03, #5294) — per-OS kill-switch rows
 

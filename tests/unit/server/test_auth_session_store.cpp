@@ -352,12 +352,12 @@ TEST_CASE("AuthRoutes /logout: success clears the cookie; a durable-delete failu
     REQUIRE(store.is_open());
     LogoutHarness h{store};
 
-    SECTION("success — HTMX: cookie cleared + HX-Redirect to /login") {
+    SECTION("success — HTMX: cookie cleared + HX-Redirect to /home (the sign-in panel)") {
         auto tok = h.mgr->create_local_session_for_test("htmx-ok", Role::user, /*mfa=*/false);
         auto res = h.sink.dispatch("POST", "/logout", "", "application/json", cookie_hdrs(tok, true));
         REQUIRE(res);
         CHECK(res->status == 200);
-        CHECK(res->get_header_value("HX-Redirect") == "/login");
+        CHECK(res->get_header_value("HX-Redirect") == "/home");
         CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") != std::string::npos);
         CHECK_FALSE(h.mgr->validate_session(tok).has_value()); // durable row gone
     }

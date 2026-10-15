@@ -39,6 +39,7 @@
 
 #include <yuzu/agent/kv_store.hpp> // kKvStoreStopBusyTimeout (#5604)
 #include <yuzu/agent/guard.hpp>  // IGuard, GuardDrift (guard abstraction)
+#include <yuzu/agent/guardian_preserved_tally.hpp> // #4415: per-full_sync skipped-rule record
 #include <yuzu/agent/spark.hpp> // SparkType (for the classify() capability set)
 
 namespace yuzu::agent {
@@ -892,6 +893,12 @@ public:
     };
     [[nodiscard]] UnsupportedLogRecord last_unsupported_log_for_test() const;
 
+    /// TEST-ONLY (#4415): the exact `Guardian: full_sync preserved N rule(s) ...` line the most
+    /// recent full_sync apply_rules emitted (empty before the first). Recorded at the point of
+    /// emission, not observed via spdlog, for the same cross-image reason as the accessors above.
+    /// Locked, returned by value. No production caller.
+    [[nodiscard]] std::string last_full_sync_preserved_line_for_test() const;
+
     /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
     /// attempt ended up with — empty if never armed as file-hash-equals, the
     /// authored value if `expected_hash` was set, or a SEEDED persisted baseline
@@ -1373,6 +1380,11 @@ private:
     std::string last_rearm_degrade_message_for_test_;
     /// TEST-ONLY (see last_unsupported_log_for_test); default level None = never logged.
     UnsupportedLogRecord last_unsupported_log_for_test_;
+    /// #4415: rules the current apply_rules skipped re-arming (mtx_-guarded; reset at the start
+    /// of each apply_rules' rule loop, filled by reconcile_rule_locked).
+    GuardianPreservedTally preserved_tally_;
+    /// TEST-ONLY (see last_full_sync_preserved_line_for_test); empty = none emitted yet.
+    std::string last_full_sync_preserved_line_for_test_;
     /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
     /// arm attempt has run yet.
     std::string last_file_expected_hash_for_test_;

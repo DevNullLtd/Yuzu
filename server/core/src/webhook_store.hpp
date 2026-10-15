@@ -147,12 +147,13 @@ public:
     /// from the plain-`false` not-found case, #3097 classification).
     [[nodiscard]] std::expected<bool, WebhookWriteError> delete_webhook(int64_t id);
 
-    /// Fetch a single webhook by id (no secret material). `nullopt` covers
-    /// both "no such id" and a degraded read — this is a pre-delete-snapshot
-    /// convenience for the REST layer's audit trail (`offload_target_store`
-    /// precedent), not itself a decision surface, so it doesn't need the
-    /// finer 404-vs-503 split `delete_webhook` has.
-    [[nodiscard]] std::optional<Webhook> get(int64_t id) const;
+    /// Fetch a single webhook by id (no secret material). `store_ok`, if
+    /// non-null, is set false on a degraded read (closed store, lease timeout,
+    /// query failure) and left true otherwise, so `nullopt` with `store_ok`
+    /// true means "no such id" and `nullopt` with it false means "could not
+    /// be read" (`OffloadTargetStore::get` precedent). Callers that only snapshot
+    /// for an audit trail may omit it.
+    [[nodiscard]] std::optional<Webhook> get(int64_t id, bool* store_ok = nullptr) const;
 
     /// Recent deliveries for a webhook, newest first. Deliberately stays a
     /// plain container (empty on error) — delivery HISTORY is an audit
@@ -160,6 +161,12 @@ public:
     /// `ResultSetStore::lineage`'s deny-or-benign carve-out, ADR-0057).
     [[nodiscard]] std::vector<WebhookDelivery> get_deliveries(int64_t webhook_id,
                                                                int limit = 50) const;
+
+    /// Same read, but `nullopt` = the read FAILED (closed store, lease
+    /// timeout, query error) so a caller that renders history can tell a
+    /// failed read from a genuinely empty log. `get_deliveries` delegates here.
+    [[nodiscard]] std::optional<std::vector<WebhookDelivery>>
+    get_deliveries_checked(int64_t webhook_id, int limit = 50) const;
 
     /// Fire an event to all matching, enabled webhooks asynchronously. Each
     /// delivery runs on the bounded worker pool (see `delivery_pool_` below)

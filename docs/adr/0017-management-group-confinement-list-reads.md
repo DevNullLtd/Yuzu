@@ -300,8 +300,9 @@ gate.
   this ADR designed; confinement is now effective on both surfaces.
   - **`/inventory` dashboard FIND** — retired: its routes were deleted. The per-row drop filter +
     omission audit now live on `/fragments/inventory/software/devices` (`InventoryRoutes`), which
-    shares them with the REST/MCP siblings above and converts the same way (swap its
-    `Inventory:Read` gate to admit-then-filter; the per-row filter is already present).
+    shares them with the REST/MCP siblings above. **DONE (M.9 PR-3):** all three Software fragments
+    now gate on `fleet_read_fn` (admit-then-filter); the catalogue and versions refuse a confined
+    caller, while the host view and devices tables are admitted and scoped.
   - **⚠ `SoftwareInventoryStore::software_catalog` / `software_versions`** (the `/inventory`
     Software-tab fleet aggregates) are a DIFFERENT shape: they read a **precomputed, fleet-wide
     rollup** (`catalog_rollup` / `version_rollup`, recomputed across ALL agents by the background
@@ -336,6 +337,14 @@ gate.
     permission-agnostic `Infrastructure:Read` `visible_set_fn` (a DIFFERENT securable from this
     row's `GuaranteedState:Read` gate) — tracked for the dashboard-rewire follow-up (PR-2), which
     also owns deciding whether that narrowing is correct or itself a bug.
+  - **Update (2026-10-15, DEX Apps stability read):** `GET /api/v1/dex/apps` and its MCP twin
+    `list_dex_apps` (per-application and per-version stability, an inherited `GuaranteedState:Read`
+    surface from #4035) are in the same class as the three resources above: the same bare global
+    `GuaranteedState:Read` gate plus the service-scoped refusal, a group-only operator refused `403`
+    (the opposite of a confined-caller leak), and a query-time `GROUP BY` over agent-attributed
+    `guardian_observations` rows (the per-application and per-version top-N membership) that is
+    **not yet confined per-caller**. It publishes only distinct-device COUNTs, never an `agent_id`.
+    The per-caller SQL slice is the same work item, tracked as #5090.
 
 ### Out of scope (global by design)
 
@@ -497,7 +506,7 @@ ahead of PR-A.)
    fallback (INV-6), replace with the permission-specific set. Six callers across dashboard + server
    + json — consider splitting REST vs dashboard.
 4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` —
-   **DONE (#3290)**. The `/software` devices expansion (`/fragments/inventory/software/devices`) remains open (its own conversion, see above).
+   **DONE (#3290)**. The `/software` devices expansion (`/fragments/inventory/software/devices`) is **DONE** (M.9 PR-3, see above).
 5. **PR-E — DEX / TAR / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
    the `AuditLog:Read` surface.
 

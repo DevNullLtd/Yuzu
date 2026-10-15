@@ -234,7 +234,7 @@ jobs:
 
       - name: Test — Dashboard reachable
         run: |
-          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-qa/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-qa/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/home)
           [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE (verified against the install CA)" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
       - name: Test — Gateway health
@@ -446,15 +446,33 @@ jobs:
   #   gateway's bundled ERTS needs GLIBC_2.38 too, and #5171 is behind it.
   # - fedora:42, gateway: the bundled OTP crypto NIF needs OpenSSL SM4
   #   symbols Red Hat's OpenSSL lacks (#5171).
+  #
+  # NON-GATING legs (matrix.experimental, ADR-2003 (Proposed, PR #5631) slice
+  # S0): rockylinux:8 (the agent's glibc 2.28 floor) and amazonlinux:2023 are
+  # expected to FAIL on the 0.14.x artefacts until the EL8-built agent lands
+  # (ADR-2003 S2). They run so the gap is measured on every pre-release.
+  # `continue-on-error` keeps a red one from failing the job, so
+  # needs.install-rpm.result stays `success`: the gap is visible in the run
+  # graph and in the step summary the failed leg writes (last step), NOT in the
+  # Pre-release QA report table. That step runs on `failure()`, so it cannot
+  # fire after a job-level timeout or cancel; such a leg is red in the run
+  # graph only. S2 promotes them (deletes `experimental`) as
+  # it moves the floor into the build.
   install-rpm:
     name: "Install .rpm (${{ matrix.distro }})"
     needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
         distro: ["fedora:42", "rockylinux:9"]
+        include:
+          - distro: "rockylinux:8"
+            experimental: true
+          - distro: "amazonlinux:2023"
+            experimental: true
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -465,6 +483,9 @@ jobs:
       - name: Test .rpm install, run and removal
         env:
           DISTRO: ${{ matrix.distro }}
+          # 'true' on the non-gating legs, empty elsewhere (matrix.experimental
+          # is only defined for the include entries).
+          EXPERIMENTAL: ${{ matrix.experimental }}
         run: |
           cat > "$RUNNER_TEMP/smoke.sh" <<'SMOKE'
           set -euo pipefail
@@ -485,6 +506,11 @@ jobs:
             fi
             return 1
           }
+          # The rpm's %pre runs groupadd/useradd. amazonlinux:2023's stock image
+          # has no shadow-utils, which would fail the install for a reason
+          # unrelated to the floor under test: a test tool, not a dependency.
+          command -v groupadd >/dev/null || dnf install -y -q shadow-utils \
+            || { echo "FAIL: could not install shadow-utils for the package's %pre"; exit 1; }
           runs "dnf install of yuzu-$PKG" dnf install -y -q "/rpms/$RPM_NAME"
           rpm -q "yuzu-$PKG" >/dev/null || { echo "FAIL: yuzu-$PKG is not installed"; exit 1; }
           echo 'PASS: installed'
@@ -569,11 +595,31 @@ jobs:
             if ! docker run --rm -e PKG="$PKG" -e DISTRO="$DISTRO" -e RPM_NAME="$(basename "${RPMS[0]}")" \
                  -v "$PWD/artifacts:/rpms:ro" -v "$RUNNER_TEMP/smoke.sh:/smoke.sh:ro" \
                  "$DISTRO" bash /smoke.sh; then
-              echo "::error::yuzu-$PKG failed the .rpm smoke test on $DISTRO"
+              # A non-gating leg must not paint the run with error annotations.
+              LEVEL=error; [ "$EXPERIMENTAL" = true ] && LEVEL=warning
+              echo "::$LEVEL::yuzu-$PKG failed the .rpm smoke test on $DISTRO"
               FAIL=1
             fi
           done
           exit "$FAIL"
+
+      # An experimental leg's failure is invisible in the QA report
+      # (continue-on-error => the job result is success), so say it here.
+      # `failure()` is explicit: an `if:` with no status function gets an
+      # implicit success() ANDed on and could never run after a failed step.
+      - name: Note failed experimental leg
+        if: ${{ failure() && matrix.experimental == true }}
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          {
+            echo "### EXPERIMENTAL leg failed: .rpm install on ${DISTRO}"
+            echo
+            echo "This leg is non-gating (continue-on-error). On 0.14.x artefacts the EXPECTED"
+            echo "cause is the glibc/libstdc++ floor (#5143) - confirm that in the smoke log:"
+            echo "other causes (mirror outage, pull limits, a timeout) look identical here."
+            echo "It does NOT appear as a failure in the Pre-release QA report table."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Windows installer smoke test ────────────────────────────────────
   #
@@ -1457,7 +1503,7 @@ jobs:
           bash scripts/ci/qa-stack.sh check-stable
           echo "PASS: 4/4 services running, none restarted"
 
-          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-upgrade/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-upgrade/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/home)
           [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
           curl -sf --max-time 10 http://127.0.0.1:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }

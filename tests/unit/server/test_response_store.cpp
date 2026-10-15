@@ -95,6 +95,14 @@ TEST_CASE("ResponseStore: open against a fresh template clone", "[pg][response_s
     REQUIRE(store.is_open());
 }
 
+TEST_CASE("ResponseStore: retention_days() reports the constructor-time window",
+          "[pg][response_store][db][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, 91);
+    REQUIRE(store.is_open());
+    CHECK(store.retention_days() == 91);
+}
 TEST_CASE("ResponseStore: bad-path constructor (unroutable DSN) is closed",
           "[response_store]") {
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};

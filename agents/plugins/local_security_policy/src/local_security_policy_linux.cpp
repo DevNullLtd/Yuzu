@@ -15,9 +15,17 @@
  *    include/substack controls are not followed, and a line that is not
  *    `type control module` is dropped without a row.
  *  - A file read successfully that sets none of the reported keys contributes no row
- *    (e.g. Debian's all-commented faillock.conf); login.defs is filtered to a fixed key
- *    list per action; pwquality.conf.d, faillock drop-ins and /etc/audit/rules.d are
- *    not read.
+ *    (e.g. Debian's all-commented faillock.conf), EXCEPT that a lockout_policy read in
+ *    which at least one source was read and NO key row (a faillock.conf key,
+ *    a pam.<type>.<module> line; login.defs rows are reported but do not count) resulted writes one
+ *    `lockout_policy|lockout_keys|not_found|<files>` row (#5620), the default "no lockout
+ *    key found" answer. An absent or unreadable sibling keeps its own `source_state` row
+ *    and does not suppress it; any key row does. `<files>` names exactly the files read
+ *    successfully, in read order. It describes those files, not the host: faillock.conf
+ *    drop-ins, PAM include/substack targets, PAM services other than the four named files,
+ *    IdM/SSSD and fail2ban are not read.
+ *  - login.defs is filtered to a fixed key list per action; pwquality.conf.d, faillock
+ *    drop-ins and /etc/audit/rules.d are not read.
  */
 #include "local_security_policy_legs.hpp"
 

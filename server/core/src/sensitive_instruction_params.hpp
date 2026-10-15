@@ -27,10 +27,13 @@
 ///     correct fix on both functional and security grounds, not merely the
 ///     safer one.
 ///
+/// `client_secret` is the shipped `server.directory.sync_entra` definition's
+/// Entra app-registration secret (content/definitions/directory_sync.yaml),
+/// a long-lived credential: it is stripped from every persisted copy, refused
+/// in a schedule, and masked by the Console, like the grant keys.
+///
 /// EXTEND this list for the next secret-carrying instruction parameter
-/// (`directory_sync.client_secret` is a known pre-existing case with the
-/// same exposure, tracked separately as systemic — PR3136 review) — never
-/// hand-roll a second per-callsite redaction or rejection.
+/// — never hand-roll a second per-callsite redaction or rejection.
 
 #include <nlohmann/json.hpp>
 
@@ -40,7 +43,8 @@
 
 namespace yuzu::server {
 
-inline constexpr std::string_view kRedactedInstructionParamKeys[] = {"grant_secret", "grant_id"};
+inline constexpr std::string_view kRedactedInstructionParamKeys[] = {"grant_secret", "grant_id",
+                                                                     "client_secret"};
 
 [[nodiscard]] inline bool is_redacted_instruction_param_key(std::string_view key) {
     for (auto redacted : kRedactedInstructionParamKeys)
