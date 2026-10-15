@@ -38,6 +38,14 @@ bundle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bundle)
 
 
+# The installer scripts only ever run on macOS. Cases that reach BSD stat
+# (`stat -f`), `shasum` or `ditto` need that userland; GNU coreutils parses
+# `stat -f` as --file-system. Pure-Bash cases with stubbed platform commands
+# stay portable to Linux, but native Windows cannot host the Bash fixtures.
+macos_userland = unittest.skipUnless(sys.platform == "darwin", "needs macOS userland (BSD stat, shasum, ditto)")
+posix_shell = unittest.skipIf(os.name == "nt", "POSIX Bash fixture; native Windows never runs these installers")
+
+
 def profile(**changes: object) -> dict:
     now = dt.datetime.now(dt.timezone.utc)
     result: dict = {
@@ -172,6 +180,7 @@ shasum() { echo 'testdigest fixture'; }
             env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "CAPTURED_HASHES": str(root / "hashes")},
             text=True, capture_output=True)
 
+    @macos_userland
     def test_builder_records_each_plugin_hash(self) -> None:
         import hashlib
         with tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_hashes_") as temporary:
@@ -181,6 +190,7 @@ shasum() { echo 'testdigest fixture'; }
             expected = hashlib.sha256(b"plugin fixture").hexdigest()
             self.assertEqual((root / "hashes").read_text(), f"{expected}  plugins/tar.dylib\n")
 
+    @posix_shell
     def test_builder_rejects_a_plugin_name_with_whitespace(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_space_") as temporary:
             result = self._build_loose(Path(temporary), "bad name.dylib")
@@ -198,6 +208,7 @@ PLUGIN_DIR="{root}/plugins"; MANIFEST="{root}/package-files.list"; HASHES="{root
 """
         return subprocess.run([PKG_SHELL, "-c", stubs + program + "\n" + body], text=True, capture_output=True)
 
+    @macos_userland
     def test_plugin_ownership_requires_the_recorded_hash(self) -> None:
         import hashlib
         with tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_owner_") as temporary:
@@ -251,7 +262,7 @@ pkgutil() { [[ "$1" == --files && "$2" == com.yuzu.agent ]] || exit 99; printf '
                 self.assertEqual(result.returncode == 0, expected is not None or status == 1)
                 self.assertEqual((root / "plugins/third-party.dylib").read_bytes(), b"unmanaged")
 
-    @unittest.skipIf(os.name == "nt", "POSIX permissions fixture")
+    @macos_userland
     def test_data_directory_created_when_missing_and_preserved_when_present(self) -> None:
         source = (BUILD_PKG.parent / "postinstall").read_text()
         start = source.index("ensure_data_directory() {")
@@ -451,6 +462,7 @@ MODE_FILE="{root}/lib/package-mode"; recovery="{root}/state/install-recovery.TES
         (root / "state/install-recovery.TEST/LaunchDaemons/com.yuzu.agent.plist").write_text("previous")
         return root / "state/install-recovery.TEST"
 
+    @posix_shell
     def test_unrecognized_legacy_app_is_quarantined_without_rolling_back_a_healthy_install(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_retire_") as temporary:
             root = Path(temporary)
@@ -464,6 +476,7 @@ MODE_FILE="{root}/lib/package-mode"; recovery="{root}/state/install-recovery.TES
             self.assertFalse((recovery / "legacy-retired.app").exists())
             self.assertEqual(len(list((root / "state/quarantine").glob("legacy-YuzuAgent.*/YuzuAgent.app"))), 1)
 
+    @posix_shell
     def test_recovery_with_a_retained_legacy_app_restarts_the_previous_service(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_recover_") as temporary:
             root = Path(temporary)
@@ -478,6 +491,7 @@ MODE_FILE="{root}/lib/package-mode"; recovery="{root}/state/install-recovery.TES
             self.assertFalse((recovery / "legacy-retired.app").exists())
             self.assertIn("bootstrap system", (root / "launchctl.log").read_text())
 
+    @posix_shell
     def test_recovery_never_starts_a_legacy_data_root_service_but_does_not_block(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_plist_") as temporary:
             root = Path(temporary)
@@ -491,6 +505,7 @@ MODE_FILE="{root}/lib/package-mode"; recovery="{root}/state/install-recovery.TES
             log = root / "launchctl.log"
             self.assertNotIn("bootstrap", log.read_text() if log.exists() else "")
 
+    @posix_shell
     def test_recovery_does_not_start_a_service_whose_definition_cannot_be_read(self) -> None:
         # A failed read used to flow through `| grep -q` and look like "not the legacy
         # program", so the service was started anyway (PR #4482 review, pipefail item).
@@ -531,6 +546,7 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
 """
         return subprocess.run([PKG_SHELL, "-c", stubs + program + "\n" + body], text=True, capture_output=True)
 
+    @macos_userland
     def test_loose_code_directory_must_be_root_owned_and_not_writable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_loose_dir_") as temporary:
             root = Path(temporary)
@@ -557,6 +573,7 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
         self.assertLess(check, postinstall.index("require_stopped\nremove_managed_plugins"))
         self.assertLess(check, postinstall.index("printf 'promoting\\n'"))
 
+    @macos_userland
     def test_recovery_does_not_start_a_loose_agent_from_an_untrusted_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_loose_recover_") as temporary:
             root = Path(temporary)
@@ -916,6 +933,7 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
             (tools / name).chmod(0o755)
         return root / "dist", os.environ | {"PATH": f"{tools}:{os.environ['PATH']}"}
 
+    @macos_userland
     def test_policy_free_bundle_package_is_built_under_the_stock_shell(self) -> None:
         # PR #4482 review: an empty POLICY_ARGS tripped `set -u` on bash 3.2 and the
         # EXIT trap turned the abort into exit 0 with no package written.
@@ -928,6 +946,7 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
             self.assertNotIn("unbound variable", result.stderr)
             self.assertTrue((output / "YuzuAgent-1.0-macos-arm64.pkg").is_file())
 
+    @macos_userland
     def test_builder_fails_when_no_package_was_written(self) -> None:
         # A tool that exits 0 without producing the artifact, or a stale artifact from an
         # earlier run, must never be reported as a successful build.
