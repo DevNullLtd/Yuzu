@@ -610,6 +610,24 @@ place, **Hardware** and **Software**, each its own page:
   - **Exports** are plain download links to the REST routes: the matching install rows as
     JSON or CSV (up to 10,000; the file says if it was cut off) and the titles as CSV.
     The sprawl filter is not applied to install exports.
+  - **Sync now.** The button at the top of the page asks devices to re-send their
+    installed-software inventory now instead of waiting for the ~24 h cadence. A dialog
+    offers three choices: **This device** (offered while the Host box names a listed host),
+    **Devices matching a scope expression or group** (a scope expression, previewed through
+    `POST /api/v1/scope/preview` so the confirm step can say how many devices match, or
+    `group:<id>`), and **Whole fleet**. After you confirm, the page says how many devices
+    were asked to sync and how many were skipped. It calls `POST /api/v1/hardware/sync`,
+    which needs `Execution:Execute`, reaches only the devices that grant covers, and skips
+    devices that are offline or whose agent is older than 0.13.1 (the toast counts both).
+    **Whole fleet** also needs a fleet-wide `Execution:Execute` grant; a
+    management-group-scoped operator is refused (`403`) and should pick a group or a scope
+    instead. One request reaches at most 500 devices (`413` above that, counted after the
+    skips: narrow the scope). A group, scope or fleet run is limited to one per operator per
+    60 seconds (`429` with `Retry-After`) and one at a time across the server (`409`); a
+    single device is exempt. The request is audited as `inventory.sync.request` before
+    anything is sent, and is refused if the audit row cannot be written. `202` means the
+    request was sent, not that the devices have synced: the page's figures change when each
+    device reports back.
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused

@@ -488,6 +488,12 @@ One device's CI record: identity, device-CI blob, installed software and tags, e
 
 ---
 
+#### `POST /api/v1/hardware/sync`
+
+Requests an on-demand software-inventory sync for a device, a scope or the whole fleet (the Software page's **Sync now**). **Permission:** `Execution:Execute`; the targets are the devices that grant covers, and the whole fleet (`"scope":"__all__"`) needs it unfiltered. The body names the targets with exactly one of `scope` (`__all__`, `group:<id>` or a device id) or `scope_expression` (a scope expression); `source` may only be `installed_software`. Offline devices and agents below 0.13.1 are skipped and counted; at most 500 devices are reached per request (`413`); a group, scope or fleet run is limited to one per operator per 60 seconds (`429`, `Retry-After`) and one at a time (`409`). The `202` body carries counts only (`requested`, `reached`, `skipped_offline`, `skipped_version`) plus `command_id`, never device ids. The request, statuses and bounds are in the OpenAPI document. **Audit:** `inventory.sync.request`, written before dispatch (see [audit-log.md](audit-log.md)).
+
+---
+
 #### `POST /api/v1/hardware/{id}/sync`
 
 Requests an on-demand agent sync for one device. **Permission:** `Execution:Execute` scoped to the device. The body, the `202` and the `409` are described in the OpenAPI document. A device id longer than 256 bytes or containing a byte below `0x20` is a `400`, answered before the permission check and with no audit row (the same id rule as `GET /api/v1/hardware/{id}`, including the registration note there). **Audit:** `inventory.sync.request` (see [audit-log.md](audit-log.md)).
