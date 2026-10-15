@@ -284,6 +284,15 @@ TEST_CASE("mcp route registration: wiring -- the sync runner is one shared insta
     const auto seam = src.find("yuzu::server::dispatch_system_reserved_ids(", confined);
     REQUIRE(seam != std::string::npos);
     CHECK(seam - confined < 2500);
+    // The confined-dispatch arm has exactly one production caller: its containment-gate bypass is
+    // for the read-only __sync__.now push only, and a second caller would inherit it.
+    {
+        auto count = std::size_t{0};
+        for (auto at = src.find("dispatch_system_reserved_ids("); at != std::string::npos;
+             at = src.find("dispatch_system_reserved_ids(", at + 1))
+            ++count;
+        CHECK(count == 1);
+    }
     // (2) one memoised runner handed to both surfaces.
     CHECK(find_live_call(src, "if (!sync_runner_) {") != std::string::npos);
     CHECK(find_live_call(src, ".sync_runner = software_sync_runner()") != std::string::npos);

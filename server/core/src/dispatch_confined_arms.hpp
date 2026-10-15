@@ -455,7 +455,7 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 ///     `sync_hardware_software` reach up to 500 on this server process under ONE command id
 ///     (gated by the type-level Execution:Execute check, a per-operator cooldown and a single
 ///     in-flight run, with WHO IS REACHED decided here by `dispatch_system_reserved_ids`, the
-///     caller's visible-set intersection taken at send time, and the 500-target cap).
+///     caller's visible-set intersection taken at send time); the 500-target cap is the Runner's.
 ///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
 ///     ENFORCE, and is therefore the one exempt channel that mutates the
 ///     endpoint. It is NOT arbitrary command execution: the assertion

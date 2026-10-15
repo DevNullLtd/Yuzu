@@ -15260,8 +15260,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // Fleet-wide per-agent action with no per-agent parameter to scope against: a
-                // service-scoped token has no confinement mechanism here (REST is gated by the
-                // type-level Execution:Execute check alone), so it is denied outright.
+                // service-scoped token has no confinement mechanism here (the type-level gate
+                // reads global grants only, and a service-scoped session's reach is its service),
+                // so it is denied outright.
                 if (deny_fleet_wide_service_scoped(
                         "inventory.sync.request", "Scope",
                         "Software sync denied to a service-scoped token (MCP sync_hardware_software)",
@@ -15302,14 +15303,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 };
                 const auto out = software_sync_runner_->run(*session, *parsed, audit);
                 if (out.status == ss::Status::Accepted) {
-                    const nlohmann::json payload = out.summary;
-                    mcp_audit("success");
+                    nlohmann::json payload = out.summary;
+                    if (!mcp_audit("success"))
+                        payload["audit_persisted"] = false; // set-and-proceed: the pre-dispatch row stands
                     res.set_content(
                         success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                         "application/json");
                     return;
                 }
-                mcp_audit("denied", "sync_hardware_software refused: " + out.message);
+                mcp_audit("denied", "sync_hardware_software refused: " + ss::audit_token(out.message));
                 switch (out.status) {
                 case ss::Status::BadScope:
                     // retry-hint-exempt: the scope expression is a client-input error

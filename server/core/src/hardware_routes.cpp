@@ -426,7 +426,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) return;
-        if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.sync")) return;
+        if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.device_sync")) return;
 
         std::string source = "all";
         if (!req.body.empty()) {

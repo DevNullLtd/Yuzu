@@ -9,17 +9,17 @@
 /// a clock, a registry or a store: how a request body selects its targets, who may name
 /// the whole fleet, how a resolved candidate list partitions into reachable / offline /
 /// too-old, the 500-target cap, the per-operator cooldown, the audit wording and the
-/// response summary. `hardware_routes.cpp` only sequences them (auth, resolve, decide,
-/// audit, dispatch) and maps each verdict to a status code.
+/// response summary. `Runner` sequences them (resolve, decide, audit, dispatch) and the surfaces
+/// (`hardware_routes.cpp`, the MCP tool) map each outcome to a status or error code.
 ///
 /// The agent ignores `stagger_seconds` for `__sync__.now`, so the server is the only thing
 /// standing between one click and a thundering herd — hence the hard cap, the cooldown and
 /// the single in-flight run. ponytail: hard cap; ADR-3007 wants a paced, unbounded run,
 /// tracked as a follow-up rather than built here.
 ///
-/// The cooldown stamps and the in-flight flag live in the route's owner, so both are per
-/// server PROCESS, not cluster-wide: under active-active each replica can run one fan-out at
-/// a time and keeps its own per-operator cooldown. Every run is still bounded by the
+/// The cooldown stamps and the in-flight lease live in `software_sync::Runner` (software_sync_runner.hpp),
+/// so both are per server PROCESS, not cluster-wide: under active-active each replica can run one
+/// fan-out at a time and keeps its own per-operator cooldown. Every run is still bounded by the
 /// 500-target cap, so replicas multiply the ceiling by their number, not without limit.
 ///
 /// Nothing here authorises anything. Execution:Execute is checked by the route; targets

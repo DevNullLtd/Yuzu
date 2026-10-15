@@ -12370,15 +12370,6 @@ private:
         return ok;
     }
 
-    /// Sync-on-demand (`__sync__.now {source}`): a system-reserved push to each id under ONE
-    /// command id and ONE gateway flush (the TAR fleet_snapshot shape). This is the
-    /// Guardian-push path (build_classified_command(system) + send_system_reserved +
-    /// forward_gateway_pending) - NOT dispatch_confined, which would withhold `__sync__` as a
-    /// plugin no agent advertises (#3511). Authorization and targeting belong to the caller:
-    /// the per-device and the fan-out sync routes gate and confine before they get here, and
-    /// the agent ignores stagger for this action, so the caller bounds the herd. `sent`
-    /// counts sessions that accepted the frame; a command that cannot be classified sends
-    /// nothing and returns the empty result (no command id).
     [[nodiscard]] static std::string mint_sync_now_command_id() {
         const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
@@ -12392,6 +12383,16 @@ private:
                                         command_id, /*parameters=*/{{"source", source}});
     }
 
+    /// Sync-on-demand (`__sync__.now {source}`): a system-reserved push to each id under ONE
+    /// command id and ONE gateway flush (the TAR fleet_snapshot shape). This is the
+    /// Guardian-push path (build_classified_command(system) + send_system_reserved +
+    /// forward_gateway_pending) - NOT dispatch_confined, which would withhold `__sync__` as a
+    /// plugin no agent advertises (#3511). Authorization and targeting belong to the caller:
+    /// the per-device sync route gates (scoped Execution:Execute) before it gets here; the fleet
+    /// fan-out uses `push_sync_now_confined`, whose reach the confined-dispatch seam decides. The
+    /// agent ignores stagger for this action, so the caller bounds the herd. `sent`
+    /// counts sessions that accepted the frame; a command that cannot be classified sends
+    /// nothing and returns the empty result (no command id).
     [[nodiscard]] yuzu::server::software_sync::DispatchResult
     push_sync_now(const std::vector<std::string>& ids, const std::string& source) {
         auto out = yuzu::server::software_sync::fan_out(
@@ -12488,6 +12489,10 @@ private:
                 if (!sess)
                     return std::nullopt;
                 return sess->agent_version;
+            };
+            env.on_takeover = [] {
+                spdlog::warn("software sync: a run took over a lapsed in-flight lease; the previous "
+                             "holder is still sending (a stalled agent stream)");
             };
             sync_runner_ = std::make_shared<yuzu::server::software_sync::Runner>(std::move(env));
         }

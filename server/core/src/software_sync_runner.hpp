@@ -6,8 +6,8 @@
 /// state it needs (the per-operator cooldown and the single in-flight slot), live here so that a
 /// second surface cannot be used to dodge either bound.
 ///
-///   preflight 403 -> cooldown 429 -> slot 409 -> resolve -> stamp cooldown -> partition + cap 413
-///   -> decide -> audit (fail closed) -> dispatch
+///   preflight 403 -> cooldown 429 -> slot 409 -> resolve -> partition + cap 413 -> decide ->
+///   audit (fail closed) -> dispatch; the cooldown is spent on a send, a 413 and an empty target list
 ///
 /// What it does NOT own: the response BODY shaping (`Outcome` carries the HTTP status for REST and
 /// a `Status` for MCP; the caller writes the envelope), authorization
@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -45,9 +46,14 @@ namespace yuzu::server::software_sync {
 /// without a lease one stalled stream would hold the slot (and answer every other run 409)
 /// until that agent reads or disconnects. The stalled run keeps going (it is bounded by the
 /// 500-target cap) and a takeover starts another bounded run, so the physical bound is the
-/// current lease holder plus every predecessor still stuck on a stalled write, with takeovers at
-/// least one lease (120 s) apart; there is no cancellation of a blocked send.
+/// current lease holder plus predecessors still stuck on a stalled write, capped at kMaxLiveRuns,
+/// with takeovers at least one lease (120 s) apart; there is no cancellation of a blocked send.
 inline constexpr std::int64_t kSlotLeaseMs = 120'000;
+
+/// The most runs that may be alive at once (the current holder plus predecessors still stuck on
+/// a stalled send). A takeover past this is refused with the same 409, so a persistent stall
+/// strands at most this many request workers instead of one per lease period.
+inline constexpr int kMaxLiveRuns = 3;
 
 /// The seams a run needs. The server wires them; a test fakes them.
 struct Env {
@@ -65,6 +71,8 @@ struct Env {
     std::function<std::int64_t()> now;
     /// Monotonic milliseconds for the slot lease. Empty = steady_clock.
     std::function<std::int64_t()> mono_ms;
+    /// Optional: told when a run takes over a lapsed lease (the previous holder is still sending).
+    std::function<void()> on_takeover;
 };
 
 /// Where a run writes its audit rows. `note` is best-effort (refusals and failures);
@@ -201,7 +209,7 @@ public:
             return refuse(Status::TooMany, 413,
                           "this would reach more than " + std::to_string(kMaxTargets) +
                               " devices; the limit is " + std::to_string(kMaxTargets) +
-                              " per request - narrow the scope",
+                              " per request - narrow the scope (this attempt counts toward the 60 s limit)",
                           "over_cap cap=" + std::to_string(kMaxTargets));
         }
 
@@ -215,8 +223,16 @@ public:
         }
 
         DispatchResult sent;
-        if (!plan.targets.empty())
-            sent = env_.dispatch(session, plan.targets);
+        if (!plan.targets.empty()) {
+            try {
+                sent = env_.dispatch(session, plan.targets);
+            } catch (const std::exception&) {
+                // The audit row is already stored; answer the retryable "nothing reachable" rather
+                // than a bare 500, and leave the cooldown unspent (the send never completed).
+                audit.note("failure", type, target_id, "dispatch_threw");
+                sent = {};
+            }
+        }
         if (!plan.targets.empty() && sent.sent == 0) {
             out.status = Status::NoneReachable;
             out.http = 503;
@@ -268,10 +284,16 @@ private:
             auto cur = r_.slot_until_ms_.load();
             if (cur != 0 && now_ms < cur)
                 return false; // held and the lease has not lapsed
+            const bool takeover = cur != 0;
+            if (takeover && r_.live_runs_.load() >= kMaxLiveRuns)
+                return false; // too many stalled predecessors already: do not strand another worker
             const auto mine = now_ms + kSlotLeaseMs;
             if (!r_.slot_until_ms_.compare_exchange_strong(cur, mine))
                 return false; // lost a race
             deadline_ = mine;
+            r_.live_runs_.fetch_add(1);
+            if (takeover && r_.env_.on_takeover)
+                r_.env_.on_takeover();
             return true;
         }
         void release() {
@@ -279,6 +301,7 @@ private:
                 return;
             auto expected = deadline_;
             r_.slot_until_ms_.compare_exchange_strong(expected, 0);
+            r_.live_runs_.fetch_sub(1);
             deadline_ = 0;
         }
 
@@ -292,6 +315,8 @@ private:
     std::unordered_map<std::string, std::int64_t> last_run_;
     /// 0 = free; otherwise the monotonic deadline of the holder's lease.
     std::atomic<std::int64_t> slot_until_ms_{0};
+    /// Runs currently holding or stuck behind a slot they took (each Slot adds one until released).
+    std::atomic<int> live_runs_{0};
 };
 
 } // namespace yuzu::server::software_sync

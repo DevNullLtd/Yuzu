@@ -35624,3 +35624,98 @@ TEST_CASE("MCP sync_hardware_software: refuses a service-scoped token, bad argum
         CHECK(body["error"]["message"].get<std::string>().find("not configured") != std::string::npos);
     }
 }
+
+TEST_CASE("MCP sync_hardware_software: a lost outcome row is flagged audit_persisted=false; the run still stands",
+          "[mcp][integration][sync_fanout][security]") {
+    SyncToolRig rig;
+    McpTestServer ts;
+    ts.software_sync_runner_for_test = rig.runner();
+    // The pre-dispatch domain row persists (the run is admitted); only the generic MCP row is lost.
+    ts.audit_succeeds_for_action_ = [](const std::string& action) {
+        return action != "mcp.sync_hardware_software";
+    };
+    ts.start("");
+    auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["audit_persisted"] == false);
+    CHECK(payload["agents_reached"] == 2);
+    CHECK(rig.dispatches == 1);
+}
+
+TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended JSON-RPC class",
+          "[mcp][integration][sync_fanout]") {
+    namespace ss = yuzu::server::software_sync;
+    struct Case {
+        const char* name;
+        std::function<void(ss::Env&)> tweak;
+        int code;
+        bool hint;
+    };
+    const std::vector<Case> cases = {
+        {"over the cap -> invalid params, no hint",
+         [](ss::Env& e) {
+             e.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+                 ss::Resolved r;
+                 r.status = ss::Resolved::Status::Ok;
+                 r.caller_unfiltered = true;
+                 for (int i = 0; i < 600; ++i)
+                     r.ids.push_back("d" + std::to_string(i));
+                 return r;
+             };
+         },
+         yuzu::server::mcp::kInvalidParams, false},
+        {"confined caller naming the fleet -> permission denied",
+         [](ss::Env& e) {
+             e.caller_unfiltered = [](const yuzu::server::auth::Session&) { return false; };
+         },
+         yuzu::server::mcp::kPermissionDenied, false},
+        {"scope not evaluable -> internal error with a 5 s hint",
+         [](ss::Env& e) {
+             e.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+                 ss::Resolved r;
+                 r.status = ss::Resolved::Status::Aborted;
+                 return r;
+             };
+         },
+         yuzu::server::mcp::kInternalError, true},
+        {"every send refused -> internal error with a hint",
+         [](ss::Env& e) {
+             e.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>&) {
+                 return ss::DispatchResult{0, "x"};
+             };
+         },
+         yuzu::server::mcp::kInternalError, true},
+    };
+    for (const auto& c : cases) {
+        INFO(c.name);
+        SyncToolRig rig;
+        ss::Env env;
+        env.resolve = [](const yuzu::server::auth::Session&, const ss::Selector&) {
+            ss::Resolved r;
+            r.status = ss::Resolved::Status::Ok;
+            r.caller_unfiltered = true;
+            r.ids = {"d0", "d1"};
+            return r;
+        };
+        env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids) {
+            return ss::DispatchResult{ids.size(), "__sync__-t"};
+        };
+        env.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
+        env.agent_version = [](const std::string&) { return std::optional<std::string>("0.13.1"); };
+        c.tweak(env);
+        McpTestServer ts;
+        ts.software_sync_runner_for_test = std::make_shared<ss::Runner>(std::move(env));
+        ts.start("");
+        auto res = ts.call(std::string(kSyncCall) + R"({"scope":"__all__"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == c.code);
+        const bool has_hint = body["error"].contains("data") && body["error"]["data"].contains("retry_after_ms") &&
+                              !body["error"]["data"]["retry_after_ms"].is_null();
+        CHECK(has_hint == c.hint);
+    }
+}

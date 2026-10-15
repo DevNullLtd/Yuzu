@@ -174,7 +174,6 @@ TEST_CASE("Ids arm: a present-EMPTY visible set reaches NOBODY (fail-closed)",
 
 TEST_CASE("system-reserved ids: unfiltered authority sends to exactly the named ids",
           "[server][dispatch][scope][security][sync_fanout]") {
-    RecordingSink sink;
     std::vector<std::string> sent_to;
     const auto r = dispatch_system_reserved_ids(
         kThree, unfiltered(), [&](const std::string& id) {
@@ -182,8 +181,7 @@ TEST_CASE("system-reserved ids: unfiltered authority sends to exactly the named 
             return true;
         });
     CHECK(r.sent == 3);
-    CHECK(sent_to == kThree);
-    CHECK_FALSE(sink.unfiltered_broadcast_used);
+    CHECK(sent_to == kThree); // one send per named id; never a send-to-all fast path
 }
 
 TEST_CASE("system-reserved ids: a device outside the caller's visible set is never sent to",
@@ -209,9 +207,10 @@ TEST_CASE("system-reserved ids: a present-EMPTY visible set reaches NOBODY",
     CHECK(calls == 0);
 }
 
-TEST_CASE("system-reserved ids: the control-plane exemption still reaches a quarantined device",
+TEST_CASE("system-reserved ids: the fail-closed containment gate is not applied (a contained device still answers)",
           "[server][dispatch][scope][security][sync_fanout]") {
-    // A contained device keeps answering the read-only sync: no containment gate applies here.
+    // The quarantine plugin gate itself is exercised in test_quarantine_dispatch_gate.cpp; this pins
+    // only that this arm does not fail closed on an empty quarantine set.
     std::vector<std::string> sent_to;
     const auto r = dispatch_system_reserved_ids(
         {"dev-Q"}, unfiltered(), [&](const std::string& id) {

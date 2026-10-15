@@ -623,7 +623,7 @@ place, **Hardware** and **Software**, each its own page:
     `POST /api/v1/hardware/sync`.
     - **Who may.** The route needs `Execution:Execute`, checked as a **global** grant (or
       RBAC off). An operator whose `Execution:Execute` is limited to management groups is
-      refused with `403` for every choice, including a single device. The route also
+      refused with `403` for every choice, including a single device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The route also
       confines its targets to the caller's own `Execution:Execute` visible set and refuses
       **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
       changes the outcome today, and both stay in place as defence in depth for when the
@@ -636,11 +636,10 @@ place, **Hardware** and **Software**, each its own page:
       narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
       up to 256 bytes.
     - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
-      (`429` with `Retry-After`) (an attempt refused for exceeding 500 devices, or one that found nothing to reach, counts as a run) and one at a time per server process (`409`); a single device
+      (`429` with `Retry-After`; an attempt refused for exceeding 500 devices, or with no live target, counts as a run, a send every device refused does not) and one at a time per server process (`409`); a single device
       is exempt from both. A `409` can follow a slow agent connection: the server sends to its
       targets one after another, and a connected agent that has stopped reading holds the run
-      until it reads or disconnects (a dead connection is cut by the gRPC keepalive, but no
-      clear time is promised for a stalled one). A server clock that steps backwards
+      for at most 120 seconds, after which the next request takes the run over (`retry_after_ms` on the `409` is the time until that lease lapses; the stalled send itself is not cancelled, and at most three runs are alive at once). A server clock that steps backwards
       cannot lock an operator out: a last-run time in the future is ignored. Both limits are
       held in each server process, not across a cluster: with several active servers every
       one allows its own run and keeps its own per-operator cooldown, and each run is still

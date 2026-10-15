@@ -398,16 +398,23 @@ TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out reques
     CHECK(op["responses"]["413"].value("description", "").find("500") != std::string::npos);
     // The 429 carries a typed integer Retry-After header; the 202 is a typed envelope; every
     // refusal body is the A4 error envelope.
+    REQUIRE(op["responses"]["429"].contains("headers"));
+    REQUIRE(op["responses"]["429"]["headers"].contains("Retry-After"));
     CHECK(op["responses"]["429"]["headers"]["Retry-After"]["schema"]["type"] == "integer");
+    REQUIRE(op["responses"]["202"].contains("content"));
     const auto& accepted_schema =
         op["responses"]["202"]["content"]["application/json"]["schema"];
+    REQUIRE(accepted_schema.contains("properties"));
+    REQUIRE(accepted_schema["properties"].contains("data"));
     CHECK(accepted_schema["required"] == json::array({"data", "meta"}));
     for (const char* field : {"requested", "agents_reached", "skipped_offline", "skipped_version",
                               "command_id", "source", "requested_at"})
         CHECK(accepted_schema["properties"]["data"]["properties"].contains(field));
-    for (const char* code : {"400", "403", "409", "413", "429", "500", "503"})
+    for (const char* code : {"400", "403", "409", "413", "429", "500", "503"}) {
+        REQUIRE(op["responses"][code].contains("content"));
         CHECK(op["responses"][code]["content"]["application/json"]["schema"]["$ref"] ==
               "#/components/schemas/A4ErrorEnvelope");
+    }
 }
 
 TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query parameter and "

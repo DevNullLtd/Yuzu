@@ -8,10 +8,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -238,40 +240,91 @@ TEST_CASE("sync runner: an expired holder's late release cannot clear the live s
     std::condition_variable cv;
     int in_dispatch = 0;
     bool release_a = false, release_b = false;
+    const auto patience = std::chrono::seconds(20); // a regression fails a CHECK; it never hangs CI
     auto env = rig.env();
     env.dispatch = [&](const auth::Session&, const std::vector<std::string>& ids) {
         std::unique_lock<std::mutex> lk(mu);
         const int me = ++in_dispatch; // 1 = the first (expiring) holder, 2 = its successor
         cv.notify_all();
-        cv.wait(lk, [&] { return me == 1 ? release_a : release_b; });
+        if (me <= 2)
+            cv.wait_for(lk, patience, [&] { return me == 1 ? release_a : release_b; });
         return ss::DispatchResult{ids.size(), "__sync__-lease"};
     };
     ss::Runner runner(std::move(env));
-    const auto wait_for = [&](int n) {
+    const auto wait_for_dispatches = [&](int n) {
         std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [&] { return in_dispatch >= n; });
+        return cv.wait_for(lk, patience, [&] { return in_dispatch >= n; });
+    };
+    const auto release = [&](bool& flag) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            flag = true;
+        }
+        cv.notify_all();
     };
 
     ss::Outcome a_out, b_out;
     std::thread a([&] { a_out = runner.run(session_of("alice"), kFleet, rig.audit()); });
-    wait_for(1);
+    const bool a_in = wait_for_dispatches(1);
     rig.mono += ss::kSlotLeaseMs + 1; // A has now held the slot past its lease
     std::thread b([&] { b_out = runner.run(session_of("bob"), kFleet, rig.audit()); });
-    wait_for(2); // B took the slot over and is in its send
-    {
-        std::lock_guard<std::mutex> lk(mu);
-        release_a = true;
-    }
-    cv.notify_all();
-    a.join(); // A has now unwound; its release must not have cleared B's lease
-    CHECK(runner.run(session_of("carol"), kFleet, rig.audit()).status == ss::Status::InFlight);
-    {
-        std::lock_guard<std::mutex> lk(mu);
-        release_b = true;
-    }
-    cv.notify_all();
+    const bool b_in = wait_for_dispatches(2); // B took the slot over and is in its send
+    release(release_a);
+    a.join(); // A has unwound; its release must not have cleared B's lease
+    const auto c_out = runner.run(session_of("carol"), kFleet, rig.audit());
+    release(release_b);
     b.join();
+    CHECK(a_in);
+    CHECK(b_in);
+    CHECK(c_out.status == ss::Status::InFlight);
     CHECK(a_out.status == ss::Status::Accepted);
     CHECK(b_out.status == ss::Status::Accepted);
     CHECK(runner.run(session_of("carol"), kFleet, rig.audit()).status == ss::Status::Accepted);
+}
+
+TEST_CASE("sync runner: stacked stalled holders are capped, and a takeover is reported",
+          "[server][software_sync][runner]") {
+    Rig rig;
+    int takeovers = 0;
+    int depth = 0;
+    std::vector<ss::Status> nested;
+    auto env = rig.env();
+    env.on_takeover = [&] { ++takeovers; };
+    ss::Runner* self = nullptr;
+    const std::vector<std::string> names = {"u1", "u2", "u3", "u4", "u5"};
+    env.dispatch = [&](const auth::Session&, const std::vector<std::string>& ids) {
+        // Each run that gets in stalls (still alive) while the lease lapses and the next tries.
+        if (depth < static_cast<int>(names.size()) - 1) {
+            ++depth;
+            rig.mono += ss::kSlotLeaseMs + 1;
+            nested.push_back(self->run(session_of(names[static_cast<std::size_t>(depth)]), kFleet, rig.audit()).status);
+        }
+        return ss::DispatchResult{ids.size(), "__sync__-stack"};
+    };
+    ss::Runner runner(std::move(env));
+    self = &runner;
+    CHECK(runner.run(session_of(names[0]), kFleet, rig.audit()).status == ss::Status::Accepted);
+    // u1 holds; u2 takes over (2 alive); u3 takes over (3 alive); u4 is refused at kMaxLiveRuns.
+    // Completion order is innermost first: u4 refused, then u3 and u2 (which had been admitted) accepted.
+    REQUIRE(nested.size() == 3);
+    CHECK(nested[0] == ss::Status::InFlight);
+    CHECK(nested[1] == ss::Status::Accepted);
+    CHECK(nested[2] == ss::Status::Accepted);
+    CHECK(takeovers == ss::kMaxLiveRuns - 1);
+}
+
+TEST_CASE("sync runner: a dispatch that throws is a retryable 503, with the slot released",
+          "[server][software_sync][runner]") {
+    Rig rig;
+    auto env = rig.env();
+    env.dispatch = [](const auth::Session&, const std::vector<std::string>&) -> ss::DispatchResult {
+        throw std::runtime_error("boom");
+    };
+    ss::Runner runner(std::move(env));
+    const auto out = runner.run(session_of("alice"), kFleet, rig.audit());
+    CHECK(out.status == ss::Status::NoneReachable);
+    CHECK(out.http == 503);
+    CHECK(out.retry_after_ms.value_or(0) > 0);
+    // The slot is free and the cooldown unspent: the retry reaches dispatch again (and throws again).
+    CHECK(runner.run(session_of("alice"), kFleet, rig.audit()).status == ss::Status::NoneReachable);
 }
