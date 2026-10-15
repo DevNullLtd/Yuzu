@@ -1,4 +1,4 @@
 - **Home shows the sign-in page first.** Signed out, `/home` shows only the Yuzu mark, the headline and the sign-in panel; the fifteen screen tiles appear once you are signed in.
 - **"Dashboard" is now "Console".** The navigation item, Home tile, page title, back-links and the related Settings labels use the new name. Routes, API paths and MCP tool names are unchanged.
 - **DEX Trends charts have depth.** The sparklines gain an area fill and an end point, the cards are elevated, and the heatmap cells highlight on hover with a legend.
-- **Quarantine controls are hidden in the web UI.** The Quarantine link, Quarantined pill, Quarantined devices panel and Containment tab on the Hardware pages are hidden until the approval workflow lands. The REST API, MCP tools and the quarantine plugin are unchanged.
+- **Quarantine controls are hidden in the web UI.** The Quarantine link, Quarantined pill, Quarantined devices panel and Containment tab on the Hardware pages are hidden until an approval workflow for containment actions is added. The REST API, MCP tools and the quarantine plugin are unchanged.
