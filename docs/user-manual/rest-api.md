@@ -327,7 +327,7 @@ All endpoints are under the `/api/v1/` prefix.
 
 #### `GET /api/v1/me`
 
-Returns the authenticated user's identity and role.
+Returns the authenticated user's identity, role and what the server will honour for this session.
 
 **Permission:** Authenticated session (no specific RBAC permission required).
 
@@ -336,12 +336,32 @@ Returns the authenticated user's identity and role.
 ```json
 {
   "data": {
-    "username": "admin",
-    "role": "admin"
+    "username": "alice",
+    "display_name": "Alice",
+    "role": "user",
+    "rbac_enabled": false,
+    "rbac_role": "Viewer",
+    "effective_role": "admin",
+    "elevated": true,
+    "elevated_until": "2026-10-13T22:31:54Z",
+    "can_access_settings": true
   },
   "meta": { "api_version": "v1" }
 }
 ```
+
+| Field | Meaning |
+|---|---|
+| `role` | The persisted legacy role (`admin` or `user`). Never the elevated view. |
+| `effective_role` | The role the server enforces now: `admin` while a just-in-time elevation is active, otherwise `role`. |
+| `elevated` | `true` while a just-in-time elevation is active. Always `false` for API, MCP and service-scoped tokens. |
+| `elevated_until` | End of the elevation window, ISO-8601 UTC. Present only when `elevated` is `true`. |
+| `can_access_settings` | `true` when `GET /settings` would render for this session. MCP-tier and service-scoped tokens are always `false`. A display hint only: every route is still gated server-side. |
+
+The response is sent with `Cache-Control: no-store, private`. During a rolling
+upgrade an older replica omits the four new fields; clients should treat a
+missing `can_access_settings` as `false`. `GET /api/me` returns the same keys
+without the `data` envelope.
 
 ---
 
@@ -1414,7 +1434,7 @@ Reassign the named responsible owner of an active engine principal. Admin-forced
 
 Auditor-runnable, independent proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — not merely a claim about the write-path guard. Resolves each engine principal's actual role assignments and effective permissions against the live RBAC reference tables and reports any violation: a literal `admin`/`Administrator` role grant, any role flagged `is_system`, or a granted securable × operation set whose size reaches the full cross-product (functionally admin-equivalent even under a custom, non-system role name).
 
-**Permission:** `AuditLog:Read` — deliberately **not** `Security`, since this is a read-only evidentiary query, not part of the write-path bar it verifies; a read-only auditor role can run it without holding engine-principal write access.
+**Permission:** `AuditLog:Read` — deliberately **not** `Security`, since this is a read-only evidentiary query, not part of the write-path bar it verifies; a read-only auditor role can run it without holding engine-principal write access. With RBAC disabled the route is admin-only like every other audit read (#5771).
 
 **Response:**
 
@@ -2649,6 +2669,13 @@ List all defined roles.
 }
 ```
 
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Caller lacks `UserManagement:Read` | `403` |
+| The RBAC store is closed, its connection pool timed out, or the read failed | `503` with `retry_after_ms` `5000` and a fixed message. Never an empty `200` list: an empty list would read as "no roles exist". |
+
 ---
 
 #### `GET /api/v1/rbac/roles/{role_name}/permissions`
@@ -2681,6 +2708,14 @@ List all permissions granted to a role.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Caller lacks `UserManagement:Read` | `403` |
+| `{role_name}` is not in the roles table (matched exactly, case-sensitive) | `404` — `role not found`. Not an empty `200`. |
+| The RBAC store is closed, its connection pool timed out, or either read failed | `503` with `retry_after_ms` `5000` and a fixed message. A degrade is never reported as `404` or as an empty permission set. |
 
 ---
 
@@ -3489,6 +3524,8 @@ Query the server audit trail. All state-changing operations are recorded with th
 
 > **Reads deny on store degrade (ADR-0040).** The audit trail is the SOC 2 evidence chain, so the audit query endpoints (`GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, and the legacy `GET /api/audit`) **return `503` when the underlying store or connection pool is unavailable — never an empty `200`.** A reviewer, SIEM, or CMDB integration can therefore never mistake an infrastructure blip for "no audit activity"; treat a `503` here as a transient, retryable evidence-availability gap, not as an empty result set. This is the read-side counterpart to the fail-hard write posture (`503` + `Sec-Audit-Failed` on the behavioural-PII routes).
 
+> **Who may read the trail.** Every audit read surface — `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, the legacy `GET /api/audit`, `GET /api/v1/engine-principals/audit/no-admin`, and the MCP `query_audit_log` / `audit_engine_no_admin` tools and `yuzu://audit/recent` resource — is gated on `AuditLog:Read`. **With RBAC disabled (the shipped default) only an `admin`-role session may read the trail** (#5771): `AuditLog:Read` is in the [authorization topology floor](rbac.md#the-authorization-topology-floor-2376), so any other authenticated session is refused with `403` and the denial is audited with a `detail` beginning `topology floor: non-admin role denied AuditLog:Read` (an MCP-tier token's row appends `(mcp_tier=<tier>)`, so match on the prefix). **With RBAC enabled** the permission is an ordinary grant: the seeded `Administrator`, `PlatformEngineer`, `Operator`, `ITServiceOwner` and `Viewer` roles hold it, and any custom role can be granted it. A holder reads every row; the audit surfaces are not confined to a management group.
+
 #### `GET /api/v1/audit`
 
 Query audit events.
@@ -3500,8 +3537,13 @@ Query audit events.
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `limit` | integer | No | Max events to return (default 100, max 1000) |
+| `offset` | integer | No | Rows to skip, `0`..`10000` (default 0) |
 | `principal` | string | No | Filter by acting user |
 | `action` | string | No | Filter by action name |
+| `target_type` | string | No | Filter by target type (exact match) |
+| `target_id` | string | No | Filter by target id (exact match); requires `target_type` |
+| `since` | integer | No | Inclusive lower bound, epoch seconds; `0` or absent is unbounded |
+| `until` | integer | No | Inclusive upper bound, epoch seconds; `0` or absent is unbounded |
 
 **Response:**
 
@@ -3509,6 +3551,7 @@ Query audit events.
 {
   "data": [
     {
+      "id": 4101,
       "timestamp": 1710849600,
       "principal": "admin",
       "action": "management_group.create",
@@ -3518,6 +3561,7 @@ Query audit events.
       "detail": "EU Production Servers"
     },
     {
+      "id": 4102,
       "timestamp": 1710849700,
       "principal": "admin",
       "action": "tag.set",
@@ -3527,6 +3571,7 @@ Query audit events.
       "detail": "production"
     },
     {
+      "id": 4103,
       "timestamp": 1710849800,
       "principal": "jane.ops",
       "action": "quarantine.enable",
@@ -3536,30 +3581,37 @@ Query audit events.
       "detail": "Suspicious network activity detected"
     }
   ],
-  "pagination": { "total": 3, "start": 0, "page_size": 50 },
+  "pagination": { "total": 3, "start": 0, "page_size": 100 },
   "meta": { "api_version": "v1" }
 }
 ```
 
-**`total` and `page_size` are not what they look like.** `total` is the
-number of rows in this response's `data` array, not the number of rows that
-matched — the route has no `offset` support, so a response at exactly
-`limit` (max 1000) rows can be silently truncated, indistinguishable from a
-complete answer. `page_size` is always `50`, regardless of the `limit` you
-passed (tracked: [#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If
-you hit the cap, narrow with `principal=`/`action=`, or fall back to the
-legacy `GET /api/audit` endpoint, which also accepts `offset`. `since`/`until`
-alone only bounds the time window — it does not by itself guarantee
-completeness inside that window if more rows matched than one call returns.
-The reliable recipe is both together: freeze a bounded window with
-`since`/`until` first, then page through it with `offset`.
+**Paging.** `total` is the number of rows in this response's `data` array,
+not the number of rows that matched; `start` echoes `offset` and `page_size`
+echoes `limit`. A page shorter than `limit` is the last page. Rows are
+ordered newest first, and rows with an identical timestamp break by `id`
+(newest first). On an unchanging result set `offset` paging neither repeats nor
+skips rows; the log is live, though, so a new event (or a retention delete)
+between two page fetches shifts later pages. Pin the window with a fixed
+`until` in the past and use `id` to de-duplicate across pages. `offset` is
+capped at 10000 and is never clamped: a larger value is a `400`. To read past
+that depth, set `until` to the oldest `timestamp` already seen (it is
+inclusive), restart at `offset=0`, and de-duplicate on `id`.
+
+Rows carry `id`, `timestamp`, `principal`, `action`, `result`, `target_type`,
+`target_id` and `detail`. `principal_role` and `source_ip` are returned only
+by the legacy `GET /api/audit`; the MCP `query_audit_log` tool returns the
+same row set as this route.
 
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
-less than 1 (a negative or zero limit; caught explicitly rather than reaching
-PostgreSQL as an invalid `LIMIT`); `503` — the audit store is unavailable or
-the query degraded (ADR-0040 deny-on-degrade — see the note above this
-section; never a false-empty `200`). A non-numeric `limit` (e.g. `abc`) is
-NOT a 400 here — it is silently caught and the request proceeds with the
+less than 1, `since`/`until` is not a non-negative integer, `since` is
+greater than `until`, `offset` is not an integer in `0..10000`, a string
+filter holds a NUL or invalid UTF-8, or
+`target_id` is given without `target_type` (the index leads with
+`target_type`, so a bare `target_id` would scan the table); `503` — the
+audit store is unavailable or the query degraded (ADR-0040 deny-on-degrade —
+see the note above this section; never a false-empty `200`). A non-numeric
+`limit` (e.g. `abc`) is NOT a 400 here — the request proceeds with the
 default `limit` (100); the sibling `auth-sample` route below is stricter and
 400s on the same input.
 
@@ -3586,9 +3638,10 @@ order so a bounded `limit` is a sample across the window, not just the latest N.
 > **non-reproducible** (no seed) — re-running yields a different draw; the audited
 > `audit.auth_sample.exported` row is the chain-of-custody record of what was pulled.
 
-**Permission:** `AuditLog:Read` — note this is deliberately *not* admin-only, so
-a dedicated read-only auditor role can pull evidence without full admin
-(separation of duties).
+**Permission:** `AuditLog:Read` — with RBAC enabled this is deliberately *not*
+admin-only, so a dedicated read-only auditor role can pull evidence without
+full admin (separation of duties). With RBAC disabled it is admin-only (#5771;
+see the note at the top of this section).
 
 The export is itself audited as `audit.auth_sample.exported` (who pulled which
 window, and how many rows) so evidence access stays on the audit chain.
@@ -10437,18 +10490,23 @@ Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a lo
 Query audit events. Legacy route — **not** merely `GET /api/v1/audit` without
 the v1 envelope; the response shape and accepted parameters both genuinely
 differ. Accepts `principal`, `action`, `target_type`, `target_id`, `since`,
-`until`, `limit`, and `offset` (more than the v1 route's `limit`/`principal`/
-`action`). Response is `{"events": [...], "count": N, "total": <number-or-
+`until`, `limit`, and `offset` (the same filter names as the v1 route; the legacy route's validation is looser in one respect only: it does not reject a `target_id` given without `target_type`). Response is `{"events": [...], "count": N, "total": <number-or-
 null>}` (field names `events`/`count`/`total`, not v1's `data`/`pagination`/
-`meta`), and each event row additionally carries `id`, `principal_role`, and
+`meta`), and each event row additionally carries `principal_role` and
 `source_ip`, which v1's row shape omits. `total` is a best-effort second read
 taken after the page itself succeeds — it is `null`, not `0` or the page
 size, when that second read degrades; do not treat `null` as "unknown but
 probably zero".
 
+`limit` is capped at 1000 (a larger value is clamped, as on v1) and `offset`
+at 10000.
+
+**Permission:** `AuditLog:Read` (admin-only while RBAC is disabled, #5771).
+
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
-`limit`/`offset` query parameter is not a valid integer, or `limit < 1` /
-`offset < 0`; `503` — the audit store is closed, or the page-rows query
+`limit`/`offset` query parameter is not a valid integer, `limit < 1`,
+`offset` outside `0..10000`, `since`/`until` is negative or `since` is after `until`, or a string filter
+contains a NUL or invalid UTF-8; `503` — the audit store is closed, or the page-rows query
 degraded (ADR-0040 deny-on-degrade; never a false-empty `200`).
 
 ---
@@ -10702,7 +10760,10 @@ exist. `POST /query` returns `400` on a malformed request body.
 
 #### `GET /api/me`
 
-Returns current user info (legacy version; prefer `/api/v1/me`).
+Returns current user info (legacy version; prefer `/api/v1/me`). The flat body carries
+`username`, `display_name`, `role`, `rbac_enabled`, `rbac_role`, `effective_role`, `elevated`,
+`elevated_until` (only while elevated) and `can_access_settings`, with the same meaning as the
+`data` object of [`GET /api/v1/me`](#get-apiv1me). Sent with `Cache-Control: no-store, private`.
 
 #### `GET /api/analytics/status`
 
@@ -11507,7 +11568,7 @@ The first three gate `GuaranteedState:Read` and are not audited (cohort posture)
 |---|---|
 | `yuzu://server/health` | Server health status |
 | `yuzu://compliance/fleet` | Fleet-wide compliance data |
-| `yuzu://audit/recent` | Recent audit events |
+| `yuzu://audit/recent` | Recent audit events (`AuditLog:Read`; admin-only while RBAC is disabled) |
 
 **Prompts:**
 

@@ -18,6 +18,9 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
 - CMake (required by Meson's cmake dependency method — not used as a build system)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - vcpkg (set `VCPKG_ROOT`)
+- Optional, for the Erlang gateway: Erlang/OTP 28.4 or any later 28.x, plus rebar3. `meson setup`
+  finds it (kerl, asdf, mise, Homebrew `erlang@28`, distro packages, the Windows installer) and skips
+  the gateway with a warning if none matches; see `docs/erlang-gateway-build.md`.
 - For vcpkg's libpq port (Postgres substrate, ADR-0006; builds postgresql from source): **Linux** needs `bison flex` (apt); **macOS** needs `autoconf automake libtool` (brew); **Windows** none extra (vcpkg auto-acquires winflexbison)
 
 ### Quick start (setup script)
@@ -47,7 +50,7 @@ out-of-tree build dir (a review worktree, a scratch checkout) needs the same two
 pointing at a populated `vcpkg_installed`.
 
 ### Build options
-`-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true — gates only the four demo plugins: `example`, `chargen`, `procfetch`, `netprobe`; every other plugin builds under `-Dbuild_agent` regardless) / `-Dbuild_tests` (default false) / `-Drequire_gateway` (default false; when true, a missing `rebar3` is a configure error instead of silently skipping the Erlang gateway build and its `gateway eunit`/`gateway ct` tests — for local fresh setups; CI legs instead run `scripts/ci/assert-gateway-tests.py` after configure, because a non-default option stored in a persistent CI build dir breaks older branches' reconfigures (see the comment above the `require_gateway` error in `meson.build` and PR #4851; #4841 is the separate macOS gap, where CI had no Erlang at all). The CI check guards only the workflow files: a local or shared build dir that has stored `-Drequire_gateway=true` must be reset to `false` from a checkout that still has the option (`meson configure -Drequire_gateway=false <dir>`) or wiped (`./scripts/setup.sh --wipe`) before another branch reconfigures it, because Meson validates `-D` against the dir's stored options and a branch whose `meson.options` lacks the option then fails with `Unknown options`), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
+`-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true — gates only the four demo plugins: `example`, `chargen`, `procfetch`, `netprobe`; every other plugin builds under `-Dbuild_agent` regardless) / `-Dbuild_tests` (default false) / `-Drequire_gateway` (default false; when true, a gateway that cannot be built - no `rebar3`, or no Erlang/OTP 28.4 or later 28.x - is a configure error instead of skipping the Erlang gateway build and its `gateway eunit`/`gateway ct` tests — for local fresh setups; CI legs instead run `scripts/ci/assert-gateway-tests.py` after configure, because a non-default option stored in a persistent CI build dir breaks older branches' reconfigures (see the comment above the `require_gateway` error in `meson.build` and PR #4851; #4841 is the separate macOS gap, where CI had no Erlang at all). The CI check guards only the workflow files: a local or shared build dir that has stored `-Drequire_gateway=true` must be reset to `false` from a checkout that still has the option (`meson configure -Drequire_gateway=false <dir>`) or wiped (`./scripts/setup.sh --wipe`) before another branch reconfigures it, because Meson validates `-D` against the dir's stored options and a branch whose `meson.options` lacks the option then fails with `Unknown options`), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
 
 ### Per-OS build directory convention
 
@@ -55,7 +58,7 @@ Per-OS build dirs prevent clobbering when one tree is built from multiple hosts 
 
 ### Windows build
 
-`docs/windows-build.md` is the source of truth — MSYS2 bash sequence, the `setup_msvc_env.sh` + `scripts/ensure-erlang.sh` activation pair, path inventory, and two hard rules: **never `vcvars64.bat`** (extension exit-1 corrupts wrappers), **never Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe/MSVC). `cross-platform` + `build-ci` load this on any Windows-touching change.
+`docs/windows-build.md` is the source of truth — MSYS2 bash sequence, `setup_msvc_env.sh` (the gateway's Erlang/OTP needs no activation: Meson resolves it), path inventory, and two hard rules: **never `vcvars64.bat`** (extension exit-1 corrupts wrappers), **never Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe/MSVC). `cross-platform` + `build-ci` load this on any Windows-touching change.
 
 **Provisioning a native Windows CI runner** — see `deploy/windows/README.md` (provisioning spec, `toolchain-manifest.json`, runner self-test; gateway toolchain via `YUZU_ESCRIPT`/`YUZU_REBAR3`; the 4 runners share one vcpkg cache via `RUNNER_TOOL_CACHE`).
 

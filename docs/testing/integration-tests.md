@@ -6,7 +6,7 @@ This document describes how to run the end-to-end integration tests for the Yuzu
 
 ### Required
 - Built C++ server and agent: `meson compile -C build-linux`
-- Erlang/OTP 26+ with rebar3
+- Erlang/OTP 28.4 or any later 28.x, with rebar3
 - curl, nc (netcat)
 
 ### Optional

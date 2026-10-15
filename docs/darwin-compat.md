@@ -64,7 +64,7 @@ Before invoking `/test` (the pre-commit/pre-push gate skill) on a fresh macOS de
 |---|---|---|
 | autoconf/automake/libtool | `brew install autoconf automake libtool` | vcpkg's libpq port (Postgres substrate, ADR-0006) runs autoreconf during `vcpkg install`; a fresh mac fails the configure phase without them |
 | GNU bash 5+ | `brew install bash` | `mapfile` and `declare -A` are bash-4-only; stock `/bin/bash` 3.2 trips the version guards in `preflight.sh`, `perf-gate.sh`, `teardown.sh`, `test-fixtures-verify.sh` |
-| Erlang/OTP 28 | via kerl locally (see `scripts/ensure-erlang.sh`); CI downloads a hash-pinned build into `$RUNNER_TEMP` per job (#4841) | Gateway build + EUnit + dialyzer |
+| Erlang/OTP 28.4+ (same major; Homebrew `erlang` 29 is refused) | via kerl or `brew install erlang@28` locally (Meson resolves it at configure; `scripts/ensure-erlang.sh` for shells); CI downloads a hash-pinned build into `$RUNNER_TEMP` per job (#4841) | Gateway build + EUnit + dialyzer |
 | OrbStack or Docker Desktop | GUI / `brew install --cask orbstack` | Phase 1 image build + Phase 2 upgrade-test. Without a running Docker daemon both phases SKIP gracefully (the rest of `/test` continues), but you cannot exercise the upgrade-test surface |
 
 UAT bring-up is `bash scripts/start-UAT.sh` (cross-platform; `linux-start-UAT.sh` is a back-compat shim). The `_portable.sh` helper auto-discovers OrbStack at `/Applications/OrbStack.app/Contents/MacOS/xbin/docker` and Docker Desktop at `/Applications/Docker.app/Contents/Resources/bin/docker` — you do not need either on PATH globally.

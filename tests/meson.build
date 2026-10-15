@@ -1078,7 +1078,7 @@ endforeach
 # assert-suite-cover.py and `--suite agent` select it. Needs no fixtures: --list-tests
 # never runs a test body. It tolerates the `--test-args '[tag]'` that meson appends to
 # every test in the suite (the script ignores trailing extras in the agent family).
-_agent_shard_python3 = find_program('python3', 'python')
+_agent_shard_python3 = yuzu_python
 test('agent shard partition invariant',
   _agent_shard_python3,
   args: [files('../scripts/ci/check-pg-shard-partition.py'),
@@ -1370,6 +1370,7 @@ if build_server
       'unit/server/test_log_token.cpp',
       'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
+      'unit/server/test_rest_audit_query.cpp',
       'unit/server/test_rest_audit_helper.cpp',
       'unit/server/test_rest_scope_v1_routes.cpp', # #2146 Batch B2: POST /api/v1/scope/validate + /preview
       'unit/server/test_tag_store.cpp',
@@ -1394,6 +1395,7 @@ if build_server
       'unit/server/test_page_routes.cpp',
       'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
+      'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1615,6 +1617,7 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
@@ -2791,7 +2794,7 @@ if build_server
   # 'server-pg-smoke') is a genuine subset: exactly one entry, the expected
   # name, the expected exact case count, --allow-running-no-tests present,
   # and every matched case also carries [pg] (script's check_smoke()).
-  _pg_shard_python3 = find_program('python3', 'python')
+  _pg_shard_python3 = yuzu_python
   test('server pg shard partition invariant',
     _pg_shard_python3,
     args: [files('../scripts/ci/check-pg-shard-partition.py'),
@@ -2887,7 +2890,7 @@ if build_server
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
-_python3_test = find_program('python3', 'python')
+_python3_test = yuzu_python
 test('proto gen_proto version check',
   _python3_test,
   args: [files('test_gen_proto_version.py')],
@@ -2907,6 +2910,33 @@ test('gateway build wrapper',
   args: [files('test_build_gateway.py')],
   suite: 'docs',
   timeout: 180,
+)
+
+# OTP pin resolution (scripts/erlang_toolchain.py find-otp): the selection
+# rules Meson relies on at configure time, against fake installs. Hermetic.
+test('gateway OTP pin resolution',
+  _python3_test,
+  args: [files('test_erlang_toolchain_otp.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
+# scripts/ensure-erlang.sh sourced under `set -euo pipefail`, as
+# release-preflight.sh and integration-test.sh do. POSIX bash; skips itself on
+# Windows.
+test('ensure-erlang strict-mode callers',
+  _python3_test,
+  args: [files('test_ensure_erlang.py')],
+  suite: 'docs',
+  timeout: 180,
+)
+
+# Every script target uses yuzu_python (no ad-hoc find_program for python).
+test('meson python lookup is yuzu_python',
+  _python3_test,
+  args: [files('test_meson_python_lookup.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # Gateway image guards (#2150): the Dockerfile.gateway abi-guard's real text
