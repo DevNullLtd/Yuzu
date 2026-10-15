@@ -603,6 +603,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // the end of the handler, so the cooldown check below and the stamp after dispatch
         // cannot interleave with another run.
         struct RunGuard {
+            RunGuard() = default;
+            RunGuard(const RunGuard&) = delete; // a copy would release the slot twice
+            RunGuard& operator=(const RunGuard&) = delete;
             std::atomic<bool>* flag{nullptr};
             ~RunGuard() {
                 if (flag) flag->store(false);
