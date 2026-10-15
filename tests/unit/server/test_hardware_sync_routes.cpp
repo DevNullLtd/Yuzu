@@ -460,7 +460,7 @@ TEST_CASE("sync route: a cross-site, foreign-origin or header-less cookie write 
         CHECK(h.dispatch_calls == 0);
         CHECK(h.audited("requested") == false);
         REQUIRE_FALSE(h.audit_rows.empty());
-        CHECK(h.audit_rows.back().starts_with("csrf.denied|denied|"));
+        CHECK(h.audit_rows.back() == "csrf.denied|denied|Endpoint|hardware.sync");
     }
 }
 

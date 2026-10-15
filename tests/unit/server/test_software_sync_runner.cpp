@@ -289,7 +289,9 @@ TEST_CASE("sync runner: stacked stalled holders are capped, and a takeover is re
     int depth = 0;
     std::vector<ss::Status> nested;
     auto env = rig.env();
+    int refused = 0;
     env.on_takeover = [&] { ++takeovers; };
+    env.on_takeover_refused = [&] { ++refused; };
     ss::Runner* self = nullptr;
     const std::vector<std::string> names = {"u1", "u2", "u3", "u4", "u5"};
     env.dispatch = [&](const auth::Session&, const std::vector<std::string>& ids) {
@@ -311,6 +313,10 @@ TEST_CASE("sync runner: stacked stalled holders are capped, and a takeover is re
     CHECK(nested[1] == ss::Status::Accepted);
     CHECK(nested[2] == ss::Status::Accepted);
     CHECK(takeovers == ss::kMaxLiveRuns - 1);
+    // Everything unwound: the live-run count returned to zero, so the slot is usable again.
+    rig.mono += ss::kSlotLeaseMs + 1;
+    CHECK(runner.run(session_of("fresh"), kFleet, rig.audit()).status == ss::Status::Accepted);
+    CHECK(refused == 1);
 }
 
 TEST_CASE("sync runner: a dispatch that throws is a retryable 503, with the slot released",

@@ -12490,6 +12490,11 @@ private:
                     return std::nullopt;
                 return sess->agent_version;
             };
+            env.on_takeover_refused = [] {
+                spdlog::warn("software sync: a takeover was refused because the maximum number of "
+                             "stalled runs are still alive; sync stays unavailable until one of their "
+                             "sends unwinds (a stalled agent stream) or the server restarts");
+            };
             env.on_takeover = [] {
                 spdlog::warn("software sync: a run took over a lapsed in-flight lease; the previous "
                              "holder is still sending (a stalled agent stream)");

@@ -73,6 +73,8 @@ struct Env {
     std::function<std::int64_t()> mono_ms;
     /// Optional: told when a run takes over a lapsed lease (the previous holder is still sending).
     std::function<void()> on_takeover;
+    /// Optional: told when a takeover is refused because kMaxLiveRuns runs are already alive.
+    std::function<void()> on_takeover_refused;
 };
 
 /// Where a run writes its audit rows. `note` is best-effort (refusals and failures);
@@ -285,8 +287,12 @@ private:
             if (cur != 0 && now_ms < cur)
                 return false; // held and the lease has not lapsed
             const bool takeover = cur != 0;
-            if (takeover && r_.live_runs_.load() >= kMaxLiveRuns)
-                return false; // too many stalled predecessors already: do not strand another worker
+            if (takeover && r_.live_runs_.load() >= kMaxLiveRuns) {
+                // Too many stalled predecessors already: do not strand another worker.
+                if (r_.env_.on_takeover_refused)
+                    r_.env_.on_takeover_refused();
+                return false;
+            }
             const auto mine = now_ms + kSlotLeaseMs;
             if (!r_.slot_until_ms_.compare_exchange_strong(cur, mine))
                 return false; // lost a race

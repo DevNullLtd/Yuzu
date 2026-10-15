@@ -639,7 +639,7 @@ place, **Hardware** and **Software**, each its own page:
       (`429` with `Retry-After`; an attempt refused for exceeding 500 devices, or with no live target, counts as a run, a send every device refused does not) and one at a time per server process (`409`); a single device
       is exempt from both. A `409` can follow a slow agent connection: the server sends to its
       targets one after another, and a connected agent that has stopped reading holds the run
-      for at most 120 seconds, after which the next request takes the run over (`retry_after_ms` on the `409` is the time until that lease lapses; the stalled send itself is not cancelled, and at most three runs are alive at once). A server clock that steps backwards
+      for at most 120 seconds, after which the next request takes the run over (`retry_after_ms` on the `409` is the time until that lease lapses; the stalled send itself is not cancelled). At most three runs are alive at once: while three stalled sends are still alive, no further takeover is allowed, the `409` keeps answering, and a WARN line is logged, until one of those sends unwinds (the agent reads, or its connection is cut) or the server restarts. A server clock that steps backwards
       cannot lock an operator out: a last-run time in the future is ignored. Both limits are
       held in each server process, not across a cluster: with several active servers every
       one allows its own run and keeps its own per-operator cooldown, and each run is still
