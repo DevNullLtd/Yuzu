@@ -105,7 +105,7 @@ TEST_CASE("sync runner: the cooldown is per operator and shared by every caller 
     const auto again = runner.run(session_of("alice"), kFleet, rig.audit());
     CHECK(again.status == ss::Status::Cooldown);
     CHECK(again.http == 429);
-    CHECK(again.retry_after_secs > 0);
+    CHECK(again.retry_after_ms.value_or(0) > 0);
     CHECK(rig.dispatch_calls == 1);
     // Another operator is not held back by alice's stamp.
     CHECK(runner.run(session_of("bob"), kFleet, rig.audit()).status == ss::Status::Accepted);
@@ -125,7 +125,7 @@ TEST_CASE("sync runner: a second run during a send is 409; a lapsed lease may be
     REQUIRE(runner.run(session_of("alice"), kFleet, rig.audit()).status == ss::Status::Accepted);
     CHECK(inner.status == ss::Status::InFlight);
     CHECK(inner.http == 409);
-    CHECK(inner.retry_after_ms >= 1000);
+    CHECK(inner.retry_after_ms.value_or(0) >= 1000);
 
     // A holder that never finishes: once its lease lapses another run takes the slot, and the
     // stalled run's late release cannot clear the new holder's lease.

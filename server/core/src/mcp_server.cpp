@@ -15322,7 +15322,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 default:
                     // Cooldown, in-flight, unresolved scope, audit unavailable, nothing reachable,
                     // over the cap: the Runner supplies the hint where retrying can help.
-                    res.set_content(a4_error(kInternalError, out.message, {}, out.retry_after_ms),
+                    res.set_content(a4_error(kInternalError, out.message, {}, out.retry_after_ms.value_or(-1)),
                                     "application/json");
                     return;
                 }

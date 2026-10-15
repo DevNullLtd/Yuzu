@@ -113,26 +113,17 @@ struct SyncHarness {
                 const auto it = version_by_id.find(id);
                 return it != version_by_id.end() ? it->second : default_version;
             };
-        if (w.resolver)
-            deps.sync_resolve_fn = [this](const auth::Session& s, const ss::Selector& sel) {
+        // The fleet run exists only when every closure it needs is wired: a missing one leaves
+        // the route's runner empty, which is the audited 500 the unwired tests pin.
+        if (w.resolver && w.dispatch && w.precheck && w.version) {
+            ss::Env env;
+            env.resolve = [this](const auth::Session& s, const ss::Selector& sel) {
                 ++resolve_calls;
                 last_selector = sel;
                 last_username = s.username;
                 return resolved;
             };
-        if (w.clock)
-            deps.sync_now_fn = [this] {
-                if (on_clock)
-                    on_clock();
-                return clock;
-            };
-        if (w.precheck)
-            deps.sync_caller_unfiltered_fn = [this](const auth::Session&) {
-                ++precheck_calls;
-                return precheck_override.value_or(resolved.caller_unfiltered);
-            };
-        if (w.dispatch)
-            deps.sync_dispatch_many_fn = [this](const auth::Session&, const std::vector<std::string>& ids) {
+            env.dispatch = [this](const auth::Session&, const std::vector<std::string>& ids) {
                 ++dispatch_calls;
                 events.push_back("dispatch");
                 dispatched.insert(dispatched.end(), ids.begin(), ids.end());
@@ -140,6 +131,19 @@ struct SyncHarness {
                     during_dispatch();
                 return ss::DispatchResult{accept.value_or(ids.size()), "__sync__-fleet-test"};
             };
+            env.caller_unfiltered = [this](const auth::Session&) {
+                ++precheck_calls;
+                return precheck_override.value_or(resolved.caller_unfiltered);
+            };
+            env.agent_version = deps.agent_version_fn;
+            if (w.clock)
+                env.now = [this] {
+                    if (on_clock)
+                        on_clock();
+                    return clock;
+                };
+            deps.sync_runner = std::make_shared<ss::Runner>(std::move(env));
+        }
         deps.write_gate.resolve_session = [this](const httplib::Request&) {
             auth::Session s;
             s.username = username;

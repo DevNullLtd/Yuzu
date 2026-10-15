@@ -186,19 +186,7 @@ void HardwareRoutes::register_routes(httplib::Server& svr, Deps deps) {
 void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     deps_ = std::move(deps);
 
-    // The fleet run: shared with the MCP twin when the server wires one; otherwise (a test) a
-    // private instance over this route's own closures.
     sync_runner_ = deps_.sync_runner;
-    if (!sync_runner_ && deps_.sync_resolve_fn && deps_.sync_dispatch_many_fn &&
-        deps_.sync_caller_unfiltered_fn && deps_.agent_version_fn) {
-        software_sync::Env env;
-        env.resolve = deps_.sync_resolve_fn;
-        env.dispatch = deps_.sync_dispatch_many_fn;
-        env.caller_unfiltered = deps_.sync_caller_unfiltered_fn;
-        env.agent_version = deps_.agent_version_fn;
-        env.now = deps_.sync_now_fn;
-        sync_runner_ = std::make_shared<software_sync::Runner>(std::move(env));
-    }
 
     // -- Page shells (auth-only chrome; fragments carry the real gates) --
     sink.Get("/hardware", [this](const httplib::Request& req, httplib::Response& res) {
@@ -625,13 +613,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const auto out = sync_runner_->run(*session, *parsed, audit);
         if (out.status != ss::Status::Accepted) {
             if (out.status == ss::Status::Cooldown)
-                res.set_header("Retry-After", std::to_string(out.retry_after_secs));
+                res.set_header("Retry-After", std::to_string(*out.retry_after_ms / 1000));
             res.status = out.http;
-            if (out.retry_after_ms >= 0)
-                res.set_content(detail::a4_error(res, out.message, {.retry_after_ms = out.retry_after_ms}),
-                                "application/json");
-            else
-                res.set_content(detail::a4_error(res, out.message), "application/json");
+            res.set_content(detail::a4_error(res, out.message, {.retry_after_ms = out.retry_after_ms}),
+                            "application/json");
             return;
         }
         nlohmann::json body = {{"data", out.summary}, {"meta", {{"api_version", "v1"}}}};

@@ -293,20 +293,6 @@ public:
     using SyncPermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                           const std::string& securable_type,
                                           const std::string& operation)>;
-    /// Selector -> caller-visible target ids (+ whether the caller is unfiltered).
-    using SyncResolveFn = std::function<software_sync::Resolved(const auth::Session&,
-                                                                const software_sync::Selector&)>;
-    /// Send `__sync__.now {source: installed_software}` to every id as one system-reserved
-    /// push (one command id, one gateway flush); `sent` counts the sessions that accepted it.
-    using SyncDispatchManyFn = std::function<software_sync::DispatchResult(
-        const auth::Session&, const std::vector<std::string>& ids)>;
-    /// Does the caller hold an UNFILTERED Execution:Execute (so may name the whole fleet)? Cheap
-    /// by contract: no fleet read. The route asks it before taking the run guard.
-    using SyncUnfilteredFn = std::function<bool(const auth::Session&)>;
-    /// Seconds since the epoch, for the sync cooldown and the `requested_at` stamp. Empty means
-    /// the system clock; a test injects a fake so the cooldown boundaries are exact.
-    using SyncNowFn = std::function<std::int64_t()>;
-
     struct Deps {
         AuthFn auth_fn;
         ScopedPermFn scoped_perm_fn;
@@ -333,24 +319,13 @@ public:
         bool containment_ui{kContainmentUi};
         /// POST /api/v1/hardware/sync — the Software page's fleet/group/scope "Sync now".
         /// `sync_perm_fn` is the type-level Execution:Execute gate (it writes the 401/403).
-        /// `sync_resolve_fn` turns a selector into the caller's visible target ids (already
-        /// intersected with their Execution:Execute visible set) and reports whether that
-        /// set is unfiltered; `sync_dispatch_many_fn` sends `__sync__.now` to each id.
-        /// `sync_caller_unfiltered_fn` lets a confined caller's `__all__` be refused before it
-        /// takes the single in-flight slot or reads the fleet.
-        /// Any of the six (`sync_perm_fn`, `auth_fn`, the three `sync_*_fn` closures above,
-        /// `agent_version_fn`) empty == the route answers an AUDITED 500 (result=failure, nothing
-        /// sent): a missing derivation is a misconfiguration, not an outage.
-        /// `sync_now_fn` is optional (empty == system clock).
+        /// `sync_runner` is the fleet run (resolve, cap, cooldown, in-flight lease, audit, send).
+        /// `sync_perm_fn`, `auth_fn` or `sync_runner` empty == the route answers an AUDITED 500
+        /// (result=failure, nothing sent): a missing derivation is a misconfiguration, not an
+        /// outage.
         SyncPermFn sync_perm_fn;
-        SyncResolveFn sync_resolve_fn;
-        SyncDispatchManyFn sync_dispatch_many_fn;
-        SyncUnfilteredFn sync_caller_unfiltered_fn;
-        SyncNowFn sync_now_fn;
-        /// The fleet run, shared with the MCP tool `sync_hardware_software` so the per-operator
-        /// cooldown and the single in-flight slot bind BOTH surfaces. Production wires one
-        /// instance into both; unset (a test), the route builds a private one from the
-        /// `sync_*_fn` closures above.
+        /// Shared with the MCP tool `sync_hardware_software` so the per-operator cooldown and
+        /// the single in-flight slot bind BOTH surfaces: production wires one instance into both.
         std::shared_ptr<software_sync::Runner> sync_runner;
         /// Same-site gate for the cookie-authorised sync POSTs (both the fleet and the
         /// per-device route). Unwired fails closed: a header-less request is refused.
@@ -368,8 +343,7 @@ private:
 
     Deps deps_;
 
-    /// The fleet-run sequence and its per-process cooldown / in-flight state (built from the
-    /// `sync_*_fn` closures when `Deps::sync_runner` is unset).
+    /// `Deps::sync_runner`: the fleet-run sequence and its per-process cooldown / in-flight state.
     std::shared_ptr<software_sync::Runner> sync_runner_;
 };
 

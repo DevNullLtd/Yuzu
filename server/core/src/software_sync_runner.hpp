@@ -89,8 +89,7 @@ struct Outcome {
     Status status{Status::Accepted};
     int http{202};
     std::string message;                // the error text (non-Accepted)
-    std::int64_t retry_after_ms{-1};    // -1 = no hint
-    std::int64_t retry_after_secs{0};   // for a Retry-After header (Cooldown)
+    std::optional<std::int64_t> retry_after_ms; // unset = no hint
     nlohmann::json summary;             // Accepted: summary_json(...)
 };
 
@@ -105,13 +104,12 @@ public:
         const std::string_view type = sel.arm == DispatchArm::Ids ? "Agent" : "Scope";
         const std::string target_id = target_label(sel);
         const auto refuse = [&](Status st, int http, std::string message, const std::string& why,
-                                std::int64_t retry_ms = -1, std::int64_t retry_secs = 0) {
+                                std::optional<std::int64_t> retry_ms = std::nullopt) {
             audit.note("denied", type, target_id, why + " scope=" + audit_token(sel.expr));
             out.status = st;
             out.http = http;
             out.message = std::move(message);
             out.retry_after_ms = retry_ms;
-            out.retry_after_secs = retry_secs;
             return out;
         };
         const auto refuse_fleet_wide = [&] {
@@ -143,7 +141,7 @@ public:
         const auto refuse_cooldown = [&](std::int64_t wait) {
             return refuse(Status::Cooldown, 429,
                           "a sync run was requested a moment ago; wait " + std::to_string(wait) + "s",
-                          "rate_limited cooldown=" + std::to_string(wait) + "s", wait * 1000, wait);
+                          "rate_limited cooldown=" + std::to_string(wait) + "s", wait * 1000);
         };
         if (guarded) {
             if (const auto wait = cooldown_wait(); wait > 0)
