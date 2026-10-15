@@ -10,6 +10,7 @@
 
 #include "app_shell.hpp"
 #include "authz_model.hpp"          // authz::in_scope
+#include "device_containment_render.hpp" // kContainmentUi
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
@@ -91,11 +92,13 @@ bool bad_hw_ident(std::string_view v) {
 }
 
 std::string hw_lens_or_overview(const std::string& raw) {
-    static constexpr std::string_view kLenses[] = {"overview", "software", "tags",    "containment",
-                                                   "dex",      "guardian", "live",    "actions"};
+    static constexpr std::string_view kLenses[] = {"overview", "software", "tags",  "dex",
+                                                   "guardian", "live",     "actions"};
     for (const auto l : kLenses)
         if (raw == l)
             return raw;
+    if (kContainmentUi && raw == "containment")
+        return raw;
     return "overview";
 }
 
@@ -260,7 +263,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // list itself is the response): a 403 means "this caller may not see pills" and draws
         // none; an unavailable or unwired gate, or a degraded store, sets the banner flag and
         // no pill (absence is then not evidence).
-        if (deps_.quarantine_list_fn && !page.rows.empty()) {
+        if (kContainmentUi && deps_.quarantine_list_fn && !page.rows.empty()) {
             std::vector<std::string> page_ids;
             page_ids.reserve(page.rows.size());
             for (const auto& row : page.rows)

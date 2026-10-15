@@ -567,6 +567,8 @@ address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
 ### Containment from the Hardware page
 
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown; quarantine is available through the REST API and MCP only.
+
 The dashboard shows and drives quarantine records without a separate page:
 
 - **Quarantined devices** panel on `/hardware` lists the active records you may read
