@@ -168,7 +168,7 @@ yuzu_integrations_js_embed = custom_target(
   input: 'static/yuzu-integrations.js',
   output: 'yuzu_integrations_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -183,7 +183,7 @@ yuzu_integrations_sync_js_embed = custom_target(
   input: 'static/yuzu-integrations-sync.js',
   output: 'yuzu_integrations_sync_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
