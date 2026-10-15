@@ -4,20 +4,31 @@
 set -euo pipefail
 
 # One package transition at a time (see postinstall; PR #4482 governance ch-3).
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+TRANSITION_LOCK=/var/db/.yuzu-agent-transition.lock
 if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
-    exec /usr/bin/lockf -k -t 600 /var/db/.yuzu-agent-transition.lock \
+    # Owner-only: a lock file any account can open is one it can hold,
+    # blocking every install and uninstall (PR #4482 governance G8-S2). /var/db
+    # is root-only, so nothing else can place this path.
+    [[ ! -L "$TRANSITION_LOCK" ]] || { echo "ERROR: refusing a symlinked transition lock" >&2; exit 1; }
+    (umask 077; : >> "$TRANSITION_LOCK")
+    chmod 600 "$TRANSITION_LOCK"
+    exec /usr/bin/lockf -k -t 600 "$TRANSITION_LOCK" \
         /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
 fi
 
 PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
 STATE_DIR="/var/db/yuzu-agent"
+LOG_DIR="/Library/Logs/Yuzu"
+# This package's own Scripts directory: build-pkg.sh puts package-info (lane,
+# unsigned plugins) and the plugin list there, so every check that needs only
+# them runs here, before Installer lays down the payload or removes anything an
+# older package's receipt listed (PR #4482 governance rd-n2).
+SCRIPT_SRC="$(cd "$(dirname "$0")" && pwd)"
 DATA_DIR="/Library/Application Support/Yuzu"
 APP_ROOT="/Library/Application Support/YuzuAgent"
 LEGACY_APP="$DATA_DIR/YuzuAgent.app"
-LEGACY_TEAM_ID="7RLSYL2JM7"
-LEGACY_APP_ID="7RLSYL2JM7.co.uk.devnullsecurity.yuzu-agent"
-LEGACY_SIGNING_AUTHORITY="Mac Developer: Nathan Dornbrook (YA95685L8R)"
-LEGACY_PROFILE_SHA256="3e764aafaa5cd29398ef6646b98c7b00332404c5ea57f79b92663695acdd70e1"
 YUZU_LIB="/usr/local/lib/yuzu"
 PLUGIN_DIR="$YUZU_LIB/plugins"
 LOOSE_BIN="/usr/local/bin"
@@ -47,11 +58,18 @@ code_directory_chain_trusted() {
     done
 }
 
-# See postinstall: content a non-root account could have written is refused (ch-4).
+# Fixing a directory's mode does not fix what a non-root user already left in
+# it: a planted yuzu-agent.old is promoted by the updater's rollback and a
+# planted plugin is loaded by the root daemon, which scans the plugin tree
+# recursively (PR #4482 governance ch-4, G8-S1). Every agent code entry in
+# /usr/local/bin (incoming names included, ch-5) and everything below the
+# plugin directory must be root-owned, not group/world writable, and not a
+# symlink. The list is reported even when a directory check also failed: a
+# recursive chown "fix" would make planted files look root-installed.
 reject_untrusted_code_entries() {
-    local entry owner mode bad=""
+    local entry owner mode bad="" found
     for entry in "$LOOSE_BIN"/yuzu-agent* "$LOOSE_BIN"/libyuzu_agent_core* \
-                 "$LOOSE_BIN/.yuzu-update-verified" "$PLUGIN_DIR"/* "$PLUGIN_DIR"/.[!.]*; do
+                 "$LOOSE_BIN"/.yuzu-* "$LOOSE_BIN"/.libyuzu_agent_core*; do
         [[ -e "$entry" || -L "$entry" ]] || continue
         if [[ -L "$entry" ]]; then
             bad="$bad$entry"$'\n'; continue
@@ -60,11 +78,29 @@ reject_untrusted_code_entries() {
         mode="$(stat -f '%Lp' "$entry")"
         [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || bad="$bad$entry"$'\n'
     done
+    if [[ -d "$PLUGIN_DIR" && ! -L "$PLUGIN_DIR" ]]; then
+        found="$(find "$PLUGIN_DIR" -mindepth 1 \( -type l -o ! -user 0 -o -perm -0020 -o -perm -0002 \) -print)" || {
+            echo "ERROR: cannot inspect $PLUGIN_DIR" >&2; return 1; }
+        [[ -z "$found" ]] || bad="$bad$found"$'\n'
+    fi
     [[ -z "$bad" ]] && return 0
     echo "ERROR: refusing to install beside code a non-root account could have written:" >&2
     printf '%s' "$bad" | while IFS= read -r entry; do echo "         $entry" >&2; done
     echo "       Inspect each entry and remove anything you did not install as root, then retry." >&2
+    echo "       Do not chown -R these paths: that makes another account's files look root-installed." >&2
     return 1
+}
+
+# Both checks run and report before either refuses (G8-S1). $1 is the lane.
+require_trusted_code_tree() {
+    local lane="$1" failed=0 directories="/usr/local, /usr/local/lib and /usr/local/lib/yuzu"
+    [[ "$lane" != loose ]] || directories="/usr/local, /usr/local/lib, /usr/local/lib/yuzu and /usr/local/bin"
+    if ! code_directory_chain_trusted "$lane"; then
+        echo "ERROR: $directories must be root-owned and not group/world writable; the active service was left unchanged" >&2
+        failed=1
+    fi
+    reject_untrusted_code_entries || failed=1
+    return "$failed"
 }
 
 secure_payload_parent() {
@@ -159,23 +195,42 @@ require_trusted_data_directory() {
         echo "       Remove the group/world write bit (chmod go-w) or restore its owner, then retry." >&2
         return 1; }
 }
+
+# The log directory follows the data directory's owner rule: install-agent-user.sh
+# gives both to _yuzu (governance rd-n3).
+require_trusted_log_directory() {
+    local owner mode
+    [[ -e "$LOG_DIR" || -L "$LOG_DIR" ]] || return 0
+    [[ -d "$LOG_DIR" && ! -L "$LOG_DIR" ]] || {
+        echo "ERROR: log path is not a real directory: $LOG_DIR" >&2; return 1; }
+    owner="$(stat -f '%u' "$LOG_DIR")"
+    mode="$(stat -f '%Lp' "$LOG_DIR")"
+    data_directory_owner_trusted "$owner" && [[ $((8#$mode & 8#022)) == 0 ]] || {
+        echo "ERROR: existing log directory must be owned by root or _yuzu and not group/world writable: $LOG_DIR" >&2
+        echo "       (owner uid $owner, mode $mode). Remove the group/world write bit or restore its owner, then retry." >&2
+        return 1; }
+}
+
+PACKAGE_MODE="$(awk -F= '$1 == "mode" {print $2}' "$SCRIPT_SRC/package-info" 2>/dev/null || true)"
+UNSIGNED_PLUGINS="$(awk -F= '$1 == "unsigned_plugins" {print $2}' "$SCRIPT_SRC/package-info" 2>/dev/null || true)"
+[[ ( "$PACKAGE_MODE" == loose || "$PACKAGE_MODE" == bundle ) && -f "$SCRIPT_SRC/package-files.list" ]] || {
+    echo "ERROR: the package is missing its package-info or plugin list" >&2; exit 1; }
 if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
     [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || {
         echo "ERROR: data path is not a real directory: $DATA_DIR" >&2; exit 1; }
     require_trusted_data_directory || exit 1
 fi
-# Both lanes deliver code below /usr/local/lib/yuzu, so its whole existing chain
-# must be root-owned and non-writable before the payload lands (PR #4482
-# governance sec-2). /usr/local/bin is checked by postinstall for the loose lane.
-code_directory_chain_trusted bundle || {
-    echo "ERROR: /usr/local, /usr/local/lib and /usr/local/lib/yuzu must be root-owned and not group/world writable" >&2
-    exit 1; }
+require_trusted_log_directory || exit 1
+# Both lanes deliver code below /usr/local/lib/yuzu and the loose lane into
+# /usr/local/bin, so the chain this package's lane uses, and everything already
+# in it, must be trusted before the payload lands (governance sec-2, ch-4,
+# ch-5, G8-S1).
+require_trusted_code_tree "$PACKAGE_MODE" || exit 1
 secure_payload_parent "$APP_ROOT" 755
 secure_payload_parent "$YUZU_LIB" 755
 if [[ -e "$PLUGIN_DIR" || -L "$PLUGIN_DIR" ]]; then
     require_trusted_directory "$PLUGIN_DIR"
 fi
-reject_untrusted_code_entries || exit 1
 ensure_state_dir
 
 
@@ -186,6 +241,42 @@ plugin_hash_matches() {
     [[ -n "$recorded" && -f "$PLUGIN_DIR/$plugin" ]] || return 1
     actual="$(shasum -a 256 "$PLUGIN_DIR/$plugin")" || return 1
     [[ "${actual%% *}" == "$recorded" ]]
+}
+
+was_managed_plugin() {
+    local plugin="$1" manifest="$YUZU_LIB/package-files.list" hashes="$YUZU_LIB/package-files.sha256"
+    [[ -f "$manifest" ]] && grep -Fqx -- "plugins/$plugin" "$manifest" || return 1
+    [[ ! -f "$hashes" ]] || plugin_hash_matches "$plugin" "$hashes"
+}
+
+# The plugin-name collision check, before the payload exists (rd-n2);
+# postinstall repeats it against the delivered files.
+reject_unmanaged_plugin_collisions() {
+    local relative name
+    while IFS= read -r relative; do
+        [[ "$relative" == plugins/* ]] || continue
+        name="${relative#plugins/}"
+        [[ -e "$PLUGIN_DIR/$name" || -L "$PLUGIN_DIR/$name" ]] || continue
+        was_managed_plugin "$name" || {
+            echo "ERROR: this package's plugin $name collides with one not installed by a Yuzu package, or changed since; the active service was left unchanged" >&2
+            return 1; }
+    done < "$SCRIPT_SRC/package-files.list"
+}
+
+# A retained --plugin-require-signature would reject every unsigned plugin of
+# this package (pd-1). An unreadable definition is not enforcing: the merge
+# replaces it with the package default.
+reject_unsigned_plugins_under_enforcement() {
+    local arguments environment
+    [[ "$UNSIGNED_PLUGINS" == 1 && -f "$PLIST" ]] || return 0
+    arguments="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST" 2>/dev/null)" || return 0
+    if ! grep -Eq '^ *--plugin-require-signature(=|$)' <<<"$arguments"; then
+        environment="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables' "$PLIST" 2>/dev/null)" || return 0
+        grep -Eq '^ *YUZU_PLUGIN_REQUIRE_SIGNATURE = ' <<<"$environment" || return 0
+    fi
+    echo "ERROR: the existing service requires signed plugins, but this package has unsigned plugins." >&2
+    echo "       Install a package built with plugin signatures, or remove --plugin-require-signature first. The active service was left unchanged." >&2
+    return 1
 }
 
 # See postinstall: an operator-modified listed plugin is kept (sec-3).
@@ -259,6 +350,9 @@ adopt_receipted_plugins() {
     temporary="$(mktemp "$YUZU_LIB/.legacy-manifest.XXXXXX")"
     while IFS= read -r relative; do
         case "$relative" in
+            usr/local/lib/yuzu/plugins/._*)
+                # AppleDouble metadata from a build host, not a plugin (xp-15).
+                ;;
             usr/local/lib/yuzu/plugins/*.dylib)
                 name="${relative#usr/local/lib/yuzu/plugins/}"
                 [[ "$name" != .* && "$name" != */* && "$name" != *[!a-zA-Z0-9_.-]* ]] || {
@@ -289,20 +383,6 @@ quarantine_legacy_app() {
     echo "WARNING: quarantined an unrecognized legacy YuzuAgent.app at $destination; it was not run, restored or deleted" >&2
 }
 
-legacy_app_is_managed() {
-    local candidate="${1:-$LEGACY_APP}"
-    [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
-    [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist" 2>/dev/null || true)" \
-        == "${LEGACY_APP_ID#*.}" ]] || return 1
-    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1 || return 1
-    [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2; exit}')" \
-        == "$LEGACY_TEAM_ID" ]] || return 1
-    [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^Authority=/{print $2; exit}')" \
-        == "$LEGACY_SIGNING_AUTHORITY" ]] || return 1
-    [[ -f "$candidate/Contents/embedded.provisionprofile" ]] || return 1
-    [[ "$(shasum -a 256 "$candidate/Contents/embedded.provisionprofile" | awk '{print $1}')" \
-        == "$LEGACY_PROFILE_SHA256" ]]
-}
 
 require_started() {
     local observation attempt stable=0
@@ -332,7 +412,7 @@ restart_restored_service() {
         return 0; }
     [[ ! -e "$recovery/loose/yuzu-agent" ]] || lane=loose
     if ! code_directory_chain_trusted "$lane"; then
-        echo "WARNING: restored the previous agent but did not start it: a directory below /usr/local is not root-owned and non-writable" >&2
+        echo "WARNING: restored the previous agent but did not start it: a directory below /usr/local is not root-owned, or is group- or world-writable" >&2
         return 0
     fi
     # Read first, then match: a failed read must never look like "not the
@@ -428,6 +508,8 @@ chmod 700 "$RECOVERY"
 
 discard_stale_manifest
 adopt_receipted_plugins
+reject_unmanaged_plugin_collisions || exit 1
+reject_unsigned_plugins_under_enforcement || exit 1
 # Recovery restarts only what was running (sec-1); postinstall refreshes this.
 if launchctl_state="$(launchctl print "system/com.yuzu.agent" 2>/dev/null)" && \
    [[ "$launchctl_state" == *"state = running"* ]]; then
@@ -435,15 +517,10 @@ if launchctl_state="$(launchctl print "system/com.yuzu.agent" 2>/dev/null)" && \
 fi
 copy_if_present "$PLIST" "$RECOVERY/LaunchDaemons/com.yuzu.agent.plist"
 copy_if_present "$APP_ROOT/YuzuAgent.app" "$RECOVERY/YuzuAgent.app"
-# Keep the old code tree out of the new data-root policy. The old app remains
-# live until postinstall has started the new daemon, but this copy permits
-# recovery if the final legacy cleanup is interrupted.
-# Copy first, then verify the copy: the check must apply to the bytes kept in
-# the root-only snapshot, not to a path that can change between check and copy.
-if [[ -d "$LEGACY_APP" && ! -L "$LEGACY_APP" ]]; then
-    copy_if_present "$LEGACY_APP" "$RECOVERY/legacy/YuzuAgent.app"
-    legacy_app_is_managed "$RECOVERY/legacy/YuzuAgent.app" || rm -rf "$RECOVERY/legacy"
-fi
+# A legacy development app under the data directory is not snapshotted: it
+# stays in place until postinstall's retire_legacy_app moves it into this
+# snapshot (legacy-retired.app), and every recovery path quarantines that copy
+# rather than restoring it (PR #4482 governance sec-8).
 copy_if_present "/usr/local/bin/yuzu-agent" "$RECOVERY/loose/yuzu-agent"
 copy_if_present "/usr/local/bin/libyuzu_agent_core.dylib" "$RECOVERY/loose/libyuzu_agent_core.dylib"
 copy_if_present "/usr/local/lib/libyuzu_agent_core.dylib" "$RECOVERY/loose/legacy-lib/libyuzu_agent_core.dylib"

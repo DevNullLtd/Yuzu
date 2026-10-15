@@ -28,7 +28,8 @@ if [[ -z "$VERSION" || ( -z "$BIN_DIR" && -z "$BUNDLE_DIR" ) || ( -n "$BIN_DIR" 
     usage; exit 1
 fi
 # The version is written into the payload manifest and the distribution XML.
-[[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]] || {
+# release.yml turns a tag's "-" into "_" (0.15.0_rc1), so "_" is allowed.
+[[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]] || {
     echo "ERROR: --version must be a plain version string: $VERSION" >&2; exit 1; }
 
 STAGING="$(mktemp -d)"
@@ -69,7 +70,19 @@ record_plugin() {
     printf 'plugins/%s\n' "$name" >> "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
     printf '%s  plugins/%s\n' "$digest" "$name" >> "${STAGING}/usr/local/lib/yuzu/.package-files.sha256.incoming"
 }
-install -m 644 "$SCRIPT_DIR/merge-launchd-plist.js" "$STAGING/usr/local/lib/yuzu/merge-launchd-plist.js"
+# The loose-lane code lands in the shared /usr/local/bin before postinstall
+# runs; postinstall promotes it only if its bytes still match (governance ch-5).
+record_loose_binary() {
+    local staged="$1" name="$2" digest
+    digest="$(shasum -a 256 "$staged")" || { echo "ERROR: cannot hash $name" >&2; return 1; }
+    digest="${digest%% *}"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "ERROR: invalid SHA-256 for $name" >&2; return 1; }
+    printf '%s  bin/%s\n' "$digest" "$name" >> "${STAGING}/usr/local/lib/yuzu/.package-files.sha256.incoming"
+}
+# The plist-merge helper runs as root, so it ships in the package's own
+# root-owned Scripts directory, never in the payload below /usr/local (PR #4482
+# governance G8-S3).
+install -m 644 "$SCRIPT_DIR/merge-launchd-plist.js" "$SCRIPTS/merge-launchd-plist.js"
 
 PACKAGE_MODE="loose"
 AGENT_BIN=""
@@ -154,11 +167,13 @@ else
     [[ -f "$AGENT_BIN" ]] || { echo "ERROR: yuzu-agent not found in $BIN_DIR" >&2; exit 1; }
     install -d "${STAGING}/usr/local/bin"
     install -m 755 "$AGENT_BIN" "${STAGING}/usr/local/bin/.yuzu-agent.incoming"
+    record_loose_binary "${STAGING}/usr/local/bin/.yuzu-agent.incoming" yuzu-agent
     for candidate in "$BIN_DIR/libyuzu_agent_core.dylib" "$BIN_DIR/agents/core/libyuzu_agent_core.dylib"; do
         [[ -f "$candidate" ]] || continue
         # Beside the binary, not in /usr/local/lib (#5144): yuzu-agent loads
         # @rpath/libyuzu_agent_core.dylib and its only LC_RPATH is @loader_path/.
         install -m 755 "$candidate" "${STAGING}/usr/local/bin/.libyuzu_agent_core.incoming.dylib"
+        record_loose_binary "${STAGING}/usr/local/bin/.libyuzu_agent_core.incoming.dylib" libyuzu_agent_core.dylib
         break
     done
     if [[ -d "$BIN_DIR/plugins" ]]; then
@@ -179,6 +194,17 @@ fi
 install -d "${STAGING}/Library/LaunchDaemons" "${STAGING}/Library/Application Support/YuzuAgent" "${STAGING}/Library/Logs/Yuzu"
 install -m 755 "$SCRIPT_DIR/uninstall.sh" "${STAGING}/usr/local/lib/yuzu/uninstall.sh"
 printf '%s\n' "$PACKAGE_MODE" > "${STAGING}/usr/local/lib/yuzu/.package-mode.incoming"
+# preinstall runs before the payload exists, so it learns what this package
+# delivers from its Scripts directory: the lane, whether any plugin is unsigned,
+# and the plugin list. Every check that needs only these runs there, before
+# Installer changes anything on disk (PR #4482 governance rd-n2).
+UNSIGNED_PLUGINS=0
+for plugin in "${STAGING}/usr/local/lib/yuzu/.plugins.incoming"/*.dylib; do
+    [[ -f "$plugin" ]] || continue
+    [[ -f "$plugin.sig" ]] || UNSIGNED_PLUGINS=1
+done
+printf 'mode=%s\nunsigned_plugins=%s\n' "$PACKAGE_MODE" "$UNSIGNED_PLUGINS" > "$SCRIPTS/package-info"
+install -m 644 "${STAGING}/usr/local/lib/yuzu/.package-files.incoming" "$SCRIPTS/package-files.list"
 
 ARCHES="$(lipo -archs "$AGENT_BIN")"
 case "$ARCHES" in

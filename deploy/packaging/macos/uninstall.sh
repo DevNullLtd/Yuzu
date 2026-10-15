@@ -4,8 +4,17 @@ set -euo pipefail
 
 # One package transition at a time: an uninstall never interleaves with an
 # install's promotion (PR #4482 governance ch-3). See postinstall.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+TRANSITION_LOCK=/var/db/.yuzu-agent-transition.lock
 if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
-    exec /usr/bin/lockf -k -t 600 /var/db/.yuzu-agent-transition.lock \
+    # Owner-only: a lock file any account can open is one it can hold,
+    # blocking every install and uninstall (PR #4482 governance G8-S2). /var/db
+    # is root-only, so nothing else can place this path.
+    [[ ! -L "$TRANSITION_LOCK" ]] || { echo "ERROR: refusing a symlinked transition lock" >&2; exit 1; }
+    (umask 077; : >> "$TRANSITION_LOCK")
+    chmod 600 "$TRANSITION_LOCK"
+    exec /usr/bin/lockf -k -t 600 "$TRANSITION_LOCK" \
         /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"
 fi
 
