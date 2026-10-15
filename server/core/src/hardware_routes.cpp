@@ -539,10 +539,17 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // -- REST v1: POST /api/v1/hardware/sync — "Sync now" for a scope (the Software page) --
     // One click, many devices. `scope` is __all__ / group:<id> / an agent id; `scope_expression`
     // is a scope DSL expression (software_sync_decision.hpp owns the request grammar and every
-    // bound below). Gate = Execution:Execute; the targets are the caller's OWN Execution:Execute
-    // visible set (a hidden device is dropped, never reported), and only a caller whose set is
-    // unfiltered may name the whole fleet. Audit BEFORE dispatch, fail closed. 202 means
-    // REQUESTED — `reached` is sessions that accepted the frame, not devices that have synced.
+    // bound below).
+    // GATE: the type-level Execution:Execute check (sync_perm_fn = require_permission), which reads
+    // GLOBAL grants only, so an operator whose Execute is limited to management groups gets 403
+    // for every scope kind. The visible-set intersection (a hidden device is dropped, never
+    // reported) and the fleet-wide refusal for a filtered caller are DEFENCE IN DEPTH behind that
+    // gate: with a global grant neither changes the outcome today, and they are wired for when the
+    // gate becomes scope-aware.
+    // REACH: this server process only. Sessions and sends are per process, so an agent attached to
+    // another replica is counted as skipped_other_replica, not offline, and is not sent to.
+    // Audit BEFORE dispatch, fail closed. 202 means REQUESTED: `agents_reached` is sessions that
+    // accepted the frame, not devices that have synced.
     static_assert(software_sync::kMaxIdLen == auth::kMaxAgentIdLength);
     sink.Post("/api/v1/hardware/sync", [this](const httplib::Request& req, httplib::Response& res) {
         namespace ss = software_sync;

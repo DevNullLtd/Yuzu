@@ -128,7 +128,7 @@ struct Selector {
     if (expression->has_value()) {
         const std::string& e = **expression;
         if (!token_ok(e, kMaxExpressionLen))
-            return std::unexpected("scope_expression must be 1-1024 characters with no control "
+            return std::unexpected("scope_expression must be 1-1024 bytes with no control "
                                    "characters");
         // classify_dispatch_arm is the one place the arm vocabulary is decided; an
         // expression of `__all__` or `group:<id>` lands on the same arm as via `scope`.
@@ -136,7 +136,7 @@ struct Selector {
     } else {
         const std::string& s = **scope;
         if (!token_ok(s, kMaxIdLen))
-            return std::unexpected("scope must be 1-256 characters with no control characters");
+            return std::unexpected("scope must be 1-256 bytes with no control characters");
         const DispatchArm arm = s == kBroadcastScope               ? DispatchArm::Broadcast
                                 : s.starts_with(kGroupScopePrefix) ? DispatchArm::Group
                                                                    : DispatchArm::Ids; // a bare agent id

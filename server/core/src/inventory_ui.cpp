@@ -968,7 +968,7 @@ function swSync() {
       { name: 'kind', label: 'Which devices', type: 'select', options: opts },
       { name: 'expr', label: 'Scope expression or group', type: 'text', maxlength: 1024,
         placeholder: 'ostype == "windows"  or  group:<id>',
-        hint: 'Used only for "Devices matching a scope expression or group".' }
+        hint: 'Used only for "Devices matching a scope expression or group". Up to 1,024 bytes.' }
     ],
     submitLabel: 'Review',
     validate: function (v) { return v.kind === 'scope' && !v.expr.trim() ? 'Enter a scope expression or group:<id>.' : null; },
