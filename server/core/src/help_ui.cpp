@@ -23,7 +23,7 @@ const char* const kHelpPageTemplate = R"HTM(<!DOCTYPE html>
 <div class="help-content">
 <header class="page-header"><div>
 <h1>Help</h1>
-<p class="subtitle">Help page is under construction. See the <a href="/">dashboard</a>.</p>
+<p class="subtitle">Help page is under construction. See the <a href="/">Console</a>.</p>
 </div></header>
 </div>
 

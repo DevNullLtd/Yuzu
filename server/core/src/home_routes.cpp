@@ -260,7 +260,7 @@ void DashboardSummaryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
              [this](const httplib::Request& req, httplib::Response& res) {
         if (deps_.deny_service_scoped_fn &&
             deps_.deny_service_scoped_fn(req, res, "dashboard.fragment.access_denied",
-                                         "service-scoped tokens may not read the Dashboard summary",
+                                         "service-scoped tokens may not read the Console summary",
                                          "", ""))
             return;
         if (!deps_.auth_fn(req, res))
