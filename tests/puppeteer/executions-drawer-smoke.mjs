@@ -67,7 +67,7 @@ async function main() {
     const keys = [
       '--mds-color-bg-success-emphasis',
       '--mds-color-theme-indicator-error',
-      '--mds-color-theme-indicator-stable',
+      '--mds-color-theme-indicator-info',
       '--mds-color-theme-text-tertiary',
       '--mds-color-state-hover',
       '--mds-color-state-selected',

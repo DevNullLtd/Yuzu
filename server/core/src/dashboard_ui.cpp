@@ -59,7 +59,9 @@ constexpr char kDashHead[] = R"HTM(<!DOCTYPE html>
       padding: 12px 16px; border-bottom: 1px solid var(--line);
       font-size: 14px; font-weight: 600; color: var(--ink);
     }
-    .panel-hd h2, .results-header h2 { font-size: 14px; font-weight: 600; }
+    .results-header h2 { font-size: 14px; font-weight: 600; }
+    .results, .scope-panel, .history-panel { display: flex; flex-direction: column; }
+    .scope-panel, .history-panel { overflow: hidden; }
     .panel-hd #status-badge { margin-left: auto; }
 
     /* ── Console (instruction bar) ───────────────────────────── */
@@ -85,9 +87,9 @@ constexpr char kDashHead[] = R"HTM(<!DOCTYPE html>
       font-size: 12.5px; font-weight: 500; white-space: nowrap; text-transform: lowercase;
     }
     #status-badge::first-letter { text-transform: uppercase; }
-    .badge-idle, .badge-done { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
-    .badge-running { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); }
-    .badge-error { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
+    .badge-idle, .badge-done { color: var(--ok); background: var(--mds-color-bg-success-tinted); }
+    .badge-running { color: var(--info); background: var(--mds-color-bg-info-tinted); }
+    .badge-error { color: var(--bad); background: var(--mds-color-bg-error-tinted); }
 
     /* Buttons: raised, 1px line, 3px radius; the primary action is the one solid blue. */
     .instr-bar button, .btn-page, .btn-create-group, .create-group-form button,
@@ -112,7 +114,7 @@ constexpr char kDashHead[] = R"HTM(<!DOCTYPE html>
     }
     .density-toggle svg { width: 14px; height: 14px; }
 
-    /* Autocomplete: a pop-over (the only place a shadow is allowed). */
+    /* Autocomplete: a pop-over, so it carries the shadow. */
     .ac-list {
       display: none; position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 200;
       max-height: 280px; overflow-y: auto;
@@ -126,7 +128,7 @@ constexpr char kDashHead[] = R"HTM(<!DOCTYPE html>
     }
     .ac-item:last-child { border-bottom: 0; }
     .ac-item:hover { background: var(--surface2); }
-    .ac-item.sel { background: color-mix(in srgb, var(--hl) 8%, transparent); box-shadow: inset 3px 0 0 var(--hl); }
+    .ac-item.sel { background: var(--mds-color-state-selected); box-shadow: inset 3px 0 0 var(--hl); }
     .ac-item .ac-desc { margin-left: 16px; text-align: right; font-family: var(--font); font-size: 12.5px; color: var(--mut); }
 )HTM";
 static_assert(sizeof(kDashHead) < kPartCap, "kDashHead must stay under the MSVC raw-string cap: split it");
@@ -172,7 +174,7 @@ constexpr char kDashCss2[] = R"HTM(
       border: 1px solid var(--line2); border-radius: var(--rad-ctl);
     }
     /* #2691: a degraded facet-values() read disables the column filter — same
-       amber treatment as .result-degrade-banner, not a plain form quirk. */
+       warn treatment as .result-degrade-banner, not a plain form quirk. */
     .filter-bar select:disabled {
       color: var(--warn); opacity: 1; background: color-mix(in srgb, var(--warn) 12%, transparent);
       border-color: color-mix(in srgb, var(--warn) 50%, var(--line2));
@@ -198,9 +200,6 @@ constexpr char kDashCss2[] = R"HTM(
       border-bottom: 1px solid var(--line); font-size: 13.5px; color: var(--ink2);
     }
     #results-table td.col-agent { width: 10rem; font-weight: 600; color: var(--ink); }
-    #results-table .result-row:hover td { background: var(--surface2); }
-    #results-table .result-row.expanded td { background: color-mix(in srgb, var(--hl) 8%, transparent); }
-    #results-table .result-row.expanded td:first-child { box-shadow: inset 3px 0 0 var(--hl); }
     #results-table .result-detail td { max-width: none; overflow: visible; white-space: normal; background: var(--bg); }
     #results-table td.empty-state {
       max-width: none; padding: 48px 16px; text-align: center; white-space: normal;
@@ -208,7 +207,7 @@ constexpr char kDashCss2[] = R"HTM(
     }
     #results-table td.empty-state strong { color: var(--ink); }
     /* #2691 finding 7: an honest "store degraded, not zero matches" banner —
-       amber (temporarily unavailable, retrying), never alarm-red. The td form
+       warn-toned (temporarily unavailable, retrying), never alarm-red. The td form
        must outrank #results-table td.empty-state, which the banner row also is. */
     .result-degrade-banner, #results-table td.result-degrade-banner {
       padding: 8px 12px; font-size: 13.5px; color: var(--ink2); background: var(--surface2);
@@ -252,7 +251,7 @@ constexpr char kDashCss2[] = R"HTM(
     .scope-item { display: flex; flex-direction: column; gap: 2px; }
     .scope-item:hover, .history-item:hover { background: var(--surface2); }
     .scope-item.selected, .history-item.active {
-      background: color-mix(in srgb, var(--hl) 8%, transparent); box-shadow: inset 3px 0 0 var(--hl);
+      background: var(--mds-color-state-selected); box-shadow: inset 3px 0 0 var(--hl);
     }
     .scope-item-name { font-size: 13.5px; font-weight: 500; color: var(--ink); }
     .scope-item-all { font-weight: 600; }
@@ -291,45 +290,18 @@ constexpr char kDashCss2[] = R"HTM(
     .modal a:hover { text-decoration: underline; }
     .modal .btn-close { margin-top: 8px; }
 
-    /* ── Command palette (Ctrl+K): a pop-over, 8px radius, shadow allowed.
-       backdrop-filter / animation / text-transform: none switch off the older
-       .cmd-palette* rules still in yuzu.css (delete those there, then drop these). ── */
-    .cmd-palette-overlay {
-      position: fixed; inset: 0; z-index: 4000; display: flex; align-items: flex-start; justify-content: center;
-      padding-top: 15vh; background: var(--mds-color-state-overlay-scrim); backdrop-filter: none;
-    }
-    .cmd-palette {
-      width: 560px; max-width: calc(100vw - 32px); max-height: 60vh; overflow: hidden; animation: none;
-      background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-over); box-shadow: var(--shadow);
-    }
-    .cmd-palette-input-row {
-      display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line);
-    }
-    .cmd-palette-input-row svg { flex-shrink: 0; color: var(--mut); }
-    .cmd-palette-input-row input {
-      flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: var(--ink); font: inherit;
-    }
+    /* ── Command palette (Ctrl+K): yuzu.css supplies the pop-over, rows and footer;
+       only this page's deltas live here. ── */
+    .cmd-palette { max-width: calc(100vw - 32px); }
+    .cmd-palette-input-row input { min-width: 0; font: inherit; outline: 0; }
     .cmd-palette-input-row input:focus-visible { outline: 0; }
-    .cmd-palette-input-row input::placeholder { color: var(--faint); }
-    .cmd-palette-input-row .cmd-palette-hint { font-size: 12px; color: var(--faint); white-space: nowrap; }
-    .cmd-palette-results { max-height: 50vh; overflow-y: auto; }
-    .cmd-palette-results:empty::after {
-      content: "No results"; display: block; padding: 16px; text-align: center; font-size: 13px; color: var(--faint);
-    }
     .cmd-section-header {
       padding: 8px 16px; background: var(--surface2); font-size: 12.5px; font-weight: 500; color: var(--mut);
       text-transform: none; letter-spacing: 0;
     }
-    .cmd-result { display: flex; align-items: center; gap: 12px; padding: 8px 16px; cursor: pointer; }
-    .cmd-result:hover { background: var(--surface2); }
-    .cmd-result.active { background: color-mix(in srgb, var(--hl) 8%, transparent); box-shadow: inset 3px 0 0 var(--hl); }
-    .cmd-result-name { color: var(--ink); }
-    .cmd-result-desc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--mut); }
-    .cmd-result-type { margin-left: auto; flex-shrink: 0; height: auto; padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
-    .cmd-palette-footer {
-      display: flex; align-items: center; gap: 16px; padding: 8px 16px;
-      border-top: 1px solid var(--line); font-size: 12px; color: var(--faint);
-    }
+    .cmd-result.active { background: var(--mds-color-state-selected); box-shadow: inset 3px 0 0 var(--hl); }
+    .cmd-result-desc { min-width: 0; }
+    .cmd-result-type { height: auto; padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
   </style>
 )HTM";
 static_assert(sizeof(kDashCss2) < kPartCap, "kDashCss2 must stay under the MSVC raw-string cap: split it");
@@ -407,9 +379,9 @@ constexpr char kDashBodyConsole[] = R"HTM(  </section>
        chart from the previous dispatch can't linger over the new
        query's results. The new deck is delivered later via the OOB
        swap from /fragments/results once execution has data to render. -->
-  <form class="instr-bar" id="instr-form"
+  <form class="instr-bar panel" id="instr-form"
         hx-post="/api/dashboard/execute" hx-swap="none">
-    <div class="panel-hd">
+    <div class="panel-hd hd">
       <h2>Console</h2>
       <span id="status-badge" class="badge-idle">IDLE</span>
     </div>
@@ -491,7 +463,7 @@ constexpr char kDashBodyConsole[] = R"HTM(  </section>
   </div>
   <div class="col">
     <div class="history-panel panel">
-      <div class="history-header">
+      <div class="history-header hd">
         History
         <button onclick="clearHistory()" title="Clear history">&times; Clear</button>
       </div>
