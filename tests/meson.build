@@ -1395,6 +1395,8 @@ if build_server
       'unit/server/test_page_routes.cpp',
       'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
+      'unit/server/test_developer_render.cpp', # System > Developer and API: pure renderers
+      'unit/server/test_developer_routes.cpp', # System > Developer and API: page + fragment gates
       'unit/server/test_access_render.cpp', # Access pages (Phase 2): Users list + Account panel renderers
       'unit/server/test_access_routes.cpp', # Access pages: /access/users + fragments + static glue (gate order, degraded states)
       'unit/server/test_access_js.cpp', # Access pages: string pins on the template and yuzu-access.js
@@ -1711,6 +1713,7 @@ if build_server
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
       'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 21 panels + static h1 on the /settings page
+      'unit/server/test_settings_general.cpp',      # System General page: runtime/events renderers, routes, page pins
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',

@@ -201,6 +201,14 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # DEX Alerts tab (posture PR-E): GET /fragments/dex/alerts is "composed-of" the legacy
 # settings fragment (+1, 199 -> 200); the fragment's three POSTs stay planned:#2146.
 #
+# System "General and appearance" page: two UI-only fragments, GET
+# /fragments/settings/general-runtime (composed-of:get.api-config) and GET
+# /fragments/settings/analytics-events (composed-of:get.api-analytics-recent). Each composes an
+# existing JSON route that is itself `planned:#2146` with no REST v1 or MCP twin (the legacy
+# runtime-config and analytics routes), so there is no twin to point at and each counts as
+# untwinned. Reviewed: a fragment is UI, not a machine surface (ADR-1005 Decision 4), and the
+# routes they compose are the ledgered gap.
+#
 # Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
 # is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
 # which counts as untwinned by design, so the count rises 199 -> 200.
@@ -258,6 +266,10 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # the two Estate changes net 0 on their own (+1 NVD status card exception, -1 discovery row
 # twinned), so the count after this merge is the value the checker reports, set from its output.
 #
+# The System General page (this branch) adds the two composed-of fragments described above
+# (general-runtime, analytics-events): +2. Landing on dev's 207 (after the audit filter parity
+# flip below), the count is 209, the value the checker reports on the merged tree.
+#
 # Audit filter parity: get.api-audit flips "planned:#2146" -> "twinned" (GET /api/v1/audit +
 # MCP query_audit_log, now at filter/paging parity), the checker reports 208 - 1 = 207 on the merged tree
 # (dev's 208 above, less this flip).
@@ -283,7 +295,12 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # Access pages merged onto the Estate changes: the count is the value the checker reports on the
 # merged tree, set from its output.
-BASELINE_UNTWINNED = 212
+#
+# System General and Data pages (#5873): re-surfaces the untwinned General runtime and analytics
+# events settings as GET /fragments/settings/general-runtime and /fragments/settings/analytics-events,
+# +2. Merged with the Access pages (212 above), the count is 214, the value the checker reports on the
+# merged tree, not hand-picked. Whether the ADR-1005 exception extends to these rows is the owner's decision on #5873.
+BASELINE_UNTWINNED = 214
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

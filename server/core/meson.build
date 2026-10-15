@@ -515,6 +515,8 @@ yuzu_server_core_lib = static_library(
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
     'src/settings_model.cpp', # #4028 — shared REST/fragment Settings read-twin builders
+    'src/settings_general_routes.cpp', # System "General and appearance": page + 2 UI fragments
+    'src/settings_general_ui.cpp',
     'src/plugin_signing_helpers.cpp',
     'src/nvd_db.cpp',
     'src/nvd_version.cpp',
@@ -720,6 +722,10 @@ yuzu_server_core_lib = static_library(
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
     'src/discover_routes.cpp', # A2 discovery surface: /api/v1/discover/* (Issue 17.1)
+    'src/settings_data_ui.cpp', # System > Data and retention page template (SYS-4)
+    'src/developer_render.cpp', # System > Developer and API: pure renderers (SYS-4)
+    'src/developer_routes.cpp', # System > Developer and API: page + fragments (SYS-4)
+    'src/developer_ui.cpp', # System > Developer and API page template (SYS-4)
     'src/enrollment_directory_model.cpp', # #4031: shared row builders — directory/enrollment/OIDC-config read twins
     'src/enrollment_directory_routes.cpp', # #4031: REST v1 read twins — /api/v1/{directory,enrollment,settings/oidc}
     'src/viz_routes.cpp',
