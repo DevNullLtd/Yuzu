@@ -6,8 +6,11 @@
     - a `/usr/local` directory the agent runs from is not root-owned, or is group- or world-writable (common on Intel Macs with Homebrew);
     - agent code or plugins there could have been written by another account (mode bits or an access control list);
     - `/etc/yuzu-agent` or its `certs` directory is not root-owned or is group- or world-writable;
-    - the data or log directory is not owned by root or `_yuzu`;
+    - the data or log directory is not root-owned, is group- or world-writable, or has an access control list that lets another account write to it (a `_yuzu`-owned directory left by `scripts/install-agent-user.sh` must be returned to root);
+    - the recovery state in `/var/db/yuzu-agent` has an access control list;
     - a retained signed-plugin requirement meets an unsigned package.
+  - `uninstall.sh` stops the agent first. If it is still running after 30 seconds, the uninstall fails and removes nothing.
+  - A loose-binary package build fails unless `libyuzu_agent_core.dylib` is present beside `yuzu-agent`.
   - On every POSIX platform, the agent's startup OTA rollback now promotes `<exe>.old` only if it is a regular, singly-linked file owned by the agent's own account or root, with no group or world write bit; anything else is refused, logged and removed.
   - See *Behaviour change: the macOS agent package installs transactionally* in `docs/user-manual/upgrading.md` and the new *Deploying with MDM* runbook.
   - Released macOS agents still use the process poll, not Endpoint Security.

@@ -216,9 +216,10 @@ remove_receipted_plugins() {
     done <<< "$receipt"
 }
 
-# Interrupted-install state is cleared FIRST, pointer before snapshots: with no
-# pointer, no later recovery can restore (and restart) the agent this script
-# removes (PR #4482 governance ch-3). The quarantine is kept for inspection.
+# Interrupted-install state is cleared once the agent has stopped and before
+# anything is removed, pointer before snapshots: with no pointer, no later
+# recovery can restore (and restart) the agent this script removes (PR #4482
+# governance ch-3). The quarantine is kept for inspection.
 clear_recovery_state() {
     local snapshot
     rm -f "$RECOVERY_FILE" "$RECOVERY_FILE.new"
@@ -247,8 +248,15 @@ if grep -Fqx com.yuzu.agent <<<"$receipt_ids"; then
     RECEIPT_VERSION="$(awk '/^version: / {print $2; exit}' <<<"$receipt_info")"
 fi
 ensure_state_dir
+# An agent that is still running after 30 s keeps its server session, so
+# removing its code, definition and recovery state would leave a root process
+# nothing can restart or roll back. Refuse with everything in place, as
+# postinstall's require_stopped does (PR #4482 review, FortitudeEtc 2026-10-15).
+stop_service || {
+    echo "ERROR: Yuzu Agent did not stop within 30 seconds; nothing was removed, and launchd loads its definition again at the next boot. Retry the uninstall." >&2
+    echo "       If it keeps failing, find the process (pgrep -lf yuzu-agent) and investigate before removing anything by hand." >&2
+    exit 1; }
 clear_recovery_state
-stop_service || echo "WARNING: Yuzu Agent is still unloading; its code is removed anyway" >&2
 retire_legacy_app
 if [[ ! -f "$MANIFEST" ]]; then
     remove_receipted_plugins

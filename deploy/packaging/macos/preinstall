@@ -93,6 +93,17 @@ acl_grants_write() {
     grep -Eq '^ *[0-9]+: .* allow .*(write|append|add_file|add_subdirectory|delete_child|chown|writesecurity|writeattr|writeextattr)' <<<"$listing"
 }
 
+# Exit 0 when the path carries any ACL entry at all, or its listing cannot be
+# read. These scripts create the recovery state as root with none, and a new
+# entry can only inherit from its parent, so an entry there was added by
+# someone else: it is refused, never stripped, so the evidence stays (PR #4482
+# review, FortitudeEtc 2026-10-15).
+carries_acl() {
+    local listing
+    listing="$(/bin/ls -lde "$1" 2>/dev/null)" || return 0
+    grep -Eq '^ *[0-9]+: ' <<<"$listing"
+}
+
 # See postinstall: the /usr/local chain is checked, never repaired (sec-2).
 code_directory_chain_trusted() {
     local lane="${1:-bundle}" path owner mode
@@ -190,6 +201,10 @@ ensure_state_dir() {
         mkdir -m 700 "$STATE_DIR"
         chown root:wheel "$STATE_DIR"
     fi
+    ! carries_acl "$STATE_DIR" || {
+        echo "ERROR: the recovery state root $STATE_DIR has an access control list, which the installer never sets." >&2
+        echo "       Inspect it (ls -lde $STATE_DIR), remove it (sudo chmod -N $STATE_DIR) and retry. The active service was left unchanged" >&2
+        exit 1; }
 }
 
 require_recovery_directory() {
@@ -201,6 +216,8 @@ require_recovery_directory() {
     mode="$(stat -f '%Lp' "$recovery")"
     [[ "$owner" == 0 && "$group" == 0 && "$mode" == 700 ]] || {
         echo "ERROR: recovery snapshot must be root:wheel mode 700" >&2; return 1; }
+    ! carries_acl "$recovery" || {
+        echo "ERROR: recovery snapshot $recovery has an access control list, which the installer never sets" >&2; return 1; }
 }
 
 # Prints the pending snapshot, or nothing when there is none usable. The state
@@ -215,6 +232,15 @@ read_recovery_path() {
         if require_recovery_directory "$pending" 2>/dev/null; then
             printf '%s\n' "$pending"
             return 0
+        fi
+        # Only root could have added an ACL, and the snapshot may be the only
+        # copy of the previous agent: keep the pointer and refuse rather than
+        # drop it as an interrupted cleanup.
+        if [[ "$pending" == "$STATE_DIR"/install-recovery.* && -d "$pending" && ! -L "$pending" ]] && \
+           carries_acl "$pending"; then
+            echo "ERROR: the recovery snapshot of an interrupted earlier install, $pending, has an access control list, which the installer never sets." >&2
+            echo "       Inspect it (ls -lde \"$pending\"), remove it (sudo chmod -N \"$pending\") and retry. The active service was left unchanged" >&2
+            return 1
         fi
     fi
     echo "WARNING: discarding an unusable installation recovery pointer (an interrupted earlier install or cleanup)" >&2
@@ -231,44 +257,42 @@ write_recovery_phase() {
 
 # These locations receive Installer payload before postinstall can run. Establish
 # their ownership without accepting a symlink before the privileged extraction.
-# The Yuzu data directory may be provisioned by EDR/FDA policy with a
-# non-package owner. Never change it: stage sealed code in its own trusted root.
-# Owner root, or the _yuzu service account that scripts/install-agent-user.sh
-# provisions (docs/agent-privilege-model.md); never group/world writable.
-data_directory_owner_trusted() {
-    local owner="$1" service_uid
-    [[ "$owner" == 0 ]] && return 0
-    service_uid="$(/usr/bin/id -u _yuzu 2>/dev/null)" || return 1
-    [[ -n "$service_uid" && "$owner" == "$service_uid" ]]
+# The Yuzu data directory may be provisioned by EDR/FDA policy. Never change it:
+# stage sealed code in its own trusted root. The daemon runs as root and opens
+# agent.db, its stores and its log by path, so whoever can create entries in
+# the data or log directory can point a root write anywhere with a symlink.
+# Both must be root-owned, not group/world writable and free of write-granting
+# ACLs; the _yuzu account scripts/install-agent-user.sh provisions for the
+# unprivileged development run is not accepted (PR #4482 review, FortitudeEtc
+# 2026-10-15; docs/agent-privilege-model.md: the macOS agent is root).
+operational_directory_trusted() {
+    local path="$1" owner mode
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] && ! acl_grants_write "$path"
+}
+
+# $1 is the directory, $2 what it is. Prints the refusal and its remedy.
+refuse_operational_directory() {
+    local path="$1" what="$2"
+    echo "ERROR: the existing $what directory must be root-owned, not group/world writable and without an ACL that lets another account write: $path" >&2
+    echo "       (owner uid $(stat -f '%u' "$path"), mode $(stat -f '%Lp' "$path")). The agent runs as root and writes there." >&2
+    echo "       Do not delete it: the data directory holds the agent's identity and enrolment. To fix it, run:" >&2
+    echo "         sudo chown -hR root:wheel \"$path\" && sudo chmod -R go-w \"$path\" && sudo chmod -RN \"$path\"" >&2
+    echo "       then install again. The active service was left unchanged." >&2
 }
 
 require_trusted_data_directory() {
-    local owner mode
-    owner="$(stat -f '%u' "$DATA_DIR")"
-    mode="$(stat -f '%Lp' "$DATA_DIR")"
-    data_directory_owner_trusted "$owner" && [[ $((8#$mode & 8#022)) == 0 ]] || {
-        echo "ERROR: existing data directory must be owned by root or _yuzu and not group/world writable: $DATA_DIR" >&2
-        echo "       (owner uid $owner, mode $mode). It holds the agent's identity and enrolment; do not delete it." >&2
-        echo "       Remove the group/world write bit (chmod go-w) or restore its owner, then retry." >&2
-        return 1; }
+    operational_directory_trusted "$DATA_DIR" || { refuse_operational_directory "$DATA_DIR" data; return 1; }
 }
 
-# The log directory follows the data directory's owner rule: install-agent-user.sh
-# gives both to _yuzu (governance rd-n3).
+# The log directory follows the data directory's rule (governance rd-n3).
 require_trusted_log_directory() {
-    local owner mode
     [[ -e "$LOG_DIR" || -L "$LOG_DIR" ]] || return 0
     [[ -d "$LOG_DIR" && ! -L "$LOG_DIR" ]] || {
         echo "ERROR: log path is not a real directory: $LOG_DIR" >&2; return 1; }
-    owner="$(stat -f '%u' "$LOG_DIR")"
-    mode="$(stat -f '%Lp' "$LOG_DIR")"
-    data_directory_owner_trusted "$owner" && [[ $((8#$mode & 8#022)) == 0 ]] || {
-        echo "ERROR: existing log directory must be owned by root or _yuzu and not group/world writable: $LOG_DIR" >&2
-        echo "       (owner uid $owner, mode $mode). Remove the group/world write bit or restore its owner, then retry." >&2
-        return 1; }
+    operational_directory_trusted "$LOG_DIR" || { refuse_operational_directory "$LOG_DIR" log; return 1; }
 }
-
-
 
 # Exit 0: the file's SHA-256 equals the hash recorded at build time.
 plugin_hash_matches() {
@@ -563,11 +587,22 @@ code_directory_trusted() {
     ! acl_grants_write "$path"
 }
 
+# A file the restarted root daemon reads or runs: a regular file, not a
+# symlink, root-owned, not group/world writable and with no write-granting ACL.
+root_file_trusted() {
+    local path="$1" owner mode
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
+    ! acl_grants_write "$path"
+}
+
 # Recovery restarts only a service that was running when the snapshot was
 # taken. A restored service that will not stay up is reported, never retried
 # forever: the pending install is the remedy (PR #4482 governance sec-1).
 restart_restored_service() {
-    local recovery="$1" lane=bundle program_args
+    local recovery="$1" lane=bundle program_args program
     [[ -e "$PLIST" ]] || return 0
     [[ -e "$recovery/service-was-running" ]] || {
         echo "WARNING: restored the previous service definition; it was not running before, so it was not started" >&2
@@ -588,6 +623,20 @@ restart_restored_service() {
     if [[ "$program_args" == *"$LEGACY_APP/Contents/MacOS/yuzu-agent"* ]]; then
         # Never start code from the non-package-owned data root.
         echo "WARNING: restored the previous legacy service definition but did not start it from non-package-owned data" >&2
+        return 0
+    fi
+    # Started as root, so the definition must run one of the package's two
+    # executables, and neither it nor that executable may be writable by another
+    # account (PR #4482 review, FortitudeEtc 2026-10-15).
+    program="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null)" || program=""
+    case "$program" in
+        "$LOOSE_BIN/yuzu-agent"|"$APP_ROOT/YuzuAgent.app/Contents/MacOS/yuzu-agent") ;;
+        *)
+            echo "WARNING: restored the previous service definition but did not start it: it does not run the package's agent" >&2
+            return 0 ;;
+    esac
+    if ! root_file_trusted "$PLIST" || ! root_file_trusted "$program"; then
+        echo "WARNING: restored the previous agent but did not start it: its service definition or executable is not root-owned and protected from other accounts" >&2
         return 0
     fi
     launchctl enable "system/com.yuzu.agent" >/dev/null 2>&1 || true
@@ -706,7 +755,7 @@ discard_recovery() {
 # exactly as before the interrupted install.
 ensure_state_dir
 if [[ -e "$RECOVERY_FILE" || -L "$RECOVERY_FILE" ]]; then
-    pending="$(read_recovery_path)"
+    pending="$(read_recovery_path)" || exit 1
     if [[ -n "$pending" ]]; then
         phase="$(cat "$pending/phase" 2>/dev/null || true)"
         case "$phase" in
@@ -785,8 +834,10 @@ rm -f "${YUZU_LIB:?}"/.rederived-manifest.* "${YUZU_LIB:?}"/.rederived-hashes.* 
 if [[ -e "$PLUGIN_DIR" || -L "$PLUGIN_DIR" ]]; then
     require_trusted_directory "$PLUGIN_DIR"
 fi
+# mktemp -d creates root:wheel (the state root's group) mode 700, and with no
+# ACL on the state root there is nothing to inherit; checked, not repaired.
 RECOVERY="$(mktemp -d "${STATE_DIR}/install-recovery.XXXXXX")"
-chmod 700 "$RECOVERY"
+require_recovery_directory "$RECOVERY" || exit 1
 
 discard_stale_manifest
 adopt_receipted_plugins

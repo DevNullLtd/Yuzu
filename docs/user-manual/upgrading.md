@@ -24,8 +24,13 @@ This applies to every macOS `.pkg`, including the release package.
     an access control list. The installer lists each entry.
   - `/etc/yuzu-agent` or `/etc/yuzu-agent/certs` is not root-owned, or is group-
     or world-writable.
-  - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu` is not owned by
-    root or `_yuzu`, or is group- or world-writable.
+  - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu` is not
+    root-owned, is group- or world-writable, or has an access control list that
+    lets another account write to it. The agent runs as root and writes there.
+    A Mac where `scripts/install-agent-user.sh` gave them to `_yuzu` needs them
+    returned to root first; the refusal prints the commands.
+  - `/var/db/yuzu-agent`, or a recovery snapshot in it, has an access control
+    list. The installer never sets one, so it refuses rather than remove it.
   - A new plugin has the same name as one no Yuzu package installed, or as a
     Yuzu plugin whose bytes were changed after installation.
   - The existing service requires signed plugins (`--plugin-require-signature`)

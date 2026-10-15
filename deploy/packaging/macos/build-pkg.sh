@@ -168,14 +168,20 @@ else
     install -d "${STAGING}/usr/local/bin"
     install -m 755 "$AGENT_BIN" "${STAGING}/usr/local/bin/.yuzu-agent.incoming"
     record_loose_binary "${STAGING}/usr/local/bin/.yuzu-agent.incoming" yuzu-agent
+    CORE_LIB=""
     for candidate in "$BIN_DIR/libyuzu_agent_core.dylib" "$BIN_DIR/agents/core/libyuzu_agent_core.dylib"; do
         [[ -f "$candidate" ]] || continue
-        # Beside the binary, not in /usr/local/lib (#5144): yuzu-agent loads
-        # @rpath/libyuzu_agent_core.dylib and its only LC_RPATH is @loader_path/.
-        install -m 755 "$candidate" "${STAGING}/usr/local/bin/.libyuzu_agent_core.incoming.dylib"
-        record_loose_binary "${STAGING}/usr/local/bin/.libyuzu_agent_core.incoming.dylib" libyuzu_agent_core.dylib
+        CORE_LIB="$candidate"
         break
     done
+    # yuzu-agent links the shared core (agents/core/meson.build), so a package
+    # without it installs an agent that cannot start (PR #4482 review,
+    # FortitudeEtc 2026-10-15). build-app.py refuses the same for the bundle.
+    [[ -n "$CORE_LIB" ]] || { echo "ERROR: libyuzu_agent_core.dylib not found in $BIN_DIR" >&2; exit 1; }
+    # Beside the binary, not in /usr/local/lib (#5144): yuzu-agent loads
+    # @rpath/libyuzu_agent_core.dylib and its only LC_RPATH is @loader_path/.
+    install -m 755 "$CORE_LIB" "${STAGING}/usr/local/bin/.libyuzu_agent_core.incoming.dylib"
+    record_loose_binary "${STAGING}/usr/local/bin/.libyuzu_agent_core.incoming.dylib" libyuzu_agent_core.dylib
     if [[ -d "$BIN_DIR/plugins" ]]; then
         for plugin in "$BIN_DIR/plugins"/*.dylib; do
             [[ -f "$plugin" ]] || continue

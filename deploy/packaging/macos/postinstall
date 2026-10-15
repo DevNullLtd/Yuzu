@@ -113,6 +113,10 @@ ensure_state_dir() {
         mkdir -m 700 "$STATE_DIR"
         chown root:wheel "$STATE_DIR"
     fi
+    ! carries_acl "$STATE_DIR" || {
+        echo "ERROR: the recovery state root $STATE_DIR has an access control list, which the installer never sets." >&2
+        echo "       Inspect it (ls -lde $STATE_DIR), remove it (sudo chmod -N $STATE_DIR) and retry. The active service was left unchanged" >&2
+        exit 1; }
 }
 
 recovery_path() {
@@ -132,6 +136,9 @@ recovery_path() {
     mode="$(stat -f '%Lp' "$pending")"
     [[ "$owner" == 0 && "$group" == 0 && "$mode" == 700 ]] || {
         echo "ERROR: recovery snapshot must be root:wheel mode 700" >&2; return 1; }
+    ! carries_acl "$pending" || {
+        echo "ERROR: recovery snapshot $pending has an access control list, which the installer never sets; remove it (sudo chmod -N) and retry" >&2
+        return 1; }
     printf '%s\n' "$pending"
 }
 
@@ -161,24 +168,32 @@ preserve_or_create_directory() {
     chown root:wheel "$path"
 }
 
-# Owner root, or the _yuzu service account that scripts/install-agent-user.sh
-# provisions (docs/agent-privilege-model.md); never group/world writable.
-data_directory_owner_trusted() {
-    local owner="$1" service_uid
-    [[ "$owner" == 0 ]] && return 0
-    service_uid="$(/usr/bin/id -u _yuzu 2>/dev/null)" || return 1
-    [[ -n "$service_uid" && "$owner" == "$service_uid" ]]
+# The daemon runs as root and opens agent.db, its stores and its log by path, so
+# whoever can create entries in the data or log directory can point a root
+# write anywhere with a symlink. Both must be root-owned, not group/world
+# writable and free of write-granting ACLs; the _yuzu account
+# scripts/install-agent-user.sh provisions for the unprivileged development run
+# is not accepted (PR #4482 review, FortitudeEtc 2026-10-15). Same rule and
+# wording as preinstall.
+operational_directory_trusted() {
+    local path="$1" owner mode
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] && ! acl_grants_write "$path"
+}
+
+# $1 is the directory, $2 what it is. Prints the refusal and its remedy.
+refuse_operational_directory() {
+    local path="$1" what="$2"
+    echo "ERROR: the existing $what directory must be root-owned, not group/world writable and without an ACL that lets another account write: $path" >&2
+    echo "       (owner uid $(stat -f '%u' "$path"), mode $(stat -f '%Lp' "$path")). The agent runs as root and writes there." >&2
+    echo "       Do not delete it: the data directory holds the agent's identity and enrolment. To fix it, run:" >&2
+    echo "         sudo chown -hR root:wheel \"$path\" && sudo chmod -R go-w \"$path\" && sudo chmod -RN \"$path\"" >&2
+    echo "       then install again. The active service was left unchanged." >&2
 }
 
 require_trusted_data_directory() {
-    local owner mode
-    owner="$(stat -f '%u' "$DATA_DIR")"
-    mode="$(stat -f '%Lp' "$DATA_DIR")"
-    data_directory_owner_trusted "$owner" && [[ $((8#$mode & 8#022)) == 0 ]] || {
-        echo "ERROR: existing data directory must be owned by root or _yuzu and not group/world writable: $DATA_DIR" >&2
-        echo "       (owner uid $owner, mode $mode). It holds the agent's identity and enrolment; do not delete it." >&2
-        echo "       Remove the group/world write bit (chmod go-w) or restore its owner, then retry." >&2
-        return 1; }
+    operational_directory_trusted "$DATA_DIR" || { refuse_operational_directory "$DATA_DIR" data; return 1; }
 }
 
 ensure_data_directory() {
@@ -199,20 +214,13 @@ ensure_data_directory() {
     chown root:wheel "$DATA_DIR"
 }
 
-# The log directory follows the data directory's owner rule:
-# install-agent-user.sh gives both to _yuzu (governance rd-n3). A missing one is
-# created root:wheel 755.
+# The log directory follows the data directory's rule (governance rd-n3). A
+# missing one is created root:wheel 755.
 require_trusted_log_directory() {
-    local owner mode
     if [[ -e "$LOG_DIR" || -L "$LOG_DIR" ]]; then
         [[ -d "$LOG_DIR" && ! -L "$LOG_DIR" ]] || {
             echo "ERROR: log path is not a real directory: $LOG_DIR" >&2; return 1; }
-        owner="$(stat -f '%u' "$LOG_DIR")"
-        mode="$(stat -f '%Lp' "$LOG_DIR")"
-        data_directory_owner_trusted "$owner" && [[ $((8#$mode & 8#022)) == 0 ]] || {
-            echo "ERROR: existing log directory must be owned by root or _yuzu and not group/world writable: $LOG_DIR" >&2
-            echo "       (owner uid $owner, mode $mode). Remove the group/world write bit or restore its owner, then retry." >&2
-            return 1; }
+        operational_directory_trusted "$LOG_DIR" || { refuse_operational_directory "$LOG_DIR" log; return 1; }
         return 0
     fi
     require_trusted_directory "$(dirname "$LOG_DIR")" || return 1
@@ -240,6 +248,17 @@ acl_grants_write() {
     local listing
     listing="$(/bin/ls -lde "$1" 2>/dev/null)" || return 0
     grep -Eq '^ *[0-9]+: .* allow .*(write|append|add_file|add_subdirectory|delete_child|chown|writesecurity|writeattr|writeextattr)' <<<"$listing"
+}
+
+# Exit 0 when the path carries any ACL entry at all, or its listing cannot be
+# read. The installer creates the recovery state as root with none, and a new
+# entry can only inherit from its parent, so an entry there was added by
+# someone else: it is refused, never stripped, so the evidence stays (PR #4482
+# review, FortitudeEtc 2026-10-15).
+carries_acl() {
+    local listing
+    listing="$(/bin/ls -lde "$1" 2>/dev/null)" || return 0
+    grep -Eq '^ *[0-9]+: ' <<<"$listing"
 }
 
 # An app that fails the legacy-ownership check is never run, restored or deleted:
@@ -586,12 +605,11 @@ verify_incoming_loose_code() {
             yuzu-agent) file="$LOOSE_BIN/.yuzu-agent.incoming" ;;
             *) file="$LOOSE_BIN/.libyuzu_agent_core.incoming.dylib" ;;
         esac
+        # Both are required: yuzu-agent links the shared core (FortitudeEtc
+        # 2026-10-15), and build-pkg.sh refuses to build without it.
         recorded="$(awk -v n="bin/$name" '$2 == n {print $1; exit}' "$INCOMING_HASHES")"
-        if [[ -z "$recorded" ]]; then
-            [[ "$name" != yuzu-agent && ! -e "$file" && ! -L "$file" ]] || {
-                echo "ERROR: the package recorded no hash for the delivered $name" >&2; return 1; }
-            continue
-        fi
+        [[ -n "$recorded" ]] || {
+            echo "ERROR: the package recorded no hash for $name; the active service was left unchanged" >&2; return 1; }
         [[ -f "$file" && ! -L "$file" ]] || { echo "ERROR: incoming $name is missing or not a regular file" >&2; return 1; }
         actual="$(shasum -a 256 "$file")" || { echo "ERROR: cannot hash incoming $name" >&2; return 1; }
         [[ "${actual%% *}" == "$recorded" ]] || {
@@ -636,11 +654,22 @@ code_directory_trusted() {
     ! acl_grants_write "$path"
 }
 
+# A file the restarted root daemon reads or runs: a regular file, not a
+# symlink, root-owned, not group/world writable and with no write-granting ACL.
+root_file_trusted() {
+    local path="$1" owner mode
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
+    ! acl_grants_write "$path"
+}
+
 # Recovery restarts only a service that was running when the snapshot was
 # taken. A restored service that will not stay up is reported, never retried
 # forever: the pending install is the remedy (PR #4482 governance sec-1).
 restart_restored_service() {
-    local recovery="$1" lane=bundle program_args
+    local recovery="$1" lane=bundle program_args program
     [[ -e "$PLIST" ]] || return 0
     [[ -e "$recovery/service-was-running" ]] || {
         echo "WARNING: restored the previous service definition; it was not running before, so it was not started" >&2
@@ -661,6 +690,20 @@ restart_restored_service() {
     if [[ "$program_args" == *"$LEGACY_APP/Contents/MacOS/yuzu-agent"* ]]; then
         # Never start code from the non-package-owned data root.
         echo "WARNING: restored the previous legacy service definition but did not start it from non-package-owned data" >&2
+        return 0
+    fi
+    # Started as root, so the definition must run one of the package's two
+    # executables, and neither it nor that executable may be writable by another
+    # account (PR #4482 review, FortitudeEtc 2026-10-15).
+    program="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null)" || program=""
+    case "$program" in
+        "$LOOSE_BIN/yuzu-agent"|"$APP_ROOT/YuzuAgent.app/Contents/MacOS/yuzu-agent") ;;
+        *)
+            echo "WARNING: restored the previous service definition but did not start it: it does not run the package's agent" >&2
+            return 0 ;;
+    esac
+    if ! root_file_trusted "$PLIST" || ! root_file_trusted "$program"; then
+        echo "WARNING: restored the previous agent but did not start it: its service definition or executable is not root-owned and protected from other accounts" >&2
         return 0
     fi
     launchctl enable "system/com.yuzu.agent" >/dev/null 2>&1 || true

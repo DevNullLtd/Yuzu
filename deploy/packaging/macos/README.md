@@ -9,6 +9,9 @@ The default package remains the loose-binary lane:
 bash deploy/packaging/macos/build-pkg.sh --bin-dir build-macos --version <version> --output dist
 ```
 
+The build fails unless `--bin-dir` holds both `yuzu-agent` and
+`libyuzu_agent_core.dylib`, because the agent links the shared core library.
+
 Both lanes run root code from below `/usr/local`, a tree the package shares
 with other tools and never re-owns: plugins from `/usr/local/lib/yuzu`, and in
 the loose lane the daemon itself from `/usr/local/bin`. Installation therefore
@@ -90,14 +93,26 @@ The bundle LaunchDaemon runs as root, retains external plugins, and always passe
 `--no-auto-update`. The sealed app is in the package-owned, root-owned
 `/Library/Application Support/YuzuAgent/YuzuAgent.app`; data stays in
 `/Library/Application Support/Yuzu` and is never ownership-reset or removed by
-this lane. Because it is the root daemon's data and working directory, an existing one
-must be owned by root or by the `_yuzu` service account that
-`scripts/install-agent-user.sh` provisions, and must not be group- or
-world-writable; otherwise installation stops before anything is staged, and the
-directory is left exactly as it was. It holds the agent's identity and
-enrolment, so never delete it to get past this check; remove the write bit or
-restore its owner instead. `/Library/Logs/Yuzu` follows the same rule, since the
-same script gives it to `_yuzu`. Configuration, certificate and plugin
+this lane. The daemon runs as root and opens its databases and log by path, so
+anyone who can create entries in these directories could redirect a root write
+with a symlink. An existing data directory must therefore be root-owned, not
+group- or world-writable, and without an access control list that lets another
+account write to it. Otherwise installation stops before anything is staged,
+and the directory is left exactly as it was. `/Library/Logs/Yuzu` follows the
+same rule. This includes the `_yuzu` account that
+`scripts/install-agent-user.sh` creates for the unprivileged development run:
+that script gives it both directories, so a Mac it has run on needs them
+returned to root before the package will install. The refusal prints the fix:
+
+```sh
+sudo chown -hR root:wheel "/Library/Application Support/Yuzu"
+sudo chmod -R go-w "/Library/Application Support/Yuzu"
+sudo chmod -RN "/Library/Application Support/Yuzu"
+```
+
+and the same for `/Library/Logs/Yuzu`. The data directory holds the agent's
+identity and enrolment, so never delete it to get past this check.
+Configuration, certificate and plugin
 directories must be root-owned and not group- or world-writable; these are all
 checked in `preinstall`, before the payload. Logs,
 configuration, and trust anchors remain outside the sealed app, with existing
@@ -166,8 +181,10 @@ keeps restarting does not count, and its upgrade is not health-gated.
 
 Recovery restarts a restored agent only if it was running when the snapshot was
 taken. A restored definition that recovery does not start (because the agent
-was not running before, its code directory is untrusted, it cannot be read, or
-it points into the data directory) is still in `/Library/LaunchDaemons`, so
+was not running before, its code directory is untrusted, it cannot be read, it
+points into the data directory, it does not run the package's own
+`yuzu-agent`, or it or that executable could be changed by another account)
+is still in `/Library/LaunchDaemons`, so
 launchd starts it at the next boot, exactly as before the install. Disable it
 (`launchctl disable system/com.yuzu.agent`) if it must stay stopped. A restored agent that does not stay running is reported, and recovery
 still completes, so the next install is never blocked by it. A payload failure
@@ -265,7 +282,12 @@ install interrupted after Installer removed an older package's files), before
 taking a new snapshot. A recovery pointer that is unusable
 (dangling after an interrupted cleanup, empty after a torn write, or a symlink)
 is reported and dropped, and a phase that cannot be read is treated as an
-interrupted promotion, so no recovery state can block later installs. Installs
+interrupted promotion, so no recovery state can block later installs. The one
+exception is an access control list on `/var/db/yuzu-agent` or on a snapshot in
+it. The installer creates that state as root and never sets one, so an entry
+there was added by someone else: the install refuses, keeps the snapshot and
+names the command to remove the list (`sudo chmod -N <path>`). It never strips
+the list itself, so the evidence stays for inspection. Installs
 and `uninstall.sh` take one lock (`/var/db/.yuzu-agent-transition.lock`, readable
 only by root, so no other account can hold it), so an
 uninstall waits while either install script is running. Installer lays down the
@@ -283,7 +305,7 @@ the installer. Removal follows the same rule: a listed plugin whose bytes were
 changed by an operator is kept, with a warning. Packages from before the hash
 sidecar existed remove listed plugins by name. The plugin directory must be
 root-owned, non-symlinked, and not group/world writable. A missing data working
-directory is created; an existing one keeps its owner, mode, and contents.
+directory is created root-owned; an existing one is never changed.
 
 The first line of `package-files.list` names the package version that wrote it.
 A package without a manifest (any release from before this one), installed over
@@ -304,7 +326,10 @@ service definition, `/Library/LaunchDaemons/com.yuzu.agent.plist`. It retains
 operational data, logs, `/etc/yuzu-agent`, trust anchors, and third-party
 plugins. The server address and any other setting kept only in the service
 definition is removed with it: keep a copy if you will reinstall, or pre-stage
-it as in "Deploying with MDM". It first discards any interrupted-install recovery state, so a later
+it as in "Deploying with MDM". It first stops the agent. If the agent is
+still running after 30 seconds, the script fails and removes nothing, so the
+code, the service definition and any recovery state stay in place; retry it.
+Once the agent has stopped, it discards any interrupted-install recovery state, so a later
 install can never restore the agent it removed. An unrecognized legacy app in
 the data root is quarantined, as the installer does, and the uninstall
 continues. `/var/db/yuzu-agent` is removed unless its `quarantine/` directory
@@ -327,8 +352,8 @@ the next package run repairs or discards whatever it finds there.
 ## Deploying with MDM
 
 The package needs no interaction. The target needs the directory state described
-above: a root-owned, non-writable `/usr/local` chain, and data and log
-directories owned by root or `_yuzu`. To have the agent start on its first
+above: a root-owned, non-writable `/usr/local` chain, and root-owned,
+non-writable data and log directories. To have the agent start on its first
 install, make its configuration available before the package runs:
 
 1. Deploy the server's CA certificate, for example
