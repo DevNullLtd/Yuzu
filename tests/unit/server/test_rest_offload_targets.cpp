@@ -510,3 +510,19 @@ TEST_CASE("REST offload-targets: a lost denied row still marks Sec-Audit-Failed 
     CHECK(gone->status == 404);
     CHECK(gone->get_header_value("Sec-Audit-Failed") == "true");
 }
+
+TEST_CASE("REST offload-targets: a denied row for a mimicking name uses the audit-safe target id",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    nlohmann::json body = {{"name", "x url=https://good.example url_fp=000000000000"},
+                           {"url", "ftp://x.example.com/h"}}; // refused by the store: validation_failed
+    auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audit_log.size() == 2); // attempted then denied
+    for (const auto& rec : h.audit_log) {
+        CHECK(rec.target_id.find(' ') == std::string::npos);
+        CHECK(rec.target_id.find('=') == std::string::npos);
+    }
+    CHECK(h.audit_log[0].target_id == h.audit_log[1].target_id);
+}

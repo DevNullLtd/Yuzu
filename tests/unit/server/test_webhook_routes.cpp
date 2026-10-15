@@ -32,7 +32,7 @@
  *     disconnect-mid-call fixture; gov Gate 3 quality-engineer, PR #3563
  *     full-PR review — this file previously overclaimed full coverage of
  *     all three WebhookWriteError arms)
- *   - webhook.create/webhook.delete audit rows carry the URL (create:
+ *   - webhook.create/webhook.delete audit rows carry the destination (scheme+host+fingerprint; create:
  *     success only; delete: a best-effort pre-delete snapshot, matching
  *     offload_routes.cpp's "compliance F-3" precedent), and every REST
  *     failure branch (invalid JSON, missing url, invalid_url, not-found)

@@ -221,14 +221,14 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                     auto id_opt = parse_id_segment(req.matches[1].str());
                     if (!id_opt) {
                         (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.delete", "denied", "offload_target",
-                                 req.matches[1].str(), "not_found");
+                                 req.matches[1].str().substr(0, 40), "not_found");
                         send_not_found(res);
                         return;
                     }
-                    // Snapshot the URL + name BEFORE delete so the audit row
-                    // captures it. After delete the row is gone and a brief
-                    // compromise-and-cleanup attacker would erase the only
-                    // record of which URL the data was exfiltrated to
+                    // Snapshot the destination + name BEFORE delete so the audit row
+                    // captures it (scheme, host and a URL fingerprint). After delete
+                    // the row is gone and a brief compromise-and-cleanup attacker
+                    // would erase the only record of where the data was sent
                     // (compliance F-3 from Gate 6).
                     auto target_snapshot = offload_store->get(*id_opt);
                     std::string snapshot_detail;

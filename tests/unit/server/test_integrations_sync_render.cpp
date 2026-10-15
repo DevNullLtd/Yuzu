@@ -245,6 +245,8 @@ TEST_CASE("offload create form: bounds and creds write-only and shutdown wording
     CHECK_THAT(html, ContainsSubstring("A normal server stop flushes them; a crash or kill loses them."));
     CHECK(!contains(html, "dropped at shutdown"));
     CHECK_THAT(html, ContainsSubstring("records the target name and the destination"));
+    CHECK(html.find("destination URL are recorded") == std::string::npos); // no stale full-URL claim
+    CHECK(html.find("destination URL is recorded") == std::string::npos);
     const auto pos = html.find("name=\"auth_credential\"");
     REQUIRE(pos != std::string::npos);
     const auto tag = html.substr(pos, html.find('>', pos) - pos);

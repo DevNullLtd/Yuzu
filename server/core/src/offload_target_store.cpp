@@ -385,8 +385,8 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
     //   would inject a second header and smuggle a request through any
     //   HTTP-aware proxy. Basic is base64'd, HMAC is hex; the guard
     //   fires for all auth_types as defence-in-depth.
-    // - name, url: both are emitted verbatim into the DELETE audit-row
-    //   `detail` field as `name=<n> url=<u>`. A control byte (CR/LF/NUL)
+    // - name, url: both reach the audit-row `detail` field (the name made
+    //   audit-safe, the URL as scheme+host and a fingerprint), and the log lines. A control byte (CR/LF/NUL)
     //   in either field would line-split the audit row and forge a
     //   downstream event in any SIEM that parses log lines individually.
     // - event_types: rides a libpq text-format parameter verbatim; a NUL

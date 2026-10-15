@@ -22,8 +22,8 @@ struct MappingChange {
 
 /// Audit details for `directory.group_mapping.update`: the group-to-role pairs,
 /// so a row records WHAT was configured, not just how many. Free text is
-/// operator- and directory-supplied, so control bytes are replaced (an audit
-/// row must not line-split) and each value is clipped. Every pair is recorded:
+/// operator- and directory-supplied, so control bytes, ',' and '=' are replaced (an audit
+/// row must not line-split or gain pairs) and each value is clipped. Every pair is recorded:
 /// a long list is split across several details, each at most `cap` bytes, so
 /// padding a request can never push an applied pair out of the trail. An empty
 /// list yields one detail ("0 mappings <verb>:").
