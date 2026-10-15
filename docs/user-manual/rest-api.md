@@ -4702,6 +4702,8 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
 
+**Dangling `attempted` row.** An `attempted` `config.update` row with no `success` or `failure` row after it means the outcome is unknown (the server stopped between the two, or the outcome row was lost); read `GET /api/config` to see what is in force. A `failure` row for a database error records `store error; outcome unknown`, because the write may have committed before the acknowledgement was lost.
+
 **Cross-site writes.** A session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API, MCP and engine token callers are exempt.
 
 **Allowed keys** (the full set; source of truth is `kAllowedKeys` in
@@ -4709,7 +4711,7 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 | Key | Type | Takes effect | Description |
 |---|---|---|---|
-| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline. Minimum 30 (the default agent heartbeat interval); a lower value is refused `400` |
+| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline. Minimum 30 (the default agent heartbeat interval); a lower value is refused `400`. 30 is a floor, not a recommendation: keep it well above the agents' own `--heartbeat`. A value stored below 30 before the floor existed is raised to 30 at server start (logged), while `GET /api/config` keeps listing the stored override until you replace it |
 | `response_retention_days` | integer | **stored only, not enforced - see note** | Days to retain command response data |
 | `audit_retention_days` | integer | **stored only, not enforced - see note** | Days to retain audit log entries |
 | `guardian_event_retention_days` | integer | **stored only, not enforced - see note** | Days to retain guaranteed-state events |
@@ -4823,7 +4825,10 @@ another OIDC field, restart first so the process is not holding the old value.
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
 > deliberate distinction, and has been unified). Note `503` is emitted by **both** sources, so status
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
-> it, on every status.
+> it, on every status. Two refusals added with the audit-first and same-site gates use the A4 envelope
+> (`correlation_id` present): `403` `cross-site request refused` and `503` `audit log unavailable; the
+> change was not made` (`retry_after_ms: 5000`, header `Sec-Audit-Failed: true`). An unknown key is a
+> bare `400` and writes no audit row.
 
 **Error (503) - runtime config store unavailable.** A genuine DB/crypto write failure, distinguished
 from caller-input validation at the seam so it never returns a `400`-shaped body instead:
@@ -4853,7 +4858,8 @@ the route's `>= 0` pre-check and is then rejected by the store's own `> 0` check
 A `heartbeat_timeout` of `1` to `29` is refused the same way with
 `{ "error": "heartbeat_timeout must be at least 30 seconds (the default agent heartbeat interval)" }`:
 a window shorter than the agent heartbeat interval would mark every directly connected agent offline
-between two heartbeats.
+between two heartbeats. The floor equals the default heartbeat interval and leaves no margin for a
+late heartbeat, so choose a value well above the interval your agents run with.
 
 **Error (400) - the redaction placeholder submitted as a secret.** `GET /api/config` omits a
 secret's value and the startup log prints `<redacted>` in its place. Any value **containing** that
@@ -6746,7 +6752,7 @@ Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` con
 
 #### Developer and API page
 
-Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a read-only front for the discovery routes above. It adds no REST route and no MCP tool: its four panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row.
+Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a read-only front for the discovery routes above. It adds no REST route and no MCP tool: its four panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row for a dashboard session (a token caller keeps its denial row).
 
 - **API:** the OpenAPI document link and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes.
 - **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown.
@@ -10631,7 +10637,7 @@ Convert a JSON result set to CSV format for download.
 
 **Cells.** A string cell and every header have a leading `=`, `+`, `-`, `@`, tab or carriage return neutralised with a leading `'` (CWE-1236), then RFC 4180 quoting. A missing or `null` cell is empty. Any other non-string cell (number, boolean, nested value) is written as its JSON text with RFC 4180 quoting only, so `-5` stays `-5` and a nested object keeps its commas inside one cell; those values cannot spell a formula.
 
-**Errors.** `400` `request body nests too deeply` when the raw text nests more than 32 levels (checked before parsing); `400` `invalid JSON array` when the body is not an array of objects; `403` without `Response:Read`. The reply is `text/csv` with `Content-Disposition: attachment; filename="export.csv"`.
+**Errors.** `400` `request body nests too deeply` when the raw text nests more than 32 levels (checked before parsing); `400` `invalid JSON array` when the body is not an array, is empty, or its first element is not a non-empty object (the first object's keys are the columns; later non-objects are skipped and keys absent from the first object are dropped); `403` without `Response:Read`. The reply is `text/csv` with `Content-Disposition: attachment; filename="export.csv"`.
 
 ---
 

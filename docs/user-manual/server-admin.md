@@ -247,7 +247,9 @@ separately.
   the log level then wins over `--log-level`. Neither is the dashboard sign-in expiry: that is the
   read-only **Dashboard idle timeout** (`--session-inactivity-secs`) and **Dashboard session
   lifetime** (fixed, 8 hours) rows in the server-configuration table below the form. The heartbeat
-  timeout must be 30 seconds or more. Runtime changes are audited first: if the `attempted` audit
+  timeout must be 30 seconds or more (a lower value stored by an earlier build is raised to 30 at
+  start, with a log line); keep it well above the agents' own heartbeat interval, since 30 leaves no
+  margin for a late heartbeat. Runtime changes are audited first: if the `attempted` audit
   row cannot be written the change is refused and the page shows the error; if only the outcome row
   is lost the change stays applied and the page shows a banner.
 - **Analytics** shows the event-collection status and the most recent buffered events (type,
@@ -1407,7 +1409,7 @@ need no change.
 **The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
 — CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
 gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
-Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), and the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only). The dashboard renders fine and reads work; only the destructive actions
+Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), and the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
