@@ -743,8 +743,8 @@ log ""
 
 # ── Test 1: Server web UI is reachable ────────────────────────────────
 log "Test: Server web UI"
-HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/login" || echo "000")
-assert_eq "Server /login returns 200" "200" "$HTTP_CODE"
+HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/home" || echo "000")
+assert_eq "Server /home (sign-in landing page) returns 200" "200" "$HTTP_CODE"
 
 # ── Test 2: Server shows connected agents ─────────────────────────────
 log "Test: Agent registration through gateway"

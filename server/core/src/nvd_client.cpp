@@ -1,10 +1,14 @@
 #include "nvd_client.hpp"
 
+#include "settings_model.hpp" // sanitize_url_userinfo
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -12,6 +16,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -59,34 +64,99 @@ std::string url_encode(const std::string& value) {
 
 } // namespace
 
+NvdProxyEndpoint parse_nvd_proxy_url(std::string_view raw) {
+    NvdProxyEndpoint ep;
+    // Config values arrive from a flag, an environment variable or a file: drop the whitespace and
+    // newline a shell or editor leaves around them.
+    const auto is_space = [](char ch) {
+        return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\v' || ch == '\f';
+    };
+    while (!raw.empty() && is_space(raw.front()))
+        raw.remove_prefix(1);
+    while (!raw.empty() && is_space(raw.back()))
+        raw.remove_suffix(1);
+    // Userinfo first, through the shared sanitiser: it ends userinfo at the LAST '@' anywhere and
+    // over-strips on ambiguity, because a boundary-first parse cannot tell a password such as
+    // "admin:1234/ss@host" from a host:port (the reasoning is in settings_model.hpp). A proxy URL
+    // with a path containing '@' therefore takes the text after that '@' as its host, which no real
+    // proxy URL has.
+    const std::string sanitized = settings_model::sanitize_url_userinfo(raw);
+    std::string_view url = sanitized;
+    // Scheme: http:// or https:// (a URL scheme is case-insensitive, RFC 3986); a URL with no
+    // scheme is "host:port". Any other scheme (socks5://) is not an HTTP proxy: unusable.
+    std::string head(url.substr(0, 8));
+    for (char& ch : head)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (head.starts_with("http://"))
+        url.remove_prefix(7);
+    else if (head.starts_with("https://"))
+        url.remove_prefix(8);
+    else if (url.find("://") != std::string_view::npos)
+        return ep;
+    // The authority ends at the first path, query or fragment delimiter.
+    if (const auto end = url.find_first_of("/?#"); end != std::string_view::npos)
+        url = url.substr(0, end);
+
+    std::string_view host = url;
+    std::string_view port_text;
+    if (!url.empty() && url.front() == '[') {
+        // Bracketed IPv6 literal: "[::1]:3128". The port, if any, follows the closing bracket.
+        const auto close = url.find(']');
+        if (close == std::string_view::npos) {
+            host = url.substr(1);
+        } else {
+            host = url.substr(1, close - 1);
+            const auto rest = url.substr(close + 1);
+            if (rest.starts_with(':'))
+                port_text = rest.substr(1);
+        }
+    } else if (const auto colon = url.rfind(':'); colon != std::string_view::npos) {
+        host = url.substr(0, colon);
+        port_text = url.substr(colon + 1);
+    }
+    // A host holding whitespace or a control character is not a host, and would be written to the
+    // log verbatim.
+    const bool bad_host = std::any_of(host.begin(), host.end(), [](char ch) {
+        const auto u = static_cast<unsigned char>(ch);
+        return u <= 0x20 || u == 0x7f;
+    });
+    if (bad_host)
+        return ep;
+    ep.host = std::string(host);
+    if (!port_text.empty()) {
+        int port = 0;
+        const char* const first = port_text.data();
+        const char* const last = first + port_text.size();
+        const auto [p, ec] = std::from_chars(first, last, port);
+        if (ec == std::errc{} && p == last && port >= 1 && port <= 65535)
+            ep.port = port;
+        // else keep the 8080 default for a port that is not a plain number in 1..65535 (the
+        // previous parse also did for a non-numeric port, but read "80x" as 80)
+    }
+    return ep;
+}
+
 NvdClient::NvdClient(std::string api_key, std::string proxy_url, std::string base_url)
     : api_key_(std::move(api_key)),
       base_url_(base_url.empty() ? (std::string("https://") + kNvdHost) : std::move(base_url)) {
-    // Parse proxy URL: "http://host:port" or "host:port"
     if (!proxy_url.empty()) {
-        auto url = proxy_url;
-        // Strip scheme
-        if (url.starts_with("http://"))
-            url = url.substr(7);
-        if (url.starts_with("https://"))
-            url = url.substr(8);
-        // Strip trailing slash
-        if (!url.empty() && url.back() == '/')
-            url.pop_back();
-
-        auto colon = url.rfind(':');
-        if (colon != std::string::npos) {
-            proxy_host_ = url.substr(0, colon);
-            try {
-                proxy_port_ = std::stoi(url.substr(colon + 1));
-            } catch (...) {
-                proxy_port_ = 8080;
-            }
+        const auto ep = parse_nvd_proxy_url(proxy_url);
+        proxy_host_ = ep.host;
+        proxy_port_ = ep.port;
+        if (proxy_url.find('@') != std::string::npos)
+            spdlog::info("NVD proxy credentials in the URL are ignored; the client does not "
+                         "authenticate to the proxy");
+        if (proxy_host_.empty()) {
+            // The operator asked for a proxy we cannot use. Say so without echoing the value,
+            // and refuse to fetch (fetch_paginated) rather than go direct.
+            proxy_unusable_ = true;
+            spdlog::error("NVD proxy URL has no usable host (accepted forms: host:port, "
+                          "http://host:port, https://host:port); NVD fetches are refused until "
+                          "it is fixed and the server is restarted");
         } else {
-            proxy_host_ = url;
-            proxy_port_ = 8080;
+            // Host and port only: the parse has already dropped any userinfo.
+            spdlog::info("NVD client using proxy {}:{}", proxy_host_, proxy_port_);
         }
-        spdlog::info("NVD client using proxy {}:{}", proxy_host_, proxy_port_);
     }
 }
 
@@ -199,6 +269,13 @@ nvd_rate_limit_wait(std::optional<std::chrono::steady_clock::time_point> last,
 
 NvdFetchResult NvdClient::fetch_paginated(const std::string& date_params) {
     NvdFetchResult combined;
+    if (proxy_unusable_) {
+        // Fail closed: a configured proxy that cannot be used must not become a direct connection.
+        spdlog::error("NVD fetch refused: --nvd-proxy is set but unusable");
+        combined.ok = false;
+        combined.reason = NvdFailureReason::kConnection;
+        return combined;
+    }
     int start_index = 0;
     int backoff_attempts = 0; // consecutive 429s (reset on success)
     int total_429s = 0;       // total 429s this window (never reset — UP-3 cap)

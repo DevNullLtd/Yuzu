@@ -142,7 +142,7 @@ Every request must be authenticated using one of three methods:
 | Bearer token | `Authorization: Bearer <token>` | `Authorization: Bearer yzt_a1b2c3d4...` |
 | X-Yuzu-Token header | `X-Yuzu-Token: <token>` | `X-Yuzu-Token: yzt_a1b2c3d4...` |
 
-Unauthenticated browser requests are redirected to `/login`. Unauthenticated API requests receive a `401 Unauthorized` response.
+Unauthenticated browser requests are redirected to `/home` (the sign-in landing page; `/login` forwards there). Unauthenticated API requests receive a `401 Unauthorized` response.
 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
 
@@ -7978,6 +7978,120 @@ service-scoped-token denial is audited under `deployment.config.view` — alread
 
 ---
 
+#### `GET /api/v1/deployments`
+
+Your own software deployments from the live `/auto` pipeline, newest first. This is the read-only
+list the dashboard fragment `GET /fragments/auto/deployments` renders; unlike
+`GET /fragments/auto/deploy/result` it **never advances the engine** and writes no per-poll audit
+row. It does not read the shelved `/software-deployments` store below. MCP twin: `list_deployments`.
+
+**Permission:** `SoftwareDeployment:Read`
+
+**Parameters:**
+
+| Name | In | Required | Description |
+|---|---|---|---|
+| `limit` | query | No | Max deployments to return (default 20; a whole integer outside 1..100 is clamped; anything else is `400`: non-numeric, a number followed by other characters such as `20junk`, or one too large for a 64-bit integer) |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "deployment_id": "0a1b2c3d4e5f6071",
+      "source_run_id": "a1b2c3d4e5f6a7b8",
+      "name": "AcmeVPN 4.2.0 rollout",
+      "artifact_filename": "acmevpn-4.2.0.msi",
+      "artifact_sha256": "3a7bd3e2...",
+      "has_args": true,
+      "status": "complete",
+      "state": { "code": "complete_failed", "label": "Complete, 2 failed", "tone": "warn" },
+      "created_at_ms": 1758000000000,
+      "completed_at_ms": 1758000900000,
+      "total": 35, "succeeded": 32, "failed": 2, "skipped": 1, "active": 0
+    }
+  ],
+  "pagination": { "start": 0, "page_size": 20, "truncated": false },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`pagination.truncated` is `true` when you own more deployments than `limit` returned. There is no
+total and no paging cursor: raise `limit` (maximum 100) to see more, and note that a deployment
+older than your newest 100 is not reachable through this endpoint.
+
+`status` is `running` or `complete`; the live engine has no staged, cancelled or rolled-back state.
+`state.label` carries the failed or skipped count of a finished deployment ("Complete, 2 failed").
+The installer URL and installer arguments are **never** returned (either can carry a signed-URL
+token or a licence key); `has_args` says only whether arguments are set. Counts are as of the last
+engine advance, which only happens while a Deployments page is open, so a `running` row can be stale.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| `limit` is not a whole integer (non-numeric, trailing characters, or does not fit 64 bits) | `400` |
+| A service-scoped API token | `403`, audited under `deployment.list.view` |
+| Deployment run store never configured on this server | `503` (A4 envelope, no `retry_after_ms`) |
+| Deployment run store degraded (transient) | `503` (A4 envelope, `retry_after_ms: 2000`) — never an empty list |
+
+**Audit:** unaudited on a successful read (run lifecycle metadata, not per-agent behavioural PII);
+a service-scoped-token denial is audited under `deployment.list.view`.
+
+---
+
+#### `GET /api/v1/deployments/{id}`
+
+One of your deployments with its device grid. MCP twin: `get_deployment`. Read-only: it never
+advances the engine and writes no per-poll audit row.
+
+**Permission:** `SoftwareDeployment:Read`
+
+**Parameters:**
+
+| Name | In | Required | Description |
+|---|---|---|---|
+| `id` | path | Yes | The deployment id (lowercase hex, from the list) |
+| `limit` | query | No | Max device rows (default 500, capped at 5000). The run counts are exact regardless; `truncated` is `true` when the grid holds fewer rows than `total` |
+
+**Response:** `data` is the list row above plus `devices` (ordered by hostname), `device_limit` and
+`truncated`:
+
+```json
+{
+  "data": {
+    "deployment_id": "0a1b2c3d4e5f6071",
+    "status": "running",
+    "total": 2, "succeeded": 1, "failed": 0, "skipped": 0, "active": 1,
+    "devices": [
+      { "agent_id": "ag-1", "hostname": "host-1", "os": "windows", "step": "succeeded",
+        "exit_code": 0, "error": "", "updated_at_ms": 1758000100000 },
+      { "agent_id": "ag-2", "hostname": "host-2", "os": "windows", "step": "executing",
+        "exit_code": 0, "error": "", "updated_at_ms": 1758000100000 }
+    ],
+    "device_limit": 500,
+    "truncated": false
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`step` is one of `pending`, `staging`, `staged`, `executing`, `succeeded`, `failed`, `skipped`. A
+device the engine refused (quarantined, kill-switched, out of scope) carries the engine's own text
+in `error`.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| `limit` is not a whole integer (non-numeric, trailing characters, or does not fit 64 bits) | `400` |
+| A service-scoped API token | `403`, audited under `deployment.detail.view` |
+| No such deployment, or it belongs to another operator | `404` — indistinguishable by design |
+| Store never configured / degraded | `503` as for the list |
+
+---
+
 ### Software Deployment
 
 Manage software packages and their deployments to agents. `SoftwareDeploymentStore` is
@@ -8322,7 +8436,7 @@ The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` 
 
 Browser-facing page that renders the 3D fleet topology. The page itself is auth-gated only; per-request RBAC enforcement happens when the page's JS hits `GET /api/v1/viz/fleet/topology` (see below).
 
-**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/login` first).
+**Permission:** Session auth only (`require_auth`); redirects to `/home` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/home` first).
 
 **Browser requirements:** the dashboard stylesheet needs Chrome 111+, Edge 111+, Firefox 121+ or Safari 16.2+ (`color-mix()` and `:has()`), and this page also requires importmap support (Safari 16.4+; the other browsers already meet it). On a browser without importmap the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
 
@@ -8339,7 +8453,7 @@ Browser-facing page that renders the 3D fleet topology. The page itself is auth-
 
 **Renderer behaviour (PR 6):**
 
-The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear above each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
+The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear below each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
 
 **Renderer behaviour (PR 7):**
 
@@ -8535,7 +8649,7 @@ the JSON route above.
 
 Browser-facing per-host drill-down page (the 2D Cytoscape IPC graph above
 the TAR process tree), opened by double-clicking a cube in `/viz/fleet`.
-Auth-gated only (`require_auth`); redirects to `/login` on no session.
+Auth-gated only (`require_auth`); redirects to `/home` on no session.
 The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` — any
 other character returns `400` — before it is templated into the page
 shell. Per-request RBAC is enforced when the page's JS fetches
@@ -9183,6 +9297,18 @@ The one device list behind every network-quality drill: worst devices by a metri
 - **Query parameters:** `metric` (`rtt` / `retrans` / `throughput`, default `rtt`); `filter=not_reporting` (devices with no network sample this cycle); `cooc` (`device` / `app` / `network_only` / `degraded` — a co-occurrence band over net-degraded devices); `key` (cohort tag key — resolves the per-device cohort value; does not filter by itself); `cohort_value` (**when present**, restricts to that cohort; an empty value selects the untagged residual); `limit` (default 50, clamped to 500).
 - **Response:** `data[]` of `{agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?}`, worst-first by the sort metric (`under_pressure` / `app_unstable` are the co-occurring facts shown inline for correlation, never a verdict; `fleet_pctile` is the device's nearest-rank position, omitted when it did not report the metric). `400` on an invalid `limit`. `403` if a service-scoped API token queries this route (fleet-wide `agent_id` rows, no single agent to confine against — same rationale as `dex/signals/{obs_type}` above).
 - **Audit (behavioral PII):** each row is an `agent_id` + its network perf/correlation facts, individual-identifying, fleet-wide — emits **`network.device.view`** (`target_type=GuaranteedState`, `target_id=` empty) before serving. A denied service-scoped token also emits this verb (`result=denied`). **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no device list.
+
+#### `GET /api/v1/network/discovered-devices`
+
+Hosts found by network discovery scans, including hosts with no agent. The REST/MCP twin of the `/fragments/network/discovered` dashboard fragment; all three call one builder, so they cannot drift. The older unbounded `GET /api/discovery/results` is unchanged.
+
+- **Permission:** `Infrastructure:Read`
+- **Query parameters:** `subnet` (only hosts found on exactly this subnet string, at most 64 bytes); `limit` (1 to 500, default and cap 500).
+- **Response:** `{data[], summary, truncated, meta}`. `data[]` rows are `{id, ip_address, mac_address, hostname, subnet, discovered_by, discovered_at, last_seen}` (epoch seconds), newest last-seen first. `summary` is `{total, subnets}` over every row matching the filter, not just the returned page; `truncated` is `true` when more rows matched than were returned. `hostname` is `unknown` when a reverse lookup failed, and `hostname` and `mac_address` are agent-reported free text.
+- **Management-group confinement:** the read is gated by a flat `Infrastructure:Read` check and is not narrowed by the admit-then-filter list chokepoint (the sibling `GET /api/v1/network/devices` is flat too, on `GuaranteedState:Read`). When RBAC is enforced, an operator confined to a management group is refused with `403` rather than shown a narrowed list; a holder of the global grant sees every discovered host. With RBAC off, any authenticated non-service session is admitted. Narrowing rows by `discovered_by` is tracked by `#5855` (revisit by 2026-11-14).
+- **No `managed` flag:** discovery does not yet match hosts to enrolled agents, so no managed or agent field is returned rather than a value that would read "unmanaged" for an enrolled host.
+- **Errors:** `400` invalid `limit` or `subnet`; `403` a service-scoped API token (denied outright and audited as `result=denied`) or missing permission; `503` the discovery store is unavailable or degraded. A store fault is never rendered as an empty list.
+- **Audit (behavioral PII):** each row names a host fleet-wide, so a served read emits **`network.discovered.view`** (`target_type=Infrastructure`, `target_id=` empty). **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no rows. MCP twin: `list_discovered_devices` (set-and-proceed, reports `audit_persisted: false` instead of refusing).
 
 ---
 
@@ -10652,6 +10778,15 @@ once the underlying condition clears.
 Trigger a manual NVD database sync. Requires `Infrastructure:Execute` (held by Administrator
 and ITServiceOwner, not Administrator alone). Runs asynchronously and returns immediately.
 
+The request is **audited before it is made** as `nvd.sync.request` (`result=success`, or
+`result=disabled` when sync is off on this server and the call answers `503`). If the audit row
+cannot be persisted the request is refused with `503` (an A4 error envelope with `retry_after_ms: 5000`) and `Sec-Audit-Failed: true`, and no sync is started. The `503` for sync-off is an A4 error envelope too, and so are the `503` and `400` of `POST /api/nvd/match`.
+
+The same status JSON drives the dashboard card `GET /fragments/auto/nvd` (gated
+`Infrastructure:Read`), which shows the CVE count, last sync, whether a sync is running, and the
+last error (escaped and length-capped). The NVD proxy shown by `GET /fragments/settings/nvd` has
+any `user:password@` removed before display.
+
 #### `POST /api/nvd/match`
 
 Match installed software against known CVEs in the NVD database. Matching
@@ -10961,7 +11096,7 @@ curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
 
 #### `GET /tar`
 
-Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list, the capture sources frame and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`). The Ad-hoc TAR SQL form is no longer on this page: a short note links to the Result sets page, where **From TAR query** takes the same parent scope, SQL, name and include-empty fields.
+Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/home` otherwise). The page hosts the retention-paused source list, the capture sources frame and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`). The Ad-hoc TAR SQL form is no longer on this page: a short note links to the Result sets page, where **From TAR query** takes the same parent scope, SQL, name and include-empty fields.
 
 **Permission:** Session-only (the page itself; embedded fragment endpoints carry their own permission gates — see below).
 
@@ -11993,6 +12128,51 @@ formed `saml_identity_links` row). See
 scope of what each half (login-time vs. deprovision-time) can and cannot
 attribute, and `docs/user-manual/metrics.md` "SCIM deprovision-linkage
 metrics" for the operator-facing description.
+
+---
+
+## Notifications feed
+
+The dashboard header bell reads and acts on the notification store through three dashboard JSON routes. They are not part of REST v1 and have no MCP twin (ADR-1005 grandfathers them as a settings-plane exception).
+
+#### `GET /api/notifications`
+
+Returns the unread feed, newest first. Requires `Infrastructure:Read`.
+
+| Query | Meaning |
+|---|---|
+| `limit` | Rows to return, default 50 (the bell sends 10). No server-side upper bound. |
+| `all=true` | Include read and dismissed rows. |
+| `offset` | Row offset; only applied together with `all=true`. |
+
+```json
+{
+  "notifications": [
+    { "id": 4801, "timestamp": 1760000000000, "level": "warn",
+      "title": "DEX alert: ...", "message": "...", "read": false, "dismissed": false }
+  ],
+  "unread_count": 1
+}
+```
+
+`timestamp` is epoch milliseconds. `level` is a free string (`success`, `warn`, `error` and `info` in practice). `title` and `message` can contain agent-supplied text; render them as text only. `503` (A4 envelope, `retry_after_ms` 5000) is returned when the store is closed or a read fails, including a database connection timeout; an empty `notifications` array therefore means nothing is waiting. A negative `limit` or `offset` answers `400` (A4 envelope), with or without `all=true`.
+
+#### `POST /api/notifications/{id}/read`
+
+Marks one notification read. Requires `Infrastructure:Write`. `200 {"status":"ok"}`; `404` when no row matches. A browser (session-cookie) call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else `403` `cross-site request refused` (audit `csrf.denied`); token callers are exempt. Audit-first: a `notification.mark_read` row with result `attempted` is written before the change and the call answers `503` with `Sec-Audit-Failed: true` if it cannot be written; a `success` or `failure` row follows. `503` also when the database write fails.
+
+#### `POST /api/notifications/{id}/dismiss`
+
+Soft-deletes one notification. Requires `Infrastructure:Write`. `200`; `404` when no row matches. Same-site rule, audit-first order and `503` behaviour as `read`, with the audit action `notification.dismiss`.
+
+Behaviour to know:
+
+- **State is global.** Read and dismissed state is stored on the row, not per user: one operator's action changes the feed for everyone. There is no route that restores a read or dismissed row.
+- **No retention and no coalescing.** Rows are kept indefinitely and a fleet-wide failing instruction produces one row per device, so a large fleet can sit at 100 or more unread.
+- **Audience.** With RBAC off every signed-in user can read the feed and only administrators can act. With RBAC on only global Administrator and ITServiceOwner assignments pass; Operators, Viewers and management-group-confined users get `403` and the bell stays hidden.
+- **Audit.** Both mutations are audited (`notification.mark_read`, `notification.dismiss`; see above), and a refused caller writes one `auth.permission_required` row per request.
+
+The header bell polls `GET /api/notifications?limit=10` with the session cookie every 60 seconds while the tab is visible and the panel is closed, and only within five minutes of the last keyboard, pointer or scroll input, because each request renews the session idle window.
 
 ---
 

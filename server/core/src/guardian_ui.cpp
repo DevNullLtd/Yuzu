@@ -35,13 +35,7 @@ const char* const kGuardianPageTemplate =
     .content { padding: 22px 28px 36px; }
 
     /* ── Page header ──────────────────────────────────────── */
-    .page-header {
-      display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between;
-      gap: 12px 24px; margin-bottom: 22px;
-    }
-    .page-header h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; }
-    .page-header .subtitle { color: var(--mut); margin-top: 4px; max-width: 70ch; }
-    .page-header .header-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .page-header { margin-bottom: 22px; }
 
     /* ── Panels: bordered regions, not floating cards ──────── */
     .section {
@@ -61,7 +55,7 @@ const char* const kGuardianPageTemplate =
       margin-left: auto; height: 28px; max-width: 190px; padding: 0 10px; font-size: 13px;
       color: var(--ink); background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
     }
-    /* Fleet Status leads the page: no box, a top rule only (the design's flat panel). */
+    /* Fleet Status leads the page: no box, a top rule only (a flat panel). */
     .section.flat {
       background: none; border-width: 1px 0 0; border-radius: 0;
       border-color: var(--line2); overflow: visible;
@@ -412,7 +406,7 @@ const char* const kGuardianPageTemplate =
     <div class="section flat">
       <div class="section-header">
         Fleet Status
-        <span class="htmx-indicator" style="margin-left:auto">Refreshing&hellip;</span>
+        <span class="htmx-indicator gs-push">Refreshing&hellip;</span>
       </div>
       <div class="section-body">
         <div class="view-switch">

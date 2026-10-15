@@ -585,8 +585,6 @@
     var btnValidate = $('ox-validate');
     var btnPreview = $('ox-preview');
     var out = $('ox-expr-out');
-    var kinds = $('ox-kinds');
-    var kindsList = $('ox-kinds-list');
     var btnTar = $('ox-tar-open');
 
     function setContext(msg, isError) {
@@ -717,46 +715,6 @@
       btnPreview.addEventListener('click', preview);
       syncButtons();
     }
-
-    /* ---- Scope kinds: loaded once, on first open, so a page view that
-       never opens the panel costs no request (and no denied-audit row for a
-       role without Infrastructure:Read). Rendered from fetched JSON with
-       textContent. ---- */
-    var kindsLoaded = false;
-    function renderKinds(doc) {
-      clear(kindsList);
-      var groups = [['Targets', doc.ground_kinds], ['Attributes', doc.attribute_kinds]];
-      groups.forEach(function (g) {
-        if (!Array.isArray(g[1])) return;
-        var h = el('li', 'ox-hint', g[0]);
-        kindsList.appendChild(h);
-        g[1].forEach(function (k) {
-          var li = el('li');
-          li.appendChild(el('code', null, k.syntax || k.kind || ''));
-          li.appendChild(el('span', null, k.description || ''));
-          kindsList.appendChild(li);
-        });
-      });
-      var foot = el('li', 'ox-hint',
-        'group: takes a group id here, not a name; the picker below emits the id.');
-      kindsList.appendChild(foot);
-    }
-    function loadKinds() {
-      if (kindsLoaded) return;
-      kindsLoaded = true;
-      clear(kindsList);
-      kindsList.appendChild(el('li', 'ox-hint', 'Loading…'));
-      api('GET', '/api/v1/discover/scope-kinds').then(function (r) {
-        if (r.status === 200 && r.data) { renderKinds(r.data); return; }
-        kindsLoaded = false; /* let a later open retry */
-        clear(kindsList);
-        var msg = r.status === 403
-          ? 'Listing scope kinds needs the Infrastructure read permission.'
-          : 'Scope kinds are unavailable. This is not an empty list.';
-        kindsList.appendChild(el('li', 'ox-hint', msg));
-      });
-    }
-    if (kinds) kinds.addEventListener('toggle', function () { if (kinds.open) loadKinds(); });
 
     /* ---- Fan-out confirm (Q6): any target that is not one agent. htmx holds
        the request at htmx:confirm; issueRequest(true) releases it. A
