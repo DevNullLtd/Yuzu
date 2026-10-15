@@ -17,7 +17,7 @@
      blocked on the first existing-store migrations proving the substrate.
    - Cohorts = operator-chosen TAG KEY (hardware model is NOT centrally
      queryable, ADR-0004 thin-center; auto-tag via the asset-tagging recipe).
-     n>=10 floor renders "n too small"; "(untagged)" residual row, never a
+     empty cohort (floor: one reporting device) renders "n too small"; "(untagged)" residual row, never a
      silent omission.
    - Session responsiveness composite (row 38) DROPPED — answered by the
      health score's Performance-family weighting; one derived score, not two.
@@ -37,7 +37,7 @@
      Settings -> DEX alerts gains the field, same F1 pattern):
      yuzu_fleet_perf_cohort_{cpu_pct,commit_pct,disk_lat_ms}{cohort,stat}
      + yuzu_fleet_perf_cohort_reporting{cohort}. Cardinality cap: top 50
-     cohort values by population, n>=10 floor applies, plus a
+     cohort values by population, one-device floor applies, plus a
      yuzu_fleet_perf_cohort_clipped count so clipping is visible.
    - Per-device/per-app NOT exported to Prometheus (cardinality + the
      agent-metrics-via-heartbeat principle); Grafana reaches those via the
@@ -243,7 +243,7 @@
         <td class="num">55.9% / 80.3% <span class="pill up">+7%</span></td>
         <td class="num">1.4 / 6.4 ms <span class="pill up">+48%</span></td></tr>
       <tr class="click"><td class="coh" style="color:var(--slate)">Precision 5680</td><td class="num">6</td>
-        <td class="num" colspan="3" style="color:var(--slate)">&mdash; (n too small: fewer than 10 reporting devices)</td></tr>
+        <td class="num" colspan="3" style="color:var(--slate)">&mdash; (n too small: no reporting device)</td></tr>
       <tr class="click"><td class="coh" style="color:var(--slate)">(untagged)</td><td class="num">168</td>
         <td class="num">6.0% / 23.9% <span class="pill flat">&minus;3%</span></td>
         <td class="num">53.0% / 77.6% <span class="pill flat">&minus;1%</span></td>
@@ -268,8 +268,8 @@
   </table>
   <div class="caveat">Row 103 by construction: tag both VDI cohorts with an <b>image</b> key, diff the
     distributions &mdash; the layered image costs +42% CPU p50 and double the disk latency against vanilla
-    on identical hardware. Honesty rules: cohorts under <b>10 reporting devices</b> render
-    &ldquo;n too small&rdquo;, never noisy percentiles; devices without the chosen key always appear as an
+    on identical hardware. Honesty rules: cohorts with <b>no reporting device</b> render
+    &ldquo;n too small&rdquo; (the floor is one device); a one-device cohort shows that device&rsquo;s exact figures; devices without the chosen key always appear as an
     explicit <b>(untagged)</b> residual.</div>
   <div class="sub" style="font-size:.68rem">Per-device comparison (&ldquo;where does <i>this</i> machine sit
     in its cohort?&rdquo;) lives on the device drill-down &rarr; <a href="dex-device-perf.html">device
@@ -281,7 +281,7 @@
     (2) <b>F2a = now-view only</b> (fleet-now cards + cohort tables, render-time over registry heartbeat
     state, zero new storage); the trend band charts above are <b>F2b</b>, blocked on the first
     existing-store Postgres migrations proving the substrate.
-    (3) <b>Cohorts = operator-chosen tag key</b> (n&ge;10 floor fixed, explicit untagged residual);
+    (3) <b>Cohorts = operator-chosen tag key</b> (one-device floor fixed, explicit untagged residual);
     hardware-model cohorts via the asset-tagging recipe, documented in F2a.
     (4) <b>Responsiveness composite dropped</b> (row 38 is answered by the health score&rsquo;s
     Performance-family weighting — one derived score, not two).

@@ -215,7 +215,7 @@ std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
         h += "<div class=\"gp-note\">band = fleet p50&ndash;p90 &middot; marker = this device "
              "(red when above fleet p90). Cohort comparison withheld &mdash; " +
              (ctx.cohort_n < kDexCohortFloor
-                  ? "this device's cohort has only " + std::to_string(ctx.cohort_n) +
+                  ? "this device's cohort has " + std::to_string(ctx.cohort_n) +
                         " reporting devices (floor " + std::to_string(kDexCohortFloor) + ")"
                   : std::string("no cohort resolved")) +
              ".</div>";
@@ -324,7 +324,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
         h += "<tr><td>" + drill("/fragments/dex/perf/devices?" + qs, label) + "</td><td>" +
              std::to_string(c.devices) + "</td>";
         if (c.suppressed) {
-            h += "<td colspan=\"3\" class=\"gp-mute\">&mdash; (n too small: fewer than " +
+            h += "<td colspan=\"3\" class=\"gp-mute\">&mdash; (n too small: below the floor of " +
                  std::to_string(kDexCohortFloor) + " reporting devices)</td>";
         } else {
             h += "<td>" + cohort_cell(c.cpu, false, now.cpu) + "</td><td>" +
@@ -335,9 +335,9 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
     }
     h += "</tbody></table>";
     h += "<div class=\"gp-note\">Percentiles compare within the chosen key&rsquo;s cohorts; the "
-         "&Delta; against the fleet p50 marks cohorts running hot. Cohorts under " +
+         "&Delta; against the fleet p50 marks cohorts running hot. Cohorts below the floor of " +
          std::to_string(kDexCohortFloor) +
-         " reporting devices withhold percentiles (statistical floor); devices without the key "
+         " reporting devices withhold percentiles; devices without the key "
          "always appear as the explicit (untagged) residual.</div>";
 
     // ── Compare two cohorts (F2c, BRD 99/103) ── the head-to-head A-vs-B diff,
@@ -420,8 +420,8 @@ std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
     h += "<div class=\"gp-note\">A = <b>" + label(cohort_a) + "</b> (" + pop(d.found_a, d.a) +
          "), B = <b>" + label(cohort_b) + "</b> (" + pop(d.found_b, d.b) +
          "). &Delta; is A&rsquo;s p50 relative to B&rsquo;s (B the baseline); a positive value "
-         "means A runs hotter. A metric is compared only where both cohorts clear the " +
-         std::to_string(kDexCohortFloor) + "-device floor.</div>";
+         "means A runs hotter. A metric is compared only where both cohorts clear the floor of " +
+         std::to_string(kDexCohortFloor) + " reporting devices.</div>";
     return h;
 }
 
