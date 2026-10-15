@@ -3605,8 +3605,8 @@ Query audit events.
 | `action` | string | No | Filter by action name |
 | `target_type` | string | No | Filter by target type (exact match) |
 | `target_id` | string | No | Filter by target id (exact match); requires `target_type` |
-| `since` | integer | No | Inclusive lower bound, epoch seconds; `0` or absent is unbounded |
-| `until` | integer | No | Inclusive upper bound, epoch seconds; `0` or absent is unbounded |
+| `since` | integer | No | Inclusive lower bound, epoch seconds. Omit for no bound; `0` is accepted and matches the same rows as omitting it. Negative is `400` |
+| `until` | integer | No | Inclusive upper bound, epoch seconds. Omit for no bound; `0` or negative is `400` |
 
 **Response:**
 
@@ -3666,17 +3666,15 @@ Rows carry `id`, `timestamp`, `principal`, `action`, `result`, `target_type`,
 by the legacy `GET /api/audit`; the MCP `query_audit_log` tool returns the
 same row set as this route.
 
-**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
-less than 1, `since`/`until` is not a non-negative integer, `since` is
+**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` is not one
+base-10 integer or is less than 1, `since` is negative or not an integer,
+`until` is `0`, negative or not an integer, `since` is
 greater than `until`, `offset` is not an integer in `0..10000`, a string
 filter holds a NUL or invalid UTF-8, or
 `target_id` is given without `target_type` (the index leads with
 `target_type`, so a bare `target_id` would scan the table); `503` — the
 audit store is unavailable or the query degraded (ADR-0040 deny-on-degrade —
-see the note above this section; never a false-empty `200`). A non-numeric
-`limit` (e.g. `abc`) is NOT a 400 here — the request proceeds with the
-default `limit` (100); the sibling `auth-sample` route below is stricter and
-400s on the same input.
+see the note above this section; never a false-empty `200`).
 
 #### `GET /api/v1/audit/auth-sample`
 
@@ -9333,7 +9331,7 @@ The **`/auto` VERIFY** before/after comparison: did upgrading `app` from `baseli
 - **Query parameters:** `group` — **required**, ≤ 512 bytes, no control characters; the management group whose members are the cohort. `app`, `baseline`, `candidate` — **required**, same validation; `baseline` and `candidate` must differ (`400` if equal after canonicalization). `window` — optional integer days, default `7`; an integer in range is clamped to `1`–`31`, while a value that is not one base-10 integer or does not fit a signed 32-bit integer (`window=99999999999`) is a `400` (the dashboard fragment answers its usual `200` note instead).
 - **Response (`200`):** `{app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, truncated, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{…}, distribution{up, flat, down}}`. `truncated:true` means the cohort exceeded the 100,000-row read cap — the counts are **incomplete and may mis-pair** machines (a device that ran both versions can be mis-reported as one-version-only); treat the result as unreliable and narrow the group or shorten the window. A zero-sample machine (one that measured nothing in-window) is excluded from pairing rather than counted as a 0%-CPU pair. `cohort_size` = group members; `paired` = ran both (the comparison population); `baseline_only`/`candidate_only` = excluded (one version only); `no_data` = `cohort_size − paired − baseline_only − candidate_only`. `small_cohort:true` = `paired` non-zero but below the cohort floor — **not** suppressed (canaries are deliberately small); with the floor at one device the field stays on the wire but is always `false`. `insufficient:true` = `paired == 0` (no machine ran both — the `cpu`/`ws`/`distribution` values are zero and should not be displayed). `cpu.*` are percent (float); `ws.*` are bytes (int64); `delta_median` is the median per-machine delta (positive = candidate heavier). `distribution.{up,flat,down}` count machines whose per-machine CPU delta exceeded / stayed within / fell below ±0.3 pp.
 - **No per-machine identity in the response** — the aggregate carries no `agent_id`. The per-machine pairs are a **dashboard-only** drill (`/fragments/auto/verify/drill`, audited `dex.app_perf.compare.drill`); there is **no REST or MCP per-machine surface** in this slice (a REST audited-fail-closed per-machine drill is a deferred follow-up).
-- **Error paths:** `400` on a missing/invalid required parameter or `baseline == candidate`; `403` if a service-scoped API token calls this route; `503` on store degrade or startup warmup (the A4 body's `retry_after_ms` carries the suggested delay).
+- **Error paths:** `400` on a missing/invalid required parameter, a malformed `window`, or `baseline == candidate`; `403` if a service-scoped API token calls this route; `503` on store degrade or startup warmup (the A4 body's `retry_after_ms` carries the suggested delay).
 - **Headers:** `X-Correlation-Id` on every response path; `Sec-Audit-Failed: true` when the audit row could not persist (the read still proceeds — operational set-and-proceed).
 - **Audit:** emits **`dex.app_perf.compare`** (`target_id=<group_id>`, `detail` carries `app=<name> base=<v> cand=<v> cohort=<N> paired=<N> view=aggregate cid=<cid>` — `paired=` so a singleton (paired=1) aggregate, which is effectively per-machine, is distinguishable in the log). Because VERIFY has no cohort floor, this recorded read is the accountability that replaces suppression (operational set-and-proceed, not fail-closed — the aggregate carries no per-machine identity, so a lost row leaks no PII). A service-scoped-token denial is also recorded under this same verb (`result=denied`, `target_id=` empty). The MCP twin is recorded under the generic `mcp.compare_app_perf_versions` tool-call audit on SUCCESS, which carries the same subject in its detail (group/app/versions/cohort/paired) and sets `audit_persisted:false` in the result body on a dropped row (MCP has no `Sec-Audit-Failed` header channel) — but a service-scoped-token DENIAL over MCP is recorded under `dex.app_perf.compare` too, matching the REST verb rather than the generic one (the deny-path convention every REST/MCP twin pair in this doc uses).
 

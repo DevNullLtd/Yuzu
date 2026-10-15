@@ -411,8 +411,8 @@ Query audit events with filtering and pagination. Maximum page size is 1000.
 | `action` | string | Filter by action (exact match) |
 | `target_type` | string | Filter by target type (exact match) |
 | `target_id` | string | Filter by target id (exact match); requires `target_type` |
-| `since` | integer | Inclusive lower bound, epoch seconds; `0` or absent is unbounded |
-| `until` | integer | Inclusive upper bound, epoch seconds; `0` or absent is unbounded |
+| `since` | integer | Inclusive lower bound, epoch seconds. Omit for no bound; `0` is accepted and matches the same rows as omitting it. Negative is `400` |
+| `until` | integer | Inclusive upper bound, epoch seconds. Omit for no bound; `0` or negative is `400` |
 | `offset` | integer | Rows to skip, `0`..`10000` (default 0) |
 
 A negative `since`, and an `until` of `0` or below, are rejected (`400` on `/api/audit`, `-32602` on MCP `query_audit_log`; `to=0` is `400` on `GET /api/v1/audit/auth-sample`): the bounds are presence-tracked, and a literal `-3600` or `until=0` used to mean no bound and returned the whole log. Omit the parameter for no bound; `since=0` (`from=0` on the auth sample) is accepted and matches the same rows as omitting it. A strict-parse `400` on these audit and analytics reads (`GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/analytics/recent`) writes no audit row, and neither does one on the notification and patch lists, the legacy policy lists, the pre-flight run form, the OTA rollout change, the DEX blast-radius thresholds, the API-token form, or the DEX signal, DEX perf and network device lists, because each is answered before any audit write. These routes audit their rejection instead, with a `result=denied` row for a malformed or out-of-range number (see their rows): `POST /api/settings/enrollment-tokens`, `POST /api/settings/enrollment-tokens/batch`, `POST /api/v1/offload-targets` and `POST /api/v1/guaranteed-state/rules` (an out-of-range `version`). `GET /api/v1/guaranteed-state/events` parses `limit` and `offset` before it writes its `dex.device.view` row, so its `400` leaves no access row.
