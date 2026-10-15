@@ -2,9 +2,10 @@
   - The new agent is staged and validated before the running one is stopped. A replaced agent that does not stay running is rolled back and restarted.
   - A first install of the stock package installs the agent but does not start it until a server trust anchor is configured. An agent that was stopped or disabled stays stopped.
   - Upgrades now keep the service definition's arguments, every `YUZU_*` variable (OTA signing and opt-outs included) and the proxy settings. Previously the definition was replaced.
-  - The installer refuses, in `preinstall` before anything is written or removed, when:
+  - The installer refuses, in `preinstall` before the payload is laid down, when:
     - a `/usr/local` directory the agent runs from is not root-owned, or is group- or world-writable (common on Intel Macs with Homebrew);
-    - agent code or plugins there could have been written by another account;
+    - agent code or plugins there could have been written by another account (mode bits or an access control list);
+    - `/etc/yuzu-agent` or its `certs` directory is not root-owned or is group- or world-writable;
     - the data or log directory is not owned by root or `_yuzu`;
     - a retained signed-plugin requirement meets an unsigned package.
   - On every POSIX platform, the agent's startup OTA rollback now promotes `<exe>.old` only if it is a regular, singly-linked file owned by the agent's own account or root, with no group or world write bit; anything else is refused, logged and removed.

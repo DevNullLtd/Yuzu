@@ -195,6 +195,17 @@ legacy_app_is_managed() {
     [[ "$(shasum -a 256 "$candidate/Contents/embedded.provisionprofile" | awk '{print $1}')" == "$LEGACY_PROFILE_SHA256" ]]
 }
 
+# Mode bits are not the whole story: a macOS ACL can grant another account
+# write access that `chmod go-w` leaves in place, and a file_inherit entry is
+# copied onto code delivered later (PR #4482 governance G8-S7). Exit 0 when an
+# ACL entry allows anyone to modify the path. An unreadable listing counts as a
+# grant.
+acl_grants_write() {
+    local listing
+    listing="$(/bin/ls -lde "$1" 2>/dev/null)" || return 0
+    grep -Eq '^ *[0-9]+: .* allow .*(write|append|add_file|add_subdirectory|delete_child|chown|writesecurity|writeattr|writeextattr)' <<<"$listing"
+}
+
 # An app that fails the legacy-ownership check is never run, restored or deleted:
 # it is moved to a root-only quarantine OUTSIDE the data root and the recovery
 # snapshot, and reported. Keeping it inside the recovery snapshot (as before)
@@ -217,6 +228,7 @@ code_directory_chain_trusted() {
         owner="$(stat -f '%u' "$path")"
         mode="$(stat -f '%Lp' "$path")"
         [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || return 1
+        ! acl_grants_write "$path" || return 1
     done
 }
 
@@ -238,12 +250,18 @@ reject_untrusted_code_entries() {
         fi
         owner="$(stat -f '%u' "$entry")"
         mode="$(stat -f '%Lp' "$entry")"
-        [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || bad="$bad$entry"$'\n'
+        if [[ "$owner" != 0 || $((8#$mode & 8#022)) != 0 ]] || acl_grants_write "$entry"; then
+            bad="$bad$entry"$'\n'
+        fi
     done
     if [[ -d "$PLUGIN_DIR" && ! -L "$PLUGIN_DIR" ]]; then
         found="$(find "$PLUGIN_DIR" -mindepth 1 \( -type l -o ! -user 0 -o -perm -0020 -o -perm -0002 \) -print)" || {
             echo "ERROR: cannot inspect $PLUGIN_DIR" >&2; return 1; }
         [[ -z "$found" ]] || bad="$bad$found"$'\n'
+        # find has no ACL test (G8-S7): check every entry, the directory included.
+        while IFS= read -r -d '' entry; do
+            ! acl_grants_write "$entry" || bad="$bad$entry (access control list grants write)"$'\n'
+        done < <(find "$PLUGIN_DIR" -print0)
     fi
     [[ -z "$bad" ]] && return 0
     echo "ERROR: refusing to install beside code a non-root account could have written:" >&2
@@ -327,9 +345,11 @@ harden_managed_plugins() {
             return 1
         fi
         chown root:wheel "$PLUGIN_DIR/$plugin"
+        chmod -N "$PLUGIN_DIR/$plugin"
         chmod go-w "$PLUGIN_DIR/$plugin"
         [[ ! -e "$PLUGIN_DIR/$plugin.sig" ]] || {
             chown root:wheel "$PLUGIN_DIR/$plugin.sig"
+            chmod -N "$PLUGIN_DIR/$plugin.sig"
             chmod go-w "$PLUGIN_DIR/$plugin.sig"
         }
     done < "$manifest"
@@ -365,14 +385,24 @@ reject_unmanaged_plugin_collisions() {
     done
 }
 
+# launchctl bootout returns before the job is gone: measured on macOS 15, the
+# agent leaves ~1.3 s after SIGTERM. Wait for it, bounded at 30 s (PR #4482
+# governance g8ch-B1). Returns 1 if it is still loaded.
+stop_service() {
+    local waited=0
+    launchctl print "system/com.yuzu.agent" >/dev/null 2>&1 || return 0
+    launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
+    while launchctl print "system/com.yuzu.agent" >/dev/null 2>&1; do
+        [[ "$waited" -lt 60 ]] || return 1
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+}
+
 require_stopped() {
-    if launchctl print "system/com.yuzu.agent" >/dev/null 2>&1; then
-        launchctl bootout "system/com.yuzu.agent"
-        if launchctl print "system/com.yuzu.agent" >/dev/null 2>&1; then
-            echo "ERROR: Yuzu Agent is still loaded; refusing package transition" >&2
-            return 1
-        fi
-    fi
+    stop_service || {
+        echo "ERROR: Yuzu Agent did not unload within 30 seconds; refusing package transition" >&2
+        return 1; }
 }
 
 require_started() {
@@ -552,7 +582,7 @@ restore_previous() {
     phase="$(cat "$recovery/phase" 2>/dev/null || true)"
     # Before promotion nothing active has changed: there is nothing to restore.
     [[ "$phase" == promoting ]] || return 0
-    launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
+    stop_service || echo "WARNING: Yuzu Agent is still unloading; restoring anyway" >&2
     # Clear both lanes and the generated plist first: recovery must restore an
     # exact prior package state, including the prior "no installed agent" case.
     rm -f "$PLIST" "$MODE_FILE" "$INCOMING_BUNDLE_ARCHIVE"
@@ -734,6 +764,7 @@ mv "$INCOMING_PLIST" "$PLIST"
 
 if [[ "$MODE" == "bundle" ]]; then
     chown -R root:wheel "$APP"
+    chmod -R -N "$APP"
     chmod -R go-w "$APP"
     harden_managed_plugins "$MANIFEST"
     bundle_args="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST")"
@@ -742,9 +773,11 @@ if [[ "$MODE" == "bundle" ]]; then
         echo "ERROR: the bundle service definition lacks --no-auto-update" >&2; exit 1; }
 else
     chown root:wheel "$LOOSE_BIN/yuzu-agent"
+    chmod -N "$LOOSE_BIN/yuzu-agent"
     chmod go-w "$LOOSE_BIN/yuzu-agent"
     if [[ -e "$LOOSE_BIN/libyuzu_agent_core.dylib" ]]; then
         chown root:wheel "$LOOSE_BIN/libyuzu_agent_core.dylib"
+        chmod -N "$LOOSE_BIN/libyuzu_agent_core.dylib"
         chmod go-w "$LOOSE_BIN/libyuzu_agent_core.dylib"
     fi
     harden_managed_plugins "$MANIFEST"
@@ -755,12 +788,25 @@ sync
 # failure there restores it. A fresh or stopped install is never rolled back
 # for not running: the agent exits until it is configured (PR #4482
 # governance hp-1, sre-2, hp-2).
-if [[ -e "$recovery/service-was-running" ]]; then
+# A running agent's disable override (effective at the next boot) is put back
+# after its restart (g8ch-i5). A running agent whose settings were lost to an
+# unreadable definition is installed but not health-gated: the package default
+# cannot run unconfigured, and rolling back would restore the unreadable
+# definition and leave it stopped anyway (g8ch-M1).
+was_disabled=0
+if service_disabled; then was_disabled=1; fi
+if [[ -e "$recovery/service-was-running" ]] && service_definition_configured "$PLIST"; then
     launchctl enable "system/com.yuzu.agent"
     launchctl bootstrap system "$PLIST"
     require_started
+    if [[ "$was_disabled" == 1 ]]; then
+        launchctl disable "system/com.yuzu.agent" ||
+            echo "WARNING: could not restore the administrator's disable override; run: launchctl disable system/com.yuzu.agent" >&2
+    fi
     outcome="Yuzu Agent installed and started."
-elif service_disabled; then
+elif [[ -e "$recovery/service-was-running" ]]; then
+    outcome="Yuzu Agent installed but NOT started: the previous service definition could not be read, so its settings were lost. Re-apply --server and a trust anchor to $PLIST, then run: launchctl bootstrap system $PLIST"
+elif [[ "$was_disabled" == 1 ]]; then
     outcome="Yuzu Agent installed. The service is disabled by an administrator and was not started; to start it run: launchctl enable system/com.yuzu.agent && launchctl bootstrap system $PLIST"
 elif service_definition_configured "$PLIST"; then
     if launchctl bootstrap system "$PLIST" && require_started; then

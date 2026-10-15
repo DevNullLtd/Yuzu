@@ -123,6 +123,20 @@ remove_managed_plugins() {
     done < "$manifest"
 }
 
+# launchctl bootout returns before the job is gone: measured on macOS 15, the
+# agent leaves ~1.3 s after SIGTERM. Wait for it, bounded at 30 s (PR #4482
+# governance g8ch-B1). Returns 1 if it is still loaded.
+stop_service() {
+    local waited=0
+    launchctl print "system/com.yuzu.agent" >/dev/null 2>&1 || return 0
+    launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
+    while launchctl print "system/com.yuzu.agent" >/dev/null 2>&1; do
+        [[ "$waited" -lt 60 ]] || return 1
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+}
+
 # Interrupted-install state is cleared FIRST, pointer before snapshots: with no
 # pointer, no later recovery can restore (and restart) the agent this script
 # removes (PR #4482 governance ch-3). The quarantine is kept for inspection.
@@ -138,7 +152,7 @@ clear_recovery_state() {
 
 ensure_state_dir
 clear_recovery_state
-launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
+stop_service || echo "WARNING: Yuzu Agent is still unloading; its code is removed anyway" >&2
 retire_legacy_app
 remove_managed_plugins "$MANIFEST" "$HASHES"
 # Both lanes are package-owned. Remove both so a loose-to-bundle (or reverse)

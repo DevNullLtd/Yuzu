@@ -29,8 +29,10 @@ Making the directories root-owned does not undo what another account already
 wrote into them. The installer also refuses when any `yuzu-agent*`,
 `libyuzu_agent_core*`, `.yuzu-*` or `.libyuzu_agent_core*` entry in
 `/usr/local/bin`, or anything at any depth below `/usr/local/lib/yuzu/plugins`
-(the agent loads plugins recursively), is a symlink, is not root-owned, or is
-group- or world-writable. It lists each one, even when it also refused a
+(the agent loads plugins recursively), is a symlink, is not root-owned, is
+group- or world-writable, or has an access control list (`ls -le`) that lets
+anyone modify it. The `/usr/local` directories are checked for such ACLs too.
+It lists each one, even when it also refused a
 directory. Inspect them, remove anything you did not install as root, then
 retry. Do not `chown -R` these paths: that makes another account's files look
 root-installed. Package promotion removes the updater's `yuzu-agent.old`
@@ -96,7 +98,8 @@ directory is left exactly as it was. It holds the agent's identity and
 enrolment, so never delete it to get past this check; remove the write bit or
 restore its owner instead. `/Library/Logs/Yuzu` follows the same rule, since the
 same script gives it to `_yuzu`. Configuration, certificate and plugin
-directories must be root-owned and not group- or world-writable. Logs,
+directories must be root-owned and not group- or world-writable; these are all
+checked in `preinstall`, before the payload. Logs,
 configuration, and trust anchors remain outside the sealed app, with existing
 ownership and modes preserved.
 When upgrading an earlier development build that placed `YuzuAgent.app` below
@@ -138,11 +141,15 @@ never overwrites one.
 
 Whether the new agent is started depends on what it replaces:
 
-- **A running agent.** The new one is started and must report `running` with a
-  PID for three consecutive observations (up to six seconds), or the previous
-  package state is restored and restarted.
-- **A service an administrator disabled** (`launchctl disable`). It is installed
-  and left stopped.
+- **A running agent.** The installer waits (up to 30 seconds) for it to exit,
+  then starts the new one, which must report `running` with a PID for three
+  consecutive observations (up to six seconds), or the previous package state is
+  restored and restarted. If an administrator had disabled it while it ran, the
+  override is put back for the next boot. If its definition could not be read,
+  so its settings were lost, the new agent is installed but not started, and the
+  Installer output says so.
+- **A service an administrator disabled** (`launchctl disable`) and not
+  running. It is installed and left stopped.
 - **Nothing running, but a server trust anchor is configured** (`--ca-cert`,
   `--tls-system-roots`, `--no-tls`, the matching `YUZU_*` variable, or
   `/etc/yuzu/certs/default-ca.pem`). It is started and its state is reported, with
@@ -252,8 +259,10 @@ The postinstall script restores the saved plist and package-owned files if
 promotion or the health observation of a previously running agent fails. It
 leaves data, logs, configuration, certificates, and third-party plugins alone.
 The recovery snapshot records a durable `prepared` or `promoting` phase. A later
-package run discards an unused prepared snapshot, or restores an interrupted
-promotion, before taking a new snapshot. A recovery pointer that is unusable
+package run restores an interrupted promotion, or discards an unused prepared
+snapshot after first putting back any live file it holds that is missing (an
+install interrupted after Installer removed an older package's files), before
+taking a new snapshot. A recovery pointer that is unusable
 (dangling after an interrupted cleanup, empty after a torn write, or a symlink)
 is reported and dropped, and a phase that cannot be read is treated as an
 interrupted promotion, so no recovery state can block later installs. Installs

@@ -20,8 +20,10 @@ This applies to every macOS `.pkg`, including the release package.
     `/usr/local`: Intel Macs, and Apple silicon Macs running an Intel or
     migrated Homebrew.
   - An agent binary, rollback file or plugin (at any depth) in those directories
-    is a symlink, or another account could have written it. The installer lists
-    each entry.
+    is a symlink, or another account could have written it, including through
+    an access control list. The installer lists each entry.
+  - `/etc/yuzu-agent` or `/etc/yuzu-agent/certs` is not root-owned, or is group-
+    or world-writable.
   - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu` is not owned by
     root or `_yuzu`, or is group- or world-writable.
   - A new plugin has the same name as one no Yuzu package installed, or as a
@@ -38,8 +40,8 @@ This applies to every macOS `.pkg`, including the release package.
   replaced `/Library/LaunchDaemons/com.yuzu.agent.plist`, losing anything added
   to it. Any other environment variable is dropped and named in
   `/var/log/install.log`. If the existing definition cannot be parsed, the
-  package default is installed with a warning, and earlier settings must be
-  re-applied.
+  package default is installed with a warning and the agent is not started;
+  earlier settings must be re-applied.
 - An unrecognized development app under the data directory is moved to
   `/var/db/yuzu-agent/quarantine/` and reported; it no longer blocks the install
   or `uninstall.sh`.
