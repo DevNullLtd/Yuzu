@@ -2,6 +2,87 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the macOS agent package installs transactionally and can refuse
+
+This applies to every macOS `.pkg`, including the release package.
+
+**What changed.**
+
+- The installer stages the new agent beside the running one and validates it.
+  The running agent is stopped only after that succeeds. If a running agent was
+  replaced and the new one does not stay running, the previous version is
+  restored and restarted.
+- The installer now **refuses** in these cases, before anything is stopped or
+  changed, and says which one applies:
+  - `/usr/local`, `/usr/local/lib` or `/usr/local/lib/yuzu`, or `/usr/local/bin`
+    for the loose-binary package, is not root-owned or is group- or
+    world-writable. That is typical of Macs whose Homebrew lives in
+    `/usr/local`: Intel Macs, and Apple silicon Macs running an Intel or
+    migrated Homebrew.
+  - An agent binary, rollback file or plugin (at any depth) in those directories
+    is a symlink, or another account could have written it, including through
+    an access control list. The installer lists each entry.
+  - `/etc/yuzu-agent` or `/etc/yuzu-agent/certs` is not root-owned, or is group-
+    or world-writable.
+  - `/Library/Application Support/Yuzu` or `/Library/Logs/Yuzu`, or anything
+    in them, is not root-owned, is group- or world-writable, or has an access
+    control list that lets another account write to it; or an entry in them is
+    a symlink, a special file or a hard-linked file. The agent runs as root and
+    opens files there by name. A Mac where `scripts/install-agent-user.sh` gave
+    them to `_yuzu` needs them returned to root first. The refusal lists each
+    entry; inspect and fix them one at a time, and never `chown -R`, which would
+    make a planted symlink look root-owned (see the packaging README).
+  - `/var/db/yuzu-agent`, or a recovery snapshot in it, has an access control
+    list. The installer never sets one, so it refuses rather than remove it.
+  - A new plugin has the same name as one no Yuzu package installed, or as a
+    Yuzu plugin whose bytes were changed after installation.
+  - The existing service requires signed plugins (`--plugin-require-signature`)
+    and the package contains an unsigned plugin. Every release `.pkg` does.
+- A first install of the stock package is **installed but not started**,
+  because the agent will not run without a server trust anchor. An agent that
+  was stopped is left stopped, including one disabled with
+  `launchctl disable system/com.yuzu.agent`; a disabled agent that was still
+  running is restarted and stays disabled for the next boot. Previously the installer loaded
+  the service every time.
+- Upgrades keep the existing service definition's arguments, every `YUZU_*`
+  environment variable and the standard proxy variables. Previously an upgrade
+  replaced `/Library/LaunchDaemons/com.yuzu.agent.plist`, losing anything added
+  to it. Any other environment variable is dropped and named in
+  `/var/log/install.log`. If the existing definition cannot be parsed, the
+  package default is installed with a warning and the agent is not started;
+  earlier settings must be re-applied.
+- An unrecognized development app under the data directory is moved to
+  `/var/db/yuzu-agent/quarantine/` and reported; it no longer blocks the install
+  or `uninstall.sh`.
+
+**What to check.**
+
+- If a refusal names a `/usr/local` directory, make it root-owned and remove
+  the group and world write bits. Then inspect the files it lists: changing
+  the directory's mode does not change who wrote what is already in it. Do not
+  `chown -R` them: that makes another account's files look root-installed.
+- If the data directory is refused, never delete it: it holds the agent's
+  identity and enrolment. Run `chmod go-w` on it, or restore its owner.
+- For signed-plugin enforcement, remove `--plugin-require-signature` before
+  upgrading to an unsigned package, or build a signed one.
+- Fleet deployment: pre-stage the server address and trust anchor so the first
+  install starts the agent. See
+  [Deploying with MDM](../../deploy/packaging/macos/README.md#deploying-with-mdm).
+- Rolling a fleet back to an older package and forward again is supported. A
+  package from before this installer replaces the service definition with its
+  default, so re-apply the server and trust settings after such a rollback.
+- After a failed install there is nothing to clean up: the next package run
+  repairs or discards any recovery state it finds under `/var/db/yuzu-agent`.
+
+The opt-in signed-app development lane (Endpoint Security) additionally moves
+the executable into `/Library/Application Support/YuzuAgent/YuzuAgent.app` and
+always runs with `--no-auto-update`, which preserves the bundle signature.
+Update that lane by installing a new package (for example through MDM), not
+over the air. The development `.pkg` is intentionally unsigned; it is not a
+customer-distribution lane. Before switching lanes, read the
+[packaging and recovery runbook](../../deploy/packaging/macos/README.md) and the
+[macOS development foundation](../macos-development-foundation.md).
+
 ## Version Compatibility
 
 | Server Version | Min Agent Version | Min Gateway Version | Notes |
