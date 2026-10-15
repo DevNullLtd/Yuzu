@@ -22311,7 +22311,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // lenient from-string parser folds any unrecognized
                     // string to None, which would silently turn a typo into
                     // an unauthenticated target instead of rejecting it.
-                    audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                    (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
                              "invalid_auth_type");
                     res.set_content(a4_error(kInvalidParams, "unrecognized auth_type"),
                                     "application/json");
@@ -22337,7 +22337,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (kInternalError + retry_after_ms) — distinct in the
                     // audit record even where the outcome collapses.
                     if (result.error() == OffloadWriteError::invalid_input) {
-                        audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                        (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
                                  "validation_failed");
                         res.set_content(
                             a4_error(kInvalidParams, "target rejected: invalid url, name, "
@@ -22348,7 +22348,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             result.error() == OffloadWriteError::store_unavailable
                                 ? "store_unavailable"
                                 : "db_error";
-                        audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                        (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
                                  detail);
                         res.set_content(a4_error(kInternalError, "offload target store unavailable",
                                                  "retry once the server reports ready",
@@ -22362,7 +22362,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // audit trail records where data was sent whichever surface created it
                 // (scheme+host and a fingerprint; the path and query are a bearer secret).
                 const bool audit_ok =
-                    audit_fn(req, "offload_target.create", "success", "offload_target",
+                    yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "success", "offload_target",
                              std::to_string(new_target_id),
                              "name=" + audit_token(name) + " " + url_audit_detail(url));
                 nlohmann::json payload_j = {{"id", new_target_id}, {"status", "created"}};
@@ -22468,7 +22468,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     const char* write_err_detail =
                         result.error() == OffloadWriteError::store_unavailable ? "store_unavailable"
                                                                                : "db_error";
-                    audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                    (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.delete", "denied", "offload_target",
                              target_id_str, write_err_detail);
                     res.set_content(a4_error(kInternalError, "offload target store unavailable",
                                              "retry once the server reports ready",
@@ -22477,13 +22477,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (!*result) {
-                    audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                    (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.delete", "denied", "offload_target",
                              target_id_str, "not_found");
                     res.set_content(a4_error(kInvalidParams, "offload target not found"),
                                     "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "offload_target.delete", "success",
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.delete", "success",
                                                "offload_target", target_id_str, snapshot_detail);
                 // "status":"deleted" matches REST's twin shape exactly
                 // (offload_routes.cpp); "deleted":true kept alongside for an

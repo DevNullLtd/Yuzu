@@ -556,3 +556,17 @@ TEST_CASE("REST webhooks[pg]: an id that overflows int64 answers 404 and the del
     REQUIRE(deliveries);
     CHECK(deliveries->status == 404);
 }
+
+TEST_CASE("REST webhooks[pg]: a lost failure row still marks Sec-Audit-Failed on the refusal",
+          "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    h.fail_result = "failure";
+    auto bad = h.sink.Post("/api/webhooks", R"({"url":"ftp://evil/h"})");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK(bad->get_header_value("Sec-Audit-Failed") == "true");
+    auto gone = h.sink.Delete("/api/webhooks/999999");
+    REQUIRE(gone);
+    CHECK(gone->status == 404);
+    CHECK(gone->get_header_value("Sec-Audit-Failed") == "true");
+}

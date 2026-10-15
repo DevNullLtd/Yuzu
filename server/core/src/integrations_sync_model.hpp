@@ -34,7 +34,8 @@ mapping_audit_chunks(const std::vector<MappingChange>& changes, std::string_view
         std::string out = s.size() > 256 ? s.substr(0, 256) + "..." : s;
         for (auto& c : out) {
             const auto u = static_cast<unsigned char>(c);
-            if (u < 0x20 || u == 0x7f)
+            // Control bytes, and the ',' and '=' the row format uses, so a group id cannot add pairs.
+            if (u < 0x20 || u == 0x7f || c == ',' || c == '=')
                 c = '?';
         }
         return out;

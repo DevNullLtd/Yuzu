@@ -495,3 +495,18 @@ TEST_CASE("REST offload-targets: a name that mimics audit fields cannot forge th
         CHECK(rec.detail.find("url=https://evil.example url_fp=") != std::string::npos);
     }
 }
+
+TEST_CASE("REST offload-targets: a lost denied row still marks Sec-Audit-Failed on the refusal",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    h.fail_result = "denied";
+    auto bad = h.sink.Post("/api/v1/offload-targets",
+                           R"({"name":"x","url":"https://x.example.com/h","auth_type":"bogus"})");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    CHECK(bad->get_header_value("Sec-Audit-Failed") == "true");
+    auto gone = h.sink.Delete("/api/v1/offload-targets/999999");
+    REQUIRE(gone);
+    CHECK(gone->status == 404);
+    CHECK(gone->get_header_value("Sec-Audit-Failed") == "true");
+}

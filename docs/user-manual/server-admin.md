@@ -192,8 +192,8 @@ targets, Directory Read for directory sync), so a fragment is never wider than i
   confirmation is a click-through, not an approval step.
 - **Offload targets** lists the targets (destination host, events, batch size, last delivery),
   opens a delivery history, and creates and deletes targets under the same rules. The credential
-  is write-only. The create audit row records the name and the full URL (see
-  [Audit Log](audit-log.md)).
+  is write-only. The create audit row records the name, the destination's scheme and host and a fingerprint
+  of the URL, never its path or query (see [Audit Log](audit-log.md)).
 - **Directory sync** shows the Microsoft Entra sync state (never synced, running, completed or
   failed are separate states, and a failed read says so rather than showing an empty panel), the
   synced user and group counts, and a form that runs a sync. The tenant, client and secret are used
@@ -282,7 +282,7 @@ separately.
 
 ### vNEXT - Integrations writes need a same-site Origin on a cookie session, write an `attempted` audit row first, and store no destination URL (breaking for cookie-reusing scripts)
 
-`POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync`, `PUT /api/directory/group-mappings` and `POST /api/settings/mcp` now answer `403` to a request authenticated by a **session cookie** that carries no `Origin`/`Referer`, or one naming another site. A script that reuses a login cookie jar (`curl -b`) must switch to an API token (token callers are not gated) or send a same-site `Origin`; behind a proxy that rewrites `Host`, declare the external origin with `--csrf-trusted-origin` as described above. Each of these writes also records a `result=attempted` audit row before it changes anything and answers `503` with `Sec-Audit-Failed: true` when that row cannot be stored; during an audit-store outage they are unavailable, deleting a webhook or offload target included (the MCP switches can still be turned off with `--mcp-disable` and a restart; check `/healthz` `stores.audit` and the `YuzuAuditPersistFailures` alert). SIEM rules that filter `result != success` will now also see the `attempted` rows. Webhook and offload audit rows record `url=<scheme>://<host>[:<port>] url_fp=<12 hex>` instead of the full URL, and their log lines name the host and the webhook or target id, never the URL; rows written by earlier builds keep the full URL, so rotate any hook URL that appears in one.
+`POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync`, `PUT /api/directory/group-mappings` and `POST /api/settings/mcp` now answer `403` to a request authenticated by a **session cookie** that carries no `Origin`/`Referer`, or one naming another site. A script that reuses a login cookie jar (`curl -b`) must switch to an API token (token callers are not gated) or send a same-site `Origin`; behind a proxy that rewrites `Host`, declare the external origin with `--csrf-trusted-origin` as described above. Each of these writes also records a `result=attempted` audit row before it changes anything and answers `503` with `Sec-Audit-Failed: true` when that row cannot be stored; during an audit-store outage they are unavailable, deleting a webhook or offload target included (the MCP switches can still be turned off with `--mcp-disable` and a restart; check `/healthz` `stores.audit` and the `YuzuAuditPersistFailures` alert). SIEM rules that filter `result != success` will now also see the `attempted` rows. Webhook and offload audit rows record `url=<scheme>://<host>[:<port>] url_fp=<12 hex>` instead of the full URL, and their log lines name the host (and the webhook or target id where one exists), never the URL; rows written by earlier builds keep the full URL, so rotate any hook URL that appears in one.
 
 ### vNEXT - `POST /api/settings/mcp` now refuses a body that omits or repeats `enabled` or `read_only` (breaking for scripted callers)
 

@@ -180,7 +180,7 @@ TEST_CASE("webhook create form: confirm names host and data classes and secret h
     CHECK_THAT(html, ContainsSubstring("it is not an approval step"));
     {
         // Both the confirm text and the hint say it, and neither says the old thing.
-        const std::string_view want = "recorded in the audit log; the analytics event stream";
+        const std::string_view want = "record only the destination";
         std::size_t n = 0;
         for (std::size_t at = 0; (at = html.find(want, at)) != std::string::npos; ++at)
             ++n;
@@ -189,7 +189,7 @@ TEST_CASE("webhook create form: confirm names host and data classes and secret h
     }
 }
 
-TEST_CASE("webhook deliveries: failed read and empty and and rows", "[integrations][render]") {
+TEST_CASE("webhook deliveries: failed read and empty rows", "[integrations][render]") {
     CHECK_THAT(render_webhook_deliveries(std::unexpected(ReadError::failed)),
                ContainsSubstring("Delivery history could not be read."));
     CHECK_THAT(render_webhook_deliveries(std::vector<WebhookDelivery>{}),
@@ -244,7 +244,7 @@ TEST_CASE("offload create form: bounds and creds write-only and shutdown wording
     CHECK_THAT(html, ContainsSubstring("min=\"1\" max=\"10000\""));
     CHECK_THAT(html, ContainsSubstring("A normal server stop flushes them; a crash or kill loses them."));
     CHECK(!contains(html, "dropped at shutdown"));
-    CHECK_THAT(html, ContainsSubstring("The target name and destination URL are recorded in the audit log."));
+    CHECK_THAT(html, ContainsSubstring("records the target name and the destination"));
     const auto pos = html.find("name=\"auth_credential\"");
     REQUIRE(pos != std::string::npos);
     const auto tag = html.substr(pos, html.find('>', pos) - pos);

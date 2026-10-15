@@ -93,6 +93,10 @@ TEST_CASE("url audit detail: scheme+host and a fingerprint and never the path or
     // ... and neither is an oversized scheme.
     CHECK(url_audit_detail(std::string(2000, 'a') + "://h.example/x").starts_with("url_fp="));
     CHECK(url_log_host("not a url") == "(host withheld)");
+    // CR/LF in a host is encoded, never echoed (the log-forging case).
+    CHECK(url_scheme_host("https://h\r\nforged/x") == "https://h%0D%0Aforged");
+    CHECK(url_log_host("https://h\r\nforged/x") == "https://h%0D%0Aforged");
+    CHECK(first_line(nullptr).empty());
     CHECK(first_line("ERROR:  violates check\nDETAIL:  Failing row contains (https://h/SECRET)") ==
           "ERROR:  violates check");
 }

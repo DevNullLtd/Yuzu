@@ -1020,3 +1020,16 @@ TEST_CASE("DiscoveryRoutes[pg]: a lost outcome row keeps the 2xx and marks Sec-A
     REQUIRE(stored);
     CHECK(stored->size() == 1); // the change was made
 }
+
+TEST_CASE("DiscoveryRoutes[pg]: a lost failure row still marks Sec-Audit-Failed on a refused sync",
+          "[directory_sync][pg][routes][security]") {
+    DirectorySyncPg store;
+    DirectoryRouteHarness h{store.get()};
+    h.fail_result = "failure";
+    auto missing = h.sink.Post("/api/directory/sync",
+                               R"({"provider":"entra","tenant_id":"t","client_id":"c"})",
+                               "application/json");
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+    CHECK(missing->get_header_value("Sec-Audit-Failed") == "true");
+}

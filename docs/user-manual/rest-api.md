@@ -5438,7 +5438,7 @@ List recent delivery attempts for a webhook, newest first. Includes HTTP status 
 time, and any error message for failed deliveries. `?limit=` defaults to 50 (any non-positive
 value also falls back to 50) and is capped at 10000; no `offset`/pagination parameter exists. A
 degraded read renders an empty list rather than a `503` — delivery history is audit convenience,
-not a decision surface.
+not a decision surface. An id too large for a 64-bit integer names no webhook and answers `404`.
 
 **Usage guide:**
 

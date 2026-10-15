@@ -8,7 +8,8 @@
 ///
 /// A destination URL is a bearer secret in practice (Slack-style hooks), so it
 /// must never reach a Postgres audit column, a log line or the analytics stream in full (the
-/// ADR-0010 "no recoverable secret at rest" rule applied to audit text): audit rows and events carry `url_audit_detail()`
+/// secrets-at-rest principle of ADR-0010, applied to audit text): audit rows and events carry
+/// `url_audit_detail()`
 /// (scheme, host and a fingerprint) instead. Two shapes are also refused at
 /// create time: embedded userinfo (`https://user:pass@host`) and control bytes
 /// (CR/LF/NUL would split an audit row). Existing rows are not rewritten.

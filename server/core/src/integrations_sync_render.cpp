@@ -17,11 +17,13 @@ std::string esc(std::string_view s) { return html_escape(std::string{s}); }
 
 constexpr std::string_view kWebhookCreateConfirm =
     "Send {events} to {host}? These events carry {data}. There is no restriction on the "
-    "destination address. The destination URL is recorded in the audit log; the analytics event "
-    "stream carries only its scheme and host.";
+    "destination address. The audit log and the analytics event stream record only the "
+    "destination's scheme and host (the audit row adds a fingerprint of the URL), never its path "
+    "or query.";
 constexpr std::string_view kOffloadCreateConfirm =
     "Send {events} to {host}? These events carry {data}. There is no restriction on the "
-    "destination address. The target name and destination URL are recorded in the audit log.";
+    "destination address. The audit log records the target name and the destination's scheme and "
+    "host plus a fingerprint of the URL, never its path or query.";
 constexpr std::string_view kSyncConfirm =
     "Sync users and groups from Microsoft Entra ID? Users and groups no longer in the directory "
     "are removed from Yuzu's synced copy. The client secret is used for this run only and is "
@@ -201,8 +203,9 @@ std::string render_webhooks(const std::expected<std::vector<WebhookRow>, ReadErr
            "<input class=\"in mono\" id=\"wh-url\" name=\"url\" type=\"text\" required maxlength=\"2048\" "
            "autocomplete=\"off\" spellcheck=\"false\" placeholder=\"https://example.invalid/hook\">"
            "<span class=\"hint\">Must start with http:// or https://. Embedded user:password is "
-           "refused. The destination URL is recorded in the audit log; the analytics event stream "
-           "carries only its scheme and host.</span></div>" +
+           "refused. The audit log and the analytics event stream record only the destination's "
+           "scheme and host (the audit row adds a fingerprint of the URL), never its path or "
+           "query.</span></div>" +
            event_checkboxes("wh") +
            "<div class=\"fld\"><label for=\"wh-secret\">Signing secret (optional)</label>"
            "<input class=\"in mono\" id=\"wh-secret\" name=\"secret\" type=\"password\" "

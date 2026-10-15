@@ -33891,6 +33891,34 @@ TEST_CASE("MCP B5: offload create and delete fail closed when the attempted row 
     CHECK(payload["offload_targets"][0]["name"] == "keep");
 }
 
+TEST_CASE("MCP B5: an offload target name that mimics audit fields cannot forge the destination",
+          "[pg][mcp][integration][b5][security]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+    auto made = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_offload_target",)"
+        R"("arguments":{"name":"x url=https://good.example url_fp=000000000000",)"
+        R"("url":"https://evil.example/exfil?k=SECRET"}}})");
+    const auto id = operator_surface_payload(made)["id"].get<int64_t>();
+    auto del = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"delete_offload_target",)"
+        R"("arguments":{"id":)" + std::to_string(id) + "}}}");
+    REQUIRE(del);
+    std::size_t rows = 0;
+    for (std::size_t i = 0; i < ts.audit_log.size(); ++i) {
+        if (!ts.audit_log[i].starts_with("offload_target."))
+            continue;
+        ++rows;
+        const auto& d = ts.audit_details[i];
+        CHECK(d.find("url_fp=") == d.rfind("url_fp="));
+        CHECK(d.find("SECRET") == std::string::npos);
+        CHECK(d.find("url=https://evil.example url_fp=") != std::string::npos);
+    }
+    CHECK(rows == 4); // attempted + success for the create and for the delete
+}
+
 TEST_CASE("MCP B5: create_offload_target rejects a duplicate name and an unrecognized "
           "auth_type",
           "[pg][mcp][integration][b5]") {

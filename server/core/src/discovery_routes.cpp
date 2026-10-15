@@ -189,8 +189,7 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
     // drift on this PII-bearing shape. Also closes a real pre-existing gap
     // the #4031 issue flagged: this route exposed email/UPN/group PII with
     // NO audit call at all. Discards AuditFn's bool result (the
-    // Integrations writes in this file, directory.sync and
-    // directory.group_mapping.update, use it) rather than
+    // Integrations writes in this file use it; this legacy read does not) rather than
     // the newer bool/fail-closed rest_audit.hpp contract the REST v1 twin
     // uses — upgrading DiscoveryRoutes wholesale onto that contract is a
     // separate, broader modernization, not scoped to this PR.

@@ -105,7 +105,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // A present-but-wrong-typed field (e.g. batch_size as a
                       // string) throws type_error out of body.value() — that's
                       // still a caller mistake, not a server fault (#3097).
-                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", name,
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
                                "invalid_field_type");
                       send_bad_json(res);
                       return;
@@ -124,7 +124,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // "bearre" into an unauthenticated target instead of
                       // rejecting it — round-trip through to_string() to catch
                       // exactly that case without touching the shared helper.
-                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", name,
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
                                "invalid_auth_type");
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "unrecognized auth_type"),
@@ -146,7 +146,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // store/infra degradation (503) — distinct in the
                       // audit record even where the HTTP status collapses.
                       if (result.error() == OffloadWriteError::invalid_input) {
-                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", name,
+                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
                                    "validation_failed");
                           res.status = 400;
                           res.set_content(
@@ -157,7 +157,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                           const char* failure = result.error() == OffloadWriteError::store_unavailable
                                                     ? "store_unavailable"
                                                     : "db_error";
-                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", name,
+                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
                                    failure);
                           send_unavailable(res);
                       }
