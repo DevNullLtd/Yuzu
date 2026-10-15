@@ -161,6 +161,14 @@ struct SyncHarness {
 
 nlohmann::json parse(const std::string& s) { return nlohmann::json::parse(s, nullptr, false); }
 
+
+// Bodies with escaped quotes are spelled as ordinary literals held in constants, not as raw
+// strings inside REQUIRE(...): MSVC's preprocessor mis-lexes a raw string with embedded quotes
+// inside a macro argument ("invalid literal suffix", C2014-class errors) and the Windows leg
+// fails to compile.
+const std::string kBodyWindows = "{\"scope_expression\":\"ostype == \\\"windows\\\"\"}";
+const std::string kBodyLinux = "{\"scope_expression\":\"ostype == \\\"linux\\\"\"}";
+
 } // namespace
 
 // ── happy path ────────────────────────────────────────────────────────────────────
@@ -230,9 +238,9 @@ TEST_CASE("sync route: the resolver sees the parsed selector and the caller's se
     CHECK(h.last_selector.arm == DispatchArm::Group);
     CHECK(h.last_selector.expr == "group:finance");
     CHECK(h.last_username == "bob");
-    REQUIRE(h.post(R"({"scope_expression":"ostype == \"windows\""})")->status == 429); // bob just ran
+    REQUIRE(h.post(kBodyWindows)->status == 429); // bob just ran
     h.username = "carol";
-    REQUIRE(h.post(R"({"scope_expression":"ostype == \"windows\""})")->status == 202);
+    REQUIRE(h.post(kBodyWindows)->status == 202);
     CHECK(h.last_selector.arm == DispatchArm::Scope);
     CHECK(h.last_selector.expr == R"(ostype == "windows")");
     CHECK(h.audit_rows.back() == "inventory.sync.request|requested|Scope|expression");
@@ -359,7 +367,7 @@ TEST_CASE("sync route: only a fleet request asks the pre-check", "[hardware][syn
     h.live(2);
     REQUIRE(h.post(R"({"scope":"group:g"})")->status == 202);
     h.username = "bob";
-    REQUIRE(h.post(R"({"scope_expression":"ostype == \"linux\""})")->status == 202);
+    REQUIRE(h.post(kBodyLinux)->status == 202);
     h.resolved.ids = {"host-01"};
     REQUIRE(h.post(R"({"scope":"host-01"})")->status == 202);
     CHECK(h.precheck_calls == 0);
