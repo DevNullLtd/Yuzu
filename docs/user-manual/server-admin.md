@@ -292,7 +292,7 @@ separately.
   after which this server drops an agent connected directly to it) and the **log level**
   (`log_level`). Both apply to this server process only, are stored, and are re-applied at restart;
   the log level then wins over `--log-level`. Neither is the dashboard sign-in expiry: that is the
-  read-only **Dashboard idle timeout** (`--session-inactivity-secs`) and **Dashboard session
+  read-only **Console idle timeout** (`--session-inactivity-secs`) and **Console session
   lifetime** (fixed, 8 hours) rows in the server-configuration table below the form. The heartbeat
   timeout must be 30 seconds or more (a lower value stored by an earlier build is raised to 30 at
   start, with a log line); keep it well above the agents' own heartbeat interval, since 30 leaves no

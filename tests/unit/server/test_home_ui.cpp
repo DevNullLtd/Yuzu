@@ -52,7 +52,7 @@ struct Expected {
     const char* sentence;
 };
 constexpr Expected kTable[] = {
-    {"Operate", "Dashboard", "/", "Ask every device a question and watch the answers arrive."},
+    {"Operate", "Console", "/", "Ask every device a question and watch the answers arrive."},
     {"Operate", "Instructions", "/instructions",
      "A library of questions and actions, with approval where it matters."},
     {"Operate", "Result sets", "/result-sets", "Save answers, re-run them, reuse them as targets."},
@@ -236,15 +236,15 @@ TEST_CASE("landing signed out: brand, headline and sign-in only; no tiles", "[ho
     }
 }
 
-TEST_CASE("landing signed in: the signed-in region replaces the form, Open <area> or Open Dashboard, Sign out",
+TEST_CASE("landing signed in: the signed-in region replaces the form, Open <area> or Open Console, Sign out",
           "[home][ui][login]") {
     const auto html = home_ui::render_landing(signed_in());
     CHECK_THAT(html, ContainsSubstring("<section class=\"panel login\" id=\"signed-in\" aria-label=\"Signed in\">"));
     CHECK_THAT(html, ContainsSubstring("<div class=\"who\"><b>dave.rae</b><span>Administrator</span></div>"));
-    CHECK_THAT(html, ContainsSubstring("<a class=\"btn primary\" id=\"open-area\" href=\"/\">Open Dashboard</a>"));
+    CHECK_THAT(html, ContainsSubstring("<a class=\"btn primary\" id=\"open-area\" href=\"/\">Open Console</a>"));
     CHECK_THAT(html, ContainsSubstring("<button class=\"btn\" type=\"button\" hx-post=\"/logout\">Sign out</button>"));
-    CHECK_THAT(html, ContainsSubstring("<p class=\"small\">You are signed in. Open the Dashboard, or pick an area below.</p>"));
-    CHECK_THAT(html, ContainsSubstring("<p class=\"lede\">Yuzu runs on your own servers. Open the Dashboard to ask your first question, or pick an area below.</p>"));
+    CHECK_THAT(html, ContainsSubstring("<p class=\"small\">You are signed in. Open the Console, or pick an area below.</p>"));
+    CHECK_THAT(html, ContainsSubstring("<p class=\"lede\">Yuzu runs on your own servers. Open the Console to ask your first question, or pick an area below.</p>"));
     // No form, no sign-in script, no SSO error.
     CHECK(count_of(html, "id=\"signin\"") == 0);
     CHECK(count_of(html, "<form") == 0);

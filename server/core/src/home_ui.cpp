@@ -17,7 +17,7 @@ namespace {
 // The fifteen screens, exactly as the design's table names them (name, link,
 // sentence) and with the nav's own icons. `key` doubles as the `next` key.
 constexpr Screen kOperate[] = {
-    {"dashboard", "Dashboard", "/", "Ask every device a question and watch the answers arrive.",
+    {"dashboard", "Console", "/", "Ask every device a question and watch the answers arrive.",
      "M4 17l6-6-6-6 M12 19h8"},
     {"instructions", "Instructions", "/instructions",
      "A library of questions and actions, with approval where it matters.",
@@ -98,13 +98,13 @@ constexpr std::string_view kLedeOut =
     "Yuzu runs on your own servers. Sign in to see the estate, run instructions on it and "
     "review what changed.";
 constexpr std::string_view kLedeIn =
-    "Yuzu runs on your own servers. Open the Dashboard to ask your first question, or pick an "
+    "Yuzu runs on your own servers. Open the Console to ask your first question, or pick an "
     "area below.";
 constexpr std::string_view kMfaNote =
     "If two-factor is on for your account, you will be asked for a code next. Forgot your "
     "password, or need an account? Ask a Yuzu administrator.";
 constexpr std::string_view kSignedInLine =
-    "You are signed in. Open the Dashboard, or pick an area below.";
+    "You are signed in. Open the Console, or pick an area below.";
 
 static_assert(kHead.size() < 15000 && kHeadline.size() < 15000,
               "MSVC C2026: keep every raw string literal under the 16,380-byte cap");
@@ -170,7 +170,7 @@ void append_sign_in(std::string& out, const LandingView& v) {
 }
 
 void append_signed_in(std::string& out, const LandingView& v, const std::string& host) {
-    const std::string_view label = v.next ? v.next->name : "Dashboard";
+    const std::string_view label = v.next ? v.next->name : "Console";
     const std::string_view href = v.next ? v.next->href : "/";
     out += R"(<section class="panel login" id="signed-in" aria-label="Signed in">)"
            R"(<div class="hd"><h2>Signed in</h2><div class="end"><span class="sub mono">)";

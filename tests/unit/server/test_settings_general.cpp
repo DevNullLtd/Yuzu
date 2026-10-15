@@ -441,7 +441,7 @@ TEST_CASE("general page: density is whitelisted on read, guarded, and admin-page
     CHECK_THAT(html, ContainsSubstring("getItem(DENSITY_KEY) === 'compact' ? 'compact' : 'comfortable'"));
     CHECK(count_of(html, "catch (err)") >= 2); // read and write are both try/catch
     CHECK_THAT(html, ContainsSubstring("Saved in this browser"));
-    CHECK_THAT(html, ContainsSubstring("Applies to the results table on the Dashboard."));
+    CHECK_THAT(html, ContainsSubstring("Applies to the results table on the Console."));
     // The drawn controls that have no route are not on the page.
     CHECK_THAT(html, !ContainsSubstring("Time zone"));
     CHECK_THAT(html, !ContainsSubstring("Server name"));

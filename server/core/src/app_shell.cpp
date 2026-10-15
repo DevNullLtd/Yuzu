@@ -43,7 +43,7 @@ constexpr NavItem kSettingsSub[] = {
 };
 
 constexpr NavItem kOperate[] = {
-    {.key = "dashboard", .label = "Dashboard", .href = "/", .icon = "M4 17l6-6-6-6 M12 19h8"},
+    {.key = "dashboard", .label = "Console", .href = "/", .icon = "M4 17l6-6-6-6 M12 19h8"},
     {.key = "instructions",
      .label = "Instructions",
      .href = "/instructions",

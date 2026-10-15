@@ -140,7 +140,7 @@ constexpr char kBody[] = R"HTM(<body>
           <label><input type="radio" name="density" value="comfortable" checked>Comfortable</label>
           <label><input type="radio" name="density" value="compact">Compact</label>
         </div>
-        <span class="hint">Compact shows more rows per screen. Applies to the results table on the Dashboard.</span>
+        <span class="hint">Compact shows more rows per screen. Applies to the results table on the Console.</span>
         <span class="hint" id="density-blocked" role="status" hidden>This browser blocked saving the setting, so it applies until you leave this page.</span>
       </div>
     </div>
@@ -218,7 +218,7 @@ constexpr char kScript[] = R"HTM(<script>
     if (x && x.status === 401) window.location.href = '/login';
   });
 
-  /* Density: the one real preference. Browser-local, Dashboard results table only. Every
+  /* Density: the one real preference. Browser-local, Console results table only. Every
      storage access is guarded (a private window throws) and the value is whitelisted on read. */
   var DENSITY_KEY = 'yuzu-table-density';
   function readDensity() {

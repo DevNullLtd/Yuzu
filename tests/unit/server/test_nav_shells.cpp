@@ -84,7 +84,7 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
     for (const auto& g : nav_groups())
         for (const auto& it : g.items)
             labels.push_back(it.label);
-    CHECK(labels == std::vector<std::string_view>{"Dashboard", "Instructions", "Result sets",
+    CHECK(labels == std::vector<std::string_view>{"Console", "Instructions", "Result sets",
                                                   "Compliance", "Guardian", "DEX", "TAR",
                                                   "Hardware", "Software", "Fleet", "Users",
                                                   "Tokens and principals", "Settings"});
@@ -169,7 +169,7 @@ TEST_CASE("app shell: Settings sub-items are System pages in artboard order, non
 TEST_CASE("app shell: breadcrumb is group / page, and a sub-item skips its parent",
           "[nav][shell]") {
     CHECK(breadcrumb_trail({.active_key = "dashboard"}) ==
-          std::vector<std::string>{"Operate", "Dashboard"});
+          std::vector<std::string>{"Operate", "Console"});
     CHECK(breadcrumb_trail({.active_key = "network"}) ==
           std::vector<std::string>{"Estate", "Network"});
     CHECK(breadcrumb_trail({.active_key = "auto"}) ==
