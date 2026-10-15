@@ -3158,8 +3158,12 @@ paths (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt — a
 mesh/SSO proxy that stamps a reserved header on every request must not be
 able to fail the probes and crash-loop the server (governance CH-3/UP-5); a
 probe performs no identity-bearing action and nothing consumes the header on
-that path. This exception is recorded in ADR-1005's exception ledger on
-acceptance. **gRPC** — a single server interceptor on the
+that path. The same four paths are also served (GET and HEAD only, no
+request body) on the plaintext HTTP→HTTPS redirect listener, with session
+resolution bound to none there: `/health` and `/api/health` always return the
+unauthenticated shape, no on-behalf-of guard runs on that listener either, and
+every other request 301s to the guarded main listener. This exception is
+recorded in ADR-1005's exception ledger on acceptance. **gRPC** — a single server interceptor on the
 one `ServerBuilder` (`grpc_on_behalf_interceptor.hpp`) covers the agent,
 management, and gateway-upstream services and every future RPC method by
 construction; a call carrying a reserved metadata key is cancelled via

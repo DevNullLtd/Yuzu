@@ -19,6 +19,7 @@
 ///     (blocking) — the one route in this cluster that actually gates.
 
 #include "health_routes.hpp"
+#include "http_route_sink.hpp"
 #include "pg_reachability_probe.hpp"
 #include "test_route_sink.hpp"
 
@@ -42,9 +43,20 @@
 #include <fstream>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <unordered_set>
 #include <string>
 #include <vector>
+
+// #5906 [live] case: httplib's acceptor crashes under TSan with no report (#438).
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define YUZU_HEALTH_ROUTES_LIVE_TSAN 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define YUZU_HEALTH_ROUTES_LIVE_TSAN 1
+#endif
 
 using namespace yuzu::server;
 using json = nlohmann::json;
@@ -88,7 +100,16 @@ struct Harness {
     bool fleet_scoped{false};
     std::vector<std::string> fleet_calls; // "Securable:Op"
 
+    // #5906: the plaintext redirect-listener sink. `plain_wired` registers the
+    // four probes on `plain_sink`; `plain_override` points at some other sink (the
+    // real-listener case); `main_serving` is read live by the 503 gate.
+    bool plain_wired{false};
+    bool main_serving{true};
+    HttpRouteSink* plain_override{nullptr};
+
+    // Both sinks LAST (sink-last rule): their handlers capture `deps`.
     yuzu::server::test::TestRouteSink sink;
+    yuzu::server::test::TestRouteSink plain_sink;
 
     void wire() {
         health::Deps deps;
@@ -158,6 +179,9 @@ struct Harness {
         deps.pg_reachability_probe = pg_probe;
         deps.server_start_time = std::chrono::steady_clock::now();
         deps.nvd_db = nvd_db;
+        deps.plaintext_probe_sink =
+            plain_override ? plain_override : (plain_wired ? &plain_sink : nullptr);
+        deps.main_listener_serving_fn = [this] { return main_serving; };
         // Every other store pointer stays null — see file header comment.
         health::register_health_routes(sink, deps);
     }
@@ -810,3 +834,242 @@ TEST_CASE("health_routes: /fragments/dashboard/health agrees with /api/health on
         CHECK(degraded_pill == (status != "healthy"));
     }
 }
+
+// ── #5906: the plaintext redirect listener's four probes ───────────────────
+
+TEST_CASE("health_routes: with no plaintext sink nothing registers there and the main sink "
+          "still has exactly 7 routes",
+          "[server][routes][health_routes][plaintext]") {
+    Harness h;
+    h.wire();
+    CHECK(h.plain_sink.route_count() == 0);
+    CHECK(h.sink.route_count() == 7);
+}
+
+TEST_CASE("health_routes: a plaintext sink gets exactly the four probe routes",
+          "[server][routes][health_routes][plaintext]") {
+    Harness h;
+    h.plain_wired = true;
+    h.wire();
+    CHECK(h.plain_sink.route_count() == 4);
+    CHECK(h.sink.route_count() == 7);
+    for (const char* path : {"/livez", "/readyz", "/health", "/api/health"}) {
+        INFO("path: " << path);
+        CHECK(h.plain_sink.Get(path) != nullptr);
+    }
+    CHECK(h.plain_sink.Get("/metrics") == nullptr);
+    CHECK(h.plain_sink.Get("/fragments/health/summary") == nullptr);
+}
+
+TEST_CASE("health_routes: a plaintext sink without main_listener_serving_fn is a wiring bug and "
+          "throws",
+          "[server][routes][health_routes][plaintext]") {
+    yuzu::server::test::TestRouteSink sink, plain;
+    Config cfg{};
+    yuzu::MetricsRegistry metrics;
+    health::Deps deps;
+    deps.cfg = &cfg;
+    deps.metrics = &metrics;
+    deps.auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        return std::nullopt;
+    };
+    deps.resolve_session_fn = [](const httplib::Request&) -> std::optional<auth::Session> {
+        return std::nullopt;
+    };
+    deps.deny_service_scoped_fn = [](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&, const std::string&,
+                                     const std::string&) -> bool { return false; };
+    deps.plaintext_probe_sink = &plain;
+    CHECK_THROWS_AS(health::register_health_routes(sink, deps), std::invalid_argument);
+}
+
+TEST_CASE("health_routes: plaintext /health never resolves a session, even with a valid cookie",
+          "[server][routes][health_routes][plaintext]") {
+    Harness h;
+    h.plain_wired = true;
+    h.wire(); // session_present defaults true
+
+    for (const char* path : {"/health", "/api/health"}) {
+        INFO("path: " << path);
+        h.reset_gate_tracking();
+        auto r = h.plain_sink.Get(path, {{"Authorization", "Bearer abc"}, {"Cookie", "session=x"}});
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(h.resolve_session_fn_called);
+        CHECK_FALSE(h.auth_fn_called);
+        auto body = json::parse(r->body);
+        CHECK(body.contains("status"));
+        CHECK(body.contains("uptime_seconds"));
+        CHECK(body["agents"].contains("online"));
+        CHECK_FALSE(body["agents"].contains("pending"));
+        CHECK_FALSE(body.contains("executions"));
+        CHECK_FALSE(body.contains("system"));
+    }
+
+    // The main sink on the same harness still shows the authenticated-only fields.
+    auto main_r = h.sink.Get("/health");
+    REQUIRE(main_r);
+    auto main_body = json::parse(main_r->body);
+    CHECK(main_body.contains("executions"));
+    CHECK(main_body.contains("system"));
+}
+
+TEST_CASE("health_routes: plaintext /api/health has the same shape as plaintext /health",
+          "[server][routes][health_routes][plaintext]") {
+    Harness h;
+    h.plain_wired = true;
+    h.wire();
+    auto a = h.plain_sink.Get("/health");
+    auto b = h.plain_sink.Get("/api/health");
+    REQUIRE(a);
+    REQUIRE(b);
+    CHECK(a->status == b->status);
+    auto ja = json::parse(a->body);
+    auto jb = json::parse(b->body);
+    ja.erase("uptime_seconds");
+    jb.erase("uptime_seconds");
+    CHECK(ja == jb);
+}
+
+TEST_CASE("health_routes: every plaintext answer is 503 while the HTTPS listener is not serving",
+          "[server][routes][health_routes][plaintext]") {
+    Harness h;
+    h.plain_wired = true;
+    h.main_serving = false;
+    h.wire();
+    for (const char* path : {"/livez", "/readyz", "/health", "/api/health"}) {
+        INFO("path: " << path);
+        auto r = h.plain_sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        auto body = json::parse(r->body);
+        CHECK(body["status"] == "not ready");
+        CHECK(body["reason"] == "https_listener_not_serving");
+    }
+    auto main_livez = h.sink.Get("/livez"); // the main sink is not gated
+    REQUIRE(main_livez);
+    CHECK(main_livez->status == 200);
+}
+
+TEST_CASE("health_routes: plaintext /livez and /readyz are the main handlers once serving",
+          "[server][routes][health_routes][plaintext]") {
+    Harness h;
+    h.plain_wired = true;
+    h.wire();
+    auto livez = h.plain_sink.Get("/livez");
+    REQUIRE(livez);
+    CHECK(livez->status == 200);
+    CHECK(json::parse(livez->body)["status"] == "ok");
+
+    h.draining = true;
+    auto readyz = h.plain_sink.Get("/readyz");
+    REQUIRE(readyz);
+    CHECK(readyz->status == 503);
+    CHECK(json::parse(readyz->body)["status"] == "draining");
+}
+
+TEST_CASE("health_routes: is_probe_path matches the closed set exactly", "[server][routes][health_routes][plaintext]") {
+    for (const char* p : {"/livez", "/readyz", "/health", "/api/health"})
+        CHECK(health::is_probe_path(p));
+    for (const char* p : {"/livez/", "/health/detailed", "/LIVEZ", "", "/metrics", "/api/healthz"})
+        CHECK_FALSE(health::is_probe_path(p));
+}
+
+TEST_CASE("health_routes: is_plaintext_probe_request admits GET/HEAD on a probe with no body headers",
+          "[server][routes][health_routes][plaintext]") {
+    auto make = [](const char* method, const char* path) {
+        httplib::Request r;
+        r.method = method;
+        r.path = path;
+        return r;
+    };
+    CHECK(health::is_plaintext_probe_request(make("GET", "/livez")));
+    CHECK(health::is_plaintext_probe_request(make("HEAD", "/readyz")));
+    CHECK_FALSE(health::is_plaintext_probe_request(make("POST", "/livez")));
+    CHECK_FALSE(health::is_plaintext_probe_request(make("PUT", "/livez")));
+    CHECK_FALSE(health::is_plaintext_probe_request(make("GET", "/login")));
+
+    auto cl = make("GET", "/livez");
+    cl.set_header("Content-Length", "0");
+    CHECK_FALSE(health::is_plaintext_probe_request(cl));
+    auto te = make("GET", "/livez");
+    te.set_header("Transfer-Encoding", "chunked");
+    CHECK_FALSE(health::is_plaintext_probe_request(te));
+}
+
+#ifndef YUZU_HEALTH_ROUTES_LIVE_TSAN
+TEST_CASE("health_routes: the production redirect pre-routing serves probes and 301s the rest",
+          "[server][routes][health_routes][plaintext][live]") {
+    httplib::Server srv;
+    health::install_plaintext_redirect_pre_routing(srv, "127.0.0.1", 8443);
+    HttplibRouteSink plain{srv};
+
+    Harness h;
+    h.plain_override = &plain;
+    h.wire();
+
+    const int port = srv.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { srv.listen_after_bind(); });
+    struct Joiner {
+        httplib::Server& s;
+        std::thread& t;
+        ~Joiner() {
+            s.stop();
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{srv, th};
+    for (int i = 0; i < 2000 && !srv.is_running(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(srv.is_running());
+
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_follow_location(false);
+    // No content coding, so the HEAD Content-Length equals the decoded GET body size.
+    cli.set_default_headers({{"Accept-Encoding", "identity"}});
+
+    auto get = cli.Get("/livez");
+    REQUIRE(get);
+    CHECK(get->status == 200);
+    CHECK(json::parse(get->body)["status"] == "ok");
+
+    auto head = cli.Head("/livez");
+    REQUIRE(head);
+    CHECK(head->status == 200);
+    CHECK(head->body.empty());
+    CHECK(head->get_header_value("Content-Length") == std::to_string(get->body.size()));
+
+    auto post = cli.Post("/livez", "", "application/json");
+    REQUIRE(post);
+    CHECK(post->status == 301);
+
+    // GET /livez that declares a body stays a 301 (the listener never buffers one).
+    httplib::Request with_body;
+    with_body.method = "GET";
+    with_body.path = "/livez";
+    with_body.set_header("Content-Length", "1");
+    with_body.body = "x";
+    auto sent = cli.send(with_body);
+    REQUIRE(sent);
+    CHECK(sent->status == 301);
+
+    auto login = cli.Get("/login");
+    REQUIRE(login);
+    CHECK(login->status == 301);
+    CHECK(login->get_header_value("Location") == "https://127.0.0.1:8443/login");
+
+    auto query = cli.Get("/login?x=1");
+    REQUIRE(query);
+    CHECK(query->status == 301);
+    const auto loc = query->get_header_value("Location");
+    CHECK(loc.size() >= 4);
+    CHECK(loc.substr(loc.size() - 4) == "?x=1");
+
+    h.main_serving = false;
+    auto down = cli.Get("/readyz");
+    REQUIRE(down);
+    CHECK(down->status == 503);
+    CHECK(json::parse(down->body)["reason"] == "https_listener_not_serving");
+}
+#endif // !YUZU_HEALTH_ROUTES_LIVE_TSAN

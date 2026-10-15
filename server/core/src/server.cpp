@@ -10298,10 +10298,11 @@ public:
 
         // cert_reloader_/redirect_server_/web_server_ were already stopped
         // early, above (#2703 Gate 7 item 2) — just the joins remain here.
-        // redirect_thread_ gets a bare join: the redirect server serves only
-        // 301s, never a held-open response, so unlike web_thread_ it has no
-        // plausible hang scenario and does not need the bounded treatment
-        // below.
+        // redirect_thread_ gets a bare join: the redirect server's handlers are
+        // the 301 and the four health-probe routes, which do no I/O and hold
+        // nothing open (snapshot()/is_open() reads only, health_routes.cpp), so
+        // unlike web_thread_ it has no plausible hang scenario and does not need
+        // the bounded treatment below.
         if (redirect_thread_.joinable()) {
             redirect_thread_.join();
         }
@@ -14760,8 +14761,7 @@ private:
             // identity-bearing action, nothing consumes the header on this
             // path, and a bricked orchestrator hides the misconfiguration the
             // guard exists to surface. Every other path rejects below.
-            if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
-                req.path == "/api/health") {
+            if (yuzu::server::health::is_probe_path(req.path)) {
                 if (enforce_pre_auth_body_cap())
                     return httplib::Server::HandlerResponse::Handled;
                 return httplib::Server::HandlerResponse::Unhandled;
@@ -15254,6 +15254,20 @@ private:
         // -- Extracted route modules ------------------------------------------------
         // Common callback lambdas shared by all extracted route modules.
         HttplibRouteSink inline_sink{*web_server_};
+        // #5906: the HTTP->HTTPS redirect listener is built here, not at listen
+        // time, so register_health_routes can put the four health probes on it.
+        // Its pre-routing handler 301s everything except those probes.
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        if (cfg_.https_enabled && cfg_.https_redirect) {
+            redirect_server_ = std::make_unique<httplib::Server>();
+            yuzu::server::health::install_plaintext_redirect_pre_routing(
+                *redirect_server_, cfg_.web_address, cfg_.https_port);
+        }
+#endif
+        // Handlers are copied into the server, so this local sink may die with the function.
+        std::unique_ptr<HttplibRouteSink> redirect_sink;
+        if (redirect_server_)
+            redirect_sink = std::make_unique<HttplibRouteSink>(*redirect_server_);
         auto auth_fn = [this](const httplib::Request& req,
                               httplib::Response& res) -> std::optional<auth::Session> {
             return require_auth(req, res);
@@ -15693,6 +15707,20 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .fleet_read_fn = draw_fleet_read_fn, // HM-2 /fragments/dashboard/health (draw-time)
+                             // #5906: the four probes also answer on the redirect listener.
+                             // web_server_->is_running() is set after a successful bind at the
+                             // top of httplib's listen_internal (httplib.h:11268) and cleared
+                             // when it returns (11269), so a failed bind, startup before
+                             // accept, and a completed shutdown all read "not serving". It
+                             // means "bound and not yet exited", not "accepting": after a fatal
+                             // accept error httplib closes the listening socket (11307-11310)
+                             // and breaks to task_queue->shutdown() (11330), so requests
+                             // already in flight drain with the flag still true while new
+                             // connections are refused. httplib 0.37.1 exposes no finer
+                             // signal, and web_thread_done_ is set only after that same drain.
+                             .plaintext_probe_sink = redirect_sink.get(),
+                             .main_listener_serving_fn =
+                                 [this] { return web_server_ && web_server_->is_running(); },
                              .cfg = &cfg_,
                              .metrics = &metrics_,
                              .registry = &registry_,
@@ -21247,41 +21275,15 @@ private:
         if (cfg_.https_enabled) {
             listen_port = cfg_.https_port;
 
-            // Start HTTP→HTTPS redirect server
-            // No on_behalf_guard here (ADR-1005): this instance routes nothing —
-            // every request gets a 301 and the re-request hits the guarded main
-            // listener, so this is not a bypass of the pre-routing chokepoint.
-            if (cfg_.https_redirect) {
-                redirect_server_ = std::make_unique<httplib::Server>();
-                auto https_port = cfg_.https_port;
-                auto web_address = cfg_.web_address;
-                redirect_server_->set_pre_routing_handler(
-                    [web_address,
-                     https_port](const httplib::Request& req,
-                                 httplib::Response& res) -> httplib::Server::HandlerResponse {
-                        auto host = req.get_header_value("Host");
-                        // Strip port from host if present
-                        auto colon = host.find(':');
-                        if (colon != std::string::npos) {
-                            host = host.substr(0, colon);
-                        }
-                        if (host.empty())
-                            host = web_address;
-                        auto location =
-                            "https://" + host + ":" + std::to_string(https_port) + req.path;
-                        if (!req.params.empty()) {
-                            location += "?";
-                            bool first = true;
-                            for (const auto& [k, v] : req.params) {
-                                if (!first)
-                                    location += "&";
-                                location += k + "=" + v;
-                                first = false;
-                            }
-                        }
-                        res.set_redirect(location, 301);
-                        return httplib::Server::HandlerResponse::Handled;
-                    });
+            // Start HTTP→HTTPS redirect server (built, and given its four health
+            // probe routes, earlier in this function).
+            // No on_behalf_guard here (ADR-1005): this instance routes ONLY the four
+            // health-probe paths — the recorded ADR-1005 exception (ledger entry
+            // 2026-07-07, amended 2026-10-15), with session resolution bound to none —
+            // and every other request 301s to the guarded main listener
+            // (health::install_plaintext_redirect_pre_routing), so this is not a bypass
+            // of the pre-routing chokepoint.
+            if (redirect_server_) {
                 redirect_thread_ = std::thread([this] {
                     spdlog::info("HTTP→HTTPS redirect on http://{}:{}/", cfg_.web_address,
                                  cfg_.web_port);

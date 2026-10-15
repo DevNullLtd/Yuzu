@@ -24,7 +24,7 @@
 ///     the request ever reaches the handlers this file registers. That
 ///     exemption is load-bearing infrastructure (a monitoring probe or an
 ///     orchestrator health check must work with no credentials) and stays
-///     in server.cpp untouched — grep `req.path == "/livez"` there.
+///     in server.cpp untouched — grep `is_probe_path` there.
 ///   - `/health`/`/api/health`'s shared `health_handler` ADDITIONALLY does
 ///     its own optional, non-blocking session resolve
 ///     (`deps.resolve_session_fn`, never writes to `res` on failure) to
@@ -32,6 +32,27 @@
 ///     `agents.pending`/`executions.*`/`system.*` fields. An unauthenticated
 ///     caller still gets 200 with the cheap probe fields — this is NOT a
 ///     gate, just a response-shape branch.
+///   - PLAINTEXT REDIRECT LISTENER (#5906): when HTTPS is on, the HTTP->HTTPS
+///     redirect listener (`--web-port`, 8080 by default) ALSO serves exactly
+///     `/livez`, `/readyz`, `/health` and `/api/health`, to GET and HEAD
+///     requests that declare no body (`is_plaintext_probe_request`); every
+///     other request still 301s. This is the same recorded ADR-1005 exception
+///     as the main listener's, with two differences: the session resolver is
+///     bound to "no session" (D6a) so `/health` and `/api/health` ALWAYS return
+///     the unauthenticated shape there — `system.*`, `agents.pending` and
+///     `executions.*` never travel over plaintext, even when the request carries
+///     a valid session cookie — and every answer is 503
+///     `{"status":"not ready","reason":"https_listener_not_serving"}` while the
+///     HTTPS listener is not bound or has exited (D6b). The guarantee is "bound
+///     and not yet exited", NOT "accepting": after a fatal accept error httplib
+///     closes the listening socket but `is_running()` stays true until
+///     already-accepted requests drain (httplib.h:11307-11330, 11269), so the
+///     gate can answer 200 for that drain window; new connections are refused
+///     throughout it. The gate exists because the redirect listener runs on its
+///     own thread and would otherwise report healthy for a server whose only
+///     real listener failed to bind. The four routes register on the SAME
+///     handler objects as the main sink (`/health` through a second thin closure
+///     over the ONE shared `health_body`).
 ///   - `/fragments/health/summary` is the one route in this cluster that
 ///     genuinely requires a session: `deps.deny_service_scoped_fn` first
 ///     (guardian-confinement-2298 PR3 §3e — service-scoped tokens denied),
@@ -79,7 +100,7 @@
 /// The corresponding `ServerImpl::nvd_metrics_scrape_mu_` member declaration
 /// is deleted from server.cpp by this extraction (dead after the move).
 ///
-/// Routes (6):
+/// Routes (6), plus the first four again on `deps.plaintext_probe_sink` when set:
 ///   GET /metrics                    (unauthenticated from 127.0.0.1/::1 always;
 ///                                     remote depends on cfg_.metrics_require_auth
 ///                                     — that branch lives in server.cpp's
@@ -101,11 +122,13 @@
 
 #include <httplib.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -180,6 +203,41 @@ class NvdSyncManager;
 
 namespace health {
 
+/// The closed set of unauthenticated probe paths (the recorded ADR-1005
+/// exception). ONE definition: the main listener's pre-routing chokepoint and
+/// the plaintext redirect listener both test membership through it.
+inline constexpr std::array<std::string_view, 4> kProbePaths{"/livez", "/readyz", "/health",
+                                                             "/api/health"};
+
+[[nodiscard]] constexpr bool is_probe_path(std::string_view p) {
+    for (const auto k : kProbePaths)
+        if (p == k)
+            return true;
+    return false;
+}
+
+/// True for a request the plaintext redirect listener serves instead of
+/// redirecting: GET or HEAD on an exact probe path that declares no body.
+/// HEAD is admitted because httplib dispatches it to the GET handlers
+/// (httplib.h:11420) and omits the body on write (httplib.h:10822, 10836), so
+/// no second registration is needed. A probe carrying Content-Length or
+/// Transfer-Encoding stays a 301: httplib runs the pre-routing handler BEFORE it
+/// reads a body (httplib.h:11337-11413), so declining those keeps the plaintext
+/// listener from ever buffering one. That ordering is a dependency on httplib
+/// 0.37.1 — a version that read the body first would invalidate this reasoning.
+[[nodiscard]] inline bool is_plaintext_probe_request(const httplib::Request& req) {
+    return (req.method == "GET" || req.method == "HEAD") && is_probe_path(req.path) &&
+           !req.has_header("Content-Length") && !req.has_header("Transfer-Encoding");
+}
+
+/// The HTTP->HTTPS redirect listener's pre-routing handler. Probe GET/HEAD
+/// requests (`is_plaintext_probe_request`) fall through to the routes
+/// `register_health_routes` puts on this server; everything else 301s to
+/// https://<Host-or-web_address>:<https_port><path>[?query]. Lives here, not in
+/// server.cpp, so a real-listener test covers the production wiring (#5906).
+void install_plaintext_redirect_pre_routing(httplib::Server& srv, std::string web_address,
+                                            int https_port);
+
 /// Construction deps for `register_health_routes`. Every closure/pointer is
 /// bound once at start_web_server() time in server.cpp and never reseated.
 /// See this file's header comment for the REQUIRED-vs-graceful null-safety
@@ -218,6 +276,15 @@ struct Deps {
     ResolveSessionFn resolve_session_fn;      // /health, /api/health
     DenyServiceScopedFn deny_service_scoped_fn; // /fragments/health/summary
     FleetReadFn fleet_read_fn;                  // /fragments/dashboard/health (optional)
+    /// Optional: when set, /livez, /readyz, /health and /api/health are ALSO
+    /// registered here (the HTTP->HTTPS redirect listener) — see the AUTH
+    /// POSTURE banner. Requires `main_listener_serving_fn`.
+    HttpRouteSink* plaintext_probe_sink{nullptr};
+    /// True while the HTTPS listener is bound and has not exited
+    /// (`web_server_->is_running()`); the plaintext sink answers 503 otherwise.
+    /// Required iff `plaintext_probe_sink` is set (registration throws
+    /// `std::invalid_argument` if unbound).
+    std::function<bool()> main_listener_serving_fn;
 
     // ---- REQUIRED (registration throws std::invalid_argument if null) ----
     Config* cfg{nullptr};
@@ -301,9 +368,10 @@ struct Deps {
     NvdSyncManager* nvd_sync{nullptr};
 };
 
-/// Register all 6 Health/Infra routes against `sink`. Throws
-/// `std::invalid_argument` if `deps.cfg` or `deps.metrics` is null — see
-/// this file's header comment.
+/// Register all 6 Health/Infra routes against `sink` (and the four probes on
+/// `deps.plaintext_probe_sink` when set). Throws `std::invalid_argument` if
+/// `deps.cfg` or `deps.metrics` is null, or if a plaintext sink is given
+/// without `main_listener_serving_fn` — see this file's header comment.
 void register_health_routes(HttpRouteSink& sink, Deps deps);
 
 } // namespace health

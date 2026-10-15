@@ -39,7 +39,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the platform default: `/etc/yuzu/yuzu-server.cfg` on Linux (and on macOS as root), `~/Library/Application Support/Yuzu/yuzu-server.cfg` on macOS as a non-root user, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows. |
 | `--data-dir` | *(config dir)* | Directory for runtime state files (auto-approve rules) and the NVD CVE cache `nvd_cves.db`, the one remaining server SQLite store, plus the `agent-updates/` (unless `--update-dir` is set) and `upload-blobs/` file directories. All other server data is in PostgreSQL — enrollment tokens and pending agents are PostgreSQL-authoritative (WS-6 6.2), not `--data-dir` files; see the blockquote below. Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but state files need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
 | `--postgres-dsn-file` | *(none)* | Read the PostgreSQL connection string from this file instead of `--postgres-dsn`, which puts it, password included, on the command line where every local user can read it. The whole file is the connection string; trailing whitespace (including the final newline) and a UTF-8 byte-order mark are ignored. Fails at startup if the file is missing, empty or larger than 64 KiB, and cannot be combined with `--postgres-dsn` / `YUZU_POSTGRES_DSN`. The file's own permissions are not checked (a Docker or Kubernetes secret is mounted world-readable inside its container): keep it where only the server's account can read it. The Windows installer stores it in the locked `%ProgramData%\Yuzu Server\postgres.dsn` and passes this flag. Env: `YUZU_POSTGRES_DSN_FILE`. |
-| `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
+| `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. When HTTPS is on this port is the HTTP→HTTPS redirect listener, which still answers `GET`/`HEAD` on the four health-probe paths directly (see [Probing a TLS-enabled server](#probing-a-tls-enabled-server)). |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--shutdown-drain-seconds` | `0` | On `SIGTERM`, keep serving for at least this many seconds after `/readyz` turns `503 draining`, so a load balancer stops routing here before the listener closes (HA WS-8). Range 0–60; `0` keeps the listener-closes-at-once behaviour a single server has always had. Set it to at least the load balancer's health-check interval × unhealthy threshold, plus one interval — see "Load balancers and shutdown drain" below. Env: `YUZU_SHUTDOWN_DRAIN_SECONDS`. |
 | `--no-https` | off | Disable HTTPS (insecure, for development only). HTTPS is **enabled by default**; provide `--https-cert` and `--https-key`, or pass `--no-https` to disable. Env: `YUZU_NO_HTTPS`. |
@@ -64,7 +64,9 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(auto)* | Path to PEM-encoded TLS certificate for the dashboard. **A per-install default cert is auto-generated when omitted** (unless `--no-default-certs`); `--no-https` disables HTTPS entirely. |
 | `--https-key` | *(auto)* | Path to PEM-encoded TLS private key. Auto-generated default used when omitted (unless `--no-default-certs`). The file must not be world-readable (Unix: `chmod 600`). |
-| `--no-https-redirect` | off | When HTTPS is enabled, do not redirect HTTP requests to HTTPS. By default, HTTP requests are redirected. |
+| `--no-https-redirect` | off | When HTTPS is enabled, do not start the HTTP listener at all (no redirect, and no plain-HTTP health probes). By default, HTTP requests are redirected, except `GET`/`HEAD` on `/livez`, `/readyz`, `/health` and `/api/health`, which are served directly. |
+| `--healthcheck` | off | Probe this server's own health endpoint and exit `0` (HTTP 200) or `1`, without starting the server. Uses the same listener flags and environment as the server (`--no-https`, `--https-port`, `--web-port`, `--web-address`, `--https-cert`, `--ca-dir`). Has no environment variable and never reads `yuzu-server.cfg`. See [Probing a TLS-enabled server](#probing-a-tls-enabled-server). |
+| `--healthcheck-path` | `/readyz` | With `--healthcheck`: the path to probe, `/readyz` or `/livez`. |
 | `--no-cert-reload` | off | Disable automatic certificate hot-reload. By default, the server polls cert/key files and hot-swaps the SSL context when they change. Env: `YUZU_NO_CERT_RELOAD`. |
 | `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
 | `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. **Warning:** enabling this exposes fleet composition data (OS, architecture, version counts) — and, when the cohort metrics export is enabled, **operator tag values** as `cohort` labels — to any network client. See [Metrics Security](metrics.md#security-considerations). Env: `YUZU_METRICS_NO_AUTH`. |
@@ -5421,6 +5423,54 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 - **A sustained overload also reds every replica together, and that is deliberate (#4944).** If the probe's one-row, no-table `SELECT` misses its 2 s deadline twice in a row, the database cannot answer real requests within their deadlines either (nearly every request validates a session and writes an audit row), so the replica is truthfully unable to serve — and, from the client side, a hopelessly slow backend and a frozen one look the same. There is **no server-side hysteresis** by decision: the rule stays two failures to go red, one success to recover, and your load balancer's thresholds are the damping — see "Load balancers and shutdown drain" below for the recommended values. A *brief* stall never evicts: one failed probe is a blip (`scripts/ha/ha-readyz-scenarios.sh`, scenario M holds a 3 s pause green; scenario L shows a CPU-starved database going red and recovering within one probe of the limit being lifted).
 - **The store rows are startup checks.** Every other row (`response_store`, `session_store`, ...) reports whether that store opened and migrated when the server started. They do not re-check a running store — a runtime problem with one store (a revoked grant, a dropped table) shows up as `503`s on that store's routes and in metrics, not on `/readyz`, because every replica shares the same database and moving traffic elsewhere would not help.
 - **Leadership is not readiness.** A replica that is not the background-work leader is fully ready.
+
+### Probing a TLS-enabled server
+
+The shipped images contain no `curl` or `wget`, and with HTTPS on (the default) the HTTP port only redirects. Two mechanisms let an orchestrator probe such a server.
+
+**1. The HTTP port answers the four probes directly.** With HTTPS on, the redirect listener (`--web-port`, `8080` by default) serves `/livez`, `/readyz`, `/health` and `/api/health` without redirecting. The rules:
+
+- `GET` and `HEAD` only, on those exact paths. Every other path, any other method, and a probe that declares a request body (`Content-Length` or `Transfer-Encoding`) still receives the `301` to HTTPS.
+- No session is ever resolved on this port. `/health` and `/api/health` always return the unauthenticated shape here (no `agents.pending`, `executions.*` or `system.*`), even when the request carries a valid session cookie.
+- Every answer is `503 {"status":"not ready","reason":"https_listener_not_serving"}` while the HTTPS listener is not bound or has exited. The check means "bound and not yet exited", not "accepting": if the HTTPS listener hits a fatal accept error, requests it had already accepted keep answering normally until they finish, while new connections are refused. A broken certificate reload that leaves the socket open is not seen by this check; use `--healthcheck` for that.
+- A server started with `--no-https-redirect` has no HTTP listener, so there is nothing to probe on this port.
+
+**2. `yuzu-server --healthcheck`.** Probes the real HTTPS listener from inside the container and exits `0` only on HTTP 200:
+
+| Aspect | Behaviour |
+|---|---|
+| Target | `https://<web-address>:<https-port>/readyz` (wildcard binds map to loopback); with `--no-https`, `http://<web-address>:<web-port>/readyz`. `--healthcheck-path /livez` selects liveness. |
+| Trust | The certificate chain is verified against **only** a trust anchor, never the system trust store. Default-certs mode: `<ca-dir>/default-ca.pem` (the install CA). Operator certificate (`--https-cert`): that certificate file itself. The host name is not checked. |
+| Redirects | Not followed. A `301` is a failure. |
+| Time | Bounded well under the 5 s a typical orchestrator allows. |
+| Output | Nothing on success. On failure one stderr line naming the target, the HTTP status or TLS reason (for example `certificate has expired`), and the trust anchor used. It never prints a key path or a response body. |
+| Inputs | The server's own flags and environment variables, with the server's defaults. It does not read `yuzu-server.cfg`. |
+
+A compose `healthcheck:` does not inherit the container's `CMD` arguments, so repeat any listener flags the server was started with. Default certificates:
+
+```yaml
+healthcheck:
+  test: ["CMD", "yuzu-server", "--healthcheck"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+```
+
+Operator certificate (the same `--https-cert` the server uses; the probe trusts that file as its anchor):
+
+```yaml
+healthcheck:
+  test: ["CMD", "yuzu-server", "--healthcheck", "--https-cert", "/etc/yuzu/tls/server.pem"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+```
+
+Notes:
+
+- If the server runs with a non-default `--ca-dir` or `--https-port`, repeat them on the healthcheck line.
+- Once `--https-cert` is set, a `default-ca.pem` left in the certificate directory by an earlier default-certs boot is **not** used. Omitting `--https-cert` from the healthcheck line while the server uses an operator certificate makes the probe anchor on that stale file and report `SSL server verification failed`.
+- Images built before this flag exist (0.14.1 and older) exit on the unknown argument; keep their existing probes.
 
 ### Load balancers and shutdown drain
 

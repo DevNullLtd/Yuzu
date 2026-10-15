@@ -585,6 +585,7 @@ yuzu_server_core_lib = static_library(
     'src/execution_model.cpp',
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
+    'src/healthcheck_probe.cpp', # #5906: yuzu-server --healthcheck transport
     'src/home_panels_render.cpp',
     'src/home_panels_routes.cpp',
     'src/leader_elector.cpp',

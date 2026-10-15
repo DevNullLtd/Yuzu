@@ -1348,6 +1348,7 @@ if build_server
       'unit/server/test_update_registry.cpp',
       'unit/server/test_legacy_sqlite_probe.cpp',
       'unit/server/test_https_config.cpp',
+      'unit/server/test_healthcheck_probe.cpp', # #5906: --healthcheck target/verdict rules + loopback TLS probe
       'unit/server/test_response_store.cpp',
       'unit/server/test_response_routes.cpp', # #2542 PR-11: the 3-route legacy pre-v1 Responses API, extracted onto the HttpRouteSink seam
       'unit/server/test_preflight_parse.cpp',
