@@ -446,11 +446,15 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 /// not by itself enough for anyone reviewing the containment surface:
 ///   - `tar_fleet_snapshot` requests a READ-ONLY topology snapshot.
 ///   - `asset_tags_sync` writes device tags. No execution.
-///   - `inventory_sync_now` asks ONE agent to re-run its daily-sync source(s)
+///   - `inventory_sync_now` asks an agent to re-run its daily-sync source(s)
 ///     and report (`__sync__.now`, ADR-0016 update). Read-only, no execution;
-///     operator-REQUESTED via `POST /api/v1/hardware/{id}/sync` (which gates
-///     the operator on Execution:Execute for that device) but system-DISPATCHED,
-///     so it rides this door. Not quarantine-gated, same as tar_fleet_snapshot.
+///     operator-REQUESTED but system-DISPATCHED, so it rides this door. Not
+///     quarantine-gated, same as tar_fleet_snapshot. Two operator routes use it:
+///     `POST /api/v1/hardware/{id}/sync` reaches ONE agent (gated on
+///     Execution:Execute for that device), and `POST /api/v1/hardware/sync` reaches
+///     up to 500 on this server process under ONE command id (gated by the type-level
+///     Execution:Execute check, the caller's visible-set intersection, the 500-target
+///     cap, a per-operator cooldown and a single in-flight run).
 ///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
 ///     ENFORCE, and is therefore the one exempt channel that mutates the
 ///     endpoint. It is NOT arbitrary command execution: the assertion
