@@ -88,6 +88,7 @@ rm -f /usr/local/bin/yuzu-agent /usr/local/bin/.yuzu-agent.incoming \
       "$PLIST" /Library/LaunchDaemons/.com.yuzu.agent.incoming.plist \
       "$MODE_FILE" /usr/local/lib/yuzu/.package-mode.incoming \
       "$MANIFEST" /usr/local/lib/yuzu/.package-files.incoming \
+      /usr/local/lib/yuzu/package-files.sha256 /usr/local/lib/yuzu/.package-files.sha256.incoming \
       /usr/local/lib/yuzu/merge-launchd-plist.py \
       /usr/local/lib/yuzu/merge-launchd-plist.js \
       /usr/local/lib/yuzu/plugin-signing-policy.json /usr/local/lib/yuzu/uninstall.sh

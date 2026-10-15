@@ -227,7 +227,7 @@ recover_interrupted_promotion() {
     launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
     remove_managed_plugins "$YUZU_LIB/package-files.list"
     remove_managed_plugins "$YUZU_LIB/.package-files.incoming"
-    rm -f "$PLIST" "$YUZU_LIB/package-mode" "$YUZU_LIB/package-files.list"
+    rm -f "$PLIST" "$YUZU_LIB/package-mode" "$YUZU_LIB/package-files.list" "$YUZU_LIB/package-files.sha256"
     rm -rf "$APP_ROOT/YuzuAgent.app"
     rm -f /usr/local/bin/yuzu-agent /usr/local/bin/libyuzu_agent_core.dylib /usr/local/lib/libyuzu_agent_core.dylib
     [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \
@@ -242,6 +242,8 @@ recover_interrupted_promotion() {
     [[ ! -e "$recovery/package-mode" ]] || ditto "$recovery/package-mode" "$YUZU_LIB/package-mode"
     [[ ! -e "$recovery/package-files.list" ]] || \
         ditto "$recovery/package-files.list" "$YUZU_LIB/package-files.list"
+    [[ ! -e "$recovery/package-files.sha256" ]] || \
+        ditto "$recovery/package-files.sha256" "$YUZU_LIB/package-files.sha256"
     [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$YUZU_LIB/plugins"
     [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$YUZU_LIB/plugins"
     quarantine_legacy_app "$recovery/legacy-retired.app"
@@ -311,6 +313,7 @@ copy_if_present "/usr/local/bin/libyuzu_agent_core.dylib" "$RECOVERY/loose/libyu
 copy_if_present "/usr/local/lib/libyuzu_agent_core.dylib" "$RECOVERY/loose/legacy-lib/libyuzu_agent_core.dylib"
 copy_if_present "/usr/local/lib/yuzu/package-mode" "$RECOVERY/package-mode"
 copy_if_present "/usr/local/lib/yuzu/package-files.list" "$RECOVERY/package-files.list"
+copy_if_present "/usr/local/lib/yuzu/package-files.sha256" "$RECOVERY/package-files.sha256"
 if [[ -f "/usr/local/lib/yuzu/package-files.list" ]]; then
     while IFS= read -r relative; do
         [[ "$relative" == plugins/* ]] || continue
@@ -329,7 +332,8 @@ rm -f "/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist" \
       "/usr/local/lib/.libyuzu_agent_core.incoming.dylib" \
       "/usr/local/lib/yuzu/.bundle-contents.incoming.zip" \
       "/usr/local/lib/yuzu/.package-mode.incoming" \
-      "/usr/local/lib/yuzu/.package-files.incoming"
+      "/usr/local/lib/yuzu/.package-files.incoming" \
+      "/usr/local/lib/yuzu/.package-files.sha256.incoming"
 write_recovery_phase "$RECOVERY" prepared
 umask 077
 printf '%s\n' "$RECOVERY" > "$RECOVERY_FILE"

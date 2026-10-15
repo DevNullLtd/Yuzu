@@ -178,9 +178,13 @@ Older loose packages did not ship `package-files.list`. Their first upgrade
 derives that manifest only from the system Installer receipt for `com.yuzu.agent`
 and snapshots it with the old plugin bytes. Missing receipts do not authorize
 overwriting same-named plugins: an unrecognized collision stops before unloading
-the running service. The plugin directory must be root-owned, non-symlinked, and
+the running service. Current packages also record each plugin's SHA-256 in
+`package-files.sha256`: a listed plugin whose bytes no longer match is not treated
+as package-owned (a collision with it stops the upgrade) and is never re-owned by
+the installer. The plugin directory must be root-owned, non-symlinked, and
 not group/world writable. A missing data working directory is created; an existing
-one keeps its owner, mode, and contents.
+one must be root-owned and not group/world writable, and keeps its owner, mode,
+and contents.
 
 For an authorized silent uninstall, run:
 

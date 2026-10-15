@@ -48,6 +48,17 @@ install -m 755 "$SCRIPT_DIR/preinstall" "$SCRIPTS/preinstall"
 install -m 755 "$SCRIPT_DIR/postinstall" "$SCRIPTS/postinstall"
 install -d "${STAGING}/usr/local/lib/yuzu/.plugins.incoming"
 : > "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
+: > "${STAGING}/usr/local/lib/yuzu/.package-files.sha256.incoming"
+# Ownership of an installed plugin is its exact bytes, not just its name: the
+# installer re-verifies these hashes before treating a file as package-owned.
+record_plugin() {
+    local staged="$1" name
+    name="$(basename "$staged")"
+    [[ "$name" != *[[:space:]]* ]] || { echo "ERROR: plugin name contains whitespace: $name" >&2; return 1; }
+    printf 'plugins/%s\n' "$name" >> "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
+    printf '%s  plugins/%s\n' "$(shasum -a 256 "$staged" | awk '{print $1}')" "$name" \
+        >> "${STAGING}/usr/local/lib/yuzu/.package-files.sha256.incoming"
+}
 install -m 644 "$SCRIPT_DIR/merge-launchd-plist.js" "$STAGING/usr/local/lib/yuzu/merge-launchd-plist.js"
 
 PACKAGE_MODE="loose"
@@ -60,7 +71,7 @@ stage_loose_plugin() {
     [[ "$name" != .* && ! -e "$destination" ]] || {
         echo "ERROR: duplicate or hidden plugin basename: $name" >&2; return 1; }
     install -m 755 "$plugin" "$destination"
-    printf 'plugins/%s\n' "$name" >> "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
+    record_plugin "$destination"
     PLUGIN_COUNT=$((PLUGIN_COUNT + 1))
 }
 if [[ -n "$BUNDLE_DIR" ]]; then
@@ -123,7 +134,7 @@ if [[ -n "$BUNDLE_DIR" ]]; then
             "$STAGED_APP/Contents/MacOS/yuzu-agent" --verify-plugin-signature "$plugin" \
                 --plugin-trust-bundle "$PLUGIN_TRUST_BUNDLE"
         fi
-        printf 'plugins/%s\n' "$(basename "$plugin")" >> "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
+        record_plugin "$plugin"
         PLUGIN_COUNT=$((PLUGIN_COUNT + 1))
     done
     [[ "$PLUGIN_COUNT" -gt 0 ]] || { echo "ERROR: bundle has no external plugins" >&2; exit 1; }

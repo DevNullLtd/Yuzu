@@ -25,6 +25,12 @@ BUILD_PKG = ROOT / "deploy/packaging/macos/build-pkg.sh"
 # GNU bash 3.2 on macOS; a newer bash first on PATH (Homebrew) hides 3.2-only
 # defects such as an empty "${array[@]}" tripping `set -u` (PR #4482 review).
 PKG_SHELL = "/bin/bash" if Path("/bin/bash").is_file() else "bash"
+
+
+def script_function(source: str, name: str) -> str:
+    """One shell function, verbatim, from an installer script."""
+    start = source.index("\n" + name + "() {") + 1
+    return source[start:source.index("\n}\n", start) + 3]
 MACOS_TRIPLET = ROOT / "triplets/arm64-osx.cmake"
 spec = importlib.util.spec_from_file_location("macos_bundle", HELPER)
 assert spec and spec.loader
@@ -145,6 +151,77 @@ shasum() { echo 'testdigest fixture'; }
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(captured.read_text(), "" if layout == "empty" else "plugins/tar.dylib\n")
+
+    def _build_loose(self, root: Path, plugin_name: str) -> subprocess.CompletedProcess:
+        binaries = root / "build"
+        (binaries / "agents/core").mkdir(parents=True)
+        (binaries / "agents/core/yuzu-agent").write_bytes(b"agent fixture")
+        (binaries / "plugins").mkdir()
+        (binaries / "plugins" / plugin_name).write_bytes(b"plugin fixture")
+        tools = root / "tools"
+        tools.mkdir()
+        for name, body in {
+            "lipo": "#!/bin/sh\necho arm64\n",
+            "pkgbuild": "#!/bin/sh\nset -eu\nroot=; last=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift 2 ;; *) last=\"$1\"; shift ;; esac; done\ncp \"$root/usr/local/lib/yuzu/.package-files.sha256.incoming\" \"$CAPTURED_HASHES\"\n: > \"$last\"\n",
+            "productbuild": "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",
+        }.items():
+            (tools / name).write_text(body)
+            (tools / name).chmod(0o755)
+        return subprocess.run(
+            [PKG_SHELL, str(BUILD_PKG), "--bin-dir", str(binaries), "--version", "1.0", "--output", str(root / "dist")],
+            env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "CAPTURED_HASHES": str(root / "hashes")},
+            text=True, capture_output=True)
+
+    def test_builder_records_each_plugin_hash(self) -> None:
+        import hashlib
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_hashes_") as temporary:
+            root = Path(temporary)
+            result = self._build_loose(root, "tar.dylib")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = hashlib.sha256(b"plugin fixture").hexdigest()
+            self.assertEqual((root / "hashes").read_text(), f"{expected}  plugins/tar.dylib\n")
+
+    def test_builder_rejects_a_plugin_name_with_whitespace(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_space_") as temporary:
+            result = self._build_loose(Path(temporary), "bad name.dylib")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("contains whitespace", result.stderr)
+
+    # PR #4482 review: package ownership of a plugin is its recorded bytes, not its name.
+    def _ownership_harness(self, root: Path, body: str) -> subprocess.CompletedProcess:
+        source = (BUILD_PKG.parent / "postinstall").read_text()
+        program = "\n".join(script_function(source, name)
+                            for name in ("plugin_hash_matches", "was_managed_plugin", "harden_managed_plugins"))
+        stubs = f"""set -eu
+chown() {{ echo "CHOWN $*" >> "{root}/chown.log"; }}
+PLUGIN_DIR="{root}/plugins"; MANIFEST="{root}/package-files.list"; HASHES="{root}/package-files.sha256"
+"""
+        return subprocess.run([PKG_SHELL, "-c", stubs + program + "\n" + body], text=True, capture_output=True)
+
+    def test_plugin_ownership_requires_the_recorded_hash(self) -> None:
+        import hashlib
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_plugin_owner_") as temporary:
+            root = Path(temporary)
+            (root / "plugins").mkdir()
+            (root / "plugins/tar.dylib").write_bytes(b"package bytes")
+            (root / "package-files.list").write_text("plugins/tar.dylib\n")
+            (root / "package-files.sha256").write_text(
+                f"{hashlib.sha256(b'package bytes').hexdigest()}  plugins/tar.dylib\n")
+            ok = self._ownership_harness(root, 'was_managed_plugin tar.dylib && harden_managed_plugins "$MANIFEST" && echo OWNED')
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertIn("OWNED", ok.stdout)
+            self.assertIn("CHOWN root:wheel", (root / "chown.log").read_text())
+            (root / "chown.log").unlink()
+            (root / "plugins/tar.dylib").write_bytes(b"replaced by someone else")
+            managed = self._ownership_harness(root, 'was_managed_plugin tar.dylib && echo MANAGED || echo NOT-MANAGED')
+            self.assertIn("NOT-MANAGED", managed.stdout)
+            harden = self._ownership_harness(root, 'harden_managed_plugins "$MANIFEST"')
+            self.assertNotEqual(harden.returncode, 0)
+            self.assertIn("does not match the package's recorded hash", harden.stderr)
+            self.assertNotIn("tar.dylib", (root / "chown.log").read_text() if (root / "chown.log").exists() else "")
+            (root / "package-files.sha256").unlink()   # an older, name-only package
+            legacy = self._ownership_harness(root, 'was_managed_plugin tar.dylib && echo MANAGED')
+            self.assertIn("MANAGED", legacy.stdout)
 
     @unittest.skipIf(os.name == "nt", "POSIX receipt fixture")
     def test_legacy_plugin_ownership_comes_only_from_exact_receipt_paths(self) -> None:
@@ -344,8 +421,7 @@ reject_unmanaged_plugin_collisions
     # install failed the same way.
     @staticmethod
     def _script_function(source: str, name: str) -> str:
-        start = source.index("\n" + name + "() {") + 1
-        return source[start:source.index("\n}\n", start) + 3]
+        return script_function(source, name)
 
     def _legacy_harness(self, root: Path, script: str, names: tuple[str, ...], body: str,
                         plist_points_to_legacy: bool = False,

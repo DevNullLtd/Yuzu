@@ -24,6 +24,8 @@ MODE_FILE="$YUZU_LIB/package-mode"
 INCOMING_MODE_FILE="$YUZU_LIB/.package-mode.incoming"
 MANIFEST="$YUZU_LIB/package-files.list"
 INCOMING_MANIFEST="$YUZU_LIB/.package-files.incoming"
+HASHES="$YUZU_LIB/package-files.sha256"
+INCOMING_HASHES="$YUZU_LIB/.package-files.sha256.incoming"
 APP="$APP_ROOT/YuzuAgent.app"
 INCOMING_APP="$APP_ROOT/.YuzuAgent.incoming.app"
 INCOMING_BUNDLE_ARCHIVE="$YUZU_LIB/.bundle-contents.incoming.zip"
@@ -211,6 +213,10 @@ harden_managed_plugins() {
         plugin="${relative#plugins/}"
         [[ -n "$plugin" && "$plugin" != */* && "$plugin" != .* ]] || {
             echo "ERROR: invalid package plugin manifest entry" >&2; return 1; }
+        if [[ -f "$HASHES" ]] && ! plugin_hash_matches "$plugin" "$HASHES"; then
+            echo "ERROR: installed plugin does not match the package's recorded hash: $plugin" >&2
+            return 1
+        fi
         chown root:wheel "$PLUGIN_DIR/$plugin"
         chmod go-w "$PLUGIN_DIR/$plugin"
         [[ ! -e "$PLUGIN_DIR/$plugin.sig" ]] || {
@@ -220,9 +226,21 @@ harden_managed_plugins() {
     done < "$manifest"
 }
 
+# Exit 0: the file's SHA-256 equals the hash recorded at build time.
+plugin_hash_matches() {
+    local plugin="$1" hashes="$2" recorded actual
+    recorded="$(awk -v n="plugins/$plugin" '$2 == n {print $1; exit}' "$hashes")"
+    [[ -n "$recorded" && -f "$PLUGIN_DIR/$plugin" ]] || return 1
+    actual="$(shasum -a 256 "$PLUGIN_DIR/$plugin" | awk '{print $1}')"
+    [[ "$actual" == "$recorded" ]]
+}
+
 was_managed_plugin() {
     local plugin="$1"
-    [[ -f "$MANIFEST" ]] && grep -Fqx -- "plugins/$plugin" "$MANIFEST"
+    [[ -f "$MANIFEST" ]] && grep -Fqx -- "plugins/$plugin" "$MANIFEST" || return 1
+    # Packages that recorded hashes own the file only while its bytes are theirs.
+    # Older packages recorded names only; their manifests still match by name.
+    [[ ! -f "$HASHES" ]] || plugin_hash_matches "$plugin" "$HASHES"
 }
 
 reject_unmanaged_plugin_collisions() {
@@ -274,7 +292,7 @@ restore_previous() {
     rm -f "$PLIST" "$MODE_FILE" "$INCOMING_BUNDLE_ARCHIVE"
     remove_managed_plugins "$MANIFEST"
     remove_managed_plugins "$INCOMING_MANIFEST"
-    rm -f "$MANIFEST"
+    rm -f "$MANIFEST" "$HASHES"
     rm -rf "$APP" "$INCOMING_APP"
     rm -f /usr/local/bin/yuzu-agent /usr/local/bin/libyuzu_agent_core.dylib /usr/local/lib/libyuzu_agent_core.dylib
     [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \
@@ -290,6 +308,8 @@ restore_previous() {
     [[ ! -e "$recovery/package-mode" ]] || ditto "$recovery/package-mode" "$MODE_FILE"
     [[ ! -e "$recovery/package-files.list" ]] || \
         ditto "$recovery/package-files.list" "$MANIFEST"
+    [[ ! -e "$recovery/package-files.sha256" ]] || \
+        ditto "$recovery/package-files.sha256" "$HASHES"
     [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$PLUGIN_DIR"
     [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$PLUGIN_DIR"
     quarantine_legacy_app "$recovery/legacy-retired.app"
@@ -393,6 +413,8 @@ for incoming_plugin in "$INCOMING_PLUGIN_DIR"/*; do
 done
 rmdir "$INCOMING_PLUGIN_DIR"
 mv "$INCOMING_MANIFEST" "$MANIFEST"
+rm -f "$HASHES"
+[[ ! -f "$INCOMING_HASHES" ]] || mv "$INCOMING_HASHES" "$HASHES"
 mv "$INCOMING_MODE_FILE" "$MODE_FILE"
 if [[ -f "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]]; then
     merge_args=(--previous "$recovery/LaunchDaemons/com.yuzu.agent.plist" --destination "$INCOMING_PLIST")
