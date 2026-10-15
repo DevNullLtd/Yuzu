@@ -395,7 +395,7 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
             h += "<div class=\"af-dev\" data-bucket=\"" + std::string(bucket_key(bk)) +
                  "\" data-fails=\"" + esc(fails) + "\">";
             // Device name links into the per-device view (/hardware/ci?id=).
-            h += "<span class=\"hn\"><a href=\"/hardware/ci?id=" + esc(d.agent_id) + "\">" + esc(host) +
+            h += "<span class=\"hn\"><a href=\"/hardware/ci?id=" + url_query_value(d.agent_id) + "\">" + esc(host) +
                  "</a></span>";
             h += "<span class=\"os\">" + esc(osline) + "</span><span class=\"badges\">";
             // Every check's status (pass = green), so the full per-device picture

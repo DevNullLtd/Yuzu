@@ -5159,6 +5159,8 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 
 The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin routes) may not contain an ASCII control character or a comma — both are rejected before the row is ever created, closing an audit-log injection path (WS-6 6.2). A UUID, hostname, or MAC-derived id is unaffected.
 
+An agent id seen for the first time must also use only letters, digits, `.`, `_`, `:` and `-`, and must not consist only of dots; otherwise `Register` (and the gateway's `ProxyRegister`) answers `INVALID_ARGUMENT` and no row is created. The check applies only when the enrollment store holds no row for the id: an agent that is already enrolled, pending or denied keeps registering under its existing id. The agent generates a UUID, so only an operator-chosen `--agent-id` / `YUZU_AGENT_ID` is affected. In the pending list, an id that is empty or is `.` or `..` is shown without row actions and the approve, deny and remove routes answer `400` for it; the Approve All / Deny All buttons are shown for such a row (even when it is the only pending one), and they act on every pending agent, so review the queue first.
+
 ### Auto-Approval Policies
 
 | Method | Route | Description |

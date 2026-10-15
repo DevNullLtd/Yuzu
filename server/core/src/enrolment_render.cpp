@@ -211,7 +211,7 @@ std::string render_tokens(const std::vector<auth::EnrollmentToken>* tokens,
             if (!t.revoked) {
                 html += "<button class=\"btn link danger\" type=\"button\" "
                         "hx-delete=\"/api/settings/enrollment-tokens/" +
-                        esc(t.token_id) +
+                        url_path_segment(t.token_id) +
                         "\" hx-target=\"#token-section\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Revoke token &quot;" +
                         esc(t.token_id) +
@@ -289,8 +289,14 @@ std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
                 utc_stamp(a.requested_at) + "</td><td>" +
                 (is_pending ? pill("warn", "Pending") : pill("bad", "Denied")) +
                 "</td><td class=\"acts\">";
-        if (is_pending) {
-            const std::string base = "/api/settings/pending-agents/" + esc(a.agent_id);
+        if (is_pending && !path_segment_ok(a.agent_id)) {
+            // Empty, `.` or `..` (also %2e forms): a browser collapses a dot-only path segment,
+            // so no per-row URL can be built. Offer no row action; the bulk buttons below stay.
+            html += "<span class=\"hint\">identifier not supported for row actions</span>";
+        } else if (is_pending) {
+            // The id is agent-supplied: ONE percent-encoded path segment (html_escape alone
+            // leaves `/`, `?`, `#` and `.` live in the URL).
+            const std::string base = "/api/settings/pending-agents/" + url_path_segment(a.agent_id);
             html += "<button class=\"btn link\" type=\"button\" hx-post=\"" + base +
                     "/approve\" hx-target=\"#pending-section\" hx-swap=\"innerHTML\">"
                     "Approve</button>"
@@ -311,7 +317,10 @@ std::string render_pending(const std::vector<auth::PendingAgent>* agents) {
     }
     html += "</tbody></table></div>";
 
-    if (n_waiting > 1) {
+    // A lone waiting row whose id cannot be addressed would otherwise have no action at all.
+    const bool lone_unaddressable =
+        n_waiting == 1 && !path_segment_ok(waiting.front()->agent_id);
+    if (n_waiting > 1 || lone_unaddressable) {
         // The bulk routes act on EVERY pending row, including any beyond the cap and any that
         // arrive after this render, so the buttons are off whenever the list is not whole.
         const bool whole = n_waiting <= kRenderCap;

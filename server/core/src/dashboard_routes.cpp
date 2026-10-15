@@ -1351,9 +1351,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // which keeps the chart deck rendered as filters change.
                  html += "<div id=\"filter-bar\" hx-swap-oob=\"true\""
                          " hx-get=\"/fragments/results/filter-bar?command_id=" +
-                         html_escape(command_id) + "&amp;plugin=" + html_escape(plugin);
+                         url_query_value(command_id) + "&amp;plugin=" + url_query_value(plugin);
                  if (!def_id.empty())
-                     html += "&amp;definition_id=" + html_escape(def_id);
+                     html += "&amp;definition_id=" + url_query_value(def_id);
                  html += "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"></div>";
 
                  // OOB: chart deck — empty initially, self-refreshes once
@@ -1367,8 +1367,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (!def_id.empty()) {
                      html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
                              " hx-get=\"/fragments/results?command_id=" +
-                             html_escape(command_id) + "&amp;plugin=" + html_escape(plugin) +
-                             "&amp;definition_id=" + html_escape(def_id) +
+                             url_query_value(command_id) + "&amp;plugin=" + url_query_value(plugin) +
+                             "&amp;definition_id=" + url_query_value(def_id) +
                              "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
                  } else {
                      // Clear any deck left over from a prior command.
@@ -2490,16 +2490,16 @@ std::string DashboardRoutes::render_results(
     // Build base URL for sort/page links (preserving all current params)
     auto base_url = [&](const std::string& new_sort, const std::string& new_dir,
                         int new_page) {
-        std::string url = "/fragments/results?command_id=" + html_escape(command_id) +
-                          "&amp;plugin=" + html_escape(plugin) +
-                          "&amp;sort=" + html_escape(new_sort) +
-                          "&amp;dir=" + html_escape(new_dir) +
+        std::string url = "/fragments/results?command_id=" + url_query_value(command_id) +
+                          "&amp;plugin=" + url_query_value(plugin) +
+                          "&amp;sort=" + url_query_value(new_sort) +
+                          "&amp;dir=" + url_query_value(new_dir) +
                           "&amp;page=" + std::to_string(new_page) +
                           "&amp;per_page=" + std::to_string(per_page);
         if (!definition_id.empty())
-            url += "&amp;definition_id=" + html_escape(definition_id);
+            url += "&amp;definition_id=" + url_query_value(definition_id);
         if (!template_id.empty())
-            url += "&amp;template_id=" + html_escape(template_id);
+            url += "&amp;template_id=" + url_query_value(template_id);
         for (const auto& f : filters) {
             // Reconstruct f_<col> params
             if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(col_names.size())) {
@@ -2508,11 +2508,11 @@ std::string DashboardRoutes::render_results(
                     if (c == ' ' || c == '-') pname += '_';
                     else pname += static_cast<char>(std::tolower(c));
                 }
-                url += "&amp;" + pname + "=" + html_escape(f.value);
+                url += "&amp;" + url_query_value(pname) + "=" + url_query_value(f.value);
             }
         }
         if (!text_query.empty())
-            url += "&amp;q=" + html_escape(text_query);
+            url += "&amp;q=" + url_query_value(text_query);
         return url;
     };
 
@@ -2675,12 +2675,12 @@ std::string DashboardRoutes::render_results(
                         if (c == ' ' || c == '-') pname += '_';
                         else pname += static_cast<char>(std::tolower(c));
                     }
-                    filter_params += "&amp;" + pname + "=" + html_escape(f.value);
+                    filter_params += "&amp;" + url_query_value(pname) + "=" + url_query_value(f.value);
                 }
             }
             html += " <button class=\"btn-create-group\" hx-get=\"/fragments/create-group-form"
-                    "?command_id=" + html_escape(command_id) +
-                    "&amp;plugin=" + html_escape(plugin) + filter_params +
+                    "?command_id=" + url_query_value(command_id) +
+                    "&amp;plugin=" + url_query_value(plugin) + filter_params +
                     "\" hx-target=\"#group-form-slot\" hx-swap=\"innerHTML\">"
                     "Create Group from " + std::to_string(total_agent_count) +
                     " Agent" + (total_agent_count != 1 ? "s" : "") + "</button>";
@@ -2711,12 +2711,14 @@ std::string DashboardRoutes::render_results(
             chart_count = VisualizationEngine::count((*def_result)->visualization_spec);
     }
     html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML">)";
-    if (chart_count > 0) {
+    // command_id is request-supplied and becomes a path segment below: no chart
+    // URL for an empty, `.` or `..` value (browsers collapse dot segments).
+    if (chart_count > 0 && path_segment_ok(command_id)) {
         html += R"(<div class="yuzu-chart-deck">)";
         for (int i = 0; i < chart_count; ++i) {
             html += R"(<div class="yuzu-chart-card" data-yuzu-chart-url=")";
-            html += "/api/v1/executions/" + html_escape(command_id) +
-                    "/visualization?definition_id=" + html_escape(definition_id) +
+            html += "/api/v1/executions/" + url_path_segment(command_id) +
+                    "/visualization?definition_id=" + url_query_value(definition_id) +
                     "&amp;index=" + std::to_string(i);
             html += R"("></div>)";
         }
