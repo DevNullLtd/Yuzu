@@ -1,6 +1,6 @@
 #!/bin/bash
 # Remove only Yuzu package-owned code and service files; retain operational data.
-set -eu
+set -euo pipefail
 
 PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
 MODE_FILE="/usr/local/lib/yuzu/package-mode"

@@ -348,7 +348,8 @@ reject_unmanaged_plugin_collisions
         return source[start:source.index("\n}\n", start) + 3]
 
     def _legacy_harness(self, root: Path, script: str, names: tuple[str, ...], body: str,
-                        plist_points_to_legacy: bool = False) -> subprocess.CompletedProcess:
+                        plist_points_to_legacy: bool = False,
+                        plist_read_fails: bool = False) -> subprocess.CompletedProcess:
         source = (BUILD_PKG.parent / script).read_text()
         program = "\n".join(self._script_function(source, name) for name in names)
         program = (program.replace("/usr/local/bin", str(root / "bin")).replace("/usr/local/lib", str(root / "lib"))
@@ -359,7 +360,7 @@ launchctl() {{ echo "$*" >> "{root}/launchctl.log"; }}
 require_started() {{ :; }}
 chown() {{ :; }}
 legacy_app_is_managed() {{ return 1; }}
-plist_buddy() {{ {"echo " + str(legacy) + "/Contents/MacOS/yuzu-agent" if plist_points_to_legacy else "echo /usr/local/bin/yuzu-agent"}; }}
+plist_buddy() {{ {"return 1" if plist_read_fails else ("echo " + str(legacy) + "/Contents/MacOS/yuzu-agent" if plist_points_to_legacy else "echo /usr/local/bin/yuzu-agent")}; }}
 ditto() {{ if [[ -d "$1" ]]; then mkdir -p "$2"; cp -R "$1/." "$2/"; else cp "$1" "$2"; fi; }}
 STATE_DIR="{root}/state"; LEGACY_APP="{legacy}"; YUZU_LIB="{root}/lib"; APP_ROOT="{root}/app"; APP="{root}/app/YuzuAgent.app"
 PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/lib/plugins"; MANIFEST="{root}/lib/package-files.list"
@@ -413,6 +414,25 @@ MODE_FILE="{root}/lib/package-mode"; recovery="{root}/state/install-recovery.TES
             self.assertIn("did not start it from non-package-owned data", result.stderr)
             log = root / "launchctl.log"
             self.assertNotIn("bootstrap", log.read_text() if log.exists() else "")
+
+    def test_recovery_does_not_start_a_service_whose_definition_cannot_be_read(self) -> None:
+        # A failed read used to flow through `| grep -q` and look like "not the legacy
+        # program", so the service was started anyway (PR #4482 review, pipefail item).
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_plist_unreadable_") as temporary:
+            root = Path(temporary)
+            recovery = self._legacy_layout(root)
+            result = self._legacy_harness(root, "preinstall",
+                                          ("quarantine_legacy_app", "remove_managed_plugins", "recover_interrupted_promotion"),
+                                          f'recover_interrupted_promotion "{recovery}" && echo RECOVERED',
+                                          plist_read_fails=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("could not read the restored service definition", result.stderr)
+            log = root / "launchctl.log"
+            self.assertNotIn("bootstrap", log.read_text() if log.exists() else "")
+
+    def test_installer_scripts_run_with_pipefail(self) -> None:
+        for name in ("preinstall", "postinstall", "uninstall.sh"):
+            self.assertIn("\nset -euo pipefail\n", (BUILD_PKG.parent / name).read_text(), name)
 
     # ── PR #4482 review (Doomgoose blocker 3): the loose lane's code directory.
     def _loose_dir_harness(self, root: Path, body: str, owners: dict[str, str], script: str = "postinstall",

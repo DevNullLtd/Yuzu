@@ -298,8 +298,15 @@ restore_previous() {
         return 0
     fi
     if [[ -e "$PLIST" ]]; then
-        if /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST" 2>/dev/null | \
-           grep -Fq -- "$LEGACY_APP/Contents/MacOS/yuzu-agent"; then
+        # Read first, then match: a failed read must never look like "not the
+        # legacy program" (it did through a pipe into grep -q), and grep -q
+        # closing the pipe early must never look like a failed read.
+        local program_args
+        program_args="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST")" || {
+            echo "WARNING: could not read the restored service definition, so it was not started" >&2
+            return 0
+        }
+        if [[ "$program_args" == *"$LEGACY_APP/Contents/MacOS/yuzu-agent"* ]]; then
             # Never start code from the non-package-owned data root. The restore is
             # complete, so report and return success: the pending installation (or
             # the next one) then installs a package-owned agent instead of failing
