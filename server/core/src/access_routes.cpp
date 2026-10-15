@@ -35,7 +35,7 @@ void refuse_empty_username(httplib::Response& res) {
     res.set_content("Session has no username.", "text/plain; charset=utf-8");
 }
 
-// Gate order matters: the loud admin gate runs BEFORE the store is read, so a denied caller
+// Gate order matters: the admin gate runs BEFORE the store is read, so a denied caller
 // never causes a read. Returns the caller's username, or nullopt after writing the response.
 std::optional<std::string> gate(const Deps& d, const httplib::Request& req, httplib::Response& res) {
     if (!d.admin_fn(req, res))
