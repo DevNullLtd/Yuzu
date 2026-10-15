@@ -628,6 +628,8 @@ yuzu_server_core_lib = static_library(
     'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
     'src/network_routes.cpp',
     'src/network_ui.cpp',
+    'src/discovered_devices_model.cpp',
+    'src/discovered_devices_reader.cpp',
     'src/device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
     'src/device_routes.cpp',
     'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
@@ -659,6 +661,7 @@ yuzu_server_core_lib = static_library(
     'src/dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
+    'src/deployments_render.cpp',
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/tar_process_tree.cpp',
