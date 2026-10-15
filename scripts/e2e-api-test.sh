@@ -1186,12 +1186,77 @@ DASH_FRAGMENTS=(
     "/fragments/health/summary"
     "/fragments/compliance/summary"
     "/fragments/policy-fragments"
+    "/fragments/dashboard/policies"
+    "/fragments/dashboard/activity"
+    "/fragments/dashboard/health"
 )
 
 for frag in "${DASH_FRAGMENTS[@]}"; do
     http_get "$SERVER_URL$frag"
     assert_status_any "GET $frag" "$HTTP_STATUS" 200 400 404
 done
+
+# Home: the landing and sign-in page. With the admin session it must show the signed-in
+# panel (never a redirect); the summary fragment below must answer with its own markup.
+http_get "$SERVER_URL/home"
+assert_eq "GET /home status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *'aria-label="Signed in"'* ]]; then
+    pass "GET /home shows the signed-in panel"
+else
+    fail "GET /home missing the signed-in panel"
+fi
+
+# Landing page without a session: the sign-in form, never a redirect; a screen page goes to
+# /home?next=<key>; /login forwards to /home keeping only a valid key.
+http_get_noauth "$SERVER_URL/home"
+assert_eq "GET /home (no session) status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *'id="signin"'* && "$HTTP_BODY" != *'aria-label="Signed in"'* ]]; then
+    pass "GET /home with no session shows the sign-in form"
+else
+    fail "GET /home with no session is not the sign-in form"
+fi
+for pair in "/devices|/home?next=devices" "/compliance|/home?next=compliance" "/login?next=%2Fevil|/home" "/login?next=devices|/home?next=devices"; do
+    from="${pair%%|*}"; want="${pair##*|}"
+    got=$(curl -s -o /dev/null -w "%{http_code} %{redirect_url}" "$SERVER_URL$from" 2>/dev/null || echo "000 ")
+    TESTS=$((TESTS + 1))
+    if [[ "$got" == "302 $SERVER_URL$want" ]]; then
+        pass "GET $from (no session) -> 302 $want"
+    else
+        fail "GET $from (no session) answered '$got', want '302 $SERVER_URL$want'"
+    fi
+done
+
+# An htmx panel request with no session: 401 + HX-Redirect to the landing page, never a 302
+# that XHR would follow and swap the sign-in page into the panel.
+hx=$(curl -s -o /dev/null -D - -H "HX-Request: true" "$SERVER_URL/fragments/dashboard/summary" 2>/dev/null | tr -d '\r')
+TESTS=$((TESTS + 1))
+if [[ "$hx" == HTTP/*\ 401* && "$hx" == *[Hh][Xx]-[Rr]edirect:\ /home* ]]; then
+    pass "htmx request with no session -> 401 with HX-Redirect: /home"
+else
+    fail "htmx request with no session did not answer 401 + HX-Redirect"
+fi
+
+# Dashboard: the admin session is unconfined, so the page and the summary fragment must
+# answer 200 with their own markup. The loose status list above would also accept a route
+# that was never registered.
+http_get "$SERVER_URL/"
+assert_eq "GET / status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *'id="dash-readout"'* && "$HTTP_BODY" == *'hx-get="/fragments/dashboard/summary"'* ]]; then
+    pass "GET / carries the readout placeholder"
+else
+    fail "GET / missing the dash-readout placeholder"
+fi
+http_get "$SERVER_URL/fragments/dashboard/summary"
+assert_eq "GET /fragments/dashboard/summary status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *'id="dash-readout"'* && "$HTTP_BODY" == *'id="dash-attention"'* && "$HTTP_BODY" == *'id="dash-estate"'* ]]; then
+    pass "GET /fragments/dashboard/summary carries all three panels"
+else
+    fail "GET /fragments/dashboard/summary missing a panel"
+fi
 
 # /fragments/executions renders a store degrade as a 200 body carrying data-degraded (the
 # dashboard drops 4xx/5xx bodies), so the loose status list above cannot see one. The

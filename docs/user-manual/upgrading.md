@@ -27,6 +27,20 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: sign-in moves to the landing page, `/login` redirects
+
+**What changed.** `/home` is now the sign-in page (and the landing page for a signed-in user). A page requested
+without a session is redirected to `/home?next=<screen key>` instead of `/login`, and `GET /login` answers
+`302` to `/home`, forwarding only a valid screen key and a known SSO error code. `POST /login`, `/login/mfa`,
+`/login/mfa/enroll`, the OIDC and SAML callbacks and the session cookie are unchanged. Signing in no longer
+leaves the user on the Dashboard: password and single-sign-on sign-ins both end on `/home`, which offers an
+"Open Dashboard" button. A request sent by htmx without a session now answers `401` with an `HX-Redirect: /home`
+header rather than a redirect, so a panel never swaps the sign-in page into itself.
+
+**What to check.** Any monitor, load-balancer health check or script that expects `GET /login` to answer `200`
+must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
+that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
+
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
 **What changed.** Deleting (deactivating) an account and demoting a local `admin` account now go through

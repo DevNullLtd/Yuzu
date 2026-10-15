@@ -1885,7 +1885,7 @@ TEST_CASE("SAML ACS — unsafe RelayState values fall back to /",
         REQUIRE(acs_res != nullptr);
         // Must be a 302 redirect — unsafe relay state should fall back to "/"
         CHECK(acs_res->status == 302);
-        CHECK(acs_res->get_header_value("Location") == "/");
+        CHECK(acs_res->get_header_value("Location") == "/home");
     }
 #endif
 }
@@ -2138,7 +2138,7 @@ TEST_CASE("SAML ACS — RelayState with path traversal (..) falls back to / (H-D
         REQUIRE(res != nullptr);
         CHECK(res->status == 302);
         // Unsafe relay state must fall back to "/"
-        CHECK(res->get_header_value("Location") == "/");
+        CHECK(res->get_header_value("Location") == "/home");
     }
 #endif
 }

@@ -1,0 +1,1 @@
+- **Dashboard Estate panel no longer says "No devices have reported" while agents are connected.** When the device store is behind the live registry (for example a failed presence write), the panel now shows "at least" the connected count instead of a false empty fleet, and the figure is cached for 60 s like any other.

@@ -351,19 +351,29 @@ TEST_CASE("page_routes: /help serves the help page, ungated", "[server][routes][
 
 TEST_CASE("page_routes: /tar, /result-sets, /instructions, /approvals, /executions, /workflows deny "
           "without auth "
-          "(redirect to /login)",
-          "[server][routes][page_routes]") {
+          "(redirect to the landing page, carrying the screen key)",
+          "[server][routes][page_routes][login]") {
     Harness h;
     h.session_present = false;
     h.wire();
 
-    for (const std::string path : {"/tar", "/result-sets", "/instructions", "/approvals",
-                                   "/executions", "/workflows"}) {
+    // The landing page reads only this validated key — never the path — to say
+    // "Sign in to open <area>." and label the post-sign-in button. A shell
+    // sub-page (Approvals, Executions, Workflows) opens as its parent item.
+    const std::pair<std::string, std::string> expected[] = {
+        {"/tar", "/home?next=tar"},
+        {"/result-sets", "/home?next=result-sets"},
+        {"/instructions", "/home?next=instructions"},
+        {"/approvals", "/home?next=instructions"},
+        {"/executions", "/home?next=instructions"},
+        {"/workflows", "/home?next=instructions"},
+    };
+    for (const auto& [path, location] : expected) {
         INFO("path: " << path);
         auto r = h.sink.Get(path);
         REQUIRE(r);
         CHECK(r->status == 302);
-        CHECK(r->get_header_value("Location") == "/login");
+        CHECK(r->get_header_value("Location") == location);
     }
 }
 
@@ -427,12 +437,14 @@ TEST_CASE("page_routes: /viz/fleet and /viz/host/:id deny without auth before th
     auto fleet = h.sink.Get("/viz/fleet");
     REQUIRE(fleet);
     CHECK(fleet->status == 302);
-    CHECK(fleet->get_header_value("Location") == "/login");
+    CHECK(fleet->get_header_value("Location") == "/home?next=fleet");
 
+    // A per-host page is not one of the landing page's screens: no key, and
+    // never the raw path.
     auto host = h.sink.Get("/viz/host/abc123");
     REQUIRE(host);
     CHECK(host->status == 302);
-    CHECK(host->get_header_value("Location") == "/login");
+    CHECK(host->get_header_value("Location") == "/home");
 }
 
 TEST_CASE("page_routes: /viz/fleet and /viz/host/:id answer 503 when the kill switch is set, "

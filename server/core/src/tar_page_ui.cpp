@@ -18,7 +18,7 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <style>
-    body { display: flex; flex-direction: column; min-height: calc(100vh - var(--shell-top-h, 0px)); }
+    body { display: flex; flex-direction: column; min-height: calc(100vh - var(--shell-top-h)); }
     .tar-content {
       width: 100%; flex: 1; padding: 22px 28px 36px;
       display: flex; flex-direction: column; gap: 22px;
@@ -29,42 +29,20 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     }
     .tar-subtitle { color: var(--mut); font-size: 14px; margin: 4px 0 0; max-width: 70ch; }
 
-    /* Frames: bordered panels with a header row; tables run edge to edge */
-    .tar-frame {
-      background: var(--surface); border: 1px solid var(--line);
-      border-radius: var(--rad-panel); min-width: 0; overflow: hidden;
-    }
+    /* Frames are yuzu.css panels (.panel / .tw); the header row stays local because look's .hd also sets
+       font-size / weight on everything inside it. Tables in a frame take the shared .tw table skin. */
+    .tar-frame { overflow: hidden; }
     .tar-frame-header {
       display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
       padding: 12px 16px; border-bottom: 1px solid var(--line);
     }
     .tar-frame-title { font-size: 14px; font-weight: 600; margin: 0; }
     .tar-frame-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-left: auto; }
-    .tar-frame-body { overflow-x: auto; }
     .tar-pad { padding: 16px; }
     #retention-paused-body > :not(table):not(.result-degrade-banner),
     #capture-sources > .picker-row,
     #cap-sources-body > :not(table):not(.apply-bar):not(.result-degrade-banner) { margin: 0; padding: 14px 16px; }
-    .tar-frame-body table { width: 100%; border-collapse: collapse; }
-    .tar-frame-body th {
-      text-align: left; padding: 8px 16px; white-space: nowrap;
-      font-size: 12.5px; font-weight: 500; color: var(--mut);
-      background: var(--surface2); border-bottom: 1px solid var(--line);
-    }
-    .tar-frame-body td {
-      padding: var(--cell-y) 16px; white-space: nowrap;
-      color: var(--ink2); border-bottom: 1px solid var(--line);
-    }
-    .tar-frame-body tbody tr:last-child td { border-bottom: 0; }
-    .tar-frame-body tbody tr:hover td { background: var(--surface2); }
-    .tar-frame-body th.r, .tar-frame-body td.r { text-align: right; }
     .tar-content code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
-    .tar-frame-body .source-pill {
-      display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 3px;
-      font-size: 12.5px; font-weight: 500; color: var(--warn);
-      background: color-mix(in srgb, var(--warn) 15%, transparent);
-    }
-    .tar-frame-body .badge { height: auto; padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
     .tar-meta { font-size: 13px; color: var(--mut); }
     .tar-meta strong, .tar-meta b { color: var(--ink); font-weight: 600; }
     .tar-frame-body .placeholder, .tar-frame-body .empty-state {
@@ -210,7 +188,7 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     .tar-tree-layout { display: flex; gap: 16px; align-items: flex-start; margin-top: 12px; }
     .tar-tree-main { flex: 1 1 auto; min-width: 0; overflow-x: auto; }
     .tar-tree-side {
-      flex: 0 0 340px; position: sticky; top: 8px; max-height: calc(100vh - var(--shell-top-h, 72px) - 2rem); overflow: auto;
+      flex: 0 0 340px; max-height: calc(100vh - var(--shell-top-h) - 2rem); overflow: auto;
       border: 1px solid var(--line); border-radius: var(--rad-panel);
     }
     .tar-tree-side > div > .tar-tree-mute { padding: 14px 16px; font-size: 13px; }
@@ -231,11 +209,11 @@ const char* const kTarPageTemplate = R"HTM(<!DOCTYPE html>
     .tar-detail-anom { padding: 10px 16px; color: var(--bad); border-bottom: 1px solid var(--line); }
     .tar-detail > .tar-tree-mute { padding: 0 16px 14px; }
     .tar-detail-conns { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-    .tar-detail-conns th, .tar-detail-conns td {
+    table.tar-detail-conns th, table.tar-detail-conns td {
       text-align: left; padding: 6px 8px; white-space: nowrap; border-bottom: 1px solid var(--line);
     }
     .tar-detail-conns th:first-child, .tar-detail-conns td:first-child { padding-left: 16px; }
-    .tar-detail-conns th { font-weight: 500; color: var(--mut); background: var(--surface2); }
+    table.tar-detail-conns th { font-weight: 500; color: var(--mut); background: var(--surface2); }
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate
 // (still one continuous <style> block in the rendered HTML).
@@ -258,10 +236,11 @@ R"HTM(
     .devnet-body { max-height: 18rem; overflow: auto; }
     .devnet-table { width: 100%; border-collapse: collapse;
       font-family: var(--mds-font-family-mono); font-size: 12.5px; }
-    .devnet-table th { position: sticky; top: 0; background: var(--surface2); text-align: left;
+    /* table.-prefixed: ties with look's (0,1,2) .tw table th/td and wins by source order */
+    table.devnet-table th { position: sticky; top: 0; background: var(--surface2); text-align: left;
       padding: 6px 12px; color: var(--mut); font-weight: 500; border-bottom: 1px solid var(--line); }
-    .devnet-table td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-    /* Table-prefixed so the cell colours outrank .tar-frame-body td */
+    table.devnet-table td { padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    /* Table-prefixed so the cell colours outrank look's .tw table td */
     .devnet-table .dn-type { color: var(--ink); font-weight: 500; }
     .devnet-table .dn-data, .devnet-table .arp-mac, .devnet-table .arp-type-dynamic { color: var(--ink2); }
     .devnet-table .dn-ttl { color: var(--mut); text-align: right; }
@@ -296,13 +275,11 @@ R"HTM(
     .state-cell { display: flex; align-items: center; gap: 10px; }
     .state-txt { font-size: 12.5px; color: var(--mut); }
     .state-on { color: var(--ok); font-weight: 500; }
-    .pending-txt { color: var(--warn) !important; font-weight: 500; }
+    .pending-txt { color: var(--warn); font-weight: 500; }
     #capTable tr.pending td { background: color-mix(in srgb, var(--warn) 10%, transparent); }
     #capTable tr.pending td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
-    .apply-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 16px;
-      padding: 12px 14px; background: var(--surface2); border-radius: var(--rad-panel);
-      border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line2));
-      font-size: 13.5px; color: var(--ink2); }
+    /* Notes and warning frame come from yuzu.css (.note.warn); only the flex row and margin are local */
+    .apply-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 16px; }
     .apply-bar[hidden] { display: none; }
     .apply-icon { color: var(--warn); }
     .apply-spacer { flex: 1; }
@@ -326,7 +303,7 @@ R"HTM(</head>
     </div>
 
     <!-- ── Retention-paused sources (Phase 15.A) ─────────────────────── -->
-    <div class="tar-frame" id="frame-retention-paused">
+    <div class="tar-frame panel" id="frame-retention-paused">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Retention-paused sources</h2>
         <div class="tar-frame-actions">
@@ -343,7 +320,7 @@ R"HTM(</head>
           </button>
         </div>
       </div>
-      <div class="tar-frame-body" id="retention-paused-body"
+      <div class="tar-frame-body tw" id="retention-paused-body"
            hx-get="/fragments/tar/retention-paused"
            hx-trigger="load"
            hx-swap="innerHTML">
@@ -354,11 +331,11 @@ R"HTM(</head>
 )HTM"
 // Literal split (MSVC C2026 16380-char cap) — adjacent raw-string literals concatenate.
 R"HTM(    <!-- ── Capture sources (ADR-0015) ───────────────────────────────── -->
-    <div class="tar-frame" id="frame-capture-sources">
+    <div class="tar-frame panel" id="frame-capture-sources">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Capture sources</h2>
       </div>
-      <div class="tar-frame-body" id="capture-sources"
+      <div class="tar-frame-body tw" id="capture-sources"
            hx-get="/fragments/tar/capture-sources" hx-trigger="load" hx-swap="innerHTML">
         <div class="placeholder">Loading capture sources&hellip;</div>
       </div>
@@ -392,7 +369,7 @@ R"HTM(    <!-- ── Capture sources (ADR-0015) ──────────�
 R"HTM(
     <!-- Ad-hoc TAR SQL moved to Result sets > From TAR query (it carries the same parent
          scope, SQL, name and include-empty fields, behind a confirm that shows the SQL). -->
-    <div class="tar-frame" id="frame-tar-sql">
+    <div class="tar-frame panel" id="frame-tar-sql">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Ad-hoc TAR SQL</h2>
       </div>
@@ -403,11 +380,11 @@ R"HTM(
     </div>
 
     <!-- ── Process tree viewer (Phase 15.H) ─────────────────────────── -->
-    <div class="tar-frame" id="frame-process-tree">
+    <div class="tar-frame panel" id="frame-process-tree">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Process tree viewer</h2>
       </div>
-      <div class="tar-frame-body tar-pad">
+      <div class="tar-frame-body tw tar-pad">
         <!-- No hx-target here: the default target is this element itself. An
              explicit hx-target="this" would be INHERITED by descendants (the poll
              div), making their swaps clobber this whole frame body. -->

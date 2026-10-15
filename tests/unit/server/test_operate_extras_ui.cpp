@@ -33,7 +33,7 @@ bool has(const std::string& hay, const char* needle) {
 std::string scope_panel_markup() {
     const std::string page = kDashboardIndexHtml;
     const auto a = page.find("id=\"ox-scope\"");
-    const auto b = page.find("class=\"scope-panel\"", a);
+    const auto b = page.find("class=\"scope-list\"", a); // the scope bar's picker follows the helper block
     REQUIRE(a != std::string::npos);
     REQUIRE(b != std::string::npos);
     return page.substr(a, b - a);
@@ -58,7 +58,8 @@ TEST_CASE("operate extras: the Dashboard page hosts the controller and the scope
     CHECK(has(page, "id=\"ox-expr\""));
     CHECK(has(page, "id=\"ox-validate\""));
     CHECK(has(page, "id=\"ox-preview\""));
-    CHECK(has(page, "id=\"ox-kinds\""));
+    // The "Scope kinds" side panel is gone; the scope bar carries a server-rendered reference line.
+    CHECK_FALSE(has(page, "id=\"ox-kinds\""));
     CHECK(has(page, "id=\"ox-tar-open\""));
     // The shared chunk is spliced into the page's own head.
     CHECK(has(page, ".ox-panel{"));
@@ -111,7 +112,7 @@ TEST_CASE("operate extras: the scope helper uses the real routes and bounds its 
     const auto& js = yuzu::server::kYuzuOperateExtrasJs;
     CHECK(has(js, "/api/v1/scope/validate"));
     CHECK(has(js, "/api/v1/scope/preview"));
-    CHECK(has(js, "/api/v1/discover/scope-kinds"));
+    CHECK_FALSE(has(js, "/api/v1/discover/scope-kinds")); // no client-side kinds fetch any more
     // No fragment, no estimate route (unconfined and fail-open, F3).
     CHECK_FALSE(has(js, "/api/scope/estimate"));
     CHECK(has(js, "PREVIEW_IDS = 25"));
