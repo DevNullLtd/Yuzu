@@ -332,7 +332,7 @@ TEST_CASE("REST offload-targets: POST 400 on bad URL scheme",
     CHECK(h.audit_log[1].result == "denied");
 }
 
-TEST_CASE("REST offload-targets: a failed attempted row refuses create and delete 503, nothing "
+TEST_CASE("REST offload-targets: a failed attempted row refuses create and delete 503 and nothing "
           "changes (mutation: mutate before auditing)",
           "[rest][offload][pg][security]") {
     OffloadHarness h;

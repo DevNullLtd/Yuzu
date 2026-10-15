@@ -168,8 +168,9 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                   // create row also records where data was sent. The URL is a
                   // bearer secret: the row carries scheme+host and a fingerprint,
                   // never the path or query (ADR-0010 Decision 4).
-                  audit_fn(req, "offload_target.create", "success", "offload_target",
-                           std::to_string(id), "name=" + name + " " + url_audit_detail(url));
+                  (void)detail::emit_behavioral_audit(
+                      audit_fn, req, res, "offload_target.create", "success", "offload_target",
+                      std::to_string(id), "name=" + name + " " + url_audit_detail(url));
                   res.status = 201;
                   res.set_content(
                       nlohmann::json({{"id", id}, {"status", "created"}}).dump(),
@@ -254,8 +255,9 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                         return;
                     }
                     if (*result) {
-                        audit_fn(req, "offload_target.delete", "success", "offload_target",
-                                 std::to_string(*id_opt), snapshot_detail);
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "offload_target.delete", "success",
+                            "offload_target", std::to_string(*id_opt), snapshot_detail);
                         res.set_content(R"({"status":"deleted"})", "application/json");
                     } else {
                         audit_fn(req, "offload_target.delete", "denied", "offload_target",

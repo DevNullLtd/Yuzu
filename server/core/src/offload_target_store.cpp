@@ -350,7 +350,7 @@ void OffloadTargetStore::set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ 
 void OffloadTargetStore::log_dropped_delivery(const std::string& target_url) {
     spdlog::warn("OffloadTargetStore: dropped delivery to {} - worker pool queue full or "
                  "server shutting down",
-                 target_url);
+                 url_scheme_host(target_url));
     if (metrics_)
         metrics_->counter("yuzu_server_offload_delivery_dropped_total").increment();
 }
@@ -765,7 +765,7 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
     // it in /deliveries.
     if (!tgt.url.starts_with("http://") && !tgt.url.starts_with("https://")) {
         record_delivery(tgt.id, event_type, event_count, payload_body, 0, "invalid_scheme");
-        spdlog::warn("OffloadTargetStore: refused dispatch with non-http(s) URL: {}", url_scheme_host(tgt.url));
+        spdlog::warn("OffloadTargetStore: refused dispatch of target {} with a non-http(s) URL", tgt.id);
         if (metrics_)
             metrics_->counter("yuzu_server_offload_delivery_failed_total").increment();
         return;
@@ -805,9 +805,9 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             // Fail closed — never fire unsigned/unauthenticated when a
             // credential was configured (ADR-0010 §1). No HTTP call is
             // made at all.
-            spdlog::warn("OffloadTargetStore: delivery to {} skipped - credential unavailable "
-                         "({})",
-                         tgt.url, pg::SecretCodec::to_external_error());
+            spdlog::warn("OffloadTargetStore: delivery to {} (target {}) skipped - credential "
+                         "unavailable ({})",
+                         url_scheme_host(tgt.url), tgt.id, pg::SecretCodec::to_external_error());
             if (metrics_)
                 metrics_->counter("yuzu_server_offload_delivery_credential_unavailable_total")
                     .increment();
@@ -874,11 +874,13 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             status_code = result->status;
         } else {
             error = "connection_failed";
-            spdlog::warn("OffloadTargetStore: delivery to {} failed: connection error", url_scheme_host(tgt.url));
+            spdlog::warn("OffloadTargetStore: delivery to {} (target {}) failed: connection error",
+                         url_scheme_host(tgt.url), tgt.id);
         }
     } catch (const std::exception& ex) {
         error = ex.what();
-        spdlog::warn("OffloadTargetStore: delivery to {} failed: {}", url_scheme_host(tgt.url), error);
+        spdlog::warn("OffloadTargetStore: delivery to {} (target {}) failed: {}",
+                     url_scheme_host(tgt.url), tgt.id, error);
     }
 
     if (metrics_) {

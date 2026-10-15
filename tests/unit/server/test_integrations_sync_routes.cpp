@@ -253,7 +253,7 @@ TEST_CASE("sync routes: directory panel reads status, count, groups and roles",
     CHECK(h.users_reads == 0); // the user list is never read for the panel
 }
 
-TEST_CASE("sync routes: a failed directory count renders total unavailable, never an invented total",
+TEST_CASE("sync routes: a failed directory count renders total unavailable and never an invented total",
           "[integrations][routes]") {
     Harness h;
     DirectoryUser u;

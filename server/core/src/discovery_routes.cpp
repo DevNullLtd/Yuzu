@@ -143,10 +143,11 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                          return;
                      }
 
-                     auto session = auth_fn(req, res);
-                     if (session)
-                         audit_fn(req, "directory.sync", "success", "Directory", "entra",
-                                  "Entra ID sync completed");
+                     // The principal comes from the request inside audit_fn; a second auth_fn
+                     // call (which can answer 401 after a multi-minute sync) is not needed.
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res, "directory.sync",
+                                                         "success", "Directory", "entra",
+                                                         "Entra ID sync completed");
 
                      auto status = directory_sync->get_status();
                      res.set_content(nlohmann::json({{"status", "completed"},
@@ -188,9 +189,9 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
     // and the MCP tool list_directory_users) — Rule 1, no more independent
     // drift on this PII-bearing shape. Also closes a real pre-existing gap
     // the #4031 issue flagged: this route exposed email/UPN/group PII with
-    // NO audit call at all. Uses the file's existing void-AuditFn
-    // fire-and-forget convention (matches this file's directory.sync /
-    // directory.group_mapping.update / discovery.scan calls) rather than
+    // NO audit call at all. Ignores AuditFn's bool result (a
+    // legacy read; the Integrations writes in this file use it, directory.sync and
+    // directory.group_mapping.update among them) rather than
     // the newer bool/fail-closed rest_audit.hpp contract the REST v1 twin
     // uses — upgrading DiscoveryRoutes wholesale onto that contract is a
     // separate, broader modernization, not scoped to this PR.
@@ -255,8 +256,8 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
     // PUT /api/directory/group-mappings — configure group-to-role mappings
     sink.Put("/api/directory/group-mappings",
-            [auth_fn, perm_fn, audit_fn, directory_sync, write_gate](const httplib::Request& req,
-                                                                      httplib::Response& res) {
+            [perm_fn, audit_fn, directory_sync, write_gate](const httplib::Request& req,
+                                                             httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Write"))
                     return;
                 if (write_gate.refuse_cross_site(audit_fn, req, res,
@@ -318,9 +319,12 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                 // Audit-first (ADR-0033 section 9): no `attempted` row, no mapping change. The
                 // per-pair rows below follow the read-back.
-                if (!detail::audit_attempted(audit_fn, req, res, "directory.group_mapping.update",
-                                             "Directory", "group-mappings",
-                                             std::to_string(applied.size()) + " mappings requested"))
+                // The row names the requested pairs (the first chunk; the per-pair rows below carry
+                // the whole list), so a lone surviving `attempted` row still says what was asked.
+                if (!detail::audit_attempted(
+                        audit_fn, req, res, "directory.group_mapping.update", "Directory",
+                        "group-mappings",
+                        integrations::mapping_audit_chunks(applied, "requested").front()))
                     return;
                 for (const auto& [group_id, role_name] : applied) {
                     if (role_name.empty())
@@ -340,19 +344,21 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                     applied, stored ? std::optional<std::map<std::string, std::string>>(*stored)
                                     : std::nullopt);
 
-                auto session = auth_fn(req, res);
-                if (session) {
-                    // Every pair reaches the trail: a long list is split over several rows.
-                    if (!outcome.confirmed.empty() || outcome.unconfirmed.empty())
-                        for (const auto& d : integrations::mapping_audit_chunks(outcome.confirmed))
-                            audit_fn(req, "directory.group_mapping.update", "success",
-                                     "Directory", "group-mappings", d);
-                    if (!outcome.unconfirmed.empty())
-                        for (const auto& d : integrations::mapping_audit_chunks(
-                                 outcome.unconfirmed, "not confirmed by read-back"))
-                            audit_fn(req, "directory.group_mapping.update", "failure",
-                                     "Directory", "group-mappings", d);
-                }
+                // Every pair reaches the trail: a long list is split over several rows. A row that
+                // cannot be written marks the response Sec-Audit-Failed (the change is made).
+                if (!outcome.confirmed.empty() || outcome.unconfirmed.empty())
+                    for (const auto& d : integrations::mapping_audit_chunks(outcome.confirmed))
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                            "directory.group_mapping.update",
+                                                            "success", "Directory",
+                                                            "group-mappings", d);
+                if (!outcome.unconfirmed.empty())
+                    for (const auto& d : integrations::mapping_audit_chunks(
+                             outcome.unconfirmed, "not confirmed by read-back"))
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                            "directory.group_mapping.update",
+                                                            "failure", "Directory",
+                                                            "group-mappings", d);
                 auto mappings = stored ? *stored : std::map<std::string, std::string>{};
 
                 nlohmann::json mappings_arr = nlohmann::json::array();

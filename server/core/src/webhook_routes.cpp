@@ -6,6 +6,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <stdexcept>
+
 namespace yuzu::server {
 
 namespace {
@@ -139,8 +141,9 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  // exfiltrates to it, then deletes it must not be able to
                  // erase every durable record of the destination. Matches
                  // the hardening in `offload_routes.cpp`.
-                 audit_fn(req, "webhook.create", "success", "webhook", std::to_string(id),
-                          url_audit_detail(url));
+                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create",
+                                                     "success", "webhook", std::to_string(id),
+                                                     url_audit_detail(url));
                  if (emit_event_fn)
                      emit_event_fn("webhook.created", req, {},
                                    {{"webhook_id", id}, {"url", url_scheme_host(url)}});
@@ -163,7 +166,15 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                                        "application/json");
                        return;
                    }
-                   auto id = std::stoll(req.matches[1].str());
+                   std::int64_t id = 0;
+                   try {
+                       id = std::stoll(req.matches[1].str());
+                   } catch (const std::out_of_range&) { // names no webhook: nothing to delete
+                       res.status = 404;
+                       res.set_content(detail::a4_error(res, "webhook not found"),
+                                       "application/json");
+                       return;
+                   }
                    // gov Gate 2/4/5 (PR #3563 full-PR review): snapshot the
                    // URL BEFORE deleting — matches `offload_routes.cpp`'s
                    // existing "compliance F-3" hardening for the identical
@@ -191,8 +202,9 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                        return;
                    }
                    if (*result) {
-                       audit_fn(req, "webhook.delete", "success", "webhook", std::to_string(id),
-                                snapshot_detail);
+                       (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.delete",
+                                                           "success", "webhook",
+                                                           std::to_string(id), snapshot_detail);
                        res.set_content(R"({"status":"deleted"})", "application/json");
                    } else {
                        audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),

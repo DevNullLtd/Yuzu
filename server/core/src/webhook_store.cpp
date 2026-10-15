@@ -595,9 +595,9 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
         auto dec = secret_codec_.decrypt(
             pg::SecretCodec::SecretId{"webhook_store", "webhooks", "secret", pk}, wh.secret_blob);
         if (!dec.has_value()) {
-            spdlog::warn("WebhookStore: delivery to {} skipped - signing secret unavailable "
-                         "({})",
-                         wh.url, pg::SecretCodec::to_external_error());
+            spdlog::warn("WebhookStore: delivery to {} (webhook {}) skipped - signing secret "
+                         "unavailable ({})",
+                         url_scheme_host(wh.url), wh.id, pg::SecretCodec::to_external_error());
             if (metrics_)
                 metrics_->counter("yuzu_server_webhook_delivery_secret_unavailable_total")
                     .increment();
@@ -644,11 +644,13 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
             status_code = result->status;
         } else {
             error = "connection_failed";
-            spdlog::warn("WebhookStore: delivery to {} failed: connection error", url_scheme_host(wh.url));
+            spdlog::warn("WebhookStore: delivery to {} (webhook {}) failed: connection error",
+                         url_scheme_host(wh.url), wh.id);
         }
     } catch (const std::exception& ex) {
         error = ex.what();
-        spdlog::warn("WebhookStore: delivery to {} failed: {}", url_scheme_host(wh.url), error);
+        spdlog::warn("WebhookStore: delivery to {} (webhook {}) failed: {}", url_scheme_host(wh.url),
+                     wh.id, error);
     }
     // `signature` is a hex digest, not secret material — nothing left to
     // wipe here. The SecureBuffer itself was already destroyed (and wiped)
@@ -722,9 +724,9 @@ void WebhookStore::fire_event(const std::string& event_type, const std::string& 
         const bool queued = delivery_pool_.submit(
             [this, wh, event_type, payload_json]() { deliver_single(wh, event_type, payload_json); });
         if (!queued) {
-            spdlog::warn("WebhookStore: dropped delivery to {} - worker pool queue full or "
-                         "server shutting down",
-                         wh.url);
+            spdlog::warn("WebhookStore: dropped delivery to {} (webhook {}) - worker pool queue "
+                         "full or server shutting down",
+                         url_scheme_host(wh.url), wh.id);
             if (metrics_)
                 metrics_->counter("yuzu_server_webhook_delivery_dropped_total").increment();
         }

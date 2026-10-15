@@ -325,7 +325,7 @@ TEST_CASE("REST webhooks[pg]: DELETE 404 on missing id, and audits it",
     CHECK(h.audit_log[1].detail == "not_found");
 }
 
-TEST_CASE("REST webhooks[pg]: a failed attempted row refuses create and delete 503, nothing changes "
+TEST_CASE("REST webhooks[pg]: a failed attempted row refuses create and delete 503 and nothing changes "
           "(mutation: mutate before auditing)",
           "[rest][webhook][pg][security]") {
     WebhookRouteHarness h;
@@ -467,7 +467,7 @@ TEST_CASE("REST webhooks[pg]: a token caller needs no Origin",
     CHECK(del->status == 200);
 }
 
-TEST_CASE("WriteGate: cookie writes need a same-site or trusted Origin, token writes need none",
+TEST_CASE("WriteGate: cookie writes need a same-site or trusted Origin and token writes need none",
           "[rest][webhook][security]") {
     std::string source = "local";
     std::vector<std::string> audited;

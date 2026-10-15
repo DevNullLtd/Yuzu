@@ -860,9 +860,9 @@ TEST_CASE("DiscoveryRoutes[pg]: group mapping audit records what is stored, not 
     CHECK(h.audits[0].action == "directory.group_mapping.update");
     CHECK(h.audits[0].result == "success");
     CHECK(h.audits[0].detail == "1 mappings updated: g1=Operator");
-    REQUIRE(h.attempts.size() == 1); // audit-first: written before the change, counts only
+    REQUIRE(h.attempts.size() == 1); // audit-first: written before the change, names the pairs
     CHECK(h.attempts[0].action == "directory.group_mapping.update");
-    CHECK(h.attempts[0].detail == "1 mappings requested");
+    CHECK(h.attempts[0].detail == "1 mappings requested: g1=Operator");
 
     // A group named twice ends with its last entry: audited once, as stored.
     h.audits.clear();
@@ -930,7 +930,7 @@ TEST_CASE("DiscoveryRoutes[pg]: a large mapping request is audited in full, over
     CHECK(pairs == 121);
 }
 
-TEST_CASE("DiscoveryRoutes[pg]: a malformed mapping entry refuses the whole batch, nothing stored",
+TEST_CASE("DiscoveryRoutes[pg]: a malformed mapping entry refuses the whole batch and stores nothing",
           "[directory_sync][pg][routes][security]") {
     DirectorySyncPg store;
     DirectoryRouteHarness h{store.get()};

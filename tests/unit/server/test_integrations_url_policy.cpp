@@ -43,9 +43,18 @@ TEST_CASE("url policy: scheme+host drops userinfo path query and fragment", "[in
     CHECK(url_scheme_host("https://host.example") == "https://host.example");
     CHECK(url_scheme_host("host.example/path").empty());
     CHECK(url_scheme_host("host.example/p?r=http://x").empty()); // "://" inside a query
+    // Only a bare host[:port] is echoed: anything else could forge a neighbouring audit field.
+    CHECK(url_scheme_host("http://[::1]:8080/x") == "http://[::1]:8080");
+    CHECK(url_scheme_host("https://Host-1.example.invalid:65535") ==
+          "https://Host-1.example.invalid:65535");
+    for (const char* bad : {"https://a url_fp=aaaaaaaaaaaa/x", "https://a,b=c/x",
+                            "https://tok:SECRET/path", "https://host:SECRET", "https://host:/x",
+                            "https://host:123456/x", "https:///x", "https://[]/x",
+                            "https://[zz]/x", "https://host\xc3\xa9/x"})
+        CHECK(url_scheme_host(bad).empty());
 }
 
-TEST_CASE("url audit detail: scheme+host and a fingerprint, never the path or query",
+TEST_CASE("url audit detail: scheme+host and a fingerprint and never the path or query",
           "[integrations][url][security]") {
     const std::string secret = "https://hooks.example.invalid/services/T0/B0/SECRET?key=SECRET2";
     const auto d = url_audit_detail(secret);
@@ -60,6 +69,11 @@ TEST_CASE("url audit detail: scheme+host and a fingerprint, never the path or qu
     // fingerprint alone.
     CHECK(url_audit_detail(std::string("https://h.example/\r\nforged=1")).starts_with("url_fp="));
     CHECK(url_audit_detail("no-scheme/path").starts_with("url_fp="));
+    // A crafted authority cannot plant a first `url_fp=` or carry a pasted `token:secret`.
+    const auto forged = url_audit_detail("https://h url_fp=deadbeefdead/x");
+    CHECK(forged.starts_with("url_fp="));
+    CHECK(forged.find("deadbeef") == std::string::npos);
+    CHECK(url_audit_detail("https://tok:SECRETVALUE/p").find("SECRETVALUE") == std::string::npos);
     // A later "://" in the path or query is not a scheme: nothing before it is echoed.
     const auto fake = url_audit_detail("hooks.example/services/T/B/SECRET?r=http://x");
     CHECK(fake.starts_with("url_fp="));

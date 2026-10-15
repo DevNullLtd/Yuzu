@@ -13,13 +13,12 @@
 /// create time: embedded userinfo (`https://user:pass@host`) and control bytes
 /// (CR/LF/NUL would split an audit row). Existing rows are not rewritten.
 
-#include <openssl/sha.h>
-
 #include <array>
-#include <cctype>
 #include <cstddef>
 #include <string>
 #include <string_view>
+
+#include <openssl/sha.h>
 
 namespace yuzu::server {
 
@@ -52,13 +51,59 @@ namespace detail {
     return end == std::string_view::npos ? rest : rest.substr(0, end);
 }
 
+/// ASCII-only classes: the <cctype> forms follow the process locale.
+[[nodiscard]] constexpr bool is_ascii_alpha(char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+[[nodiscard]] constexpr bool is_ascii_digit(char c) noexcept {
+    return c >= '0' && c <= '9';
+}
+
 /// A URI scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). Anything else before "://" is part
 /// of a path or query, not a scheme.
-[[nodiscard]] inline bool is_url_scheme(std::string_view s) noexcept {
-    if (s.empty() || !std::isalpha(static_cast<unsigned char>(s.front())))
+[[nodiscard]] constexpr bool is_url_scheme(std::string_view s) noexcept {
+    if (s.empty() || !is_ascii_alpha(s.front()))
         return false;
     for (char c : s)
-        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '+' && c != '-' && c != '.')
+        if (!is_ascii_alpha(c) && !is_ascii_digit(c) && c != '+' && c != '-' && c != '.')
+            return false;
+    return true;
+}
+
+/// A bare `host[:port]`: a DNS name or IPv4 address ([A-Za-z0-9.-]), or a bracketed IPv6 literal,
+/// then optionally `:` and 1-5 digits. Anything else (a space, '=', ',', text after a colon) is not
+/// echoed into an audit row or log line, where it could forge a neighbouring field.
+[[nodiscard]] constexpr bool is_plain_host_port(std::string_view a) noexcept {
+    if (a.empty() || a.size() > 261) // 253-byte DNS name + ":65535"
+        return false;
+    std::size_t host_end = 0;
+    if (a.front() == '[') {
+        const auto close = a.find(']');
+        if (close == std::string_view::npos || close == 1)
+            return false;
+        for (char c : a.substr(1, close - 1))
+            if (!is_ascii_digit(c) && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') &&
+                c != ':' && c != '.')
+                return false;
+        host_end = close + 1;
+    } else {
+        const auto colon = a.rfind(':');
+        host_end = colon == std::string_view::npos ? a.size() : colon;
+        if (host_end == 0)
+            return false;
+        for (char c : a.substr(0, host_end))
+            if (!is_ascii_alpha(c) && !is_ascii_digit(c) && c != '.' && c != '-')
+                return false;
+    }
+    if (host_end == a.size())
+        return true;
+    if (a[host_end] != ':')
+        return false;
+    const auto port = a.substr(host_end + 1);
+    if (port.empty() || port.size() > 5)
+        return false;
+    for (char c : port)
+        if (!is_ascii_digit(c))
             return false;
     return true;
 }
@@ -70,8 +115,9 @@ namespace detail {
 }
 
 /// `scheme://host[:port]` with any userinfo, path, query and fragment removed.
-/// Returns an empty string when `url` does not start with `<scheme>://` (never echo an
-/// unparseable value, and never mistake a later "://" in a path or query for the scheme).
+/// Returns an empty string when `url` does not start with `<scheme>://` or its authority is not a
+/// plain `host[:port]` (never echo an unparseable value, never mistake a later "://" in a path or
+/// query for the scheme, never let a crafted authority forge an audit or log field).
 [[nodiscard]] inline std::string url_scheme_host(std::string_view url) {
     const auto scheme_end = url.find("://");
     if (scheme_end == std::string_view::npos || !detail::is_url_scheme(url.substr(0, scheme_end)))
@@ -79,6 +125,8 @@ namespace detail {
     auto authority = detail::url_authority(url);
     if (const auto at = authority.rfind('@'); at != std::string_view::npos)
         authority = authority.substr(at + 1);
+    if (!detail::is_plain_host_port(authority))
+        return {};
     std::string out(url.substr(0, scheme_end + 3));
     out.append(authority);
     return out;
@@ -135,10 +183,10 @@ struct UrlDeliveryParts {
 /// Slack-style token lives. An unparseable value reports the fingerprint only.
 [[nodiscard]] inline std::string url_audit_detail(std::string_view url) {
     std::string out;
-    // A value with control bytes (not yet validated on the audit-first path) is never echoed.
-    // Bounded: this can run on an unvalidated value (the audit-first row precedes validation).
+    // Safe on an unvalidated value (the audit-first row precedes validation): a value with
+    // control bytes is never echoed, and url_scheme_host returns only a bare scheme://host[:port].
     if (const auto host = url_has_control_bytes(url) ? std::string{} : url_scheme_host(url);
-        !host.empty() && host.size() <= 300)
+        !host.empty())
         out = "url=" + host + " ";
     out += "url_fp=" + url_fingerprint(url);
     return out;

@@ -12,7 +12,9 @@
 ///      "started, outcome unknown".
 ///
 /// Same idiom as `NotificationRoutes::audited_mutation`; header-only so the webhook,
-/// offload and directory routes share one definition.
+/// offload and directory routes share one definition. A caller whose OUTCOME row fails after the
+/// change was made keeps its 2xx but marks the response `Sec-Audit-Failed` (the row is written
+/// with `(void)detail::emit_behavioral_audit(...)`, whose header side effect is the signal).
 
 #include <yuzu/server/auth.hpp>
 
@@ -71,7 +73,9 @@ template <class AuditFn>
                               detail_text))
         return true;
     res.status = 503;
-    res.set_content(a4_error(res, "audit log unavailable; the change was not made"),
+    res.set_content(a4_error(res, "audit log unavailable; the change was not made",
+                             A4ErrorOpts{.retry_after_ms = 5000,
+                                         .remediation = "retry once the audit log is available"}),
                     "application/json");
     return false;
 }

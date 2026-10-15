@@ -280,6 +280,10 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT - Integrations writes need a same-site Origin on a cookie session, write an `attempted` audit row first, and store no destination URL (breaking for cookie-reusing scripts)
+
+`POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync`, `PUT /api/directory/group-mappings` and `POST /api/settings/mcp` now answer `403` to a request authenticated by a **session cookie** that carries no `Origin`/`Referer`, or one naming another site. A script that reuses a login cookie jar (`curl -b`) must switch to an API token (token callers are not gated) or send a same-site `Origin`; behind a proxy that rewrites `Host`, declare the external origin with `--csrf-trusted-origin` as described above. Each of these writes also records a `result=attempted` audit row before it changes anything and answers `503` with `Sec-Audit-Failed: true` when that row cannot be stored; during an audit-store outage they are unavailable (the MCP switches can still be turned off with `--mcp-disable` and a restart; check `/healthz` `stores.audit` and the `YuzuAuditPersistFailures` alert). SIEM rules that filter `result != success` will now also see the `attempted` rows. Webhook and offload audit rows record `url=<scheme>://<host> url_fp=<12 hex>` instead of the full URL; rows written by earlier builds keep the full URL, so rotate any hook URL that appears in one.
+
 ### vNEXT - `POST /api/settings/mcp` now refuses a body that omits or repeats `enabled` or `read_only` (breaking for scripted callers)
 
 The dashboard route behind the MCP settings form used to read the first `enabled` and `read_only`
@@ -1439,7 +1443,7 @@ need no change.
 **The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
 — CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
 gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
-Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), and the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only). The dashboard renders fine and reads work; only the destructive actions
+Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), and the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only), and the Integrations page's webhook, offload-target, directory-sync, group-mapping and MCP-settings saves (`403 cross-site request refused`). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
@@ -1521,7 +1525,7 @@ bar, the 403s will continue. It is the fastest diagnosis for a mistyped entry.
 
 **What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as
 before, so an unproxied deployment sees no difference. Non-browser clients sending neither
-`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, and the two
+`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, except on the routes that gate a cookie session with `browser_write_is_cross_site` (the bell, instruction and dashboard-dispatch writes, and the Integrations writes: webhooks, offload targets, directory sync, group mappings, MCP settings), which refuse a header-less cookie request; and the two
 CA endpoints still treat both-headers-absent as cross-site. Leaving the flag unset is safe: it
 means same-host only, which is the previous behaviour.
 
