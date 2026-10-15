@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_set>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp).
@@ -625,6 +626,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             ~RunGuard() { release(); }
         } run_guard;
+        static_assert(!std::is_copy_constructible_v<RunGuard> && !std::is_move_constructible_v<RunGuard>,
+                      "a copied or moved guard would release the slot twice");
         const bool guarded = ss::needs_run_guard(sel.arm);
         const auto cooldown_wait = [&] {
             std::lock_guard<std::mutex> lk(sync_run_mu_);

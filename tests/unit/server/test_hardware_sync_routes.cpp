@@ -527,7 +527,11 @@ TEST_CASE("sync route: a run already in flight makes a second one 409 and sends 
     h.live(2);
     int inner_status = 0;
     int inner_dispatches_before = -1;
+    bool inside = false; // never re-enter from the inner request, whatever it does
     h.during_dispatch = [&] {
+        if (inside)
+            return;
+        inside = true;
         inner_dispatches_before = h.dispatch_calls;
         h.username = "bob"; // a different operator, so only the in-flight guard can refuse
         auto r = h.post(R"({"scope":"__all__"})");
@@ -538,6 +542,9 @@ TEST_CASE("sync route: a run already in flight makes a second one 409 and sends 
     CHECK(inner_status == 409);
     CHECK(h.dispatch_calls == 1);
     CHECK(inner_dispatches_before == 1);
+    // The refusal is on the audit record, as the last row after the first run's own.
+    CHECK(h.audited("denied"));
+    CHECK(contains(h.audit_details.back(), "run_in_flight"));
     // The flag is released afterwards: bob can run now.
     h.during_dispatch = nullptr;
     h.username = "bob";
@@ -549,19 +556,52 @@ TEST_CASE("sync route: the same operator overlapping a run gets 409 from the slo
     SyncHarness h;
     h.live(2);
     int inner_status = 0;
+    bool inside = false;
     h.during_dispatch = [&] {
+        if (inside)
+            return;
+        inside = true;
         auto r = h.post(R"({"scope":"group:g"})"); // alice again, her first run not yet stamped
         inner_status = r ? r->status : -1;
     };
     REQUIRE(h.post(R"({"scope":"__all__"})")->status == 202);
     CHECK(inner_status == 409);
     CHECK(h.dispatch_calls == 1);
+    CHECK(h.audited("denied"));
+    CHECK(contains(h.audit_details.back(), "run_in_flight"));
     // Once the first run has stamped, the cooldown (not the slot) is what refuses her.
     h.during_dispatch = nullptr;
     CHECK(h.post(R"({"scope":"group:g"})")->status == 429);
 }
 
-TEST_CASE("sync route: a refused cooldown never holds the slot while the audit row is written",
+TEST_CASE("sync route: the cooldown 429 outranks the in-flight 409",
+          "[hardware][sync_fanout][route]") {
+    SyncHarness h;
+    h.live(2);
+    REQUIRE(h.post(R"({"scope":"__all__"})")->status == 202); // alice stamps at t0
+    h.clock += 1;
+    // bob starts a run; from inside it alice asks for one. Both limits apply to her (bob holds the
+    // slot, and she is inside her own window); the cooldown is checked first, so she is told 429.
+    int inner_status = 0;
+    bool inside = false;
+    h.during_dispatch = [&] {
+        if (inside)
+            return;
+        inside = true;
+        h.username = "alice";
+        auto r = h.post(R"({"scope":"group:g"})");
+        inner_status = r ? r->status : -1;
+        h.username = "bob";
+    };
+    h.username = "bob";
+    REQUIRE(h.post(R"({"scope":"__all__"})")->status == 202);
+    CHECK(inner_status == 429);
+    CHECK(contains(h.audit_details.back(), "rate_limited"));
+    CHECK_FALSE(contains(h.audit_details.back(), "run_in_flight"));
+    CHECK(h.dispatch_calls == 2); // alice's t0 run and bob's; the refused one sent nothing
+}
+
+TEST_CASE("sync route: an early cooldown 429 does not hold the slot while its audit row is written",
           "[hardware][sync_fanout][route]") {
     SyncHarness h;
     h.live(2);
