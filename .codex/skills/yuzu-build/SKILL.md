@@ -17,7 +17,7 @@ description: Configure, compile, and test Yuzu with the repo's canonical Meson e
 - On Linux, run `./scripts/setup.sh [--tests]` and then `meson compile -C build-linux`.
 - On macOS, run `./scripts/setup.sh [--tests]` and then `meson compile -C build-macos`.
 - On Windows, invoke `$yuzu-windows-msvc` first and then use `build-windows`.
-- If the build touches the gateway custom target or Erlang tests, source `scripts/ensure-erlang.sh` before building.
+- Meson resolves the gateway's Erlang/OTP (28.4 or later 28.x) at configure, for the gateway custom target and its tests; source `scripts/ensure-erlang.sh` only before running `rebar3` or `erl` by hand.
 
 ## Choose Tests
 

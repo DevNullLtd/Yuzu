@@ -197,9 +197,8 @@ public:
 
     /// GET /api/v1/dex/perf/group?group_id=&app=&version= — the management-group
     /// trend: the on-the-fly B1 aggregate over the group's members, with
-    /// `kDexCohortFloor` suppression APPLIED INSIDE the impl (a named group is a
-    /// set of specific devices, so a small-N aggregate is de-facto individual
-    /// behaviour — works-council). `nullopt` = the aggregate read failed OR the
+    /// `kDexCohortFloor` suppression APPLIED INSIDE the impl (the one floor
+    /// constant, one device since the 2026-10-14 ruling). `nullopt` = the aggregate read failed OR the
     /// B1 `group_reader_` is unwired OR the group/tag store is unwired OR the
     /// member-resolution read degraded (`ManagementGroupStore::get_members_checked`
     /// returned `nullopt` — store-not-open / pool-acquire-timeout / query-error,

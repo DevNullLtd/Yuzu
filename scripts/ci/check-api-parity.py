@@ -201,6 +201,14 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # DEX Alerts tab (posture PR-E): GET /fragments/dex/alerts is "composed-of" the legacy
 # settings fragment (+1, 199 -> 200); the fragment's three POSTs stay planned:#2146.
 #
+# System "General and appearance" page: two UI-only fragments, GET
+# /fragments/settings/general-runtime (composed-of:get.api-config) and GET
+# /fragments/settings/analytics-events (composed-of:get.api-analytics-recent). Each composes an
+# existing JSON route that is itself `planned:#2146` with no REST v1 or MCP twin (the legacy
+# runtime-config and analytics routes), so there is no twin to point at and each counts as
+# untwinned. Reviewed: a fragment is UI, not a machine surface (ADR-1005 Decision 4), and the
+# routes they compose are the ledgered gap.
+#
 # Compliance page, policy fragments list: the new GET /fragments/policy-fragments HTML view
 # is a `composed-of:get.api-policy-fragments` row (the JSON list stays the twinned capability),
 # which counts as untwinned by design, so the count rises 199 -> 200.
@@ -258,18 +266,49 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # the two Estate changes net 0 on their own (+1 NVD status card exception, -1 discovery row
 # twinned), so the count after this merge is the value the checker reports, set from its output.
 #
-# Integrations page, webhook panel (System pages SYS-5): the two new webhook fragments
-# (GET /fragments/settings/webhooks and .../{id}/deliveries) are `composed-of:` the legacy
-# /api/webhooks routes, which are themselves `planned:#2146` and have no REST v1 or MCP twin
-# yet, so they cannot be `twinned`. +2, measured by the checker on its own base (204 -> 206). The
-# offload-target and directory sync fragments are `twinned` to existing v1 routes and MCP tools and add nothing.
-# Merged with the dev changes above (208, including the Estate read twins) the two webhook rows
-# bring the count to 210 (208 + 2), the value the checker reports on the merged tree.
-# OWNER DECISION PENDING: this raise is NOT covered by the ADR-1005 exception recorded for the
-# four Dashboard fragments of PR #5859. The twins that would remove it (and the legacy-route
-# writes the page drives) are tracked in #5885; until the owner extends the exception or the twins
-# land, the +2 stands as a flagged, reviewed raise.
-BASELINE_UNTWINNED = 210
+# The System General page (this branch) adds the two composed-of fragments described above
+# (general-runtime, analytics-events): +2. Landing on dev's 207 (after the audit filter parity
+# flip below), the count is 209, the value the checker reports on the merged tree.
+#
+# Audit filter parity: get.api-audit flips "planned:#2146" -> "twinned" (GET /api/v1/audit +
+# MCP query_audit_log, now at filter/paging parity), the checker reports 208 - 1 = 207 on the merged tree
+# (dev's 208 above, less this flip).
+#
+# Merged onto the Estate changes: the count is the value the checker reports on the merged
+# tree, set from its output.
+#
+# Access Users page (#5880): re-surfaces the untwinned Settings users list as two read-only
+# fragments, GET /fragments/access/users/list (planned:#2146) and .../detail (composed-of the
+# list), +2. A GET /api/v1/users twin is not built here; the Settings rows and these two
+# are retired together when that twin lands.
+#
+# Tokens and principals page (#5880): re-surfaces the untwinned Settings token and principal
+# lists as three read-only fragments, GET /fragments/access/tokens/list, .../principals/list
+# and .../principals/detail (each planned:#2146), +3. The token list is not a twin of the
+# self-only GET /api/v1/tokens (an administrator on a cookie session sees every owner). The two
+# principal fragments share GET /api/v1/engine-principals' EnginePrincipal:Read gate but add the
+# page's roles/credentials composition and an audit-gated revocation detail, so they are not
+# ledgered as twins here. Merged with the 207 above, the two Access pages make 212 (207 + 2 + 3),
+# the value the checker reports on the merged tree, not hand-picked. The ADR-1005 exception
+# recorded for the four Dashboard fragments does not cover these rows; whether to extend it is
+# the owner's decision on #5880.
+#
+# Access pages merged onto the Estate changes: the count is the value the checker reports on the
+# merged tree, set from its output.
+#
+# System General and Data pages (#5873): re-surfaces the untwinned General runtime and analytics
+# events settings as GET /fragments/settings/general-runtime and /fragments/settings/analytics-events,
+# +2. Merged with the Access pages (212 above), the count is 214, the value the checker reports on the
+# merged tree, not hand-picked. Whether the ADR-1005 exception extends to these rows is the owner's decision on #5873.
+#
+# Integrations page, webhook panel (System pages SYS-5, #5872): the two webhook fragments
+# (GET /fragments/settings/webhooks and .../{id}/deliveries) are `composed-of:` the legacy /api/webhooks
+# routes, which are themselves `planned:#2146` with no REST v1 or MCP twin yet, so they cannot be
+# `twinned`: +2. Merged with the General and Access rows above (214), the count is 216, the value the
+# checker reports on the merged tree, not hand-picked. OWNER DECISION PENDING: this raise is not covered by
+# the ADR-1005 exception recorded for the four Dashboard fragments of PR #5859. The twins that would remove
+# it are tracked in #5885.
+BASELINE_UNTWINNED = 216
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

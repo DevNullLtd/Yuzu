@@ -15,6 +15,9 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "audit_store.hpp"
+#include "dashboard_api_routes.hpp"
+#include "test_route_sink.hpp"
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_tag_store_pg_helper.hpp" // TagStorePg — ADR-0050 PG port
@@ -34,6 +37,7 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -467,6 +471,168 @@ TEST_CASE("AuthRoutes::require_admin — unscoped admin token is accepted (regre
 }
 
 // ---------------------------------------------------------------------------
+// require_admin decision table (#5779): every Session state pinned to its
+// (return, status, A4 message, audit row). The expected values are the
+// pre-refactor behaviour (require_admin before it was rebuilt on
+// authz::admin_gate_verdict), so this table must hold unchanged on both sides.
+// ---------------------------------------------------------------------------
+
+namespace {
+yuzu::test::PgTestTemplate admin_gate_table_audit_tpl{"admingateaudit", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("admingateaudit template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("AuthRoutes::require_admin — decision table over every session state",
+          "[pg][auth_routes][admin_gate][scope][mcp]") {
+    AuthRoutesFixture fix; // test_user = admin; api_tokens + analytics are PG clones
+    yuzu::test::PostgresTestDb audit_db{admin_gate_table_audit_tpl};
+    REQUIRE(audit_db.available());
+    pg::PgPool audit_pool{{.conninfo = audit_db.dsn(), .size = 2}};
+    AuditStore audit_store{audit_pool};
+    REQUIRE(audit_store.is_open());
+    AuthRoutes ar{fix.cfg, fix.auth_mgr, /*rbac_store=*/nullptr, fix.api_tokens.get(),
+                  &audit_store, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  fix.analytics.get(), fix.oidc_mu, fix.oidc_provider};
+    REQUIRE(fix.auth_mgr.upsert_user("plain_user", "password1234", auth::Role::user));
+
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    auto token = [&](const char* who, const char* scope, const char* tier) {
+        auto raw = fix.api_tokens->create_token("t", who, now + 3600, scope, tier);
+        REQUIRE(raw.has_value());
+        return "Bearer " + *raw;
+    };
+    auto cookie = [&](const std::string& tok) { return "yuzu_session=" + tok; };
+
+    // outcome: 0 admit, 401 unauthenticated, 403 denied.
+    struct Row {
+        const char* name;
+        std::string header; // "" = send no credential
+        std::string value;
+        int status;
+        const char* message;      // A4 error.message ("" when admitted)
+        const char* audit_target; // target_type of the auth.admin_required row ("" = none/blank)
+        const char* audit_detail; // detail of that row ("" for the admin-role denial)
+        bool audit_row;
+    };
+    const std::string admin_cookie = fix.auth_mgr.create_local_session_for_test(
+        "test_user", auth::Role::admin, true);
+    const std::string user_cookie = fix.auth_mgr.create_local_session_for_test(
+        "plain_user", auth::Role::user, true);
+    const std::string elevated_cookie = fix.auth_mgr.create_local_session_for_test(
+        "plain_user", auth::Role::user, true);
+    REQUIRE(fix.auth_mgr.elevate_session(elevated_cookie, std::chrono::seconds(300)).has_value());
+
+    const char* kSvc = "service-scoped tokens cannot perform admin operations";
+    const char* kMcp = "MCP tokens cannot perform admin operations";
+    const char* kRole = "admin role required";
+    const Row rows[] = {
+        {"no credential", "", "", 401, "unauthorized", "", "", false},
+        {"cookie admin", "Cookie", cookie(admin_cookie), 0, "", "", "", false},
+        {"cookie user", "Cookie", cookie(user_cookie), 403, kRole, "endpoint", "", true},
+        {"cookie user, JIT-elevated", "Cookie", cookie(elevated_cookie), 0, "", "", "", false},
+        {"token admin", "Authorization", token("test_user", "", ""), 0, "", "", "", false},
+        {"token user", "Authorization", token("plain_user", "", ""), 403, kRole, "endpoint", "",
+         true},
+        {"token admin + mcp", "Authorization", token("test_user", "", "readonly"), 403, kMcp, "",
+         "MCP token blocked from admin route", true},
+        {"token user + mcp", "Authorization", token("plain_user", "", "supervised"), 403, kMcp, "",
+         "MCP token blocked from admin route", true},
+        {"token admin + service scope", "Authorization", token("test_user", "finance-svc", ""), 403,
+         kSvc, "", "service-scoped token blocked from admin route", true},
+        {"token user + service scope", "Authorization", token("plain_user", "finance-svc", ""), 403,
+         kSvc, "", "service-scoped token blocked from admin route", true},
+        {"token admin + scope AND mcp (scope wins)", "Authorization",
+         token("test_user", "finance-svc", "readonly"), 403, kSvc, "",
+         "service-scoped token blocked from admin route", true},
+    };
+
+    // The /api/me side of the parity pin: the SAME credential through the real
+    // require_auth must report can_access_settings == what require_admin admits.
+    yuzu::server::test::TestRouteSink sink;
+    yuzu::server::dashboard_api::register_dashboard_api_routes(
+        sink, yuzu::server::dashboard_api::Deps{
+                  .auth_fn = [&ar](const httplib::Request& r, httplib::Response& s) {
+                      return ar.require_auth(r, s);
+                  },
+                  .perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                const std::string&) { return true; },
+                  .visible_agents_json_fn = [](const std::string&) { return nlohmann::json::array(); },
+              });
+
+    for (const auto& row : rows) {
+        INFO(row.name);
+        {
+            std::unordered_map<std::string, std::string> hdrs;
+            if (!row.header.empty())
+                hdrs.emplace(row.header, row.value);
+            const auto audits_before = audit_store.query(AuditQuery{.action = "auth.admin_required"});
+            REQUIRE(audits_before.has_value());
+            auto me = sink.dispatch("GET", "/api/me", "", "application/json", hdrs);
+            REQUIRE(me);
+            if (row.status == 401) {
+                CHECK(me->status == 401);
+                CHECK_FALSE(nlohmann::json::parse(me->body).contains("can_access_settings"));
+            } else {
+                CHECK(me->status == 200);
+                CHECK(nlohmann::json::parse(me->body)["can_access_settings"].get<bool>() ==
+                      (row.status == 0));
+                CHECK(me->get_header_value("Cache-Control") == "no-store, private");
+            }
+            // Reporting never consults the gate: no audit row from /api/me.
+            const auto audits_after = audit_store.query(AuditQuery{.action = "auth.admin_required"});
+            REQUIRE(audits_after.has_value());
+            CHECK(audits_after->size() == audits_before->size());
+        }
+        httplib::Request req;
+        req.path = "/settings";
+        if (!row.header.empty())
+            req.headers.emplace(row.header, row.value);
+        httplib::Response res;
+        auto before = audit_store.query(AuditQuery{.action = "auth.admin_required"});
+        REQUIRE(before.has_value());
+
+        const bool ok = ar.require_admin(req, res);
+        CHECK(ok == (row.status == 0));
+        if (row.status == 0) {
+            CHECK(res.status != 403);
+            CHECK(res.status != 401);
+        } else {
+            CHECK(res.status == row.status);
+            auto j = nlohmann::json::parse(res.body);
+            CHECK(j["error"]["code"].get<int>() == row.status);
+            CHECK(j["error"]["message"].get<std::string>() == row.message);
+            CHECK_FALSE(j["error"].contains("permission"));
+        }
+        auto after = audit_store.query(AuditQuery{.action = "auth.admin_required"});
+        REQUIRE(after.has_value());
+        const auto added = after->size() - before->size();
+        CHECK(added == (row.audit_row ? 1u : 0u));
+        if (row.audit_row && added == 1u) {
+            // The row this call wrote: the one id past everything seen before.
+            int64_t max_before = 0;
+            for (const auto& b : *before)
+                max_before = std::max(max_before, b.id);
+            const AuditEvent* found = nullptr;
+            for (const auto& a : *after)
+                if (a.id > max_before)
+                    found = &a;
+            REQUIRE(found != nullptr);
+            const auto& e = *found;
+            CHECK(e.result == "denied");
+            CHECK(e.target_type == row.audit_target);
+            CHECK(e.target_id == (std::string(row.audit_target) == "endpoint" ? "/settings" : ""));
+            CHECK(e.detail == row.audit_detail);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // require_permission MCP-tier enforcement tests (#520)
 // The tier (readonly/operator/supervised) is the primary boundary; the creator's
 // actual role is the secondary RBAC boundary. RBAC-disabled deployments still work.
@@ -798,6 +964,40 @@ TEST_CASE("AuthRoutes::require_permission — no MCP tier (incl. readonly, admin
         CHECK_FALSE(ok);
         CHECK(res.status == 403);
         CHECK(res.body.find("MCP token tier does not allow") != std::string::npos);
+    }
+}
+
+// #5771: AuditLog:Read is in the topology floor. The audit surfaces are reached by
+// ordinary API tokens as well as cookie sessions; a token session carries its creator's
+// live legacy role, so with RBAC off a non-admin creator's token is refused and an
+// admin creator's is admitted. Real bearer -> require_permission path (no mocks).
+TEST_CASE("AuthRoutes::require_permission — AuditLog:Read floor: RBAC-off ordinary API token "
+          "of a non-admin is refused, an admin-owned token is admitted (#5771)",
+          "[pg][auth_routes][security][floor]") {
+    AuthRoutesFixture fix;
+    REQUIRE(fix.auth_mgr.upsert_user("plain_user", "plain_password1", auth::Role::user));
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto user_raw = fix.api_tokens->create_token("audit-user", "plain_user", now + 3600);
+    REQUIRE(user_raw.has_value());
+    auto admin_raw = fix.api_tokens->create_token("audit-admin", "test_user", now + 3600);
+    REQUIRE(admin_raw.has_value());
+
+    {
+        auto req = request_with_header("Authorization", "Bearer " + *user_raw);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        CHECK(res.status == 403);
+        CHECK(fix.counter("yuzu_auth_topology_floor_denied_total",
+                          {{"permission", "AuditLog:Read"}}) == 1.0);
+    }
+    {
+        auto req = request_with_header("Authorization", "Bearer " + *admin_raw);
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "AuditLog", "Read"));
+        CHECK(fix.counter("yuzu_auth_topology_floor_denied_total",
+                          {{"permission", "AuditLog:Read"}}) == 1.0);
     }
 }
 

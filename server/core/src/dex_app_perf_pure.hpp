@@ -83,9 +83,8 @@ struct AppPerfTrendPoint {
     /// Set by BOTH the fleet and group paths: this (version, day) point covered
     /// fewer than the statistical floor (`kDexCohortFloor`) of devices, so its stats
     /// are suppressed (means/percentiles cleared) and only `device_count` is honest.
-    /// A sub-floor aggregate singles out one operator's behaviour even without an
-    /// agent_id (works-council / GDPR singling-out), whether it is fleet-wide or a
-    /// named-group slice — so the fleet path floors too, not just the group path.
+    /// The floor is one device (maintainer ruling 2026-10-14), so this is only ever
+    /// true for a point no device contributed to; the flag stays on the wire.
     bool suppressed{false};
 };
 

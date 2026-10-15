@@ -678,7 +678,11 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   (a backward clock step below the grant). It is also bounded by the session's own
   absolute expiry, and auto-reverts when the window lapses or on explicit
   revoke/logout, but **not** on restart. See `docs/auth-architecture.md` →
-  "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
+  "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)". The session reports its
+  own elevation state on `GET /api/me` and `GET /api/v1/me` (`effective_role`,
+  `elevated`, `elevated_until`, `can_access_settings`); `role` there stays the
+  persisted role. `can_access_settings` comes from `authz::admin_gate_verdict`
+  (`admin_gate.hpp`), the same function `require_admin` applies.
 - **Scope: interactive cookie sessions only.** `/api/v1/elevate` reads the
   session cookie and `elevate_session` keys on the cookie token; API and MCP
   tokens resolve through `synthesize_token_session` (no cookie, no
@@ -2886,19 +2890,24 @@ MCP twins).
 2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
    EnginePrincipal:Read}` — plus, as of #4028, `{TlsConfig:Read,
    PluginSigning:Read, ServerConfig:Read, AnalyticsConfig:Read}` (see
-   "Settings read-twins" below), and as of #4031, `{Enrollment:Read,
-   OidcConfig:Read}` — require the `admin` session role regardless of the
-   RBAC on/off toggle, via `authz_topology_floor.hpp`'s
-   `topology_floor_applies()`. The three groups are different categories
-   that happen to share this one mechanism: the original three are
-   authorization-topology reads (the RBAC role graph, the engine-principal
+   "Settings read-twins" below), as of #4031, `{Enrollment:Read,
+   OidcConfig:Read}`, as of Wave 7 PR7.2, `{Forensics:Read}`, and as of
+   #5771, `{AuditLog:Read}` (see "The audit trail" below) — require the
+   `admin` session role regardless of the RBAC on/off toggle, via
+   `authz_topology_floor.hpp`'s `topology_floor_applies()`. The groups are
+   different categories that happen to share this one mechanism: the
+   original three are authorization-topology reads (the RBAC role graph, the engine-principal
    grant graph, the access-review export) that intentionally stay reachable
    by an admin-owned session on ANY transport, MCP tokens included, per the
    legacy-role-fallback note below; the #4028 four and #4031 two are
    server-administration reads that #520 additionally excludes from every
    MCP tier outright (`mcp_policy.hpp`'s `tier_allows()`), so an admin-owned
    MCP token cannot reach them even though it would otherwise satisfy this
-   same floor check. (`Directory` deliberately has no floor entry, since it
+   same floor check. `AuditLog:Read` is a further class — evidence-grade
+   data, neither topology nor a gate migration — and, like the original three
+   and unlike the #4028/#4031 reads, is NOT excluded from MCP tiers: an
+   admin-owned MCP token still reads it through `query_audit_log` where its
+   tier already allowed that. (`Directory` deliberately has no floor entry, since it
    was never `admin_fn_`-gated to begin with — `list_directory_users` and
    most of `get_directory_status`'s payload stay reachable at Viewer role
    and readonly MCP tier. **One field is the exception:**
@@ -2941,6 +2950,24 @@ MCP twins).
    alert on floored denials specifically rather than parsing audit-log
    text.
 
+**The audit trail (#5771).** `AuditLog:Read` was the one evidence store left
+open by default: with RBAC off, any signed-in session read the full trail
+through seven surfaces — `GET /api/audit` (which also returns the actor's role
+and source IP), `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`,
+`GET /api/v1/engine-principals/audit/no-admin`, MCP `query_audit_log` /
+`audit_engine_no_admin`, and the `yuzu://audit/recent` resource. All seven gate
+on the same `("AuditLog", "Read")` pair through `require_permission`, so the
+single floor entry covers them; there is no per-route change and no second
+list. Engine principals and service-scoped tokens were already refused with
+RBAC off and are unchanged. With RBAC on nothing changes: every seeded holder
+(`Administrator`, `PlatformEngineer`, `Operator`, `ITServiceOwner`, `Viewer`)
+and any custom role granted the pair is admitted, and — as before — a holder
+reads every row, because the audit surfaces are not yet management-group
+confined (ADR-0017 lists them as a later step). Deliberately NOT done here: a
+dedicated securable for the sensitive fields (source IP, actor role) so a
+`Reviewer`-style role could read audit evidence under RBAC, and field-level
+redaction by caller role — both are separate, separately-decidable follow-ons.
+
 **Deliberately NOT floored, on purpose:**
 
 - **`Security:Read`** — considered and excluded because it is too coarse
@@ -2977,6 +3004,27 @@ only when a change cannot be expressed as an idempotent additive re-seed
 (`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
+
+## Render-time permission probes (capability hints)
+
+Three `AuthRoutes` methods answer a permission question without writing a denial row, for pages
+that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
+with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable) and
+`probe_fleet_read` (`require_fleet_read`'s decision and scope). Each runs the gate's own code
+under the thread-local `AuditProbeScope`, which makes `audit_log` a no-op (the `role.elevation.expired` lifecycle row, written through `audit_log_for_principal`, is still written), and withholds the
+denial row **only for an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
+`oidc` or `saml` and not an engine principal). A token or engine caller that reaches such a route
+keeps its row.
+
+What is withheld is the audit row. The denial counters (`yuzu_auth_topology_floor_denied_total`,
+`yuzu_auth_service_scope_default_denied_total`, `yuzu_server_rbac_read_degrade_total`) still tick,
+and the store's own read telemetry is untouched.
+
+A probe is a rendering hint unless a route deliberately binds it as its gate: the Dashboard panel
+fragments do (a refused sign-in is shown a note and leaves no row), while an action route must
+re-check through `require_permission` or `require_scoped_permission`. An earlier design that
+threaded a `Quiet` argument through `require_permission` was dropped because nothing called it and
+it did not cover `require_fleet_read`.
 
 ## Settings read-twins (#4028, api-parity programme #2146)
 
@@ -3455,7 +3503,8 @@ walkthrough.
   the three read routes are human-admin + RBAC gated but not step-up gated —
   list and get on `EnginePrincipal:Read` (moved off the over-broad
   `Security:Read` by #2376, see "The authorization topology floor" above), and
-  `audit/no-admin` on `AuditLog:Read`. Every route —
+  `audit/no-admin` on `AuditLog:Read` (floored under RBAC-off by #5771, so
+  the auditor route is admin-only on a default install). Every route —
   reads included — structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
   §9 belt): an engine principal can never read or mutate its own or another

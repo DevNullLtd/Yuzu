@@ -200,10 +200,10 @@ required.
 | `api_token.confirm` | ApiToken | A human self-service maker-checker confirmation that a rotation's successor secret was received/installed (`POST /api/v1/tokens/{id}/confirm` or the `confirm_api_token_rotation` MCP twin) — the human twin of `engine_principal.credential.confirm`; `{id}` is the successor token id the rotate response returned. `target_id` is the token id. `result=denied` when `{id}` exists but is owned by a different principal (`detail=owner=<principal_id>`, same 404-shaped body as rotate's denied case); `result=failure` when the store rejects the confirm (e.g. a replay after the rotation already resolved — `detail` carries the store's terminal message); `result=success` on confirm (`detail=confirmed`), which revokes the predecessor immediately and promotes the successor to the token's sole active credential. |
 | `engine_principal.role.assigned` | EnginePrincipal | A fleet-wide RBAC role was assigned to an engine principal via `POST /api/v1/engine-principals/{id}/roles` or the MCP `assign_engine_role` twin (PR 4.2, design §4.1). `target_id` is the full `engine:<slug>` principal id. `result=success` with `detail=<role_name>`; `result=denied` (target is not a live engine principal, the role is unknown, or `validate_assignment` rejects an admin/built-in/wildcard target — design §4.2 "no admin, ever") with `detail=<role_name>: <reason>`. Permission gate: `Security:Write`, plus admin + MFA step-up. |
 | `engine_principal.role.unassigned` | EnginePrincipal | A fleet-wide RBAC role was removed from an engine principal via `DELETE /api/v1/engine-principals/{id}/roles/{role}` or the MCP `unassign_engine_role` twin. `target_id` is the full `engine:<slug>` principal id; `detail=<role_name>`. `result=success` only — the unassign is **idempotent** (matching the management-group sibling): removing a role the principal never held still returns `200` and still writes a `success` row, so a success row does not by itself prove a grant existed. A `503` (store unavailable) writes no row. Permission gate: `Security:Write`, plus admin + MFA step-up. |
-| `engine_principal.role.listed` | EnginePrincipal | The fleet-wide RBAC roles assigned to an engine principal were enumerated via `GET /api/v1/engine-principals/{id}/roles` or the MCP `list_engine_roles` twin. `target_id` is the full `engine:<slug>` principal id; `result=success`. Audited because privilege enumeration is a security-sensitive read (SOC 2 CC7.2), even though it is a read. Permission gate: `EnginePrincipal:Read`. |
+| `engine_principal.role.listed` | EnginePrincipal | The fleet-wide RBAC roles assigned to an engine principal were enumerated via `GET /api/v1/engine-principals/{id}/roles` or the MCP `list_engine_roles` twin. `target_id` is the full `engine:<slug>` principal id; `result=success`. Audited because privilege enumeration is a security-sensitive read (SOC 2 CC7.2), even though it is a read. Permission gate: `EnginePrincipal:Read`. The Tokens and principals page fragments (`/fragments/access/principals/list` and `/detail`, gated on the same `EnginePrincipal:Read`) also write this verb, once per fragment and only when the roles were actually read (the list fragment for its Roles column, with an empty `target_id` and `detail=count=<rows>`; the detail fragment for the selected principal, `target_id` the principal id). A refused engine or MCP-tier session is recorded under `engine_principal.list` / `engine_principal.get` below, not here. |
 | `engine_principal.create` | EnginePrincipal | A new engine-principal identity is minted via `POST /api/v1/engine-principals` or the `create_engine_principal` MCP tool. `detail` carries `owner=<username>; classification=<internal\|external>` on both REST and MCP. |
-| `engine_principal.list` | EnginePrincipal | The engine-principal list surface (`GET /api/v1/engine-principals`) was enumerated. Emitted on every successful call, including by a read-only auditor role — an admit-then-audit read, not a mutation. **REST-only** — the `list_engine_principals` MCP tool does not emit this verb; its call is recorded only under the generic `mcp.list_engine_principals` tool-call audit action (`target_type=mcp_tool`), not this domain-specific verb. |
-| `engine_principal.get` | EnginePrincipal | A single engine principal's identity row was read (`GET /api/v1/engine-principals/{id}`). **REST-only**, same caveat as `engine_principal.list` above — the `get_engine_principal` MCP tool records only the generic `mcp.get_engine_principal` tool-call audit action. |
+| `engine_principal.list` | EnginePrincipal | The engine-principal list surface (`GET /api/v1/engine-principals`) was enumerated. Emitted on every successful call, including by a read-only auditor role — an admit-then-audit read, not a mutation. **REST-only** — the `list_engine_principals` MCP tool does not emit this verb; its call is recorded only under the generic `mcp.list_engine_principals` tool-call audit action (`target_type=mcp_tool`), not this domain-specific verb. The Tokens and principals page list fragment (`/fragments/access/principals/list`, gated on the same `EnginePrincipal:Read`) also writes this verb; an engine or MCP-tier session that passes the permission gate is then refused and writes `result=denied`, `detail=engine_session_denied` or `mcp_session_denied` (one that fails the permission gate gets that gate's ordinary denial). |
+| `engine_principal.get` | EnginePrincipal | A single engine principal's identity row was read (`GET /api/v1/engine-principals/{id}`). **REST-only**, same caveat as `engine_principal.list` above — the `get_engine_principal` MCP tool records only the generic `mcp.get_engine_principal` tool-call audit action. The Tokens and principals page detail fragment (`/fragments/access/principals/detail`, gated on the same `EnginePrincipal:Read`) also writes this verb; an engine or MCP-tier session that passes the permission gate is then refused and writes `result=denied`, `detail=engine_session_denied` or `mcp_session_denied` (one that fails the permission gate gets that gate's ordinary denial). |
 | `engine_principal.revoke` | EnginePrincipal | An engine principal was terminally revoked (`DELETE /api/v1/engine-principals/{id}` or `revoke_engine_principal`). `detail` carries `credentials_revoked=<N>` and, if given, `superseded_by=<successor id>` (REST) or the caller-supplied `reason` (MCP). The revoke call itself is idempotent (a repeat call on an already-revoked principal still returns success, never an error) but **the audit row is not** — a repeat call **re-emits** a fresh `result=success` row each time (with `credentials_revoked=0` on the repeat), so the audit trail shows every repeat operator action, not just the first revoke. |
 | `engine_principal.credential.mint` | EnginePrincipal | The first credential was minted for an engine principal (`POST /api/v1/engine-principals/{id}/credentials` or `mint_engine_credential`). **REST:** `target_id` is the engine principal id; `detail` carries `ttl_days=<N>`. **MCP:** `target_id` is instead the newly-minted credential's `token_id` (falls back to the principal id only if the freshly-minted row can't be looked back up); `detail` carries `principal=<engine principal id>`, not `ttl_days`. The raw secret itself is never written to the audit log on either surface. |
 | `engine_principal.credential.rotate` | EnginePrincipal | An overlap-pair credential rotation was initiated or continued (`POST /api/v1/engine-principals/{id}/credentials/rotate` or `rotate_engine_credential`). `result=failure` on a rejected call (e.g. below the 24h overlap floor, or a different operator touching an in-flight rotation); on success the reveal itself is recorded separately as `engine_principal.credential.reveal` below, not folded into this row. `target_id` is the engine principal id on both REST and MCP (this verb is only ever emitted on the failure path). |
@@ -318,7 +318,8 @@ required.
 | `inventory.sync.request` | Agent | An operator clicked **Sync now** on a device's Hardware CI record (or called `POST /api/v1/hardware/{id}/sync` directly) to request an out-of-cycle daily-sync push for one device instead of waiting for the ~24h cadence. Gated on `Execution:Execute` scoped to the device (`scoped_perm_fn`) — a sync-on-demand is a device action, not an inventory read. `target_id` is the `agent_id`; `source` (body field, default `all`) is one of `installed_software` / `app_perf` / `device_ci` / `software_licensing` / `all`. `result` and `detail` vary by outcome: `result=denied` for a non-JSON-object body (`detail=malformed JSON body`, `400`), a malformed `source` (`detail=bad source=<value>`, `400`, or `detail=source field is not a string`, `400`), or an agent whose reported version predates sync-on-demand (`detail=agent_version=<v> predates sync-on-demand`, `409` — needs 0.13.1 or later); `result=failure` (`detail=sync dispatch unwired`, `503`) if the server has no sync-dispatch mechanism wired; `result=no_agents` if the agent isn't currently connected (`detail=agent_offline`, `503`); `result=requested` (`detail=source=<source>`, `202`) once every precondition passes (a device id over 256 bytes or containing a byte below `0x20` is refused with `400` before the permission check and writes no audit row), audited **before** the command is dispatched to the agent — `emit_behavioral_audit` (the same helper `device.live.*` uses) fails the request CLOSED with `503` + `Sec-Audit-Failed` if this row cannot persist, and the command is never dispatched in that case. If the registry then refuses the dispatch itself (agent connected per the roster but unreachable), the response is `503` with no second audit row — the `requested` row is the durable evidence that the operator asked; whether the agent was actually reached is visible only in the HTTP response (`command_id` is minted by dispatch and returned in the response body, never persisted to the audit row), the same one-row-per-request convention `/api/v1/dex/devices/{id}/live` uses. |
 | `hardware.actions.view` | Agent | An operator opened the **Actions** lens on a device's Hardware CI record (`/fragments/hardware/ci/actions`) — the generic action-runner catalogue: every one of a connected agent's loaded-plugin actions, classified by capability, with parameter-hint forms for the ones this deployment recognises. Gated **per device** on `Inventory:Read` (`scoped_perm_fn`); viewing the catalogue itself additionally needs `Execution:Execute` for the device — an operator with only `Inventory:Read` sees a "needs Execute" placeholder instead, which is **not** audited (only a rendered catalogue is). `target_id` is the `agent_id`; `result=success` carries `detail=actions catalogue: <n> rows`. Actually **running** one of the listed actions is a separate event — dispatch goes through the existing `POST /api/command` route (and its own audit), so this verb records only that the catalogue was viewed. |
 | `hardware.action.result` | Agent | A poll of a dispatched Actions-lens command's result (`/fragments/hardware/ci/result`), audited once the poll reaches a **terminal** phase — rendered output, a renderable-but-empty result, a failed command, or a timeout — never on an in-flight "still waiting" tick. Gated the same as `hardware.actions.view` (`Inventory:Read` scoped to the device) plus a per-poll `Execution:Execute` probe; a caller without Execute sees an explanatory placeholder instead, unaudited. `target_id` is the `agent_id`; `result` is always `success` — it records that the result **view was rendered** to the operator, not that the underlying dispatched action itself succeeded — with `detail=<plugin> command_id=<id> phase=<n>` (`n` is the numeric result phase: `1`=rendered, `2`=rendered-empty, `3`=failed, `4`=timed out). |
-| `config.update` | RuntimeConfig | An operator wrote a runtime-config key via `PUT /api/config/:key` (`Infrastructure:Write`). `target_id` is the key name. For an ordinary key `detail` carries `value=<the new value>` verbatim, so this row is the change-management evidence for what a setting was changed to and by whom. **For a secret-valued key (today `oidc_client_secret`) `detail` never carries the real value** - the write path records `value=<redacted>`, and `AuditStore::query()` additionally redacts the `detail` of any *pre-existing* `config.update` row naming a secret key **on read**, so rows written before that fix shipped no longer disclose the plaintext through `GET /api/v1/audit`, the legacy `GET /api/audit`, or the MCP `query_audit_log` tool (every reader shares the one read path). The stored row on disk is left unchanged - an audit row is evidence, so this redacts what a caller *sees* rather than rewriting history. If you set `oidc_client_secret` before that fix, rotate it: the value was disclosed while it was being recorded in the clear. **Rotating durably takes more than one step, and rotating through Settings alone breaks the next restart** — see [`upgrading.md`](upgrading.md) ("Security: rotate `oidc_client_secret` if it was ever set on this install") for what to remediate, and [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to configure it. The note below about Settings is about where the audit evidence lands, not how to rotate. Note this verb covers the generic config API only; a change made through Settings emits its own verb instead (`settings.dex_alerts.*`, `plugin_signing.require.changed`, and for OIDC `oidc.configure` on `target_type="OidcConfig"` with the ISSUER as `target_id`). **Consequence for rotation evidence:** a Settings-driven OIDC secret rotation is audited as `oidc.configure` and does NOT name `oidc_client_secret` anywhere, so a query for `config.update` + `target_id=oidc_client_secret` finds only rotations done through the generic API. Since Settings is the only path that applies an OIDC change to the running server, expect key-level rotation evidence to be absent for the path operators are told to use. |
+| `csrf.denied` (runtime config) | Endpoint | A browser (session-cookie) `PUT /api/config/{key}` that carried no `Origin`/`Referer`, or one naming another site (and not a `--csrf-trusted-origin` entry). `target_id` is `config`. The call answers `403` and changes nothing; API, MCP and engine token callers are exempt. |
+| `config.update` | RuntimeConfig | An operator wrote a runtime-config key via `PUT /api/config/:key` (`Infrastructure:Write`). The write is audit-first: a row with result `attempted` and an empty `detail` is stored before anything changes (if it cannot be stored the call is refused `503` and nothing changes), then a `success` row, or a `failure` row when the store refuses the value (`detail` is the store's refusal text, for example the 30 second floor, never the submitted value; a database error records `store error; outcome unknown`). A lone `attempted` row with no outcome row means the result is unknown: read `GET /api/config` (see the PUT section of the REST reference). An unknown key, or a body or integer that fails validation, is refused before any row is written. A browser call from another site is refused and recorded as `csrf.denied` (`target_type=Endpoint`, `target_id=config`). `target_id` is the key name. For an ordinary key the `success` row's `detail` carries `value=<the new value>` verbatim, so this row is the change-management evidence for what a setting was changed to and by whom. **For a secret-valued key (today `oidc_client_secret`) `detail` never carries the real value** - the write path records `value=<redacted>`, and `AuditStore::query()` additionally redacts the `detail` of any *pre-existing* `config.update` row naming a secret key **on read**, so rows written before that fix shipped no longer disclose the plaintext through `GET /api/v1/audit`, the legacy `GET /api/audit`, or the MCP `query_audit_log` tool (every reader shares the one read path). The stored row on disk is left unchanged - an audit row is evidence, so this redacts what a caller *sees* rather than rewriting history. If you set `oidc_client_secret` before that fix, rotate it: the value was disclosed while it was being recorded in the clear. **Rotating durably takes more than one step, and rotating through Settings alone breaks the next restart** — see [`upgrading.md`](upgrading.md) ("Security: rotate `oidc_client_secret` if it was ever set on this install") for what to remediate, and [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to configure it. The note below about Settings is about where the audit evidence lands, not how to rotate. Note this verb covers the generic config API only; a change made through Settings emits its own verb instead (`settings.dex_alerts.*`, `plugin_signing.require.changed`, and for OIDC `oidc.configure` on `target_type="OidcConfig"` with the ISSUER as `target_id`). **Consequence for rotation evidence:** a Settings-driven OIDC secret rotation is audited as `oidc.configure` and does NOT name `oidc_client_secret` anywhere, so a query for `config.update` + `target_id=oidc_client_secret` finds only rotations done through the generic API. Since Settings is the only path that applies an OIDC change to the running server, expect key-level rotation evidence to be absent for the path operators are told to use. |
 | `settings.dex_alerts.cohort_export` | RuntimeConfig | An admin set or cleared the cohort metrics export tag key via the DEX → Alerts tab. `target_id` is `dex_cohort_export_key`; `detail` carries `export_key=<key>` or `export disabled`. The runtime-config store keeps no history, so this row is the change-management evidence for what cohort labels were exported when. |
 | `tar.db.corruption_quarantined` | Agent | (SOC 2 CC7.1/CC7.2) An agent reported, via its heartbeat, that its `tar.db` was quarantined as corrupt and re-initialised. Principal `system`, target type `Agent` (`target_id` = the device's agent id), `detail` = `corruption_total=<n> quarantine=<epoch>:<file>`; the paths are `<agent data_dir>/tar.db` and `<agent data_dir>/<file>` (basename only: the heartbeat tag value cap is 64 bytes and the data dir is agent configuration). One row per (agent, quarantine identity) per server process (another HA node ingesting the same agent can add a second row for the same identity): the server dedups against the audit store itself, so store prunes, server restarts and HA node switches never repeat it. At most one row per agent per 10 minutes per server process (in-memory; a restart or another HA node opens a fresh window), so a rotating identity cannot mint a row per heartbeat; intermediate quarantines inside one window collapse to the newest identity, which is logged on the first heartbeat after the window — for TRUE event frequency, trust the agent's own cumulative `heartbeat.db_corruption_total` count (surfaced fleet-wide via `yuzu_fleet_tar_db_corruption_agents`, see the metrics reference), never a row count, which under-represents by design inside a rate-limit window. Derived from heartbeat tags, so it is agent-asserted, not server-verified: this row corroborates that the agent's own software believed it hit corruption; it does not rule out an actor with agent-level access forging the same signal, and should not be presented as conclusive evidence against tampering. |
 | `tar.status.scan` | Infrastructure | An operator clicked **Scan fleet** on the TAR dashboard page (`/tar`). A `tar.status` command was dispatched to the operator's visible-agent set. `detail` carries the count of agents the dispatch reached (e.g. `dispatched to 47 agent(s) in scope`). One row per Scan button press; no row on page-load Refresh. |
@@ -386,6 +387,23 @@ The `/auto` deploy verbs share this pattern: `deployment.create` emits `resumed`
 
 ## REST API
 
+**Who may read the audit trail.** Reading it needs the `AuditLog:Read`
+permission, on every surface: the REST routes below, the dashboard viewer, and
+the MCP `query_audit_log` / `audit_engine_no_admin` tools and
+`yuzu://audit/recent` resource.
+
+- **RBAC disabled (the shipped default):** only an `admin`-role session may
+  read the trail (#5771). Any other authenticated session gets `403`, audited with a `detail` beginning
+  `topology floor: non-admin role denied AuditLog:Read` (match on the prefix: an
+  MCP-tier token's row appends `(mcp_tier=<tier>)`). Engine principals and
+  service-scoped tokens are refused as before.
+- **RBAC enabled:** `AuditLog:Read` is an ordinary grant. The seeded
+  `Administrator`, `PlatformEngineer`, `Operator`, `ITServiceOwner` and `Viewer`
+  roles hold it; a custom role can be granted it. A holder sees every row.
+
+See [RBAC](rbac.md#the-authorization-topology-floor-2376) for the floor and for
+how to grant a non-admin the read.
+
 ### GET /api/v1/audit
 
 Query audit events with filtering and pagination. Maximum page size is 1000.
@@ -397,10 +415,11 @@ Query audit events with filtering and pagination. Maximum page size is 1000.
 | `limit` | integer | Number of events to return (default 100, max 1000) |
 | `principal` | string | Filter by principal username |
 | `action` | string | Filter by action (exact match) |
-
-Note: the v1 endpoint supports `principal` and `action` filters only. For
-additional filters (`target_type`, `target_id`, `since`, `until`, `offset`),
-use the legacy `/api/audit` endpoint.
+| `target_type` | string | Filter by target type (exact match) |
+| `target_id` | string | Filter by target id (exact match); requires `target_type` |
+| `since` | integer | Inclusive lower bound, epoch seconds; `0` or absent is unbounded |
+| `until` | integer | Inclusive upper bound, epoch seconds; `0` or absent is unbounded |
+| `offset` | integer | Rows to skip, `0`..`10000` (default 0) |
 
 **Example --- fetch the 20 most recent events:**
 
@@ -415,6 +434,7 @@ curl -s -b cookies.txt \
 {
   "data": [
     {
+      "id": 4101,
       "timestamp": 1710849600,
       "principal": "admin",
       "action": "tag.set",
@@ -427,7 +447,7 @@ curl -s -b cookies.txt \
   "pagination": {
     "total": 20,
     "start": 0,
-    "page_size": 50
+    "page_size": 100
   },
   "meta": {
     "api_version": "v1"
@@ -436,17 +456,17 @@ curl -s -b cookies.txt \
 ```
 
 **`total` is the number of rows returned in this response, not the number of
-rows that matched** — the route caps at `limit` (max 1000) with no `offset`
-support, so a response at exactly `limit` rows can mean there are older
-matches you have not seen, not that you have everything. `page_size` is
-likewise always `50`, independent of the `limit` you actually passed
-([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If you hit the cap,
-narrow with `principal=`/`action=`, or use the legacy `GET /api/audit`
-endpoint, which also accepts `offset`. `since`/`until` alone only bounds the
-time window — it does not by itself guarantee completeness inside that
-window if more rows matched than one call returns. The reliable recipe is
-both together: freeze a bounded window with `since`/`until` first, then page
-through it with `offset`.
+rows that matched.** `start` echoes `offset` and `page_size` echoes `limit`; a
+page shorter than `limit` is the last page.
+The MCP `query_audit_log` tool also returns `has_more`, true when more matching rows exist
+past the page. Rows are ordered newest first and
+rows with an identical timestamp break by `id` (newest first). On an unchanging
+result set `offset` paging neither repeats nor skips rows; the log is live, so a
+new event or a retention delete between page fetches shifts later pages. Pin the
+window with a fixed `until` in the past and use `id` to de-duplicate. `offset` is
+capped at 10000 and never clamped (a larger value is a `400`). To read deeper,
+set `until` to the oldest `timestamp` already seen (inclusive), restart at
+`offset=0`, and de-duplicate on `id`.
 
 **Example --- filter by principal and action:**
 
@@ -464,16 +484,18 @@ curl -s -b cookies.txt \
 
 ### GET /api/audit (legacy)
 
-The legacy endpoint supports the full set of query parameters and has no
-hard-coded limit cap. New integrations should prefer `/api/v1/audit` once
-additional filters are added there.
+The legacy endpoint caps `limit` at 1000 and rejects `offset` above 10000, the
+same ceilings as `/api/v1/audit`. It answers `400` for a negative `since`/`until`, an
+inverted window, and a string filter holding a NUL or invalid UTF-8 (the v1 route does the
+same for the string filters). New integrations should prefer `/api/v1/audit`, which also
+rejects a `target_id` given without `target_type`.
 
 **Query parameters:**
 
 | Parameter | Type | Description |
 |---|---|---|
-| `limit` | integer | Number of events to return (default 100, no hard cap) |
-| `offset` | integer | Offset for pagination (default 0) |
+| `limit` | integer | Number of events to return (default 100, max 1000) |
+| `offset` | integer | Offset for pagination, `0`..`10000` (default 0; larger is a `400`) |
 | `principal` | string | Filter by principal username |
 | `action` | string | Filter by action (exact match) |
 | `target_type` | string | Filter by target type |
@@ -492,11 +514,11 @@ The legacy response envelope differs from v1:
 ```
 
 The legacy response includes additional fields per event not present in the v1
-response: `id`, `principal_role`, `source_ip`.
+response: `principal_role`, `source_ip` (`id` is on both).
 
 ```bash
 curl -s -b cookies.txt \
-  'http://localhost:8080/api/audit?limit=5000&principal=admin' | jq .
+  'http://localhost:8080/api/audit?limit=1000&principal=admin' | jq .
 ```
 
 ## Dashboard viewer
@@ -504,7 +526,8 @@ curl -s -b cookies.txt \
 The Yuzu dashboard includes a built-in audit log viewer accessible from the
 navigation menu. The viewer renders audit events as an HTMX-powered table with
 live filtering by principal, action, and date range. No additional
-configuration is required.
+configuration is required. It is backed by `GET /api/audit`, so the same
+`AuditLog:Read` rule applies (admin-only while RBAC is disabled).
 
 ## Retention and cleanup
 

@@ -80,6 +80,7 @@ template <typename Req> auto settings_req_get_file(const Req& req, const std::st
 
 // Settings page HTML template (defined in settings_ui.cpp).
 extern const char* const kSettingsHtml;
+extern const char* const kSettingsDataHtml; // settings_data_ui.cpp (SYS-4)
 
 // GatewayUpstreamServiceImpl and AgentRegistry are inner classes of server.cpp.
 // We use callbacks (AgentsJsonFn, GatewaySessionCountFn) to avoid depending on
@@ -298,6 +299,15 @@ nlohmann::json settings_ok_envelope(nlohmann::json data) {
     return out;
 }
 
+/// The server-config builder input shared by the fragment and its REST twin: the fixed
+/// sign-in lifetime is `AuthManager::kSessionDuration`, passed in so settings_model.hpp
+/// stays free of the auth dependency (main.cpp derives its warn threshold the same way).
+nlohmann::json server_config_view(const Config& cfg) {
+    return settings_model::build_server_config_settings(
+        cfg, std::chrono::duration_cast<std::chrono::seconds>(auth::AuthManager::kSessionDuration)
+                 .count());
+}
+
 } // anonymous namespace
 
 // ── Fragment renderers ──────────────────────────────────────────────────────
@@ -306,7 +316,7 @@ std::string SettingsRoutes::render_server_config_fragment() {
     // #4028 — shared builder (settings_model.hpp); the REST twin
     // GET /api/v1/settings/server-config formats the SAME JSON as its
     // response body instead of re-deriving these fields from cfg_.
-    const auto v = settings_model::build_server_config_settings(*cfg_);
+    const auto v = server_config_view(*cfg_);
 
     std::string html;
 
@@ -323,8 +333,20 @@ std::string SettingsRoutes::render_server_config_fragment() {
     html += "<tr><td>Web UI Port</td><td><code>" + std::to_string(v.at("web_port").get<int>()) +
             "</code></td></tr>";
 
-    html += "<tr><td>Session Timeout</td><td><code>" +
+    // This is the AGENT heartbeat window (agents silent for longer are dropped), not the
+    // dashboard sign-in expiry; the two rows after it are the sign-in limits.
+    html += "<tr><td>Agent heartbeat timeout</td><td><code>" +
             std::to_string(v.at("session_timeout_seconds").get<std::int64_t>()) +
+            "s</code></td></tr>";
+    {
+        const auto idle = v.at("session_inactivity_seconds").get<std::int64_t>();
+        html += "<tr><td>Dashboard idle timeout</td><td>" +
+                (idle > 0 ? "<code>" + std::to_string(idle) + "s</code>"
+                          : std::string("Off")) +
+                "</td></tr>";
+    }
+    html += "<tr><td>Dashboard session lifetime</td><td><code>" +
+            std::to_string(v.at("session_absolute_lifetime_seconds").get<std::int64_t>()) +
             "s</code></td></tr>";
     html += "<tr><td>Max Agents</td><td><code>" +
             std::to_string(v.at("max_agents").get<std::int64_t>()) + "</code></td></tr>";
@@ -2627,28 +2649,16 @@ std::string SettingsRoutes::render_analytics_fragment() {
     return html;
 }
 
+nlohmann::json SettingsRoutes::retention_view() const {
+    return settings_model::build_data_retention_settings(
+        *cfg_, retention_enforced_fn_ ? retention_enforced_fn_()
+                                      : settings_model::RetentionEnforced{});
+}
+
 std::string SettingsRoutes::render_data_retention_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/data-retention formats
     // the SAME JSON as its response body instead of re-deriving these fields.
-    const auto v = settings_model::build_data_retention_settings(*cfg_);
-
-    std::string html;
-
-    html += "<div class=\"form-row\">"
-            "  <label>Response Data</label>"
-            "  <code>" +
-            std::to_string(v.at("response_retention_days").get<int>()) +
-            " days</code>"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Audit Logs</label>"
-            "  <code>" +
-            std::to_string(v.at("audit_retention_days").get<int>()) +
-            " days</code>"
-            "</div>";
-
-    return html;
+    return settings_model::render_retention_table(retention_view());
 }
 
 namespace {
@@ -2747,7 +2757,7 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
             (export_key.empty() ? "Export off" : "Export on") + "</span></div></div>"
             "<div class=\"pb\"><p>When a tag key is set, per-cohort fleet performance gauges "
             "(<code>yuzu_fleet_perf_cohort_*</code>) are exported on /metrics for that key's "
-            "cohorts: top 50 by population, a 10-device statistical floor, and a "
+            "cohorts: top 50 by population, the one-device statistical floor (an empty cohort is withheld), and a "
             "<code>_clipped</code> gauge that makes any capping visible. Empty disables the "
             "export (the default). Fleet-level gauges are always exported.</p>"
             "<p><b>The key's tag values become Prometheus labels</b> visible to whatever scrapes "
@@ -3471,9 +3481,8 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ServerConfig", "Read"))
                      return;
-                 res.set_content(
-                     settings_ok_envelope(settings_model::build_server_config_settings(*cfg_)).dump(),
-                     "application/json");
+                 res.set_content(settings_ok_envelope(server_config_view(*cfg_)).dump(),
+                                 "application/json");
              });
 
     sink.Get("/fragments/settings/https",
@@ -3551,15 +3560,24 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_data_retention_fragment(), "text/html; charset=utf-8");
              });
 
+    // System > Data and retention page (SYS-4): same admin gate and redirect as
+    // GET /settings. A page route, not ledgered (the parity check covers only
+    // /fragments/* and /api/*).
+    sink.Get("/settings/data", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!admin_fn_(req, res)) {
+            res.set_redirect("/");
+            return;
+        }
+        res.set_content(kSettingsDataHtml, "text/html; charset=utf-8");
+    });
+
     // #4028 — REST v1 read-twin. ServerConfig:Read. NOT audited — "lowest
     // sensitivity of the eight" per #4028's Evidence section.
     sink.Get("/api/v1/settings/data-retention",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ServerConfig", "Read"))
                      return;
-                 res.set_content(settings_ok_envelope(
-                                     settings_model::build_data_retention_settings(*cfg_))
-                                     .dump(),
+                 res.set_content(settings_ok_envelope(retention_view()).dump(),
                                  "application/json");
              });
 

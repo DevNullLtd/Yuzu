@@ -15,6 +15,7 @@
 #include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
 #include "runtime_config_store.hpp"
+#include "settings_model.hpp" // RetentionEnforced
 #include "tag_store.hpp"
 #include "update_registry.hpp"
 
@@ -95,6 +96,14 @@ public:
     /// (so no request can race the set). May stay empty (tests) — the
     /// handlers then persist without the live apply.
     void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
+
+    /// Reads the retention windows the stores actually enforce (the stores copy
+    /// their window at construction, so Config can differ). Wired by server.cpp
+    /// before the listener starts; the closure must report `nullopt` for a store
+    /// that is absent or not open. Left empty (tests), every window renders as
+    /// "Unknown" rather than a number nothing verified.
+    using RetentionEnforcedFn = std::function<settings_model::RetentionEnforced()>;
+    void set_retention_enforced_fn(RetentionEnforcedFn fn) { retention_enforced_fn_ = std::move(fn); }
 
     /// Inject the engine-principal store (nullable — a null pointer means
     /// the feature is not yet wired; server.cpp wiring is a separate task
@@ -288,6 +297,8 @@ private:
     AuditFn audit_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
+    RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
+    nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
     Config* cfg_{};
     auth::AuthManager* auth_mgr_{};
     auth::AutoApproveEngine* auto_approve_{};
