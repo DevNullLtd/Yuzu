@@ -630,8 +630,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                       "a copied or moved guard would release the slot twice");
         const bool guarded = ss::needs_run_guard(sel.arm);
         const auto cooldown_wait = [&] {
-            std::lock_guard<std::mutex> lk(sync_run_mu_);
-            return ss::cooldown_remaining(ss::last_run_of(sync_last_run_, session->username), now());
+            std::optional<std::int64_t> last;
+            {
+                std::lock_guard<std::mutex> lk(sync_run_mu_);
+                last = ss::last_run_of(sync_last_run_, session->username);
+            }
+            return ss::cooldown_remaining(last, now()); // the clock is read outside the lock
         };
         const auto refuse_cooldown = [&](std::int64_t wait) {
             res.set_header("Retry-After", std::to_string(wait));

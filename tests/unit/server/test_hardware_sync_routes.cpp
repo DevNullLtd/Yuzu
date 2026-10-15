@@ -71,6 +71,9 @@ struct SyncHarness {
     std::function<void()> during_dispatch;
     // Runs inside every audit write, to prove what the route holds while it writes.
     std::function<void()> on_audit;
+    // Runs on every read of the injected clock (before it returns), to interleave a competing
+    // request at an exact point of the route.
+    std::function<void()> on_clock;
 
     explicit SyncHarness(SyncWiring w = {}) {
         resolved.status = ss::Resolved::Status::Ok;
@@ -117,7 +120,11 @@ struct SyncHarness {
                 return resolved;
             };
         if (w.clock)
-            deps.sync_now_fn = [this] { return clock; };
+            deps.sync_now_fn = [this] {
+                if (on_clock)
+                    on_clock();
+                return clock;
+            };
         if (w.precheck)
             deps.sync_caller_unfiltered_fn = [this](const auth::Session&) {
                 ++precheck_calls;
@@ -622,6 +629,63 @@ TEST_CASE("sync route: an early cooldown 429 does not hold the slot while its au
     CHECK(h.post(R"({"scope":"group:g"})")->status == 429);
     CHECK(fired);
     CHECK(inner_status == 202);
+}
+
+TEST_CASE("sync route: a run that stamped between the cooldown check and the slot is still refused",
+          "[hardware][sync_fanout][route][security]") {
+    SyncHarness h;
+    h.live(2);
+    const std::int64_t t0 = h.clock;
+    // alice's request R2 reads her (empty) cooldown, then reads the clock. On that first clock read
+    // a COMPETING run by the same operator completes (taking and releasing the slot, stamping at
+    // T). R2 then takes the now-free slot with a stale view; only the re-read after the slot stops
+    // it. Everything R2 does next is observed.
+    bool competing_done = false;
+    bool audit_armed = false;
+    bool audit_fired = false;
+    int competing_status = 0;
+    int bob_status = 0;
+    h.on_clock = [&] {
+        if (competing_done)
+            return;
+        competing_done = true;
+        h.clock = t0 + 5; // the competing run stamps at t0 + 5
+        auto r = h.post(R"({"scope":"group:g"})");
+        competing_status = r ? r->status : -1;
+        h.clock = t0 + 12; // time passes before R2's own re-read
+        audit_armed = true;
+    };
+    // From inside R2's refusal audit write a different operator asks for a run: the slot must be
+    // free (R2 released it before writing), so bob is not answered 409.
+    h.on_audit = [&] {
+        if (!audit_armed || audit_fired)
+            return;
+        audit_fired = true;
+        h.username = "bob";
+        auto r = h.post(R"({"scope":"group:g"})");
+        bob_status = r ? r->status : -1;
+        h.username = "alice";
+    };
+    auto r2 = h.post(R"({"scope":"group:g"})");
+    REQUIRE(r2);
+    CHECK(competing_status == 202);
+    CHECK(r2->status == 429);
+    CHECK(r2->get_header_value("Retry-After") == "53"); // 60 s from the competing stamp at t0+5, read at t0+12
+    // R2's refusal row is on the audit record (bob's run wrote its own rows after it).
+    CHECK(std::any_of(h.audit_details.begin(), h.audit_details.end(), [](const std::string& d) {
+        return contains(d, "rate_limited cooldown=53s");
+    }));
+    CHECK(h.dispatch_calls == 2); // the competing run and bob's; R2 itself sent nothing
+    CHECK(audit_fired);
+    CHECK(bob_status == 202); // the slot was free while R2's refusal was audited
+    // R2's refusal did not overwrite the competing run's stamp: still counted from t0 + 5.
+    h.on_clock = nullptr;
+    h.on_audit = nullptr;
+    h.clock = t0 + 35;
+    auto later = h.post(R"({"scope":"group:g"})");
+    REQUIRE(later);
+    CHECK(later->status == 429);
+    CHECK(later->get_header_value("Retry-After") == "30");
 }
 
 TEST_CASE("sync route: a single-device sync is not held by a multi-device run in flight",
