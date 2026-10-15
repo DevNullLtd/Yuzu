@@ -482,9 +482,8 @@ TEST_CASE("instruction_fragment_routes: filters, limit+1 truncation, approval co
         auto res = h.sink.Get("/fragments/instructions");
         REQUIRE(res);
         CHECK(res->body.find("Needs approval") == std::string::npos);
-        // No Templates control, host or helper script without the read permission.
+        // No Templates control or host without the read permission.
         CHECK(res->body.find("ox-templates") == std::string::npos);
-        CHECK(res->body.find("oxTplMark") == std::string::npos);
         CHECK(res->body.find("Triage Set") == std::string::npos);
         CHECK(res->body.find("data-denied=\"true\"") != std::string::npos);
         CHECK(res->body.find("Beta three") != std::string::npos); // the list itself is unchanged
@@ -526,7 +525,7 @@ TEST_CASE("instruction_fragment_routes: probe-stamped controls follow the permis
 
     // The Templates panel lands directly under the library toolbar (after the filter form,
     // before the table), not below the 100-row table where the click looked like a no-op;
-    // htmx scrolls it into view and the clicked row is marked.
+    // htmx scrolls it into view (show:#ox-templates:top).
     {
         const auto filter = b.find("class=\"ox-filter\"");
         const auto host = b.find("id=\"ox-templates\"");
@@ -538,9 +537,6 @@ TEST_CASE("instruction_fragment_routes: probe-stamped controls follow the permis
         CHECK(b.find("id=\"ox-templates\"", host + 1) == std::string::npos); // one host only
     }
     CHECK(b.find("hx-swap=\"innerHTML show:#ox-templates:top\"") != std::string::npos);
-    CHECK(b.find("aria-controls=\"ox-templates\" aria-expanded=\"false\" "
-                 "onclick=\"oxTplMark(this)\"") != std::string::npos);
-    CHECK(b.find("function oxTplMark(") != std::string::npos);
     CHECK(b.find("hx-on") == std::string::npos);
 
     SECTION("write denied: no New, Import, set select or set buttons") {

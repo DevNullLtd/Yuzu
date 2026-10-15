@@ -209,10 +209,10 @@ TEST_CASE("instruction extras ui: templates panel has a heading naming the defin
     for (const bool can_write : {false, true}) {
         const auto h = ex::render_templates_panel("def1", "Disk <usage>", {}, can_write);
         CHECK(has(h, "<h2>Response templates: Disk &lt;usage&gt;</h2>"));
-        // Close empties the host and clears the row mark; plain inline handler, no hx-on, and
-        // no data-ox hook (a read-only panel carries none).
+        // Close empties the host; plain inline handler, no hx-on, and no data-ox hook (a
+        // read-only panel carries none).
         CHECK(has(h, "aria-label=\"Close response templates\""));
-        CHECK(has(h, "replaceChildren();oxTplMark()"));
+        CHECK(has(h, "getElementById('ox-templates').replaceChildren()\""));
         CHECK_FALSE(has(h, "hx-on"));
     }
     // Every state of the panel sits inset inside the library panel that hosts it.

@@ -153,11 +153,10 @@ std::string render_templates_panel(const std::string& definition_id,
         h += "<button type=\"button\" class=\"btn btn-secondary btn-sm\" data-ox=\"tpl-new\" "
              "data-def-id=\"" +
              html_escape(definition_id) + "\">New template</button>";
-    // Close empties the host and clears the library row's mark (oxTplMark is emitted with the
-    // library fragment that hosts this panel). Constants only.
+    // Close empties the host (#ox-templates, in the library fragment). Constants only.
     h += "<button type=\"button\" class=\"btn btn-ghost btn-sm\" "
          "aria-label=\"Close response templates\" onclick=\"document.getElementById("
-         "'ox-templates').replaceChildren();oxTplMark()\">Close</button></div>";
+         "'ox-templates').replaceChildren()\">Close</button></div>";
     h += "</div><div class=\"tw\"><table><thead><tr><th>Name</th><th>Columns</th><th>Sort</th>"
          "<th>Filters</th><th></th></tr></thead><tbody>";
     // The synthesised default: fixed, no actions. An authored default hides it in the API list;

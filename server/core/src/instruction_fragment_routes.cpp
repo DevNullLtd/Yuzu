@@ -35,16 +35,6 @@ std::string url_encode(const std::string& v) {
     return out;
 }
 
-// Marks the library row whose Templates button was clicked (tr.sel, the product's one
-// selected-row style) and sets aria-expanded on it, so the click is visibly acknowledged; a
-// call with no button clears the mark (the panel's Close button). Constants only, no data.
-constexpr std::string_view kTemplatesRowMarkScript =
-    "<script>function oxTplMark(b){document.querySelectorAll('#tab-definitions tr.sel')"
-    ".forEach(function(r){r.classList.remove('sel');var x=r.querySelector("
-    "'[aria-controls=ox-templates]');if(x)x.setAttribute('aria-expanded','false')});"
-    "if(b){b.closest('tr').classList.add('sel');b.setAttribute('aria-expanded','true')}}"
-    "</script>";
-
 // -- Server-side YAML syntax highlighter ----------------------------------
 // Used by the instruction editor's yaml-preview fragment below. Moved
 // (not duplicated) from ServerImpl's private statics in server.cpp
@@ -302,9 +292,8 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                                 "hx-get=\"/fragments/instructions/templates?id=" +
                                 url_encode(d.id) +
                                 "\" hx-target=\"#ox-templates\" "
-                                "hx-swap=\"innerHTML show:#ox-templates:top\" "
-                                "aria-controls=\"ox-templates\" aria-expanded=\"false\" "
-                                "onclick=\"oxTplMark(this)\">Templates</button> "
+                                "hx-swap=\"innerHTML show:#ox-templates:top\">"
+                                "Templates</button> "
                                 "<button type=\"button\" class=\"btn btn-secondary btn-sm\" "
                                 "data-ox=\"export\" data-def-id=\"" +
                                 html_escape(d.id) + "\" data-def-name=\"" + html_escape(d.name) +
@@ -342,8 +331,6 @@ void register_instruction_fragment_routes(HttpRouteSink& sink, Deps deps) {
                 html += "</tbody></table></div>";
             }
             html += instruction_extras::render_library_foot(limit, truncated);
-            if (show_approval && !defs.empty())
-                html += kTemplatesRowMarkScript;
             html += "</section>";
 
             if (probe_sets) {
