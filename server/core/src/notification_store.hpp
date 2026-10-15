@@ -14,11 +14,12 @@
 /// #1033-banning idiom), never `sqlite3_changes()`.
 ///
 /// Posture (ADR-0012 §1): construction is AUTHORITATIVE/fail-closed — a
-/// Postgres store that cannot open is a fatal startup error. Runtime
-/// reads/writes below stay plain container/bool returns (never
-/// `std::expected`) because NONE of them feed an authorization, targeting,
+/// Postgres store that cannot open is a fatal startup error. The plain runtime
+/// reads/writes below stay container/bool returns for callers that only draw a badge (the
+/// `_checked` variants add the failure channel the operator-facing bell routes use; ADR-0046
+/// Update 2026-10-15) because NONE of them feed an authorization, targeting,
 /// enforcement, or skip decision — `list_unread`/`list_all`/`count_unread`
-/// back a dashboard badge and a display list, and `mark_read`/`dismiss`
+/// back a display list and a count, and `mark_read`/`dismiss`
 /// affect only what is shown, never what runs. A transient DB error on any
 /// of these degrades the display (empty list, stale badge); it never
 /// silently grants, targets, or suppresses anything (the playbook's own
@@ -31,8 +32,10 @@
 /// instead; `set_metrics()` went with it — this store's `metrics_` pointer
 /// had no other consumer.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <string>
 #include <vector>
 
@@ -99,7 +102,32 @@ public:
     /// query error (same display-only degrade as list_unread).
     std::size_t count_unread();
 
+    /// Failure-distinguishing readers and mutators (PR #5859 review). The plain methods above
+    /// keep the display-only degrade for callers that only draw a badge; the operator-facing
+    /// bell route uses these so that a lease timeout or a query error is an error the page can
+    /// show, not "No unread notifications." A closed store is also an error here.
+    /// `mark_read_checked` / `dismiss_checked`: `true` = exactly one row changed, `false` = no
+    /// such id, error = the write may not have reached Postgres.
+    [[nodiscard]] std::expected<std::vector<Notification>, std::string>
+    list_unread_checked(int limit = 50);
+    [[nodiscard]] std::expected<std::vector<Notification>, std::string>
+    list_all_checked(int limit = 100, int offset = 0);
+    [[nodiscard]] std::expected<std::size_t, std::string> count_unread_checked();
+    [[nodiscard]] std::expected<bool, std::string> mark_read_checked(int64_t id);
+    [[nodiscard]] std::expected<bool, std::string> dismiss_checked(int64_t id);
+
+    /// Test seam: shorten the bounded lease wait so a held-lease failure test does not sit out
+    /// the 2 s production timeout. Not for production use.
+    void set_acquire_timeout_for_test(std::chrono::milliseconds t) noexcept {
+        read_timeout_ = t;
+        write_timeout_ = t;
+    }
+
 private:
+    /// Bounded wait for a pooled connection; a display path must not pin an HTTP worker.
+    static constexpr std::chrono::milliseconds kDefaultAcquireTimeout{2000};
+    std::chrono::milliseconds read_timeout_{kDefaultAcquireTimeout};
+    std::chrono::milliseconds write_timeout_{kDefaultAcquireTimeout};
     pg::PgPool& pool_;
     bool open_{false};
 };

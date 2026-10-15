@@ -1406,7 +1406,7 @@ need no change.
 **The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
 — CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
 gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
-Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`). The dashboard renders fine and reads work; only the destructive actions
+Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), and the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
@@ -2814,7 +2814,7 @@ unaffected and needs no change.
 
 The Settings page is the primary administrative interface. It is accessible only to users with the **admin** role and is rendered server-side using HTMX.
 
-**URL:** `/settings` (redirects to `/login` if unauthenticated or non-admin)
+**URL:** `/settings` (redirects to the sign-in page, `/home`, if unauthenticated; a signed-in non-admin is sent to `/`)
 
 The Settings page is organized into sections, each loaded as an HTMX fragment. Changes take effect immediately without a server restart unless otherwise noted.
 
@@ -3465,7 +3465,7 @@ identity by clicking the **Sign out everywhere** button on their own
 row in Settings → Users. Unlike the admin **Revoke sessions** button,
 this revokes BOTH cookie sessions AND every API token the user owns
 (the lost-laptop scenario must kill every credential, not just
-browser cookies). After the request the page redirects to `/login`
+browser cookies). After the request the page redirects to `/home`
 and the response clears the session cookie via `Set-Cookie: Max-Age=0`.
 
 > **MCP-tier and service-scoped tokens cannot self-revoke.** Those
@@ -4186,10 +4186,10 @@ the `openssl` keypair-generation and IdP-registration recipe.
 ### Known limitations in this release
 
 - **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
-- **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and there is no login-page SAML button — SAML operators go to `/auth/saml/start`.
+- **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and the sign-in page (`/home`) offers a SAML button only when no OIDC provider is enabled — SAML operators otherwise go to `/auth/saml/start`.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
 - **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.
-- **No login-page button:** Navigate directly to `GET /auth/saml/start`; there is no "Sign in with SAML" button on the login page.
+- **Login-page button:** The sign-in page (`/home`) shows "Sign in with single sign-on" for SAML when SAML is enabled and no OIDC provider is; with both enabled the button starts OIDC and SAML operators navigate to `GET /auth/saml/start`.
 
 See `docs/user-manual/authentication.md` "SAML 2.0 SSO" for the full login flow, capability table, and `docs/auth-architecture.md` "SAML 2.0 SP" for the implementation reference.
 
@@ -5108,6 +5108,32 @@ DEX alerting is configured on the **DEX page, Alerts tab** (it moved out of Sett
 | `settings.dex_alerts.cohort_export` | An admin sets or clears the cohort metrics export tag key (detail records the new key, or "export disabled"). |
 | `dex.device.perf.query` | An operator loads a device performance sparkline panel (DEX device drill-down). Execute-gated; detail records the target agent and command id. |
 | `dex.device.procperf.query` | An operator loads a device's per-application panel (usage-class telemetry — deliberately a separate verb from the machine-health `dex.device.perf.query` so usage reads stay separately countable). Execute-gated; detail records the target agent and command id. |
+
+### Home (sign-in landing page)
+
+`GET /home` is the landing and sign-in page: the first page a visitor sees, with no sidebar and no header bar because there may be no session yet. Top to bottom it shows a slim bar (the Yuzu mark; the server's host name and the running version are added only once signed in, because the page is reachable without a session), a headline with the sign-in panel beside it, and the fifteen screens of the product as tiles in five families (Operate, Posture, Estate, Access, System), each saying what the area does. The page fetches no data. It is reached from the Yuzu logo on every other page; it has no sidebar entry, and `/` stays the Dashboard.
+
+**Signing in.** The panel carries the one sign-in form: username and password, a "Sign in with single sign-on" link when an identity provider (OIDC or SAML) is configured, and a note about two-factor codes when `--mfa-enforcement` is `admin-only` or `required`. The form posts to `POST /login` and, where applicable, `POST /login/mfa` or `POST /login/mfa/enroll`, exactly as before; `GET /login` now redirects to `/home`, so bookmarks and the SSO error bounces keep working. After signing in the user stays on `/home`: the panel is replaced by a signed-in panel showing the display name and role, an "Open Dashboard" button, a "Sign out" button, and the line "You are signed in. Open the Dashboard, or pick an area below." A signed-in user who opens `/home` (or clicks the logo) sees that panel straight away. Sign out returns to the form.
+
+**Opening a screen without a session.** Any page requested without a session is redirected to `/home?next=<key>`, where `<key>` names the requested screen (`devices`, `compliance`, ... one of the fifteen tiles; a sub-page such as `/approvals` counts as its parent, Instructions). The page shows "Sign in to open <area>." above the form and, after sign-in, labels the primary button "Open <area>" instead of "Open Dashboard". `next` is only ever one of those keys: a path, a URL or an unknown value is ignored, so it cannot redirect anywhere, and the server never redirects automatically after sign-in. A signed-out click on a tile goes through the same redirect, because the tiles are ordinary links to their screens.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/home` | The landing and sign-in page. No session needed: a signed-out visitor gets the sign-in form (with `?next=<screen key>` driving the "Sign in to open <area>." notice), a signed-in one the signed-in panel. Never cached. |
+| `GET` | `/login` | Redirects (`302`) to `/home`, forwarding a validated `next` key and a known `error` code (`sso_denied`, `sso_failed`, `sso_invalid`, `saml`) and nothing else. |
+
+### Dashboard panels
+
+The Dashboard (`/`) carries, under the console, a four-cell readout (devices online, policy checks passing, failed executions in the last 24 hours, approvals waiting), a Needs attention list beside Server health, a Recent events table, and Estate state beside Compliance by policy. Each is an HTMX fragment loaded once per page view; none of them polls (the console's own scope picker still refreshes every 5 seconds, as before). The page header (shared by every page) does poll in the background: the online count and approvals badge every 30 seconds and the notifications bell every 60 seconds while the tab is visible. A figure the account is refused is decided with a non-auditing check (the same decision as the gate, with its `auth.permission_required` and `auth.fleet_read_required` rows withheld), so rendering the Dashboard writes no denial rows; the Recent events panel also checks the administrator role first. That includes a direct request to a panel URL by a refused interactive sign-in, and a store outage met by one on those panels (the `503` and the degrade counter remain); an API, MCP or engine token that reaches a panel URL still leaves its denial row. The bell and the approvals badge keep the auditing gate on their own requests: an account refused either leaves one `auth.permission_required` row per page view, because each stops polling after the first `403`. When the live registry knows more connected agents than the device store counts as live (for example after failed presence writes or during start-up lag), the Estate figures read "at least N" instead of understating the fleet or claiming no devices; if it persists, check the database and the server log for presence-write failures. The devices figure for an unrestricted account comes from one database count that costs seconds on a large fleet, so each server process reuses it for 60 seconds; a reload inside that minute shows the same device numbers, and the "As of" time on the panels is the time of the view, so the online count can be about a minute (plus the registry's 3 second presence cache) older than it. If that count cannot be read, devices show "could not read" (never 0) for the next 5 seconds of views without trying again. The cache is per server process: with several replicas behind a load balancer each reads and caches on its own, so two views can differ by up to a minute, and the database sees one such count per replica per minute while reads succeed (one attempt per replica every 5 seconds while the database cannot answer). When the live registry's online count cannot be read (it is unavailable past about 100,000 presence rows, and on a presence-store error) the online number is the database presence count instead, which leaves out an agent that has connected but not yet been written to the presence store. Accounts limited to a group of devices are never served this cached count.
+
+Every figure is a typed read of an existing source and keeps its own gate. A figure that cannot be shown says why (no access, limited to a group of devices, could not be read) and is never rendered as 0. "Nothing needs attention" appears only when every contributing figure was read successfully. The enrolment row is shown to administrators only. The design's remaining Dashboard rows (a ranked "devices to look at first" list, events by severity, command throughput and activity by hour) have no data source on the server and are not drawn rather than filled with sample figures; the scope bar's reference line lists the scope kinds from the same catalogue as `GET /api/v1/discover/scope-kinds`.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/fragments/dashboard/summary` | The readout, Needs attention and Estate state panels (HTMX). Per-figure gates: `Inventory:Read`, `Policy:Read`, `Execution:Read`, `Approval:Read`. Answers `200` for every signed-in caller: a refused or degraded figure becomes a panel note, never an error body. A service-scoped token is refused first with `403` (audit action `dashboard.fragment.access_denied`); a request with no session gets `401`. Accounts limited to a group of devices see device figures narrowed to their group, read from the newest 100,000 devices and shown as "at least N" when that read is full, and a "limited" note for fleet-wide compliance and failed executions. Estate state is the same device figure as the readout (seen in 30 days, online, offline, not seen for 2 days or more). |
+| `GET` | `/fragments/dashboard/policies` | Compliance by policy (HTMX): the five enabled policies with the lowest pass rate and "Lowest 5 of N policies", where N counts the first 100 enabled policies. A policy with no results yet shows "No results yet", never 0%. Gate: `Policy:Read`; accounts limited to a group of devices see a "limited" note because the per-policy counts are fleet-wide. A refused or degraded read, and a service-scoped token (audit action `dashboard.fragment.access_denied`), become a panel note with status `200`; a request with no session gets `401`. |
+| `GET` | `/fragments/dashboard/activity` | Recent events (HTMX): the eight newest audit rows as a five-column table (time, who, action, target, severity). The severity column is the audit row's own result (success, failure, denied) and nothing more. Shown to administrators only, and also gated by `AuditLog:Read`; other accounts see a note and no denial is written for them. The detail, source address, user agent and session of an event are never shown. The panel is not narrowed to a device group: an administrator limited to a group who holds `AuditLog:Read` sees what `GET /api/audit` returns. The "Audit log" button appears only when the navigation has an audit item. Notes answer `200`; a request with no session gets `401`. |
+| `GET` | `/fragments/dashboard/health` | Server health (HTMX): overall status, database reachability, uptime, version, agents connected to this server and, for an account with unscoped `Execution:Read`, executions running. A signed-in session is required; a service-scoped token gets a note first. Notes answer `200`; a request with no session gets `401`. |
 
 ---
 

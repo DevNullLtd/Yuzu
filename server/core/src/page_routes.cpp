@@ -1,6 +1,7 @@
 #include "page_routes.hpp"
 
 #include "agent_registry.hpp"  // real yuzu::server::detail::AgentRegistry definition
+#include "home_ui.hpp"         // sign_in_location: a signed-out page request goes to the landing page
 #include "http_route_sink.hpp"
 #include "result_sets_ui.hpp" // yuzu::server::kResultSetsPageHtml
 
@@ -297,7 +298,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/tar", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         res.set_content(kTarPageHtml, "text/html; charset=utf-8");
@@ -311,7 +312,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
              [deps](const httplib::Request& req, httplib::Response& res) {
                  auto session = deps.auth_fn(req, res);
                  if (!session) {
-                     res.set_redirect("/login");
+                     res.set_redirect(home_ui::sign_in_location(req.path));
                      return;
                  }
                  res.set_content(kResultSetsPageHtml, "text/html; charset=utf-8");
@@ -342,7 +343,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/viz/fleet", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         // Gate 7 sec-L1 / cons-N1 — honour the kill switch on the page
@@ -376,7 +377,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
         R"(/viz/host/([^/]+))", [deps](const httplib::Request& req, httplib::Response& res) {
             auto session = deps.auth_fn(req, res);
             if (!session) {
-                res.set_redirect("/login");
+                res.set_redirect(home_ui::sign_in_location(req.path));
                 return;
             }
             // Gate 7 sec-L1 / cons-N1 — kill switch on the host
@@ -414,7 +415,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
              [deps](const httplib::Request& req, httplib::Response& res) {
                  auto session = deps.auth_fn(req, res);
                  if (!session) {
-                     res.set_redirect("/login");
+                     res.set_redirect(home_ui::sign_in_location(req.path));
                      return;
                  }
                  res.set_content(kInstructionPageHtml, "text/html; charset=utf-8");
@@ -424,7 +425,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/approvals", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         res.set_content(kApprovalsPageHtml, "text/html; charset=utf-8");
@@ -434,7 +435,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/executions", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         res.set_content(kExecutionsPageHtml, "text/html; charset=utf-8");
@@ -444,7 +445,7 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/workflows", [deps](const httplib::Request& req, httplib::Response& res) {
         auto session = deps.auth_fn(req, res);
         if (!session) {
-            res.set_redirect("/login");
+            res.set_redirect(home_ui::sign_in_location(req.path));
             return;
         }
         res.set_content(kWorkflowsPageHtml, "text/html; charset=utf-8");

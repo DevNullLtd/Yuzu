@@ -12,6 +12,7 @@
  * retired (chore/retire-migrate-from-sqlite-batch-b, #3623).
  */
 
+#include <chrono>
 #include "notification_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -187,3 +188,40 @@ TEST_CASE("NotificationStore: empty store returns empty lists", "[notification_s
     CHECK(store.list_all().empty());
     CHECK(store.count_unread() == 0);
 }
+
+// ── The failure channel (PR #5859 review) ─────────────────────────────────
+
+TEST_CASE("NotificationStore: the checked readers and mutators report a lost connection as an "
+          "error instead of an empty answer",
+          "[notification_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, notif_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    NotificationStore store{pool};
+    REQUIRE(store.is_open());
+    const auto id = store.create("info", "t", "m");
+    REQUIRE(id > 0);
+
+    SECTION("with a connection every checked call answers like its plain twin") {
+        CHECK(store.list_unread_checked().value().size() == 1);
+        CHECK(store.list_all_checked().value().size() == 1);
+        CHECK(store.count_unread_checked().value() == 1);
+        CHECK(store.mark_read_checked(id).value());
+        CHECK_FALSE(store.dismiss_checked(999999).value()); // unknown id is false, not an error
+    }
+
+    SECTION("with the only connection held, every checked call is an error") {
+        store.set_acquire_timeout_for_test(std::chrono::milliseconds{50});
+        auto held = pool.acquire();
+        REQUIRE(held);
+        CHECK_FALSE(store.list_unread_checked().has_value());
+        CHECK_FALSE(store.list_all_checked().has_value());
+        CHECK_FALSE(store.count_unread_checked().has_value());
+        CHECK_FALSE(store.mark_read_checked(id).has_value());
+        CHECK_FALSE(store.dismiss_checked(id).has_value());
+        // The display-only twins keep their documented degrade.
+        CHECK(store.list_unread().empty());
+        CHECK(store.count_unread() == 0);
+    }
+}
+

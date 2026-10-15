@@ -14,8 +14,10 @@
 
 #include "authz_topology_floor.hpp"
 #include "body_cap_policy.hpp" // resolve_body_cap — path_class label for the service-scope deny metric (#2298 PR 3)
+#include "default_certs.hpp" // detect_hostname — the server name on the landing page's slim bar
 #include "deprovision_deny_split.hpp" // record_deprovision_deny_split — ADR-2001 #3069 shared split
 #include "engine_principal_store.hpp"
+#include "home_ui.hpp" // the landing and sign-in page (GET /home; GET /login redirects there)
 #include "http_route_sink.hpp"
 #include "legacy_self_service_allow.hpp"
 #include "mcp_policy.hpp"
@@ -31,12 +33,11 @@
 #include "service_scope_policy.hpp" // authz::service_scope_global_safe — #2298 PR 3 default-deny table
 #include "web_utils.hpp" // audit_token — CWE-117 neutralisation for the audit-failure warn
 
+#include <yuzu/version.hpp> // kVersionString — the version on the landing page's slim bar
+
 #include <ctime>
 
 #include <nlohmann/json.hpp>
-
-// Login page HTML (defined in login_ui.cpp)
-extern const char* const kLoginHtml;
 
 namespace yuzu::server {
 
@@ -678,8 +679,25 @@ bool AuthRoutes::service_scope_admits(std::string_view securable_type,
 bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& securable_type,
                                 const std::string& operation) {
     httplib::Response discarded; // require_permission writes its 403/503 here, never to the page
-    const AuditProbeScope probe;
-    return require_permission(req, discarded, securable_type, operation);
+    return probe_permission(req, discarded, securable_type, operation);
+}
+
+bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response& res,
+                                  const std::string& securable_type,
+                                  const std::string& operation) {
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
+    return require_permission(req, res, securable_type, operation);
+}
+
+std::expected<authz::ListAuthority, authz::GateFailure>
+AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res,
+                             const std::string& securable_type, const std::string& operation) {
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
+    return require_fleet_read(req, res, securable_type, operation);
 }
 
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
@@ -2001,17 +2019,71 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
 }
 
 void AuthRoutes::register_routes(HttpRouteSink& sink) {
-    // -- Login page -----------------------------------------------------------
-    sink.Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
-        std::string html(kLoginHtml);
-        // Inject OIDC enablement flag into the page
-        std::shared_lock oidc_lock(oidc_mu_);
-        if (oidc_provider_ && oidc_provider_->is_enabled()) {
-            auto pos = html.find("/*OIDC_CONFIG*/");
-            if (pos != std::string::npos)
-                html.replace(pos, 15, "window.OIDC_ENABLED=true;");
+    // -- Landing and sign-in page ---------------------------------------------
+    // `/home` is the one sign-in page: the form, the TOTP/enrolment steps and
+    // the SSO link all live there (home_ui.cpp). It needs no session — a
+    // signed-out visitor gets the form, a signed-in one the signed-in panel —
+    // and it never redirects after sign-in (the user stays on Home). `next` is
+    // only ever a screen key from the page's own allow-list; anything else is
+    // treated as absent, so it can neither open-redirect nor echo input.
+    sink.Get("/home", [this](const httplib::Request& req, httplib::Response& res) {
+        static const std::string host = detect_hostname();
+        home_ui::LandingView v;
+        v.server_name = host;
+        v.version = yuzu::kVersionString;
+        if (req.has_param("next"))
+            v.next = home_ui::screen_by_key(req.get_param_value("next"));
+        {
+            std::shared_lock oidc_lock(oidc_mu_);
+            if (oidc_provider_ && oidc_provider_->is_enabled())
+                v.sso_href = "/auth/oidc/start";
         }
-        res.set_content(html, "text/html; charset=utf-8");
+        if (v.sso_href.empty() && saml_provider_ && saml_provider_->is_enabled())
+            v.sso_href = "/auth/saml/start";
+        v.mfa_note = cfg_.mfa_enforcement != "optional";
+        // A visitor with no credential at all never reaches the session store: this page
+        // is open to the internet, and resolving an empty token would cost a database
+        // read per view.
+        const bool has_credential = !extract_session_cookie(req).empty() ||
+                                    !req.get_header_value("Authorization").empty() ||
+                                    !req.get_header_value("X-Yuzu-Token").empty();
+        if (auto session = has_credential ? resolve_session(req) : std::nullopt) {
+            v.who = home_ui::SignedIn{
+                .name = session->display_name.empty() ? session->username : session->display_name,
+                .role = session->role == auth::Role::admin ? "Administrator" : "Viewer"};
+        } else if (req.has_param("error")) {
+            v.error_message = home_ui::sso_error_message(req.get_param_value("error"));
+        }
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(home_ui::render_landing(v), "text/html; charset=utf-8");
+    });
+
+    // `/login` is the address every existing redirect, bookmark and SSO error
+    // bounce still uses; it forwards to the landing page, carrying only a
+    // validated `next` key and a known `error` code.
+    sink.Get("/login", [](const httplib::Request& req, httplib::Response& res) {
+        std::string location = "/home";
+        char sep = '?';
+        if (req.has_param("next")) {
+            if (const auto* s = home_ui::screen_by_key(req.get_param_value("next"))) {
+                location += sep;
+                location += "next=";
+                location += s->key;
+                sep = '&';
+            }
+        }
+        if (req.has_param("error")) {
+            const std::string code = req.get_param_value("error");
+            for (std::string_view known : {"sso_denied", "sso_failed", "sso_invalid", "saml"}) {
+                if (code == known) {
+                    location += sep;
+                    location += "error=";
+                    location += code;
+                    break;
+                }
+            }
+        }
+        res.set_redirect(location);
     });
 
     sink.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
@@ -3348,7 +3420,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Success — the durable row is gone; clear the cookie and finish.
         res.set_header("Set-Cookie", "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
         if (is_htmx) {
-            res.set_header("HX-Redirect", "/login");
+            // Back to the sign-in panel on the landing page.
+            res.set_header("HX-Redirect", "/home");
             res.set_content("", "text/plain");
         } else {
             res.set_content(R"({"status":"ok"})", "application/json");
@@ -3883,7 +3956,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 .increment();
         }
 
-        res.set_redirect("/");
+        // Sign-in stays on Home (the signed-in panel offers "Open Dashboard"): the
+        // landing page is where every sign-in ends, password or federated.
+        res.set_redirect("/home");
     });
 
     // -- SAML 2.0 SSO endpoints ------------------------------------------------
@@ -4526,7 +4601,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             return true;
         };
-        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/"};
+        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/home"};
         res.set_redirect(target);
     });
 
