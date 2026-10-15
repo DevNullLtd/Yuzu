@@ -4981,7 +4981,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/directory` | Render the OIDC/Directory configuration fragment (HTMX). |
 | `POST` | `/api/settings/oidc` | Save OIDC/Entra ID configuration (form-encoded). Persisted to runtime config. |
-| `POST` | `/api/settings/oidc/test` | Test OIDC discovery for the form's issuer: fetches and validates the discovery document, then fetches the `jwks_uri` and counts the signing keys. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. |
+| `POST` | `/api/settings/oidc/test` | Test OIDC discovery for the form's issuer: fetches and validates the discovery document, then fetches the `jwks_uri` and counts the signing keys. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims, and it does not read the running provider's discovery state, so it is not a guarantee of what a sign-in will hit (see [Authentication](authentication.md#oidc-single-sign-on)). |
 
 ### Users
 
