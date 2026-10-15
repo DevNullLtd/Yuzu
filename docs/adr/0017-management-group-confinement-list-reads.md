@@ -337,6 +337,14 @@ gate.
     permission-agnostic `Infrastructure:Read` `visible_set_fn` (a DIFFERENT securable from this
     row's `GuaranteedState:Read` gate) — tracked for the dashboard-rewire follow-up (PR-2), which
     also owns deciding whether that narrowing is correct or itself a bug.
+  - **Update (2026-10-15, DEX Apps stability read):** `GET /api/v1/dex/apps` and its MCP twin
+    `list_dex_apps` (per-application and per-version stability, an inherited `GuaranteedState:Read`
+    surface from #4035) are in the same class as the three resources above: the same bare global
+    `GuaranteedState:Read` gate plus the service-scoped refusal, a group-only operator refused `403`
+    (the opposite of a confined-caller leak), and a query-time `GROUP BY` over agent-attributed
+    `guardian_observations` rows (the per-application and per-version top-N membership) that is
+    **not yet confined per-caller**. It publishes only distinct-device COUNTs, never an `agent_id`.
+    The per-caller SQL slice is the same work item, tracked as #5090.
 
 ### Out of scope (global by design)
 

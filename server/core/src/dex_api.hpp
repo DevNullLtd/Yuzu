@@ -66,11 +66,13 @@
 /// briefly gained one during WS-A4 PR-1 review and lost it for the same
 /// reason — see its own doc comment.
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "dex_read_model.hpp"
+#include "dex_score_policy.hpp"
 
 namespace yuzu::server {
 
@@ -85,6 +87,12 @@ struct DexSignalDetailModel {
     std::vector<DexDeviceCrashCount> devices;
     std::vector<DexDayCrashCount> by_day;
 };
+
+/// Provider of the score policy the Apps read scores under, read once per
+/// request. CONTRACT: returns, by value, a policy that passed
+/// `dex_score_policy_fault`. The shared builder re-checks it and reports a
+/// fault as a degraded model (503 / MCP error), never as a score.
+using DexScorePolicyFn = std::function<DexScorePolicy()>;
 
 /// The in-process public DEX signals API. Each method == one public REST/MCP
 /// resource, so presentation/MCP consume only what the public, versioned core
@@ -120,7 +128,10 @@ public:
     [[nodiscard]] virtual DexAppModel app(const std::string& process_name,
                                           const std::string& window) const = 0;
 
-    /// GET /api/v1/dex/apps — app-centric stability list (no per-agent identity).
+    /// GET /api/v1/dex/apps — app-centric stability list (no per-agent identity),
+    /// per application and per version. `degraded` = null store, failed read or
+    /// invalid score policy: the handler must refuse it, never render it as an
+    /// empty or perfect list.
     [[nodiscard]] virtual DexAppsModel apps(const std::string& window) const = 0;
 
     /// GET /api/v1/dex/catalogue?os=&window= — the Catalogue View 1 family

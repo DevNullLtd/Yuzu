@@ -1,12 +1,16 @@
 #include "dashboard_api_routes.hpp"
 
+#include "admin_gate.hpp"
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
+#include "response_query_params.hpp"
 #include "data_export.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp" // extract_json_string — shared JSON body-extraction helper
+#include "mcp_jsonrpc.hpp"   // json_exceeds_depth / kMcpMaxJsonDepth
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
+#include "web_utils.hpp"
 
 #include <exception>
 #include <stdexcept>
@@ -59,6 +63,21 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             j["rbac_enabled"] = false;
             j["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
         }
+        // Session self-description (#5779, #4208). `role` stays the persisted
+        // role; these report what the server will actually honour. No store
+        // read and no gate call, so no audit row per page load.
+        const bool elevated = auth::is_elevated(*session);
+        j["effective_role"] = auth::role_to_string(auth::effective_role(*session));
+        j["elevated"] = elevated;
+        if (elevated) {
+            j["elevated_until"] = format_iso_utc(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    session->elevated_until.time_since_epoch())
+                    .count());
+        }
+        j["can_access_settings"] =
+            authz::admin_gate_verdict(*session) == authz::AdminGate::Admit;
+        res.set_header("Cache-Control", "no-store, private");
         res.set_content(j.dump(), "application/json");
     });
 
@@ -124,6 +143,22 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+        // A NUL (%00) or invalid UTF-8 in a percent-decoded filter breaks the bind (truncation
+        // widens the query; a bad byte becomes a false 503); the v1 route refuses both, so does this.
+        if (!audit_string_filters_wellformed(q)) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"string filters must be valid UTF-8 without NUL"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        if (q.since < 0 || q.until < 0 || (q.since > 0 && q.until > 0 && q.since > q.until)) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"since/until must be non-negative with since <= until"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
         // Range, not just parseability: a negative limit would otherwise
         // reach PG as `LIMIT -1`, error, and be reported as an audit-store
         // DEGRADE — 503 plus the read-degrade counter the availability
@@ -137,6 +172,16 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+        // Same ceilings as the v1 and MCP twins: an unbounded limit/offset asks
+        // Postgres for the whole table (#4644/#4703 class).
+        if (q.offset > kAuditMaxOffset) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"offset must be 0..10000"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        q.limit = cap_query_limit(q.limit);
 
         // ADR-0040: reads are degrade-distinguishable. A store/pool failure
         // returns nullopt — surface 503, NEVER a false-empty 200 (an audit
@@ -186,6 +231,17 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                                                 httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Response", "Read"))
             return;
+
+        // Depth guard before parse: json_array_to_csv dump()s non-string cells and
+        // nlohmann dump() is recursive -- a deeply nested body would SIGSEGV the
+        // process (same class as config_routes.cpp / #2437).
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"request body nests too deeply"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
 
         auto csv = data_export::json_array_to_csv(req.body);
         if (csv.empty()) {

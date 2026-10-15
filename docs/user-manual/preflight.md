@@ -100,9 +100,9 @@ pass/fail gate (unlike pre-flight's go/no-go). An AI colleague driving the rollo
 reads the same numbers over MCP and makes the call.
 
 Real canaries are small — two or three devices — so Verify deliberately has **no
-minimum cohort size**: a small paired set is shown with an *"indicative"* note rather
-than hidden. Because that means reading a handful of named machines' data, the
-comparison is **recorded in the audit log**. The aggregate is shown without any
+minimum cohort size**: a paired set of any size is shown with its exact figures (no
+"indicative" label is rendered at the one-device floor). Because that means reading
+named machines' data, the comparison is **recorded in the audit log**. The aggregate is shown without any
 per-machine identity; the **per-machine pairs** are behind a separate *"Show
 per-machine pairs"* click, so opening that view is a deliberate, separately-audited
 action.
@@ -255,9 +255,19 @@ they never create a run or a deployment.
   for one pre-flight run, gated `SoftwareDeployment:Read`. Reuses the existing `deployment.config.view`
   verb (already distinct from `deployment.create`).
 
-Both REST routes are unaudited on a successful read (the response is run scope/lifecycle metadata,
+- `GET /api/v1/deployments` and `GET /api/v1/deployments/{id}` / MCP `list_deployments` and
+  `get_deployment` — your deployments and one deployment's device grid, gated
+  `SoftwareDeployment:Read`. These are the read-only way to see a rollout: unlike the page's
+  result poll (`/fragments/auto/deploy/result`) they never advance the engine and write no per-poll audit row
+  (the REST reads are unaudited; an MCP call records the generic `mcp.<tool>` success row). A deployment shows **Running** or **Complete**; a finished one says how many devices
+  failed or were skipped ("Complete, 2 failed"). There is no staged, cancelled or rolled-back state
+  in this pipeline. The installer URL and arguments are never shown, only whether arguments are set.
+  A service-scoped token is denied under `deployment.list.view` / `deployment.detail.view`.
+
+The REST routes above are unaudited on a successful read (the response is run scope/lifecycle metadata,
 not per-agent behavioural PII, matching the fragments' own posture) but audit a service-scoped-token
 denial under their own verb. Their MCP twins instead call the generic
-`mcp.list_preflight_runs`/`mcp.get_deployment_preview` success audit, matching the majority
+`mcp.list_preflight_runs`/`mcp.get_deployment_preview` (and, for the two deployment reads above,
+`mcp.list_deployments`/`mcp.get_deployment`) success audit, matching the majority
 convention for MCP read tools in this codebase — the two transports deliberately diverge here; see
 `docs/api-twin-recipe.md` §4 for why REST/MCP/dashboard audit postures are not required to agree.

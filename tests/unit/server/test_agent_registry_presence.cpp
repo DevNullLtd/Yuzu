@@ -116,6 +116,47 @@ TEST_CASE("HA WS-5: all_ids() merges live presence for a remote-only agent", "[p
     }
 }
 
+TEST_CASE("known_agent_count is local UNION presence, deduped, and typed on a degraded read",
+          "[ha][presence]") {
+    using yuzu::server::PresenceIdentity;
+    using yuzu::server::PresenceReadError;
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_agent_info("local-1", "linux", "h1"));
+    (void)registry.register_agent(make_agent_info("local-2", "linux", "h2"));
+
+    // No reader configured yet: the count is the local-only size, as all_ids().
+    REQUIRE(registry.known_agent_count().has_value());
+    CHECK(*registry.known_agent_count() == registry.local_agent_count());
+
+    std::expected<std::vector<PresenceIdentity>, PresenceReadError> reply =
+        std::vector<PresenceIdentity>{{"local-1", "h1", "linux", "", ""},
+                                      {"remote-1", "h3", "windows", "", ""},
+                                      {"remote-2", "h4", "darwin", "", ""}};
+    registry.configure_presence([&reply](std::chrono::seconds) { return reply; },
+                                std::chrono::hours(1));
+
+    auto n = registry.known_agent_count();
+    REQUIRE(n.has_value());
+    CHECK(*n == 4); // local-1 is in both sets and counted once
+    CHECK(*n == registry.all_ids().size());
+
+    SECTION("a degraded read is an error, not the local-only count") {
+        AgentRegistry degraded(bus, metrics);
+        (void)degraded.register_agent(make_agent_info("local-1", "linux", "h1"));
+        degraded.configure_presence(
+            [](std::chrono::seconds)
+                -> std::expected<std::vector<PresenceIdentity>, PresenceReadError> {
+                return std::unexpected(PresenceReadError::Truncated);
+            },
+            std::chrono::hours(1));
+        auto d = degraded.known_agent_count();
+        REQUIRE_FALSE(d.has_value());
+        CHECK(d.error() == PresenceReadError::Truncated);
+    }
+}
+
 TEST_CASE("HA WS-5: evaluate_scope resolves a remote-only agent's identity attributes",
           "[pg][ha][presence]") {
     YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);

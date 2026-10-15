@@ -9,7 +9,7 @@ description: "Use the supported Yuzu Windows workflow: MSYS2 bash plus MSVC plus
 
 - Start in MSYS2 bash.
 - Run `source ./setup_msvc_env.sh`.
-- If the build touches the gateway custom target, also run `source scripts/ensure-erlang.sh`.
+- Meson resolves the gateway's Erlang/OTP itself; run `source scripts/ensure-erlang.sh` only before running `rebar3` or `erl` by hand.
 - Use `build-windows` for local builds.
 - Use `./scripts/setup.sh [--tests]` before `meson compile -C build-windows` unless the build directory already exists and only needs a reconfigure.
 

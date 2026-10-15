@@ -19,7 +19,8 @@ Companion docs:
   including the option D LNK2038 fix and the four failed approaches that
   preceded it.
 - `docs/windows-build.md` — the canonical Windows build path
-  (MSYS2 bash + `setup_msvc_env.sh` + `scripts/ensure-erlang.sh`).
+  (MSYS2 bash + `setup_msvc_env.sh`; Meson resolves the gateway's Erlang/OTP
+  itself, and `scripts/ensure-erlang.sh` is only for hand-run `rebar3`/`erl`).
 
 ---
 
