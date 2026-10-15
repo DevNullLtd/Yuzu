@@ -197,6 +197,16 @@ enum class SsoOnlyLocalGate : std::uint8_t {
 /// ServerImpl creates an AuthRoutes instance early, then builds lightweight lambda
 /// callbacks from its public methods to inject into RestApiV1, McpServer,
 /// SettingsRoutes, and its own remaining route handlers.
+/// Whether a probe may withhold this caller's denial rows. Only an interactive cookie session
+/// qualifies (local, OIDC or SAML sign-in); an API/MCP/engine token or an engine principal that
+/// reaches a panel URL is anomalous and keeps the auditing behaviour, so a revoked or
+/// low-tier machine credential probing the Dashboard still leaves its row (PR #5859 review).
+[[nodiscard]] inline bool denial_row_may_be_withheld(const auth::Session& s) noexcept {
+    if (s.principal_kind == "engine")
+        return false;
+    return s.auth_source == "local" || s.auth_source == "oidc" || s.auth_source == "saml";
+}
+
 class AuthRoutes {
 public:
     AuthRoutes(Config& cfg, auth::AuthManager& auth_mgr, RbacStore* rbac_store,
@@ -266,8 +276,12 @@ public:
                                       const std::string& operation);
 
     /// `has_permission` with the gate's own response kept: `res` receives the 401/403/503 that
-    /// `require_permission` would write, so a caller can tell "denied" from "store unavailable"
-    /// while still recording no denial row. Same NEVER-a-gate rule as `has_permission`.
+    /// `require_permission` would write, so a caller can tell "denied" from "store unavailable".
+    /// The denial row is withheld for an interactive cookie session only
+    /// (`denial_row_may_be_withheld`); a token or engine caller keeps it. The decision is the
+    /// gate's own, so a route that binds this instead of `require_permission` accepts that a
+    /// refused cookie session leaves no `auth.permission_required` row. The Dashboard panels
+    /// do, by decision; an action route must not.
     [[nodiscard]] bool probe_permission(const httplib::Request& req, httplib::Response& res,
                                         const std::string& securable_type,
                                         const std::string& operation);
@@ -275,8 +289,11 @@ public:
     /// `has_permission`'s twin for the fleet-read gate: `require_fleet_read`'s own decision path
     /// (so the verdict and the scope cannot drift from the gate's), with its
     /// `auth.fleet_read_required` denial rows withheld. For a page that decides what to DRAW from
-    /// the caller's scope. The decision is the gate's own; a caller that uses this instead of
-    /// the loud gate accepts that a refusal leaves no `auth.fleet_read_required` row.
+    /// the caller's scope. The decision is the gate's own; the row is withheld for an interactive
+    /// cookie session only (`denial_row_may_be_withheld`), and a caller that uses this instead of
+    /// the loud gate accepts that a refused cookie session leaves no `auth.fleet_read_required`
+    /// row. Store-outage rows on this path are withheld too (the 503 and the
+    /// `yuzu_server_rbac_read_degrade_total` counter remain).
     /// `res` receives the gate's 401/403/503 and is meant to be a scratch response.
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     probe_fleet_read(const httplib::Request& req, httplib::Response& res,

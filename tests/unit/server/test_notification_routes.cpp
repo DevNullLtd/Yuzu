@@ -73,6 +73,7 @@ struct NotificationHarness {
     bool perm_allow{true};
     bool audit_persists{true};
     std::string auth_source{"local"}; // a cookie session unless a test says otherwise
+    std::vector<std::string> trusted_origins;
     std::vector<AuditCall> audit_calls;
     std::vector<PermCall> perm_calls;
 
@@ -113,7 +114,7 @@ struct NotificationHarness {
             return s;
         };
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
-        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, store, resolve_fn);
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, store, resolve_fn, trusted_origins);
     }
 };
 
@@ -522,3 +523,85 @@ TEST_CASE("bell routes: a store that cannot get a connection answers 503 with th
         CHECK_FALSE(still[0].dismissed);
     }
 }
+
+// ── Gate order, Referer and trusted origins, input edges (governance round) ──
+
+TEST_CASE("bell POSTs: the permission gate answers first (no csrf.denied row), a Referer-only "
+          "same-site call and a trusted origin are accepted",
+          "[notification_routes][pg][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
+    PgWired w{db.dsn()};
+    NotificationHarness h;
+    h.store = &w.store;
+    h.trusted_origins = {"https://proxy.example"};
+    h.wire();
+    auto make = [&] {
+        auto id = w.store.create("info", "t", "m");
+        REQUIRE(id > 0);
+        return "/api/notifications/" + std::to_string(id) + "/read";
+    };
+
+    SECTION("an unauthorised cross-site caller gets the permission 403, not a csrf row") {
+        h.perm_allow = false;
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}};
+        auto res = h.sink.Post(make(), "");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(body(res->body)["error"]["message"] == "denied"); // perm_fn's own body
+        CHECK(h.audit_calls.empty());
+    }
+    SECTION("Referer alone, naming this site, is enough") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Referer", "https://yuzu.test/dashboard"}};
+        auto res = h.sink.Post(make(), "");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    SECTION("an Origin on the trusted list is accepted behind a Host-rewriting proxy") {
+        h.sink.default_headers = {{"Host", "yuzu-server:8080"}, {"Origin", "https://proxy.example"}};
+        auto res = h.sink.Post(make(), "");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    SECTION("the cross-site 403 says so in its message") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}};
+        auto res = h.sink.Post(make(), "");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(body(res->body)["error"]["message"] == "cross-site request refused");
+    }
+}
+
+TEST_CASE("bell routes: an id that does not fit int64 is a 404 with nothing audited, and a "
+          "negative limit or offset is a 400 not an outage",
+          "[notification_routes][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, notif_routes_tpl);
+    PgWired w{db.dsn()};
+    NotificationHarness h;
+    h.store = &w.store;
+    h.wire();
+
+    for (const char* verb : {"read", "dismiss"}) {
+        auto res = h.sink.Post(std::string("/api/notifications/99999999999999999999/") + verb, "");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+    }
+    CHECK(h.audit_calls.empty()); // no such notification: no mutation, no audit-first row
+
+    for (const char* q : {"limit=-1", "offset=-1", "all=true&offset=-5"}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/notifications?") + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(body(res->body)["error"]["code"] == 400);
+    }
+
+    // The audited id is canonical: leading zeros are not preserved.
+    auto id = w.store.create("info", "t", "m");
+    REQUIRE(id > 0);
+    auto padded = h.sink.Post("/api/notifications/000" + std::to_string(id) + "/read", "");
+    REQUIRE(padded);
+    CHECK(padded->status == 200);
+    REQUIRE(h.audit_calls.size() == 2);
+    CHECK(h.audit_calls[0].target_id == std::to_string(id));
+}
+

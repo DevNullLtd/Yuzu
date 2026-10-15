@@ -12024,7 +12024,7 @@ Returns the unread feed, newest first. Requires `Infrastructure:Read`.
 
 #### `POST /api/notifications/{id}/read`
 
-Marks one notification read. Requires `Infrastructure:Write`. `200 {"status":"ok"}`; `404` when no row matches. A browser (session-cookie) call must carry an `Origin` or `Referer` naming this site, else `403` (audit `csrf.denied`); token callers are exempt. Audit-first: a `notification.mark_read` row with result `attempted` is written before the change and the call answers `503` with `Sec-Audit-Failed: true` if it cannot be written; a `success` or `failure` row follows. `503` also when the database write fails.
+Marks one notification read. Requires `Infrastructure:Write`. `200 {"status":"ok"}`; `404` when no row matches. A browser (session-cookie) call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else `403` `cross-site request refused` (audit `csrf.denied`); token callers are exempt. `limit` and `offset` on the list route must not be negative (`400`). Audit-first: a `notification.mark_read` row with result `attempted` is written before the change and the call answers `503` with `Sec-Audit-Failed: true` if it cannot be written; a `success` or `failure` row follows. `503` also when the database write fails.
 
 #### `POST /api/notifications/{id}/dismiss`
 
@@ -12035,7 +12035,7 @@ Behaviour to know:
 - **State is global.** Read and dismissed state is stored on the row, not per user: one operator's action changes the feed for everyone. There is no route that restores a read or dismissed row.
 - **No retention and no coalescing.** Rows are kept indefinitely and a fleet-wide failing instruction produces one row per device, so a large fleet can sit at 100 or more unread.
 - **Audience.** With RBAC off every signed-in user can read the feed and only administrators can act. With RBAC on only global Administrator and ITServiceOwner assignments pass; Operators, Viewers and management-group-confined users get `403` and the bell stays hidden.
-- **Audit asymmetry.** Dismiss is audited, mark-read is not, and a refused caller writes one `auth.permission_required` row per request.
+- **Audit.** Both mutations are audited (`notification.mark_read`, `notification.dismiss`; see above), and a refused caller writes one `auth.permission_required` row per request.
 
 The header bell polls `GET /api/notifications?limit=10` with the session cookie every 60 seconds while the tab is visible and the panel is closed, and only within five minutes of the last keyboard, pointer or scroll input, because each request renews the session idle window.
 

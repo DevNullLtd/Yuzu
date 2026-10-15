@@ -190,12 +190,21 @@ TEST_CASE("fleet_estate_reading: the Dashboard's production input never reads a 
         CHECK(r.online == 7);
         CHECK_FALSE(r.lower_bound);
     }
+    SECTION("registry ahead of the store's live count but still under total: flagged too") {
+        c.total = 10; // 4 offline rows; 2 connected agents have no row
+        c.live = 6;
+        c.stale = 0;
+        const auto r = fleet_estate_reading(c, std::size_t{8});
+        CHECK(r.total == 10);
+        CHECK(r.online == 8);
+        CHECK(r.lower_bound); // total and the offline split understate
+    }
     SECTION("registry agrees with the store: passed through unflagged") {
         c.total = 10;
         c.live = 7;
         c.stale = 2;
-        const auto r = fleet_estate_reading(c, std::size_t{8});
-        CHECK(r.online == 8);
+        const auto r = fleet_estate_reading(c, std::size_t{7});
+        CHECK(r.online == 7);
         CHECK(r.online + r.not_seen + r.offline == r.total);
         CHECK_FALSE(r.lower_bound);
     }

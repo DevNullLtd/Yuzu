@@ -482,14 +482,19 @@ TEST_CASE("probe_fleet_read / probe_permission: the gate's verdict with no denia
         CHECK(after_gate->size() == 1);
     }
 
-    SECTION("the probe admits exactly when the gate does") {
-        auto req = fix.session_request("rae", auth::Role::user);
-        httplib::Response a, b;
-        auto probed = fix.ar->probe_fleet_read(req, a, "Infrastructure", "Read");
-        auto gated = fix.ar->require_fleet_read(req, b, "Infrastructure", "Read");
-        CHECK(probed.has_value() == gated.has_value());
-        if (probed && gated)
-            CHECK(probed->visible_for_query() == gated->visible_for_query());
+    SECTION("the probe answers with the gate's own verdict and status (this fixture has no "
+            "management-group store, so the fleet gate fails closed for both; the admit path "
+            "of the shared decision is covered by the has_permission cases above)") {
+        for (auto role : {auth::Role::user, auth::Role::admin}) {
+            auto req = fix.session_request(role == auth::Role::admin ? "rae" : "ray", role);
+            httplib::Response a, b;
+            auto probed = fix.ar->probe_fleet_read(req, a, "Infrastructure", "Read");
+            auto gated = fix.ar->require_fleet_read(req, b, "Infrastructure", "Read");
+            CHECK(probed.has_value() == gated.has_value());
+            CHECK(a.status == b.status);
+            if (probed && gated)
+                CHECK(probed->visible_for_query() == gated->visible_for_query());
+        }
     }
 
     SECTION("probe_permission keeps the gate's status and writes no row") {
@@ -501,6 +506,24 @@ TEST_CASE("probe_fleet_read / probe_permission: the gate's verdict with no denia
         REQUIRE(rows.has_value());
         CHECK(rows->empty());
     }
+}
+
+TEST_CASE("denial_row_may_be_withheld: only an interactive cookie sign-in qualifies",
+          "[authz][probe]") {
+    auto session = [](const char* source, const char* kind) {
+        auth::Session s;
+        s.auth_source = source;
+        s.principal_kind = kind;
+        return s;
+    };
+    CHECK(yuzu::server::denial_row_may_be_withheld(session("local", "user")));
+    CHECK(yuzu::server::denial_row_may_be_withheld(session("oidc", "user")));
+    CHECK(yuzu::server::denial_row_may_be_withheld(session("saml", "user")));
+    // A machine credential or an engine principal keeps its denial rows.
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("api_token", "user")));
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("mcp_token", "user")));
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("engine_token", "engine")));
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("local", "engine")));
 }
 
 // ── 10. Securable seeding ─────────────────────────────────────────────────

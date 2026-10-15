@@ -391,8 +391,12 @@ TEST_CASE("app shell: bell requests use the three existing routes, credentialed,
     CHECK_THAT(html, ContainsSubstring("!Array.isArray(d.notifications)||typeof d.unread_count!=='number'"));
     // 401 and 403 hide the bell and stop; 403 on an action disables the buttons.
     CHECK_THAT(html, ContainsSubstring("if(r.status===401||r.status===403){root.hidden=true;stopped=true;return null;}"));
-    CHECK_THAT(html, ContainsSubstring("if(r.status===403){readOnly=true;"));
+    CHECK_THAT(html, ContainsSubstring("if(r.status===403){return r.json()"));
+    CHECK_THAT(html, ContainsSubstring("else{readOnly=true;"));
     CHECK_THAT(html, ContainsSubstring("Your account can view notifications but not change them."));
+    // A same-site refusal is told apart from a read-only account, with the remedy named.
+    CHECK_THAT(html, ContainsSubstring("refused as cross-site"));
+    CHECK_THAT(html, ContainsSubstring("--csrf-trusted-origin"));
     CHECK_THAT(html, ContainsSubstring("No unread notifications."));
 }
 

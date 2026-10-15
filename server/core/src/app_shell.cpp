@@ -320,7 +320,7 @@ constexpr std::string_view kBellScript = R"JS(<script>
   function txt(v){return v==null?'':String(v);}
   var root=el('shell-bell'); if(!root)return;
   var sum=el('shell-bell-sum'), chip=el('shell-bell-n'), list=el('shell-bell-list'), note=el('shell-bell-note');
-  var inflight=false, stopped=false, readOnly=false, failed=false, actErr=false, shown=0, total=0, armed=null, armTimer=0, last=Date.now(), paused=false;
+  var inflight=false, stopped=false, readOnly=false, xsite=false, failed=false, actErr=false, shown=0, total=0, armed=null, armTimer=0, last=Date.now(), paused=false;
 
   function when(ts){
     var s=Math.floor((Date.now()-ts)/1000);
@@ -338,6 +338,7 @@ constexpr std::string_view kBellScript = R"JS(<script>
     if(failed)p.push('Notifications could not be refreshed.');
     if(actErr)p.push('Could not update that notification. Try again.');
     if(readOnly)p.push('Your account can view notifications but not change them.');
+    if(xsite)p.push('That change was refused as cross-site. Ask an administrator to check the --csrf-trusted-origin setting.');
     if(!failed&&total>shown)p.push('Showing the newest '+shown+' of '+total.toLocaleString('en-GB')+' unread.');
     note.textContent=p.join(' ');note.hidden=p.length===0;
   }
@@ -348,10 +349,13 @@ constexpr std::string_view kBellScript = R"JS(<script>
     armed=null;
   }
   function act(n,kind,itemEl){
-    disarm();actErr=false;
+    disarm();actErr=false;xsite=false;
     fetch('/api/notifications/'+n.id+'/'+(kind==='read'?'read':'dismiss'),{method:'POST',signal:AbortSignal.timeout(TIMEOUT_MS)}).then(function(r){
       if(r.status===401){root.hidden=true;stopped=true;return;}
-      if(r.status===403){readOnly=true;[].forEach.call(list.querySelectorAll('button'),function(b){b.disabled=true;});refreshNote();return;}
+      if(r.status===403){return r.json().catch(function(){return null;}).then(function(j){
+        if(j&&j.error&&/cross-site/.test(j.error.message||''))xsite=true;
+        else{readOnly=true;[].forEach.call(list.querySelectorAll('button'),function(b){b.disabled=true;});}
+        refreshNote();});}
       if(r.ok||r.status===404){
         var nx=itemEl.nextElementSibling;itemEl.remove();shown=Math.max(0,shown-1);total=Math.max(0,total-1);setChip(total);
         if(!list.children.length)empty();

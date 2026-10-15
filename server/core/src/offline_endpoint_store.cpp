@@ -159,7 +159,13 @@ FleetEstateReading fleet_estate_reading(const FleetStateCounts& counts,
                                         std::optional<std::size_t> registry_known) noexcept {
     const std::int64_t online =
         registry_known ? static_cast<std::int64_t>(*registry_known) : counts.live;
-    return reconcile_fleet_estate(counts.total, online, counts.stale);
+    auto r = reconcile_fleet_estate(counts.total, online, counts.stale);
+    // The registry knowing more connected agents than the store has live rows means some
+    // connected agents have no row: total and the offline split understate even when online
+    // still fits under total, so say "at least".
+    if (online > counts.live)
+        r.lower_bound = true;
+    return r;
 }
 
 OfflineEndpointStore::OfflineEndpointStore(pg::PgPool& pool) : pool_(pool) {

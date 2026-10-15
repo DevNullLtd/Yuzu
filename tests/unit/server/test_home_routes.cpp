@@ -804,9 +804,12 @@ TEST_CASE("home_routes: wiring -- the estate closure uses fleet_estate_reading a
     const std::string estate = src.substr(est, 2200);
     CHECK(has(estate, "fleet_estate_reading("));
     CHECK_FALSE(has(estate, "partition_fleet_state("));
+    CHECK(has(estate, "registry_.known_agent_count()")); // the registry count is the input
+    CHECK(has(estate, "r.lower_bound}"));                // and the flag reaches the figure
 
     // (2) the draw-time bindings are the probe-backed closures
     CHECK(has(src, "return probe_fleet_read(req, res, type, op);"));
+    CHECK(has(src, "auth_routes_->probe_fleet_read(req, res, securable_type, operation)"));
     CHECK(has(src, "auth_routes_->probe_permission(req, res, type, op)"));
     const auto sum = src.find("dashboard_summary_routes_->register_routes(");
     REQUIRE(sum != std::string::npos);
@@ -815,6 +818,15 @@ TEST_CASE("home_routes: wiring -- the estate closure uses fleet_estate_reading a
     CHECK(has(summary, ".perm_fn = draw_perm_fn"));
     CHECK(has(src, "hp.fleet_read_fn = draw_fleet_read_fn;"));
     CHECK(has(src, "hp.perm_fn = draw_perm_fn;"));
-    CHECK(has(src, ".fleet_read_fn = draw_fleet_read_fn, // HM-2 /fragments/dashboard/health"));
+    const auto hl = src.find("register_health_routes(");
+    REQUIRE(hl != std::string::npos);
+    CHECK(has(src.substr(hl, 1500), ".fleet_read_fn = draw_fleet_read_fn"));
+    // The bell is registered with the session resolver and trusted origins its same-site gate
+    // reads; dropping either silently re-opens it to a header-less cookie write.
+    const auto bl = src.find("notification_routes_->register_routes(");
+    REQUIRE(bl != std::string::npos);
+    const std::string bell = src.substr(bl, 400);
+    CHECK(has(bell, "resolve_session_fn"));
+    CHECK(has(bell, "cfg_.csrf_trusted_origins"));
 }
 

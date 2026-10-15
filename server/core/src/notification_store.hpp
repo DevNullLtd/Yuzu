@@ -15,10 +15,11 @@
 ///
 /// Posture (ADR-0012 §1): construction is AUTHORITATIVE/fail-closed — a
 /// Postgres store that cannot open is a fatal startup error. The plain runtime
-/// reads/writes below stay container/bool returns (the `_checked` variants add the
-/// failure channel the bell route needs) because NONE of them feed an authorization, targeting,
+/// reads/writes below stay container/bool returns for callers that only draw a badge (the
+/// `_checked` variants add the failure channel the operator-facing bell routes use; ADR-0046
+/// Update 2026-10-15) because NONE of them feed an authorization, targeting,
 /// enforcement, or skip decision — `list_unread`/`list_all`/`count_unread`
-/// back a dashboard badge and a display list, and `mark_read`/`dismiss`
+/// back a display list and a count, and `mark_read`/`dismiss`
 /// affect only what is shown, never what runs. A transient DB error on any
 /// of these degrades the display (empty list, stale badge); it never
 /// silently grants, targets, or suppresses anything (the playbook's own

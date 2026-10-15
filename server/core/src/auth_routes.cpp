@@ -685,14 +685,18 @@ bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& 
 bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response& res,
                                   const std::string& securable_type,
                                   const std::string& operation) {
-    const AuditProbeScope probe;
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
     return require_permission(req, res, securable_type, operation);
 }
 
 std::expected<authz::ListAuthority, authz::GateFailure>
 AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res,
                              const std::string& securable_type, const std::string& operation) {
-    const AuditProbeScope probe;
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
     return require_fleet_read(req, res, securable_type, operation);
 }
 

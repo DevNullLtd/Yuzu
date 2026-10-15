@@ -23,6 +23,15 @@ void unavailable(httplib::Response& res, const char* message) {
                     "application/json");
 }
 
+/// A row that must not abort the request: an empty AuditFn (audit off) or a throwing one is a
+/// no-op here, as in `emit_behavioral_audit`. Used for the `csrf.denied` row and the outcome
+/// rows, whose loss never changes the response (the `attempted` row is the gate).
+void note_audit(const NotificationRoutes::AuditFn& audit_fn, const httplib::Request& req,
+                const char* action, const char* result, const char* target_type,
+                const std::string& target_id, const char* detail) {
+    (void)detail::try_persist_audit(audit_fn, req, action, result, target_type, target_id, detail);
+}
+
 /// Cookie-authorised writes need a same-site Origin/Referer (token callers are exempt); see
 /// `browser_write_is_cross_site`. Runs AFTER the permission gate so an unauthorised caller
 /// still gets the 403 it always did. The refusal is audited.
@@ -38,8 +47,8 @@ bool refuse_cross_site(const NotificationRoutes::AuditFn& audit_fn,
                                      req.get_header_value("Origin"),
                                      req.get_header_value("Referer"), trusted_origins))
         return false;
-    (void)audit_fn(req, "csrf.denied", "denied", "Endpoint", "notification",
-                   "cross-site or header-less browser write refused");
+    note_audit(audit_fn, req, "csrf.denied", "denied", "Endpoint", "notification",
+               "cross-site or header-less browser write refused");
     res.status = 403;
     res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
     return true;
@@ -52,33 +61,34 @@ bool refuse_cross_site(const NotificationRoutes::AuditFn& audit_fn,
 template <class Mutate>
 void audited_mutation(const NotificationRoutes::AuditFn& audit_fn, const char* verb,
                       const httplib::Request& req, httplib::Response& res, Mutate&& mutate) {
-    const auto id = req.matches[1].str();
+    // The route regex admits any digit string. One that does not fit an int64 names no
+    // notification: nothing to change, so nothing to audit-first.
+    std::int64_t numeric = 0;
+    try {
+        numeric = std::stoll(req.matches[1].str());
+    } catch (...) {
+        res.status = 404;
+        res.set_content(detail::a4_error(res, "notification not found"), "application/json");
+        return;
+    }
+    const auto id = std::to_string(numeric); // canonical: "0007" is audited as "7"
     if (!detail::emit_behavioral_audit(audit_fn, req, res, verb, "attempted", "notification", id, "")) {
         unavailable(res, "audit log unavailable; the change was not made");
         return;
     }
-    std::int64_t numeric = 0;
-    try {
-        numeric = std::stoll(id);
-    } catch (...) { // out of range for int64: no such notification
-        (void)audit_fn(req, verb, "failure", "notification", id, "no such notification");
-        res.status = 404;
-        res.set_content(detail::a4_error(res, "notification not found"), "application/json");
-        return;
-    }
     auto applied = mutate(numeric);
     if (!applied) {
-        (void)audit_fn(req, verb, "failure", "notification", id, "store error");
+        note_audit(audit_fn, req, verb, "failure", "notification", id, "store error");
         unavailable(res, "notification store unavailable");
         return;
     }
     if (!*applied) {
-        (void)audit_fn(req, verb, "failure", "notification", id, "no such notification");
+        note_audit(audit_fn, req, verb, "failure", "notification", id, "no such notification");
         res.status = 404;
         res.set_content(detail::a4_error(res, "notification not found"), "application/json");
         return;
     }
-    (void)audit_fn(req, verb, "success", "notification", id, "");
+    note_audit(audit_fn, req, verb, "success", "notification", id, "");
     res.set_content(R"({"status":"ok"})", "application/json");
 }
 
@@ -117,6 +127,12 @@ void NotificationRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Pe
                 }
                 if (!offset_str.empty()) {
                     try { offset = std::stoi(offset_str); } catch (...) {}
+                }
+                if (limit < 0 || offset < 0) { // a client mistake, not a store outage
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "limit and offset must not be negative"),
+                                    "application/json");
+                    return;
                 }
 
                 // A failed read is an error the bell can show, never "No unread

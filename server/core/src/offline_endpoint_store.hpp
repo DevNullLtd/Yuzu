@@ -174,7 +174,8 @@ struct FleetEstateReading {
 
 /// The production counts-to-figure adapter behind the Dashboard's unrestricted Estate figure:
 /// `online` is the registry's union count when it can answer, else the SQL durable-live count,
-/// and the result goes through `reconcile_fleet_estate`. A free function (not a lambda in
+/// and the result goes through `reconcile_fleet_estate`; it is also a lower bound whenever the
+/// registry's count exceeds the store's live count (connected agents with no row). A free function (not a lambda in
 /// server.cpp) so the registry-ahead-of-store case is a unit test on the real wiring input.
 [[nodiscard]] FleetEstateReading fleet_estate_reading(const FleetStateCounts& counts,
                                                       std::optional<std::size_t> registry_known) noexcept;
