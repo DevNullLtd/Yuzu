@@ -16,10 +16,11 @@ if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
     chmod 600 "$TRANSITION_LOCK"
     # Lock this shell's own descriptor, so the lock lasts exactly as long as
     # this script: with a separate lockf wrapper process, killing the wrapper
-    # released the lock while the script ran on (governance uh8-6). An older
-    # lockf without the descriptor form fails with another status; perl's
-    # flock on the same descriptor is the fallback there, and the wrapper form
-    # only the last resort. 75 is lockf's timeout, kept short so this
+    # released the lock while the script ran on (governance uh8-6). macOS 13
+    # and 14 ship no /usr/bin/lockf at all (measured, #5903), so there perl's
+    # flock on the same descriptor takes the lock; the wrapper form is only the
+    # last resort, and with neither tool the install refuses rather than run
+    # unlocked. 75 is lockf's timeout, kept short so this
     # message appears well within the time Installer allows a script (sre8-2).
     exec 9>>"$TRANSITION_LOCK"
     lock_status=0
@@ -42,6 +43,9 @@ if [[ "${YUZU_PKG_TRANSITION_LOCKED:-}" != 1 ]]; then
         fi
     fi
     if [[ "$lock_status" != 0 ]]; then
+        [[ -x /usr/bin/lockf ]] || {
+            echo "ERROR: neither /usr/bin/lockf nor /usr/bin/perl can take the install lock on this Mac; nothing was changed" >&2
+            exit 1; }
         exec 9>&-
         exec /usr/bin/lockf -k -t 120 "$TRANSITION_LOCK" \
             /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"

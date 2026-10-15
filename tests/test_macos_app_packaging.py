@@ -2859,7 +2859,8 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
     _WRAPPER = ('        exec /usr/bin/lockf -k -t 120 "$TRANSITION_LOCK" \\\n'
                 '            /usr/bin/env YUZU_PKG_TRANSITION_LOCKED=1 /bin/bash "$0" "$@"\n')
 
-    def _lock_preamble(self, name: str, lock: Path, perl: str = "/usr/bin/perl") -> str:
+    def _lock_preamble(self, name: str, lock: Path, perl: str = "/usr/bin/perl",
+                       lockf_installed: bool = True) -> str:
         """The script's real lock preamble against a fixture lock path; lockf is
         resolved through PATH (a test may define a function), perl is the given
         path (a missing one disables the flock fallback), the wrapper re-exec
@@ -2873,6 +2874,9 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         preamble = (preamble.replace(self._WRAPPER, '        echo WRAPPER; exit 0\n')
                     .replace("/usr/bin/lockf -s -t 120 9", "lockf -s -t 120 9")
                     .replace("/usr/bin/perl", shlex.quote(perl))
+                    # Whether /usr/bin/lockf exists is the test's choice, not the host's:
+                    # macOS 13 and 14 ship none (#5903), and neither does Linux.
+                    .replace("[[ -x /usr/bin/lockf ]]", "[[ -x /bin/sh ]]" if lockf_installed else "[[ -x /nonexistent/lockf ]]")
                     .replace("TRANSITION_LOCK=/var/db/.yuzu-agent-transition.lock",
                              f"TRANSITION_LOCK={shlex.quote(str(lock))}"))
         return preamble + "echo LOCKED\n"
@@ -2936,10 +2940,13 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         # uh8-6: lockf's descriptor form first; then perl's flock on the same fd;
         # only with neither, the wrapper form. A timeout (75) from either refuses.
         for name in ("preinstall", "postinstall", "uninstall.sh"):
-            for status, perl, outcome in ((64, "missing", "WRAPPER"), (2, "missing", "WRAPPER"),
-                                          (75, "real", "REFUSED"), (64, "exit 75", "REFUSED"),
-                                          (64, "exit 2", "WRAPPER"), (64, "real", "LOCKED")):
-                with self.subTest(script=name, status=status, perl=perl), \
+            # #5903: macOS 13/14 have no lockf (status 127); there perl takes the lock,
+            # and with neither tool the install refuses instead of exec'ing a missing lockf.
+            for status, perl, outcome, installed in ((64, "missing", "WRAPPER", True), (2, "missing", "WRAPPER", True),
+                                                     (75, "real", "REFUSED", True), (64, "exit 75", "REFUSED", True),
+                                                     (64, "exit 2", "WRAPPER", True), (64, "real", "LOCKED", True),
+                                                     (127, "real", "LOCKED", False), (127, "missing", "NO-TOOL", False)):
+                with self.subTest(script=name, status=status, perl=perl, lockf_installed=installed), \
                         tempfile.TemporaryDirectory(prefix="yuzu_test_lock_status_") as temporary:
                     root = Path(temporary)
                     lock = root / "transition.lock"
@@ -2951,7 +2958,7 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                     lockf = f"lockf() {{ return {status}; }}\n"
                     # A descriptor still open at the wrapper means the fallback leaked it.
                     probe_fd = 'echo "FD9=$( { true >&9; } 2>/dev/null && echo open || echo closed)"\n'
-                    script = self._lock_preamble(name, lock, perl=perl_path).replace(
+                    script = self._lock_preamble(name, lock, perl=perl_path, lockf_installed=installed).replace(
                         '        echo WRAPPER; exit 0\n', '        ' + probe_fd + '        echo WRAPPER; exit 0\n')
                     result = self._run_lock(lockf + script)
                     if outcome == "WRAPPER":
@@ -2963,6 +2970,11 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertIn("LOCKED", result.stdout)
                         self.assertNotIn("WRAPPER", result.stdout)
+                    elif outcome == "NO-TOOL":
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertNotIn("LOCKED", result.stdout)
+                        self.assertNotIn("WRAPPER", result.stdout)
+                        self.assertIn("neither /usr/bin/lockf nor", result.stderr)
                     else:
                         self.assertNotEqual(result.returncode, 0)
                         self.assertNotIn("LOCKED", result.stdout)
