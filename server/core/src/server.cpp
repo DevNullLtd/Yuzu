@@ -15615,9 +15615,9 @@ private:
         // (users, roles, role permissions, role assignments, enforcement) and the static glue.
         // Placed after audit_fn. The lambdas below capture `this` and are quiesced by the
         // web_thread_ join in stop(), before rbac_store_ is reset. The read goes through
-        // AuthDB::list_users() (a std::expected: a store
-        // fault reaches the page as "could not be read", never as an empty list); the
-        // in-memory AuthManager::list_users() fallback is deliberately not used.
+        // AuthDB::list_users() (a std::expected: a store fault reaches the page as "could not
+        // be read", never as an empty list); the in-memory AuthManager::list_users() fallback
+        // is deliberately not used.
         yuzu::server::access::register_access_routes(
             inline_sink,
             yuzu::server::access::Deps{

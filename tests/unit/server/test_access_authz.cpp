@@ -229,7 +229,7 @@ TEST_CASE("access authz: RBAC on, a Reviewer reads the grant table but is offere
     CHECK(r.route_audits == std::vector<std::string>{"rbac.assignments.list/success"});
 }
 
-TEST_CASE("access authz: RBAC on, a user with no role gets the loud denial on every gated panel",
+TEST_CASE("access authz: RBAC on, a user with no role gets the loud denial on every permission-gated panel",
           "[pg][access][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
     Rig r{db_.dsn()};

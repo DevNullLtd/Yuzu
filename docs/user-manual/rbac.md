@@ -435,8 +435,9 @@ Settings uses, so the two stay equivalent.
   account. A refused browser session writes no audit row (the panels load automatically, so
   a row per page view would fill the log with denials); a refused API or MCP token that
   reaches the panel URL is recorded as an administrator-required denial.
-  The Roles panels need the `UserManagement:Read` permission and record each refused load as a
-  permission-required denial, so a person without it leaves one denial row per refused Roles panel.
+  The Roles and Role permissions panels need the `UserManagement:Read` permission and record each
+  refused load as a permission-required denial, so a person without it leaves one denial row per
+  refused panel (the Role assignments panel is covered below).
 - **Account role versus RBAC role.** The account role (`admin` or `user`) is the legacy role:
   it decides who can open Settings and what applies while RBAC enforcement is off. RBAC roles
   apply once enforcement is on.
