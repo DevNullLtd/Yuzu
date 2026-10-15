@@ -335,8 +335,9 @@ body of `POST /api/v1/inventory/query` and `POST /api/inventory/query`; a non-in
 presence-tracked now: `-3600` and `until=0` used to mean no bound and returned the whole log,
 statistics set or inventory. Omit the parameter for no bound; `since=0` (`from=0` on the auth sample)
 is accepted and matches the same rows as omitting it. On the auth-sample export a present but empty
-`from` or `to` is accepted as unbounded on that side. `GET /api/v1/audit` takes no `since`/`until`
-and is unchanged.
+`from` or `to` is accepted as unbounded on that side. `GET /api/v1/audit` follows the same rule: it
+gained `since`/`until` on `dev` with `0` read as unbounded, and an `until` of `0` or below (or a
+negative `since`) is now `400` there too.
 
 The same strictness now covers the dashboard fragments' `page`/`per_page`, the software
 inventory (the three software fragments answer `200` with an `inv-caveat` note for a malformed
