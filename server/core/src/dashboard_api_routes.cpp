@@ -7,6 +7,7 @@
 #include "data_export.hpp"
 #include "http_route_sink.hpp"
 #include "json_extract.hpp" // extract_json_string — shared JSON body-extraction helper
+#include "mcp_jsonrpc.hpp"   // json_exceeds_depth / kMcpMaxJsonDepth
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
 #include "web_utils.hpp"
@@ -230,6 +231,17 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                                                 httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Response", "Read"))
             return;
+
+        // Depth guard before parse: json_array_to_csv dump()s non-string cells and
+        // nlohmann dump() is recursive -- a deeply nested body would SIGSEGV the
+        // process (same class as config_routes.cpp / #2437).
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"request body nests too deeply"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
 
         auto csv = data_export::json_array_to_csv(req.body);
         if (csv.empty()) {

@@ -79,6 +79,7 @@
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
 #include "deployment_store.hpp"
+#include "developer_routes.hpp" // System > Developer and API page + fragments (read-only)
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovered_devices_reader.hpp" // make_discovered_devices_reader (core wiring)
 #include "discovery_store.hpp"
@@ -170,6 +171,7 @@
 #include "tag_routes.hpp" // #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
 #include "data_inventory_routes.hpp" // #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
 #include "config_routes.hpp" // #2542 PR-12: the 2-route Runtime Configuration API (7.3), extracted onto the HttpRouteSink seam
+#include "settings_general_routes.hpp" // System "General and appearance" page + two UI fragments
 #include "diagnostics_routes.hpp" // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
 #include "legacy_events_routes.hpp" // #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
 #include "instruction_fragment_routes.hpp" // #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
@@ -13964,7 +13966,17 @@ private:
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
                 try {
-                    cfg_.session_timeout = std::chrono::seconds(std::stoi(e.value));
+                    // A value stored before the 30 s floor existed would make every directly
+                    // connected agent flap; raise it to the floor and say how to clear it.
+                    const int stored = std::stoi(e.value);
+                    const int applied = clamp_heartbeat_timeout(stored);
+                    if (applied != stored)
+                        spdlog::warn("Stored heartbeat_timeout {} is below the {} second minimum; "
+                                     "using {} seconds. PUT /api/config/heartbeat_timeout with a "
+                                     "value of {} or more to replace the stored one.",
+                                     stored, kMinHeartbeatTimeoutSeconds, applied,
+                                     kMinHeartbeatTimeoutSeconds);
+                    cfg_.session_timeout = std::chrono::seconds(applied);
                 } catch (...) {}
             } else if (e.key == "response_retention_days") {
                 try {
@@ -15887,6 +15899,58 @@ private:
                              .runtime_config_store = runtime_config_store_.get(),
                          });
 
+        // System "General and appearance" page and its two UI-only fragments
+        // (settings_general_routes.*). All three are admin-gated (`require_admin`, the same
+        // gate `/settings` uses); the runtime form writes through the PUT above and nothing
+        // here adds a REST route or an MCP tool. The analytics store is held weakly and
+        // locked per call, like every other consumer of it (it is reset on shutdown).
+        yuzu::server::settings_general::register_settings_general_routes(
+            inline_sink,
+            yuzu::server::settings_general::Deps{
+                .admin_fn =
+                    [this](const httplib::Request& req, httplib::Response& res) {
+                        return require_admin(req, res);
+                    },
+                .runtime_fn =
+                    [this]() {
+                        yuzu::server::settings_general::RuntimeView v;
+                        v.heartbeat_seconds =
+                            static_cast<std::int64_t>(cfg_.session_timeout.count());
+                        const auto level =
+                            spdlog::level::to_string_view(spdlog::default_logger()->level());
+                        v.log_level.assign(level.data(), level.size());
+                        v.store_available =
+                            runtime_config_store_ && runtime_config_store_->is_open();
+                        return v;
+                    },
+                .events_fn =
+                    [this, weak_store = std::weak_ptr<AnalyticsEventStore>(analytics_store_)]() {
+                        yuzu::server::settings_general::EventsView v;
+                        v.collection_enabled = cfg_.analytics_enabled;
+                        v.sink_configured =
+                            !cfg_.clickhouse_url.empty() || !cfg_.analytics_jsonl_path.empty();
+                        if (auto store = weak_store.lock()) {
+                            v.store_present = true;
+                            v.store_open = store->is_open();
+                            v.emitted_by_this_server = store->total_emitted();
+                            if (v.store_open) {
+                                v.pending = store->pending_count();
+                                if (auto events = store->query_recent(
+                                        yuzu::server::settings_general::kRecentEventsLimit)) {
+                                    std::vector<yuzu::server::settings_general::EventRow> rows;
+                                    rows.reserve(events->size());
+                                    for (const auto& e : *events)
+                                        rows.push_back({e.event_type, e.source,
+                                                        severity_to_string(e.severity),
+                                                        e.event_time});
+                                    v.recent = std::move(rows);
+                                }
+                            }
+                        }
+                        return v;
+                    },
+            });
+
         // #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API.
         // `forward_legacy_command_fn` wraps the ServerImpl-private
         // `forward_legacy_command` member — see diagnostics_routes.hpp's
@@ -16154,6 +16218,19 @@ private:
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
+        // System > Data and retention: report the windows the three stores really
+        // enforce (each copied its window at construction and never re-reads cfg_).
+        // A store that is absent or failed to open enforces nothing: report unknown.
+        settings_routes_->set_retention_enforced_fn([this]() {
+            yuzu::server::settings_model::RetentionEnforced e;
+            if (response_store_ && response_store_->is_open())
+                e.response_retention_days = response_store_->retention_days();
+            if (audit_store_ && audit_store_->is_open())
+                e.audit_retention_days = audit_store_->retention_days();
+            if (guaranteed_state_store_ && guaranteed_state_store_->is_open())
+                e.guardian_event_retention_days = guaranteed_state_store_->retention_days();
+            return e;
+        });
 
         // #2542 PR-12: the legacy GET /events SSE stream, extracted onto
         // the HttpRouteSink seam (legacy_events_routes.cpp) — see that
@@ -20019,6 +20096,29 @@ private:
         discover_routes_ = std::make_unique<DiscoverRoutes>();
         discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
                                           instruction_store_.get(), &registry_);
+
+        // System > Developer and API (read-only): page + five fragments over the
+        // shared discovery builders above. The page and every fragment are admin-only like
+        // /settings; a fragment then also takes its twin's own Infrastructure:Read gate.
+        {
+            HttplibRouteSink developer_sink{*web_server_};
+            yuzu::server::developer::register_developer_routes(
+                developer_sink,
+                yuzu::server::developer::Deps{
+                    .admin_fn =
+                        [this](const httplib::Request& req, httplib::Response& res) {
+                            return require_admin(req, res);
+                        },
+                    .perm_fn = perm_fn,
+                    .probe_fn =
+                        [this](const httplib::Request& req, const std::string& type,
+                               const std::string& op) {
+                            return auth_routes_->has_permission(req, type, op);
+                        },
+                    .rbac_store = rbac_store_.get(),
+                    .registry = &registry_,
+                });
+        }
 
         // DEX app-perf-over-time read providers (slice 2). `dex_perf_api`
         // (built once ABOVE, before the DexRoutes registration) is the ONE

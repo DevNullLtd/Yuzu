@@ -233,6 +233,30 @@ separately.
 
 ---
 
+## Settings: General page
+
+**Settings → General** (`/settings/general`, admin only; every panel it shows also stays on the
+`/settings` page).
+
+- **Appearance** holds the table-density preference (Comfortable or Compact). It is saved in this
+  browser only and applies to the Dashboard results table.
+- **Server** holds the two runtime settings that change on a running server, written through
+  `PUT /api/config/{key}`: the **agent heartbeat timeout** (`heartbeat_timeout`; seconds of silence
+  after which this server drops an agent connected directly to it) and the **log level**
+  (`log_level`). Both apply to this server process only, are stored, and are re-applied at restart;
+  the log level then wins over `--log-level`. Neither is the dashboard sign-in expiry: that is the
+  read-only **Dashboard idle timeout** (`--session-inactivity-secs`) and **Dashboard session
+  lifetime** (fixed, 8 hours) rows in the server-configuration table below the form. The heartbeat
+  timeout must be 30 seconds or more (a lower value stored by an earlier build is raised to 30 at
+  start, with a log line); keep it well above the agents' own heartbeat interval, since 30 leaves no
+  margin for a late heartbeat. Runtime changes are audited first: if the `attempted` audit
+  row cannot be written the change is refused and the page shows the error; if only the outcome row
+  is lost the change stays applied and the page shows a banner.
+- **Analytics** shows the event-collection status and the most recent buffered events (type,
+  source, severity, time; no host or user).
+
+---
+
 ## Upgrade Notes
 
 ### vNEXT - `--gateway-upstream` refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs)
@@ -1418,7 +1442,7 @@ need no change.
 **The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
 — CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
 gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
-Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), and the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only). The dashboard renders fine and reads work; only the destructive actions
+Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), and the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
@@ -4982,7 +5006,7 @@ the audit log. Each stamps `ttl_expires_at` once, at INSERT, from the retention
 setting in force at the time (`AuditStore::log`, `ResponseStore::store`,
 `GuaranteedStateStore::compute_ttl_epoch`), and nothing ever rewrites it, so
 existing rows always age out on their original TTLs. Only rows written after the
-change (and, per the #483 note below, after a restart) get the shorter window.
+change get the shorter window.
 
 What is specific to the audit log is *how* the expired rows then leave: see the
 note below.
@@ -4998,7 +5022,7 @@ note below.
 > single declined pass more likely right after the change. It is self-healing --
 > see [The retention clock guard](audit-log.md#the-retention-clock-guard).
 
-> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and can be updated at runtime via `PUT /api/config/<key>` with an `Infrastructure:Write` permission. Runtime updates are persisted via `RuntimeConfigStore` and reflected immediately in the `/api/config` GET response — **but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.** This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.
+> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`). `PUT /api/config/<key>` (with `Infrastructure:Write`) persists a value via `RuntimeConfigStore` and `/api/config` then reports it — **but each running store copied its retention value at construction and does not re-read it, so a stored value is not the window being enforced.** Change a window with the startup option or environment variable and restart. This limitation is shared across all three retention keys and is tracked as issue #483. The **Data and retention** page (Settings, System group) shows the enforced value and flags a stored value that is not in force.
 
 ---
 

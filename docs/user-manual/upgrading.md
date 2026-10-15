@@ -82,6 +82,16 @@ ignoring it.
 store is degraded (previously an empty `200`) and `404` for an unknown role
 (previously `200 {"data":[]}`).
 
+## Behaviour change: `PUT /api/config/{key}` is audit-first, refuses cross-site cookie writes and floors `heartbeat_timeout` at 30 seconds
+
+**What changed.**
+
+- A call to `PUT /api/config/{key}` now writes a `config.update` audit row with result `attempted` before it changes anything, then a `success` or `failure` row. Each accepted call leaves two rows where it left one. If the `attempted` row cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and nothing is changed, so a runtime setting (including the log level) cannot be changed during an audit-store outage.
+- A call authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise it answers `403 cross-site request refused` and is audited as `csrf.denied`. API, MCP and engine token callers are not affected.
+- `heartbeat_timeout` below 30 seconds is refused with `400`. A value below 30 that an earlier build stored is raised to 30 when the server starts (a WARN line names it); `GET /api/config` keeps listing the stored override until you `PUT` a value of 30 or more.
+
+**What to check.** A script that signs in with a cookie and calls this route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. A SIEM or alert rule that counts one `config.update` row per change now sees two; match on `result=success`. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin` or the General page's Save is refused. A stored value below 30 cannot be cleared by saving 30 on the General page, because that page already shows 30 as the current value: save another value first, or `PUT` it with a token. The Developer page's fragments are now administrators only (a non-admin holding `Infrastructure:Read` gets `403` from them), and the permission grid no longer writes a denial row on each load. Whatever you set, keep `heartbeat_timeout` well above the heartbeat interval your agents run with: 30 leaves no margin for a late heartbeat.
+
 ## Behaviour change: sign-in moves to the landing page, `/login` redirects
 
 **What changed.** `/home` is now the sign-in page (and the landing page for a signed-in user). A page requested

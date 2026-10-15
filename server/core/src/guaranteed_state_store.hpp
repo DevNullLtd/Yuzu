@@ -213,6 +213,11 @@ public:
     GuaranteedStateStore& operator=(const GuaranteedStateStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
+    /// The retention window this store was constructed with and actually
+    /// enforces (days; <= 0 means "never expire"). Read-only: the value is
+    /// copied at construction and never re-read, so this is the ENFORCED
+    /// figure, which can differ from Config / a stored runtime override.
+    [[nodiscard]] int retention_days() const noexcept { return retention_days_; }
 
     /// Wire a metrics registry for `yuzu_server_guardian_read_degrade_total{reason}`
     /// (DEX/analytics reads) and the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family

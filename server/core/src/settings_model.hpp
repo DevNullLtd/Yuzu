@@ -31,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <optional>
 #include <string>
@@ -128,7 +129,16 @@ namespace yuzu::server::settings_model {
 /// ServerConfig:Read. Nothing secret (#4028 Evidence) — gRPC/web
 /// addresses+ports, session timeout, max agents, rate limits, OTA/gRPC
 /// tuning knobs.
-[[nodiscard]] nlohmann::json build_server_config_settings(const Config& cfg);
+///
+/// `session_timeout_seconds` is the AGENT heartbeat timeout (`Config::session_timeout`:
+/// seconds without a heartbeat before the server drops a directly connected agent). It is
+/// not the dashboard sign-in expiry; that is the two additive fields below:
+///   `session_inactivity_seconds`        `Config::session_inactivity_secs` (0 = idle timeout off)
+///   `session_absolute_lifetime_seconds` the fixed sign-in lifetime. A caller input, not a
+///       `Config` field (`AuthManager::kSessionDuration`), passed in so this header keeps
+///       its "Config only, no auth dependency" contract (cf. `build_gateway_settings`).
+[[nodiscard]] nlohmann::json build_server_config_settings(const Config& cfg,
+                                                          std::int64_t session_absolute_lifetime_seconds);
 
 /// `GET /fragments/settings/mcp` + `GET /api/v1/settings/mcp`. ServerConfig:Read.
 /// {enabled, read_only, endpoint_url} — `endpoint_url` is computed the same
@@ -136,10 +146,32 @@ namespace yuzu::server::settings_model {
 /// defaults `0.0.0.0` to `localhost` for a copy-pasteable value).
 [[nodiscard]] nlohmann::json build_mcp_settings(const Config& cfg);
 
+/// The retention windows the three stores actually ENFORCE, in days (<= 0 means
+/// "never expire"). `std::nullopt` = unknown: the store is absent or not open,
+/// so the figure is reported as null rather than a number the store does not
+/// enforce. The stores copy their window at construction and never re-read
+/// `Config`, so this can differ from the stored/configured value.
+struct RetentionEnforced {
+    std::optional<int> response_retention_days;
+    std::optional<int> audit_retention_days;
+    std::optional<int> guardian_event_retention_days;
+};
+
 /// `GET /fragments/settings/data-retention` + `GET /api/v1/settings/data-retention`.
-/// ServerConfig:Read. {response_retention_days, audit_retention_days} — two
-/// integers, lowest sensitivity of the eight (#4028 Evidence).
-[[nodiscard]] nlohmann::json build_data_retention_settings(const Config& cfg);
+/// ServerConfig:Read. {response_retention_days, audit_retention_days,
+/// guardian_event_retention_days, enforced:{<same three>: int|null}} — a handful
+/// of integers, lowest sensitivity of the eight (#4028 Evidence). The top-level
+/// three are the configured/stored values (unchanged keys); `enforced` is what
+/// the stores really apply.
+[[nodiscard]] nlohmann::json build_data_retention_settings(const Config& cfg,
+                                                           const RetentionEnforced& enforced = {});
+
+/// The data-retention table (pure; every cell is an integer or a fixed string).
+/// Input is `build_data_retention_settings`' JSON. Per window: enforced N > 0
+/// "N days", N <= 0 "No expiry", unknown an idle "Unknown" pill (never "0"); a
+/// stored value that differs from the enforced one adds a warn pill and the
+/// action-bearing hint. Followed by the cleanup-semantics hint.
+[[nodiscard]] std::string render_retention_table(const nlohmann::json& retention);
 
 /// `GET /fragments/settings/analytics` + `GET /api/v1/settings/analytics`.
 /// AnalyticsConfig:Read. {enabled, drain_interval_seconds, batch_size,
