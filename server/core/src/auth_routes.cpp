@@ -676,6 +676,13 @@ bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& 
     return probe_permission(req, discarded, securable_type, operation);
 }
 
+bool AuthRoutes::probe_admin(const httplib::Request& req, httplib::Response& res) {
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
+    return require_admin(req, res);
+}
+
 bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response& res,
                                   const std::string& securable_type,
                                   const std::string& operation) {

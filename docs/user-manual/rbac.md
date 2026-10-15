@@ -373,7 +373,10 @@ counted in `yuzu_auth_topology_floor_denied_total{permission}`, separate
 > auditing permission gate. An ordinary non-admin call therefore increments this counter and writes
 > an `auth.permission_required` `denied` row for a permission the caller never asked for. Until
 > #2829 lands, do **not** alert on this counter alone as evidence of someone probing the
-> authorization topology — correlate with the route in the audit row first.
+> authorization topology — correlate with the route in the audit row first. The Access
+> principals fragments (`/fragments/access/principals/*`) are a further source: they probe
+> `EnginePrincipal:Read` on every page view, a floored refusal moves this counter, and for a
+> browser session no audit row accompanies the increment.
 from an ordinary legacy-fallback denial, so a spike in floored denials is
 visible without grepping audit-log text.
 
@@ -419,6 +422,26 @@ being wrong changes what a real request is allowed to do. The risk is
 purely that an auditor reading the export or a closed campaign draws the
 wrong conclusion about what state RBAC was in — not that access control
 itself misbehaves.
+
+## Viewing accounts from the dashboard
+
+The **Users** page (`/access/users`, in the **Access** section of the sidebar) lists the
+accounts that can sign in to this server and shows one account's details beside the list.
+It is read-only: it shows each account's name, where it comes from (local, OIDC, SAML, AD or
+SCIM) and its account role. Adding, removing and changing accounts is done in **Settings**.
+
+- **Who can see it.** Any signed-in user can open the page. The two panels need the
+  Administrator account role; for anyone else each panel says it is not available to their
+  account. A refused browser session writes no audit row (the panels load automatically, so
+  a row per page view would fill the log with denials); a refused API or MCP token that
+  reaches the panel URL is recorded as an administrator-required denial.
+- **Account role versus RBAC role.** The account role (`admin` or `user`) is the legacy role:
+  it decides who can open Settings and what applies while RBAC enforcement is off. RBAC roles
+  apply once enforcement is on, and are managed through the RBAC API.
+- **Unreadable store.** If the account store does not answer, the Users panel shows a red
+  message with a Retry button. It never shows an empty list in that case, so a degraded store
+  cannot be mistaken for "nobody is here".
+- **Your own account.** Your row is marked "Current user" and has no Manage link.
 
 ## Concepts
 
@@ -826,6 +849,10 @@ curl -s -b cookies.txt -X POST \
     "role_name": "Operator"
   }'
 ```
+
+## Tokens and principals page
+
+The read-only `/access/tokens` page shows API tokens and engine principals. Its token list uses `ApiToken:Read` and is scoped to the caller's own tokens unless the caller is an administrator on a cookie session; an administrator's API, MCP or service-scoped token gets its own tokens only. The principal list and detail use `EnginePrincipal:Read`, the same permission as `GET /api/v1/engine-principals` (administrators only while RBAC is disabled; an ordinary grant once it is enabled): with RBAC on, an account administrator without that grant is refused and a non-administrator who holds it is admitted. Engine and MCP-tier credentials are refused whatever they hold. A refused browser session writes no audit row, because the panels load automatically. A revoked principal's free-text revocation detail comes from the audit trail and is shown only to callers who also hold `AuditLog:Read`; others see it marked withheld. The no-administrator check above the list also needs `AuditLog:Read` and is skipped, with a note, without it. Role assignment for engine principals is shown here; assigning is not.
 
 ## Examples
 
