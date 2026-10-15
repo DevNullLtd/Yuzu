@@ -482,6 +482,9 @@ TEST_CASE("instruction_fragment_routes: filters, limit+1 truncation, approval co
         auto res = h.sink.Get("/fragments/instructions");
         REQUIRE(res);
         CHECK(res->body.find("Needs approval") == std::string::npos);
+        // No Templates control, host or helper script without the read permission.
+        CHECK(res->body.find("ox-templates") == std::string::npos);
+        CHECK(res->body.find("oxTplMark") == std::string::npos);
         CHECK(res->body.find("Triage Set") == std::string::npos);
         CHECK(res->body.find("data-denied=\"true\"") != std::string::npos);
         CHECK(res->body.find("Beta three") != std::string::npos); // the list itself is unchanged
@@ -520,6 +523,25 @@ TEST_CASE("instruction_fragment_routes: probe-stamped controls follow the permis
           std::string::npos);
     CHECK(b.find("id=\"ox-templates\"") != std::string::npos);
     CHECK(b.find("hx-delete=\"/api/instructions/" + *def_id + "\"") != std::string::npos);
+
+    // The Templates panel lands directly under the library toolbar (after the filter form,
+    // before the table), not below the 100-row table where the click looked like a no-op;
+    // htmx scrolls it into view and the clicked row is marked.
+    {
+        const auto filter = b.find("class=\"ox-filter\"");
+        const auto host = b.find("id=\"ox-templates\"");
+        const auto first_row = b.find("<tr");
+        REQUIRE(filter != std::string::npos);
+        REQUIRE(first_row != std::string::npos);
+        CHECK(filter < host);
+        CHECK(host < first_row);
+        CHECK(b.find("id=\"ox-templates\"", host + 1) == std::string::npos); // one host only
+    }
+    CHECK(b.find("hx-swap=\"innerHTML show:#ox-templates:top\"") != std::string::npos);
+    CHECK(b.find("aria-controls=\"ox-templates\" aria-expanded=\"false\" "
+                 "onclick=\"oxTplMark(this)\"") != std::string::npos);
+    CHECK(b.find("function oxTplMark(") != std::string::npos);
+    CHECK(b.find("hx-on") == std::string::npos);
 
     SECTION("write denied: no New, Import, set select or set buttons") {
         h.probe_allow = {"InstructionDefinition:Read", "InstructionDefinition:Delete",
