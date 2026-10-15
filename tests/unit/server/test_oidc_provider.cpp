@@ -1563,13 +1563,13 @@ TEST_CASE("OIDC discovery: cached keys are dropped after the hard maximum key ag
 
     // Inside the ceiling the cached key still verifies and nothing is refetched (a failed
     // attempt re-arms the retry timer, which the seam keeps fresh).
-    provider.set_jwks_key_age_for_test(std::chrono::hours(23));
+    provider.set_jwks_key_age_for_test(std::chrono::minutes(50));
     CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
     CHECK(idp.jwks_calls.load() == 1);
 
     // Past it the key is no longer trusted, even though the retry timer is fresh: the fetch is
     // tried (and fails), and the verification is refused with the fixed unavailable token.
-    provider.set_jwks_key_age_for_test(std::chrono::hours(25));
+    provider.set_jwks_key_age_for_test(std::chrono::minutes(70));
     auto stale = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
     REQUIRE_FALSE(stale.has_value());
     CHECK(stale.error() == std::string(OidcProvider::kJwksUnavailable));
@@ -1589,6 +1589,27 @@ TEST_CASE("OIDC discovery: cached keys are dropped after the hard maximum key ag
     CHECK(recovered > while_down);
     CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
     CHECK(idp.jwks_calls.load() == recovered);
+}
+
+TEST_CASE(
+    "OIDC discovery: a token naming a kid the key set lacks is refused, never checked against "
+    "another key; a token with no kid still uses the first key",
+    "[oidc][oidc_discovery][jwt]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+
+    // The kid is not published and the refetch cannot fix that (the endpoint is down): the cached
+    // key must NOT be tried for a token that names a different key.
+    idp.with([](MockIdp& m) { m.jwks_status = 503; });
+    auto unknown = provider.verify_jwt_signature(signed_token(cfg, "never-published"));
+    REQUIRE_FALSE(unknown.has_value());
+    // The same with the endpoint answering: the published set does not hold the kid either.
+    idp.with([](MockIdp& m) { m.jwks_status = 200; });
+    CHECK_FALSE(provider.verify_jwt_signature(signed_token(cfg, "never-published")).has_value());
+    // A token with no kid is still checked against the first key.
+    CHECK(provider.verify_jwt_signature(signed_token(cfg, "")).has_value());
 }
 
 TEST_CASE("OIDC discovery: a failed attempt is remembered, two logins inside the window cost ONE GET",

@@ -387,7 +387,7 @@ private:
     /// still refetch on every call (#1900). Cached keys are trusted until the next SUCCESSFUL
     /// fetch replaces them, but never for longer than `kJwksMaxKeyAge` after the last success
     /// (#1901 UP-5): past that the cache is dropped and every login refetches until the IdP
-    /// answers, so a key the IdP retired cannot keep verifying through a long outage.
+    /// answers, so a key the IdP retired cannot keep verifying through an outage.
     bool fetch_jwks();
 
     OidcConfig config_;
@@ -410,8 +410,11 @@ private:
     std::chrono::steady_clock::time_point jwks_fetched_at_;     // last ATTEMPT (retry timer)
     std::chrono::steady_clock::time_point jwks_last_success_{}; // last stored key set
     static constexpr auto kJwksCacheTtl = std::chrono::hours(1);
-    /// Hard ceiling on how long cached keys are trusted without a successful refetch.
-    static constexpr auto kJwksMaxKeyAge = std::chrono::hours(24);
+    /// Hard ceiling on how long cached keys are trusted without a successful refetch. Equal to
+    /// the cache TTL on purpose: a refresh that fails once the TTL has passed fails closed. A
+    /// sign-in needs the IdP's token endpoint anyway, so keeping stale keys through a JWKS
+    /// outage buys almost no availability and extends the window for a retired key.
+    static constexpr auto kJwksMaxKeyAge = std::chrono::hours(1);
 
     static constexpr auto kChallengeTtl = std::chrono::minutes(10);
 };

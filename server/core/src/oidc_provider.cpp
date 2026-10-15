@@ -1288,9 +1288,10 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
         // the IdP answers (#1901 UP-5).
         if (!jwks_cache_.empty() && now - jwks_last_success_ > kJwksMaxKeyAge) {
             spdlog::error("OidcProvider: the {} cached signing keys were last fetched more than {} "
-                          "hours ago and the JWKS endpoint has not answered since; dropping them",
+                          "minutes ago and the JWKS endpoint has not answered with a usable key "
+                          "set since; dropping them",
                           jwks_cache_.size(),
-                          std::chrono::duration_cast<std::chrono::hours>(kJwksMaxKeyAge).count());
+                          std::chrono::duration_cast<std::chrono::minutes>(kJwksMaxKeyAge).count());
             jwks_cache_.clear();
         }
         auto age = now - jwks_fetched_at_;
@@ -1327,8 +1328,9 @@ find_key:;
             }
         }
     }
-    // If kid is empty, use the first key (some IdPs don't set kid)
-    if (!pkey) {
+    // If the token carries NO kid, use the first key (some IdPs don't set kid). A token that names
+    // a kid the (refetched) key set does not hold is refused, never checked against another key.
+    if (!pkey && kid.empty()) {
         std::lock_guard lock(jwks_mu_);
         if (!jwks_cache_.empty())
             pkey = jwks_cache_.front().pkey;
