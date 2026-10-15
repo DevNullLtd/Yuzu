@@ -16,6 +16,11 @@
 #   E  environment-only target: the probe reads the server's own listener variables.
 #   F  an existing, invalid --config file is neither read nor touched, and changes nothing
 #      about the diagnostic.
+#   G  a TLS context OpenSSL cannot create (a config naming a missing provider) is exit 1 plus
+#      one line, never a crash (rc 139) and never the "no trust anchor" reason. Hosts where the
+#      config does not provoke the failure just see a connection failure, which passes too.
+#   H  a wildcard --web-address is probed over loopback, not dialled as written.
+#   I  --healthcheck-path /livez probes /livez.
 #
 # Run:  bash tests/shell/test_healthcheck_cli.sh <BUILDDIR>
 set -euo pipefail
@@ -68,9 +73,9 @@ check "A stdout is empty" "$([ ! -s "$CAP/a.out" ]; echo $?)"
 check "A stderr is exactly one line" "$([ "$(wc -l <"$CAP/a.err" | tr -d ' ')" = 1 ]; echo $?)"
 line="$(head -n1 "$CAP/a.err")"
 check "A line names the target" \
-  "$(case "$line" in "healthcheck: GET http://127.0.0.1:$PORT/readyz -> "*) true;; *) false;; esac; echo $?)"
+  "$([[ "$line" == "healthcheck: GET http://127.0.0.1:$PORT/readyz -> "* ]]; echo $?)"
 check "A line ends with the anchor note" \
-  "$(case "$line" in *"(trust anchor: none)") true;; *) false;; esac; echo $?)"
+  "$([[ "$line" == *"(trust anchor: none)" ]]; echo $?)"
 check "A wrote no files" "$([ -z "$(find "$WORK" -type f)" ]; echo $?)"
 
 # B: TLS probe against an empty CA dir (no default-ca.pem there).
@@ -109,9 +114,9 @@ unset YUZU_NO_HTTPS YUZU_WEB_ADDRESS YUZU_WEB_PORT
 line="$(head -n1 "$CAP/e.err")"
 check "E rc is 1" "$([ "$(rc e)" = 1 ]; echo $?)"
 check "E line names the environment target" \
-  "$(case "$line" in "healthcheck: GET http://127.0.0.1:$PORT/readyz -> "*) true;; *) false;; esac; echo $?)"
+  "$([[ "$line" == "healthcheck: GET http://127.0.0.1:$PORT/readyz -> "* ]]; echo $?)"
 check "E line ends with the anchor note" \
-  "$(case "$line" in *"(trust anchor: none)") true;; *) false;; esac; echo $?)"
+  "$([[ "$line" == *"(trust anchor: none)" ]]; echo $?)"
 
 # F: an invalid config file sits outside $WORK (which A/B check for stray writes). A probe that
 # loaded it would log to stdout (Unsupported version) and, on first-run setup, rewrite it.
@@ -125,5 +130,41 @@ check "F stdout is empty" "$([ ! -s "$CAP/f.out" ]; echo $?)"
 check "F diagnostic is identical to A's" "$(same_bytes "$CAP/f.err" "$CAP/a.err"; echo $?)"
 check "F config file is byte-identical" "$(same_bytes "$BADCFG" "$CAP/invalid-yuzu-server.orig"; echo $?)"
 check "F wrote no files" "$([ -z "$(find "$WORK" -type f)" ]; echo $?)"
+
+# G: the provoking config lives under $CAP (A/B/F check that $WORK stays empty).
+cat >"$CAP/bad-openssl.cnf" <<'EOF_CNF'
+openssl_conf = openssl_init
+[openssl_init]
+providers = provider_sect
+[provider_sect]
+missing = missing_sect
+[missing_sect]
+module = /nonexistent/yuzu_missing_provider.so
+activate = 1
+EOF_CNF
+export OPENSSL_CONF="$(winpath "$CAP/bad-openssl.cnf")"
+run g "${STATE[@]}" --healthcheck --web-address 127.0.0.1 --https-port "$PORT" \
+  --ca-dir "$(winpath "$WORK/empty")"
+unset OPENSSL_CONF
+line="$(head -n1 "$CAP/g.err")"
+check "G rc is 1" "$([ "$(rc g)" = 1 ]; echo $?)"
+check "G stderr is exactly one line" "$([ "$(wc -l <"$CAP/g.err" | tr -d ' ')" = 1 ]; echo $?)"
+check "G is not reported as a missing trust anchor" \
+  "$(! grep -q 'no trust anchor' "$CAP/g.err"; echo $?)"
+check "G a context failure names its own reason" \
+  "$([[ "$line" != *"exception:"* || "$line" == *"TLS context unavailable"* ]]; echo $?)"
+
+# H: the images bind 0.0.0.0, which is not a destination.
+run h "${STATE[@]}" --healthcheck --no-https --web-address 0.0.0.0 --web-port "$PORT"
+line="$(head -n1 "$CAP/h.err")"
+check "H wildcard bind is probed on loopback" \
+  "$([[ "$line" == "healthcheck: GET http://127.0.0.1:$PORT/readyz -> "* ]]; echo $?)"
+
+# I: the liveness path.
+run i "${STATE[@]}" --healthcheck --no-https --web-address 127.0.0.1 --web-port "$PORT" \
+  --healthcheck-path /livez
+line="$(head -n1 "$CAP/i.err")"
+check "I --healthcheck-path /livez probes /livez" \
+  "$([[ "$line" == "healthcheck: GET http://127.0.0.1:$PORT/livez -> "* ]]; echo $?)"
 
 exit "$fail"

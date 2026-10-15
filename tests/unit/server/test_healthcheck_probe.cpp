@@ -33,6 +33,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #ifndef _WIN32
@@ -133,6 +134,46 @@ TEST_CASE("healthcheck: wildcard binds map to loopback and IPv6 hosts are bracke
     CHECK(healthcheck_url(t) == "http://127.0.0.1:8080/readyz");
 }
 
+TEST_CASE("healthcheck: the target host comes from --web-address through probe_host_for",
+          "[server][healthcheck]") {
+    // The shipped images run `--web-address 0.0.0.0`: a probe that dialled the raw bind address
+    // (or a hard-coded loopback) would pass every other case here.
+    const auto host_for = [](const char* web_address) {
+        Config cfg{};
+        cfg.web_address = web_address;
+        return resolve_healthcheck_target(cfg, "/readyz", fs::path{"/certs"}, true).host;
+    };
+    CHECK(host_for("0.0.0.0") == "127.0.0.1");
+    CHECK(host_for("::") == "::1");
+    CHECK(host_for("10.0.0.5") == "10.0.0.5");
+}
+
+TEST_CASE("healthcheck: the published per-phase bounds", "[server][healthcheck]") {
+    // Published in the server-admin "Time" row and the changelog fragment.
+    CHECK(kConnectSec == 1);
+    CHECK(kWriteSec == 1);
+    CHECK(kReadSec == 2);
+    CHECK(kRequestMs == 3000);
+    CHECK(kProbeDeadline == std::chrono::milliseconds(4000));
+}
+
+TEST_CASE("healthcheck: first_pem_certificate returns only the first certificate block",
+          "[server][healthcheck]") {
+    const std::string a = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    const std::string b = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
+    CHECK(first_pem_certificate("").empty());
+    CHECK(first_pem_certificate("not a pem\n").empty());
+    CHECK(first_pem_certificate(a) == a);
+    CHECK(first_pem_certificate(a + b) == a);
+    // Whatever surrounds the block is dropped; the closing newline is normalised.
+    CHECK(first_pem_certificate("junk\n" + a.substr(0, a.size() - 1) + "\ntrailing") == a);
+    // A private key ahead of the certificate is skipped, never returned.
+    CHECK(first_pem_certificate("-----BEGIN PRIVATE KEY-----\nKKKK\n-----END PRIVATE KEY-----\n" +
+                                a + b) == a);
+    // An unterminated block is not a certificate.
+    CHECK(first_pem_certificate("-----BEGIN CERTIFICATE-----\nAAAA\n").empty());
+}
+
 TEST_CASE("healthcheck: only HTTP 200 is healthy", "[server][healthcheck]") {
     CHECK(healthcheck_exit_code({200, {}}) == 0);
     CHECK(healthcheck_exit_code({301, {}}) == 1);
@@ -142,7 +183,7 @@ TEST_CASE("healthcheck: only HTTP 200 is healthy", "[server][healthcheck]") {
           1);
 }
 
-TEST_CASE("healthcheck: the diagnostic is one line, names target and anchor, never the key path",
+TEST_CASE("healthcheck: the diagnostic is one line, names target and anchor - never the key path",
           "[server][healthcheck]") {
     Config cfg{};
     cfg.https_cert_path = "/op/server.pem";
@@ -190,7 +231,7 @@ TEST_CASE("healthcheck: control bytes in the target never split the diagnostic l
     CHECK(line.find("(trust anchor: /certs/an_chor_.pem)") != std::string::npos);
 }
 
-TEST_CASE("healthcheck: each diagnostic field is capped on its own, never the whole line",
+TEST_CASE("healthcheck: each diagnostic field is capped on its own - never the whole line",
           "[server][healthcheck]") {
     // healthcheck_diagnostic wraps log_key_token around the URL, the reason and the anchor
     // SEPARATELY: each over-long field keeps a 231-byte head, '~' and a 24-byte tail (256 bytes),
@@ -279,6 +320,23 @@ TEST_CASE("healthcheck: probe_bounded returns the outcome of a probe that finish
     CHECK(out->status == 200);
 }
 
+TEST_CASE("healthcheck: a probe thread that cannot be started is exit 1 and one line - no abort",
+          "[server][healthcheck]") {
+    // pthread_create failure (a pids limit) is not portably forceable, so inject the spawn.
+    // Mutation: without the try/catch in probe_bounded the system_error reaches Catch2 as an
+    // unexpected exception (and, in the real binary, SIGABRT with no line).
+    const auto out = probe_bounded(
+        std::chrono::seconds(2), [] { return HealthcheckOutcome{.status = 200, .error = {}}; },
+        [](std::packaged_task<HealthcheckOutcome()>&&) -> std::thread {
+            throw std::system_error(
+                std::make_error_code(std::errc::resource_unavailable_try_again));
+        });
+    REQUIRE(out.has_value());
+    CHECK(out->status == 0);
+    CHECK(out->error.starts_with("cannot start probe thread"));
+    CHECK(healthcheck_exit_code(*out) == 1);
+}
+
 namespace {
 
 // File-static so a plain function pointer (run_healthcheck's hard_exit hook, shaped like
@@ -290,7 +348,7 @@ void record_exit(int code) {
 
 } // namespace
 
-TEST_CASE("healthcheck: run_healthcheck cuts a hanging probe at the deadline, prints the timeout "
+TEST_CASE("healthcheck: run_healthcheck cuts a hanging probe at the deadline - prints the timeout "
           "line and exits 1",
           "[server][healthcheck]") {
     g_recorded_exit = -1;
@@ -314,7 +372,8 @@ TEST_CASE("healthcheck: run_healthcheck cuts a hanging probe at the deadline, pr
     CHECK(g_recorded_exit.load() == 1);
     CHECK(diag.str() == "healthcheck: GET http://127.0.0.1:" + std::to_string(cfg.web_port) +
                             "/readyz -> timed out after 50 ms (trust anchor: none)\n");
-    // Pinned in the header too: published in the server-admin Time row; compose's timeout is 5 s.
+    // Pinned in the header too: published in the server-admin Time row; the documented healthcheck
+    // timeout is 5 s (Compose's default is 30 s).
     CHECK(kProbeDeadline == std::chrono::milliseconds(4000));
 }
 
@@ -363,12 +422,12 @@ TEST_CASE("healthcheck: run_healthcheck turns an exception from the probe into e
     SECTION("std::bad_alloc, as httplib throws it on a huge Content-Length") {
         // what() is implementation-defined ("std::bad_alloc" vs MSVC's "bad allocation").
         run([](const HealthcheckTarget&) -> HealthcheckOutcome { throw std::bad_alloc{}; },
-            std::string{std::bad_alloc{}.what()});
+            std::string{"exception: "} + std::bad_alloc{}.what());
     }
     SECTION("another std::exception") {
         run([](const HealthcheckTarget&) -> HealthcheckOutcome {
             throw std::runtime_error{"boom"};
-        }, "boom");
+        }, "exception: boom");
     }
     SECTION("a non-std exception type") {
         struct NotStd {};
@@ -392,26 +451,28 @@ TEST_CASE("healthcheck: run_healthcheck ignores SIGPIPE before the probe runs",
     g_recorded_exit = -1;
     Config cfg{};
     cfg.https_enabled = false;
-    bool seen_ignored = false;
+    // Owned by the probe (like the sibling cases' abandoned-worker state), so a worker that
+    // outlives this frame writes into live memory.
+    auto seen_ignored = std::make_shared<std::atomic<bool>>(false);
     std::ostringstream diag;
     // Captured inside the probe, so this also proves the ordering: before the first socket I/O.
     const int code = run_healthcheck(
         cfg, "/readyz", diag,
-        [&seen_ignored](const HealthcheckTarget&) {
+        [seen_ignored](const HealthcheckTarget&) {
             struct sigaction sa{};
             sigaction(SIGPIPE, nullptr, &sa);
-            seen_ignored = (sa.sa_handler == SIG_IGN);
+            *seen_ignored = (sa.sa_handler == SIG_IGN);
             return HealthcheckOutcome{.status = 200, .error = {}};
         },
         kProbeDeadline, &record_exit);
 
     CHECK(code == 0);
-    CHECK(seen_ignored);
+    CHECK(seen_ignored->load());
 }
 #endif
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-TEST_CASE("healthcheck: a TLS target with no trust anchor is refused, never probed against the "
+TEST_CASE("healthcheck: a TLS target with no trust anchor is refused - never probed against the "
           "system store",
           "[server][healthcheck]") {
     // An empty CA path would make httplib's load_certs() fall back to the OS trust store.
@@ -532,7 +593,7 @@ TEST_CASE("healthcheck: default-CA mode verifies a leaf issued by the install CA
     CHECK(healthcheck_diagnostic(t, out).empty());
 }
 
-TEST_CASE("healthcheck: the probe trusts ONLY its anchor, never the system store",
+TEST_CASE("healthcheck: the probe trusts ONLY its anchor - never the system store",
           "[server][healthcheck][live]") {
     // httplib 0.37.1 load_certs() merges the OS trust store into the context when
     // no CA file path is set. After a connect the client's own store must hold
@@ -552,13 +613,16 @@ TEST_CASE("healthcheck: the probe trusts ONLY its anchor, never the system store
     const auto r = c->Get("/livez"); // triggers load_certs()
     REQUIRE(r);
     CHECK(r->status == 200);
-    auto* store = SSL_CTX_get_cert_store(static_cast<SSL_CTX*>(c->tls_context()));
+    auto* ctx = static_cast<SSL_CTX*>(c->tls_context());
+    auto* store = SSL_CTX_get_cert_store(ctx);
     REQUIRE(store != nullptr);
     CHECK(sk_X509_OBJECT_num(X509_STORE_get0_objects(store)) == 1);
+    // The stalled-responder case below measures this by timing only; pin the knob itself.
+    CHECK(SSL_CTX_get_quiet_shutdown(ctx) == 1);
     c.reset(); // explicit destroy (httplib 0.37.1 SSLClient destructor workaround)
 }
 
-TEST_CASE("healthcheck: operator mode anchors on the server certificate itself (partial chain), "
+TEST_CASE("healthcheck: operator mode anchors on the server certificate itself (partial chain) - "
           "hostname unchecked",
           "[server][healthcheck][live]") {
     // A CA-issued, SAN-less leaf, with its issuer ABSENT from the anchor file: it
@@ -588,6 +652,80 @@ TEST_CASE("healthcheck: operator mode anchors on the server certificate itself (
     CHECK(healthcheck_exit_code(control) == 1);
     CHECK(control.error.find("verification") != std::string::npos);
     CHECK(control.error.find("issuer") != std::string::npos);
+}
+
+TEST_CASE("healthcheck: operator mode with a full-chain file trusts only its first certificate",
+          "[server][healthcheck][live]") {
+    // D4: the anchor file is the server certificate followed by its issuing CA, as an operator's
+    // fullchain.pem is. Handing httplib the whole file would trust the CA too, and with the
+    // partial-chain flag and hostname checking off, any sibling leaf under that CA would pass.
+    // Mutation: load the file with set_ca_cert_path in operator mode and the sibling case below
+    // answers 200.
+    yuzu::test::TempDir tmp{"yuzu_test_healthcheck-"};
+    fs::create_directories(tmp.path / "l");
+    fs::create_directories(tmp.path / "sibling");
+    const auto ca = gwt::make_ca("hc-ca");
+    const auto leaf = gwt::make_leaf(ca, "hc-server", true, false);
+    const auto sibling = gwt::make_leaf(ca, "hc-sibling", true, false);
+    write_file(tmp.path / "fullchain.pem", leaf.cert_pem + ca.cert_pem);
+
+    auto srv = tls_server(tmp.path / "l", leaf);
+    const auto ok = probe_once(tls_target(srv->port, tmp.path / "fullchain.pem", true));
+    CHECK(ok.status == 200);
+
+    auto srv_sibling = tls_server(tmp.path / "sibling", sibling);
+    const auto refused =
+        probe_once(tls_target(srv_sibling->port, tmp.path / "fullchain.pem", true));
+    CHECK(refused.status == 0);
+    CHECK(healthcheck_exit_code(refused) == 1);
+    CHECK(refused.error.find("verification") != std::string::npos);
+    CHECK(refused.error.find("issuer") != std::string::npos);
+}
+
+TEST_CASE("healthcheck: operator mode loads exactly one certificate from a two-certificate file",
+          "[server][healthcheck][live]") {
+    // The trust-store count after a connect: 2 would mean the whole file was loaded.
+    yuzu::test::TempDir tmp{"yuzu_test_healthcheck-"};
+    fs::create_directories(tmp.path);
+    const auto ca = gwt::make_ca("hc-ca");
+    const auto leaf = gwt::make_leaf(ca, "hc-server", true, false);
+    write_file(tmp.path / "fullchain.pem", leaf.cert_pem + ca.cert_pem);
+    auto srv = tls_server(tmp.path, leaf);
+
+    auto c = make_tls_client(tls_target(srv->port, tmp.path / "fullchain.pem", true));
+    c->set_connection_timeout(1, 0);
+    c->set_read_timeout(2, 0);
+    const auto r = c->Get("/livez");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    auto* store = SSL_CTX_get_cert_store(static_cast<SSL_CTX*>(c->tls_context()));
+    REQUIRE(store != nullptr);
+    CHECK(sk_X509_OBJECT_num(X509_STORE_get0_objects(store)) == 1);
+    c.reset(); // explicit destroy (httplib 0.37.1 SSLClient destructor workaround)
+}
+
+TEST_CASE("healthcheck: an anchor that cannot be loaded fails as a loading error naming the anchor",
+          "[server][healthcheck][live]") {
+    // Operator mode falls back to set_ca_cert_path when the file is missing or holds no
+    // certificate, so the diagnostic stays httplib's own `SSL certificate loading failed`
+    // rather than a misleading verification failure.
+    yuzu::test::TempDir tmp{"yuzu_test_healthcheck-"};
+    fs::create_directories(tmp.path);
+    const auto ca = gwt::make_ca("hc-ca");
+    const auto leaf = gwt::make_leaf(ca, "hc-server", true, false);
+    write_file(tmp.path / "garbage.pem", "this is not a certificate\n");
+    auto srv = tls_server(tmp.path, leaf);
+
+    for (const bool operator_mode : {true, false}) {
+        for (const char* name : {"missing.pem", "garbage.pem"}) {
+            INFO("operator_mode: " << operator_mode << ", anchor: " << name);
+            const auto t = tls_target(srv->port, tmp.path / name, operator_mode);
+            const auto out = probe_once(t);
+            CHECK(out.status == 0);
+            CHECK(out.error.find("loading") != std::string::npos);
+            CHECK(healthcheck_diagnostic(t, out).find(name) != std::string::npos);
+        }
+    }
 }
 
 TEST_CASE("healthcheck: a leaf from another CA is refused with the OpenSSL reason",

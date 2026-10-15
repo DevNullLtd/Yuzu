@@ -12,9 +12,10 @@
 ///   - HTTPS on (the default) -> https://<host>:<https_port>, verified against
 ///     ONLY a trust anchor: `<ca_dir|default_cert_dir>/default-ca.pem` in
 ///     default-certs mode (server.cpp's `https_needs` branch), or the
-///     `--https-cert` file itself, as a partial-chain anchor, in operator mode.
-///     Never the system trust store; hostname is not checked (the probe dials a
-///     loopback address the operator certificate was never issued for).
+///     first certificate in the `--https-cert` file (the server certificate
+///     itself), as a partial-chain anchor, in operator mode. Never the system
+///     trust store; hostname is not checked (for a wildcard bind the probe dials
+///     loopback, an address the operator certificate was never issued for).
 ///   - `--no-https` -> http://<host>:<web_port>, no anchor.
 ///   - A build without CPPHTTPLIB_OPENSSL_SUPPORT serves plain HTTP on web_port
 ///     even when https_enabled (server.cpp, start_web_server), so the probe does
@@ -53,6 +54,23 @@ struct HealthcheckOutcome {
     if (bind_address == "::")
         return "::1";
     return std::string{bind_address};
+}
+
+/// The first `BEGIN CERTIFICATE`..`END CERTIFICATE` block of a PEM bundle, markers and a
+/// closing newline included; empty when there is none (or the block is unterminated).
+/// Operator mode anchors the probe on this block only (#5906, D4): a full-chain
+/// `--https-cert` file also carries the issuing intermediate, and trusting that would let any
+/// sibling leaf under it pass, with hostname checking off.
+[[nodiscard]] inline std::string first_pem_certificate(std::string_view pem) {
+    constexpr std::string_view kBegin = "-----BEGIN CERTIFICATE-----";
+    constexpr std::string_view kEnd = "-----END CERTIFICATE-----";
+    const auto b = pem.find(kBegin);
+    if (b == std::string_view::npos)
+        return {};
+    const auto e = pem.find(kEnd, b + kBegin.size());
+    if (e == std::string_view::npos)
+        return {};
+    return std::string{pem.substr(b, e + kEnd.size() - b)} + '\n';
 }
 
 /// `default_cert_dir` and `tls_supported` are injected so a test never touches

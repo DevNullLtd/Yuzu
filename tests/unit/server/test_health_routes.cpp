@@ -1,10 +1,10 @@
 /// @file test_health_routes.cpp
-/// HTTP-level coverage for the 6-route Health/Infra cluster (#2542 PR-10) —
+/// HTTP-level coverage for the 7-route Health/Infra cluster (#2542 PR-10) —
 /// driven in-process through TestRouteSink (no httplib acceptor, #438),
 /// mirroring test_result_set_routes.cpp's / test_page_routes.cpp's Harness
 /// shape — except the one [live] case at the end, which binds a real loopback
 /// listener to cover install_plaintext_redirect_pre_routing. None of
-/// these 6 routes touches Postgres directly through this harness (every store
+/// these 7 routes touches Postgres directly through this harness (every store
 /// pointer defaults to null and the handlers'
 /// `store && store->is_open()` idiom degrades to "not open" — a REAL
 /// degraded-dependency case, not a mock), so every case here runs without
@@ -46,7 +46,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -615,7 +617,7 @@ TEST_CASE("health_routes: /fragments/health/summary renders the WARN strip "
 // handlers are correct, but nothing above reads server.cpp — a future edit
 // that drops the production `register_health_routes(...)` call at
 // server.cpp's registration site would leave every case above green while
-// the real server 404s all 6 routes (custom_properties_routes'/
+// the real server 404s all 7 routes (custom_properties_routes'/
 // result_set_routes' PR-4/PR-5 precedent for this tripwire). It also pins the
 // #5906 wiring the unit harness cannot see (ServerImpl needs Postgres): the
 // plaintext redirect listener's probe routes and their 503 gate.
@@ -664,8 +666,38 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            "web_server_->is_running(); }",
            1, "the plaintext probes are gated on the HTTPS listener actually running");
     // One closed probe set shared by the main pre-routing chokepoint.
-    expect("health::is_probe_path(req.path)", 1,
+    expect("if (yuzu::server::health::is_probe_path(req.path)) {", 1,
            "main pre-routing exempts probes through the one shared predicate");
+    // The sink the probes register on must exist before register_health_routes is handed it:
+    // deleting the construction leaves a null sink, which silently registers nothing.
+    expect("redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_)", 1,
+           "the redirect listener's route sink is built");
+    {
+        const auto built =
+            flat.find(squeeze("redirect_sink_ = std::make_unique<HttplibRouteSink>("));
+        const auto handed = flat.find(squeeze(".plaintext_probe_sink = redirect_sink_.get()"));
+        CHECK(built != std::string::npos);
+        CHECK(handed != std::string::npos);
+        CHECK(built < handed);
+    }
+    // #5906 gate fixes: the redirect listener's eager fixed pool, its security headers and
+    // request counter, and the bounded shutdown wait that covers its thread.
+    expect("redirect_server_->new_task_queue = [redirect_pool]", 1,
+           "the redirect listener has its own fixed pool, not httplib's dynamic default");
+    expect("new httplib::ThreadPool(redirect_pool, redirect_pool)", 1,
+           "base == max: the dynamic-growth branch stays dead");
+    expect("install_plaintext_post_routing(*redirect_server_", 1,
+           "the redirect listener installs the shared post-routing handler");
+    expect("HeaderBundle::make(cfg_.csp_extra_sources, /*https_enabled=*/false)", 1,
+           "the redirect listener's headers carry no HSTS");
+    expect("redirect_thread_done_ = true;", 1,
+           "the redirect thread signals stop()'s bounded wait");
+    expect("(redirect_thread_done_ || !redirect_thread_.joinable())", 1,
+           "stop() waits for the redirect thread inside the one 15s bound");
+    expect("no plausible hang scenario", 0,
+           "the false 'cannot hang' comment (and its bare join) stays gone");
+    expect("listener failed to bind or exited with an error", 2,
+           "both listen() results are checked and logged");
     // The redirect listener exists only behind the guard, and is built at exactly one site.
     expect("if (cfg_.https_enabled && cfg_.https_redirect)", 1,
            "the redirect listener is built only when HTTPS and the redirect are on");
@@ -957,6 +989,14 @@ TEST_CASE("health_routes: plaintext /health never resolves a session, even with 
         CHECK_FALSE(body["agents"].contains("pending"));
         CHECK_FALSE(body.contains("executions"));
         CHECK_FALSE(body.contains("system"));
+        // An allowlist, not just a denylist: a future unauthenticated top-level key would
+        // otherwise start travelling over plaintext untested.
+        std::set<std::string> keys;
+        for (const auto& [k, v] : body.items())
+            keys.insert(k);
+        CHECK(keys == std::set<std::string>{"status", "uptime_seconds", "agents", "stores",
+                                            "version", "tls"});
+        CHECK(body["agents"] == json{{"online", 0}});
     }
 
     // The main sink on the same harness still shows the authenticated-only fields.
@@ -1057,6 +1097,16 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
           "[server][routes][health_routes][plaintext][live]") {
     httplib::Server srv;
     health::install_plaintext_redirect_pre_routing(srv, "127.0.0.1", 8443);
+    // The request counter's view: one (method, status) per response, recorded on the worker
+    // thread before the reply is written.
+    std::mutex seen_mu;
+    std::vector<std::pair<std::string, int>> seen;
+    health::install_plaintext_post_routing(
+        srv, security::HeaderBundle::make("", /*https_enabled=*/false),
+        [&](const httplib::Request& req, const httplib::Response& res) {
+            std::lock_guard<std::mutex> lk(seen_mu);
+            seen.emplace_back(req.method, res.status);
+        });
     HttplibRouteSink plain{srv};
 
     Harness h;
@@ -1084,42 +1134,77 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
     // No content coding, so the HEAD Content-Length equals the decoded GET body size.
     cli.set_default_headers({{"Accept-Encoding", "identity"}});
 
+    // The five security headers ride every answer, probe or redirect, and never HSTS.
+    const auto expect_security_headers = [](const httplib::Result& r) {
+        REQUIRE(r);
+        CHECK(r->has_header("Content-Security-Policy"));
+        CHECK(r->get_header_value("X-Frame-Options") == "DENY");
+        CHECK(r->get_header_value("X-Content-Type-Options") == "nosniff");
+        CHECK(r->has_header("Referrer-Policy"));
+        CHECK(r->has_header("Permissions-Policy"));
+        CHECK_FALSE(r->has_header("Strict-Transport-Security"));
+    };
+    // Exactly one counter observation per request, with that request's status.
+    const auto counted = [&](std::size_t n, const char* method, int status) {
+        std::lock_guard<std::mutex> lk(seen_mu);
+        REQUIRE(seen.size() == n);
+        CHECK(seen.back().first == method);
+        CHECK(seen.back().second == status);
+    };
+
     auto get = cli.Get("/livez");
     REQUIRE(get);
     CHECK(get->status == 200);
     CHECK(json::parse(get->body)["status"] == "ok");
+    expect_security_headers(get);
+    counted(1, "GET", 200);
 
     auto head = cli.Head("/livez");
     REQUIRE(head);
     CHECK(head->status == 200);
     CHECK(head->body.empty());
     CHECK(head->get_header_value("Content-Length") == std::to_string(get->body.size()));
+    counted(2, "HEAD", 200);
 
     auto post = cli.Post("/livez", "", "application/json");
     REQUIRE(post);
     CHECK(post->status == 301);
+    counted(3, "POST", 301);
 
-    // GET /livez that declares a body stays a 301: is_plaintext_probe_request declines it.
-    // That httplib runs pre-routing before reading a body (so this listener never buffers
-    // one) is a property of the pinned httplib, proven by test_body_cap_policy.cpp's
-    // raw-socket case; this case proves only the predicate's answer.
+    // A GET /livez carrying a Content-Length header (even 0) stays a 301:
+    // is_plaintext_probe_request declines it. That httplib runs pre-routing before reading a
+    // body (so this listener never buffers one) is a property of the pinned httplib, proven by
+    // test_body_cap_policy.cpp's raw-socket case; this case proves only the predicate's answer.
+    // Content-Length: 0 and no body byte: the predicate declines any Content-Length, and
+    // sending a real byte to a listener that answers before reading it risks the RST that loses
+    // the buffered reply on Windows (#2757, test_loopback_http.hpp).
     httplib::Request with_body;
     with_body.method = "GET";
     with_body.path = "/livez";
-    with_body.set_header("Content-Length", "1");
-    with_body.body = "x";
+    with_body.set_header("Content-Length", "0");
     auto sent = cli.send(with_body);
     REQUIRE(sent);
     CHECK(sent->status == 301);
+    counted(4, "GET", 301);
 
     auto login = cli.Get("/login");
     REQUIRE(login);
     CHECK(login->status == 301);
     CHECK(login->get_header_value("Location") == "https://127.0.0.1:8443/login");
+    expect_security_headers(login);
+    counted(5, "GET", 301);
+
+    // A decoded control byte makes set_redirect a silent no-op (empty 200); it must answer 400.
+    // Mutation: drop the status check in the redirect handler and this reads 200.
+    auto ctrl = cli.Get("/livez%00");
+    REQUIRE(ctrl);
+    CHECK(ctrl->status == 400);
+    counted(6, "GET", 400);
 
     auto query = cli.Get("/login?x=1");
     REQUIRE(query);
     CHECK(query->status == 301);
+    counted(7, "GET", 301);
     const auto loc = query->get_header_value("Location");
     CHECK(loc.size() >= 4);
     CHECK(loc.substr(loc.size() - 4) == "?x=1");
@@ -1129,5 +1214,7 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
     REQUIRE(down);
     CHECK(down->status == 503);
     CHECK(json::parse(down->body)["reason"] == "https_listener_not_serving");
+    expect_security_headers(down);
+    counted(8, "GET", 503);
 }
 #endif // !YUZU_HEALTH_ROUTES_LIVE_TSAN

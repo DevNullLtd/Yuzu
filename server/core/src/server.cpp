@@ -10298,14 +10298,12 @@ public:
 
         // cert_reloader_/redirect_server_/web_server_ were already stopped
         // early, above (#2703 Gate 7 item 2) — just the joins remain here.
-        // redirect_thread_ gets a bare join: the redirect server's handlers are
-        // the 301 and the four health-probe routes, which do no I/O and hold
-        // nothing open (snapshot()/is_open() reads only, health_routes.cpp), so
-        // unlike web_thread_ it has no plausible hang scenario and does not need
-        // the bounded treatment below.
-        if (redirect_thread_.joinable()) {
-            redirect_thread_.join();
-        }
+        // redirect_thread_ is NOT given a bare join (#5906): its handlers do no I/O, but
+        // httplib has only per-recv socket timeouts and ThreadPool::shutdown() joins every
+        // worker, so one peer trickling header bytes holds a worker, and so listen()'s return,
+        // for as long as it keeps trickling; and Server::stop() is a no-op before listen_internal
+        // sets is_running_, so a SIGTERM racing startup leaves listen() running with nothing to
+        // stop it. It shares the bounded wait below with web_thread_.
 
         // #2703 Gate 7 merge-slice item 2 (operator-adjudicated: 15s
         // shutdown grace bound). std::thread has no timed join, so
@@ -10333,19 +10331,29 @@ public:
         // by the write timeout rather than the tick — the close-signals above
         // wake a WAITING pump, not one already mid-write) or a genuinely
         // wedged handler unrelated to any stream.
-        if (web_thread_.joinable()) {
+        if (web_thread_.joinable() || redirect_thread_.joinable()) {
             // #3007 governance (sre, unhappy-path UP-7/UP-8): stop() now runs off the
             // signal handler, so this wait is silent-by-design up to 15s with no
             // progress evidence — indistinguishable from a genuine wedge to an operator
             // watching logs. One line here costs nothing and closes that gap.
-            spdlog::info("Shutting down server: waiting up to 15s for the web listener "
-                         "thread to finish...");
+            spdlog::info("Shutting down server: waiting up to 15s for the web and redirect "
+                         "listener threads to finish...");
             std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
+            // One 15s bound covers both listeners. A listener thread that was never started
+            // (not joinable) counts as done.
             const bool finished = web_thread_done_cv_.wait_for(
-                lk, std::chrono::seconds(15), [this] { return web_thread_done_; });
+                lk, std::chrono::seconds(15), [this] {
+                    return (web_thread_done_ || !web_thread_.joinable()) &&
+                           (redirect_thread_done_ || !redirect_thread_.joinable());
+                });
+            const bool web_wedged = web_thread_.joinable() && !web_thread_done_;
+            const bool redirect_wedged = redirect_thread_.joinable() && !redirect_thread_done_;
             lk.unlock();
             if (finished) {
-                web_thread_.join();
+                if (web_thread_.joinable())
+                    web_thread_.join();
+                if (redirect_thread_.joinable())
+                    redirect_thread_.join();
             } else {
                 // #3007: stop() now runs on an ordinary thread (main.cpp's shutdown
                 // watcher / a Windows console-handler thread), never inside a real OS
@@ -10353,13 +10361,16 @@ public:
                 // anyway: std::_Exit() below skips atexit handling and any buffered
                 // spdlog sink flush, so a log call here could be silently lost — this
                 // write() is guaranteed to reach stderr before the process ends.
-                const char msg[] =
-                    "ServerImpl::stop: web thread did not finish within the 15s shutdown "
-                    "grace bound (#2703 Gate 7 item 2) - force-exiting.\n";
+                std::string msg = "ServerImpl::stop: ";
+                msg += web_wedged ? (redirect_wedged ? "web and redirect listener threads"
+                                                     : "web listener thread")
+                                  : "redirect listener thread";
+                msg += " did not finish within the 15s shutdown grace bound (#2703 Gate 7 "
+                       "item 2, #5906) - force-exiting.\n";
 #ifdef _WIN32
-                _write(2, msg, sizeof(msg) - 1);
+                _write(2, msg.data(), static_cast<unsigned>(msg.size()));
 #else
-                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+                (void)::write(STDERR_FILENO, msg.data(), msg.size());
 #endif
                 std::_Exit(1);
             }
@@ -15425,8 +15436,36 @@ private:
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         if (cfg_.https_enabled && cfg_.https_redirect) {
             redirect_server_ = std::make_unique<httplib::Server>();
+            // Eager fixed pool, not httplib's default dynamic one (as web_server_ above): the
+            // default grows by spawning a std::thread inside enqueue on the accept loop with no
+            // handler, so a thread-create failure under load would std::terminate; base == max
+            // kills that branch by construction, and a failure to spawn the pool happens at boot,
+            // before any traffic. The size is httplib's own default MAXIMUM (4 x max(8, hw-1)),
+            // so concurrent-connection capacity is exactly what it was.
+            const std::size_t redirect_pool = CPPHTTPLIB_THREAD_POOL_MAX_COUNT;
+            redirect_server_->new_task_queue = [redirect_pool] {
+                return new httplib::ThreadPool(redirect_pool, redirect_pool);
+            };
             yuzu::server::health::install_plaintext_redirect_pre_routing(
                 *redirect_server_, cfg_.web_address, cfg_.https_port);
+            // The main listener's SOC2-C1 response headers, minus HSTS (RFC 6797 s7.2: no STS
+            // over a non-secure transport) and upgrade-insecure-requests, plus the request
+            // counter. Not the main handler's other work: no engine-class stash is ever written
+            // on these workers (principal_class_resolved reduces to the presentation class), no
+            // quota slot is admitted, and no CORS applies to a listener that only redirects or
+            // answers the four probes.
+            yuzu::server::health::install_plaintext_post_routing(
+                *redirect_server_,
+                security::HeaderBundle::make(cfg_.csp_extra_sources, /*https_enabled=*/false),
+                [this](const httplib::Request& req, const httplib::Response& res) {
+                    metrics_
+                        .counter("yuzu_http_requests_total",
+                                 {{"method", req.method},
+                                  {"status", std::to_string(res.status)},
+                                  {"principal_class",
+                                   std::string(principal_class_resolved(req))}})
+                        .increment();
+                });
         }
 #endif
         if (redirect_server_)
@@ -21430,9 +21469,20 @@ private:
             // of the pre-routing chokepoint.
             if (redirect_server_) {
                 redirect_thread_ = std::thread([this] {
-                    spdlog::info("HTTP→HTTPS redirect on http://{}:{}/", cfg_.web_address,
-                                 cfg_.web_port);
-                    redirect_server_->listen(cfg_.web_address, cfg_.web_port);
+                    spdlog::info("HTTP→HTTPS redirect on http://{}:{}/ (health probes served "
+                                 "directly)",
+                                 cfg_.web_address, cfg_.web_port);
+                    // listen() returns false on a failed bind or a fatal accept error (and true
+                    // after stop()); the flag below is set either way so stop()'s wait ends.
+                    if (!redirect_server_->listen(cfg_.web_address, cfg_.web_port))
+                        spdlog::error(
+                            "Redirect listener failed to bind or exited with an error on {}:{}",
+                            cfg_.web_address, cfg_.web_port);
+                    {
+                        std::lock_guard<std::mutex> lk(web_thread_done_mtx_);
+                        redirect_thread_done_ = true;
+                    }
+                    web_thread_done_cv_.notify_all();
                 });
             }
         }
@@ -21444,7 +21494,12 @@ private:
             } else {
                 spdlog::info("Web UI available at http://{}:{}/", cfg_.web_address, listen_port);
             }
-            web_server_->listen(cfg_.web_address, listen_port);
+            if (!web_server_->listen(cfg_.web_address, listen_port))
+                spdlog::error("Web listener failed to bind or exited with an error on {}:{}{}",
+                              cfg_.web_address, listen_port,
+                              cfg_.https_enabled && cfg_.https_redirect
+                                  ? "; plain-port probes answer 503 https_listener_not_serving"
+                                  : "");
             // #2703 Gate 7 item 2: listen() returned (every worker drained back
             // into the pool and the pool itself joined — see httplib's
             // ThreadPool::shutdown()), so this thread is about to exit. Signal
@@ -21822,6 +21877,9 @@ private:
     // must outlive start_web_server().
     std::unique_ptr<HttplibRouteSink> redirect_sink_;
     std::thread redirect_thread_;
+    // #5906: like web_thread_done_ (same mutex and cv), signalled by the redirect thread's body
+    // once listen() returns, so stop()'s one bounded wait covers both listeners.
+    bool redirect_thread_done_{false};
 
     // Certificate hot-reload
     std::unique_ptr<CertReloader> cert_reloader_;

@@ -257,7 +257,7 @@ Example:
   --https-key /etc/yuzu/server.key
 ```
 
-When `--https` is enabled, plain HTTP requests are redirected to HTTPS by default, except `GET`/`HEAD` on the four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`), which are served directly. Pass `--no-https-redirect` to not start the HTTP listener at all (HTTPS only; see server-admin.md).
+When HTTPS is enabled (the default), plain HTTP requests are redirected to HTTPS by default, except `GET`/`HEAD` on the four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`), which are served directly. Pass `--no-https-redirect` to not start the HTTP listener at all (HTTPS only; see server-admin.md).
 
 ```bash
 # Verify HTTPS is working

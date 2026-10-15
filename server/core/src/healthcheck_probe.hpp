@@ -12,26 +12,35 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <iosfwd>
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <thread>
 
 namespace yuzu::server::healthcheck {
 
 /// Absolute cap over the whole `--healthcheck` probe, name resolution and TLS handshake
-/// included. 1 s of headroom under compose's 5 s healthcheck timeout covers exec, CLI parse,
-/// the diagnostic write and exit; published verbatim in the server-admin "Time" row.
+/// included. 1 s of headroom under the documented 5 s healthcheck timeout (Compose's own
+/// default is 30 s) covers exec, CLI parse, the diagnostic write and exit; published verbatim
+/// in the server-admin "Time" row, together with the per-phase bounds below.
 inline constexpr std::chrono::milliseconds kProbeDeadline{4000};
 static_assert(kProbeDeadline < std::chrono::seconds(5),
-              "must stay under compose's 5 s healthcheck timeout");
+              "must stay under the documented 5 s healthcheck timeout");
+inline constexpr int kConnectSec = 1;   ///< TCP connect
+inline constexpr int kWriteSec = 1;     ///< socket write
+inline constexpr int kReadSec = 2;      ///< socket read
+inline constexpr int kRequestMs = 3000; ///< whole-request ceiling (probe_once default)
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 /// The configure half of the TLS probe, exposed so a test can inspect the
-/// client's trust store after a connect. Loads the anchor via
-/// set_ca_cert_path only (never the system store); verification on, hostname
-/// check off, redirects not followed. Returns nullptr when the target has no
-/// trust anchor: an empty CA path would make httplib fall back to the OS store.
+/// client's trust store after a connect. Loads the anchor from the CA file or a PEM
+/// block only (never the system store); verification on, hostname
+/// check off, redirects not followed. Operator mode (`partial_chain`) anchors on the first
+/// certificate of the anchor file only (first_pem_certificate). Returns nullptr when the
+/// target has no trust anchor: an empty CA path would make httplib fall back to the OS store.
+/// Throws std::runtime_error when OpenSSL cannot create a client context.
 [[nodiscard]] std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& target);
 #endif
 
@@ -42,16 +51,28 @@ static_assert(kProbeDeadline < std::chrono::seconds(5),
 /// ceiling handed to httplib::set_max_timeout; it does not cover name
 /// resolution or the TLS handshake (see probe_bounded).
 [[nodiscard]] HealthcheckOutcome probe_once(const HealthcheckTarget& target,
-                                            int max_total_ms = 3000);
+                                            int max_total_ms = kRequestMs);
+
+/// The worker-thread factory probe_bounded calls.
+using ProbeSpawn = std::thread (*)(std::packaged_task<HealthcheckOutcome()>&&);
+
+/// Starts the probe worker; the production `spawn` of probe_bounded. A test injects a spawn
+/// that throws to prove the thread-creation failure path, which cannot be forced portably.
+inline std::thread start_probe_thread(std::packaged_task<HealthcheckOutcome()>&& task) {
+    return std::thread(std::move(task));
+}
 
 /// Runs `probe` on a worker thread and waits up to `deadline` for it. Returns
 /// its outcome if it finished, or nullopt if the deadline came first, in which
 /// case the worker is detached: it is blocked inside httplib/OpenSSL, which
 /// offers no cancellation. The caller must not return into code that tears
 /// down process state (exit via std::_Exit); the worker owns everything it
-/// touches, so abandoning it is safe until then.
+/// touches, so abandoning it is safe until then. If `spawn` throws
+/// std::system_error the result is a present outcome (status 0, "cannot start probe
+/// thread: ..."), never an exception.
 [[nodiscard]] std::optional<HealthcheckOutcome>
-probe_bounded(std::chrono::milliseconds deadline, std::function<HealthcheckOutcome()> probe);
+probe_bounded(std::chrono::milliseconds deadline, std::function<HealthcheckOutcome()> probe,
+              ProbeSpawn spawn = &start_probe_thread);
 
 /// Entry point for `yuzu-server --healthcheck`. Writes one diagnostic line to
 /// `diag` on failure and nothing on success; returns the process exit code. The
@@ -60,7 +81,9 @@ probe_bounded(std::chrono::milliseconds deadline, std::function<HealthcheckOutco
 /// failure (exit 1, one line naming it). The three trailing parameters are the injection
 /// points a test drives; the defaults ARE production: `probe_once`,
 /// `kProbeDeadline` and `std::_Exit`. On POSIX it also sets SIGPIPE to ignored
-/// before the first socket write (see healthcheck_probe.cpp).
+/// before the first socket write (see healthcheck_probe.cpp). `std::_Exit` is the same
+/// primitive ServerImpl::stop() uses to force-exit past a wedged web thread: the abandoned
+/// worker captures state that normal teardown would destroy under it.
 [[nodiscard]] int run_healthcheck(
     const Config& cfg, std::string_view path, std::ostream& diag,
     std::function<HealthcheckOutcome(const HealthcheckTarget&)> probe =

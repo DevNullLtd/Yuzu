@@ -274,7 +274,8 @@ function effectiveCertSans(c) {
 function generateCompose(c) {
   // HTTPS is served unless plaintext mode explicitly disables it. In TLS modes
   // the dashboard/API is HTTPS on container port 8443 (8080 is an HTTP→HTTPS
-  // redirect, except the four health-probe GETs, served directly); plaintext serves HTTP on 8080 (#1484).
+  // redirect, except the four health-probe GETs, served directly); plaintext
+  // serves HTTP on 8080 (#1484).
   const tls = c.tlsMode !== 'plaintext';
   const webScheme = tls ? 'https' : 'http';
   const webContainerPort = tls ? 8443 : 8080;

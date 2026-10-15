@@ -51,9 +51,12 @@
 ///     gate can answer 200 for that drain window; new connections are refused
 ///     throughout it. The gate exists because the redirect listener runs on its
 ///     own thread and would otherwise report healthy for a server whose only
-///     real listener failed to bind. The four routes register on the SAME
-///     handler objects as the main sink (`/health` through a second thin closure
-///     over the ONE shared `health_body`).
+///     real listener failed to bind. `/livez` and `/readyz` are the same handlers
+///     as the main sink's, wrapped by the 503 gate; `/health` and `/api/health` go
+///     through a second thin closure over the ONE shared `health_body`.
+///     The redirect listener's responses carry the five security headers (no
+///     HSTS) and are counted in `yuzu_http_requests_total` through
+///     `install_plaintext_post_routing`; the 301s are counted too.
 ///   - `/fragments/health/summary` is the one route in this cluster that
 ///     genuinely requires a session: `deps.deny_service_scoped_fn` first
 ///     (guardian-confinement-2298 PR3 §3e — service-scoped tokens denied),
@@ -101,7 +104,7 @@
 /// The corresponding `ServerImpl::nvd_metrics_scrape_mu_` member declaration
 /// is deleted from server.cpp by this extraction (dead after the move).
 ///
-/// Routes (6), plus /livez, /readyz, /health and /api/health again on
+/// Routes (7), plus /livez, /readyz, /health and /api/health again on
 /// `deps.plaintext_probe_sink` when set:
 ///   GET /metrics                    (unauthenticated from 127.0.0.1/::1 always;
 ///                                     remote depends on cfg_.metrics_require_auth
@@ -118,6 +121,7 @@
 ///   GET /fragments/health/summary   (deny_service_scoped_fn THEN auth_fn)
 
 #include "authz_gates.hpp" // authz::FleetReadGate (Dashboard health panel)
+#include "security_headers.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -220,6 +224,8 @@ namespace health {
 /// reads a body (httplib.h:11337-11413), so declining those keeps the plaintext
 /// listener from ever buffering one. That ordering is a dependency on httplib
 /// 0.37.1 — a version that read the body first would invalidate this reasoning.
+/// Because no body is ever admitted here, this listener needs no row in
+/// `body_cap_policy.hpp`'s table (the #2407 routed-concerns row).
 [[nodiscard]] inline bool is_plaintext_probe_request(const httplib::Request& req) {
     return (req.method == "GET" || req.method == "HEAD") && is_probe_path(req.path) &&
            !req.has_header("Content-Length") && !req.has_header("Transfer-Encoding");
@@ -232,6 +238,18 @@ namespace health {
 /// server.cpp, so a real-listener test covers the production wiring (#5906).
 void install_plaintext_redirect_pre_routing(httplib::Server& srv, std::string web_address,
                                             int https_port);
+
+/// The redirect listener's post-routing handler (#5906): applies `headers` (the five security
+/// response headers every other HTTP response carries, SOC2-C1) and then calls `on_response`
+/// (the request counter; may be empty). The caller builds `headers` for a non-HTTPS bundle
+/// (`HeaderBundle::make(extras, /*https_enabled=*/false)`), which omits
+/// Strict-Transport-Security (RFC 6797 s7.2: no STS over a non-secure transport) and
+/// upgrade-insecure-requests. Deliberately nothing else from the main listener's post-routing
+/// handler: no engine-class stash (never written on this listener's workers), no quota slot, no
+/// CORS.
+void install_plaintext_post_routing(
+    httplib::Server& srv, security::HeaderBundle headers,
+    std::function<void(const httplib::Request&, const httplib::Response&)> on_response);
 
 /// Construction deps for `register_health_routes`. Every closure/pointer is
 /// bound once at start_web_server() time in server.cpp and never reseated.
@@ -363,7 +381,7 @@ struct Deps {
     NvdSyncManager* nvd_sync{nullptr};
 };
 
-/// Register all 6 Health/Infra routes against `sink` (and the four probes on
+/// Register all 7 Health/Infra routes against `sink` (and the four probes on
 /// `deps.plaintext_probe_sink` when set). Throws `std::invalid_argument` if
 /// `deps.cfg` or `deps.metrics` is null, or if a plaintext sink is given
 /// without `main_listener_serving_fn` — see this file's header comment.

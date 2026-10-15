@@ -1123,8 +1123,25 @@ void install_plaintext_redirect_pre_routing(httplib::Server& srv, std::string we
                     first = false;
                 }
             }
+            // set_redirect (void in httplib 0.37.1) silently ignores a location carrying a
+            // CR/LF/control byte (a decoded %00 in the path) and leaves the status unset, which
+            // would answer an empty 200.
             res.set_redirect(location, 301);
+            if (res.status != 301)
+                res.status = 400;
             return httplib::Server::HandlerResponse::Handled;
+        });
+}
+
+void install_plaintext_post_routing(
+    httplib::Server& srv, security::HeaderBundle headers,
+    std::function<void(const httplib::Request&, const httplib::Response&)> on_response) {
+    srv.set_post_routing_handler(
+        [headers = std::move(headers), on_response = std::move(on_response)](
+            const httplib::Request& req, httplib::Response& res) {
+            headers.apply(res);
+            if (on_response)
+                on_response(req, res);
         });
 }
 
