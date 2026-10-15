@@ -317,6 +317,14 @@ Read-only MCP to Full access, and an empty request switched MCP off. It now requ
 changed otherwise. The rebuilt panel always sends both. A script that posted a single field must
 send both.
 
+### vNEXT - changing an account's role or granting elevation eligibility needs your own administrator role (breaking for elevation-only operators)
+
+**What changed.** `POST /api/settings/users/{username}/role` and the grant form (`eligible=true`) of `POST /api/v1/users/{username}/elevation-eligibility` refuse, with `403`, a session that is administrator only through a temporary elevation. The attempt is audited (`elevated_session_role_change_blocked`, `elevated_session_eligibility_grant_blocked`).
+
+**Who this affects.** Operators who rely on an elevated session to change roles or grant eligibility, in particular deployments where every administrator is an elevation-eligible `user` account.
+
+**What to do.** Make the change from an account whose own role is `admin` (a local administrator, or a member of the identity provider's administrator group). Revoking eligibility is still allowed during an elevation.
+
 ### vNEXT - `--gateway-upstream` refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs)
 
 The gateway-upstream service now admits only a gateway whose certificate key (SPKI SHA-256) is pinned, carries `serverAuth` and is inside its validity window, and the server **exits at boot, before binding a port,** when `--gateway-upstream` is set and that cannot be arranged. Who is affected and what to do:
@@ -3382,6 +3390,7 @@ The server emits an audit event on every branch:
 | Role changed | `success` | `old_role=user,new_role=admin` (or vice versa) |
 | Same role requested | `no_op` | `same_role=admin` (or `user`) |
 | Self-target rejected | `denied` | `self_role_change_blocked` |
+| Caller is an administrator only through a temporary elevation | `denied` | `elevated_session_role_change_blocked` (HTTP 403) |
 | Invalid username | `denied` | `invalid_username` |
 | Invalid JSON body | `denied` | `invalid_json` |
 | Missing `role` field | `denied` | `missing_role` |
@@ -3391,6 +3400,10 @@ The server emits an audit event on every branch:
 | Account deactivated between the route's lookup and the write, `admin` requested | `denied` | `inactive_promotion_refused` (HTTP 409; an account already inactive when the request arrives is `user_not_found`, HTTP 404) |
 | Role store unavailable, or the guard is not wired | `failure` | `store_failure` (HTTP 503, no retry hint: the change may or may not have been applied, so check the user's role and revoke the user's sessions) |
 | Role changed but session cleanup failed | `partial` | `role_changed session_wipe_failed=true old_role=<r> new_role=<r>` (HTTP 503, no retry hint: revoke the user's sessions) |
+
+> **Changing a role needs your own administrator role.** A session that is
+> administrator only through a temporary elevation (`POST /api/v1/elevate`) is
+> refused with HTTP 403: an account role is a standing grant, an elevation is not.
 
 > **You cannot change your own role.** The endpoint rejects self-target
 > with HTTP 403, audited as `denied:self_role_change_blocked`. The same
