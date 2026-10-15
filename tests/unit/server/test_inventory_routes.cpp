@@ -605,7 +605,7 @@ TEST_CASE("software routes: any degraded read is the retry banner with an audite
     REQUIRE(contains(res->body, "hx-get=\"/fragments/inventory/software\" hx-target"));
     REQUIRE_FALSE(contains(res->body, "(503)"));
     auto filtered = h.sink.Get(std::string(kSoftware) + "?kind=app");
-    REQUIRE(contains(filtered->body, "data-act=\"retry\" style=\"margin-left:.6rem\" "
+    REQUIRE(contains(filtered->body, "data-act=\"retry\" "
                                      "hx-get=\"/fragments/inventory/software?kind=app\""));
 
     // ONE provider failing (the rows read; every other read answers) is the same degrade.
