@@ -8693,14 +8693,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                if ((aq.since && *aq.since < 0) || (aq.until && *aq.until <= 0) ||
-                    (aq.since && aq.until && *aq.since > *aq.until)) {
+                if (aq.since && *aq.since < 0) {
+                    res.set_content(a4_error(kInvalidParams, "since must not be negative",
+                                             "pass a non-negative epoch second or omit it"),
+                                    "application/json");
+                    return;
+                }
+                if (aq.until && *aq.until <= 0) {
                     res.set_content(
-                        a4_error(kInvalidParams,
-                                 "since must not be negative, until must be a positive epoch "
-                                 "second, and since must not be after until",
-                                 "pass epoch seconds, lower bound first; omit a bound to leave it open"),
+                        a4_error(kInvalidParams, "until must be a positive epoch second or omitted",
+                                 "pass a positive epoch second or omit it to leave the bound open"),
                         "application/json");
+                    return;
+                }
+                if (aq.since && aq.until && *aq.since > *aq.until) {
+                    res.set_content(a4_error(kInvalidParams, "since must not be after until",
+                                             "pass epoch seconds, lower bound first"),
+                                    "application/json");
                     return;
                 }
                 aq.target_type = *target_type_opt;

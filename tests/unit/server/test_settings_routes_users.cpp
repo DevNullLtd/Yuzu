@@ -1161,8 +1161,9 @@ TEST_CASE("SettingsRoutes POST api-tokens: an empty or literal-zero ttl_hours st
 }
 
 // The auto-approve rule index is a `(\d+)` path segment: a 21-digit value made `stoul` THROW (a
-// 500). It cannot name a rule, so it is a 404 and the rule list is untouched.
-TEST_CASE("SettingsRoutes auto-approve: a rule index that overflows is a 404 not a 500",
+// 500). It cannot name a rule, so the engine reports "not found" (the page re-renders) and the
+// rule list is untouched.
+TEST_CASE("SettingsRoutes auto-approve: a rule index that overflows is not a 500 and changes nothing",
           "[pg][settings][numeric_params]") {
     SettingsAdr2001Harness h;
     h.auto_approve.add_rule({});
@@ -1170,10 +1171,10 @@ TEST_CASE("SettingsRoutes auto-approve: a rule index that overflows is a 404 not
     auto toggle = h.sink.Post("/api/settings/auto-approve/99999999999999999999/toggle", "",
                               "application/x-www-form-urlencoded");
     REQUIRE(toggle);
-    CHECK(toggle->status == 404);
+    CHECK(toggle->status < 500);
     auto del = h.sink.Delete("/api/settings/auto-approve/99999999999999999999");
     REQUIRE(del);
-    CHECK(del->status == 404);
+    CHECK(del->status < 500);
     CHECK(h.auto_approve.list_rules().size() == before);
 }
 

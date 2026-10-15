@@ -134,8 +134,11 @@ TEST_CASE("v1 audit: since/until are inclusive", "[pg][audit][rest]") {
     CHECK(h.get("?since=2000&until=3000")["data"].size() == 2);
     CHECK(h.get("?since=3001&until=4999")["data"].size() == 0);
     CHECK(h.get("?until=1000")["data"].size() == 1);
-    // 0 means unbounded on that side.
-    CHECK(h.get("?since=0&until=0")["data"].size() == 6);
+    // since=0 is a harmless literal bound (matches what omitting it matches); until=0 would bound
+    // the read at the epoch, so it is refused rather than read as "the whole log" (#4644).
+    CHECK(h.get("?since=0")["data"].size() == 6);
+    h.get("?until=0", 400);
+    h.get("?since=0&until=0", 400);
 }
 
 TEST_CASE("v1 audit: offset pages with real start and page_size and ties are stable",
