@@ -31,6 +31,14 @@ bool contains(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+// Which dependencies are wired. Every one defaults to wired; a test turns one off. Declared
+// outside the harness: a nested type with default member initializers cannot be used in the
+// enclosing class's own default argument.
+struct SyncWiring {
+    bool perm = true, auth = true, resolver = true, dispatch = true, precheck = true, version = true,
+         audit = true, clock = true;
+};
+
 struct SyncHarness {
     HardwareRoutes routes;
     yuzu::server::test::TestRouteSink sink; // declared after `routes`: its handlers capture it
@@ -62,51 +70,56 @@ struct SyncHarness {
     // Runs inside the dispatch call, to re-enter the route while a run is in flight.
     std::function<void()> during_dispatch;
 
-    explicit SyncHarness(bool wire_dispatch = true, bool wire_resolver = true, bool wire_precheck = true) {
+    explicit SyncHarness(SyncWiring w = {}) {
         resolved.status = ss::Resolved::Status::Ok;
         resolved.caller_unfiltered = true;
 
         HardwareRoutes::Deps deps;
-        deps.auth_fn = [this](const httplib::Request&, httplib::Response&) {
-            auth::Session s;
-            s.username = username;
-            return std::optional<auth::Session>(s);
-        };
-        deps.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
-                               const std::string& tt, const std::string& tid, const std::string& d) {
-            events.push_back("audit:" + r);
-            audit_rows.push_back(a + "|" + r + "|" + tt + "|" + tid);
-            audit_details.push_back(d);
-            return !audit_should_fail;
-        };
-        deps.sync_perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                                   const std::string& type, const std::string& op) {
-            if (type != "Execution" || op != "Execute")
-                return false;
-            if (!allow_execute)
-                res.status = 403;
-            return allow_execute;
-        };
+        if (w.auth)
+            deps.auth_fn = [this](const httplib::Request&, httplib::Response&) {
+                auth::Session s;
+                s.username = username;
+                return std::optional<auth::Session>(s);
+            };
+        if (w.audit)
+            deps.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                                   const std::string& tt, const std::string& tid, const std::string& d) {
+                events.push_back("audit:" + r);
+                audit_rows.push_back(a + "|" + r + "|" + tt + "|" + tid);
+                audit_details.push_back(d);
+                return !audit_should_fail;
+            };
+        if (w.perm)
+            deps.sync_perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                                       const std::string& type, const std::string& op) {
+                if (type != "Execution" || op != "Execute")
+                    return false;
+                if (!allow_execute)
+                    res.status = 403;
+                return allow_execute;
+            };
         deps.scoped_perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                                  const std::string&, const std::string&) { return true; };
-        deps.agent_version_fn = [this](const std::string& id) -> std::optional<std::string> {
-            const auto it = version_by_id.find(id);
-            return it != version_by_id.end() ? it->second : default_version;
-        };
-        if (wire_resolver)
+        if (w.version)
+            deps.agent_version_fn = [this](const std::string& id) -> std::optional<std::string> {
+                const auto it = version_by_id.find(id);
+                return it != version_by_id.end() ? it->second : default_version;
+            };
+        if (w.resolver)
             deps.sync_resolve_fn = [this](const auth::Session& s, const ss::Selector& sel) {
                 ++resolve_calls;
                 last_selector = sel;
                 last_username = s.username;
                 return resolved;
             };
-        deps.sync_now_fn = [this] { return clock; };
-        if (wire_precheck)
+        if (w.clock)
+            deps.sync_now_fn = [this] { return clock; };
+        if (w.precheck)
             deps.sync_caller_unfiltered_fn = [this](const auth::Session&) {
                 ++precheck_calls;
                 return precheck_override.value_or(resolved.caller_unfiltered);
             };
-        if (wire_dispatch)
+        if (w.dispatch)
             deps.sync_dispatch_many_fn = [this](const std::vector<std::string>& ids) {
                 ++dispatch_calls;
                 events.push_back("dispatch");
@@ -560,31 +573,74 @@ TEST_CASE("sync route: a partly refused send reports only what was accepted", "[
     CHECK(d["skipped_offline"] == 2);
 }
 
-TEST_CASE("sync route: unwired dependencies fail closed", "[hardware][sync_fanout][route]") {
-    {
-        SyncHarness h(/*wire_dispatch=*/false);
+TEST_CASE("sync route: a missing dependency is an AUDITED 500 and nothing runs",
+          "[hardware][sync_fanout][route][security]") {
+    struct Case {
+        const char* name;
+        SyncWiring wiring;
+    };
+    SyncWiring no_perm, no_auth, no_resolver, no_dispatch, no_precheck, no_version;
+    no_perm.perm = false;
+    no_auth.auth = false;
+    no_resolver.resolver = false;
+    no_dispatch.dispatch = false;
+    no_precheck.precheck = false;
+    no_version.version = false;
+    for (const Case& c : {Case{"sync_perm_fn", no_perm}, Case{"auth_fn", no_auth},
+                          Case{"sync_resolve_fn", no_resolver}, Case{"sync_dispatch_many_fn", no_dispatch},
+                          Case{"sync_caller_unfiltered_fn", no_precheck},
+                          Case{"agent_version_fn", no_version}}) {
+        INFO(c.name);
+        SyncHarness h(c.wiring);
         h.live(1);
         auto res = h.post(R"({"scope":"__all__"})");
         REQUIRE(res);
-        CHECK(res->status == 503);
-        CHECK(h.resolve_calls == 0);
-    }
-    {
-        SyncHarness h(/*wire_dispatch=*/true, /*wire_resolver=*/false);
-        auto res = h.post(R"({"scope":"__all__"})");
-        REQUIRE(res);
-        CHECK(res->status == 503);
-        CHECK(h.dispatch_calls == 0);
-    }
-    {
-        SyncHarness h(/*wire_dispatch=*/true, /*wire_resolver=*/true, /*wire_precheck=*/false);
-        h.live(1);
-        auto res = h.post(R"({"scope":"__all__"})");
-        REQUIRE(res);
-        CHECK(res->status == 503);
+        CHECK(res->status == 500); // a misconfiguration, not a retryable outage
+        CHECK(contains(res->body, "not configured"));
         CHECK(h.resolve_calls == 0);
         CHECK(h.dispatch_calls == 0);
+        // The refusal is on the audit record (the sink is independent of the missing dependency).
+        REQUIRE(h.audit_rows.size() == 1);
+        CHECK(h.audit_rows[0] == "inventory.sync.request|failure|Scope|");
+        CHECK(h.audit_details[0] == "sync fan-out unwired");
     }
+}
+
+TEST_CASE("sync route: with no audit sink the unwired refusal is still a 500, and audit-off still serves",
+          "[hardware][sync_fanout][route]") {
+    {
+        SyncWiring w;
+        w.audit = false;
+        w.resolver = false; // something else is missing too
+        SyncHarness h(w);
+        auto res = h.post(R"({"scope":"__all__"})");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(h.audit_rows.empty());
+    }
+    {
+        // Audit-off is a legal deployment (try_persist_audit treats it as persisted): it serves.
+        SyncWiring w;
+        w.audit = false;
+        SyncHarness h(w);
+        h.live(2);
+        auto res = h.post(R"({"scope":"group:g"})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(h.dispatch_calls == 1);
+    }
+}
+
+TEST_CASE("sync route: with no injected clock the system clock is used", "[hardware][sync_fanout][route]") {
+    SyncWiring w;
+    w.clock = false;
+    SyncHarness h(w);
+    h.live(1);
+    auto res = h.post(R"({"scope":"group:g"})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    // A real epoch second, not the fake clock's constant.
+    CHECK(parse(res->body)["data"]["requested_at"].get<std::int64_t>() > h.clock);
 }
 
 TEST_CASE("sync route: the per-device sync route is still its own route", "[hardware][sync_fanout][route]") {

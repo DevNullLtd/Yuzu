@@ -552,9 +552,14 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!deps_.sync_perm_fn || !deps_.auth_fn || !deps_.sync_resolve_fn ||
             !deps_.sync_dispatch_many_fn || !deps_.sync_caller_unfiltered_fn ||
             !deps_.agent_version_fn) {
-            res.status = 503;
-            res.set_content(detail::a4_error(res, "sync-on-demand is unavailable on this server",
-                                             {.retry_after_ms = 5000}),
+            // The derivation of "which devices may this caller sync" is this route's only
+            // per-device authorization, so a missing dependency is a server misconfiguration
+            // (500), not a transient outage, and it is audited. Nothing here may use the
+            // dependencies that are missing; the audit sink is optional (audit-off is legal).
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "failure", "Scope", "",
+                                            "sync fan-out unwired");
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "sync fan-out is not configured on this server"),
                             "application/json");
             return;
         }
