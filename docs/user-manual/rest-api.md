@@ -2081,7 +2081,10 @@ Quarantine a device.
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
 
-Release a device from quarantine.
+Release a device from quarantine. This ends the server's quarantine **record** only: it does
+**not** remove the device's firewall rules. To lift those, run the quarantine plugin's release
+instruction (`security.quarantine.release`, "Release Device from Quarantine") from the Instructions
+page or through `execute_instruction`.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
 
