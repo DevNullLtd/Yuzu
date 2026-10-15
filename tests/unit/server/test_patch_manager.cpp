@@ -452,7 +452,9 @@ TEST_CASE("DiscoveryRoutes: GET /api/patches and /api/patches/deployments reject
     auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                       const std::string&) -> bool { return true; };
     auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                       const std::string&, const std::string&, const std::string&) {};
+                       const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
     routes.register_routes(sink, auth_fn, perm_fn, audit_fn, /*directory_sync=*/nullptr, &mgr,
                            /*deployment_store=*/nullptr, /*discovery_store=*/nullptr);
 
