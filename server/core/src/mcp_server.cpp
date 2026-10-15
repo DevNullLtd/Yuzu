@@ -132,6 +132,17 @@
 namespace yuzu::server::mcp {
 namespace {
 
+// `maxLength` of query_audit_log's string filters: published in its schema (A5) and enforced by the
+// handler in characters (UTF-8 code points), as JSON Schema counts them. Keep the schema literal in
+// step with these.
+constexpr std::size_t kAuditFilterMaxLen = 1024; // an SSO principal (oidc:<iss>#<sub>) reaches ~516
+
+/// UTF-8 code points in `v` (every byte that is not a continuation byte starts one).
+inline std::size_t utf8_length(const std::string& v) {
+    return static_cast<std::size_t>(std::count_if(
+        v.begin(), v.end(), [](unsigned char c) { return (c & 0xC0) != 0x80; }));
+}
+
 // ── Lightweight JSON string builder (same pattern as rest_api_v1.cpp) ─────
 // Uses direct string building to avoid nlohmann template-instantiation bloat.
 
@@ -603,9 +614,16 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","tags"]})j"},
 
     {"query_audit_log",
-     "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
-     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
-     R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}}},"required":["entries"]})j"},
+     "Query the audit log with filters. Returns timestamped entries (newest first, rows with "
+     "equal timestamps in a fixed order) showing who did what, when. Paging: a page shorter "
+     "than `limit` is the last one, and `has_more` (in structuredContent; the text content is the "
+     "bare entries array) is true when more matching rows exist past "
+     "this page; walk with `offset` (0..10000; past that, set `until` to the oldest "
+     "`timestamp` seen and restart at offset 0). The log is live, so a walk by offset can repeat a row "
+     "when newer rows arrive and can skip one when retention deletes rows; de-duplicate on the "
+     "entry `id`. A store fault is retryable (retry_after_ms); a bad filter is not.",
+     R"({"type":"object","properties":{"principal":{"type":"string","maxLength":1024,"description":"Exact principal name"},"action":{"type":"string","maxLength":1024,"description":"Exact audit action, e.g. auth.permission_required"},"target_type":{"type":"string","maxLength":1024,"description":"Exact target type"},"target_id":{"type":"string","maxLength":1024,"description":"Exact target id; requires target_type"},"since":{"type":"integer","minimum":0,"description":"Unix epoch lower bound, inclusive; 0 or absent = unbounded"},"until":{"type":"integer","minimum":0,"description":"Unix epoch upper bound, inclusive; 0 or absent = unbounded"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500,"description":"Entries per page"},"offset":{"type":"integer","default":0,"minimum":0,"maximum":10000,"description":"Entries to skip before this page"}}})",
+     R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}},"has_more":{"type":"boolean","description":"More matching rows exist past this page"}},"required":["entries","has_more"]})j"},
 
     {"list_definitions",
      // #4029: full filter set (was plugin/type only) — mirrors GET /api/v1/instructions.
@@ -8528,16 +8546,98 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "AuditLog", "Read"))
                     return;
                 if (!audit_store) {
-                    res.set_content(error_response(id, kInternalError, "Audit store unavailable"),
+                    res.set_content(a4_error(kInternalError, "Audit store unavailable",
+                                             "the audit store is not configured on this server"),
                                     "application/json");
                     return;
                 }
                 AuditQuery aq;
-                aq.principal = param_str(args, "principal");
-                aq.action = param_str(args, "action");
-                aq.target_type = param_str(args, "target_type");
-                aq.since = param_int(args, "since");
-                aq.until = param_int(args, "until");
+                // Strict: a present wrong-typed value is refused, not dropped
+                // (a dropped filter would widen the evidence read silently).
+                auto principal_opt = param_string_strict(args, "principal");
+                auto action_opt = param_string_strict(args, "action");
+                auto target_type_opt = param_string_strict(args, "target_type");
+                auto target_id_opt = param_string_strict(args, "target_id");
+                auto offset_opt = param_int_strict(args, "offset", 0);
+                auto since_opt = param_int_strict(args, "since", 0);
+                auto until_opt = param_int_strict(args, "until", 0);
+                if (!principal_opt || !action_opt || !target_type_opt) {
+                    res.set_content(a4_error(kInvalidParams,
+                                             "principal/action/target_type must be JSON strings",
+                                             "pass the filter as a string or omit it"),
+                                    "application/json");
+                    return;
+                }
+                // A NUL would truncate the bound value at the C-string boundary and widen the filter.
+                for (const auto* v : {&*principal_opt, &*action_opt, &*target_type_opt}) {
+                    if (v->find('\0') != std::string::npos) {
+                        res.set_content(a4_error(kInvalidParams, "string filters must not contain NUL",
+                                                 "remove the NUL byte from the filter"),
+                                        "application/json");
+                        return;
+                    }
+                    if (utf8_length(*v) > kAuditFilterMaxLen) {
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "string filters are limited to " +
+                                         std::to_string(kAuditFilterMaxLen) + " characters",
+                                     "narrow by action, time window or another filter; GET /api/v1/audit has no length bound"),
+                            "application/json");
+                        return;
+                    }
+                }
+                aq.principal = *principal_opt;
+                aq.action = *action_opt;
+                if (!since_opt || !until_opt || *since_opt < 0 || *until_opt < 0 ||
+                    (*since_opt > 0 && *until_opt > 0 && *since_opt > *until_opt)) {
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "since/until must be non-negative integers with since <= until",
+                                 "pass epoch seconds, lower bound first"),
+                        "application/json");
+                    return;
+                }
+                aq.target_type = *target_type_opt;
+                if (!target_id_opt) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "target_id must be a JSON string",
+                                 "pass the id as a string or omit it"),
+                        "application/json");
+                    return;
+                }
+                if (!offset_opt || *offset_opt < 0 || *offset_opt > kAuditMaxOffset) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "offset must be an integer 0..10000",
+                                 "page with 0 <= offset <= 10000"),
+                        "application/json");
+                    return;
+                }
+                if (target_id_opt->find('\0') != std::string::npos) {
+                    res.set_content(a4_error(kInvalidParams, "target_id must not contain NUL",
+                                             "remove the NUL byte from the id"),
+                                    "application/json");
+                    return;
+                }
+                if (utf8_length(*target_id_opt) > kAuditFilterMaxLen) {
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "target_id is limited to " + std::to_string(kAuditFilterMaxLen) +
+                                     " characters",
+                                 "narrow by action, time window or another filter; GET /api/v1/audit has no length bound"),
+                        "application/json");
+                    return;
+                }
+                aq.target_id = *target_id_opt;
+                aq.offset = static_cast<int>(*offset_opt);
+                if (!aq.target_id.empty() && aq.target_type.empty()) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "target_id requires target_type",
+                                 "add target_type to the filter"),
+                        "application/json");
+                    return;
+                }
+                aq.since = *since_opt;
+                aq.until = *until_opt;
                 // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the
                 // query_responses idiom (`:3660`). Upper alone left a
                 // negative or zero `limit` reaching `AuditStore::query`,
@@ -8548,17 +8648,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 // never reads false-empty. `param_int32`'s int64->int32 cast
                 // also wraps a limit above INT_MAX negative before `std::min`
                 // ever saw it; clamping the raw int64 first avoids that.
-                aq.limit = static_cast<int>(
+                const int page_limit = static_cast<int>(
                     std::clamp<std::int64_t>(param_int(args, "limit", 50), 1, 500));
+                aq.limit = page_limit + 1; // one extra row says whether more exist past this page
                 // ADR-0040: degrade-distinguishable read — nullopt on a
                 // store/pool failure. Surface an error, never a false-empty
                 // result (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
                 if (!events) {
-                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                    res.set_content(a4_error(kInternalError, "Audit store degraded",
+                                             "retry once the audit store recovers",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
+                const bool has_more = events->size() > static_cast<std::size_t>(page_limit);
+                events->resize(std::min(events->size(), static_cast<std::size_t>(page_limit)));
                 JArr arr;
                 for (const auto& e : *events) {
                     arr.add(JObj()
@@ -8575,7 +8680,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 res.set_content(
                     success_response(id,
                                       tool_result_split(arr.str(),
-                                                         JObj().raw("entries", arr.str()).str(),
+                                                         JObj()
+                                                             .raw("entries", arr.str())
+                                                             .raw("has_more",
+                                                                  has_more ? "true" : "false")
+                                                             .str(),
                                                          kObjectOutputSchema)),
                     "application/json");
                 return;
