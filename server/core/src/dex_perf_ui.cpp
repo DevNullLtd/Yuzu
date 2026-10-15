@@ -228,7 +228,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
     const auto now = dex_perf_fleet_now(snap);
 
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("perf", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Fleet performance</h1>"
          "</div><div class=\"gp-sub\">Continuous device telemetry (30&nbsp;s on-device sampling) "

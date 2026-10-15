@@ -57,7 +57,7 @@ TEST_CASE("render_dex_app_perf_picker: top-level tab — subnav + Dashboard back
     CHECK(has(h, "class=\"on\" hx-get=\"/fragments/dex/perf/apps"));
     CHECK(has(h, ">Performance<"));
     CHECK(has(h, ">App Performance<"));
-    CHECK(has(h, "href=\"/\">&larr; Dashboard</a>")); // top-level convention, not a sub-fragment back-link
+    CHECK(has(h, "href=\"/\">&larr; Console</a>")); // top-level convention, not a sub-fragment back-link
 }
 
 TEST_CASE("render_dex_app_perf_picker: search filters by name, case-insensitive",

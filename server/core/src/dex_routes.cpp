@@ -574,7 +574,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
                 ++mon_types;
 
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("catalogue", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Signal catalogue</h1></div>"
          "<div class=\"gp-sub\"><b>" +
@@ -1092,7 +1092,7 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
     const int64_t N = fleet.windows_online; // scored over reporting Windows agents
 
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("health", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>DEX health</h1></div>"
          "<div class=\"gp-sub\">A single roll-up of the measured signal rates &mdash; it "
@@ -1282,7 +1282,7 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
     };
 
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("trends", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Cross-OS &amp; signal trends"
          "</h1></div><div class=\"gp-sub\">Coverage-honest by design: each OS collects a different "
@@ -1416,7 +1416,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
     };
     std::string head;
-    head += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    head += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     head += dex_subnav("overview", window_days);
     head += "<div class=\"gp-head\"><div>"
             "<div class=\"gp-titleline\"><h1>DEX</h1></div>"
@@ -2083,7 +2083,7 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
 
 std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
                                      int window_days) {
-    std::string h = "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    std::string h = "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("apps", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Applications</h1></div>"
          "<div class=\"gp-sub\">Stability per application across the fleet &mdash; crashes &amp; "
