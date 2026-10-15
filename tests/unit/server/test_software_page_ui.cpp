@@ -783,7 +783,7 @@ TEST_CASE("software page: Sync now button and dialog script drive the fan-out ro
                              "'/api/v1/hardware/sync'", "'/api/v1/scope/preview'", "installed_software",
                              "body.scope = '__all__'", "body.scope_expression", "'This device ('",
                              "Whole fleet", "Devices matching a scope expression or group", "'sw-agent'",
-                             "d.agents_reached"})
+                             "d.agents_reached", "d.skipped_other_replica"})
         REQUIRE(has(s, need));
     // The 202 count is agents_reached (as on /api/command and the per-device route).
     REQUIRE_FALSE(has(s, "d.reached"));

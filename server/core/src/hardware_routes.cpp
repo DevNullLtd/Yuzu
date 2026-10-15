@@ -668,8 +668,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // the 500 cap applies; ADR-3007's paced run replaces both when the fleet outgrows it.
         std::vector<ss::Candidate> candidates;
         candidates.reserve(resolved.ids.size());
-        for (const auto& id : resolved.ids)
-            candidates.push_back({id, deps_.agent_version_fn(id)});
+        for (const auto& id : resolved.ids) {
+            auto version = deps_.agent_version_fn(id); // a session on THIS process, or nullopt
+            const bool elsewhere = !version && resolved.fleet_live.contains(id);
+            candidates.push_back({id, std::move(version), elsewhere});
+        }
         const auto plan = ss::partition(
             candidates, [](std::string_view v) { return agent_supports_sync_now(v); });
 
