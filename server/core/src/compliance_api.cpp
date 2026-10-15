@@ -68,6 +68,11 @@ public:
         return store_.get_fleet_compliance();
     }
 
+    [[nodiscard]] std::expected<std::vector<ComplianceSummary>, PolicyReadError>
+    compliance_by_policy() const override {
+        return store_.compliance_by_policy_checked();
+    }
+
     [[nodiscard]] std::expected<ComplianceSummary, PolicyReadError>
     compliance_summary(const std::string& policy_id) const override {
         return store_.get_compliance_summary(policy_id);

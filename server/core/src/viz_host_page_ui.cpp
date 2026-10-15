@@ -71,6 +71,8 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
     }
     .vh-hd h2 { font-size: 14px; font-weight: 600; }
     .vh-sub { color: var(--mut); font-size: 13px; }
+    /* A very long agent id must wrap, not scroll the page sideways. */
+    .page-header .subtitle, .vh-sub { overflow-wrap: anywhere; }
     .vh-legend {
       margin-left: auto;
       display: flex;
@@ -80,7 +82,8 @@ const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
       color: var(--mut);
     }
     .vh-legend i { display: inline-block; vertical-align: -1px; margin-right: 6px; }
-    .vh-sw { width: 10px; height: 10px; }
+    /* Swatches carry meaning by colour: keep them in forced-colors / High Contrast. */
+    .vh-sw { width: 10px; height: 10px; forced-color-adjust: none; }
     .vh-sw.proc { background: var(--c1); border-radius: 50%; }
     .vh-sw.sock { background: var(--c3); border-radius: 2px; }
     .vh-sw.owns { width: 14px; height: 0; border-top: 1px dashed var(--faint); }

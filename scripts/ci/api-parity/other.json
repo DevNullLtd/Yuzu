@@ -542,6 +542,22 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/dashboard/activity",
+    "capability_id": "get.fragments-dashboard-activity",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-audit"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dashboard/health",
+    "capability_id": "get.fragments-dashboard-health",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-health"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/instructions",
     "capability_id": "get.fragments-instructions",
     "rest_v1_twin": null,

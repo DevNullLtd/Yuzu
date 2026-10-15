@@ -142,7 +142,7 @@ Every request must be authenticated using one of three methods:
 | Bearer token | `Authorization: Bearer <token>` | `Authorization: Bearer yzt_a1b2c3d4...` |
 | X-Yuzu-Token header | `X-Yuzu-Token: <token>` | `X-Yuzu-Token: yzt_a1b2c3d4...` |
 
-Unauthenticated browser requests are redirected to `/login`. Unauthenticated API requests receive a `401 Unauthorized` response.
+Unauthenticated browser requests are redirected to `/home` (the sign-in landing page; `/login` forwards there). Unauthenticated API requests receive a `401 Unauthorized` response.
 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
 
@@ -8374,7 +8374,7 @@ The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` 
 
 Browser-facing page that renders the 3D fleet topology. The page itself is auth-gated only; per-request RBAC enforcement happens when the page's JS hits `GET /api/v1/viz/fleet/topology` (see below).
 
-**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/login` first).
+**Permission:** Session auth only (`require_auth`); redirects to `/home` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables the page as well as the API: a signed-in request for `/viz/fleet` returns `503` with a plain-text message instead of the page shell (a request with no session still redirects to `/home` first).
 
 **Browser requirements:** the dashboard stylesheet needs Chrome 111+, Edge 111+, Firefox 121+ or Safari 16.2+ (`color-mix()` and `:has()`), and this page also requires importmap support (Safari 16.4+; the other browsers already meet it). On a browser without importmap the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
 
@@ -8391,7 +8391,7 @@ Browser-facing page that renders the 3D fleet topology. The page itself is auth-
 
 **Renderer behaviour (PR 6):**
 
-The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear above each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
+The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#2dd4bf`, macOS/Darwin `#f5c542`, Windows `#4c9aff`, default `#9aa2ae`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear below each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
 
 **Renderer behaviour (PR 7):**
 
@@ -8587,7 +8587,7 @@ the JSON route above.
 
 Browser-facing per-host drill-down page (the 2D Cytoscape IPC graph above
 the TAR process tree), opened by double-clicking a cube in `/viz/fleet`.
-Auth-gated only (`require_auth`); redirects to `/login` on no session.
+Auth-gated only (`require_auth`); redirects to `/home` on no session.
 The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` — any
 other character returns `400` — before it is templated into the page
 shell. Per-request RBAC is enforced when the page's JS fetches
@@ -11020,7 +11020,7 @@ curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
 
 #### `GET /tar`
 
-Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list, the capture sources frame and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`). The Ad-hoc TAR SQL form is no longer on this page: a short note links to the Result sets page, where **From TAR query** takes the same parent scope, SQL, name and include-empty fields.
+Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/home` otherwise). The page hosts the retention-paused source list, the capture sources frame and the process tree viewer (a per-host process tree reconstructed from the device's local TAR warehouse; see `docs/user-manual/tar.md`). The Ad-hoc TAR SQL form is no longer on this page: a short note links to the Result sets page, where **From TAR query** takes the same parent scope, SQL, name and include-empty fields.
 
 **Permission:** Session-only (the page itself; embedded fragment endpoints carry their own permission gates — see below).
 
@@ -12052,6 +12052,51 @@ formed `saml_identity_links` row). See
 scope of what each half (login-time vs. deprovision-time) can and cannot
 attribute, and `docs/user-manual/metrics.md` "SCIM deprovision-linkage
 metrics" for the operator-facing description.
+
+---
+
+## Notifications feed
+
+The dashboard header bell reads and acts on the notification store through three dashboard JSON routes. They are not part of REST v1 and have no MCP twin (ADR-1005 grandfathers them as a settings-plane exception).
+
+#### `GET /api/notifications`
+
+Returns the unread feed, newest first. Requires `Infrastructure:Read`.
+
+| Query | Meaning |
+|---|---|
+| `limit` | Rows to return, default 50 (the bell sends 10). No server-side upper bound. |
+| `all=true` | Include read and dismissed rows. |
+| `offset` | Row offset; only applied together with `all=true`. |
+
+```json
+{
+  "notifications": [
+    { "id": 4801, "timestamp": 1760000000000, "level": "warn",
+      "title": "DEX alert: ...", "message": "...", "read": false, "dismissed": false }
+  ],
+  "unread_count": 1
+}
+```
+
+`timestamp` is epoch milliseconds. `level` is a free string (`success`, `warn`, `error` and `info` in practice). `title` and `message` can contain agent-supplied text; render them as text only. `503` (A4 envelope, `retry_after_ms` 5000) is returned when the store is closed or a read fails, including a database connection timeout; an empty `notifications` array therefore means nothing is waiting. A negative `limit` or `offset` answers `400` (A4 envelope), with or without `all=true`.
+
+#### `POST /api/notifications/{id}/read`
+
+Marks one notification read. Requires `Infrastructure:Write`. `200 {"status":"ok"}`; `404` when no row matches. A browser (session-cookie) call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else `403` `cross-site request refused` (audit `csrf.denied`); token callers are exempt. Audit-first: a `notification.mark_read` row with result `attempted` is written before the change and the call answers `503` with `Sec-Audit-Failed: true` if it cannot be written; a `success` or `failure` row follows. `503` also when the database write fails.
+
+#### `POST /api/notifications/{id}/dismiss`
+
+Soft-deletes one notification. Requires `Infrastructure:Write`. `200`; `404` when no row matches. Same-site rule, audit-first order and `503` behaviour as `read`, with the audit action `notification.dismiss`.
+
+Behaviour to know:
+
+- **State is global.** Read and dismissed state is stored on the row, not per user: one operator's action changes the feed for everyone. There is no route that restores a read or dismissed row.
+- **No retention and no coalescing.** Rows are kept indefinitely and a fleet-wide failing instruction produces one row per device, so a large fleet can sit at 100 or more unread.
+- **Audience.** With RBAC off every signed-in user can read the feed and only administrators can act. With RBAC on only global Administrator and ITServiceOwner assignments pass; Operators, Viewers and management-group-confined users get `403` and the bell stays hidden.
+- **Audit.** Both mutations are audited (`notification.mark_read`, `notification.dismiss`; see above), and a refused caller writes one `auth.permission_required` row per request.
+
+The header bell polls `GET /api/notifications?limit=10` with the session cookie every 60 seconds while the tab is visible and the panel is closed, and only within five minutes of the last keyboard, pointer or scroll input, because each request renews the session idle window.
 
 ---
 

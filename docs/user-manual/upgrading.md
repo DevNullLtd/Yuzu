@@ -81,6 +81,20 @@ ignoring it.
 store is degraded (previously an empty `200`) and `404` for an unknown role
 (previously `200 {"data":[]}`).
 
+## Behaviour change: sign-in moves to the landing page, `/login` redirects
+
+**What changed.** `/home` is now the sign-in page (and the landing page for a signed-in user). A page requested
+without a session is redirected to `/home?next=<screen key>` instead of `/login`, and `GET /login` answers
+`302` to `/home`, forwarding only a valid screen key and a known SSO error code. `POST /login`, `/login/mfa`,
+`/login/mfa/enroll`, the OIDC and SAML callbacks and the session cookie are unchanged. Signing in no longer
+leaves the user on the Dashboard: password and single-sign-on sign-ins both end on `/home`, which offers an
+"Open Dashboard" button. A request sent by htmx without a session now answers `401` with an `HX-Redirect: /home`
+header rather than a redirect, so a panel never swaps the sign-in page into itself.
+
+**What to check.** Any monitor, load-balancer health check or script that expects `GET /login` to answer `200`
+must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
+that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
+
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
 **What changed.** Deleting (deactivating) an account and demoting a local `admin` account now go through

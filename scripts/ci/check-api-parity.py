@@ -224,10 +224,27 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # or MCP twin), so it deepens an untwinned surface by one row. Merged with the containment rows above
 # the count is 204 (203 + 1), the value the checker reports on the merged tree.
 #
+# Home page (HM-1, measured on its own base at 200 = 199 + 1): +1 `composed-of:` row,
+# GET /fragments/home/summary (readout, needs attention) over the existing hardware roster,
+# approvals count, executions and fleet-compliance reads; a UI fragment. NOT a rule that such a
+# fragment owes no twin: ADR-1005 Decision 4 says a dashboard fragment is not an API twin. The
+# four Dashboard rows below are an owner-accepted TEMPORARY exception (review of PR #5859,
+# 2026-10-15), so the baseline stays raised until the estate partition, activity and health
+# reads have REST v1 and MCP twins; the next reader should not take it as precedent.
+# Home panels (HM-2, measured on its own base at 204 = 201 + 3): +3. The three Home fragments
+# (/fragments/home/policies, /fragments/home/activity, /fragments/home/health) are UI-only
+# compositions over existing twinned or planned reads, so each is a composed-of row that
+# counts untwinned.
+# Both Home changes landed on 201 on their own base. Merged with the dev changes above (204) the
+# four Home/Dashboard rows bring the count to 208 (204 + 4), the value the checker reports on the
+# merged tree.
+# Design delta 2026-10-14: the four rows above moved with their panels to the Dashboard and
+# are now /fragments/dashboard/{summary,policies,activity,health} (same composed-of status,
+# same count; a rename, not a new surface), so the count stays 208.
 # Audit filter parity: get.api-audit flips "planned:#2146" -> "twinned" (GET /api/v1/audit +
-# MCP query_audit_log, now at filter/paging parity), 204 - 1 = 203, the value the checker
-# reports on the merged tree.
-BASELINE_UNTWINNED = 203
+# MCP query_audit_log, now at filter/paging parity), the checker reports 208 - 1 = 207 on the merged tree
+# (dev's 208 above, less this flip).
+BASELINE_UNTWINNED = 207
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
