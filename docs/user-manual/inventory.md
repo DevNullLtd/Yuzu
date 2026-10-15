@@ -485,7 +485,12 @@ place, **Hardware** and **Software**, each its own page:
   device in one action — under the hood it loops the existing single-device tag routes,
   so each device still runs its own `Tag:Write` gate and its own `tag.set`/`tag.delete`
   audit row; nothing is bulk-authorized. The KPI strip (Total CIs / Online / Offline /
-  Stale / CI coverage) is computed over the same rows the table shows. **The list is
+  Stale / CI coverage) is computed over the same rows the table shows. Two readouts sit
+  beside it: **Median memory** (over the devices that have synced a positive RAM figure,
+  with that device count in the label) and a **By manufacturer** line (case-folded, the
+  top eight and an "Other" tail). Both are computed from the devices you can see before
+  any search or filter narrows the table, and both are hidden when no device has synced
+  the figure or the CI columns are degraded. **The list is
   gated on the global `Inventory:Read`, but — unlike the old Devices tab, whose
   management-group confinement this doc used to flag as "designed for, not yet verified
   effective" — it is wired as a live caller of the real ADR-0017 admit-then-filter
@@ -515,8 +520,30 @@ place, **Hardware** and **Software**, each its own page:
     `inventory.device.software`), now with its own filter box and, for the first time,
     rendered **Signature** and **Ecosystem** columns. Carries the same **Sync now**
     affordance, scoped to the `installed_software` source.
-  - **Tags** — inline add/remove via the existing tag routes, shown only when a
-    `Tag:Write` probe passes for the device.
+  - **Tags and properties** — inline add/remove via the existing tag routes. Add is
+    shown when a `Tag:Write` probe passes for the device; Remove needs its own
+    `Tag:Delete` probe (a different permission), taken only when this lens is open. The
+    lens also hosts **Custom properties** (the device's `props.<key>` values, read from
+    `GET /api/agents/{id}/properties`, gated on scoped `Infrastructure:Read`; edit
+    controls need `Infrastructure:Write`) and **Property schemas** (fleet-wide, read from
+    `GET /api/property-schemas`, so a management-group-confined operator sees a note
+    naming the missing fleet-wide `Infrastructure:Read` grant instead). Both load in one
+    fragment, `GET /fragments/hardware/ci/properties?id=`; a degraded store reads
+    "could not be read", never "No properties set." Property values are written to the
+    audit log (`custom_property.set`) and take part in scope expressions.
+    Add tag, Remove tag, Add or edit property, Delete property and Save schema open a
+    dialog (`static/yuzu-device-data.js` on the shared dialog module); removing or setting
+    the `service` tag says that it decides which service-scoped API tokens can reach the
+    device. The **environment** tag accepts only `Dev`, `UAT` or `Production`, exact case.
+  - **Installed software** also shows "N applications, last synced <time>" (a device that
+    never synced and a degraded read are worded differently), and two **click-to-load**
+    panels: **Application usage** (hours and runs over the last 30 days, first and last
+    seen, the first 200 executables by hours; scoped `Forensics:Read`, audit verb
+    `app_usage.agent.view`) and **Detected licences** (scoped `SoftwareLicensing:Read`,
+    audit verb `sle.agent.view`; no per-user column). Both write the audit row before
+    reading and, when it cannot persist, show "withheld" with `Sec-Audit-Failed: true`
+    and no data. They are the HTML twins of `GET /api/v1/forensics/agents/{id}/app-usage`
+    and `GET /api/v1/sle/agents/{id}`.
   - **DEX**, **Guardian**, **Live** — not reimplemented: these mount the *same*
     `/fragments/device/*` fragments the (now-redirected) device page used, each gated on
     scoped `GuaranteedState:Read` as before. **Live** additionally carries the ten
@@ -554,6 +581,11 @@ place, **Hardware** and **Software**, each its own page:
     Yuzu does not hold yet (end-of-support, unused, unauthorised, new titles,
     normalisation). The strip is the fleet-wide hourly rollup and does not change with
     the filters.
+  - **Inventory sources.** A panel under the results lists each collector that has
+    written inventory (Source, Devices, Last collected). It is the HTML twin of
+    `GET /api/v1/inventory/tables` and needs the fleet-wide `Inventory:Read` grant; a
+    caller without it sees a note, a degraded store says so, and an empty store says no
+    inventory has been collected yet.
   - **Search and filters.** One search box matches title, publisher, ecosystem or the
     source that found the software; chips narrow by kind, ecosystem and found-by; a host
     type-ahead shows a single device's software. The type-ahead lists the first 1,000

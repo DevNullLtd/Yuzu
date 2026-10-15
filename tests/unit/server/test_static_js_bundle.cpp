@@ -37,6 +37,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <regex>
 #include <string>
 #include <string_view>
 
@@ -362,6 +363,26 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares per-OS palette for linux/darwin
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("macos:   '#f5c542'"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows: '#4c9aff'"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("default: '#9aa2ae'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs pins the listener coral, talking-socket blue and local edge",
+          "[static-js][viz]") {
+    // Reverting the listener sphere to yellow (or the :port label away from the coral chart
+    // token) must fail loud: the invariants doc and the legend both name these colours.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xff6b7a"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ctx.fillStyle = '#ff6b7a'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("TALKING_SOCKET_COLOR = 0x7ab6ff"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("color: 0xe9ecf0"));
+}
+
+TEST_CASE("static_js_bundle: the Fleet page keeps its error banner and the Host page its Refresh button",
+          "[static-js][viz][page]") {
+    REQUIRE(kVizFleetPageHtml != nullptr);
+    REQUIRE(kVizHostPageHtml != nullptr);
+    const std::string fleet(kVizFleetPageHtml);
+    CHECK_THAT(fleet, ContainsSubstring("id=\"viz-error\" role=\"alert\""));
+    CHECK_THAT(fleet, ContainsSubstring("#viz-error.shown { display: flex; }"));
+    CHECK_THAT(std::string(kVizHostPageHtml), ContainsSubstring("id=\"refresh-btn\""));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs leaves the stage backdrop to the page CSS",
@@ -1142,6 +1163,19 @@ TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and 
     CHECK_THAT(armed, ContainsSubstring("filter: none"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuCss has no unscoped .scope rule", "[static-js][yuzu-css]") {
+    // The DEX trends OS cards (dex_routes.cpp) carry a bare `.scope` element and
+    // style it themselves (`.gp-oscard .scope`, guardian_page_ui.cpp). A bare
+    // `.scope` selector in the shared sheet reaches that element on every page
+    // that loads it: the old `@media (max-width: 1440px) { .scope { width: 220px
+    // !important } }` pinned the card line to 220 px below 1440 px. The dashboard
+    // panel is `.scope-panel`; `.scope-*` classes are different tokens and stay.
+    // A selector starts after the sheet start, `{`, `}`, `,` or a comment end; `.scope` followed
+    // by `-` or a word character is another class and does not match.
+    const std::regex bare_scope(R"((^|[{},/])\s*\.scope(?![-\w]))");
+    CHECK_FALSE(std::regex_search(yuzu::server::kYuzuCss, bare_scope));
+}
+
 TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs", "[static-js][yuzu-css]") {
     CHECK(yuzu::server::kYuzuCss.find('\0') == std::string::npos);
     // (See kEChartsJs counterpart — stray-delimiter check is tautological
@@ -1480,4 +1514,25 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",
     CHECK(html.find("cdn.") == std::string::npos);
     CHECK(html.find("unpkg.") == std::string::npos);
     CHECK(html.find("jsdelivr.") == std::string::npos);
+}
+
+// ── Shared dialog module (yuzu-dialog.js) ───────────────────────────────────
+
+namespace yuzu::server {
+extern const std::string kYuzuDialogJs;
+} // namespace yuzu::server
+
+TEST_CASE("static_js_bundle: kYuzuDialogJs exposes YuzuDialog and carries no markup sink",
+          "[static-js][dialog][security]") {
+    const std::string& js = yuzu::server::kYuzuDialogJs;
+    CHECK(js.size() >= 4000);
+    CHECK(js.find('\0') == std::string::npos);
+    CHECK_THAT(js, ContainsSubstring("window.YuzuDialog"));
+    CHECK_THAT(js, ContainsSubstring("showModal"));
+    CHECK_THAT(js, ContainsSubstring("AbortSignal.timeout(15000)"));
+    CHECK(js.find("innerHTML") == std::string::npos);
+    CHECK(js.find("insertAdjacentHTML") == std::string::npos);
+    CHECK(js.find("eval(") == std::string::npos);
+    CHECK(js.find("new Function") == std::string::npos);
+    CHECK(js.find("document.write") == std::string::npos);
 }

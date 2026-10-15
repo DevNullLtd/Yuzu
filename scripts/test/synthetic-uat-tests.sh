@@ -249,6 +249,7 @@ else
     T5_START=$(now_ms)
     HELP_BODY=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
         -X POST "$DASHBOARD_URL/api/dashboard/execute" \
+        -H "Origin: ${DASHBOARD_URL%/}" \
         -d "instruction=help&scope=__all__" 2>/dev/null || echo "")
     T5_MS=$(elapsed_ms "$T5_START")
     HELP_ROWS=$(echo "$HELP_BODY" | grep -o 'result-row' | wc -l)

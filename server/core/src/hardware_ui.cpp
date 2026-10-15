@@ -6,8 +6,11 @@
 /// and plugin scope"). Honesty: a degraded read renders a banner, never an empty
 /// table (ADR-0016 §7).
 
+#include "device_data_render.hpp"
 #include "hardware_routes.hpp"
 
+#include "device_containment_render.hpp"
+#include "device_estate_render.hpp"
 #include "web_utils.hpp"
 
 #include <cctype>
@@ -159,7 +162,6 @@ std::string hw_style() {
   .hw-pill.ok{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
   .hw-pill.warn{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
   .hw-pill.bad{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
-  .hw-os{padding:0 5px;border:1px solid var(--line2);border-radius:3px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:11.5px}
   .hw-tag{display:inline-flex;align-items:center;margin-right:4px;padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500}
   a.hw-tag.link{cursor:pointer}
   a.hw-tag.link:hover{color:var(--ink)}
@@ -202,7 +204,28 @@ std::string kpis_html(const HardwareKpis& k, bool ci_degraded) {
     h += kpi("Offline", std::to_string(k.offline));
     h += kpi("Stale", std::to_string(k.stale), k.stale > 0 ? "warn" : "");
     h += kpi("CI coverage", ci_degraded ? "&mdash;" : (std::to_string(k.with_ci) + " / " + std::to_string(k.total)));
+    // Readouts over the scoped roster: hidden when no device has synced the figure, and
+    // when the CI columns themselves are degraded (a blank would read as "none").
+    if (!ci_degraded && k.median_ram_gb) {
+        const double v = *k.median_ram_gb;
+        const long long tenths = static_cast<long long>(v * 10.0 + 0.5);
+        std::string text = std::to_string(tenths / 10);
+        if (tenths % 10)
+            text += "." + std::to_string(tenths % 10);
+        const std::string label = "Median memory, " + std::to_string(k.ram_devices) +
+                                  (k.ram_devices == 1 ? " device" : " devices") + " with hardware synced";
+        h += kpi(label.c_str(), text + " GB");
+    }
     h += "</div>";
+    if (!ci_degraded && !k.by_manufacturer.empty()) {
+        h += "<div class=\"gp-mute\" id=\"hw-by-vendor\">By manufacturer: ";
+        bool first = true;
+        for (const auto& [name, n] : k.by_manufacturer) {
+            h += std::string(first ? "" : " &middot; ") + esc(name) + " " + std::to_string(n);
+            first = false;
+        }
+        h += "</div>";
+    }
     return h;
 }
 
@@ -236,7 +259,7 @@ std::string dex_badge(int score) {
     if (score < 0)
         return "<span class=\"hw-grey\">&mdash;</span>";
     const char* tone = score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad");
-    return "<span class=\"hw-pill " + std::string(tone) + "\">" + std::to_string(score) + "</span>";
+    return "<span class=\"pill " + std::string(tone) + "\">" + std::to_string(score) + "</span>";
 }
 
 // A clickable tag chip that narrows the list to this exact key[=value] — targets the
@@ -307,11 +330,19 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
     return h;
 }
 
-std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q) {
+std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q, bool quarantined) {
     const std::string name = d.hostname.empty() ? d.agent_id : d.hostname;
     const std::string status_pill = d.online
-        ? "<span class=\"hw-pill ok\">online</span>"
-        : (d.stale ? "<span class=\"hw-pill warn\">stale</span>" : "<span class=\"hw-pill\">offline</span>");
+        ? "<span class=\"pill ok\">online</span>"
+        : (d.stale ? "<span class=\"pill warn\">stale</span>" : "<span class=\"pill idle\">offline</span>");
+    // Quarantined pill + the row's route into the Containment lens. The link is a plain
+    // anchor (the create dialog needs OS/online/whitelist context, and 50 live buttons
+    // would need 50 scoped probes); yuzu-estate.js stops the row's own click handler from
+    // overriding its target.
+    const std::string quarantine_cell =
+        std::string(quarantined ? "<span class=\"hw-pill bad\">Quarantined</span> " : "") +
+        "<a class=\"hw-lab\" data-act=\"row-containment\" href=\"/hardware/ci?id=" + url_encode(d.agent_id) +
+        "&amp;lens=containment\">" + (quarantined ? "Containment" : "Quarantine") + "</a>";
     const std::string cpu_ram = [&] {
         const std::string ct = ci_cores_threads(d.ci_cpu_cores, d.ci_cpu_threads);
         const std::string ram = ci_ram_gb(d.ci_ram_bytes);
@@ -345,8 +376,8 @@ std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q) {
            "<td><a class=\"hw-name\" href=\"/hardware/ci?id=" + url_encode(d.agent_id) + "\">" +
            esc(name) + "</a></td>"
            "<td class=\"hw-mono\">" + ip_cell + "</td>"
-           "<td><span class=\"hw-os\">" + os_label(d.os) + "</span></td>"
-           "<td>" + status_pill + "</td>"
+           "<td><span class=\"os-tag\">" + os_label(d.os) + "</span></td>"
+           "<td>" + status_pill + " " + quarantine_cell + "</td>"
            "<td>" + dex_badge(d.dex_score) + "</td>"
            "<td class=\"hw-mono\">" + version_cell + "</td>"
            "<td>" + (d.last_seen.empty() ? "?" : esc(d.last_seen)) + "</td>"
@@ -405,6 +436,10 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     if (tags_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
              "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
+    if (page.quarantine_degraded)
+        h += "<div class=\"gp-banner hw-degrade\"><b>Quarantine state unavailable.</b> The quarantine "
+             "records could not be read or checked &mdash; a row without a Quarantined pill here is "
+             "not \"not quarantined\".</div>";
     // Sticky bulk-tag action bar (round-3 item 7) — hidden by CSS until a row is
     // checked (hwSelRender toggles a `show` class); JS lives in guardian_page_ui.cpp.
     // Applying loops the EXISTING single-agent /api/tags/set|delete per selected
@@ -417,11 +452,11 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
          "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\">"
          "<input id=\"hw-bulk-value\" class=\"hw-search\" placeholder=\"value\" style=\"min-width:120px\" "
          "maxlength=\"448\">"
-         "<button type=\"button\" class=\"gp-btn accent\" onclick=\"hwBulkTag(this,'set')\">Apply</button>"
+         "<button type=\"button\" class=\"gp-btn accent\" data-service-note=\"" + esc(std::string(kHwServiceTagSetNote)) + "\" onclick=\"hwBulkTag(this,'set')\">Apply</button>"
          "<span class=\"hw-lab\">Remove tag</span>"
          "<input id=\"hw-bulk-rkey\" class=\"hw-search\" placeholder=\"key\" style=\"min-width:120px\" "
          "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\">"
-         "<button type=\"button\" class=\"gp-btn\" onclick=\"hwBulkTag(this,'delete')\">Apply</button>"
+         "<button type=\"button\" class=\"gp-btn\" data-service-note=\"" + esc(std::string(kHwServiceTagRemoveNote)) + "\" onclick=\"hwBulkTag(this,'delete')\">Apply</button>"
          "<button type=\"button\" class=\"gp-btn\" onclick=\"hwSelClear()\">Clear</button>"
          "</div>";
     h += "<div class=\"hw-toolbar\"><div class=\"gp-filters\">" + chip("All OS", "all", q, true) +
@@ -453,7 +488,7 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
         h += sortable_th("OS version", HwSortKey::OsVersion, q);
         h += "</tr></thead><tbody>";
         for (const auto& row : page.rows)
-            h += row_html(row, q);
+            h += row_html(row, q, page.quarantined_ids.contains(row.agent_id));
         h += "</tbody></table></div>";
         h += pagination(q, page.total_matching);
     }
@@ -507,7 +542,9 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
     h += "</div></div>";
 
     h += render_hardware_results_region(page, ci_degraded, tags_degraded);
-    h += "</section></div>";
+    h += "</section>";
+    h += quarantine_panel_placeholder();
+    h += "</div>";
     return h;
 }
 
@@ -531,9 +568,13 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
     std::string h;
     if (lens == "software") {
         h += render_hardware_software_lens(agent_id, detail.software, detail.software_truncated, online,
-                                           aff.sync);
+                                           aff.sync, detail.software_last_seen);
     } else if (lens == "tags") {
-        h += render_hardware_tags_lens(agent_id, detail.tags, aff.can_write_tags);
+        h += render_hardware_tags_lens(agent_id, detail.tags, aff.can_write_tags, aff.can_delete_tags);
+    } else if (lens == "containment") {
+        // Lazy: the fragment takes its own Security:Read / Security:Execute probes, so a
+        // viewer who never opens this lens never pays the denied-probe audit rows.
+        h += containment_lens_placeholder(agent_id);
     } else if (lens == "actions") {
         // The route swaps this placeholder for the real actions lens on load —
         // rendering the lens itself needs actions_fn/classify_fn/schema_fn, which
@@ -663,6 +704,8 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
             h += field("Architecture", r.arch);
             h += "</div></div>";
         }
+        // Stored data: click-to-load, so a viewer who never opens it pays no denied probe.
+        h += stored_data_placeholder(agent_id);
     }
     return h;
 }
@@ -687,10 +730,10 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
     h += "<div class=\"hw-wrap\">";
     h += "<div class=\"hw-hdr\"><a class=\"gp-btn\" href=\"/hardware\">&larr; Hardware</a></div>";
     h += "<div class=\"hw-hdr\">";
-    h += std::string("<span class=\"hw-pill") + (online ? " ok\">online" : "\">offline") + "</span>";
+    h += std::string("<span class=\"pill") + (online ? " ok\">online" : " idle\">offline") + "</span>";
     h += "<h1 class=\"hw-h1\" style=\"margin:0\">" + esc(hostname) + "</h1>";
     if (!os.empty())
-        h += "<span class=\"hw-os\">" + os_label(os) + "</span>";
+        h += "<span class=\"os-tag\">" + os_label(os) + "</span>";
     h += "<span class=\"hw-mono\">" + esc(agent_id) + "</span>";
     h += "<span class=\"hw-lab\">last seen " + esc(last_seen.empty() ? "?" : last_seen) + "</span>";
     h += "<span style=\"flex:1\"></span>";
@@ -704,6 +747,10 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
         h += "</div>";
     }
 
+    // Quarantine banner: one lazily loaded placeholder, empty unless the device has an
+    // active record. It sits above the lens bar so it shows on every lens, including Live
+    // and Actions, whose instructions a quarantined device withholds.
+    h += containment_banner_placeholder(agent_id);
     h += render_hardware_lens_bar(agent_id, active_lens, /*oob=*/false);
     h += "<div id=\"hw-ci-lens\">";
     h += render_hardware_lens_body(agent_id, detail, active_lens, now_secs, aff);
@@ -716,7 +763,8 @@ std::string render_hardware_lens_bar(const std::string& agent_id, const std::str
                     std::string(oob ? " hx-swap-oob=\"true\"" : "") + ">";
     h += device_lens_tab("overview", "Overview", agent_id, active);
     h += device_lens_tab("software", "Installed software", agent_id, active);
-    h += device_lens_tab("tags", "Tags", agent_id, active);
+    h += device_lens_tab("tags", "Tags and properties", agent_id, active);
+    h += device_lens_tab("containment", "Containment", agent_id, active);
     h += device_lens_tab("dex", "DEX", agent_id, active);
     h += device_lens_tab("guardian", "Guardian", agent_id, active);
     h += device_lens_tab("live", "Live", agent_id, active);
@@ -761,7 +809,8 @@ std::string render_hardware_sync_terminal(const std::string& agent_id, const std
 
 std::string render_hardware_software_lens(const std::string& agent_id,
                                           const std::optional<std::vector<SoftwareEntry>>& software,
-                                          bool truncated, bool online, const HwSyncAffordance& sync) {
+                                          bool truncated, bool online, const HwSyncAffordance& sync,
+                                          std::optional<std::int64_t> software_last_seen) {
     if (!software)
         return "<div class=\"gp-banner hw-degrade\"><b>Installed software unavailable.</b> The software "
                "inventory store could not be read. Retry shortly.</div>";
@@ -777,7 +826,19 @@ std::string render_hardware_software_lens(const std::string& agent_id,
     // Round-3 item 3: a searchable text filter over this device's own installed-
     // software table (gpSearch, group "hwsw" — self-contained to this lens, no
     // server round-trip needed since a per-device list is small).
-    std::string h = "<div class=\"hw-panel\"><div class=\"hw-tools\"><input class=\"hw-search\" "
+    // "N applications, last synced <when>": a never-synced device (0) and a degraded
+    // read (nullopt) are told apart, neither is shown as a bare count.
+    std::string summary = std::to_string(software->size()) +
+                          (software->size() == 1 ? " application" : " applications");
+    if (!software_last_seen)
+        summary += ", last synced time unavailable";
+    else if (*software_last_seen <= 0)
+        summary += ", never synced";
+    else
+        summary += ", last synced " + esc(format_iso_utc(*software_last_seen));
+    std::string h = "<div class=\"hw-panel\"><div class=\"hw-page\" id=\"hw-sw-summary\">" + summary +
+                    (truncated ? " (list truncated)" : "") + "</div>"
+                    "<div class=\"hw-tools\"><input class=\"hw-search\" "
                     "placeholder=\"Filter installed software…\" oninput=\"gpSearch(this)\" "
                     "data-gpf=\"hwsw\"></div>";
     h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr><th>Name</th><th>Version</th><th>Publisher</th>"
@@ -795,42 +856,56 @@ std::string render_hardware_software_lens(const std::string& agent_id,
         h += "<div class=\"hw-page\">List truncated &mdash; showing the first " +
              std::to_string(kHwSoftwareCap) + " entries.</div>";
     h += "</div>";
+    // Application usage and detected licences are behavioural reads: click-to-load only.
+    h += device_data::render_usage_load_hosts(agent_id);
     return h;
 }
 
 std::string render_hardware_tags_lens(const std::string& agent_id,
                                       const std::optional<std::vector<DeviceTag>>& tags,
-                                      bool can_write) {
+                                      bool can_write, bool can_delete) {
+    // The custom-properties and property-schema panels load into this host on open
+    // (their own fragment carries the Infrastructure probes, so a record view that
+    // never opens this lens never pays them).
+    const std::string properties_host =
+        "<div hx-get=\"/fragments/hardware/ci/properties?id=" + url_encode(agent_id) +
+        "\" hx-trigger=\"load\" hx-swap=\"innerHTML\" style=\"margin-top:22px\"><span "
+        "class=\"gp-mute\">Loading properties&hellip;</span></div>";
     if (!tags)
         return "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read. "
-               "Retry shortly.</div>";
+               "Retry shortly.</div>" + properties_host;
     std::string h = "<div class=\"hw-panel\">";
     if (can_write) {
-        // Posts JSON to the EXISTING /api/tags/set (scoped Tag:Write, audited tag.set)
-        // via hwTagSet — no new route. Key rules mirror TagStore::validate_key.
-        h += "<form class=\"hw-hdr\" data-agent=\"" + esc(agent_id) + "\" onsubmit=\"return false\">"
-             "<input class=\"hw-search\" name=\"key\" placeholder=\"key (e.g. owner)\" "
-             "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\" style=\"min-width:160px\">"
-             "<input class=\"hw-search\" name=\"value\" placeholder=\"value\" maxlength=\"448\">"
-             "<button type=\"button\" class=\"gp-btn accent\" onclick=\"hwTagSet(this)\">Add tag</button>"
-             "</form>";
+        // The Add tag dialog (static/yuzu-device-data.js) posts JSON to the EXISTING
+        // /api/tags/set (scoped Tag:Write, audited tag.set). The hint and the service
+        // sentence are server-authored so the page and its tests share one wording.
+        h += "<div class=\"hw-hdr\"><button type=\"button\" class=\"gp-btn accent\" "
+             "data-act=\"tag-add\" data-agent=\"" + esc(agent_id) + "\" data-hint=\"" +
+             esc(std::string(kHwTagKeyHint)) + "\" data-service-set-note=\"" +
+             esc(std::string(kHwServiceTagSetNote)) + "\">Add tag</button></div>";
     }
     if (tags->empty()) {
         h += "<div class=\"hw-empty\">No tags set on this device.</div></div>";
-        return h;
+        return h + properties_host;
     }
+    // Remove needs Tag:Delete, a different permission from the Tag:Write that
+    // gates Add — a Write-only viewer must not be offered a control that 403s.
     h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr><th>Key</th><th>Value</th><th>Source</th>" +
-         std::string(can_write ? "<th></th>" : "") + "</tr></thead><tbody>";
+         std::string(can_delete ? "<th></th>" : "") + "</tr></thead><tbody>";
     for (const auto& t : *tags) {
         h += "<tr><td class=\"hw-name\">" + esc(t.key) + "</td><td class=\"hw-mono\">" + esc(t.value) +
              "</td><td class=\"hw-mono\">" + esc(t.source) + "</td>";
-        if (can_write)
-            h += "<td><a class=\"gp-btn danger\" data-agent=\"" + esc(agent_id) + "\" data-key=\"" + esc(t.key) +
-                 "\" onclick=\"hwTagDelete(this)\">remove</a></td>";
+        if (can_delete)
+            h += "<td><button type=\"button\" class=\"gp-btn danger\" data-act=\"tag-del\" data-agent=\"" +
+                 esc(agent_id) + "\" data-key=\"" + esc(t.key) + "\"" +
+                 (t.key == "service"
+                      ? " data-service-note=\"" + esc(std::string(kHwServiceTagRemoveNote)) + "\""
+                      : std::string()) +
+                 ">Remove</button></td>";
         h += "</tr>";
     }
     h += "</tbody></table></div></div>";
-    return h;
+    return h + properties_host;
 }
 
 } // namespace yuzu::server

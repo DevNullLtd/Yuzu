@@ -19,6 +19,7 @@
 
 #include <httplib.h>
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -97,22 +98,27 @@ public:
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
 
-    std::string render_compliance_summary_fragment();
-    std::string render_compliance_detail_fragment(const std::string& policy_id);
+    /// `can_*` are the route's one-shot Policy:Write / :Execute / :Delete
+    /// probes; the markup omits controls the viewer cannot use.
+    std::string render_compliance_summary_fragment(bool can_write = false, bool can_execute = false,
+                                                   bool can_delete = false);
+    /// `scope` is the caller's admitted visible set (nullopt = whole fleet).
+    /// `rows_read` is set to the number of agent rows read when the store
+    /// answered (the caller audits that read) and left empty otherwise.
+    std::string render_compliance_detail_fragment(const std::string& policy_id,
+                                                  const authz::VisibleSet& scope,
+                                                  std::optional<std::size_t>& rows_read);
+    std::string render_policy_fragments_fragment();
 
-    // guardian-confinement-2298 PR3 §3e: both compliance fragments below are
-    // auth_fn_-only (no perm_fn_ at all) and render per-agent compliance rows
-    // fleet-wide plus policy scope expressions — no per-target parameter to
-    // scope against. Same shape/ordering/throw-safety contract as
+    // guardian-confinement-2298 PR3 §3e: blanket service-scoped-token deny for
+    // the two compliance fragments, ahead of their grant gates (#4042:
+    // summary = perm_fn_(Policy,Read); detail = fleet_read_fn_(Policy,Read),
+    // confined and audited). Same shape/ordering/throw-safety contract as
     // GuardianRoutes::deny_service_scoped_ (JSON A4 body even though the
     // caller is an HTMX fragment route — that's the established precedent
     // for this route class, not a fragment-specific shape).
     [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req,
                                             httplib::Response& res) const;
-
-    // -- Static helpers -------------------------------------------------------
-
-    static const char* compliance_level(int pct);
 
     // -- Dependency pointers (stored by register_routes) -----------------------
 

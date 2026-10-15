@@ -27,7 +27,9 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <format>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -203,6 +205,126 @@ TEST_CASE("ResultSetStore: members_checked matches the plain wrapper on the heal
     auto recovered = degraded_store.members_checked(rs->id, "", 100);
     REQUIRE(recovered.has_value());
     CHECK(recovered->device_ids.size() == 3);
+}
+
+// ── Members visibility (PR #5846 review blocker) ───────────────────────────
+// The members page is a display read of per-device data: the caller's CURRENT list-read scope
+// must reach the SQL before ORDER BY/LIMIT (ADR-0017 INV-3), or ids they can no longer see take
+// page slots and are paged through.
+
+TEST_CASE("build_members_page_sql: the visibility predicate precedes the keyset predicate, "
+          "ORDER BY and LIMIT, and an engaged-empty scope matches nothing",
+          "[result_set][members][security]") {
+    SECTION("no scope: the statement is the unrestricted keyset page") {
+        auto b = build_members_page_sql("rs_a", "", 10, std::nullopt);
+        CHECK(b.sql == "SELECT device_id FROM result_set_store.result_set_members "
+                       "WHERE result_set_id = $1 ORDER BY device_id ASC LIMIT $2::bigint");
+        CHECK(b.params == std::vector<std::string>{"rs_a", "11"});
+        auto c = build_members_page_sql("rs_a", "dev-5", 10, std::nullopt);
+        CHECK(c.sql == "SELECT device_id FROM result_set_store.result_set_members "
+                       "WHERE result_set_id = $1 AND device_id > $2 ORDER BY device_id ASC "
+                       "LIMIT $3::bigint");
+        CHECK(c.params == std::vector<std::string>{"rs_a", "dev-5", "11"});
+    }
+    SECTION("a scope is bound as one array and sits before the cursor, ORDER BY and LIMIT") {
+        auto b = build_members_page_sql("rs_a", "dev-5", 10,
+                                        authz::VisibleSet{std::unordered_set<std::string>{"dev-7"}});
+        const auto any_at = b.sql.find("device_id = ANY($2::text[])");
+        const auto cursor_at = b.sql.find("device_id > $3");
+        const auto order_at = b.sql.find("ORDER BY");
+        const auto limit_at = b.sql.find("LIMIT");
+        REQUIRE(any_at != std::string::npos);
+        REQUIRE(cursor_at != std::string::npos);
+        CHECK(any_at < cursor_at);
+        CHECK(cursor_at < order_at);
+        CHECK(order_at < limit_at);
+        // Declared outside the macro: a quoted literal inside CHECK is an MSVC preprocessor trap.
+        const std::string one_id_array = "{\"dev-7\"}";
+        REQUIRE(b.params.size() == 4);
+        CHECK(b.params[0] == "rs_a");
+        CHECK(b.params[1] == one_id_array);
+        CHECK(b.params[2] == "dev-5");
+        CHECK(b.params[3] == "11");
+    }
+    SECTION("an engaged but empty scope is 1=0, never the unrestricted read") {
+        auto b = build_members_page_sql("rs_a", "", 10, authz::deny_all());
+        CHECK(b.sql.find("AND 1=0") != std::string::npos);
+        CHECK(b.sql.find("AND 1=0") < b.sql.find("ORDER BY"));
+        CHECK(b.sql.find("ANY(") == std::string::npos);
+    }
+}
+
+TEST_CASE("ResultSetStore: members_checked pushes the visible set into the SQL, so hidden ids "
+          "neither appear nor consume page slots, at 1/9/10/11 visible members and page size 10 "
+          "(mutation: drop the predicate and hidden ids lead the first page)",
+          "[pg][result_set][members][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    for (const int visible_n : {1, 9, 10, 11}) {
+        INFO("visible members: " << visible_n);
+        // 15 hidden ids sort BEFORE every visible one ("aaa-..."), and a hidden id sits between
+        // each pair of visible ones ("dev-NN-h"): a post-filter would hand back a first page of
+        // only hidden ids, and an interleaved one would short every page.
+        std::vector<std::string> all;
+        std::unordered_set<std::string> visible;
+        std::vector<std::string> expected;
+        for (int i = 0; i < 15; ++i)
+            all.push_back(std::format("aaa-{:02d}", i));
+        for (int i = 0; i < visible_n; ++i) {
+            const auto v = std::format("dev-{:02d}", i);
+            all.push_back(v);
+            all.push_back(v + "-h");
+            visible.insert(v);
+            expected.push_back(v);
+        }
+        auto rs = store.create_materialized(req("alice", std::format("set-{}", visible_n)), all);
+        REQUIRE(rs.has_value());
+
+        std::vector<std::string> seen;
+        std::vector<std::size_t> page_sizes;
+        std::string cursor;
+        for (int guard = 0; guard < 10; ++guard) {
+            auto page = store.members_checked(rs->id, cursor, 10, authz::VisibleSet{visible});
+            REQUIRE(page.has_value());
+            page_sizes.push_back(page->device_ids.size());
+            for (const auto& id : page->device_ids)
+                seen.push_back(id);
+            if (page->next_cursor.empty())
+                break;
+            // The cursor is the last VISIBLE id of the page, so the next page resumes after it.
+            CHECK(page->next_cursor == page->device_ids.back());
+            cursor = page->next_cursor;
+        }
+        CHECK(seen == expected); // every visible id, in order, no hidden id, no duplicate
+        // The first page is full whenever 10+ are visible: hidden ids took no slot.
+        CHECK(page_sizes.front() == static_cast<std::size_t>(std::min(visible_n, 10)));
+        CHECK(page_sizes.size() == (visible_n > 10 ? 2u : 1u)); // exactly 10 visible = one page
+    }
+
+    SECTION("an engaged-empty scope is an empty page with no cursor, not the unrestricted read") {
+        auto rs = store.create_materialized(req("alice", "all-hidden"), {"d1", "d2", "d3"});
+        REQUIRE(rs.has_value());
+        auto none = store.members_checked(rs->id, "", 10, authz::deny_all());
+        REQUIRE(none.has_value());
+        CHECK(none->device_ids.empty());
+        CHECK(none->next_cursor.empty());
+        // Control: the default (unrestricted) read of the same set sees all three.
+        auto all = store.members_checked(rs->id, "", 10);
+        REQUIRE(all.has_value());
+        CHECK(all->device_ids.size() == 3);
+    }
+    SECTION("a scope naming ids that are not members changes nothing about the members") {
+        auto rs = store.create_materialized(req("alice", "partial"), {"d1", "d2", "d3"});
+        REQUIRE(rs.has_value());
+        auto page = store.members_checked(
+            rs->id, "", 10,
+            authz::VisibleSet{std::unordered_set<std::string>{"d2", "not-a-member"}});
+        REQUIRE(page.has_value());
+        CHECK(page->device_ids == std::vector<std::string>{"d2"});
+    }
 }
 
 TEST_CASE("ResultSetStore: lineage walks parent chain root-first", "[pg][result_set][lineage]") {

@@ -17,15 +17,12 @@ const char* const kSettingsPageTemplate =
   <script src="/static/htmx.js"></script>
   <script src="/static/sse.js"></script>
   <style>
-    body { min-height: calc(100vh - var(--shell-top-h, 0px)); }
+    body { min-height: calc(100vh - var(--shell-top-h)); }
 
     /* ── Page frame ────────────────────────────────────────── */
     .content {
       max-width: 1200px; padding: 22px 28px 36px;
       display: flex; flex-direction: column; gap: 22px;
-    }
-    .page-head h1 {
-      font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2;
     }
     code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
     .muted { color: var(--mut); }
@@ -52,6 +49,7 @@ const char* const kSettingsPageTemplate =
     .section-note {
       margin: 12px 0 0; font-size: 12.5px; color: var(--mut);
     }
+    .section-note.warn { color: var(--warn); }
 
     /* ── Form elements ─────────────────────────────────────── */
     .form-row {
@@ -75,6 +73,7 @@ const char* const kSettingsPageTemplate =
       font-family: var(--mds-font-family-mono); font-size: 12.5px;
     }
     .form-row input[type="text"], .form-row input[type="password"], .form-row select { flex: 1; }
+    .form-row input.num-narrow { width: 7rem; flex: 0 0 auto; }
     .form-row input[type="text"], .form-row input[type="password"] {
       font-family: var(--mds-font-family-mono); font-size: 12.5px;
     }
@@ -168,7 +167,7 @@ const char* const kSettingsPageTemplate =
     .feedback:empty { display: none; }
     .feedback-ok    { color: var(--ok); }
     .feedback-error { color: var(--bad); }
-    .callout, .feedback-warning {
+    .feedback-warning {
       padding: 12px 14px; border: 1px solid var(--line2);
       border-radius: var(--rad-panel); background: var(--surface2); color: var(--ink2);
       font-size: 13.5px;
@@ -241,7 +240,7 @@ const char* const kSettingsPageTemplate =
 
   <div class="content">
 
-    <div class="page-head"><h1>Settings</h1></div>
+    <div class="page-header"><h1>Settings</h1></div>
 
     <!-- ── Server Configuration ───────────────────────────── -->
     <div class="section">
@@ -545,24 +544,6 @@ const char* const kSettingsPageTemplate =
       </div>
     </div>
 
-    <!-- ── DEX Alerts (F1) ────────────────────────────────── -->
-    <div class="section">
-      <div class="section-header">DEX Alerts</div>
-      <div class="section-body">
-        <p class="section-intro">
-          Route DEX reliability signals to operator notifications and the
-          <code>dex.signal</code> webhook event, and tune the fleet blast-radius
-          incident thresholds. Changes apply immediately.
-        </p>
-        <div id="dex-alerts-section"
-             hx-get="/fragments/settings/dex-alerts"
-             hx-trigger="load"
-             hx-swap="innerHTML">
-          <span class="muted">Loading...</span>
-        </div>
-      </div>
-    </div>
-
     <!-- ── MCP (AI Integration) ────────────────────────── -->
     <div class="section">
       <div class="section-header">MCP (AI Integration)</div>
@@ -605,23 +586,6 @@ const char* const kSettingsPageTemplate =
         <div id="mgmt-groups-section"
              hx-get="/fragments/settings/management-groups"
              hx-trigger="load, refreshMgmtGroups from:body"
-             hx-swap="innerHTML">
-          <span class="muted">Loading...</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- ── Tag Compliance ──────────────────────────────────── -->
-    <div class="section">
-      <div class="section-header">Tag Compliance</div>
-      <div class="section-body">
-        <p class="section-intro">
-          Devices should have all 4 structured tag categories assigned.
-          Devices missing tags are flagged but continue to function normally.
-        </p>
-        <div id="tag-compliance-section"
-             hx-get="/fragments/settings/tag-compliance"
-             hx-trigger="load"
              hx-swap="innerHTML">
           <span class="muted">Loading...</span>
         </div>
@@ -1015,13 +979,6 @@ const char* const kSettingsPageTemplate =
           showToast(msg, confirmedNone ? 'success' : 'warning');
         }
       });
-    });
-    /* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-    document.addEventListener('keydown', function(e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-        e.preventDefault();
-        window.location.href = '/?palette=1';
-      }
     });
   </script>
 </body>

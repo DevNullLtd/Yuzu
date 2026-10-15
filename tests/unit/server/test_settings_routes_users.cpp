@@ -127,6 +127,7 @@ struct SettingsRoutesHarness {
     // tests can act as different principals against the same harness.
     std::string session_user;
     auth::Role session_role{auth::Role::admin};
+    bool elevated{false};
 
     // Audit capture — each audit_fn_ call from the routes layer appends an
     // entry. Tests assert on this to verify CC7.2 evidence emission.
@@ -150,7 +151,9 @@ struct SettingsRoutesHarness {
         };
 
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
-            if (session_user.empty() || session_role != auth::Role::admin) {
+            // `elevated` models a JIT-elevated `user` session: require_admin admits it through
+            // effective_role while the session's own durable role stays `user`.
+            if (session_user.empty() || (session_role != auth::Role::admin && !elevated)) {
                 res.status = 403;
                 return false;
             }
@@ -290,6 +293,7 @@ struct SettingsAdr2001Harness {
 
     std::string session_user{"admin"};
     auth::Role session_role{auth::Role::admin};
+    bool elevated{false};
     std::vector<AuditCall> audit_calls;
 
     ~SettingsAdr2001Harness() {
@@ -330,7 +334,9 @@ struct SettingsAdr2001Harness {
             return s;
         };
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
-            if (session_user.empty() || session_role != auth::Role::admin) {
+            // `elevated` models a JIT-elevated `user` session: require_admin admits it through
+            // effective_role while the session's own durable role stays `user`.
+            if (session_user.empty() || (session_role != auth::Role::admin && !elevated)) {
                 res.status = 403;
                 return false;
             }
@@ -414,6 +420,43 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin cannot delete self",
     // SOC 2 CC7.2 evidence emission — denied destructive ops must reach
     // audit_store, not just spdlog (governance Gate 6 CO-1).
     CHECK(h.has_audit("user.delete", "denied", "User", "admin"));
+}
+
+TEST_CASE("SettingsRoutes POST role: a JIT-elevated user cannot change an account role",
+          "[settings][users][elevation]") {
+    SettingsRoutesHarness h;
+    h.session_user = "mallory";
+    h.session_role = auth::Role::user; // durable role
+    h.elevated = true;                 // admitted by admin_fn through the elevation
+    auto res = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "bob"));
+    CHECK(h.audit_calls.back().detail == "elevated_session_role_change_blocked");
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::user); // unchanged
+}
+
+TEST_CASE("SettingsRoutes POST role: a JIT-elevated user cannot mint a standing admin; "
+          "an administrator still can",
+          "[pg][settings][users][elevation]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "mallory";
+    h.session_role = auth::Role::user;
+    h.elevated = true;
+    auto res = h.set_role("bob", "admin");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_detail("user.role_change", "denied", "bob") ==
+          "elevated_session_role_change_blocked");
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::user); // unchanged
+    // The same call from a session whose own role is admin still works.
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+    h.elevated = false;
+    res = h.set_role("bob", "admin");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.auth_mgr.get_user_role("bob") == auth::Role::admin);
 }
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other users",

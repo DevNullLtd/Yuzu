@@ -134,7 +134,12 @@ constexpr const char* kSampleYaml = "---\n"
                                     "kind: InstructionDefinition\n"
                                     "metadata:\n"
                                     "  id: signing.smoke.test\n"
-                                    "  displayName: Signing Smoke Test\n";
+                                    "  displayName: Signing Smoke Test\n"
+                                    "spec:\n"
+                                    "  type: question\n"
+                                    "  execution:\n"
+                                    "    plugin: system_info\n"
+                                    "    action: os_name\n";
 
 } // namespace
 
@@ -161,6 +166,97 @@ TEST_CASE("InstructionStore: signed import with valid signature is accepted",
     REQUIRE(got.has_value());
     REQUIRE(got->has_value());
     CHECK((*got)->yaml_source == kSampleYaml);
+}
+
+// ── The signature covers yaml_source ONLY: dispatch/policy columns must come from it ──────
+
+namespace {
+/// Signs `yaml` and returns the envelope with `override_fn` applied to the unsigned fields.
+template <typename F>
+std::string signed_envelope(const std::string& id, const std::string& yaml, F&& override_fn) {
+    auto kp = generate_ed25519();
+    auto sig = sign_hex(kp.pkey.get(), yaml);
+    auto j = nlohmann::json::parse(build_envelope(id, yaml, sig, kp.public_key_hex));
+    override_fn(j);
+    return j.dump();
+}
+} // namespace
+
+TEST_CASE("InstructionStore: a validly signed export cannot be re-labelled through its unsigned "
+          "fields (plugin, action, approval_mode, type, concurrency_mode)",
+          "[instruction_store][1073][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    // The signed YAML says always-approve; an attacker flips the unsigned envelope to auto.
+    const std::string yaml = std::string(kSampleYaml) + "  approval: always\n";
+    const std::pair<const char*, const char*> tampers[] = {
+        {"plugin", "remediation"},
+        {"action", "wipe"},
+        {"approval_mode", "auto"},
+        {"type", "action"},
+        {"concurrency_mode", "per-definition"},
+    };
+    for (const auto& [field, value] : tampers) {
+        INFO(field);
+        auto env = signed_envelope(std::string("def.relabel.") + field, yaml,
+                                   [&](nlohmann::json& j) { j[field] = value; });
+        auto r = store.import_definition_json(env);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find(field) != std::string::npos);
+        CHECK(r.error().find("signed yaml_source") != std::string::npos);
+        CHECK(r.error().find(value) == std::string::npos); // the attacker's value is not echoed
+    }
+}
+
+TEST_CASE("InstructionStore: a signed import takes plugin, action and approval from the signed "
+          "YAML, whether or not the envelope repeats them",
+          "[instruction_store][1073][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string yaml = std::string(kSampleYaml) + "  approval: always\n";
+    // Envelope omits every dispatch field: they are derived from the YAML.
+    auto bare = signed_envelope("def.derived", yaml, [](nlohmann::json& j) {
+        for (const char* k : {"plugin", "action", "type", "approval_mode", "concurrency_mode"})
+            j.erase(k);
+    });
+    auto r = store.import_definition_json(bare);
+    REQUIRE(r.has_value());
+    auto got = store.get_definition(*r);
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((*got)->plugin == "system_info");
+    CHECK((*got)->action == "os_name");
+    CHECK((*got)->approval_mode == "always");
+    CHECK((*got)->concurrency_mode == "per-device");
+
+    // Envelope that repeats the same values (action in a different case) is fine.
+    auto same = signed_envelope("def.same", yaml, [](nlohmann::json& j) {
+        j["approval_mode"] = "always";
+        j["action"] = "OS_NAME";
+    });
+    CHECK(store.import_definition_json(same).has_value());
+}
+
+TEST_CASE("InstructionStore: a signed YAML that does not declare its plugin and action is "
+          "refused",
+          "[instruction_store][1073][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    // The envelope names a plugin/action, but nothing signed does.
+    const std::string yaml = "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
+                             "metadata:\n  id: signing.noexec\n  displayName: No Exec\n";
+    auto env = signed_envelope("def.noexec", yaml, [](nlohmann::json&) {});
+    auto r = store.import_definition_json(env);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("must declare the plugin and action") != std::string::npos);
 }
 
 // ── Negative crypto proofs ───────────────────────────────────────────────────

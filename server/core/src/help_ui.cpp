@@ -9,10 +9,9 @@ const char* const kHelpPageTemplate = R"HTM(<!DOCTYPE html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu — Help</title>
 <link rel="stylesheet" href="/static/yuzu.css">
+<script src="/static/htmx.js"></script>
 <style>
 .help-content{padding:22px 28px 36px}
-.help-content h1{font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
-.help-content p{max-width:70ch;margin-top:4px;color:var(--mut)}
 .help-content a{color:var(--primary);text-decoration:none}
 .help-content a:hover{text-decoration:underline}
 .help-content a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
@@ -22,8 +21,10 @@ const char* const kHelpPageTemplate = R"HTM(<!DOCTYPE html>
   <!--yuzu:shell--><!--/yuzu:shell-->
 
 <div class="help-content">
+<header class="page-header"><div>
 <h1>Help</h1>
-<p>Help page is under construction. See the <a href="/">dashboard</a>.</p>
+<p class="subtitle">Help page is under construction. See the <a href="/">dashboard</a>.</p>
+</div></header>
 </div>
 
 <div id="toast-container" class="toast-container"></div>
@@ -51,15 +52,6 @@ function showToast(message, level) {
 document.body.addEventListener('showToast', function(e) {
   var d = e.detail || {};
   showToast(d.message || 'Done', d.level || 'success');
-});
-</script>
-<script>
-/* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-document.addEventListener('keydown', function(e) {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-    e.preventDefault();
-    window.location.href = '/?palette=1';
-  }
 });
 </script>
 </body></html>

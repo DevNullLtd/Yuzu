@@ -184,10 +184,10 @@ assert_contains "Login error has 'error' key" '"error"' "$BAD_LOGIN_BODY"
 assert_contains "Login error has 'code' field" '"code"' "$BAD_LOGIN_BODY"
 
 # ══════════════════════════════════════════════════════════════════════════
-# Category 2: Auth Enforcement — Page routes redirect to /login
+# Category 2: Auth Enforcement — Page routes redirect to the landing page (/home)
 # ══════════════════════════════════════════════════════════════════════════
 log ""
-log "Category 2: Auth Enforcement — Page routes redirect to /login (302)"
+log "Category 2: Auth Enforcement — Page routes redirect to /home (302)"
 
 PAGE_ROUTES=(
     "/"
@@ -210,9 +210,13 @@ done
 log ""
 log "Category 3: Unauthenticated endpoints accessible without auth"
 
-# /login → 200
-status=$(http_status "GET" "/login")
-assert_eq "GET /login → 200" "200" "$status"
+# /home → 200 (the landing and sign-in page; no session needed)
+status=$(http_status "GET" "/home")
+assert_eq "GET /home → 200" "200" "$status"
+
+# /login → 302 to /home (the old sign-in address forwards to the landing page)
+status=$(http_status_redirect "/login")
+assert_eq "GET /login → 302" "302" "$status"
 
 # /livez → 200
 status=$(http_status "GET" "/livez")

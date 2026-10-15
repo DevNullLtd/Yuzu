@@ -5,9 +5,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 #ifdef _WIN32
 // clang-format off
@@ -36,16 +39,25 @@ std::string rule_type_to_string(AutoApproveRuleType t) {
     return "unknown";
 }
 
-AutoApproveRuleType string_to_rule_type(const std::string& s) {
-    if (s == "trusted_ca")
-        return AutoApproveRuleType::trusted_ca;
-    if (s == "hostname_glob")
-        return AutoApproveRuleType::hostname_glob;
-    if (s == "ip_subnet")
-        return AutoApproveRuleType::ip_subnet;
-    if (s == "cloud_provider")
-        return AutoApproveRuleType::cloud_provider;
-    return AutoApproveRuleType::hostname_glob; // safe default
+// Prefix length 0-32 from 1-2 ASCII digits; nullopt otherwise (no stoi, never throws).
+std::optional<int> parse_prefix_len(std::string_view s) {
+    if (s.empty() || s.size() > 2)
+        return std::nullopt;
+    int n = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9')
+            return std::nullopt;
+        n = n * 10 + (c - '0');
+    }
+    if (n > 32)
+        return std::nullopt;
+    return n;
+}
+
+bool has_delimiter_or_control(std::string_view s) {
+    return std::any_of(s.begin(), s.end(), [](unsigned char c) {
+        return c == ':' || c < 0x20 || c == 0x7f;
+    });
 }
 
 std::string to_lower(std::string s) {
@@ -56,6 +68,56 @@ std::string to_lower(std::string s) {
 
 } // anonymous namespace
 
+std::optional<AutoApproveRuleType> parse_auto_approve_rule_type(std::string_view s) {
+    if (s == "trusted_ca")
+        return AutoApproveRuleType::trusted_ca;
+    if (s == "hostname_glob")
+        return AutoApproveRuleType::hostname_glob;
+    if (s == "ip_subnet")
+        return AutoApproveRuleType::ip_subnet;
+    if (s == "cloud_provider")
+        return AutoApproveRuleType::cloud_provider;
+    return std::nullopt;
+}
+
+std::string validate_auto_approve_rule(AutoApproveRuleType type, std::string_view value,
+                                       std::string_view label) {
+    if (value.empty())
+        return "value is required";
+    if (value.size() > kMaxRuleValueLen)
+        return "value is too long";
+    if (label.size() > kMaxRuleLabelLen)
+        return "label is too long";
+    if (has_delimiter_or_control(value))
+        return "value must not contain ':' or control characters";
+    if (has_delimiter_or_control(label))
+        return "label must not contain ':' or control characters";
+    if (type == AutoApproveRuleType::trusted_ca) {
+        const bool hex64 = value.size() == 64 && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+                               return std::isxdigit(c) != 0;
+                           });
+        if (!hex64)
+            return "trusted_ca value must be a 64-character hex SHA-256 fingerprint";
+    } else if (type == AutoApproveRuleType::hostname_glob) {
+        if (value.find_first_not_of('*') == std::string_view::npos)
+            return "hostname_glob must not match every host";
+    } else if (type == AutoApproveRuleType::ip_subnet) {
+        const auto slash = value.find('/');
+        const std::string net(value.substr(0, slash));
+        struct in_addr a{};
+        if (inet_pton(AF_INET, net.c_str(), &a) != 1)
+            return "ip_subnet value must be an IPv4 address or CIDR";
+        if (slash != std::string_view::npos) {
+            const auto prefix = parse_prefix_len(value.substr(slash + 1));
+            if (!prefix)
+                return "ip_subnet prefix must be 0-32";
+            if (*prefix == 0)
+                return "ip_subnet must not match every address";
+        }
+    }
+    return {};
+}
+
 // ── Persistence ──────────────────────────────────────────────────────────────
 
 bool AutoApproveEngine::load(const std::filesystem::path& path) {
@@ -65,67 +127,120 @@ bool AutoApproveEngine::load(const std::filesystem::path& path) {
     if (!f.is_open())
         return false;
 
-    std::lock_guard lock(mu_);
-    rules_.clear();
-    require_all_ = false;
+    // Parse into temporaries: the live policy is replaced only by a file that is entirely
+    // well-formed. A torn or hand-edited line must never silently widen admission (a bad
+    // `mode:` reading as `any`, or an unknown-type line vanishing from an `all` conjunction).
+    std::vector<AutoApproveRule> parsed;
+    bool require_all = false;
+    bool malformed = false;
 
     std::string line;
     while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') // a hand-edited CRLF file
+            line.pop_back();
         if (line.empty() || line[0] == '#')
             continue;
 
-        // mode:any or mode:all
+        // mode:any or mode:all - exactly, nothing else
         if (line.starts_with("mode:")) {
-            require_all_ = (line.substr(5) == "all");
+            const auto m = std::string_view(line).substr(5);
+            if (m == "any" || m == "all") {
+                require_all = (m == "all");
+            } else {
+                malformed = true;
+            }
             continue;
         }
 
         // type:value:label:enabled
         std::istringstream ss(line);
         std::string type_s, value, label, enabled_s;
-        if (!std::getline(ss, type_s, ':'))
-            continue;
-        if (!std::getline(ss, value, ':'))
-            continue;
+        std::getline(ss, type_s, ':');
+        const bool has_value = static_cast<bool>(std::getline(ss, value, ':'));
         std::getline(ss, label, ':');
         std::getline(ss, enabled_s, ':');
 
+        // An unknown type is never defaulted to another (broader) type.
+        const auto parsed_type = parse_auto_approve_rule_type(type_s);
+        if (!parsed_type || !has_value) {
+            malformed = true;
+            continue;
+        }
         AutoApproveRule rule;
-        rule.type = string_to_rule_type(type_s);
+        rule.type = *parsed_type;
         rule.value = value;
         rule.label = label;
         rule.enabled = enabled_s.empty() || enabled_s == "1";
-        rules_.push_back(std::move(rule));
+        parsed.push_back(std::move(rule));
     }
+    f.close();
 
+    std::lock_guard lock(mu_);
+    if (malformed) {
+        // Zero rules in mode `any`: evaluate() matches nothing, so agents wait for a human.
+        // Keep the original bytes - a later save would otherwise overwrite them.
+        rules_.clear();
+        require_all_ = false;
+        std::error_code ec;
+        std::filesystem::rename(path, path.string() + ".rejected", ec);
+        spdlog::error("Auto-approve policy {} has a malformed line; no auto-approve rules are "
+                      "active. The file was {} - re-create the rules in Settings.",
+                      path.string(),
+                      ec ? "left in place (rename to .rejected failed: " + ec.message() + ")"
+                         : "kept as " + path.string() + ".rejected");
+        return true;
+    }
+    rules_ = std::move(parsed);
+    require_all_ = require_all;
     spdlog::info("Loaded {} auto-approve rules from {}", rules_.size(), path.string());
     return true;
 }
 
-void AutoApproveEngine::save() const {
+bool AutoApproveEngine::save() const {
     std::lock_guard lock(mu_);
-    save_locked();
+    return write_locked(rules_, require_all_);
 }
 
 // Must be called with mu_ held.
-void AutoApproveEngine::save_locked() const {
+bool AutoApproveEngine::write_locked(const std::vector<AutoApproveRule>& rules,
+                                     bool require_all) const {
     if (config_path_.empty())
-        return;
+        return true;
 
-    std::ofstream f(config_path_, std::ios::trunc);
-    if (!f.is_open()) {
-        spdlog::error("Failed to save auto-approve config to {}", config_path_.string());
-        return;
+    // Temp file + rename: a crash or a full disk mid-write must never leave a torn live
+    // file (a truncated `mode:` or glob line would load as a different, wider policy).
+    const auto tmp = std::filesystem::path(config_path_.string() + ".tmp");
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f.is_open()) {
+            spdlog::error("Failed to save auto-approve config to {}", tmp.string());
+            return false;
+        }
+        f << "# Yuzu Auto-Approve Policies\n";
+        f << "# Format: type:value:label:enabled\n";
+        f << "mode:" << (require_all ? "all" : "any") << "\n";
+        for (const auto& rule : rules) {
+            f << rule_type_to_string(rule.type) << ":" << rule.value << ":" << rule.label << ":"
+              << (rule.enabled ? "1" : "0") << "\n";
+        }
+        f.flush();
+        if (!f.good()) {
+            spdlog::error("Failed to write auto-approve config to {}", tmp.string());
+            f.close();
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
     }
-
-    f << "# Yuzu Auto-Approve Policies\n";
-    f << "# Format: type:value:label:enabled\n";
-    f << "mode:" << (require_all_ ? "all" : "any") << "\n";
-
-    for (const auto& rule : rules_) {
-        f << rule_type_to_string(rule.type) << ":" << rule.value << ":" << rule.label << ":"
-          << (rule.enabled ? "1" : "0") << "\n";
+    std::error_code ec;
+    std::filesystem::rename(tmp, config_path_, ec);
+    if (ec) {
+        spdlog::error("Failed to replace auto-approve config {}: {}", config_path_.string(),
+                      ec.message());
+        std::filesystem::remove(tmp, ec);
+        return false;
     }
+    return true;
 }
 
 // ── Evaluation ───────────────────────────────────────────────────────────────
@@ -225,7 +340,12 @@ bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::stri
     }
 
     auto net_str = cidr.substr(0, slash);
-    int prefix_len = std::stoi(cidr.substr(slash + 1));
+    // Fail closed: a malformed/out-of-range prefix never matches and never throws
+    // (this runs under mu_ on the Register path).
+    const auto parsed_prefix = parse_prefix_len(std::string_view(cidr).substr(slash + 1));
+    if (!parsed_prefix)
+        return false;
+    const int prefix_len = *parsed_prefix;
 
     // Parse both IPs as IPv4
     struct in_addr net_addr{}, ip_addr{};
@@ -244,26 +364,39 @@ bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::stri
 
 // ── CRUD ─────────────────────────────────────────────────────────────────────
 
-void AutoApproveEngine::add_rule(const AutoApproveRule& rule) {
+bool AutoApproveEngine::add_rule(const AutoApproveRule& rule) {
     std::lock_guard lock(mu_);
-    rules_.push_back(rule);
-    save_locked();
+    auto next = rules_;
+    next.push_back(rule);
+    if (!write_locked(next, require_all_))
+        return false;
+    rules_ = std::move(next);
+    return true;
 }
 
-void AutoApproveEngine::remove_rule(size_t index) {
+RuleEdit AutoApproveEngine::remove_rule(size_t index) {
     std::lock_guard lock(mu_);
-    if (index < rules_.size()) {
-        rules_.erase(rules_.begin() + static_cast<std::ptrdiff_t>(index));
-        save_locked();
-    }
+    if (index >= rules_.size())
+        return {RuleEdit::Status::not_found, {}};
+    auto next = rules_;
+    next.erase(next.begin() + static_cast<std::ptrdiff_t>(index));
+    if (!write_locked(next, require_all_))
+        return {RuleEdit::Status::persist_failed, rules_[index]};
+    RuleEdit edit{RuleEdit::Status::ok, rules_[index]};
+    rules_ = std::move(next);
+    return edit;
 }
 
-void AutoApproveEngine::set_enabled(size_t index, bool enabled) {
+RuleEdit AutoApproveEngine::toggle_rule(size_t index) {
     std::lock_guard lock(mu_);
-    if (index < rules_.size()) {
-        rules_[index].enabled = enabled;
-        save_locked();
-    }
+    if (index >= rules_.size())
+        return {RuleEdit::Status::not_found, {}};
+    auto next = rules_;
+    next[index].enabled = !next[index].enabled;
+    if (!write_locked(next, require_all_))
+        return {RuleEdit::Status::persist_failed, rules_[index]};
+    rules_ = std::move(next);
+    return {RuleEdit::Status::ok, rules_[index]};
 }
 
 std::vector<AutoApproveRule> AutoApproveEngine::list_rules() const {
@@ -276,9 +409,12 @@ bool AutoApproveEngine::require_all() const {
     return require_all_;
 }
 
-void AutoApproveEngine::set_require_all(bool val) {
+bool AutoApproveEngine::set_require_all(bool val) {
     std::lock_guard lock(mu_);
+    if (!write_locked(rules_, val))
+        return false;
     require_all_ = val;
+    return true;
 }
 
 } // namespace yuzu::server::auth

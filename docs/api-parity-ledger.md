@@ -122,40 +122,51 @@ the paged shape and the export mode is recorded here rather than as a separate r
 `version`, `limit` and `cursor` only (an unknown argument name is ignored, as on the other read tools; only approval-gated tools validate argument names at dispatch). The row
 stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by `#5699` (revisit by 2026-11-07), with the same ADR-1005 exception entry.
 
+**Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
+
+**Known asymmetry on the discovered-devices pair.** The legacy `GET /api/discovery/results` row is
+`twinned` to `GET /api/v1/network/discovered-devices` / `list_discovered_devices`, but the raw route is
+not retired and is not equivalent: it is unbounded (no `limit`, no `truncated`), returns the
+`managed` and `agent_id` columns (the new twin deliberately omits them: nothing maintains the
+flag yet), uses the `{devices,total}` shape, writes no `network.discovered.view` audit row and has
+no explicit service-scoped denial of its own (it relies on the `Infrastructure:Read` gate). The
+bounded, audited twin is the supported read for agents and integrations; hardening or retiring the
+raw route is tracked by `#5856` (revisit by 2026-11-14).
+
 ## Summary
 
 <!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; regenerate with `python3 scripts/ci/check-api-parity.py --render-doc` and splice between these markers -->
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 14 | 9 | 5 |
-| inventory | 3 | 3 | 0 |
-| dex | 26 | 18 | 8 |
-| guardian | 16 | 6 | 10 |
+| devices | 21 | 12 | 9 |
+| inventory | 4 | 4 | 0 |
+| dex | 27 | 18 | 9 |
+| guardian | 18 | 8 | 10 |
 | tar | 12 | 4 | 8 |
 | auto-preflight | 4 | 1 | 3 |
-| auto-deploy | 4 | 1 | 3 |
+| auto-deploy | 6 | 3 | 3 |
 | auto-verify | 3 | 0 | 3 |
-| network | 2 | 1 | 1 |
+| network | 3 | 2 | 1 |
 | viz | 2 | 2 | 0 |
 | executions | 6 | 1 | 5 |
 | scope-result-sets | 1 | 0 | 1 |
-| instructions | 24 | 11 | 13 |
-| compliance-policy | 19 | 6 | 13 |
-| settings | 15 | 0 | 15 |
-| rbac | 10 | 0 | 10 |
+| instructions | 27 | 14 | 13 |
+| compliance-policy | 22 | 6 | 16 |
+| settings | 26 | 7 | 19 |
+| rbac | 13 | 0 | 13 |
 | auth-mfa | 7 | 0 | 7 |
-| engine-principals | 1 | 0 | 1 |
+| engine-principals | 3 | 0 | 3 |
 | access-reviews | 2 | 0 | 2 |
 | ca-pki | 3 | 2 | 1 |
-| ota | 15 | 0 | 15 |
-| enrollment | 19 | 5 | 14 |
-| other | 74 | 13 | 61 |
-| **Total** | **282** | **83** | **199** |
+| ota | 15 | 1 | 14 |
+| enrollment | 21 | 7 | 14 |
+| other | 79 | 17 | 62 |
+| **Total** | **325** | **109** | **216** |
 
-Registered `/api/vN/*` routes: 247. OpenAPI `paths` entries: 246. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 187.
+Registered `/api/vN/*` routes: 250. OpenAPI `paths` entries: 249. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 190.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 199.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 216.
 
 <!-- END GENERATED -->
 

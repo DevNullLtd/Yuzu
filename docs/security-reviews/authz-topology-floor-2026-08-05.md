@@ -391,3 +391,33 @@ non-interaction.
   authorization topology (none is, per decision 4, as of this review),
   that is a separate securable-cut-and-floor decision, not an extension of
   this floor's scope by reinterpretation.
+
+## Addendum 2026-10-13 — `AuditLog:Read` is now floored (#5771)
+
+This supersedes the last row of decision 9's enumeration table
+(`GET /api/v1/engine-principals/audit/no-admin`, `AuditLog:Read`, "no —
+deliberate") and the "Floored?" column for `AuditLog:Read` generally.
+
+- **What was found.** With RBAC off, `AuditLog:Read` was not in the floor, so
+  the legacy branch admitted every authenticated session to the whole audit
+  trail through `GET /api/audit`, `GET /api/v1/audit`,
+  `GET /api/v1/audit/auth-sample`, the no-admin auditor route, MCP
+  `query_audit_log` / `audit_engine_no_admin` and `yuzu://audit/recent`. The
+  trail is the SOC 2 CC6.1/CC7.2 evidence store; the legacy route also
+  returns actor role and source IP.
+- **Decision.** Add `{"AuditLog", "Read"}` to `kTopologyFloor` (the one
+  chokepoint — no second list). The inclusion test in
+  `authz_topology_floor.hpp` gains a third class, evidence-grade data, so the
+  entry is a stated criterion rather than a silent widening.
+- **The no-admin auditor row.** Decision 9 kept it unfloored so an auditor
+  without grant-graph access could still run it. That purpose is an RBAC-ON
+  purpose: with RBAC off no non-admin auditor role exists (a non-admin has no
+  grants at all), so flooring costs nothing there, and with RBAC on the floor
+  never engages. The row now floors with the rest of the audit surfaces.
+- **Not changed.** RBAC-on admission for every seeded `AuditLog:Read` holder
+  and any custom grant; engine-principal and service-scoped behaviour; the
+  fact that holders read every row (management-group confinement of the audit
+  surfaces remains the ADR-0017 follow-up).
+- **Not done here (separately decidable).** A dedicated securable for the
+  sensitive fields (source IP, actor role), as #2324 did for `AccessReview`,
+  or field-level redaction by caller role.

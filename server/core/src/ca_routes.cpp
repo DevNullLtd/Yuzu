@@ -7,6 +7,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <ctime>
 #include <string>
@@ -86,6 +87,11 @@ std::string fmt_epoch(int64_t epoch) {
     std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm_buf);
     return std::string(buf);
 }
+
+/// True when a certificate with a recorded `not_after` has lapsed at `now` (epoch seconds).
+/// Pure: `now` is passed in. `not_after == 0` is "no expiry recorded" (rendered "—"), never
+/// expired — the same rule the API-token table applies to its expiry.
+bool cert_expired(int64_t not_after, int64_t now) { return not_after > 0 && not_after < now; }
 
 /// Validate + normalise a serial to the canonical uppercase hex form `ca_store` stores.
 /// Returns empty if it is not 1–64 hex digits. Shared by the REST + dashboard
@@ -191,6 +197,9 @@ std::string render_ca_fragment(CaStore* ca_store) {
         return html + "<p class=\"feedback-error\">Certificate inventory unavailable "
                       "(store error).</p>";
     auto& issued = *issued_or_err;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
     html += "<table class=\"user-table\">"
             "<thead><tr><th>Serial</th><th>Subject</th><th>Purpose</th><th>Expires</th>"
             "<th>Status</th><th></th></tr></thead><tbody>";
@@ -209,7 +218,10 @@ std::string render_ca_fragment(CaStore* ca_store) {
                     "<td>" + fmt_epoch(c.not_after) +
                     "</td>"
                     "<td><span class=\"role-badge " +
-                    (revoked ? "role-user\">Revoked" : "role-admin\">Active") + "</span></td><td>";
+                    (revoked                           ? "role-user\">Revoked"
+                     : cert_expired(c.not_after, now) ? "role-user\">Expired"
+                                                      : "role-admin\">Active") +
+                    "</span></td><td>";
             if (!revoked) {
                 // Carry the serial in a hidden input rather than a JSON hx-vals
                 // attribute: simpler, and it avoids JSON-inside-an-HTML-attribute
@@ -242,7 +254,7 @@ std::string render_ca_fragment(CaStore* ca_store) {
     // more — say so + point at the paginated REST endpoint, so certs beyond the
     // cap aren't silently invisible/unrevocable from the dashboard.
     if (static_cast<int>(issued.size()) >= kPanelLimit) {
-        html += "<p class=\"section-note\" style=\"color:var(--warn)\">Showing the first " +
+        html += "<p class=\"section-note warn\">Showing the first " +
                 std::to_string(kPanelLimit) +
                 " certificates. Use <code>GET /api/v1/ca/issued?offset=</code> to page through the "
                 "full inventory.</p>";

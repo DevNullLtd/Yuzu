@@ -31,5 +31,16 @@
     },
     "mcp_twin": "get_software_versions",
     "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/inventory/sources",
+    "capability_id": "get.fragments-inventory-sources",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/inventory/tables"
+    },
+    "mcp_twin": "list_inventory_tables",
+    "status": "twinned"
   }
 ]

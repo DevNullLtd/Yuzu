@@ -248,6 +248,8 @@ async function main() {
   await page.type('input[name="password"]', PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForNavigation({ waitUntil: 'networkidle2' });
+  // Sign-in now ends on the landing page (/home); the console is the Dashboard at /.
+  await page.goto(`${BASE_URL}/`, { waitUntil: 'networkidle2' });
   await sleep(2000);
   console.log('Login OK\n');
 
