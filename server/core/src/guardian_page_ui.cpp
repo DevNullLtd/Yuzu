@@ -244,9 +244,8 @@ const char* const kGuardianDetailPageTemplate =
     .gp-oscard .state.limited { color: var(--warn); background: var(--mds-color-bg-warning-tinted); }
     .gp-oscard .scope { font-size: 12.5px; color: var(--mut); margin-top: 2px; }
     .gp-smgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
-    .gp-sm { --gp-sm-lift: 0 6px 18px light-dark(rgba(0,0,0,.12), rgba(0,0,0,.35));
-                background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel);
-                padding: 12px 14px; box-shadow: var(--gp-sm-lift);
+    .gp-sm { background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel);
+                padding: 12px 14px; box-shadow: var(--mds-elevation-2);
                 transition: transform .12s ease, border-color .12s ease; }
     .gp-sm:hover { transform: translateY(-1px); border-color: var(--line2); }
     .gp-sm .smh { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
