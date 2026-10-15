@@ -674,7 +674,11 @@ PLIST="{root}/LaunchDaemons/com.yuzu.agent.plist"; PLUGIN_DIR="{root}/ul/lib/yuz
         self.assertIn('remove_managed_plugins "$INCOMING_MANIFEST"', postinstall)
         self.assertIn('LEGACY_APP="$DATA_DIR/YuzuAgent.app"', preinstall)
         self.assertIn('legacy_app_is_managed()', preinstall)
-        self.assertIn('if legacy_app_is_managed; then', preinstall)
+        # Copy, then verify the copy (never the live path between check and copy).
+        copy_at = preinstall.index('copy_if_present "$LEGACY_APP" "$RECOVERY/legacy/YuzuAgent.app"')
+        verify_at = preinstall.index('legacy_app_is_managed "$RECOVERY/legacy/YuzuAgent.app" || rm -rf "$RECOVERY/legacy"')
+        self.assertLess(copy_at, verify_at)
+        self.assertNotIn('if legacy_app_is_managed; then', preinstall)
         self.assertIn('LEGACY_TEAM_ID="7RLSYL2JM7"', preinstall)
         self.assertIn('LEGACY_PROFILE_SHA256="3e764aafaa5cd29398ef6646b98c7b00332404c5ea57f79b92663695acdd70e1"', preinstall)
         self.assertIn('LEGACY_SIGNING_AUTHORITY="Mac Developer: Nathan Dornbrook (YA95685L8R)"', preinstall)

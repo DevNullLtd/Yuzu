@@ -300,8 +300,11 @@ copy_if_present "$APP_ROOT/YuzuAgent.app" "$RECOVERY/YuzuAgent.app"
 # Keep the old code tree out of the new data-root policy. The old app remains
 # live until postinstall has started the new daemon, but this copy permits
 # recovery if the final legacy cleanup is interrupted.
-if legacy_app_is_managed; then
+# Copy first, then verify the copy: the check must apply to the bytes kept in
+# the root-only snapshot, not to a path that can change between check and copy.
+if [[ -d "$LEGACY_APP" && ! -L "$LEGACY_APP" ]]; then
     copy_if_present "$LEGACY_APP" "$RECOVERY/legacy/YuzuAgent.app"
+    legacy_app_is_managed "$RECOVERY/legacy/YuzuAgent.app" || rm -rf "$RECOVERY/legacy"
 fi
 copy_if_present "/usr/local/bin/yuzu-agent" "$RECOVERY/loose/yuzu-agent"
 copy_if_present "/usr/local/bin/libyuzu_agent_core.dylib" "$RECOVERY/loose/libyuzu_agent_core.dylib"
