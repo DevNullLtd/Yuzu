@@ -598,6 +598,7 @@ restart_restored_service() {
 
 recover_interrupted_promotion() {
     local recovery="$1"
+    echo "Recovering an interrupted earlier Yuzu Agent install from its snapshot" >&2
     require_trusted_restore_targets "$recovery" || return 1
     stop_service || echo "WARNING: Yuzu Agent is still unloading; restoring anyway" >&2
     remove_managed_plugins "$YUZU_LIB/package-files.list" "$YUZU_LIB/package-files.sha256" \
@@ -702,6 +703,7 @@ if [[ -e "$RECOVERY_FILE" || -L "$RECOVERY_FILE" ]]; then
         case "$phase" in
             prepared)
                 require_trusted_restore_targets "$pending" || exit 1
+                echo "Checking an unfinished earlier Yuzu Agent install for files to put back" >&2
                 restore_missing_live_files "$pending"
                 discard_recovery "$pending"
                 ;;

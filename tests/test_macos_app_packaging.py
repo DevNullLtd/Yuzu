@@ -3447,14 +3447,18 @@ DEFAULT_CA="{root}/etc/default-ca.pem"
         post = (BUILD_PKG.parent / "postinstall").read_text()
         start = post.index("\nretire_legacy_app", post.index("# The previous development bundle lived below")) + 1
         tail = post[start:]
-        for name, upgrade in (("upgrade", True), ("fresh install", False)):
+        # r2-L2: not after a lost definition either, whose settings were not kept.
+        for name, prior, lost, preserved in (("upgrade", True, 0, True), ("fresh install", False, 0, False),
+                                             ("upgrade, definition lost", True, 1, False)):
+            upgrade = preserved
             with self.subTest(case=name), tempfile.TemporaryDirectory(prefix="yuzu_test_preserved_") as temporary:
                 root = Path(temporary)
                 recovery = self._recovery_layout(root, phase="promoting")
-                if not upgrade:
+                if not prior:
                     (recovery / "LaunchDaemons/com.yuzu.agent.plist").unlink()
                 body = ('retire_legacy_app() { :; }\n'
-                        f'recovery="{recovery}"\noutcome="OUTCOME-LINE"\nPROMOTION_ARMED=1\n' + tail)
+                        f'recovery="{recovery}"\noutcome="OUTCOME-LINE"\nPROMOTION_ARMED=1\n'
+                        f'prior_definition_lost={lost}\n' + tail)
                 result = self._installer_harness(root, "postinstall", ("finish_recovery",), body)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("OUTCOME-LINE", result.stdout)

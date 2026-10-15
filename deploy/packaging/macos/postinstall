@@ -953,7 +953,8 @@ fi
 # a copy until this transition is fully durable.
 retire_legacy_app || echo "WARNING: could not retire the legacy development app; it was left in place" >&2
 upgraded=0
-[[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || upgraded=1
+# Not after a lost definition: its settings were not preserved (r2-L2).
+[[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" || "$prior_definition_lost" == 1 ]] || upgraded=1
 PROMOTION_ARMED=0
 finish_recovery "$recovery"
 INSTALL_COMPLETED=1
