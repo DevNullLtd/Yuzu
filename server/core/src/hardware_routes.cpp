@@ -545,6 +545,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         namespace ss = software_sync;
         constexpr const char* kAction = "inventory.sync.request";
         detail::ensure_correlation_id(res);
+        const auto now = [this] { return deps_.sync_now_fn ? deps_.sync_now_fn() : now_secs(); };
         if (!deps_.sync_perm_fn || !deps_.auth_fn || !deps_.sync_resolve_fn ||
             !deps_.sync_dispatch_many_fn || !deps_.sync_caller_unfiltered_fn ||
             !deps_.agent_version_fn) {
@@ -611,8 +612,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             std::int64_t wait = 0;
             {
                 std::lock_guard<std::mutex> lk(sync_run_mu_);
-                wait = ss::cooldown_remaining(ss::last_run_of(sync_last_run_, session->username),
-                                              now_secs());
+                wait = ss::cooldown_remaining(ss::last_run_of(sync_last_run_, session->username), now());
             }
             if (wait > 0) {
                 res.set_header("Retry-After", std::to_string(wait));
@@ -685,10 +685,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (guarded && sent.sent > 0) {
             std::lock_guard<std::mutex> lk(sync_run_mu_);
-            ss::stamp(sync_last_run_, session->username, now_secs());
+            ss::stamp(sync_last_run_, session->username, now());
         }
         nlohmann::json out = {
-            {"data", ss::summary_json(ss::finalize(plan.counts, sent.sent), sent.command_id, now_secs())},
+            {"data", ss::summary_json(ss::finalize(plan.counts, sent.sent), sent.command_id, now())},
             {"meta", {{"api_version", "v1"}}},
         };
         res.status = 202;

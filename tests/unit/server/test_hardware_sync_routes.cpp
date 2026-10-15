@@ -38,6 +38,7 @@ struct SyncHarness {
     bool allow_execute = true;
     std::string username = "alice";
     bool audit_should_fail = false;
+    std::int64_t clock = 1'700'000'000; // the route's injected "now" (seconds)
 
     // The resolver's answer. `ids` is what the caller can SEE (already confined).
     ss::Resolved resolved;
@@ -99,6 +100,7 @@ struct SyncHarness {
                 last_username = s.username;
                 return resolved;
             };
+        deps.sync_now_fn = [this] { return clock; };
         if (wire_precheck)
             deps.sync_caller_unfiltered_fn = [this](const auth::Session&) {
                 ++precheck_calls;
@@ -416,24 +418,62 @@ TEST_CASE("sync route: the cap counts devices that will be sent to, not devices 
     CHECK(d["skipped_offline"] == 300);
 }
 
-TEST_CASE("sync route: a second run by the same operator inside 60 s is 429 with Retry-After",
+TEST_CASE("sync route: the cooldown is exactly 60 s per operator, on the injected clock",
           "[hardware][sync_fanout][route]") {
     SyncHarness h;
     h.live(2);
-    REQUIRE(h.post(R"({"scope":"__all__"})")->status == 202);
-    auto again = h.post(R"({"scope":"group:g"})");
-    REQUIRE(again);
-    CHECK(again->status == 429);
-    const int retry = std::stoi(again->get_header_value("Retry-After"));
-    CHECK(retry >= 1);
-    CHECK(retry <= 60);
-    CHECK(h.dispatch_calls == 1); // the second run sent nothing
-    CHECK(h.resolve_calls == 1);  // and was refused before resolving
+    const std::int64_t t0 = h.clock;
+    auto first = h.post(R"({"scope":"__all__"})");
+    REQUIRE(first);
+    REQUIRE(first->status == 202);
+    CHECK(parse(first->body)["data"]["requested_at"] == t0); // stamped from the injected clock
+
+    // Inside the window: 429 with the exact seconds left, in the header and in the body.
+    const auto attempt = [&](std::int64_t dt) {
+        h.clock = t0 + dt;
+        return h.post(R"({"scope":"group:g"})");
+    };
+    struct Window {
+        std::int64_t dt;
+        int left;
+    };
+    for (const Window w : {Window{0, 60}, Window{1, 59}, Window{30, 30}, Window{59, 1}}) {
+        INFO("t+" << w.dt);
+        auto r = attempt(w.dt);
+        REQUIRE(r);
+        CHECK(r->status == 429);
+        CHECK(r->get_header_value("Retry-After") == std::to_string(w.left));
+        CHECK(parse(r->body)["error"]["retry_after_ms"] == w.left * 1000);
+    }
+    CHECK(h.dispatch_calls == 1); // none of those sent anything
+    CHECK(h.resolve_calls == 1);  // and each was refused before resolving
     CHECK(h.audited("denied"));
-    CHECK(contains(h.audit_details.back(), "rate_limited"));
-    // Another operator is not held back by this one's run.
+    CHECK(contains(h.audit_details.back(), "rate_limited cooldown=1s"));
+
+    // At exactly t+60 the window is over, and the new run restarts it.
+    auto again = attempt(60);
+    REQUIRE(again);
+    CHECK(again->status == 202);
+    CHECK(h.dispatch_calls == 2);
+    auto restarted = attempt(61);
+    REQUIRE(restarted);
+    CHECK(restarted->status == 429);
+    CHECK(restarted->get_header_value("Retry-After") == "59");
+
+    // A clock that stepped back reads as a full wait, never a negative one.
+    auto back = attempt(30);
+    REQUIRE(back);
+    CHECK(back->status == 429);
+    CHECK(back->get_header_value("Retry-After") == "60");
+
+    // Neither another operator nor a single named device is held by this operator's window.
+    h.clock = t0 + 61;
     h.username = "bob";
     CHECK(h.post(R"({"scope":"group:g"})")->status == 202);
+    h.username = "alice";
+    h.resolved.ids = {"host-01"};
+    CHECK(h.post(R"({"scope":"host-01"})")->status == 202);
+    CHECK(h.post(R"({"scope":"host-01"})")->status == 202);
 }
 
 TEST_CASE("sync route: a run already in flight makes a second one 409 and sends nothing",

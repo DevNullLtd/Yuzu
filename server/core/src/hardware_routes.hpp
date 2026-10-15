@@ -294,6 +294,9 @@ public:
     /// Does the caller hold an UNFILTERED Execution:Execute (so may name the whole fleet)? Cheap
     /// by contract: no fleet read. The route asks it before taking the run guard.
     using SyncUnfilteredFn = std::function<bool(const auth::Session&)>;
+    /// Seconds since the epoch, for the sync cooldown and the `requested_at` stamp. Empty means
+    /// the system clock; a test injects a fake so the cooldown boundaries are exact.
+    using SyncNowFn = std::function<std::int64_t()>;
 
     struct Deps {
         AuthFn auth_fn;
@@ -323,10 +326,12 @@ public:
         /// `sync_caller_unfiltered_fn` lets a confined caller's `__all__` be refused before it
         /// takes the single in-flight slot or reads the fleet.
         /// Any of the four empty == the route answers 503 (fail closed, nothing sent).
+        /// `sync_now_fn` is optional (empty == system clock).
         SyncPermFn sync_perm_fn;
         SyncResolveFn sync_resolve_fn;
         SyncDispatchManyFn sync_dispatch_many_fn;
         SyncUnfilteredFn sync_caller_unfiltered_fn;
+        SyncNowFn sync_now_fn;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);
