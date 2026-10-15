@@ -450,7 +450,7 @@ curl -s -b cookies.txt \
 
 **`total` is the number of rows returned in this response, not the number of
 rows that matched.** `start` echoes `offset` and `page_size` echoes `limit`; a
-page shorter than `limit` is the last page. Rows are ordered newest first and
+page shorter than `limit` is the last page. The MCP `query_audit_log` tool also returns `has_more`, true when more matching rows exist past the page. Rows are ordered newest first and
 rows with an identical timestamp break by `id` (newest first). On an unchanging
 result set `offset` paging neither repeats nor skips rows; the log is live, so a
 new event or a retention delete between page fetches shifts later pages. Pin the

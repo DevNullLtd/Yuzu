@@ -17565,6 +17565,131 @@ TEST_CASE("MCP query_audit_log: target_id and offset filter and page; wrong type
     }
 }
 
+TEST_CASE("MCP query_audit_log: the published schema carries its bounds and descriptions "
+          "and the output declares has_more (A5 items 2-4; PR #5870 review)",
+          "[mcp][audit][a5]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    nlohmann::json tool;
+    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+        if (t["name"] == "query_audit_log")
+            tool = t;
+    REQUIRE_FALSE(tool.is_null());
+    const auto& props = tool["inputSchema"]["properties"];
+    for (const char* f : {"principal", "action", "target_type"}) {
+        INFO(f);
+        CHECK(props[f]["maxLength"] == 256);
+        CHECK_FALSE(props[f]["description"].get<std::string>().empty());
+    }
+    CHECK(props["target_id"]["maxLength"] == 512);
+    for (const char* f : {"since", "until", "limit", "offset"}) {
+        INFO(f);
+        CHECK_FALSE(props[f]["description"].get<std::string>().empty());
+    }
+    // The description says what a short and a full page mean and that the walk is over a live log.
+    const auto desc = tool["description"].get<std::string>();
+    CHECK(desc.find("has_more") != std::string::npos);
+    CHECK(desc.find("live") != std::string::npos);
+    CHECK(desc.find("retry_after_ms") != std::string::npos);
+    // The output schema declares and requires has_more next to entries.
+    const auto& out = tool["outputSchema"];
+    CHECK(out["properties"].contains("has_more"));
+    CHECK(out["properties"]["has_more"]["type"] == "boolean");
+    const auto req = out["required"];
+    CHECK(std::find(req.begin(), req.end(), "has_more") != req.end());
+    CHECK(std::find(req.begin(), req.end(), "entries") != req.end());
+}
+
+TEST_CASE("MCP query_audit_log: has_more says whether rows exist past the page; refusals and "
+          "store faults are A4 errors (PR #5870 review)",
+          "[pg][mcp][integration][audit][a5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    for (const char* tid : {"id-a", "id-b", "id-c"}) {
+        AuditEvent evt;
+        evt.principal = "a5-probe";
+        evt.action = "a5.probe";
+        evt.target_type = "a5_t";
+        evt.target_id = tid;
+        evt.result = "success";
+        evt.timestamp = 1000;
+        REQUIRE(store.log(evt));
+    }
+
+    McpTestServer ts;
+    ts.audit_store_for_test = &store;
+    ts.start("readonly");
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":76,)"
+                                       R"("params":{"name":"query_audit_log","arguments":)") +
+                           args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const std::string base = R"("principal":"a5-probe")";
+    auto page = [&](const std::string& extra) {
+        auto body = call("{" + base + extra + "}");
+        REQUIRE(body.contains("result"));
+        return body["result"]["structuredContent"];
+    };
+
+    SECTION("has_more is true exactly when more rows exist past the page") {
+        auto first = page(R"(,"limit":2)");
+        CHECK(first["entries"].size() == 2);
+        CHECK(first["has_more"] == true);
+        auto exact = page(R"(,"limit":3)");
+        CHECK(exact["entries"].size() == 3);
+        CHECK(exact["has_more"] == false); // a full page that happens to be the last
+        auto tail = page(R"(,"limit":2,"offset":2)");
+        CHECK(tail["entries"].size() == 1);
+        CHECK(tail["has_more"] == false);
+        auto past = page(R"(,"offset":3)");
+        CHECK(past["entries"].empty());
+        CHECK(past["has_more"] == false);
+    }
+
+    SECTION("refusals carry the A4 envelope with a remediation and no retry hint") {
+        const std::vector<std::string> bads = {
+            R"({"offset":-1})", R"({"principal":42})", R"({"target_id":"x"})" /* no target_type */,
+            R"({"principal":")" + std::string(257, 'p') + R"("})",
+            R"({"target_type":"t","target_id":")" + std::string(513, 'i') + R"("})",
+            R"({"since":9,"until":3})"};
+        for (const std::string& bad : bads) {
+            INFO(bad.substr(0, 60));
+            auto body = call(bad);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == -32602);
+            const auto& data = body["error"]["data"];
+            CHECK_FALSE(data["correlation_id"].get<std::string>().empty());
+            CHECK(data["retry_after_ms"].is_null());
+            CHECK_FALSE(data["remediation"].is_null());
+        }
+    }
+
+    SECTION("the filter limits are inclusive: 256 and 512 characters are accepted") {
+        auto ok = call(R"({"principal":")" + std::string(256, 'p') + R"("})");
+        CHECK(ok.contains("result"));
+        auto ok2 = call(R"({"target_type":"t","target_id":")" + std::string(512, 'i') + R"("})");
+        CHECK(ok2.contains("result"));
+    }
+
+    SECTION("a store fault is a retryable A4 error, never an empty page") {
+        auto held = pool.acquire(); // the only connection: the store's 2 s bounded wait expires
+        REQUIRE(held);
+        auto body = call("{" + base + "}");
+        REQUIRE(body.contains("error"));
+        const auto& data = body["error"]["data"];
+        CHECK(data["retry_after_ms"].is_number());
+        CHECK(data["retry_after_ms"].get<int>() > 0);
+        CHECK_FALSE(data["remediation"].is_null());
+        CHECK_FALSE(body.contains("result"));
+    }
+}
+
 TEST_CASE("MCP audit surfaces gate on exactly AuditLog:Read (#5771: the pair the "
           "topology floor keys on)",
           "[pg][mcp][integration][audit]") {

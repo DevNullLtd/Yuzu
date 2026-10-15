@@ -142,6 +142,24 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+        // A NUL in a percent-decoded filter (%00) would truncate the bound value at the C-string
+        // boundary and widen the query; the v1 and MCP twins refuse it, so does this route.
+        for (const std::string* v : {&q.principal, &q.action, &q.target_type, &q.target_id}) {
+            if (v->find('\0') != std::string::npos) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"string filters must not contain NUL"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+        }
+        if (q.since < 0 || q.until < 0 || (q.since > 0 && q.until > 0 && q.since > q.until)) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"since/until must be non-negative with since <= until"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
         // Range, not just parseability: a negative limit would otherwise
         // reach PG as `LIMIT -1`, error, and be reported as an audit-store
         // DEGRADE — 503 plus the read-degrade counter the availability

@@ -1004,6 +1004,15 @@ TEST_CASE("AuditLog:Read floor: a non-admin is refused 403 on filtered and malfo
     const std::vector<std::pair<std::string, int>> queries = {
         {"/api/audit?offset=10001", 400},
         {"/api/audit?since=abc", 400},
+        // PR #5870 review: a decoded NUL would truncate the bound value (the v1/MCP twins refuse
+        // it), and a negative or inverted window is a client error, not a query.
+        {"/api/audit?principal=a%00b", 400},
+        {"/api/audit?action=a%00b", 400},
+        {"/api/audit?target_type=a%00b", 400},
+        {"/api/audit?target_id=a%00b", 400},
+        {"/api/audit?since=-1", 400},
+        {"/api/audit?until=-5", 400},
+        {"/api/audit?since=9&until=3", 400},
         {"/api/v1/audit?offset=10001", 400},
         {"/api/v1/audit?since=9&until=3", 400},
         {"/api/v1/audit?target_id=x", 400},
