@@ -46,8 +46,9 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
   before, and server-side enforcement does not depend on the UI. While the controls are
   hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
   ends the server record only; to remove the device's firewall rules, run the quarantine
-  plugin's `unquarantine` instruction from the Instructions page (or through
-  `execute_instruction`) and confirm with `status`. No configuration change is needed.
+  plugin's release instruction (`security.quarantine.release`, "Release Device from Quarantine")
+  from the Instructions page (or through `execute_instruction`) and confirm with the
+  status instruction. No configuration change is needed.
 - **Colour schemes.** Settings > General > Appearance now offers six schemes (Slate stays
   the default). The choice is stored in the browser, not on the server.
 
