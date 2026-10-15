@@ -780,11 +780,11 @@ TEST_CASE("OIDC egress NAT64: RFC 7050 discovery refuses what is not an unambigu
     CHECK_FALSE(discover_prefix_from_ipv4only_answer(v6("2606:4700:4700::1111")).has_value());
     // Embeds a neighbour of the well-known addresses, at every length.
     for (const int length : kLengths)
-        for (const char* near : {"192.0.0.169", "192.0.0.172", "192.0.2.170", "193.0.0.170"}) {
-            CAPTURE(length, near);
+        for (const char* neighbour : {"192.0.0.169", "192.0.0.172", "192.0.2.170", "193.0.0.170"}) {
+            CAPTURE(length, neighbour);
             CHECK_FALSE(
                 discover_prefix_from_ipv4only_answer(
-                    synthesize(mask_to(v6("2a0e:b107:122:344::"), length), length, v4(near)))
+                    synthesize(mask_to(v6("2a0e:b107:122:344::"), length), length, v4(neighbour)))
                     .has_value());
         }
     // A non-zero u octet is not a legal /32../64 layout.
