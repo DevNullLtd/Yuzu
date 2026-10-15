@@ -106,7 +106,7 @@
  *   inconsistent, invalid_weights or invalid_edges.
  * - The string vocabulary is closed and wire-stable: withheld reasons
  *   (no_population, invalid_weights, invalid_edges, inconsistent,
- *   below_floor), deduction names (breadth, crashes, hangs, regression) and
+ *   below_floor; the Apps list adds offline_affected outside this module), deduction names (breadth, crashes, hangs, regression) and
  *   band labels (excellent, good, fair, poor). Renaming one is a contract
  *   break. `name` and `withheld` are always string literals (static storage),
  *   never owned, never freed; compare them by content (std::string_view(x) ==

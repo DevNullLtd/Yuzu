@@ -1263,8 +1263,8 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
     };
     const Slot slot{apps_reads_in_flight_};
     // A refused caller holds its increment until it returns, so a burst can refuse
-    // one read too many for an instant; the refusal is retryable and the budget
-    // is never exceeded.
+    // a few reads more than necessary for an instant; the refusal is retryable and
+    // the budget is never exceeded.
     if (apps_reads_in_flight_.fetch_add(1, std::memory_order_relaxed) >= apps_read_budget_.load()) {
         if (const auto d =
                 note_read_degrade(metrics_, kReasonConcurrencyBudget, kDegradeSource, budget_sampler);
