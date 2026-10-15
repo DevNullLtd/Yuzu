@@ -65,11 +65,6 @@ struct Selector {
     std::string expr;
 };
 
-struct Request {
-    Selector sel;
-    std::string source{kSource};
-};
-
 [[nodiscard]] inline bool token_ok(std::string_view s, std::size_t max_len) {
     if (s.empty() || s.size() > max_len)
         return false;
@@ -79,18 +74,19 @@ struct Request {
     return true;
 }
 
-/// Parse a request body into a selector + source, or the caller-facing 400 message.
+/// Parse a request body into the selector it names, or the caller-facing 400 message. `source`
+/// is optional and may only be `installed_software` (anything else is refused); it selects
+/// nothing, so it is checked here and not carried.
 ///
 /// `scope` is `__all__`, `group:<id>` or an agent id; `scope_expression` is a scope DSL
 /// expression. They are ALTERNATIVES (supplying both is refused, mirroring
 /// `check_targeting_shape`: the executed set must be the requested set, never a
 /// precedence outcome), and naming neither is refused rather than read as "everyone".
 /// A present-but-non-string field is a 400, never a throw out of the JSON library.
-[[nodiscard]] inline std::expected<Request, std::string> parse_request(const nlohmann::json& body) {
+[[nodiscard]] inline std::expected<Selector, std::string> parse_request(const nlohmann::json& body) {
     if (!body.is_object())
         return std::unexpected("body must be a JSON object");
 
-    Request out;
     if (const auto it = body.find("source"); it != body.end()) {
         if (!it->is_string())
             return std::unexpected("source must be a string");
@@ -126,22 +122,19 @@ struct Request {
                                    "characters");
         // classify_dispatch_arm is the one place the arm vocabulary is decided; an
         // expression of `__all__` or `group:<id>` lands on the same arm as via `scope`.
-        out.sel = {classify_dispatch_arm(false, e), e};
-    } else {
-        const std::string& s = **scope;
-        if (!token_ok(s, kMaxIdLen))
-            return std::unexpected("scope must be 1-256 characters with no control characters");
-        if (s == kBroadcastScope) {
-            out.sel = {DispatchArm::Broadcast, s};
-        } else if (s.starts_with("group:")) {
-            if (s.size() == 6)
-                return std::unexpected("group scope needs an id: group:<id>");
-            out.sel = {DispatchArm::Group, s};
-        } else {
-            out.sel = {DispatchArm::Ids, s}; // a bare agent id
-        }
+        return Selector{classify_dispatch_arm(false, e), e};
     }
-    return out;
+    const std::string& s = **scope;
+    if (!token_ok(s, kMaxIdLen))
+        return std::unexpected("scope must be 1-256 characters with no control characters");
+    if (s == kBroadcastScope)
+        return Selector{DispatchArm::Broadcast, s};
+    if (s.starts_with("group:")) {
+        if (s.size() == 6)
+            return std::unexpected("group scope needs an id: group:<id>");
+        return Selector{DispatchArm::Group, s};
+    }
+    return Selector{DispatchArm::Ids, s}; // a bare agent id
 }
 
 /// Bounded rendering of caller text for an audit row. `log_token` neutralises control bytes,
@@ -294,10 +287,10 @@ inline void stamp(std::unordered_map<std::string, std::int64_t>& state, const st
 
 // ── wording ───────────────────────────────────────────────────────────────────────
 
-/// The pre-dispatch audit `detail`: scope, arm, source and the four counts.
-[[nodiscard]] inline std::string audit_detail(const Request& rq, const Counts& c) {
-    return "scope=" + audit_token(rq.sel.expr) + " arm=" + std::string(dispatch_arm_label(rq.sel.arm)) +
-           " source=" + rq.source + " requested=" + std::to_string(c.requested) +
+/// The pre-dispatch audit `detail`: scope, arm and the four counts.
+[[nodiscard]] inline std::string audit_detail(const Selector& sel, const Counts& c) {
+    return "scope=" + audit_token(sel.expr) + " arm=" + std::string(dispatch_arm_label(sel.arm)) +
+           " requested=" + std::to_string(c.requested) +
            " reached=" + std::to_string(c.reached) +
            " skipped_offline=" + std::to_string(c.skipped_offline) +
            " skipped_version=" + std::to_string(c.skipped_version);

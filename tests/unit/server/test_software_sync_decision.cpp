@@ -49,9 +49,8 @@ TEST_CASE("sync request: each scope spelling lands on exactly one arm", "[server
         INFO(r.body);
         const auto got = ss::parse_request(json::parse(r.body));
         REQUIRE(got.has_value());
-        CHECK(got->sel.arm == r.arm);
-        CHECK(got->sel.expr == r.expr);
-        CHECK(got->source == "installed_software");
+        CHECK(got->arm == r.arm);
+        CHECK(got->expr == r.expr);
     }
 }
 
@@ -236,16 +235,14 @@ TEST_CASE("sync audit target: an expression never becomes an identifier", "[serv
     CHECK(ss::target_label({DispatchArm::Ids, "host-01"}) == "host-01");
 }
 
-TEST_CASE("sync audit detail carries scope, arm, source and all four counts", "[server][software_sync]") {
-    ss::Request rq;
-    rq.sel = {DispatchArm::Group, "group:finance"};
+TEST_CASE("sync audit detail carries scope, arm and all four counts", "[server][software_sync]") {
+    ss::Selector sel{DispatchArm::Group, "group:finance"};
     const ss::Counts c{.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2};
-    CHECK(ss::audit_detail(rq, c) ==
-          "scope=group:finance arm=group source=installed_software requested=12 reached=7 "
-          "skipped_offline=3 skipped_version=2");
+    CHECK(ss::audit_detail(sel, c) ==
+          "scope=group:finance arm=group requested=12 reached=7 skipped_offline=3 skipped_version=2");
     // A hostile expression cannot forge a second field or a new line.
-    rq.sel = {DispatchArm::Scope, "x\nrequested=0"};
-    const auto d = ss::audit_detail(rq, c);
+    sel = {DispatchArm::Scope, "x\nrequested=0"};
+    const auto d = ss::audit_detail(sel, c);
     CHECK(d.find('\n') == std::string::npos);
     CHECK(d.starts_with("scope=x_requested_0 arm=scope "));
     CHECK(std::string(ss::audit_result({.requested = 5, .reached = 1})) == "requested");
@@ -260,13 +257,13 @@ TEST_CASE("sync audit detail: a hostile expression cannot forge a neighbouring c
             ++n;
         return n;
     };
-    ss::Request rq;
+    ss::Selector sel;
     const ss::Counts c{.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2};
     for (const char* hostile : {"x reached=0 skipped_offline=99", "x,reached=0,skipped_version=99",
                                 "x\treached=0\r\nskipped_offline=99", "reached=0 requested=0 arm=group"}) {
         INFO(hostile);
-        rq.sel = {DispatchArm::Scope, hostile};
-        const auto d = ss::audit_detail(rq, c);
+        sel = {DispatchArm::Scope, hostile};
+        const auto d = ss::audit_detail(sel, c);
         // Exactly one of each count key, and it is the real one, after the scope token.
         for (const char* key : {"requested=", "reached=", "skipped_offline=", "skipped_version=", "arm="})
             CHECK(occurrences(d, key) == 1);

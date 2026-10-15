@@ -55,7 +55,6 @@ struct SyncHarness {
     int resolve_calls = 0;
     ss::Selector last_selector;
     std::string last_username;
-    std::string last_source;
     // Runs inside the dispatch call, to re-enter the route while a run is in flight.
     std::function<void()> during_dispatch;
 
@@ -98,12 +97,10 @@ struct SyncHarness {
                 return resolved;
             };
         if (wire_dispatch)
-            deps.sync_dispatch_many_fn = [this](const std::vector<std::string>& ids,
-                                                const std::string& source) {
+            deps.sync_dispatch_many_fn = [this](const std::vector<std::string>& ids) {
                 ++dispatch_calls;
                 events.push_back("dispatch");
                 dispatched.insert(dispatched.end(), ids.begin(), ids.end());
-                last_source = source;
                 if (during_dispatch)
                     during_dispatch();
                 return ss::DispatchResult{accept.value_or(ids.size()), "__sync__-fleet-test"};
@@ -160,14 +157,12 @@ TEST_CASE("sync route: a fleet run is 202 with counts only, audited before anyth
     // Only the live, new-enough devices were sent, in one dispatch call.
     CHECK(h.dispatch_calls == 1);
     CHECK(h.dispatched == std::vector<std::string>{"d0", "d3"});
-    CHECK(h.last_source == "installed_software");
     // Audit BEFORE dispatch, once, carrying scope, arm and every count.
     REQUIRE(h.events == std::vector<std::string>{"audit:requested", "dispatch"});
     REQUIRE(h.audit_rows.size() == 1);
     CHECK(h.audit_rows[0] == "inventory.sync.request|requested|Scope|__all__");
     CHECK(h.audit_details[0] ==
-          "scope=__all__ arm=broadcast source=installed_software requested=4 reached=2 "
-          "skipped_offline=1 skipped_version=1");
+          "scope=__all__ arm=broadcast requested=4 reached=2 skipped_offline=1 skipped_version=1");
 }
 
 TEST_CASE("sync route: the resolver sees the parsed selector and the caller's session",

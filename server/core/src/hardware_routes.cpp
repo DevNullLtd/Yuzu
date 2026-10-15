@@ -565,7 +565,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(detail::a4_error(res, parsed.error()), "application/json");
             return;
         }
-        const ss::Selector& sel = parsed->sel;
+        const ss::Selector& sel = *parsed;
         const char* const target_type = sel.arm == DispatchArm::Ids ? "Agent" : "Scope";
         const std::string target_id = ss::target_label(sel);
         const auto refuse = [&](int status, const std::string& message, const std::string& why,
@@ -652,7 +652,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         // Audit BEFORE dispatch and fail closed — same contract as the per-device route.
         if (!detail::emit_behavioral_audit(deps_.audit_fn, req, res, kAction, ss::audit_result(plan.counts),
-                                           target_type, target_id, ss::audit_detail(*parsed, plan.counts))) {
+                                           target_type, target_id, ss::audit_detail(sel, plan.counts))) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
                                              {.retry_after_ms = 5000}),
@@ -662,7 +662,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         ss::DispatchResult sent;
         if (!plan.targets.empty())
-            sent = deps_.sync_dispatch_many_fn(plan.targets, parsed->source);
+            sent = deps_.sync_dispatch_many_fn(plan.targets);
         if (!plan.targets.empty() && sent.sent == 0) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "no selected device is reachable right now",

@@ -287,10 +287,10 @@ public:
     /// Selector -> caller-visible target ids (+ whether the caller is unfiltered).
     using SyncResolveFn = std::function<software_sync::Resolved(const auth::Session&,
                                                                 const software_sync::Selector&)>;
-    /// Send `__sync__.now {source}` to every id as one system-reserved push (one command id,
-    /// one gateway flush); `sent` counts the sessions that accepted the frame.
-    using SyncDispatchManyFn = std::function<software_sync::DispatchResult(
-        const std::vector<std::string>& ids, const std::string& source)>;
+    /// Send `__sync__.now {source: installed_software}` to every id as one system-reserved
+    /// push (one command id, one gateway flush); `sent` counts the sessions that accepted it.
+    using SyncDispatchManyFn =
+        std::function<software_sync::DispatchResult(const std::vector<std::string>& ids)>;
 
     struct Deps {
         AuthFn auth_fn;

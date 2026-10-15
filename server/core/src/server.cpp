@@ -18631,7 +18631,7 @@ private:
                              // stagger for `__sync__.now`, so the herd is bounded by the route's
                              // 500-target cap, not here.
                              .sync_dispatch_many_fn =
-                                 [this](const std::vector<std::string>& ids, const std::string& source)
+                                 [this](const std::vector<std::string>& ids)
                                      -> software_sync::DispatchResult {
                                      const auto now_s =
                                          std::chrono::duration_cast<std::chrono::seconds>(
@@ -18644,7 +18644,8 @@ private:
                                              auth::AuthManager::random_bytes(8));
                                      auto classified = build_classified_command(
                                          yuzu::server::DispatchCaller{.system = true}, "__sync__",
-                                         "now", out.command_id, /*parameters=*/{{"source", source}});
+                                         "now", out.command_id,
+                                         /*parameters=*/{{"source", std::string(software_sync::kSource)}});
                                      if (!classified)
                                          return out;
                                      for (const auto& id : ids)
