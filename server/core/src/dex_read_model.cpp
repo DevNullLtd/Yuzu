@@ -189,7 +189,8 @@ DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int6
     f.crashes = r.crashes;
     f.hangs = r.hangs;
     f.distinct_devices = r.affected_devices;
-    f.distinct_devices_online = affected;
+    if (population)
+        f.distinct_devices_online = affected;
     f.last_seen = r.last_seen;
     // An unknown or zero population nulls both share and rate. affected >
     // population cannot happen when the numerator is drawn from the
@@ -230,7 +231,8 @@ json figures_json(const DexStabilityFigures& f) {
     return {{"crashes", f.crashes},
             {"hangs", f.hangs},
             {"distinct_devices", f.distinct_devices},
-            {"distinct_devices_online", f.distinct_devices_online},
+            {"distinct_devices_online",
+             f.distinct_devices_online ? json(*f.distinct_devices_online) : json(nullptr)},
             {"last_seen", f.last_seen},
             {"share_affected", interval_or_null(f.share_affected)},
             {"rate_per_1000", interval_or_null(f.rate_per_1000)},

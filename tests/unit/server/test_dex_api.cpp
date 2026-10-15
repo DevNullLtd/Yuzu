@@ -25,6 +25,7 @@
 #include "../test_helpers.hpp"
 
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -407,6 +408,9 @@ TEST_CASE("DexApi: apps without a FleetFn has an unknown population, scores with
     CHECK_FALSE(m.apps[0].figures.share_affected);
     CHECK_FALSE(m.apps[0].figures.rate_per_1000);
     CHECK(std::string(m.apps[0].figures.score.withheld) == "no_population");
+    // No fleet source: which affected devices are online is unknown, not zero.
+    CHECK_FALSE(m.apps[0].figures.distinct_devices_online.has_value());
+    CHECK_FALSE(m.apps[0].versions[0].figures.distinct_devices_online.has_value());
 }
 
 TEST_CASE("DexApi: apps on a failed store read is degraded, never an empty list",
@@ -816,13 +820,25 @@ TEST_CASE("DexApi: apps read over its concurrency budget is refused as a degrade
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     seed_apps_fixture(store);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto counter = [&] {
+        return metrics
+            .counter("yuzu_server_guardian_read_degrade_total",
+                     {{"reason", "concurrency_budget"}, {"source", "guardian_state"}})
+            .value();
+    };
+    CHECK(GuaranteedStateStore::kDexAppsConcurrentReads == 4); // the documented budget
     const auto api = make_local_dex_api(&store, fleet20);
     REQUIRE_FALSE(api->apps("7d").degraded);
+    CHECK(counter() == 0.0);
     store.set_apps_read_budget_for_test(0);
     const auto refused = api->apps("7d");
     CHECK(refused.degraded);
     CHECK(refused.apps.empty());
+    CHECK(counter() == 1.0); // counted once under the documented reason and source
     CHECK_FALSE(store.dex_app_stability_checked("", "windows", 10, 20, 5, {}));
+    CHECK(counter() == 2.0);
     // The slot is released after a refusal: restoring the budget serves again.
     store.set_apps_read_budget_for_test(GuaranteedStateStore::kDexAppsConcurrentReads);
     CHECK_FALSE(api->apps("7d").degraded);

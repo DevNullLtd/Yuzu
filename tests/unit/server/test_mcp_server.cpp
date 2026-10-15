@@ -8394,6 +8394,11 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         // The nested objects are always emitted in full: pin their required keys.
         const auto interval_req = nlohmann::json::array({"estimate", "lower", "upper", "reliable"});
         const auto deduction_req = nlohmann::json::array({"name", "points", "assessed"});
+        CHECK(std::find(out["properties"]["apps"]["items"]["required"].begin(),
+                        out["properties"]["apps"]["items"]["required"].end(),
+                        "distinct_devices_online") !=
+              out["properties"]["apps"]["items"]["required"].end());
+        CHECK(row["distinct_devices_online"]["type"] == nlohmann::json::array({"integer", "null"}));
         CHECK(row["versions"]["items"]["required"] ==
               nlohmann::json::array({"version", "crashes", "hangs", "distinct_devices",
                                      "distinct_devices_online", "last_seen", "share_affected",

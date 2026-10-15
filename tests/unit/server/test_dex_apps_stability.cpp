@@ -137,6 +137,8 @@ TEST_CASE("apps model: unknown or zero population gives no share, no rate, no sc
         CHECK_FALSE(f.score.score);
         CHECK(std::string(f.score.withheld) == "no_population");
         CHECK(f.score.deductions.empty());
+        // Zero online devices is a known empty set; no fleet source leaves membership unknown.
+        CHECK(f.distinct_devices_online.has_value() == pop.has_value());
     }
 }
 
@@ -147,7 +149,7 @@ TEST_CASE("apps model: more devices affected than online is a refusal, not a cla
     const auto m = dex_apps_model_from_rows("30d", {total_row("a.exe", 9, 0, 9, 9, 0)}, 5, def());
     const auto& f = m.apps[0].figures;
     CHECK_FALSE(f.share_affected);
-    CHECK_FALSE(f.rate_per_1000); // same denominator mismatch: no rate on a basis the row calls inconsistent
+    CHECK_FALSE(f.rate_per_1000); // no rate beside a score the row withholds as inconsistent
     CHECK(std::string(f.score.withheld) == "inconsistent");
     // Exactly the population affected is consistent: share and rate are published.
     const auto eq = dex_apps_model_from_rows("30d", {total_row("a.exe", 9, 0, 5, 9, 0)}, 5, def());
@@ -235,7 +237,7 @@ TEST_CASE("apps json: exact golden for the unknown-population model", "[dex][app
     const auto m = dex_apps_model_from_rows(
         "7d", {total_row("a.exe", 2, 1, 2, 2, 1), version_row("a.exe", "1.0", 2, 1, 2)}, std::nullopt, def());
     const std::string fig =
-        R"("crashes":2,"distinct_devices":2,"distinct_devices_online":2,"hangs":1,)"
+        R"("crashes":2,"distinct_devices":2,"distinct_devices_online":null,"hangs":1,)"
         R"("last_seen":"2026-10-14T00:00:00Z",)"
         R"("rate_per_1000":null,"score":{"band":null,"deductions":[],"score":null,"withheld":"no_population"},)"
         R"("share_affected":null)";
@@ -319,7 +321,7 @@ TEST_CASE("apps json: a populated row carries the score object, rate and both ca
 // Churn: seven devices crashed and went offline while fifty others are online.
 // The counts keep the seven; the share, rate and score are over the online
 // population, whose members none of the seven are, so they read zero affected.
-TEST_CASE("apps model: devices that crashed and went offline are in the counts, not the share",
+TEST_CASE("apps model: devices that crashed and went offline are in the counts and not the share",
           "[dex][apps_model]") {
     auto r = total_row("a.exe", 12, 3, 7, 0, 0);
     r.affected_online = 0;
@@ -339,7 +341,7 @@ TEST_CASE("apps model: devices that crashed and went offline are in the counts, 
     CHECK(*f.score.score == Approx(100.0));
 }
 
-TEST_CASE("apps model: share, rate and score use the online figures only", "[dex][apps_model]") {
+TEST_CASE("apps model: share and rate and score use the online figures only", "[dex][apps_model]") {
     // 7 devices affected in the window; 2 of them are online, with 3 crashes + 1 hang.
     auto r = total_row("a.exe", 12, 3, 7, 3, 1);
     r.affected_online = 2;

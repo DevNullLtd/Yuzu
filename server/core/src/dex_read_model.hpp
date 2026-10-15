@@ -122,10 +122,13 @@ struct DexStabilityFigures {
     int64_t crashes{0};
     int64_t hangs{0};
     int64_t distinct_devices{0};
-    int64_t distinct_devices_online{0}; ///< of distinct_devices, those online now (the share's numerator)
+    /// Of distinct_devices, those online now (the share's numerator); nullopt when
+    /// there is no fleet source, so membership is unknown (not zero).
+    std::optional<int64_t> distinct_devices_online;
     std::string last_seen;
     std::optional<DexInterval> share_affected; ///< Wilson; null when no population
-    std::optional<DexInterval> rate_per_1000;  ///< exact; online-device events per 1,000 online devices
+    std::optional<DexInterval> rate_per_1000;  ///< exact; online-device events per 1,000 online
+                                               ///< devices
     StabilityScore score;
 };
 
