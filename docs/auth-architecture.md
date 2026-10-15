@@ -16,7 +16,7 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 - **Login page** — the landing page at `/home` (`GET /login` redirects there), dark-themed, with a single-sign-on button when an OIDC or SAML provider is enabled. Yuzu does not support Light Mode.
 - **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, enrollment tokens, pending agent approvals, AD/Entra section.
 - **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
-- **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
+- **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated page requests to `/home` (carrying the validated `next` screen key; `/login` itself now redirects there), and returns 401 for API calls and htmx panel requests (with `HX-Redirect`).
 - **HTMX paradigm** — Settings page uses HTMX for server interactions; server renders HTML fragments. Vanilla JS is reserved for what htmx cannot do CSP-safely: clipboard copy and `fetch()` to JSON REST v1 routes (engine principals, password change/reset). Never `hx-on` (the CSP has no `unsafe-eval`). Dominant UI pattern going forward.
 - **Session revocation REST surface (CC6.3 revocation, CC6.7 disposition, CC6.8 termination).**
   - `DELETE /api/v1/sessions?username=<name>` — admin-only via `UserManagement:Write`. Cookie sessions only; API tokens deliberately not revoked.

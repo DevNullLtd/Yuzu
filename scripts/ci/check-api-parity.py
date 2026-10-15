@@ -226,8 +226,11 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # Home page (HM-1, measured on its own base at 200 = 199 + 1): +1 `composed-of:` row,
 # GET /fragments/home/summary (readout, needs attention) over the existing hardware roster,
-# approvals count, executions and fleet-compliance reads; a UI fragment, no machine twin owed
-# (ADR-1005).
+# approvals count, executions and fleet-compliance reads; a UI fragment. NOT a rule that such a
+# fragment owes no twin: ADR-1005 Decision 4 says a dashboard fragment is not an API twin. The
+# four Dashboard rows below are an owner-accepted TEMPORARY exception (review of PR #5859,
+# 2026-10-15), so the baseline stays raised until the estate partition, activity and health
+# reads have REST v1 and MCP twins; the next reader should not take it as precedent.
 # Home panels (HM-2, measured on its own base at 204 = 201 + 3): +3. The three Home fragments
 # (/fragments/home/policies, /fragments/home/activity, /fragments/home/health) are UI-only
 # compositions over existing twinned or planned reads, so each is a composed-of row that
