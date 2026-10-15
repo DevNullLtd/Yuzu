@@ -1,3 +1,5 @@
+> **2026-10-15:** this record describes `6eb78e12e` only; it is superseded in part by [macos-development-foundation-20261015.md](macos-development-foundation-20261015.md).
+
 # macOS development foundation — governance and validation
 
 Status: **PASS for the scoped development-foundation governance review**. All 12
