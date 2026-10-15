@@ -546,7 +546,7 @@ TEST_CASE("REST offload-targets: GET /:id/deliveries rejects a malformed limit",
         REQUIRE(res);
         CHECK(res->status == 400);
     }
-    auto ok = h.sink.Get(base + "?limit=0"); // well-formed, out of range: clamped to 1
+    auto ok = h.sink.Get(base + "?limit=0"); // well-formed but out of range: not rejected
     REQUIRE(ok);
     CHECK(ok->status == 200);
 }

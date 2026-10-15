@@ -8447,7 +8447,7 @@ void RestApiV1::register_routes(
             // needed. out>=0 rejects negatives.
             auto parse_epoch = [](const std::string& s, std::optional<int64_t>& out) -> bool {
                 if (s.empty())
-                    return true; // optional — leave unset (unbounded that side)
+                    return true; // optional: leave unset (unbounded that side)
                 // Reject leading whitespace / '+' / '-' that std::stoll would
                 // otherwise silently accept (cpp-expert S-1 / UP-9): a strict
                 // digits-only contract, so "non-numeric → 400" is literally true.
