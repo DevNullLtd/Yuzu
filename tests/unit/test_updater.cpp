@@ -234,6 +234,39 @@ TEST_CASE("rollback_if_needed refuses a writable or symlinked .old",
     std::ifstream in(exe_path, std::ios::binary);
     REQUIRE(std::string(std::istreambuf_iterator<char>(in), {}) == "fake-binary-content");
 }
+
+// Governance g8q-2: startup maintenance removes a refused .old (cleanup runs after
+// the refusal), keeps the executable, and never deletes through a symlink.
+TEST_CASE("startup maintenance removes a refused .old and keeps the executable",
+          "[updater][rollback][maintenance]") {
+    TempUpdaterDir tmp("rollback_refused_cleanup");
+    const auto& dir = tmp.guard.path;
+    auto exe_path = dir / "yuzu-agent";
+    auto old_path = dir / "yuzu-agent.old";
+    auto target = dir / "planted";
+    write_fake_binary(exe_path);
+
+    UpdateConfig config;
+    config.enabled = true;
+    Updater updater(config, "test-agent", "0.1.0", "darwin", "arm64", exe_path);
+
+    SECTION("group- or world-writable") {
+        write_fake_binary(old_path);
+        fs::permissions(old_path, fs::perms::group_write | fs::perms::others_write,
+                        fs::perm_options::add);
+        REQUIRE_FALSE(updater.perform_startup_maintenance());
+    }
+    SECTION("a symlink") {
+        write_fake_binary(target);
+        fs::create_symlink(target, old_path);
+        REQUIRE_FALSE(updater.perform_startup_maintenance());
+        REQUIRE(fs::exists(target));
+    }
+    REQUIRE_FALSE(fs::exists(fs::symlink_status(old_path)));
+    REQUIRE_FALSE(fs::is_symlink(exe_path));
+    std::ifstream in(exe_path, std::ios::binary);
+    REQUIRE(std::string(std::istreambuf_iterator<char>(in), {}) == "fake-binary-content");
+}
 #endif
 
 TEST_CASE("disabled startup maintenance leaves executable-adjacent rollback files untouched",

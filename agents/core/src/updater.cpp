@@ -1064,10 +1064,14 @@ bool Updater::rollback_if_needed() {
         spdlog::error("Refusing rollback: cannot inspect '{}'", old_path.string());
         return false;
     }
-    if (!S_ISREG(old_st.st_mode) || old_st.st_uid != ::geteuid() || old_st.st_nlink != 1 ||
+    // root's own files are trusted too: a non-root agent never wrote them, but
+    // no other account could have planted them (governance xp-19).
+    const bool owner_trusted = old_st.st_uid == ::geteuid() || old_st.st_uid == 0;
+    if (!S_ISREG(old_st.st_mode) || !owner_trusted || old_st.st_nlink != 1 ||
         (old_st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
         spdlog::error("Refusing rollback: '{}' is not a singly-linked regular file owned by this "
-                      "account and writable only by it (uid {}, mode {:o}, links {}, inode {})",
+                      "account or root and writable only by its owner (uid {}, mode {:o}, links {}, "
+                      "inode {})",
                       old_path.string(), static_cast<unsigned long>(old_st.st_uid),
                       static_cast<unsigned>(old_st.st_mode & 07777),
                       static_cast<unsigned long>(old_st.st_nlink),
