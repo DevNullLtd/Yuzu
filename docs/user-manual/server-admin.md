@@ -169,6 +169,51 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 
 ---
 
+## Settings: Integrations page
+
+**Settings → Integrations** (`/settings/integrations`, admin only; the MCP and Gateway panels also
+stay on the `/settings` page). Every panel reads through admin-only fragments that are also gated
+by the securable of the matching JSON route (Infrastructure Read for webhooks and offload
+targets, Directory Read for directory sync), so a fragment is never wider than its JSON twin.
+
+- **MCP server** enables or disables the endpoint and sets Read-only or Full access, with one
+  Save. The confirmation names the state being saved (MCP off, on in read-only mode, or on with
+  write and execute tools). A change lasts until the server restarts, then the start-up flags
+  (`--mcp-disable`, `--mcp-read-only`) apply again; a server started with `--mcp-disable` does not
+  serve MCP until it is restarted without it.
+- **Gateway** shows the upstream-service state, the listen address, the gateway mode and the
+  number of agents connected through the gateway, the flag guidance for a server where the
+  upstream service is not running, and the gateway environment-variable reference.
+- **Webhooks** lists the configured webhooks (destination host, events, last delivery) and opens
+  a delivery history. You can create and delete a webhook; the create confirmation names the
+  destination host and the data the chosen events carry. A destination with embedded
+  `user:password@`, or with control characters in the URL or event types, is refused. The
+  signing secret is write-only. There is no restriction on the destination address, and the
+  confirmation is a click-through, not an approval step.
+- **Offload targets** lists the targets (destination host, events, batch size, last delivery),
+  opens a delivery history, and creates and deletes targets under the same rules. The credential
+  is write-only. The create audit row records the name, the destination's scheme and host and a fingerprint
+  of the URL, never its path or query (see [Audit Log](audit-log.md)).
+- **Directory sync** shows the Microsoft Entra sync state (never synced, running, completed or
+  failed are separate states, and a failed read says so rather than showing an empty panel), the
+  synced user and group counts, and a form that runs a sync. The tenant, client and secret are used
+  for that one request and never stored. "Show directory users" loads the list on request, audited
+  as `directory.users.view`; it is withheld if the audit row cannot be written and shows the first
+  200 users. Group-to-role mappings are recorded for reference; nothing reads them at sign-in.
+
+**Upgrade note.** `POST /api/settings/mcp` now requires exactly one `enabled` and exactly one
+`read_only` field, each the literal `true` or `false`, and answers `400` otherwise. Scripts that
+omitted a field or sent another value must be updated. Creating a webhook or offload target with
+`user:password@` in the URL, or with a control character in the URL or event types, now answers
+`400` (existing rows are not changed). Webhook and offload-target audit rows now record the
+destination's scheme and host plus a short fingerprint, never the URL path or query; rows written by
+earlier builds still hold the full URL and should be treated like a credential. These writes (and
+directory sync, the group-mapping save and `POST /api/settings/mcp`) write an `attempted` audit row
+first and refuse with `503` if it cannot be stored, and refuse a cross-site browser request with
+`403`.
+
+---
+
 ## Configuration Files
 
 The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg` on Linux, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) and its runtime state files live on disk; the state files are written to `--data-dir` (default: the directory containing the config file). Apart from those files, the NVD cache and the `agent-updates/`/`upload-blobs/` file directories, everything — users, sessions, MFA/TOTP, SCIM and every other server store — lives in PostgreSQL (see [PostgreSQL Substrate](#postgresql-substrate)). There is no `auth.db`; legacy `*.db` files left in `--data-dir` by older releases are only probed at startup to warn, never read.
@@ -259,6 +304,27 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT - Integrations writes need a same-site Origin on a cookie session, write an `attempted` audit row first, and store no destination URL (breaking for cookie-reusing scripts)
+
+`POST`/`DELETE /api/webhooks`, `POST`/`DELETE /api/v1/offload-targets`, `POST /api/directory/sync`, `PUT /api/directory/group-mappings` and `POST /api/settings/mcp` now answer `403` to a request authenticated by a **session cookie** that carries no `Origin`/`Referer`, or one naming another site. A script that reuses a login cookie jar (`curl -b`) must switch to an API token (token callers are not gated) or send a same-site `Origin`; behind a proxy that rewrites `Host`, declare the external origin with `--csrf-trusted-origin` as described above. Each of these writes also records a `result=attempted` audit row before it changes anything and answers `503` with `Sec-Audit-Failed: true` when that row cannot be stored; during an audit-store outage they are unavailable, deleting a webhook or offload target included (the MCP switches can still be turned off with `--mcp-disable` and a restart; check `/healthz` `stores.audit` and the `YuzuAuditPersistFailures` alert). SIEM rules that filter `result != success` will now also see the `attempted` rows. Webhook and offload audit rows record `url=<scheme>://<host>[:<port>] url_fp=<12 hex>` instead of the full URL, and their log lines name the host (and the webhook or target id where one exists), never the URL; rows written by earlier builds keep the full URL, so rotate any hook URL that appears in one.
+
+### vNEXT - `POST /api/settings/mcp` now refuses a body that omits or repeats `enabled` or `read_only` (breaking for scripted callers)
+
+The dashboard route behind the MCP settings form used to read the first `enabled` and `read_only`
+value it found and treat an absent one as `false`: a request carrying only `enabled=true` switched
+Read-only MCP to Full access, and an empty request switched MCP off. It now requires exactly one
+`enabled` and exactly one `read_only`, each `true` or `false`, and answers `400` with nothing
+changed otherwise. The rebuilt panel always sends both. A script that posted a single field must
+send both.
+
+### vNEXT - changing an account's role or granting elevation eligibility needs your own administrator role (breaking for elevation-only operators)
+
+**What changed.** `POST /api/settings/users/{username}/role` and the grant form (`eligible=true`) of `POST /api/v1/users/{username}/elevation-eligibility` refuse, with `403`, a session that is administrator only through a temporary elevation. The attempt is audited (`elevated_session_role_change_blocked`, `elevated_session_eligibility_grant_blocked`).
+
+**Who this affects.** Operators who rely on an elevated session to change roles or grant eligibility, in particular deployments where every administrator is an elevation-eligible `user` account.
+
+**What to do.** Make the change from an account whose own role is `admin` (a local administrator, or a member of the identity provider's administrator group). Revoking eligibility is still allowed during an elevation.
+
 ### vNEXT - `--gateway-upstream` refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs)
 
 The gateway-upstream service now admits only a gateway whose certificate key (SPKI SHA-256) is pinned, carries `serverAuth` and is inside its validity window, and the server **exits at boot, before binding a port,** when `--gateway-upstream` is set and that cannot be arranged. Who is affected and what to do:
@@ -269,6 +335,14 @@ The gateway-upstream service now admits only a gateway whose certificate key (SP
 - **Windows installer:** `/GATEWAY` with your own gRPC certificates needs `/GATEWAY_PEER_PIN_FILE=<cert.pem>` (preferred) or `/GATEWAY_PEER_PIN=<64 hex>` the first time, and `/GATEWAY /NOTLS` together with either is refused.
 
 Check your own unit, env file, compose file or installer arguments before upgrading; the literal commands, the per-deployment table and the rollback steps are in [Upgrading](upgrading.md) ("Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization"), and the full reference is [Gateway upstream peer authorization](#gateway-upstream-peer-authorization) below. Pins are fixed at boot; changing or withdrawing one is a restart.
+
+### vNEXT - changing sign-in provider settings needs your own administrator role (breaking for elevation-only operators)
+
+**What changed.** `POST /api/settings/oidc` (Settings > OIDC) and `PUT /api/config/{key}` for the `oidc_*` keys refuse, with `403`, any session whose own role is not `admin`: a session that is administrator only through a temporary elevation, and (for the config route) a non-administrator account that holds `Infrastructure:Write` through a custom or service role, or whose authority is an RBAC Administrator grant only, and any MCP-tier token. The attempt is audited (`elevated_session_oidc_change_blocked`, `elevated_session_oidc_setting_blocked`). Other runtime-config keys are unaffected.
+
+**Who this affects.** Operators who rely on an elevated session to change the OIDC issuer, client, secret, redirect URI or administrator group, in particular deployments where every administrator is an elevation-eligible `user` account; and automation that writes `oidc_*` through `PUT /api/config/{key}` with a token whose creator is not an `admin` account.
+
+**What to do.** Make the change from an account whose own role is `admin` (a local administrator, or a member of the identity provider's administrator group). If no such account can sign in, use the break-glass account (`--break-glass-user`, `--break-glass-arm`) or the direct-SQL fallback in [`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md). A stored `oidc_*` value overrides the matching `--oidc-*` flag after a restart, so correct the stored value rather than only the flag.
 
 ### vNEXT — the shipped Docker Compose files keep `/etc/yuzu/certs` on a volume (#5370; action needed before you recreate a 0.14.0 container)
 
@@ -1442,7 +1516,7 @@ need no change.
 **The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
 — CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
 gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
-Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), and the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only). The dashboard renders fine and reads work; only the destructive actions
+Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only), and the Integrations page's webhook, offload-target, directory-sync, group-mapping and MCP-settings saves (`403 cross-site request refused`). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
@@ -1524,7 +1598,7 @@ bar, the 403s will continue. It is the fastest diagnosis for a mistyped entry.
 
 **What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as
 before, so an unproxied deployment sees no difference. Non-browser clients sending neither
-`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, and the two
+`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, except on the routes that gate a cookie session with `browser_write_is_cross_site` (the bell, instruction and dashboard-dispatch writes, and the Integrations writes: webhooks, offload targets, directory sync, group mappings, MCP settings), which refuse a header-less cookie request; and the two
 CA endpoints still treat both-headers-absent as cross-site. Leaving the flag unset is safe: it
 means same-host only, which is the previous behaviour.
 
@@ -2869,7 +2943,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
 | Tag Compliance | *(moved)* | Now the **Compliance by tag** panel on the Compliance page; see [Tag Compliance](#tag-compliance). |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
-| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart reverts to the command-line/environment value, so a durable rotation must update that too; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
+| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart rebuilds the provider from the command-line/environment value, so a durable rotation must update that too; the stored admin group is the exception and still applies; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
 | Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). A view over the same `AuditLog:Read`/`AuditLog:Attest`-gated `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. See `docs/auth-architecture.md` "Periodic access reviews". |
 
@@ -3043,6 +3117,7 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 - The certificate file may contain the full chain (leaf + intermediates).
 - The private key must not be password-protected.
 - On Unix, the private key file must not be readable by group or others. The server will refuse to start if permissions are too open. Fix with: `chmod 600 /path/to/key.pem`.
+- A key uploaded or pasted in Settings is created owner-only (0600) and replaced atomically by rename. Mount the certificate directory, not the single `server-key.pem` file, into a container: a single-file bind mount cannot be replaced and the upload fails with an error in the server log.
 - For production, use certificates signed by a trusted CA. Self-signed certificates work but require agents to trust the CA.
 
 ### Certificate Hot-Reload
@@ -3316,6 +3391,7 @@ The server emits an audit event on every branch:
 | Role changed | `success` | `old_role=user,new_role=admin` (or vice versa) |
 | Same role requested | `no_op` | `same_role=admin` (or `user`) |
 | Self-target rejected | `denied` | `self_role_change_blocked` |
+| Caller is an administrator only through a temporary elevation | `denied` | `elevated_session_role_change_blocked` (HTTP 403) |
 | Invalid username | `denied` | `invalid_username` |
 | Invalid JSON body | `denied` | `invalid_json` |
 | Missing `role` field | `denied` | `missing_role` |
@@ -3325,6 +3401,10 @@ The server emits an audit event on every branch:
 | Account deactivated between the route's lookup and the write, `admin` requested | `denied` | `inactive_promotion_refused` (HTTP 409; an account already inactive when the request arrives is `user_not_found`, HTTP 404) |
 | Role store unavailable, or the guard is not wired | `failure` | `store_failure` (HTTP 503, no retry hint: the change may or may not have been applied, so check the user's role and revoke the user's sessions) |
 | Role changed but session cleanup failed | `partial` | `role_changed session_wipe_failed=true old_role=<r> new_role=<r>` (HTTP 503, no retry hint: revoke the user's sessions) |
+
+> **Changing a role needs your own administrator role.** A session that is
+> administrator only through a temporary elevation (`POST /api/v1/elevate`) is
+> refused with HTTP 403: an account role is a standing grant, an elevation is not.
 
 > **You cannot change your own role.** The endpoint rejects self-target
 > with HTTP 403, audited as `denied:self_role_change_blocked`. The same
@@ -5079,6 +5159,8 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `DELETE` | `/api/settings/pending-agents/{id}` | Remove a pending agent from the queue. `409` if the row is no longer `pending` (already `approved`/`denied`) — removal only succeeds against a genuinely pending row, by design (WS-6 6.2). |
 
 The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin routes) may not contain an ASCII control character or a comma — both are rejected before the row is ever created, closing an audit-log injection path (WS-6 6.2). A UUID, hostname, or MAC-derived id is unaffected.
+
+An agent id seen for the first time must also use only letters, digits, `.`, `_`, `:` and `-`, and must not consist only of dots; otherwise `Register` (and the gateway's `ProxyRegister`) answers `INVALID_ARGUMENT` and no row is created. The check applies only when the enrollment store holds no row for the id: an agent that is already enrolled, pending or denied keeps registering under its existing id. The agent generates a UUID, so only an operator-chosen `--agent-id` / `YUZU_AGENT_ID` is affected. In the pending list, an id that is empty or is `.` or `..` is shown without row actions and the approve, deny and remove routes answer `400` for it; the Approve All / Deny All buttons are shown for such a row (even when it is the only pending one), and they act on every pending agent, so review the queue first.
 
 ### Auto-Approval Policies
 

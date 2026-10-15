@@ -1614,6 +1614,9 @@ if build_server
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
       'unit/server/test_webhook_routes.cpp',
+      'unit/server/test_integrations_url_policy.cpp', # SYS-5: outbound URL policy + mapping audit detail (pure)
+      'unit/server/test_integrations_sync_render.cpp', # SYS-5: webhook / offload / directory-sync panel renderers (pure)
+      'unit/server/test_integrations_sync_routes.cpp', # SYS-5: the six fragments + controller script pins (TestRouteSink)
       'unit/server/test_migration_runner.cpp',
       'unit/server/test_rate_limiter.cpp',
       'unit/server/test_cert_reloader.cpp',
@@ -1710,6 +1713,7 @@ if build_server
       'unit/server/test_settings_routes_enrollment.cpp', # WS-6 6.2 enrollment mutations: audit rows, atomic bulk, fail-closed
       'unit/server/test_settings_routes_dex_alerts.cpp',
       'unit/server/test_settings_routes_ota_audit.cpp',
+      'unit/server/test_settings_routes_cert_upload.cpp', # TLS server key created 0600 / dir 0700, symlink replaced not followed
       'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
@@ -1720,6 +1724,8 @@ if build_server
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
       'unit/server/test_nav_shells.cpp',            # app shell: nav model, renderer, marker swap, per-page active item
+      'unit/server/test_integrations_panels.cpp',   # System Integrations: MCP/Gateway panels, MCP form parser + POST handler
+      'unit/server/test_integrations_page.cpp',     # System Integrations: page route, page + script pins
       'unit/server/test_name_lookup_memo.cpp',      # Operate O1: the per-render definition-name memo (stop on first read failure)
       'unit/server/test_approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
       'unit/server/test_executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers

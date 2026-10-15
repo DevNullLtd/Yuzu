@@ -2526,9 +2526,13 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             const std::string rowstate = ni ? "notimpl" : (d.state == "errored" ? "drifted" : d.state);
             h += "<tr data-gpf=\"d\" data-gpstate=\"" + rowstate + "\" data-gpname=\"" +
                  html_escape(lower(d.host)) + "\"><td class=\"" + std::string(d.online ? "" : "gp-mute") +
-                 "\"><a href=\"/viz/host/" + html_escape(d.agent_id) +
-                 "\" title=\"Open host detail\">" +
-                 html_escape(d.host) + "</a>" +
+                 "\">" +
+                 // agent_id is agent-supplied: one encoded path segment, and no link
+                 // at all for an empty, `.` or `..` id (browsers collapse those).
+                 (path_segment_ok(d.agent_id)
+                      ? "<a href=\"/viz/host/" + url_path_segment(d.agent_id) +
+                            "\" title=\"Open host detail\">" + html_escape(d.host) + "</a>"
+                      : html_escape(d.host)) +
                  (d.online ? "" : " <span class=\"gp-mute\">(offline)</span>") +
                  "</td><td>" + statecell + "</td>"
                  "<td class=\"gp-mute\">" + as_of + "</td></tr>";

@@ -672,6 +672,20 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             response->set_enrollment_status("denied");
             return grpc::Status::OK;
         }
+        // Mirror of the direct Register gate: a NEW agent_id (no enrollment row)
+        // must use the agent's own identifier charset; existing rows are exempt.
+        if (!prior && !auth::is_valid_new_agent_id(info.agent_id())) {
+            spdlog::warn("[gateway] ProxyRegister rejected: agent_id has characters outside "
+                         "[A-Za-z0-9._:-] (or is only dots)");
+            if (metrics_) {
+                metrics_
+                    ->counter("yuzu_register_invalid_agent_id_total",
+                              {{"reason", "charset"}, {"source", "gateway_proxy"}})
+                    .increment();
+            }
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "agent_id may only contain letters, digits, '.', '_', ':' and '-'");
+        }
     }
 
     {

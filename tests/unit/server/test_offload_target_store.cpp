@@ -466,8 +466,8 @@ TEST_CASE("OffloadTargetStore[pg]: batched event past the depth guard is preserv
 TEST_CASE("OffloadTargetStore[pg]: rejects name with control bytes",
           "[offload_store][pg][security]") {
     OffloadTargetStorePg store;
-    // Audit-row line-splitting via newline in name — DELETE handler
-    // emits `name=<n> url=<u>` to the audit `detail` field.
+    // Audit-row line-splitting via newline in name — the handlers emit
+    // `name=<n> ...` to the audit `detail` field.
     CHECK_FALSE(store->create_target("evil\nfake.event", "https://x.example.com/h",
                                      OffloadAuthType::None, "", "*")
                     .has_value());

@@ -32,6 +32,7 @@
 
 #include "test_auth_db_pg_helper.hpp"
 #include "test_route_sink.hpp"
+#include "url_attr_scan.hpp"
 #include "../test_helpers.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -570,6 +571,96 @@ TEST_CASE("settings enrollment: the batch route refuses a malformed count or lim
         CHECK(res->status == 400);
         CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
         CHECK(h.auth_mgr.list_enrollment_tokens().value().empty());
+    }
+}
+
+// ── Pending-agent row URLs: the agent-supplied id is ONE encoded path segment ──
+
+namespace {
+const std::vector<std::string> kHostilePendingIds = {
+    "./bulk-approve?", "../auto-approve/mode?", "../users/x", "a/b",
+    "%2E%2E/x",        "%252e",                 "a#b",        "a?b",
+    "caf\xC3\xA9",     "a b&c",
+};
+} // namespace
+
+TEST_CASE("settings pending: a hostile agent id reaches Approve/Deny only as one encoded segment, "
+          "and the encoded URL still acts on that exact row",
+          "[pg][settings_routes][enrollment][url_path_segment]") {
+    for (const auto& id : kHostilePendingIds) {
+        INFO("id=" << id);
+        EnrollRoutesHarness h;
+        h.queue(id);
+        h.queue("bystander"); // must NOT be touched by the hostile row's click
+
+        auto page = h.sink.Get("/fragments/settings/pending");
+        REQUIRE(page);
+        const auto urls = yuzu::test::url_attr_values(page->body);
+
+        // The Deny control says Deny and confirms Deny; it is the only confirm on the row.
+        CHECK(page->body.find("hx-confirm=\"Deny agent enrollment?\"") != std::string::npos);
+        CHECK(page->body.find("Forget") == std::string::npos);
+
+        const std::string base = "/api/settings/pending-agents/" + url_path_segment(id);
+        REQUIRE(yuzu::test::has_url(urls, base + "/approve"));
+        REQUIRE(yuzu::test::has_url(urls, base + "/deny"));
+        for (const auto& u : urls) {
+            CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+            if (u.rfind("/api/settings/pending-agents/", 0) == 0)
+                CHECK(yuzu::test::path_slashes(u) == 5); // /api/settings/pending-agents/<seg>/<verb>
+        }
+
+        // Follow the rendered Approve URL the way the server's router does: decode, then match.
+        // (TestRouteSink re-splits a decoded '?' as a query, which httplib does not do, so
+        // ids carrying '?' are covered by the structural checks above only.)
+        const auto decoded = yuzu::test::pct_decode(base + "/approve");
+        if (decoded.find('?') != std::string::npos)
+            continue;
+        auto res = h.sink.Post(decoded, "", kForm);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.status_of(id) == auth::PendingStatus::approved);
+        CHECK(h.status_of("bystander") == auth::PendingStatus::pending);
+        CHECK(h.only("enrollment.approve").target_id == id);
+    }
+}
+
+TEST_CASE("settings pending: an empty-looking dot-only agent id gets no row action, and the API "
+          "refuses it",
+          "[pg][settings_routes][enrollment][url_path_segment]") {
+    EnrollRoutesHarness h;
+    h.queue(".");
+    h.queue("..");
+    h.queue("%2e%2e");
+    h.queue("normal");
+
+    auto page = h.sink.Get("/fragments/settings/pending");
+    REQUIRE(page);
+    const auto urls = yuzu::test::url_attr_values(page->body);
+    CHECK(yuzu::test::has_url(urls, "/api/settings/pending-agents/normal/approve"));
+    for (const auto& u : urls) {
+        CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
+        CHECK(u.find("pending-agents/./") == std::string::npos);
+        CHECK(u.find("pending-agents/../") == std::string::npos);
+    }
+    CHECK(page->body.find("identifier not supported for row actions") != std::string::npos);
+
+    // A direct API call carrying a dot-only id is a 400 and an audited denial, never a store hit.
+    for (const std::string seg : {".", "..", "%2e%2e"}) {
+        h.audit_calls.clear();
+        auto a = h.sink.Post("/api/settings/pending-agents/" + seg + "/approve", "", kForm);
+        REQUIRE(a);
+        CHECK(a->status == 400);
+        CHECK(h.only("enrollment.approve").result == "denied");
+        auto d = h.sink.Post("/api/settings/pending-agents/" + seg + "/deny", "", kForm);
+        REQUIRE(d);
+        CHECK(d->status == 400);
+        CHECK(h.only("enrollment.deny").result == "denied");
+        auto r = h.sink.Delete("/api/settings/pending-agents/" + seg);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(h.only("enrollment.remove").result == "denied");
+        CHECK(h.status_of(seg) == auth::PendingStatus::pending);
     }
 }
 

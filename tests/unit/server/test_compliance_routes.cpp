@@ -361,6 +361,22 @@ TEST_CASE("/fragments/compliance/{policy_id}: an ordinary session reaches the de
     }
 }
 
+TEST_CASE("/fragments/compliance/{policy_id}: ids with '.', '_' and '-' anywhere reach the "
+          "detail handler",
+          "[compliance][url_path_segment]") {
+    // Every id the create check allows ([A-Za-z0-9._-]{1,128}) must be openable from its
+    // View link, including ones that start with '.' or '-'.
+    for (const std::string id : {"pol.one_2", ".hidden", "-lead", "a..b", "v1.2.3"}) {
+        INFO("id=" << id);
+        ComplianceHarness h{nullptr, true, empty_seam()};
+        auto res = h.sink.Get("/fragments/compliance/" + id);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("No compliance data yet") != std::string::npos);
+        CHECK(h.fleet_read_calls == 1);
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // #4034 — GET /api/v1/compliance* + /api/v1/polic* REST v1 twins. The
 // harness's `policy_store` is always nullptr (matching the pre-existing

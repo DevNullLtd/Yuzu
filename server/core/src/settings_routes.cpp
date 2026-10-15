@@ -5,6 +5,7 @@
 #include "settings_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "cert_upload_files.hpp"
 #include "ota_signature_sidecar.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
 #include "rollout_pct_reject.hpp" // the shared malformed-rollout_pct 400 + toast
@@ -23,6 +24,7 @@
 #include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
 #include "directory_sync.hpp"   // access-review read-model optional email enrichment
 #include "http_route_sink.hpp"
+#include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
@@ -32,6 +34,7 @@
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
+#include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
@@ -1960,17 +1963,25 @@ std::string SettingsRoutes::render_pending_fragment() {
                     "</span></td>"
                     "<td>";
 
-            if (a.status == auth::PendingStatus::pending) {
+            if (a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id)) {
+                // The id is empty, `.` or `..`: a browser collapses a dot-only
+                // path segment, so no per-row URL can be built for it. Offer no
+                // row action (the bulk buttons below act on the whole queue and show for it).
+                html += "<span class=\"muted\">identifier not supported for row actions</span>";
+            } else if (a.status == auth::PendingStatus::pending) {
+                // The id is agent-supplied: percent-encode it as ONE path segment
+                // (html_escape alone leaves `/`, `?`, `#` and `.` live in the URL).
+                const std::string seg = url_path_segment(a.agent_id);
                 html += "<button class=\"btn btn-primary\" "
                         "style=\"margin-right:0.3rem\" "
                         "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
+                        seg +
                         "/approve\" "
                         "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
                         ">Approve</button>"
                         "<button class=\"btn btn-danger\" "
                         "hx-post=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
+                        seg +
                         "/deny\" "
                         "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Deny agent enrollment?\""
@@ -1996,7 +2007,13 @@ std::string SettingsRoutes::render_pending_fragment() {
     auto pending_count = std::count_if(agents.begin(), agents.end(), [](const auto& a) {
         return a.status == auth::PendingStatus::pending;
     });
-    if (pending_count > 1) {
+    // The bulk bar also shows for a lone pending row whose id cannot be addressed
+    // per-row, so such a row is never left with no action at all.
+    const bool has_unaddressable_pending =
+        std::any_of(agents.begin(), agents.end(), [](const auto& a) {
+            return a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id);
+        });
+    if (pending_count > 1 || (pending_count == 1 && has_unaddressable_pending)) {
         html += "<div style=\"margin-top:0.75rem;display:flex;gap:0.5rem\">"
                 "<button class=\"btn btn-primary\" "
                 "onclick=\"twoClickConfirm(this, function() { "
@@ -2362,6 +2379,49 @@ std::string SettingsRoutes::render_updates_fragment() {
                                 ? std::to_string(pkg.file_size / 1024) + " KB"
                                 : std::to_string(pkg.file_size / (1024 * 1024)) + " MB";
 
+            // platform/arch/version are operator-uploaded path segments: encode
+            // each, and offer no rollout/delete URL when one is empty or only
+            // `.`/`..` (a browser collapses a dot segment).
+            const bool pkg_actionable = path_segment_ok(pkg.platform) &&
+                                        path_segment_ok(pkg.arch) && path_segment_ok(pkg.version);
+            std::string rollout_cell;
+            std::string delete_cell;
+            if (pkg_actionable) {
+                const std::string pkg_path = url_path_segment(pkg.platform) + "/" +
+                                             url_path_segment(pkg.arch) + "/" +
+                                             url_path_segment(pkg.version);
+                rollout_cell =
+                    "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
+                    "hx-post=\"/api/settings/updates/" +
+                    pkg_path +
+                    "/rollout\" "
+                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
+                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
+                    "value=\"" +
+                    std::to_string(pkg.rollout_pct) +
+                    "\" "
+                    "style=\"width:60px\" "
+                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
+                    "<span style=\"width:2.5em\">" +
+                    std::to_string(pkg.rollout_pct) +
+                    "%</span>"
+                    "<button class=\"btn btn-secondary\" type=\"submit\">Set</button>"
+                    "</form>";
+                delete_cell = "<button class=\"btn btn-danger\" "
+                              "hx-delete=\"/api/settings/updates/" +
+                              pkg_path +
+                              "\" "
+                              "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                              "hx-confirm=\"Delete update package " +
+                              html_escape(pkg.version) + " for " + html_escape(pkg.platform) +
+                              "/" + html_escape(pkg.arch) +
+                              "?\""
+                              ">Delete</button>";
+            } else {
+                rollout_cell = delete_cell =
+                    "<span class=\"muted\">identifier not supported for actions</span>";
+            }
+
             html += "<tr>"
                     "<td>" +
                     html_escape(pkg.platform) +
@@ -2416,38 +2476,14 @@ std::string SettingsRoutes::render_updates_fragment() {
                                        "--update-require-signature will refuse this "
                                        "package.\">unsigned</span>")) +
                     "</td>"
-                    "<td>"
-                    "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
-                    "hx-post=\"/api/settings/updates/" +
-                    html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "/" +
-                    html_escape(pkg.version) +
-                    "/rollout\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
-                    "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
-                    "value=\"" +
-                    std::to_string(pkg.rollout_pct) +
-                    "\" "
-                    "style=\"width:60px\" "
-                    "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
-                    "<span style=\"width:2.5em\">" +
-                    std::to_string(pkg.rollout_pct) +
-                    "%</span>"
-                    "<button class=\"btn btn-secondary\" type=\"submit\">Set</button>"
-                    "</form></td>"
+                    "<td>" +
+                    rollout_cell +
+                    "</td>"
                     "<td>" +
                     std::string(pkg.mandatory ? "Yes" : "No") +
                     "</td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "hx-delete=\"/api/settings/updates/" +
-                    html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "/" +
-                    html_escape(pkg.version) +
-                    "\" "
-                    "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Delete update package " +
-                    html_escape(pkg.version) + " for " + html_escape(pkg.platform) + "/" +
-                    html_escape(pkg.arch) +
-                    "?\""
-                    ">Delete</button></td></tr>";
+                    "<td>" +
+                    delete_cell + "</td></tr>";
         }
     }
 
@@ -2510,86 +2546,16 @@ std::string SettingsRoutes::render_updates_fragment() {
 std::string SettingsRoutes::render_gateway_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/gateway formats the SAME
     // JSON as its response body instead of re-deriving these fields.
+    // The markup lives in integrations_render.cpp (pure, on yuzu.css classes) so this
+    // fragment looks the same on /settings/integrations and on the monolith.
     auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
     const auto v = settings_model::build_gateway_settings(*cfg_, gateway_enabled_, count);
-    bool enabled = v.at("enabled").get<bool>();
-    std::string status_cls = enabled ? "role-badge role-ok" : "role-badge";
-    std::string status_text = enabled ? "Enabled" : "Disabled";
-
-    std::string html;
-
-    html += "<div class=\"form-row\">"
-            "  <label>Upstream Service</label>"
-            "  <span class=\"" + status_cls + "\">" + status_text +
-            "</span>"
-            "</div>";
-
-    if (enabled) {
-        html += "<div class=\"form-row\">"
-                "  <label>Listen Address</label>"
-                "  <code>" +
-                html_escape(v.at("listen_address").get<std::string>()) +
-                "</code>"
-                "</div>";
-
-        const bool gw_mode = v.at("gateway_mode").get<bool>();
-        html += "<div class=\"form-row\">"
-                "  <label>Gateway Mode</label>"
-                "  <span class=\"" +
-                std::string(gw_mode ? "role-badge role-ok" : "role-badge") + "\">" +
-                (gw_mode ? "Active" : "Inactive") +
-                "</span>"
-                "</div>";
-
-        auto shown_count = v.at("active_sessions").get<std::int64_t>();
-        html += "<div class=\"form-row\">"
-                "  <label>Active Sessions</label>"
-                "  <span>" +
-                std::to_string(shown_count) + " agent" + (shown_count != 1 ? "s" : "") +
-                " via gateway</span>"
-                "</div>";
-    } else {
-        html += "<p class=\"section-note\">"
-                "The gateway upstream service is not running. Start the server with "
-                "<code>--gateway-upstream 0.0.0.0:50055</code> to enable it. The service "
-                "requires an authorized gateway peer: pin the gateway's key with "
-                "<code>--gateway-peer-pin</code> or <code>--gateway-peer-pin-file</code> "
-                "(automatic on the built-in default certificates), or, on a plaintext "
-                "development rig only, acknowledge that peer authorization is disabled with "
-                "<code>--insecure-gateway-peer</code>. Without one of these the server "
-                "refuses to start. Pins are read once at boot; changing them needs a restart.</p>";
-    }
-
-    html += "<div style=\"margin-top:1rem;padding-top:0.75rem;border-top:1px solid var(--line)\">"
-            "<div class=\"sub-head\" style=\"margin-top:0\">"
-            "Erlang gateway environment variables</div>"
-            "<table class=\"user-table\">"
-            "<thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead>"
-            "<tbody>"
-            "<tr><td><code>YUZU_GW_UPSTREAM_ADDR</code></td>"
-            "    <td>C++ server hostname</td><td><code>127.0.0.1</code></td></tr>"
-            "<tr><td><code>YUZU_GW_UPSTREAM_PORT</code></td>"
-            "    <td>C++ server port</td><td><code>50055</code></td></tr>"
-            "<tr><td><code>YUZU_GW_AGENT_PORT</code></td>"
-            "    <td>Agent-facing listener port</td><td><code>50051</code></td></tr>"
-            "<tr><td><code>YUZU_GW_MGMT_PORT</code></td>"
-            "    <td>Management listener port</td><td><code>50052</code></td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_ENABLED</code></td>"
-            "    <td>TLS master switch</td><td><code>auto</code></td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_CERTFILE</code></td>"
-            "    <td>Gateway certificate path</td><td>&mdash;</td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_KEYFILE</code></td>"
-            "    <td>Gateway private key path</td><td>&mdash;</td></tr>"
-            "<tr><td><code>YUZU_GW_TLS_CACERTFILE</code></td>"
-            "    <td>CA certificate bundle</td><td>&mdash;</td></tr>"
-            "<tr><td><code>YUZU_GW_PROMETHEUS_PORT</code></td>"
-            "    <td>Prometheus metrics port</td><td><code>9568</code></td></tr>"
-            "<tr><td><code>YUZU_GW_HEALTH_PORT</code></td>"
-            "    <td>Health endpoint port</td><td><code>8080</code></td></tr>"
-            "</tbody></table>"
-            "</div>";
-
-    return html;
+    integrations::GatewayView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.listen_address = v.at("listen_address").get<std::string>();
+    view.gateway_mode = v.at("gateway_mode").get<bool>();
+    view.active_sessions = v.at("active_sessions").get<std::int64_t>();
+    return integrations::render_gateway_panel(view);
 }
 
 std::string SettingsRoutes::render_https_fragment() {
@@ -2914,81 +2880,13 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
 std::string SettingsRoutes::render_mcp_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/mcp formats the SAME
     // JSON as its response body instead of re-deriving these fields.
+    // Markup and the form's one-value-per-field encoding: integrations_render.cpp.
     const auto v = settings_model::build_mcp_settings(*cfg_);
-
-    std::string html;
-    bool mcp_enabled = v.at("enabled").get<bool>();
-
-    std::string status_cls = mcp_enabled ? "role-badge role-ok" : "role-badge";
-    std::string status_text = mcp_enabled ? "Enabled" : "Disabled";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Status</label>"
-            "  <span class=\"" + status_cls + "\">" + status_text +
-            "</span>"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Endpoint</label>"
-            "  <code>POST /mcp/v1/</code>"
-            "</div>";
-
-    std::string enabled_checked = mcp_enabled ? " checked" : "";
-    html += "<form hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\" hx-swap=\"innerHTML\">"
-            "<div class=\"form-row\">"
-            "  <label>MCP Enabled</label>"
-            "  <label class=\"toggle\">"
-            "    <input type=\"hidden\" name=\"enabled\" value=\"false\">"
-            "    <input type=\"checkbox\" name=\"enabled\" value=\"true\"" +
-            enabled_checked +
-            " hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\""
-            " hx-swap=\"innerHTML\" hx-include=\"closest form\">"
-            "    <span class=\"slider\"></span>"
-            "  </label>"
-            "</div>";
-
-    const bool mcp_read_only = v.at("read_only").get<bool>();
-    std::string readonly_checked = mcp_read_only ? " checked" : "";
-    std::string readonly_cls = mcp_read_only ? "role-badge role-warn" : "role-badge";
-    std::string readonly_text = mcp_read_only ? "Read-Only" : "Full Access";
-    html += "<div class=\"form-row\">"
-            "  <label>Access Mode</label>"
-            "  <label class=\"toggle\">"
-            "    <input type=\"hidden\" name=\"read_only\" value=\"false\">"
-            "    <input type=\"checkbox\" name=\"read_only\" value=\"true\"" +
-            readonly_checked +
-            " hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\""
-            " hx-swap=\"innerHTML\" hx-include=\"closest form\">"
-            "    <span class=\"slider\"></span>"
-            "  </label>"
-            "  <span class=\"" +
-            readonly_cls + "\">" + readonly_text +
-            "</span>"
-            "</div>";
-
-    html += "</form>";
-
-    html += "<p class=\"section-note\">"
-            "MCP authentication uses API Tokens with an MCP tier. "
-            "Create tokens in the <strong>API Tokens</strong> section above — "
-            "select an MCP tier (readonly, operator, or supervised) from the dropdown."
-            "</p>";
-
-    std::string url = v.at("endpoint_url").get<std::string>();
-
-    html += "<div class=\"note\" style=\"margin-top:0.75rem\">"
-            "  <div class=\"sub-head\" style=\"margin-top:0\">MCP client connection</div>"
-            "  <div style=\"margin-bottom:0.3rem\">"
-            "    Endpoint: <code>" +
-            html_escape(url) +
-            "</code></div>"
-            "  <div class=\"hint\">"
-            "    Transport: HTTP + JSON-RPC 2.0 &nbsp;|&nbsp; "
-            "    Auth: <code>Authorization: Bearer &lt;mcp-token&gt;</code>"
-            "  </div>"
-            "</div>";
-
-    return html;
+    integrations::McpView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.read_only = v.at("read_only").get<bool>();
+    view.endpoint_url = v.at("endpoint_url").get<std::string>();
+    return integrations::render_mcp_panel(view);
 }
 
 std::string SettingsRoutes::render_nvd_fragment() {
@@ -4502,9 +4400,9 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto cert_dir = auth::default_cert_dir();
+        auto cert_dir = cert_dir_override_.empty() ? auth::default_cert_dir() : cert_dir_override_;
         std::error_code ec;
-        std::filesystem::create_directories(cert_dir, ec);
+        cert_upload::create_cert_dir(cert_dir, ec);
         if (ec) {
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot create cert directory.</span>",
@@ -4527,15 +4425,12 @@ void SettingsRoutes::register_routes(
         }
 
         auto out_path = cert_dir / out_name;
-        {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.upload", "failure", "Certificate", type, "write failed");
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
 
         if (type == "cert")
@@ -4544,14 +4439,6 @@ void SettingsRoutes::register_routes(
             cfg_->tls_server_key = out_path;
         else if (type == "ca")
             cfg_->tls_ca_cert = out_path;
-
-#ifndef _WIN32
-        if (type == "key") {
-            std::filesystem::permissions(
-                out_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                std::filesystem::perm_options::replace);
-        }
-#endif
 
         spdlog::info("Certificate uploaded: {} -> {}", type, out_path.string());
         audit_fn_(req, "cert.upload", "success", "Certificate", type, "");
@@ -4616,9 +4503,9 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto cert_dir = auth::default_cert_dir();
+        auto cert_dir = cert_dir_override_.empty() ? auth::default_cert_dir() : cert_dir_override_;
         std::error_code ec;
-        std::filesystem::create_directories(cert_dir, ec);
+        cert_upload::create_cert_dir(cert_dir, ec);
         if (ec) {
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Cannot create cert directory.</span>",
@@ -4627,24 +4514,13 @@ void SettingsRoutes::register_routes(
         }
 
         auto out_path = cert_dir / out_name;
-        {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!cert_upload::write_cert_file(cert_dir, out_name, type == "key", content)) {
+            audit_fn_(req, "cert.paste", "failure", "Certificate", type, "write failed");
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
-
-#ifndef _WIN32
-        if (type == "key") {
-            std::filesystem::permissions(
-                out_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                std::filesystem::perm_options::replace);
-        }
-#endif
 
         if (type == "cert")
             cfg_->tls_server_cert = out_path;
@@ -4667,6 +4543,26 @@ void SettingsRoutes::register_routes(
     sink.Post("/api/settings/oidc", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        // admin_fn_ admits a JIT-elevated session, but the sign-in provider (issuer, client,
+        // admin group) decides who becomes a STANDING administrator at the next SSO login, so
+        // an elevated session must not change it. Same own-role rule as the role-change route.
+        const auto caller = auth_fn_(req, res);
+        if (!caller) {
+            res.status = 401;
+            return;
+        }
+        if (caller->role != auth::Role::admin) {
+            audit_fn_(req, "oidc.configure", "denied", "OidcConfig", "",
+                      "elevated_session_oidc_change_blocked");
+            res.status = 403;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Changing sign-in provider settings needs your own administrator role, not an elevation","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Changing sign-in provider settings needs your "
+                                                  "own administrator role, not a temporary "
+                                                  "elevation"),
+                            "application/json");
+            return;
+        }
 
         auto issuer = extract_form_value(req.body, "issuer");
         auto client_id = extract_form_value(req.body, "client_id");
@@ -5383,6 +5279,24 @@ void SettingsRoutes::register_routes(
         auto session = auth_fn_(req, res);
         if (!session) {
             res.status = 401;
+            return;
+        }
+        // admin_fn_ admits a JIT-elevated session (effective_role). An elevation is temporary
+        // authority, and an account role is a STANDING grant: letting an elevated `user`
+        // change an account's role would turn the elevation into a durable administrator that
+        // outlives the window (the same principle as rbac_admin_predicate.hpp, decision 1).
+        // Require the session's own role (`session->role`, not `effective_role`): a local
+        // account's role, or the IdP-mapped role of an SSO session. Sessions are wiped on a
+        // role change, which bounds how stale that cached role can be.
+        if (session->role != auth::Role::admin) {
+            audit_fn_(req, "user.role_change", "denied", "User", req.matches[1].str(),
+                      "elevated_session_role_change_blocked");
+            res.status = 403;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Changing an account role needs your own administrator role, not an elevation","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Changing an account role needs your own "
+                                                  "administrator role, not a temporary elevation"),
+                            "application/json");
             return;
         }
         // PR2 — MFA step-up gate. Role changes promote/demote a
@@ -6127,13 +6041,33 @@ void SettingsRoutes::register_routes(
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
+    // A pending-agent id that is empty, `.` or `..` can never be addressed by a
+    // browser-built URL (dot segments collapse), so an API call carrying one is
+    // refused outright rather than matched against the store.
+    auto refuse_unaddressable_agent_id = [this](const httplib::Request& req,
+                                                httplib::Response& res, const char* verb,
+                                                const std::string& agent_id,
+                                                const std::string& by) -> bool {
+        if (path_segment_ok(agent_id))
+            return false;
+        audit_fn_(req, verb, "denied", "Agent", agent_id, "invalid_agent_id by=" + by);
+        res.status = 400;
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"Invalid agent id","level":"error"}})");
+        res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+        return true;
+    };
+
     sink.Post(R"(/api/settings/pending-agents/(.+)/approve)",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
                   auto session = auth_fn_(req, res);
                   if (!session)
+                      return;
+                  if (refuse_unaddressable_agent_id(req, res, "enrollment.approve", agent_id,
+                                                    session->username))
                       return;
                   auto approved = auth_mgr_->approve_pending_agent(agent_id, session->username);
                   if (!approved) {
@@ -6158,12 +6092,15 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post(R"(/api/settings/pending-agents/(.+)/deny)",
-              [this](const httplib::Request& req, httplib::Response& res) {
+              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto agent_id = req.matches[1].str();
                   auto session = auth_fn_(req, res);
                   if (!session)
+                      return;
+                  if (refuse_unaddressable_agent_id(req, res, "enrollment.deny", agent_id,
+                                                    session->username))
                       return;
                   auto denied = auth_mgr_->deny_pending_agent(agent_id, session->username);
                   if (!denied) {
@@ -6188,12 +6125,15 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Delete(R"(/api/settings/pending-agents/(.+))",
-                [this](const httplib::Request& req, httplib::Response& res) {
+                [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
                     auto agent_id = req.matches[1].str();
                     auto session = auth_fn_(req, res);
                     if (!session)
+                        return;
+                    if (refuse_unaddressable_agent_id(req, res, "enrollment.remove", agent_id,
+                                                      session->username))
                         return;
                     auto removed = auth_mgr_->remove_pending_agent(agent_id);
                     if (!removed) {
@@ -6526,18 +6466,49 @@ void SettingsRoutes::register_routes(
         });
 
     // -- Settings API: MCP toggle (HTMX POST) ---------------------------------
+    // The body is parsed at a key boundary and must carry exactly one `enabled` and one
+    // `read_only`, each `true` or `false` (integrations_render.cpp). The earlier first-match
+    // read treated an absent field as false, so a partial body switched MCP off or flipped
+    // Read-only to Full access. Nothing changes on a refused body.
     sink.Post("/api/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        auto enabled_val = extract_form_value(req.body, "enabled");
-        auto read_only_val = extract_form_value(req.body, "read_only");
-        cfg_->mcp_disable = (enabled_val != "true");
-        cfg_->mcp_read_only = (read_only_val == "true");
+        // Same-site gate for a cookie-authorised write: unlike origin_safe above, a header-less
+        // cookie request is refused (browsers always send an Origin on a write); token callers
+        // are exempt.
+        const auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"),
+                                        cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
+                                             : std::span<const std::string>{})) {
+            audit_fn_(req, "csrf.denied", "denied", "Endpoint", "/api/settings/mcp",
+                      "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"),
+                            "application/json");
+            return;
+        }
+        const auto form = integrations::parse_mcp_form(req.body);
+        if (!form) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, form.error()), "application/json");
+            return;
+        }
+        const std::string requested =
+            "enabled=" + std::string(form->enabled ? "true" : "false") +
+            ", read_only=" + std::string(form->read_only ? "true" : "false");
+        // Audit-first (ADR-0033 section 9): no `attempted` row, no change to the MCP switches.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "settings.mcp", "MCP",
+                                     "mcp_settings", requested))
+            return;
+        cfg_->mcp_disable = !form->enabled;
+        cfg_->mcp_read_only = form->read_only;
         spdlog::info("MCP settings changed: enabled={}, read_only={}", !cfg_->mcp_disable,
                      cfg_->mcp_read_only);
-        audit_fn_(req, "settings.mcp", "success", "MCP", "mcp_settings",
-                  "enabled=" + std::string(!cfg_->mcp_disable ? "true" : "false") +
-                      ", read_only=" + std::string(cfg_->mcp_read_only ? "true" : "false"));
+        audit_fn_(req, "settings.mcp", "success", "MCP", "mcp_settings", requested);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"MCP settings saved","level":"success"}})");
         res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");

@@ -1,9 +1,14 @@
 #include "webhook_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "outbound_url_policy.hpp"
+
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
 
 #include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <stdexcept>
 
 namespace yuzu::server {
 
@@ -29,7 +34,8 @@ std::string_view audit_detail_for(WebhookWriteError err) {
 }
 
 void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::AuditFn audit_fn,
-          WebhookRoutes::EmitEventFn emit_event_fn, WebhookStore* webhook_store) {
+          WebhookRoutes::EmitEventFn emit_event_fn, WebhookStore* webhook_store,
+          WriteGate write_gate) {
     // GET /api/webhooks — list all webhooks
     sink.Get("/api/webhooks",
             [perm_fn, webhook_store](const httplib::Request& req, httplib::Response& res) {
@@ -69,9 +75,11 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
 
     // POST /api/webhooks — create a new webhook
     sink.Post("/api/webhooks",
-             [perm_fn, audit_fn, emit_event_fn, webhook_store](const httplib::Request& req,
-                                                                httplib::Response& res) {
+             [perm_fn, audit_fn, emit_event_fn, webhook_store,
+              write_gate](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Write"))
+                     return;
+                 if (write_gate.refuse_cross_site(audit_fn, req, res, "/api/webhooks"))
                      return;
                  if (!webhook_store || !webhook_store->is_open()) {
                      res.status = 503;
@@ -83,14 +91,14 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  try {
                      body = nlohmann::json::parse(req.body);
                  } catch (...) {
-                     audit_fn(req, "webhook.create", "failure", "webhook", "", "invalid_json");
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "failure", "webhook", "", "invalid_json");
                      res.status = 400;
                      res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                      return;
                  }
                  auto url = body.value("url", "");
                  if (url.empty()) {
-                     audit_fn(req, "webhook.create", "failure", "webhook", "", "url_required");
+                     (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "failure", "webhook", "", "url_required");
                      res.status = 400;
                      res.set_content(detail::a4_error(res, "url is required"), "application/json");
                      return;
@@ -99,17 +107,25 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  auto secret = body.value("secret", "");
                  auto enabled = body.value("enabled", true);
 
+                 // Audit-first (ADR-0033 section 9): no `attempted` row, no webhook.
+                 if (!detail::audit_attempted(audit_fn, req, res, "webhook.create", "webhook", "",
+                                              url_audit_detail(url)))
+                     return;
                  auto result = webhook_store->create_webhook(url, event_types, secret, enabled);
                  if (!result) {
                      // #3097 classification: caller error (bad URL) is 400,
                      // never conflated with a store/DB degradation (503).
                      if (result.error() == WebhookWriteError::invalid_url) {
-                         audit_fn(req, "webhook.create", "failure", "webhook", "", "invalid_url");
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "failure", "webhook", "", "invalid_url");
                          res.status = 400;
-                         res.set_content(detail::a4_error(res, "url must be http:// or https://"),
-                                         "application/json");
+                         res.set_content(
+                             detail::a4_error(res, "url must be http:// or https:// without "
+                                                   "embedded credentials, and url and "
+                                                   "event_types must not contain control "
+                                                   "characters"),
+                             "application/json");
                      } else {
-                         audit_fn(req, "webhook.create", "failure", "webhook", "",
+                         (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create", "failure", "webhook", "",
                                   std::string(audit_detail_for(result.error())));
                          res.status = 503;
                          res.set_content(detail::a4_error(res, "webhook store unavailable"),
@@ -118,17 +134,21 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                      return;
                  }
                  const auto id = *result;
-                 // gov Gate 2 security-guardian / Gate 4 consistency-auditor
-                 // (PR #3563 full-PR review): record the URL in the audit
-                 // detail, not just the id — a compromise-and-cleanup
-                 // attacker who creates a webhook, exfiltrates data to it,
-                 // then deletes it must not be able to erase every durable
-                 // record of WHERE the data went. Matches the sibling
-                 // hardening already applied to `offload_routes.cpp`.
-                 audit_fn(req, "webhook.create", "success", "webhook", std::to_string(id), url);
+                 // The analytics event carries scheme+host only: a Slack-style
+                 // URL path is a bearer secret and the stream can leave the host.
+                 // The audit row follows the same rule (scheme+host plus a
+                 // fingerprint). It records WHERE the
+                 // data goes, not just the id (PR #3563 review): a
+                 // compromise-and-cleanup attacker who creates a webhook,
+                 // exfiltrates to it, then deletes it must not be able to
+                 // erase every durable record of the destination. Matches
+                 // the hardening in `offload_routes.cpp`.
+                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.create",
+                                                     "success", "webhook", std::to_string(id),
+                                                     url_audit_detail(url));
                  if (emit_event_fn)
                      emit_event_fn("webhook.created", req, {},
-                                   {{"webhook_id", id}, {"url", url}});
+                                   {{"webhook_id", id}, {"url", url_scheme_host(url)}});
                  res.set_content(
                      nlohmann::json({{"id", id}, {"status", "created"}}).dump(),
                      "application/json");
@@ -136,9 +156,11 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
 
     // DELETE /api/webhooks/:id — delete a webhook
     sink.Delete(R"(/api/webhooks/(\d+))",
-               [perm_fn, audit_fn, webhook_store](const httplib::Request& req,
-                                                   httplib::Response& res) {
+               [perm_fn, audit_fn, webhook_store, write_gate](const httplib::Request& req,
+                                                                   httplib::Response& res) {
                    if (!perm_fn(req, res, "Infrastructure", "Write"))
+                       return;
+                   if (write_gate.refuse_cross_site(audit_fn, req, res, "/api/webhooks/{id}"))
                        return;
                    if (!webhook_store) {
                        res.status = 503;
@@ -146,20 +168,20 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                                        "application/json");
                        return;
                    }
-                   // A 21-digit `(\d+)` id made `stoll` throw (500): not representable => 404.
-                   // Audited like an absent id: a delete attempt on this surface leaves a row
-                   // whichever way it fails. The id is digits only (the route regex) and capped.
-                   const auto id_parsed =
-                       yuzu::server::parse_query_int<long long>(req.matches[1].str());
-                   if (!id_parsed) {
-                       audit_fn(req, "webhook.delete", "failure", "webhook",
-                                req.matches[1].str().substr(0, 32), "id_not_representable");
+                   std::int64_t id = 0;
+                   try {
+                       id = std::stoll(req.matches[1].str());
+                   } catch (const std::out_of_range&) { // names no webhook: nothing to delete
+                       // Audited like the in-range not-found below (and the offload twin), so
+                       // probing with absurd ids is visible; the id is digits only (route regex).
+                       (void)detail::emit_behavioral_audit(
+                           audit_fn, req, res, "webhook.delete", "failure", "webhook",
+                           req.matches[1].str().substr(0, 40), "not_found");
                        res.status = 404;
                        res.set_content(detail::a4_error(res, "webhook not found"),
                                        "application/json");
                        return;
                    }
-                   const auto id = *id_parsed;
                    // gov Gate 2/4/5 (PR #3563 full-PR review): snapshot the
                    // URL BEFORE deleting — matches `offload_routes.cpp`'s
                    // existing "compliance F-3" hardening for the identical
@@ -169,12 +191,17 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                    // OR a transient read failure) just means the audit
                    // detail stays empty, not that the delete is refused.
                    auto snapshot = webhook_store->get(id);
+                   const std::string snapshot_detail =
+                       snapshot ? url_audit_detail(snapshot->url) : "";
+                   if (!detail::audit_attempted(audit_fn, req, res, "webhook.delete", "webhook",
+                                                std::to_string(id), snapshot_detail))
+                       return;
                    auto result = webhook_store->delete_webhook(id);
                    if (!result) {
                        // #3097 classification: a query failure against an
                        // open store is 503, distinct from the plain
                        // not-found case below (never conflated).
-                       audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
+                       (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.delete", "failure", "webhook", std::to_string(id),
                                 std::string(audit_detail_for(result.error())));
                        res.status = 503;
                        res.set_content(detail::a4_error(res, "webhook store unavailable"),
@@ -182,11 +209,12 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                        return;
                    }
                    if (*result) {
-                       audit_fn(req, "webhook.delete", "success", "webhook", std::to_string(id),
-                                snapshot ? snapshot->url : "");
+                       (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.delete",
+                                                           "success", "webhook",
+                                                           std::to_string(id), snapshot_detail);
                        res.set_content(R"({"status":"deleted"})", "application/json");
                    } else {
-                       audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
+                       (void)detail::emit_behavioral_audit(audit_fn, req, res, "webhook.delete", "failure", "webhook", std::to_string(id),
                                 "not_found");
                        res.status = 404;
                        res.set_content(detail::a4_error(res, "webhook not found"),
@@ -205,14 +233,15 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                                     "application/json");
                     return;
                 }
-                const auto webhook_id_parsed =
-                    yuzu::server::parse_query_int<long long>(req.matches[1].str());
-                if (!webhook_id_parsed) {
+                std::int64_t webhook_id = 0;
+                try {
+                    webhook_id = std::stoll(req.matches[1].str());
+                } catch (const std::out_of_range&) { // names no webhook
                     res.status = 404;
-                    res.set_content(detail::a4_error(res, "webhook not found"), "application/json");
+                    res.set_content(detail::a4_error(res, "webhook not found"),
+                                    "application/json");
                     return;
                 }
-                const auto webhook_id = *webhook_id_parsed;
                 int limit = 50;
                 auto limit_str = req.get_param_value("limit");
                 if (req.has_param("limit")) {
@@ -245,15 +274,17 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
 
 void WebhookRoutes::register_routes(httplib::Server& svr, AuthFn /*auth_fn*/, PermFn perm_fn,
                                     AuditFn audit_fn, EmitEventFn emit_event_fn,
-                                    WebhookStore* webhook_store) {
+                                    WebhookStore* webhook_store, WriteGate write_gate) {
     HttplibRouteSink sink(svr);
-    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store);
+    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store,
+          std::move(write_gate));
 }
 
 void WebhookRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn perm_fn,
                                     AuditFn audit_fn, EmitEventFn emit_event_fn,
-                                    WebhookStore* webhook_store) {
-    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store);
+                                    WebhookStore* webhook_store, WriteGate write_gate) {
+    mount(sink, std::move(perm_fn), std::move(audit_fn), std::move(emit_event_fn), webhook_store,
+          std::move(write_gate));
 }
 
 } // namespace yuzu::server

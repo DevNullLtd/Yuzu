@@ -469,6 +469,31 @@ inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 /// hostname-derived or UUID-derived agent_id fits in well under 100 chars.
 inline constexpr std::size_t kMaxAgentIdLength = 256;
 
+/// Charset a NEW agent_id must use at first registration: `[A-Za-z0-9._:-]`,
+/// not made only of dots. The agent daemon generates a UUID v4
+/// (`identity_store.cpp`, hex + `-`); an operator `--agent-id` is typically a
+/// hostname-style name. Anything else (`/ ? # % & space` and so on) never
+/// belongs in a page link or a path-routed API id, and a dot-only id is
+/// collapsed by browsers. Applied ONLY where the store holds no row for the id
+/// yet (`Register`/`ProxyRegister`): an id already enrolled, pending or denied
+/// keeps working unchanged, so no existing agent is locked out; renderers
+/// percent-encode and refuse dot-only ids for those (`url_path_segment`).
+[[nodiscard]] inline bool is_valid_new_agent_id(std::string_view id) noexcept {
+    if (id.empty() || id.size() > kMaxAgentIdLength)
+        return false;
+    bool all_dots = true;
+    for (const char ch : id) {
+        const auto c = static_cast<unsigned char>(ch);
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-';
+        if (!ok)
+            return false;
+        if (c != '.')
+            all_dots = false;
+    }
+    return !all_dots;
+}
+
 /// Maximum length of any free-text field the enrollment/pending store accepts
 /// (label, hostname, os, arch, agent_version, acting principal). The store
 /// REJECTS longer values (`StoreError::InvalidInput`); the Register/ProxyRegister

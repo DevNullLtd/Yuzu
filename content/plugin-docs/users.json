@@ -1290,7 +1290,9 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/5872-integrations-directory-users-total.fixed.md"
+    ],
     "definitions": [
       "content/definitions/users.yaml"
     ],

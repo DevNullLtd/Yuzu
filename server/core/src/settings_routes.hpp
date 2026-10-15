@@ -73,9 +73,10 @@ public:
     /// see `rest_audit.hpp`'s "null/empty audit_fn is not a persistence
     /// failure" contract. Not all 8 sub-areas are wired to it: only the four
     /// judged high/mixed-high sensitivity in #4028's Evidence section
-    /// (tls, https, plugin-signing, analytics) call it; the other four
+    /// (tls, https, plugin-signing, analytics) call it; of the other four
     /// (gateway, server-config, mcp, data-retention — "nothing secret" per
-    /// the same Evidence section) issue no audit call at all, matching the
+    /// the same Evidence section) the READ routes issue no audit call at all (`POST
+    /// /api/settings/mcp` writes its audit-first `attempted` row through it), matching the
     /// unaudited posture the existing `/fragments/settings/*` HTML renderers
     /// for those four already have today.
     using AuditReadFn =
@@ -95,6 +96,10 @@ public:
     /// (so no request can race the set). May stay empty (tests) — the
     /// handlers then persist without the live apply.
     void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
+
+    /// Test seam: directory the cert-upload / cert-paste routes write into.
+    /// Empty (production) = auth::default_cert_dir().
+    void set_cert_dir_for_test(std::filesystem::path dir) { cert_dir_override_ = std::move(dir); }
 
     /// Reads the retention windows the stores actually enforce (the stores copy
     /// their window at construction, so Config can differ). Wired by server.cpp
@@ -296,6 +301,7 @@ private:
     AuditFn audit_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
+    std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()
     RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
     nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
     Config* cfg_{};
