@@ -61,10 +61,11 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     session->agent_version = info.agent_version();
     // Every spdlog call in THIS function prints the claimed id (via safe_agent_id) and any
     // agent-supplied free text (tag key, hostname) or store error text neutralised (CWE-117);
-    // the gateway path reaches here without the direct path's enrollment checks. The removal,
-    // rollback and sweep lines further down print ids read back from the session table: both
-    // callers bound them in length and refused an embedded NUL before this call, but those
-    // lines do not neutralise newline, space or '='.
+    // the gateway path reaches here without the direct path's token checks. Both callers read
+    // the enrollment status first (get_pending_status) and return on error; AuthDB refuses any
+    // id with a control byte or ',' there (agent_id_ok), so the removal, rollback and sweep
+    // lines further down print session-table ids that carry no control byte. Those lines do
+    // not neutralise space or '=', so they are not wrapped.
     const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
     // Ingest filter (#3295): validated and non-service, mirroring TagStore's
     // own sync_agent_tags gate (tag_store.cpp) so a service claim or an
