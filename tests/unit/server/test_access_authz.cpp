@@ -1,7 +1,7 @@
 /**
  * @file test_access_authz.cpp
  * @brief [pg] persona matrix for the Users and roles fragments, driven through the REAL AuthRoutes
- *        gates (require_auth / require_admin / require_permission) over a real RbacStore and
+ *        gates (require_auth / probe_admin / require_permission) over a real RbacStore and
  *        AuditStore. test_access_routes.cpp stubs the gates; this file proves the production
  *        wiring admits and refuses the right callers, with RBAC off (the shipped default) and on.
  *
@@ -85,7 +85,7 @@ struct Rig {
             return ar->require_auth(q, r);
         };
         d.admin_fn = [this](const httplib::Request& q, httplib::Response& r) {
-            return ar->require_admin(q, r);
+            return ar->probe_admin(q, r); // what server.cpp binds: no denial row for a cookie session
         };
         d.perm_fn = [this](const httplib::Request& q, httplib::Response& r, const std::string& t,
                            const std::string& o) { return ar->require_permission(q, r, t, o); };
@@ -180,7 +180,8 @@ TEST_CASE("access authz: a plain user with RBAC off is refused every admin panel
     }
     CHECK(r.user_reads == 0);
     CHECK(r.route_audits.empty()); // no success row for a refused caller
-    CHECK(r.denied_rows() == 4);   // one gate denial per refused fragment
+    // One gate denial per refused fragment, except Users: its admin probe is quiet for a cookie session.
+    CHECK(r.denied_rows() == 3);
 
     // The enforcement state is session-only (its REST twin /api/v1/me), and the switch is not live.
     const auto enf = r.get(kEnforce, c);
@@ -246,7 +247,7 @@ TEST_CASE("access authz: RBAC on, a user with no role gets the loud denial on ev
     CHECK(r.get(kUsers, c)->status == 403);
     CHECK(r.user_reads == 0);
     CHECK(r.route_audits.empty());
-    CHECK(r.denied_rows() == 4);
+    CHECK(r.denied_rows() == 3); // Roles, Role permissions, Role assignments; the Users probe is quiet
 }
 
 TEST_CASE("access authz: RBAC on, an Administrator grant keeps the page usable for the account that flipped it",

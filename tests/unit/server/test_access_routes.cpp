@@ -750,8 +750,8 @@ TEST_CASE("access routes: the wiring in server.cpp uses the checked reads and th
     const auto end = server.find("\n            });", at);
     REQUIRE(end != std::string::npos);
     const std::string blk = server.substr(at, end - at);
-    // The loud account-role gate really is require_admin, not a permissive lambda.
-    CHECK_THAT(blk, ContainsSubstring("return require_admin(req, res);"));
+    // The account-role gate really is the audit-quiet admin probe, not a permissive lambda.
+    CHECK_THAT(blk, ContainsSubstring("return auth_routes_->probe_admin(req, res);"));
     CHECK_THAT(blk, ContainsSubstring("auth_db_->list_users()"));
     CHECK_THAT(blk, ContainsSubstring(".perm_fn = perm_fn"));
     CHECK_THAT(blk, ContainsSubstring("rbac_store_->list_roles_checked()"));
