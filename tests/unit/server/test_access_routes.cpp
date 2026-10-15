@@ -4,13 +4,13 @@
  *        TestRouteSink (no acceptor). Every closure is injected and re-read per call.
  *
  * Pinned, in order of consequence:
- *   - the loud admin gate runs BEFORE the store is read (a denied caller costs no read);
- *   - the page itself makes no gate call (no page-level probe: one denial row per panel,
- *     not an extra one for the page);
+ *   - the admin gate (quiet for cookie sessions) runs BEFORE the store is read (a denied caller costs no read);
+ *   - the page itself makes no gate call (no page-level probe, so the page adds nothing to
+ *     what its panels do);
  *   - a store that did not answer is a 200 red box, never an empty table;
  *   - `oidc:<iss>#<sub>` survives the `?username=` round trip;
  *   - an empty session username is refused, not rendered;
- *   - `register_access_routes` binds the REAL `require_admin` (source scan of server.cpp),
+ *   - `register_access_routes` binds the REAL `probe_admin` (lexical gate over server.cpp),
  *     because every case here stubs the gate and would pass with a permissive lambda.
  */
 

@@ -15512,13 +15512,11 @@ private:
                     q.target_type = "EnginePrincipal";
                     q.target_id = id;
                     q.action = "engine_principal.revoke";
-                    q.limit = yuzu::server::access_tokens::kRevokeHistoryWindow;  // newest first
+                    q.limit = yuzu::server::access_tokens::kRevokeHistoryQueryLimit;  // newest first
                     auto events = audit_store_->query(q);
                     if (!events)
                         return std::unexpected(std::string("audit store did not answer"));
-                    return yuzu::server::access_tokens::RevokeDetail{
-                        yuzu::server::access_tokens::committed_revoke_detail(*events),
-                        static_cast<int>(events->size()) >= q.limit};
+                    return yuzu::server::access_tokens::revoke_detail_from(std::move(*events));
                 },
             });
 

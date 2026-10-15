@@ -69,8 +69,10 @@ struct PageFlags {
 /// from MCP; it is escaped like every other store string.
 [[nodiscard]] std::string committed_revoke_detail(const std::vector<AuditEvent>& newest_first);
 
-/// Newest-first window of `engine_principal.revoke` audit events read for one principal.
+/// Newest-first window of `engine_principal.revoke` audit events read for one principal. The
+/// query asks for one row more (`kRevokeHistoryQueryLimit`) so "more exist" is observable.
 inline constexpr int kRevokeHistoryWindow = 200;
+inline constexpr int kRevokeHistoryQueryLimit = kRevokeHistoryWindow + 1;
 
 /// The original revoke's detail plus whether the window was full (so an older original may
 /// lie beyond it).
@@ -78,6 +80,10 @@ struct RevokeDetail {
     std::string text;
     bool truncated{false};
 };
+
+/// `committed_revoke_detail` over at most `kRevokeHistoryWindow` events, with `truncated` set
+/// when the query returned the extra row (input is newest first, up to the query limit).
+[[nodiscard]] RevokeDetail revoke_detail_from(std::vector<AuditEvent> newest_first);
 
 struct TokensView {
     std::vector<ApiToken> rows;  ///< store order (newest first)

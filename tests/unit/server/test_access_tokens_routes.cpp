@@ -69,10 +69,12 @@ struct Harness {
     // gates
     bool perm_allow{true};
     std::set<std::string> perm_deny;  // "Securable:Op" refused even when perm_allow
+    int deny_status{403};             // status a refusal writes (503 = degraded RBAC read)
     std::vector<std::pair<std::string, std::string>> perm_calls;
     // audit
     bool audit_ok{true};
     std::vector<std::string> audit_actions;
+    std::vector<std::string> audit_details;
     // reads
     std::vector<std::string> token_filters;
     std::expected<std::vector<ApiToken>, std::string> tokens{
@@ -109,13 +111,14 @@ struct Harness {
             perm_calls.emplace_back(t, o);
             if (perm_allow && !perm_deny.contains(t + ":" + o))
                 return true;
-            res.status = 403;
+            res.status = deny_status;
             res.set_content(kDenyBody, "application/json");
             return false;
         };
         d.audit_fn = [this](const httplib::Request&, const std::string& action, const std::string&,
-                            const std::string&, const std::string&, const std::string&) {
+                            const std::string&, const std::string&, const std::string& detail) {
             audit_actions.push_back(action);
+            audit_details.push_back(detail);
             return audit_ok;
         };
         d.rbac_enforced_fn = [] { return false; };
@@ -331,6 +334,8 @@ TEST_CASE("principals routes: the EnginePrincipal:Read gate and the engine/MCP b
             CHECK(h.principal_list_calls == 0);
             CHECK(h.get_calls.empty());
             CHECK(h.audit_actions.size() == 1);  // the denial is recorded
+            CHECK(h.audit_details.at(0) ==
+                  (std::string(shape) == "mcp_tier" ? "mcp_session_denied" : "engine_session_denied"));
         }
     }
 }
@@ -519,6 +524,13 @@ TEST_CASE("principals routes: the audit trail's text and the REST check need Aud
     REQUIRE(res);
     CHECK_THAT(res->body, ContainsSubstring("data-check=\"0\""));
 
+    // A degraded RBAC read is "unavailable", never worded as a missing permission.
+    h.deny_status = 503;
+    res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("(unavailable)"));
+    CHECK_THAT(res->body, !ContainsSubstring("withheld"));
+
     h.perm_deny.clear();
     res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
     REQUIRE(res);
@@ -563,7 +575,7 @@ TEST_CASE("tokens routes: server.cpp binds the quiet probe, rbac view and checke
     CHECK_THAT(blk, ContainsSubstring("list_active_for_principal_checked(id)"));
     CHECK_THAT(blk, ContainsSubstring("list_all_principal_roles_checked()"));
     CHECK_THAT(blk, ContainsSubstring("get_principal_roles_checked(\"engine\", id)"));
-    CHECK_THAT(text.substr(end, 1500), ContainsSubstring("committed_revoke_detail(*events)"));
+    CHECK_THAT(text.substr(end, 1500), ContainsSubstring("revoke_detail_from(std::move(*events))"));
 }
 
 // The fragments are swapped into #tokens-body / #principals-body, so their header and body are

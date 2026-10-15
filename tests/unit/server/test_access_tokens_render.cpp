@@ -477,3 +477,39 @@ TEST_CASE("every store-sourced field is escaped in every cell it reaches",
     t.mcp_tier = kXss;
     CHECK_THAT(render_tokens_list(view({t}), flags()), !ContainsSubstring("<img"));
 }
+
+TEST_CASE("revoke history: truncated only when the query returned the row past the window",
+          "[access-tokens][render]") {
+    AuditEvent ok;
+    ok.result = "success";
+    ok.detail = "newest";
+    // Newest first; the oldest success is the LAST element, so a 201st row would be a different one.
+    for (const std::size_t n : {std::size_t{199}, std::size_t{200}}) {
+        INFO(n);
+        std::vector<AuditEvent> ev(n, ok);
+        ev.back().detail = "oldest-in-window";
+        const auto r = revoke_detail_from(ev);
+        CHECK_FALSE(r.truncated);
+        CHECK(r.text == "oldest-in-window");
+    }
+    std::vector<AuditEvent> over(201, ok);
+    over[199].detail = "oldest-in-window";
+    over[200].detail = "beyond-window";  // dropped: the window is the newest 200
+    const auto r = revoke_detail_from(over);
+    CHECK(r.truncated);
+    CHECK(r.text == "oldest-in-window");
+    CHECK(revoke_detail_from({}).text.empty());
+}
+
+TEST_CASE("principal detail: a full history window with no success is not worded as a success",
+          "[access-tokens][render]") {
+    PrincipalDetail d;
+    d.row = principal("gone", "revoked");
+    d.credentials = std::vector<ApiToken>{};
+    d.roles = std::vector<PrincipalRole>{};
+    d.revoke_detail = std::string{};
+    d.revoke_truncated = true;
+    const auto html = render_principal_detail(d, d.row.principal_id);
+    CHECK_THAT(html, ContainsSubstring("none of the newest 200 succeeded"));
+    CHECK_THAT(html, !ContainsSubstring("oldest success among"));
+}

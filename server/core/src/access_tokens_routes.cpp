@@ -23,10 +23,15 @@ namespace access_tokens {
 namespace {
 
 // A scratch probe of `securable:Read`: the page asks "may this caller see X" to decide what to
-// draw; a refusal is not an error and writes no response.
-bool may_read(const Deps& d, const httplib::Request& req, const char* securable) {
+// draw; a refusal is not an error and writes no response. A 503 (the RBAC read degraded) is
+// reported apart from a refusal so it is never worded as a missing permission.
+enum class Probe { Allowed, Refused, Unavailable };
+
+Probe probe_read(const Deps& d, const httplib::Request& req, const char* securable) {
     httplib::Response scratch;
-    return d.perm_fn(req, scratch, securable, "Read");
+    if (d.perm_fn(req, scratch, securable, "Read"))
+        return Probe::Allowed;
+    return scratch.status == 503 ? Probe::Unavailable : Probe::Refused;
 }
 
 constexpr const char* kHtml = "text/html; charset=utf-8";
@@ -130,7 +135,7 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
                  PrincipalsView view;
-                 view.can_run_check = may_read(deps, req, "AuditLog");
+                 view.can_run_check = probe_read(deps, req, "AuditLog") == Probe::Allowed;
                  view.rows = std::move(*rows);
                  // The store returns oldest first; the cap banner promises the newest.
                  std::ranges::reverse(view.rows);
@@ -192,8 +197,11 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  d.revoke_detail = std::string{};
                  if (d.row.lifecycle_state != "active") {
                      // The free text is the audit trail's: AuditLog:Read, as GET /api/v1/audit.
-                     if (!may_read(deps, req, "AuditLog")) {
-                         d.revoke_detail = Withheld{};
+                     if (const auto audit = probe_read(deps, req, "AuditLog"); audit != Probe::Allowed) {
+                         if (audit == Probe::Unavailable)
+                             d.revoke_detail = Unavailable{};
+                         else
+                             d.revoke_detail = Withheld{};
                      } else if (auto rd = deps.revoke_detail_fn(id); rd) {
                          d.revoke_detail = std::move(rd->text);
                          d.revoke_truncated = rd->truncated;

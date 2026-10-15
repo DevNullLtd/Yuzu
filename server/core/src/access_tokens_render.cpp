@@ -119,6 +119,16 @@ std::string committed_revoke_detail(const std::vector<AuditEvent>& newest_first)
     return {};
 }
 
+RevokeDetail revoke_detail_from(std::vector<AuditEvent> newest_first) {
+    RevokeDetail out;
+    const auto window = static_cast<std::size_t>(kRevokeHistoryWindow);
+    out.truncated = newest_first.size() > window;
+    if (out.truncated)
+        newest_first.erase(newest_first.begin() + static_cast<std::ptrdiff_t>(window), newest_first.end());
+    out.text = committed_revoke_detail(newest_first);
+    return out;
+}
+
 bool valid_principal_id(std::string_view id) {
     constexpr std::string_view kPrefix = "engine:";
     if (!id.starts_with(kPrefix))
@@ -267,10 +277,13 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
             detail = "(withheld: needs the AuditLog:Read permission)";
         else if (const auto& s = std::get<std::string>(d.revoke_detail); !s.empty())
             detail = esc(s);
-        if (d.revoke_truncated)
-            detail += " <span class=\"hint\">(more than " + std::to_string(kRevokeHistoryWindow) +
-                      " revoke events: this is the oldest success among the newest " +
-                      std::to_string(kRevokeHistoryWindow) + ", not necessarily the original)</span>";
+        if (d.revoke_truncated) {
+            const auto win = std::to_string(kRevokeHistoryWindow);
+            const bool have = std::holds_alternative<std::string>(d.revoke_detail) &&
+                              !std::get<std::string>(d.revoke_detail).empty();
+            detail += have ? " <span class=\"hint\">(more than " + win + " revoke events: this is the oldest success among the newest " + win + ", not necessarily the original)</span>"
+                           : " <span class=\"hint\">(more than " + win + " revoke events and none of the newest " + win + " succeeded)</span>";
+        }
         out += kv("Revocation detail", detail);
     }
     out += "</div>";
