@@ -21,6 +21,10 @@ HELPER = ROOT / "deploy/packaging/macos/build-app.py"
 PLIST_HELPER = ROOT / "deploy/packaging/macos/generate-launchd-plist.py"
 MERGE_PLIST_HELPER = ROOT / "deploy/packaging/macos/merge-launchd-plist.js"
 BUILD_PKG = ROOT / "deploy/packaging/macos/build-pkg.sh"
+# Run the package builder under the shell a stock Mac actually has. /bin/bash is
+# GNU bash 3.2 on macOS; a newer bash first on PATH (Homebrew) hides 3.2-only
+# defects such as an empty "${array[@]}" tripping `set -u` (PR #4482 review).
+PKG_SHELL = "/bin/bash" if Path("/bin/bash").is_file() else "bash"
 MACOS_TRIPLET = ROOT / "triplets/arm64-osx.cmake"
 spec = importlib.util.spec_from_file_location("macos_bundle", HELPER)
 assert spec and spec.loader
@@ -130,7 +134,7 @@ shasum() { echo 'testdigest fixture'; }
                     tool.write_text(body)
                     tool.chmod(0o755)
                 result = subprocess.run(
-                    ["bash", str(BUILD_PKG), "--bin-dir", str(binaries), "--version", "1.0", "--output", str(root / "dist")],
+                    [PKG_SHELL, str(BUILD_PKG), "--bin-dir", str(binaries), "--version", "1.0", "--output", str(root / "dist")],
                     env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "CAPTURED_MANIFEST": str(captured)},
                     text=True, capture_output=True,
                 )
@@ -349,7 +353,7 @@ reject_unmanaged_plugin_collisions
                 if tampered:
                     plugin.write_bytes(b"changed after CMS signing")
                 output = root / ("tampered" if tampered else "valid")
-                result = subprocess.run(["bash", str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
+                result = subprocess.run([PKG_SHELL, str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
                                          "--version", "1.0", "--output", str(output),
                                          "--plugin-trust-bundle", str(trust)], text=True, capture_output=True,
                                         env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}",
@@ -553,7 +557,7 @@ reject_unmanaged_plugin_collisions
             codesign.write_text("#!/bin/sh\nexit 0\n")
             codesign.chmod(0o755)
             output = root / "dist"
-            result = subprocess.run(["bash", str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
+            result = subprocess.run([PKG_SHELL, str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
                                      "--version", "1.0", "--output", str(output),
                                      "--plugin-trust-bundle", str(trust)],
                                     capture_output=True, text=True,
@@ -610,7 +614,7 @@ reject_unmanaged_plugin_collisions
                 tool.write_text(body)
                 tool.chmod(0o755)
             output = root / "dist"
-            result = subprocess.run(["bash", str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
+            result = subprocess.run([PKG_SHELL, str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
                                      "--version", "1.0", "--output", str(output)],
                                     capture_output=True, text=True,
                                     env=os.environ | {"PATH": f"{tools}:{os.environ['PATH']}",
@@ -621,6 +625,52 @@ reject_unmanaged_plugin_collisions
             self.assertEqual(source_plugin.read_bytes(), b"mutated source bytes")
             self.assertEqual((app.parent / "Info.plist").read_bytes(), b"mutated source plist")
             self.assertEqual(captured.read_bytes(), b"original staged bytes")
+
+    def _bundle_fixture(self, root: Path, productbuild: str) -> tuple[Path, dict[str, str]]:
+        app = root / "bundle/YuzuAgent.app/Contents/MacOS"
+        app.mkdir(parents=True)
+        (app / "yuzu-agent").write_text("#!/bin/sh\nexit 0\n")
+        (app / "yuzu-agent").chmod(0o755)
+        with (app.parent / "Info.plist").open("wb") as output:
+            plistlib.dump({"CFBundleShortVersionString": "1.0"}, output)
+        (root / "bundle/plugins").mkdir()
+        (root / "bundle/plugins/tar.dylib").write_bytes(b"plugin")   # no plugin-signing-policy.json
+        tools = root / "tools"
+        tools.mkdir()
+        for name, body in {
+            "codesign": "#!/bin/sh\nexit 0\n",
+            "lipo": "#!/bin/sh\necho arm64\n",
+            "pkgbuild": "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",
+            "productbuild": productbuild,
+        }.items():
+            (tools / name).write_text(body)
+            (tools / name).chmod(0o755)
+        return root / "dist", os.environ | {"PATH": f"{tools}:{os.environ['PATH']}"}
+
+    def test_policy_free_bundle_package_is_built_under_the_stock_shell(self) -> None:
+        # PR #4482 review: an empty POLICY_ARGS tripped `set -u` on bash 3.2 and the
+        # EXIT trap turned the abort into exit 0 with no package written.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_nopolicy_") as temporary:
+            output, env = self._bundle_fixture(Path(temporary), "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n")
+            result = subprocess.run([PKG_SHELL, str(BUILD_PKG), "--bundle-dir", str(Path(temporary) / "bundle"),
+                                     "--version", "1.0", "--output", str(output)],
+                                    capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("unbound variable", result.stderr)
+            self.assertTrue((output / "YuzuAgent-1.0-macos-arm64.pkg").is_file())
+
+    def test_builder_fails_when_no_package_was_written(self) -> None:
+        # A tool that exits 0 without producing the artifact, or a stale artifact from an
+        # earlier run, must never be reported as a successful build.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_nopkg_") as temporary:
+            output, env = self._bundle_fixture(Path(temporary), "#!/bin/sh\nexit 0\n")
+            output.mkdir()
+            (output / "YuzuAgent-1.0-macos-arm64.pkg").write_text("stale from an earlier run")
+            result = subprocess.run([PKG_SHELL, str(BUILD_PKG), "--bundle-dir", str(Path(temporary) / "bundle"),
+                                     "--version", "1.0", "--output", str(output)],
+                                    capture_output=True, text=True, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not write", result.stderr)
 
     def test_builder_refuses_a_populated_output_before_touching_inputs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
@@ -819,7 +869,7 @@ reject_unmanaged_plugin_collisions
                 tool.chmod(0o755)
             environment = os.environ | {"PATH": f"{tools}:{os.environ['PATH']}"}
             output = root / "dist"
-            result = subprocess.run(["bash", str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
+            result = subprocess.run([PKG_SHELL, str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
                                      "--version", "1.0", "--output", str(output),
                                      "--plugin-trust-bundle", str(trust)],
                                     capture_output=True, text=True, env=environment)
@@ -828,7 +878,7 @@ reject_unmanaged_plugin_collisions
 
     @unittest.skipIf(os.name == "nt", "POSIX Bash fixture")
     def test_builder_rejects_ambiguous_lanes_before_invoking_macos_tools(self) -> None:
-        result = subprocess.run(["bash", str(BUILD_PKG), "--bin-dir", "x", "--bundle-dir", "y",
+        result = subprocess.run([PKG_SHELL, str(BUILD_PKG), "--bin-dir", "x", "--bundle-dir", "y",
                                  "--version", "1.0"], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exactly one", result.stderr)

@@ -32,7 +32,18 @@ STAGING="$(mktemp -d)"
 SCRIPTS="$(mktemp -d)"
 COMPONENT_DIR="$(mktemp -d)"
 VALIDATION_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGING" "$SCRIPTS" "$COMPONENT_DIR" "$VALIDATION_DIR"' EXIT
+# Success is decided by reaching the end, never by $? in this trap: stock macOS
+# /bin/bash 3.2 reports $?=0 to an EXIT trap after a `set -u` abort, so a
+# status-preserving trap would still turn that abort into a successful exit.
+BUILD_COMPLETED=0
+cleanup() {
+    local rc=$?
+    rm -rf "$STAGING" "$SCRIPTS" "$COMPONENT_DIR" "$VALIDATION_DIR"
+    # Keep a real failure's own status; only a "0" from an unfinished run is false.
+    if [[ "$BUILD_COMPLETED" != 1 && "$rc" == 0 ]]; then rc=1; fi
+    exit "$rc"
+}
+trap cleanup EXIT
 install -m 755 "$SCRIPT_DIR/preinstall" "$SCRIPTS/preinstall"
 install -m 755 "$SCRIPT_DIR/postinstall" "$SCRIPTS/postinstall"
 install -d "${STAGING}/usr/local/lib/yuzu/.plugins.incoming"
@@ -104,7 +115,7 @@ if [[ -n "$BUNDLE_DIR" ]]; then
     python3 "$SCRIPT_DIR/generate-launchd-plist.py" --source "$SCRIPT_DIR/com.yuzu.agent.plist" \
         --output "${STAGING}/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist" \
         --bundle-executable "/Library/Application Support/YuzuAgent/YuzuAgent.app/Contents/MacOS/yuzu-agent" \
-        "${POLICY_ARGS[@]}"
+        ${POLICY_ARGS[@]+"${POLICY_ARGS[@]}"}  # bash 3.2: a bare empty "${a[@]}" trips set -u
     for plugin in "$STAGED_PLUGINS"/*.dylib; do
         [[ -f "$plugin" ]] || continue
         codesign --verify --strict --verbose=2 "$plugin"
@@ -163,5 +174,10 @@ cat > "$DIST_XML" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2"><title>Yuzu Agent ${VERSION}</title><organization>${IDENTIFIER}</organization><domains enable_localSystem="true"/><options customize="never" require-scripts="true" rootVolumeOnly="true"/><volume-check><allowed-os-versions><os-version min="13.3"/></allowed-os-versions></volume-check><choices-outline><line choice="default"><line choice="${IDENTIFIER}"/></line></choices-outline><choice id="default"/><choice id="${IDENTIFIER}" visible="false"><pkg-ref id="${IDENTIFIER}"/></choice><pkg-ref id="${IDENTIFIER}" version="${VERSION}" onConclusion="none">yuzu-agent-component.pkg</pkg-ref></installer-gui-script>
 XML
+# Remove any earlier artifact first, so the existence check below proves THIS run wrote it.
+rm -f "$PRODUCT_PKG"
 productbuild --distribution "$DIST_XML" --package-path "$COMPONENT_DIR" "$PRODUCT_PKG"
+[[ -f "$PRODUCT_PKG" ]] || {
+    echo "ERROR: productbuild reported success but did not write $PRODUCT_PKG" >&2; exit 1; }
+BUILD_COMPLETED=1
 echo "Built $PACKAGE_MODE package: $PRODUCT_PKG"
