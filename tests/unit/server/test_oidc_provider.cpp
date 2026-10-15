@@ -1610,6 +1610,12 @@ TEST_CASE(
     CHECK_FALSE(provider.verify_jwt_signature(signed_token(cfg, "never-published")).has_value());
     // A token with no kid is still checked against the first key.
     CHECK(provider.verify_jwt_signature(signed_token(cfg, "")).has_value());
+    // A kid member that is present but empty is malformed and is refused, not treated as absent.
+    auto empty_kid =
+        make_jwt_with_header(R"({"alg":"RS256","kid":"","typ":"JWT"})", R"({"sub":"x"})");
+    auto r = provider.verify_jwt_signature(empty_kid);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == "JWT kid is not a non-empty string");
 }
 
 TEST_CASE("OIDC discovery: a failed attempt is remembered, two logins inside the window cost ONE GET",

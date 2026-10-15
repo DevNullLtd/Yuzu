@@ -1268,6 +1268,10 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
     };
     auto alg = header_string("alg");
     auto kid = header_string("kid");
+    // A kid member that is present but not a non-empty string is malformed: refuse it rather
+    // than let it fall through to the no-kid first-key path below.
+    if (const auto kid_it = hdr.find("kid"); kid_it != hdr.end() && kid.empty())
+        return std::unexpected("JWT kid is not a non-empty string");
 
     // Reject alg:none — the classic JWT bypass attack
     if (alg.empty() || alg == "none" || alg == "None" || alg == "NONE")
@@ -1287,11 +1291,10 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
         // the cache makes it empty, so the fetch below runs on this and every later login until
         // the IdP answers (#1901 UP-5).
         if (!jwks_cache_.empty() && now - jwks_last_success_ > kJwksMaxKeyAge) {
-            spdlog::error("OidcProvider: the {} cached signing keys were last fetched more than {} "
-                          "minutes ago and the JWKS endpoint has not answered with a usable key "
-                          "set since; dropping them",
-                          jwks_cache_.size(),
-                          std::chrono::duration_cast<std::chrono::minutes>(kJwksMaxKeyAge).count());
+            spdlog::info("OidcProvider: the {} cached signing keys were last fetched more than {} "
+                         "minutes ago; dropping them and fetching a fresh set",
+                         jwks_cache_.size(),
+                         std::chrono::duration_cast<std::chrono::minutes>(kJwksMaxKeyAge).count());
             jwks_cache_.clear();
         }
         auto age = now - jwks_fetched_at_;

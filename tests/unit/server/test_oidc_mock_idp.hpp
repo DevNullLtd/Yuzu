@@ -379,7 +379,10 @@ inline std::string rs256_sign(const std::string& kid, const std::string& payload
     auto b64 = [](const std::string& s) {
         return oidc::OidcProvider::base64url_encode(std::vector<uint8_t>(s.begin(), s.end()));
     };
-    const std::string header = R"({"alg":"RS256","kid":")" + kid + R"(","typ":"JWT"})";
+    // An empty kid omits the member (a token with no kid); a hand-built header covers the rest.
+    const std::string header = kid.empty()
+                                   ? std::string(R"({"alg":"RS256","typ":"JWT"})")
+                                   : R"({"alg":"RS256","kid":")" + kid + R"(","typ":"JWT"})";
     const std::string signing_input = b64(header) + "." + b64(payload_json);
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> md(EVP_MD_CTX_new(), EVP_MD_CTX_free);
     if (!md || EVP_DigestSignInit(md.get(), nullptr, EVP_sha256(), nullptr, key.pk.get()) != 1)
