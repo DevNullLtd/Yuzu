@@ -892,8 +892,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
     };
     sink.Get("/readyz", readyz_handler);
 
-    // Plaintext redirect listener probes (#5906): posture, D6a/D6b and the drain-window
-    // caveat are in the AUTH POSTURE banner in health_routes.hpp.
+    // Plaintext redirect listener probes (#5906): the posture, the no-session rule, the 503
+    // gate and the drain-window caveat are in the AUTH POSTURE banner in health_routes.hpp.
     if (deps.plaintext_probe_sink) {
         auto plain_health = [health_body](const httplib::Request& req, httplib::Response& res) {
             health_body(req, res, /*is_authenticated=*/false);

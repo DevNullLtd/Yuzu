@@ -3095,7 +3095,7 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 1. Navigate to **Settings > TLS Configuration**.
 2. Toggle **Enable HTTPS**.
 3. Upload PEM-encoded certificate and private key files using the **Upload PEM** button, or paste PEM content directly using the **Paste PEM** button.
-4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS.
+4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS, except GET/HEAD on the four health-probe paths (see Probing a TLS-enabled server).
 
 ### Certificate Requirements
 
@@ -5426,7 +5426,7 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 
 ### Probing a TLS-enabled server
 
-The shipped images contain no `curl` or `wget`, and with HTTPS on (the default) the HTTP port only redirects. Two mechanisms let an orchestrator probe such a server.
+The shipped images contain no `curl` (the chiselled image ships a static busybox with `wget`, see `deploy/docker/Dockerfile.server.chisel`), and before this change the HTTP port answered every request with a redirect when HTTPS was on. Two mechanisms now let an orchestrator probe such a server.
 
 **1. The HTTP port answers the four probes directly.** With HTTPS on, the redirect listener (`--web-port`, `8080` by default) serves `/livez`, `/readyz`, `/health` and `/api/health` without redirecting. The rules:
 
@@ -5442,7 +5442,7 @@ The shipped images contain no `curl` or `wget`, and with HTTPS on (the default) 
 | Target | `https://<web-address>:<https-port>/readyz` (wildcard binds map to loopback); with `--no-https`, `http://<web-address>:<web-port>/readyz`. `--healthcheck-path /livez` selects liveness. |
 | Trust | The certificate chain is verified against **only** a trust anchor, never the system trust store. Default-certs mode: `<ca-dir>/default-ca.pem` (the install CA). Operator certificate (`--https-cert`): that certificate file itself. The host name is not checked. |
 | Redirects | Not followed. A `301` is a failure. |
-| Time | Bounded well under the 5 s a typical orchestrator allows. |
+| Time | Each phase is bounded: TCP connect 1 s, each TLS handshake step 1 s, the request as a whole 3 s; a server that accepts but never answers is reported in about 2 s, one that trickles a response in about 3 s. |
 | Output | Nothing on success. On failure one stderr line naming the target, the HTTP status or TLS reason (for example `certificate has expired`), and the trust anchor used. It never prints a key path or a response body. |
 | Inputs | The server's own flags and environment variables, with the server's defaults. It does not read `yuzu-server.cfg`. |
 

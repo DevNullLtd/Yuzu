@@ -143,10 +143,10 @@ TEST_CASE("healthcheck: the diagnostic is one line, names target and anchor, nev
     CHECK(line503.find("https://127.0.0.1:8443/readyz") != std::string::npos);
     CHECK(line503.find("/op/server.pem") != std::string::npos);
 
-    const auto lineErr = healthcheck_diagnostic(t, {0, "Connection"});
-    CHECK(lineErr.find("Connection") != std::string::npos);
-    CHECK(lineErr.find("/op/server.pem") != std::string::npos);
-    for (const auto& line : {line503, lineErr}) {
+    const auto line_err = healthcheck_diagnostic(t, {0, "Connection"});
+    CHECK(line_err.find("Connection") != std::string::npos);
+    CHECK(line_err.find("/op/server.pem") != std::string::npos);
+    for (const auto& line : {line503, line_err}) {
         CHECK(line.find("key.pem") == std::string::npos);
         CHECK(line.find('\n') == std::string::npos);
     }
@@ -177,14 +177,18 @@ struct LoopbackServer {
         port = svr->bind_to_any_port("127.0.0.1");
         REQUIRE(port > 0);
         th = std::thread([this] { svr->listen_after_bind(); });
-        for (int i = 0; i < 2000 && !svr->is_running(); ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        svr->wait_until_ready();
         REQUIRE(svr->is_running());
     }
     ~LoopbackServer() {
-        svr->stop();
-        if (th.joinable())
+        // Order is load-bearing: stop() is a no-op until the accept loop is running, so a
+        // join() after an early stop() would hang. See test_mcp_body_cap.cpp for the full
+        // account of why the wait sits inside the joinable() test.
+        if (th.joinable()) {
+            svr->wait_until_ready();
+            svr->stop();
             th.join();
+        }
     }
 };
 
@@ -218,8 +222,10 @@ HealthcheckTarget tls_target(int port, const fs::path& anchor, bool partial_chai
     return t;
 }
 
-/// An SSLServer answering 200 on /readyz and /livez, serving `leaf`.
-std::unique_ptr<LoopbackServer> tls_server(const fs::path& dir, const gwt::TestLeaf& leaf) {
+/// An SSLServer answering 200 on /readyz and /livez, serving `leaf`. `readyz`, when given,
+/// replaces the /readyz handler.
+std::unique_ptr<LoopbackServer> tls_server(const fs::path& dir, const gwt::TestLeaf& leaf,
+                                           httplib::Server::Handler readyz = nullptr) {
     write_file(dir / "server.pem", leaf.cert_pem);
     write_file(dir / "server.key", leaf.key_pem);
     auto ssl = std::make_unique<httplib::SSLServer>((dir / "server.pem").string().c_str(),
@@ -228,7 +234,7 @@ std::unique_ptr<LoopbackServer> tls_server(const fs::path& dir, const gwt::TestL
     auto ok = [](const httplib::Request&, httplib::Response& res) {
         res.set_content("ok", "text/plain");
     };
-    ssl->Get("/readyz", ok);
+    ssl->Get("/readyz", readyz ? std::move(readyz) : httplib::Server::Handler{ok});
     ssl->Get("/livez", ok);
     auto srv = std::make_unique<LoopbackServer>(std::move(ssl));
     srv->start();
@@ -292,7 +298,8 @@ TEST_CASE("healthcheck: operator mode anchors on the server certificate itself (
     yuzu::test::TempDir tmp{"yuzu_test_healthcheck-"};
     fs::create_directories(tmp.path);
     const auto ca = gwt::make_ca("hc-ca");
-    auto lp = gwt::leaf_params("operator-leaf", true, false, yuzu::server::pki::validity_days_from_now(1));
+    auto lp = gwt::leaf_params("operator-leaf", true, false,
+                               yuzu::server::pki::validity_days_from_now(1));
     lp.san = {};
     auto issued = yuzu::server::pki::issue_leaf(ca.cert_pem, ca.key_pem,
                                                 yuzu::server::pki::KeyAlgo::EcP256, lp);
@@ -349,6 +356,49 @@ TEST_CASE("healthcheck: an expired leaf is refused and the reason says so",
     CHECK(out.error.find("expired") != std::string::npos);
 }
 
+TEST_CASE("healthcheck: a stalled TLS responder is cut off",
+          "[server][healthcheck][live]") {
+    // The request phase is cut at max_total_ms, but httplib then closes the TLS session
+    // gracefully: tls::shutdown calls SSL_shutdown twice, and the second call waits for the
+    // peer's close_notify on a socket whose SO_RCVTIMEO is the read timeout (2 s here). A
+    // responder stuck in its handler never sends one, so without quiet shutdown on the
+    // client context this case measures 0.2 s + 2.0 s = 2.2 s and FAILS the 2 s bound;
+    // with it, ~0.2 s.
+    yuzu::test::TempDir tmp{"yuzu_test_healthcheck-"};
+    fs::create_directories(tmp.path);
+    const auto ca = gwt::make_ca("hc-ca");
+    const auto leaf = gwt::make_leaf(ca, "hc-server", true, false);
+    write_file(tmp.path / "default-ca.pem", ca.cert_pem);
+
+    std::mutex mu;
+    std::condition_variable cv;
+    bool release = false;
+    auto srv = tls_server(tmp.path, leaf, [&](const httplib::Request&, httplib::Response& res) {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return release; });
+        res.set_content("late", "text/plain");
+    });
+    // Declared AFTER the server so it is destroyed first: the blocked handler must be
+    // released before the server's destructor joins its worker.
+    yuzu::test::ScopeExit releaser{[&] {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            release = true;
+        }
+        cv.notify_all();
+    }};
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto out = probe_once(tls_target(srv->port, tmp.path / "default-ca.pem", false),
+                                /*max_total_ms=*/200);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    INFO("elapsed ms: " << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    CHECK(out.status == 0);
+    CHECK_FALSE(out.error.empty());
+    CHECK(healthcheck_exit_code(out) == 1);
+    CHECK(elapsed < std::chrono::seconds(2)); // sanity bound only, never a lower bound
+}
+
 #endif // CPPHTTPLIB_OPENSSL_SUPPORT
 
 TEST_CASE("healthcheck: a stalled responder is cut off by the whole-request ceiling",
@@ -365,18 +415,13 @@ TEST_CASE("healthcheck: a stalled responder is cut off by the whole-request ceil
     srv.start();
     // Declared AFTER the server so it is destroyed first: the blocked handler must
     // be released before the server's destructor joins its worker.
-    struct Releaser {
-        std::mutex& mu;
-        std::condition_variable& cv;
-        bool& release;
-        ~Releaser() {
-            {
-                std::lock_guard<std::mutex> lk(mu);
-                release = true;
-            }
-            cv.notify_all();
+    yuzu::test::ScopeExit releaser{[&] {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            release = true;
         }
-    } releaser{mu, cv, release};
+        cv.notify_all();
+    }};
 
     const auto t0 = std::chrono::steady_clock::now();
     const auto out = probe_once(plain_target(srv.port), /*max_total_ms=*/200);

@@ -3523,6 +3523,19 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
+# #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
+# Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
+# runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
+if _bash_test.found() and meson.can_run_host_binaries() and build_server
+  test('--healthcheck CLI contract (#5906)',
+    _bash_test,
+    args: [files('shell/test_healthcheck_cli.sh'), meson.project_build_root()],
+    suite: 'server',
+    timeout: 60,
+    depends: [yuzu_server_exe],
+  )
+endif
+
 # #4666 PR-2 acceptance-evidence harness: formalizes the hand-verified manual
 # repro of the blocked-log-sink SIGTERM scenario (main.cpp's async log
 # hand-off, log_handoff.hpp) into a committed, repeatable shell test against

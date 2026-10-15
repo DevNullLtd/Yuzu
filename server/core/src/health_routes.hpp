@@ -37,13 +37,14 @@
 ///     `/livez`, `/readyz`, `/health` and `/api/health`, to GET and HEAD
 ///     requests that declare no body (`is_plaintext_probe_request`); every
 ///     other request still 301s. This is the same recorded ADR-1005 exception
-///     as the main listener's, with two differences: the session resolver is
-///     bound to "no session" (D6a) so `/health` and `/api/health` ALWAYS return
+///     as the main listener's, with two differences: no session is ever
+///     resolved on plaintext (the session resolver is bound to "no session"),
+///     so `/health` and `/api/health` ALWAYS return
 ///     the unauthenticated shape there — `system.*`, `agents.pending` and
 ///     `executions.*` never travel over plaintext, even when the request carries
 ///     a valid session cookie — and every answer is 503
 ///     `{"status":"not ready","reason":"https_listener_not_serving"}` while the
-///     HTTPS listener is not bound or has exited (D6b). The guarantee is "bound
+///     HTTPS listener is not bound or has exited. The guarantee is "bound
 ///     and not yet exited", NOT "accepting": after a fatal accept error httplib
 ///     closes the listening socket but `is_running()` stays true until
 ///     already-accepted requests drain (httplib.h:11307-11330, 11269), so the

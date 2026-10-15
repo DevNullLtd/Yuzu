@@ -1,9 +1,11 @@
 /// @file test_health_routes.cpp
 /// HTTP-level coverage for the 6-route Health/Infra cluster (#2542 PR-10) —
-/// driven in-process through TestRouteSink (no httplib acceptor, #438),
-/// mirroring test_result_set_routes.cpp's / test_page_routes.cpp's Harness
-/// shape. None of these 6 routes touches Postgres directly through this
-/// harness (every store pointer defaults to null and the handlers'
+/// driven in-process through TestRouteSink (no httplib acceptor, #438) except
+/// the one [live] case at the end, which binds a real loopback listener to
+/// cover install_plaintext_redirect_pre_routing, mirroring
+/// test_result_set_routes.cpp's / test_page_routes.cpp's Harness shape. None of
+/// these 6 routes touches Postgres directly through this harness (every store
+/// pointer defaults to null and the handlers'
 /// `store && store->is_open()` idiom degrades to "not open" — a REAL
 /// degraded-dependency case, not a mock), so every case here runs without
 /// YUZU_TEST_POSTGRES_DSN.
@@ -23,6 +25,8 @@
 #include "pg_reachability_probe.hpp"
 #include "test_route_sink.hpp"
 
+#include "../test_helpers.hpp"
+
 #include "agent_registry.hpp"
 #include "default_certs.hpp"
 #include "event_bus.hpp"
@@ -38,6 +42,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -610,19 +615,62 @@ TEST_CASE("health_routes: /fragments/health/summary renders the WARN strip "
 // that drops the production `register_health_routes(...)` call at
 // server.cpp's registration site would leave every case above green while
 // the real server 404s all 6 routes (custom_properties_routes'/
-// result_set_routes' PR-4/PR-5 precedent for this tripwire).
+// result_set_routes' PR-4/PR-5 precedent for this tripwire). It also pins the
+// #5906 wiring the unit harness cannot see (ServerImpl needs Postgres): the
+// plaintext redirect listener's probe routes and their 503 gate.
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("health_routes: wiring -- server.cpp still calls "
-          "register_health_routes",
+          "register_health_routes and wires the plaintext probe listener",
           "[server][routes][health_routes]") {
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
     std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(in.is_open());
-    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_health_routes(") != std::string::npos);
+
+    // Compare with all whitespace removed so a clang-format re-wrap of a call site
+    // can neither redden nor greenwash the tripwire.
+    const auto squeeze = [](std::string s) {
+        s.erase(std::remove_if(s.begin(), s.end(),
+                               [](unsigned char c) { return std::isspace(c) != 0; }),
+                s.end());
+        return s;
+    };
+    const auto flat = squeeze(src);
+    const auto occurrences = [&](const std::string& needle) {
+        const auto n = squeeze(needle);
+        std::size_t count = 0;
+        for (auto pos = flat.find(n); pos != std::string::npos; pos = flat.find(n, pos + 1))
+            ++count;
+        return count;
+    };
+    const auto expect = [&](const char* needle, std::size_t want, const char* behaviour) {
+        INFO(behaviour);
+        CHECK(occurrences(needle) == want);
+    };
+
+    // The redirect listener's 301/probe pre-routing lives in health_routes.cpp; server.cpp
+    // must install it.
+    expect("install_plaintext_redirect_pre_routing(*redirect_server_", 1,
+           "server.cpp installs the redirect pre-routing from health_routes");
+    // The probe routes must be handed the plaintext sink and the 503 gate.
+    expect(".plaintext_probe_sink = redirect_sink_.get()", 1,
+           "register_health_routes receives the redirect listener's sink");
+    expect(".main_listener_serving_fn", 1, "the plaintext probes are gated on the HTTPS listener");
+    // One closed probe set shared by the main pre-routing chokepoint.
+    expect("health::is_probe_path(req.path)", 1,
+           "main pre-routing exempts probes through the one shared predicate");
+    // The redirect listener exists only behind the guard, and is built at exactly one site.
+    expect("if (cfg_.https_enabled && cfg_.https_redirect)", 1,
+           "the redirect listener is built only when HTTPS and the redirect are on");
+    expect("redirect_server_ = std::make_unique<httplib::Server>()", 1,
+           "no second, unguarded redirect listener construction site");
+    // The pre-routing lambda must not be re-forked inline in server.cpp.
+    expect("redirect_server_->set_pre_routing_handler", 0,
+           "the redirect pre-routing is not re-forked in server.cpp");
 }
 
 // ---------------------------------------------------------------------------
@@ -968,14 +1016,16 @@ TEST_CASE("health_routes: plaintext /livez and /readyz are the main handlers onc
     CHECK(json::parse(readyz->body)["status"] == "draining");
 }
 
-TEST_CASE("health_routes: is_probe_path matches the closed set exactly", "[server][routes][health_routes][plaintext]") {
+TEST_CASE("health_routes: is_probe_path matches the closed set exactly",
+          "[server][routes][health_routes][plaintext]") {
     for (const char* p : {"/livez", "/readyz", "/health", "/api/health"})
         CHECK(health::is_probe_path(p));
     for (const char* p : {"/livez/", "/health/detailed", "/LIVEZ", "", "/metrics", "/api/healthz"})
         CHECK_FALSE(health::is_probe_path(p));
 }
 
-TEST_CASE("health_routes: is_plaintext_probe_request admits GET/HEAD on a probe with no body headers",
+TEST_CASE("health_routes: is_plaintext_probe_request admits GET/HEAD on a probe with no body "
+          "headers",
           "[server][routes][health_routes][plaintext]") {
     auto make = [](const char* method, const char* path) {
         httplib::Request r;
@@ -1011,17 +1061,17 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
     const int port = srv.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
     std::thread th([&] { srv.listen_after_bind(); });
-    struct Joiner {
-        httplib::Server& s;
-        std::thread& t;
-        ~Joiner() {
-            s.stop();
-            if (t.joinable())
-                t.join();
+    // Order is load-bearing: stop() is a no-op until the accept loop is running, so a
+    // join() after an early stop() would hang. See test_mcp_body_cap.cpp for the full
+    // account of why the wait sits inside the joinable() test.
+    yuzu::test::ScopeExit joiner{[&] {
+        if (th.joinable()) {
+            srv.wait_until_ready();
+            srv.stop();
+            th.join();
         }
-    } joiner{srv, th};
-    for (int i = 0; i < 2000 && !srv.is_running(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }};
+    srv.wait_until_ready();
     REQUIRE(srv.is_running());
 
     httplib::Client cli("127.0.0.1", port);
@@ -1044,7 +1094,10 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
     REQUIRE(post);
     CHECK(post->status == 301);
 
-    // GET /livez that declares a body stays a 301 (the listener never buffers one).
+    // GET /livez that declares a body stays a 301: is_plaintext_probe_request declines it.
+    // That httplib runs pre-routing before reading a body (so this listener never buffers
+    // one) is a property of the pinned httplib, proven by test_body_cap_policy.cpp's
+    // raw-socket case; this case proves only the predicate's answer.
     httplib::Request with_body;
     with_body.method = "GET";
     with_body.path = "/livez";

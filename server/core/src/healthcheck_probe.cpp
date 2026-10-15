@@ -26,6 +26,13 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
     c->enable_server_certificate_verification(true);
     c->enable_server_hostname_verification(false);
     c->set_follow_location(false);
+    // Quiet shutdown: skip the TLS close_notify exchange. The request's scope exit always
+    // closes the session gracefully, and httplib's tls::shutdown calls SSL_shutdown twice,
+    // the second waiting for the peer's close_notify on a socket whose SO_RCVTIMEO is the
+    // read timeout. A peer that stalls (never answers, so never reads ours) would cost
+    // one more read timeout on top of the request deadline (measured +2.0 s). The probe
+    // reads one status line and exits, so there is nothing a clean close would protect.
+    SSL_CTX_set_quiet_shutdown(static_cast<SSL_CTX*>(c->tls_context()), 1);
     return c;
 }
 #endif
@@ -44,11 +51,10 @@ HealthcheckOutcome probe_once(const HealthcheckTarget& t, int max_total_ms) {
         client = std::make_unique<httplib::ClientImpl>(t.host, t.port);
         client->set_follow_location(false);
     }
-    // Deadline composition: the connect timeout bounds the TCP connect, read/write
-    // bound each TLS handshake step, and the whole-request max timeout
-    // (httplib.h:9906-9950) bounds the request phase as a whole. No single knob
-    // covers all three in 0.37.1; the sum is sized to stay under compose's 5 s on
-    // loopback.
+    // Deadline composition: TCP connect <= 1 s, each TLS handshake select <= 1 s, and the
+    // request phase <= max_total_ms (3 s by default) as a whole (httplib.h:9906-9950);
+    // make_tls_client's quiet shutdown means no close_notify wait follows. No single knob
+    // covers all of these in 0.37.1; the sum is sized to stay under compose's 5 s on loopback.
     constexpr int kConnectSec = 1;
     constexpr int kWriteSec = 1;
     constexpr int kReadSec = 2;

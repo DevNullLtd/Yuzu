@@ -879,7 +879,7 @@ yuzu_server_core_dep = declare_dependency(
                + saml_deps,
 )
 
-executable(
+yuzu_server_exe = executable(
   'yuzu-server',
   files('src/main.cpp'),
   dependencies: [yuzu_server_core_dep, cli11_dep] + auth_crypto_deps,

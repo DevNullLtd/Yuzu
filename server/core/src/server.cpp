@@ -15264,10 +15264,8 @@ private:
                 *redirect_server_, cfg_.web_address, cfg_.https_port);
         }
 #endif
-        // Handlers are copied into the server, so this local sink may die with the function.
-        std::unique_ptr<HttplibRouteSink> redirect_sink;
         if (redirect_server_)
-            redirect_sink = std::make_unique<HttplibRouteSink>(*redirect_server_);
+            redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_);
         auto auth_fn = [this](const httplib::Request& req,
                               httplib::Response& res) -> std::optional<auth::Session> {
             return require_auth(req, res);
@@ -15712,7 +15710,7 @@ private:
                              // startup and a completed shutdown all read "not serving". No finer
                              // signal in httplib 0.37.1; web_thread_done_ is set only after the
                              // drain (caveat: AUTH POSTURE banner, health_routes.hpp).
-                             .plaintext_probe_sink = redirect_sink.get(),
+                             .plaintext_probe_sink = redirect_sink_.get(),
                              .main_listener_serving_fn =
                                  [this] { return web_server_ && web_server_->is_running(); },
                              .cfg = &cfg_,
@@ -21666,6 +21664,10 @@ private:
 
     // HTTPS redirect server
     std::unique_ptr<httplib::Server> redirect_server_;
+    // Route sink over redirect_server_, declared after it so it is destroyed first.
+    // The health-route closures keep this pointer (Deps is copied into them), so it
+    // must outlive start_web_server().
+    std::unique_ptr<HttplibRouteSink> redirect_sink_;
     std::thread redirect_thread_;
 
     // Certificate hot-reload
