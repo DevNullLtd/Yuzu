@@ -136,6 +136,14 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/auto/nvd",
+    "capability_id": "get.fragments-auto-nvd",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:<ADR-1005 grandfathered surface #2 — NVD status card over the same JSON as GET /api/nvd/status, which stays settings-plane (2027-Q1); get_nvd_status MCP is deliberate debt, not twinned>"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/compliance/summary",
     "capability_id": "get.fragments-compliance-summary",
     "rest_v1_twin": null,

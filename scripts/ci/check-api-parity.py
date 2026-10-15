@@ -242,6 +242,22 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # are now /fragments/dashboard/{summary,policies,activity,health} (same composed-of status,
 # same count; a rename, not a new surface), so the count stays 208.
 #
+# Estate deployment read twins: GET /fragments/auto/deployments and .../detail are new routes
+# ledgered "twinned" (GET /api/v1/deployments[/{id}] + MCP list_deployments / get_deployment,
+# count unchanged). The new GET /fragments/auto/nvd status card is ledgered "exception"
+# (grandfathered NVD surface, no get_nvd_status MCP): +1. Merged on top of the 201 above, the
+# checker reported 202 on the merged tree.
+#
+# Network discovery read twin (Estate E-2): the unbounded legacy GET /api/discovery/results
+# row flips "planned:#2146" -> "twinned" (GET /api/v1/network/discovered-devices + MCP
+# list_discovered_devices); the new GET /fragments/network/discovered row is born "twinned"
+# (count unchanged): -1 on its own. Combined with the +1 above the checker reported 201 on the
+# merged tree, not a hand-added delta.
+#
+# Landing on dev's 208 (device containment, hardware properties and the Home/Dashboard rows, above),
+# the two Estate changes net 0 on their own (+1 NVD status card exception, -1 discovery row
+# twinned), so the count after this merge is the value the checker reports, set from its output.
+#
 # Access Users page (PR X-1): re-surfaces the untwinned Settings users list as two read-only
 # fragments, GET /fragments/access/users/list (planned:#2146) and .../detail (composed-of the
 # list), +2. A GET /api/v1/users twin is not built here; the Settings rows and these two
@@ -253,6 +269,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # principal twins sit behind EnginePrincipal:Read, where the page keeps the stricter admin gate),
 # +3. Merged with the 208 above, the two Access pages make 213 (208 + 2 + 3), the value the
 # checker reports on the merged tree, not hand-picked.
+#
+# Access pages merged onto the Estate changes: the count is the value the checker reports on the
+# merged tree, set from its output.
 BASELINE_UNTWINNED = 213
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────

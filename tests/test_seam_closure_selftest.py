@@ -72,6 +72,8 @@ EXPECTED_FAMILIES = {
             "server/core/src/network_routes.cpp",
             "server/core/src/network_ui.cpp",
             "server/core/src/network_perf_model.cpp",
+            "server/core/src/discovered_devices_model.hpp",
+            "server/core/src/discovered_devices_model.cpp",
             "server/core/src/network_api.hpp",
             "server/core/src/network_api_local.hpp",
         ],
