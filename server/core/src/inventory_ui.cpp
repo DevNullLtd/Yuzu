@@ -112,6 +112,7 @@ std::string inv_style() {
     return R"css(<style>
   .inv-wrap>*+*{margin-top:22px}
   .inv-h1{margin:0;font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+  .inv-titlerow{display:flex;align-items:center;justify-content:space-between;gap:12px}
   .inv-wrap>.inv-sub{margin-top:4px;max-width:70ch;color:var(--mut)}
   .inv-wrap>.inv-sub a{color:var(--primary)}.inv-wrap>.inv-sub a:hover{text-decoration:underline}
   .inv-wrap :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
@@ -312,7 +313,11 @@ std::string results_get(const SoftwarePageFilters& f) {
 
 std::string sw_head() {
     return inv_style() +
-           "<div class=\"inv-wrap\"><h1 class=\"inv-h1\">Software</h1>"
+           "<div class=\"inv-wrap\"><div class=\"inv-titlerow\"><h1 class=\"inv-h1\">Software</h1>"
+           // Opens the Sync now dialog (device / scope / whole fleet); the route enforces
+           // Execution:Execute, so a caller without it is told so in the dialog.
+           "<button type=\"button\" class=\"gp-btn accent\" data-act=\"sync\" onclick=\"swSync()\" "
+           "title=\"Ask devices to re-send their software inventory now\">Sync now</button></div>"
            "<div class=\"inv-sub\">Installed-software inventory by application, version and "
            "device, synced <b>daily</b> from every endpoint (ADR-0016 daily-sync). Looking for a "
            "device? See <a href=\"/hardware\">Hardware</a>.</div>";
@@ -931,6 +936,71 @@ function swShut(box) { box.innerHTML = ''; box.removeAttribute('data-open'); swM
 function swClose(x) {
   var b = x.closest('.inv-exp-body'), box = b && b.parentNode;
   if (box && box.id) swShut(box);
+}
+/* Sync now: pick the devices (this device / a scope expression or group / the whole fleet), confirm
+   the count, POST /api/v1/hardware/sync. Two shared-dialog steps; the server enforces every bound. */
+function swSyncDone(r) {
+  var d = r.data && r.data.data, note, msg, skip = [];
+  if (!r.ok || !d) {
+    if (typeof showToast === 'function') showToast(r.message || ('Sync request failed (' + r.status + ')'), 'error');
+    return;
+  }
+  msg = 'Sync requested for ' + d.reached + ' device' + (d.reached === 1 ? '' : 's');
+  if (d.skipped_offline) skip.push(d.skipped_offline + ' offline');
+  if (d.skipped_version) skip.push(d.skipped_version + ' on an agent older than 0.13.1');
+  if (skip.length) msg += ' (skipped: ' + skip.join(', ') + ')';
+  if (typeof showToast === 'function') showToast(msg, d.reached ? 'success' : 'warning');
+  var f = document.querySelector('.inv-fresh');
+  if (f) {
+    note = document.getElementById('sw-sync-note');
+    if (!note) { note = document.createElement('span'); note.id = 'sw-sync-note'; f.appendChild(note); }
+    note.textContent = ' \u00b7 ' + msg + ' at ' + new Date().toLocaleTimeString();
+  }
+}
+function swSync() {
+  var D = window.YuzuDialog;
+  if (!D) return;
+  var a = document.getElementById('sw-agent'), h = document.getElementById('sw-host'),
+      id = a ? a.value : '', host = id && h && h.value.trim() ? h.value.trim() : id, count = null, opts = [];
+  if (id) opts.push({ value: 'device', label: 'This device (' + host + ')' });
+  opts.push({ value: 'scope', label: 'Devices matching a scope expression or group' });
+  opts.push({ value: 'fleet', label: 'Whole fleet' });
+  D.form({
+    title: 'Sync now',
+    body: 'Ask devices to re-send their installed-software inventory now instead of waiting for the daily sync. ' +
+          'Only connected devices on agent 0.13.1 or later respond, and one request reaches at most 500 devices.',
+    fields: [
+      { name: 'kind', label: 'Which devices', type: 'select', options: opts },
+      { name: 'expr', label: 'Scope expression or group', type: 'text', maxlength: 1024,
+        placeholder: 'ostype == "windows"  or  group:<id>',
+        hint: 'Used only for "Devices matching a scope expression or group".' }
+    ],
+    submitLabel: 'Review',
+    validate: function (v) { return v.kind === 'scope' && !v.expr.trim() ? 'Enter a scope expression or group:<id>.' : null; },
+    submit: function (v) {
+      var e = v.expr.trim();
+      count = null;
+      if (v.kind !== 'scope' || e.indexOf('group:') === 0) return Promise.resolve(null);
+      return D.request('POST', '/api/v1/scope/preview', { json: { expression: e } }).then(function (r) {
+        if (!r.ok) return r.message || ('Scope preview failed (' + r.status + ')');
+        count = r.data && r.data.data ? r.data.data.matched_count : null;
+        return count === 0 ? 'That scope matches no devices you can sync.' : null;
+      });
+    }
+  }).then(function (v) {
+    if (!v) return null;
+    var e = v.expr.trim(), body = { source: 'installed_software' }, what;
+    if (v.kind === 'device') { body.scope = id; what = '1 device (' + host + ') will be asked to re-send its software inventory.'; }
+    else if (v.kind === 'fleet') { body.scope = '__all__'; what = 'Every connected device you can reach will be asked to re-send its software inventory.'; }
+    else if (e.indexOf('group:') === 0) { body.scope = e; what = 'Every connected device in ' + e + ' will be asked to re-send its software inventory.'; }
+    else {
+      body.scope_expression = e;
+      what = (count === null ? 'The devices matching this scope' : count + ' device' + (count === 1 ? ' matches' : 's match') + ' this scope and') +
+             ' will be asked to re-send their software inventory.';
+    }
+    return D.confirm({ title: 'Sync now?', body: [what, 'Offline devices and agents older than 0.13.1 are skipped.'], confirmLabel: 'Sync now' })
+      .then(function (ok) { return ok ? D.request('POST', '/api/v1/hardware/sync', { json: body }) : null; });
+  }).then(function (r) { if (r) swSyncDone(r); }, function () { /* dialog busy or closed */ });
 }
 document.body.addEventListener('htmx:configRequest', function (e) {
   var p = e.detail.path || '';

@@ -15,6 +15,9 @@
 #include <string>
 #include <vector>
 
+// The shared full-page shell /software is served from (guardian_page_ui.cpp, global scope).
+extern const char* const kGuardianDetailPageHtml;
+
 using namespace yuzu::server;
 namespace swc = yuzu::server::software_catalogue;
 
@@ -763,6 +766,37 @@ TEST_CASE("software page: shell script is CSP-safe and wires the page's behaviou
     for (const char* never : {"hx-on", "new Function", "eval("})
         REQUIRE_FALSE(has(s, never));
     REQUIRE(s.rfind("<script>", 0) == 0);
+}
+
+// "Sync now" (device / scope or group / whole fleet). The button heads the Full page only; the
+// dialog is the shared one (the page shell loads it), built from the page script. Kills: dropping
+// the button, pointing the script at the per-device route, and an innerHTML sink for server text.
+TEST_CASE("software page: Sync now button and dialog script drive the fan-out route", "[inventory][ui]") {
+    const std::string h = full({}, page());
+    REQUIRE(has(h, "<div class=\"inv-titlerow\"><h1 class=\"inv-h1\">Software</h1><button type=\"button\" "
+                   "class=\"gp-btn accent\" data-act=\"sync\" onclick=\"swSync()\""));
+    REQUIRE(count_of(h, "data-act=\"sync\"") == 1);
+    REQUIRE_FALSE(has(render_software_page({}, page(), SoftwarePageMode::Results), "data-act=\"sync\""));
+
+    const std::string s = software_page_script();
+    for (const char* need : {"function swSync()", "function swSyncDone(", "window.YuzuDialog",
+                             "'/api/v1/hardware/sync'", "'/api/v1/scope/preview'", "installed_software",
+                             "body.scope = '__all__'", "body.scope_expression", "'This device ('",
+                             "Whole fleet", "Devices matching a scope expression or group", "'sw-agent'"})
+        REQUIRE(has(s, need));
+    // Not the per-device route (that one is /api/v1/hardware/{id}/sync), and server text is
+    // only ever written with textContent.
+    REQUIRE_FALSE(has(s, "'/api/v1/hardware/' +"));
+    const auto from = s.find("function swSyncDone(");
+    const auto to = s.find("document.body.addEventListener('htmx:configRequest'");
+    REQUIRE(from != std::string::npos);
+    REQUIRE(to != std::string::npos);
+    REQUIRE(from < to);
+    const std::string sync_js = s.substr(from, to - from);
+    REQUIRE(has(sync_js, "textContent"));
+    REQUIRE_FALSE(has(sync_js, "innerHTML"));
+    // The shared dialog module is loaded by the shell this script rides.
+    REQUIRE(has(kGuardianDetailPageHtml, "/static/yuzu-dialog.js"));
 }
 
 // The Inventory sources panel loads once with the full page and only there: the Results and
