@@ -3777,7 +3777,8 @@ TEST_CASE("OIDC JWKS: a document with no usable keys does not displace the cache
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-2")).has_value());
 }
 
-#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+// (Still inside the !YUZU_OIDC_MOCK_IDP_TSAN region opened above: this case uses the MockIdp
+// header's jwks_json(), which the TSan configuration does not compile.)
 
 // ── One malformed key does not discard its siblings (#5692 C7) ───────────────
 
@@ -3821,7 +3822,6 @@ TEST_CASE("OIDC JWKS: a key with a member of the wrong type is skipped - its sib
     CHECK_FALSE(OidcProvider::parse_jwks(R"({"keys":5})").has_value());
 }
 
-#ifndef YUZU_OIDC_MOCK_IDP_TSAN
 TEST_CASE("OIDC JWKS: a served set with one malformed key still verifies tokens under the good key",
           "[oidc][oidc_discovery][security]") {
     MockIdp idp;
