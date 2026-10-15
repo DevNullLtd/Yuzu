@@ -304,6 +304,7 @@ TEST_CASE("perf fragment: real aggregations, no suppression at the one-device fl
     CHECK(html.find("Fleet performance") != std::string::npos);
     CHECK(html.find("Performance") != std::string::npos); // the 5th subnav tab
     CHECK(html.find("n too small") == std::string::npos); // cohort "b" (4) is published
+    CHECK(html.find("below the floor of 1 reporting devices") != std::string::npos);
     CHECK(html.find("Windows and Linux") != std::string::npos); // coverage honesty (C1)
     CHECK(html.find("of 16 perf-capable online") != std::string::npos);
     CHECK(html.find("/fragments/dex/perf/devices?metric=cpu") != std::string::npos); // drill
@@ -523,6 +524,15 @@ TEST_CASE("device_context: pctiles, cohort floor, honest absence", "[dex][perf][
         CHECK(c10.cpu.cohort_pctile >= 0);
         REQUIRE(c10.cpu.cohort);
         CHECK_FALSE(dex_perf_cohorts(ten)[0].suppressed);
+    }
+    SECTION("no cohort comparison: only a cohort under the floor is called out") {
+        DexPerfDeviceContext ctx;
+        ctx.found = true;
+        ctx.reporting = true;
+        ctx.cohort_n = 3; // cleared the one-device floor but nothing resolved to compare
+        CHECK(render_dex_device_perf_context(ctx, "model", "7d").find("(floor") == std::string::npos);
+        ctx.cohort_n = 0;
+        CHECK(render_dex_device_perf_context(ctx, "model", "7d").find("(floor 1)") != std::string::npos);
     }
     SECTION("online but not reporting: found, not reporting, no pctiles") {
         snap.devices.push_back(dev("quiet", std::nullopt, std::nullopt, std::nullopt, "a"));

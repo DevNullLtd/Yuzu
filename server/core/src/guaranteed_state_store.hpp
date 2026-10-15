@@ -288,7 +288,8 @@ public:
     /// duty). `std::nullopt` on a degraded read (store-not-open / pool-timeout /
     /// query-error), never collapsed into an empty vector, same contract as
     /// `dex_signal_summary_checked`. Row order is unspecified (no ORDER BY):
-    /// `dex_apps_model_from_rows` owns the published ranking.
+    /// `dex_apps_model_from_rows` owns the published ranking. `app_limit` 0 returns
+    /// no rows, so `apps_total` is unreportable; callers pass a positive limit.
     std::optional<std::vector<DexAppStabilityRow>>
     dex_app_stability_checked(const std::string& since, const std::string& platform, int app_limit,
                               int version_limit, std::int64_t per_device_cap) const;

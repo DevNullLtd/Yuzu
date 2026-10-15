@@ -270,6 +270,16 @@ TEST_CASE("apps json: a small rate is serialised at full precision", "[dex][apps
     CHECK(j["apps"][0]["share_affected"]["estimate"].get<double>() == Approx(1e-6));
 }
 
+// The score takes the per-device-capped hang count, never the raw one.
+TEST_CASE("apps model: the score uses capped hangs not raw hangs", "[dex][apps_model]") {
+    const auto m = dex_apps_model_from_rows(
+        "7d", {total_row("a.exe", 12, 9, 7, 10, 5), total_row("b.exe", 12, 5, 7, 10, 5)}, 50, def());
+    REQUIRE(m.apps.size() == 2);
+    REQUIRE(m.apps[0].figures.score.score);
+    REQUIRE(m.apps[1].figures.score.score);
+    CHECK(*m.apps[0].figures.score.score == *m.apps[1].figures.score.score);
+}
+
 TEST_CASE("apps json: an empty model", "[dex][apps_model]") {
     DexAppsModel m;
     m.window = "7d";
@@ -291,5 +301,7 @@ TEST_CASE("apps json: a populated row carries the score object, rate and both ca
     CHECK(a["score"]["withheld"].is_null());
     CHECK(a["rate_per_1000"]["estimate"].get<double>() == Approx(300.0));
     CHECK(a["score"]["deductions"][0]["name"].is_string());
+    CHECK(a["score"]["deductions"][0].at("points").get<double>() == Approx(8.4)); // 60 * 7 / 50
+    CHECK(a["score"]["deductions"][0].at("assessed") == true);
     CHECK(a["versions"][0]["version"] == "1.0");
 }

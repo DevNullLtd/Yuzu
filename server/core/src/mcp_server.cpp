@@ -1592,7 +1592,7 @@ static const ToolDef kTools[] = {
      "Application and per-version stability list: every application with a Windows crash/hang "
      "signal in the window - the 100 applications affecting the most Windows devices (then "
      "crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then "
-     "name); apps_total counts every application with a Windows crash or hang signal in the "
+     "name in byte order); apps_total counts every application with a Windows crash or hang signal in the "
      "window and apps_truncated flags the cut; up to 20 versions each, versions_truncated flags "
      "that cut. Each row carries crashes, hangs, devices affected, "
      "the share of the reporting population affected (95 percent Wilson interval), events per "

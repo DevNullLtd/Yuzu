@@ -64,7 +64,7 @@ name-normalized guess. Attribution of repository/install/service signals to the
 originating app is a follow-on slice; the Apps tab today scopes to crash and
 hang signals only. The Apps API (`GET /api/v1/dex/apps`) now also carries per-version
 figures, the reporting population, exact intervals and the stability score with its
-decomposition; the tab itself follows in a later change. Tab counts are all platforms; the API counts Windows devices only, so the same application can show different crashes and devices on the two surfaces until the tab is rewired. Per-version crash/hang *counts* on the performance trend
+decomposition; the tab itself follows in a later change. Tab counts are all platforms; the API counts Windows devices only and keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut), so the same application can show different crashes and devices on the two surfaces until the tab is rewired. Per-version crash/hang *counts* on the performance trend
 (as opposed to the per-app crash/hang totals already shown here) are not
 rendered on the Apps tab; `GET /api/v1/dex/perf/app` carries them per version
 — see "Fleet-wide application performance" under Drill-downs.
@@ -147,7 +147,7 @@ server-side series store).
   from a central inventory column: tag the fleet via the tag API (see the
   asset-tagging guide) and the comparison appears. Honesty rules: the one-device floor
   means a cohort is published whenever at least one device reported (only an empty
-  cohort shows "n too small"), and devices without the chosen key always appear as an explicit
+  cohort shows "n too small"; a cohort keyed by a per-device tag value with one device is that device's exact figures), and devices without the chosen key always appear as an explicit
   **(untagged)** residual row.
 - **Everything drills.** Each metric card opens the worst devices by that
   metric; the Reporting card opens the devices *not* reporting; each cohort

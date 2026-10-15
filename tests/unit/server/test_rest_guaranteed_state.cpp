@@ -2460,6 +2460,7 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
     REQUIRE(spec["paths"].contains("/dex/apps"));
     const auto& apps_rsp = spec["paths"]["/dex/apps"]["get"]["responses"];
     REQUIRE(apps_rsp.contains("200"));
+    REQUIRE(apps_rsp.contains("400"));
     REQUIRE(apps_rsp.contains("503"));
     const auto desc = apps_rsp["200"]["description"].get<std::string>();
     CHECK(desc.find("versions_truncated") != std::string::npos);
@@ -2744,6 +2745,9 @@ TEST_CASE("REST dex/catalogue: invalid os / window -> 400, missing dex_api -> 50
         auto res = h.sink.Get("/api/v1/dex/catalogue");
         REQUIRE(res);
         CHECK(res->status == 503);
+        auto apps = h.sink.Get("/api/v1/dex/apps");
+        REQUIRE(apps);
+        CHECK(apps->status == 503);
     }
 }
 
@@ -3652,7 +3656,9 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         REQUIRE(res);
         CHECK(res->status == 200);
         auto j = nlohmann::json::parse(res->body);
-        CHECK(j["data"]["floor"].get<int64_t>() == 1); // the one-device floor, as a literal
+        // The one-device floor as a literal: deliberately not kDexCohortFloor, so a
+        // constant change breaks this wire pin.
+        CHECK(j["data"]["floor"].get<int64_t>() == 1);
         CHECK(j["data"]["key"].get<std::string>() == "model");
         CHECK(j["data"]["value"].get<std::string>() == "Latitude 5420");
     }
@@ -3742,6 +3748,14 @@ TEST_CASE("REST dex/perf/group: missing params → 400; provider absent → 503;
         auto j = nlohmann::json::parse(res->body);
         CHECK(j["data"]["floor"].get<int64_t>() == 1); // the one-device floor, as a literal
     }
+}
+
+TEST_CASE("REST dex/perf/cohort-diff: the one-device floor is echoed", "[pg][rest][dex][app_perf]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/perf/cohort-diff?a=x&b=y");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(nlohmann::json::parse(res->body)["data"]["floor"].get<int64_t>() == 1);
 }
 
 TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",

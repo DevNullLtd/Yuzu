@@ -628,7 +628,7 @@ TEST_CASE("DexApi: apps store read honours the window, the per-device cap and la
     }
     for (int i = 0; i < 7; ++i)
         seed_obs_v(store, id(), "c2", "cap.exe", "process.hung", "1.0", kTs);
-    seed_obs_v(store, id(), "c3", "cap.exe", "process.crashed", "1.0", old_ts); // outside 7d
+    seed_obs_v(store, id(), "c3", "cap.exe", "process.crashed", "2.0", old_ts); // outside 7d
     auto total_of = [](const std::vector<yuzu::server::DexAppStabilityRow>& rows) {
         for (const auto& r : rows)
             if (!r.version)
@@ -645,8 +645,82 @@ TEST_CASE("DexApi: apps store read honours the window, the per-device cap and la
     CHECK(t.capped_hangs == 5);
     CHECK(t.affected_devices == 2);
     CHECK(t.last_seen == later);
+    for (const auto& r : *week) // a version row caps its hangs per device too
+        if (r.version == "1.0.0.0")
+            CHECK(r.capped_hangs == 5);
     const auto all = store.dex_app_stability_checked("", "windows", 10, 20, 5);
     REQUIRE(all);
     CHECK(total_of(*all).affected_devices == 3);
     CHECK(total_of(*all).crashes == 9);
+    for (const auto& r : *all) // a version row's last_seen is its newest observation
+        if (r.version == "2.0.0.0")
+            CHECK(r.last_seen == later);
+}
+
+// Membership and version cuts: each SECTION seeds its own small store and reads the
+// statement directly, so a changed ORDER BY, COUNT or collation shows in the rows.
+TEST_CASE("DexApi: apps store cuts rank by devices, then events, then byte-order name",
+          "[pg][dex][apps_model]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int n = 0;
+    auto obs = [&](const char* agent, const char* app, const char* type, const char* ver) {
+        seed_obs_v(store, "mb" + std::to_string(++n), agent, app, type, ver, kTs);
+    };
+    const std::string since = yuzu::server::dex_iso_since(7);
+    auto kept = [&](int app_limit, int version_limit, bool versions) {
+        std::vector<std::string> out;
+        const auto rows = store.dex_app_stability_checked(since, "windows", app_limit, version_limit, 5);
+        REQUIRE(rows);
+        for (const auto& r : *rows)
+            if (r.version.has_value() == versions)
+                out.push_back(r.subject + (r.version ? "@" + *r.version : ""));
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    using Names = std::vector<std::string>;
+    SECTION("the version cut ranks by devices, not events, and breaks ties in byte order") {
+        obs("d1", "v.exe", "process.crashed", "2.0.0.0");
+        obs("d2", "v.exe", "process.crashed", "2.0.0.0");
+        for (int i = 0; i < 3; ++i)
+            obs("d3", "v.exe", "process.crashed", "1.0.0.9");
+        CHECK(kept(10, 1, true) == Names{"v.exe@2.0.0.0"});
+        // Under a locale collation that ignores dots "1.0.10.0" sorts before "1.0.1.9".
+        obs("d4", "t.exe", "process.crashed", "1.0.10.0");
+        obs("d5", "t.exe", "process.crashed", "1.0.1.9");
+        CHECK(kept(10, 1, true) == Names{"t.exe@1.0.1.9", "v.exe@2.0.0.0"});
+    }
+    SECTION("membership counts a device once even when it spans versions") {
+        for (const char* ver : {"1.0", "2.0"})
+            for (int i = 0; i < 5; ++i)
+                obs("sick", "sick.exe", "process.crashed", ver);
+        obs("p1", "pair.exe", "process.crashed", "1.0");
+        obs("p2", "pair.exe", "process.crashed", "1.0");
+        CHECK(kept(1, 20, false) == Names{"pair.exe"});
+    }
+    SECTION("an equal-devices equal-crashes tie is broken by hangs, then byte-order name") {
+        obs("d1", "a-plain.exe", "process.crashed", "1.0");
+        obs("d2", "z-hang.exe", "process.crashed", "1.0");
+        obs("d2", "z-hang.exe", "process.hung", "1.0");
+        CHECK(kept(1, 20, false) == Names{"z-hang.exe"});
+    }
+    SECTION("an all-equal tie falls to byte order, not database collation") {
+        obs("d1", "a.exe", "process.crashed", "1.0");
+        obs("d2", "B.exe", "process.crashed", "1.0");
+        CHECK(kept(1, 20, false) == Names{"B.exe"});
+    }
+    SECTION("apps_total names the cut exactly at app_limit and app_limit + 1") {
+        for (const char* app : {"x.exe", "y.exe", "z.exe"})
+            obs("d1", app, "process.crashed", "1.0");
+        const auto policy = yuzu::server::dex_default_score_policy();
+        for (int limit : {3, 2}) {
+            const auto rows = store.dex_app_stability_checked(since, "windows", limit, 20, 5);
+            REQUIRE(rows);
+            const auto m = yuzu::server::dex_apps_model_from_rows("7d", *rows, 20, policy);
+            CHECK(m.apps_total == 3);
+            CHECK(m.apps_truncated == (limit == 2));
+        }
+    }
 }

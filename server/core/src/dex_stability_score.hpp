@@ -98,10 +98,9 @@
  *   deductions are present together exactly when `withheld` is empty. No
  *   withheld result carries N, A or any count, whatever the reason. A page
  *   that shows a count from its own input may show N, and only N, for
- *   below_floor; never A, crash or
- *   hang counts, which are the individual behaviour the floor withholds, and
- *   never any count for no_population, inconsistent, invalid_weights or
- *   invalid_edges.
+ *   below_floor; never A, crash or hang counts, which are the individual
+ *   behaviour the floor withholds, and never any count for no_population,
+ *   inconsistent, invalid_weights or invalid_edges.
  * - The string vocabulary is closed and wire-stable: withheld reasons
  *   (no_population, invalid_weights, invalid_edges, inconsistent,
  *   below_floor), deduction names (breadth, crashes, hangs, regression) and

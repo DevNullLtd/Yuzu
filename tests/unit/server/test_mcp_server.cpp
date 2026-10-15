@@ -9541,6 +9541,7 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
         ts.call(
               R"({"jsonrpc":"2.0","method":"tools/call","id":57,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"model","a":"a","b":"b"}}})")
             ->body);
+    CHECK(diff["floor"] == 1); // the one-device floor as a literal, independent of the constant
     CHECK(diff["found_a"] == true);
     CHECK(diff["found_b"] == true);
     CHECK(diff["a"]["cohort"] == "a");

@@ -393,13 +393,13 @@ TEST_CASE("DexPerfApi group_trend()/tag_trend() REAL member resolution + kDexCoh
         CHECK((*trend)[0].cpu_mean == 5.0); // the exact mean is published
     }
 
-    SECTION("group_trend: at-floor member count passes (real metrics visible)") {
+    SECTION("group_trend: a ten-member group publishes real metrics") {
         ManagementGroup g;
         g.name = "AtFloorGroup";
         g.membership_type = "static";
         auto group_id = mgmt.create_group(g);
         REQUIRE(group_id.has_value());
-        // 10 members == kDexCohortFloor: passes, not suppressed.
+        // 10 members, well above the one-device floor: published, not suppressed.
         for (int i = 0; i < 10; ++i) {
             const std::string a = "gfloor-" + std::to_string(i);
             REQUIRE(mgmt.add_member(*group_id, a).has_value());

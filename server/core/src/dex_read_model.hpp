@@ -148,10 +148,13 @@ inline constexpr const char* kDexAppsPopulationBasis = "windows_online";
 /// policy): never render it as an empty or perfect list.
 struct DexAppsModel {
     std::string window;
-    std::optional<int64_t> population; ///< Windows devices online now; nullopt = no fleet source wired (unknown), 0 = no Windows device online
+    /// Windows devices online now; nullopt = no fleet source wired (unknown),
+    /// 0 = no Windows device online.
+    std::optional<int64_t> population;
     std::vector<DexAppStability> apps;
-    int64_t apps_total{0};       ///< every application with a Windows crash/hang signal in the window
-    bool apps_truncated{false};  ///< apps_total > apps.size(): the top-N cut dropped some
+    /// Every application with a Windows crash/hang signal in the window.
+    int64_t apps_total{0};
+    bool apps_truncated{false}; ///< apps_total > apps.size(): the top-N cut dropped some
     bool degraded{false};
 };
 
