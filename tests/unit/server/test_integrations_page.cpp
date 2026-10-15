@@ -113,7 +113,7 @@ TEST_CASE("integrations page: structure, loaders at the existing ids, CSP-safe m
     CHECK_THAT(html, ContainsSubstring("refreshDirectory from:body"));
     CHECK_THAT(html, ContainsSubstring("<script src=\"/static/yuzu-integrations-sync.js\" defer></script>"));
     // No inline script at all on this page: the script is the static file.
-    CHECK(count_of(html, "<script>") == 1); // the shell's own identity/online script only
+    CHECK(count_of(html, "<script>") == 2); // the shell's own two: identity/online and the header bell
 
     CHECK_THAT(html, !ContainsSubstring("hx-on"));
     static const std::regex inline_handler(R"re(\son[a-z]+\s*=)re");
