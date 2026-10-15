@@ -18,8 +18,9 @@
 namespace yuzu::server {
 
 /// Every quarantine/containment surface on /hardware (row pill + link, degrade banner, Quarantined
-/// devices panel, record banner, Containment tab and lens) is gated on this. The renderers, the
-/// /fragments/hardware/{quarantine,ci/containment} routes, REST and MCP are untouched.
+/// devices panel, record banner, Containment tab and lens) is gated on it. This is the DEFAULT of the runtime input `containment_ui` carried by
+/// HardwareRoutes::Deps, HardwareListPage and HwCiAffordances, so a test can drive both states. The
+/// renderers, the /fragments/hardware/{quarantine,ci/containment} routes, REST and MCP are untouched.
 // ponytail: UI hidden until the approval workflow lands; flip to true to restore
 inline constexpr bool kContainmentUi = false;
 

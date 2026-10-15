@@ -22,6 +22,7 @@
 
 #include "authz_gates.hpp"           // authz::FleetReadGate
 #include "command_capability.hpp"    // CommandCapability, ClassificationError
+#include "device_containment_render.hpp" // kContainmentUi
 #include "dex_routes.hpp"            // DexAgentResponse (ResponsesFn return type)
 #include "hardware_action_form.hpp"  // ActionFormSpec
 #include "hardware_list_model.hpp"
@@ -79,6 +80,9 @@ struct HwCiAffordances {
     // not swap a 403, so the lens body checks this first and renders an honest note
     // instead of an hx-get a caller without the permission could never see resolve.
     bool can_read_guaranteed_state{false};
+    /// Render the record banner placeholder, the Containment tab and the Containment lens body.
+    /// Copied from HardwareRoutes::Deps; the default is the compile-time kContainmentUi.
+    bool containment_ui{kContainmentUi};
 };
 
 /// The lens tab bar alone, id="hw-lens-bar" — factored out so a lens-only response
@@ -87,7 +91,8 @@ struct HwCiAffordances {
 /// changes which tab looks active). `oob=true` emits `hx-swap-oob="true"` on the
 /// wrapping div; the full record render uses `oob=false` since the bar is already
 /// in the right place in the DOM.
-std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob);
+std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob,
+                                     bool containment_ui = kContainmentUi);
 
 /// The CI record: back link + header (hostname/OS/online/last-seen/agent id/Sync now)
 /// + lens tabs + the active lens's body. `lens` in {"overview","software","tags","actions"}.
@@ -318,6 +323,10 @@ public:
         /// The authoritative active-quarantine read, for the list's Quarantined pill. Empty
         /// = no pill and no banner (the panel and lens have their own routes).
         QuarantineListFn quarantine_list_fn;
+        /// Show every quarantine/containment control on the Hardware pages. False: no pill,
+        /// row link, banner, panel, tab or lens, and no list-time quarantine read. The default is
+        /// kContainmentUi.
+        bool containment_ui{kContainmentUi};
         /// POST /api/v1/hardware/sync — the Software page's fleet/group/scope "Sync now".
         /// `sync_perm_fn` is the type-level Execution:Execute gate (it writes the 401/403).
         /// `sync_resolve_fn` turns a selector into the caller's visible target ids (already

@@ -10,7 +10,6 @@
 
 #include "app_shell.hpp"
 #include "authz_model.hpp"          // authz::in_scope
-#include "device_containment_render.hpp" // kContainmentUi
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
@@ -91,13 +90,13 @@ bool bad_hw_ident(std::string_view v) {
     });
 }
 
-std::string hw_lens_or_overview(const std::string& raw) {
+std::string hw_lens_or_overview(const std::string& raw, bool containment_ui) {
     static constexpr std::string_view kLenses[] = {"overview", "software", "tags",  "dex",
                                                    "guardian", "live",     "actions"};
     for (const auto l : kLenses)
         if (raw == l)
             return raw;
-    if (kContainmentUi && raw == "containment")
+    if (containment_ui && raw == "containment")
         return raw;
     return "overview";
 }
@@ -173,6 +172,7 @@ HwCiAffordances HardwareRoutes::affordances_for(const httplib::Request& req, con
     aff.can_write_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Write", id);
     aff.can_read_guaranteed_state =
         deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "GuaranteedState", "Read", id);
+    aff.containment_ui = deps_.containment_ui;
     return aff;
 }
 
@@ -243,10 +243,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                 "Inventory", "fleet", "hardware roster read failed");
             HardwareListPage degraded;
             degraded.query = *normalised;
+            degraded.containment_ui = deps_.containment_ui;
             send_html(res, render_hardware_list_fragment(degraded, false, /*roster_unavailable=*/true, results_only));
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        page.containment_ui = deps_.containment_ui;
         // DEX is scored ONLY on the page's rendered rows (device_routes.cpp's own
         // "score only rendered rows" rule) — a GROUP-BY per device is too costly to
         // run over the whole roster on every filter/sort/page click.
@@ -263,7 +265,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // list itself is the response): a 403 means "this caller may not see pills" and draws
         // none; an unavailable or unwired gate, or a degraded store, sets the banner flag and
         // no pill (absence is then not evidence).
-        if (kContainmentUi && deps_.quarantine_list_fn && !page.rows.empty()) {
+        if (deps_.containment_ui && deps_.quarantine_list_fn && !page.rows.empty()) {
             std::vector<std::string> page_ids;
             page_ids.reserve(page.rows.size());
             for (const auto& row : page.rows)
@@ -312,8 +314,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         // Allowlisted: the value reaches the audit detail and echoed markup, so an unknown
         // or oversized `lens` falls back to the overview rather than being carried through.
-        const std::string lens = hw_lens_or_overview(req.has_param("lens") ? req.get_param_value("lens")
-                                                                          : std::string{});
+        const std::string lens = hw_lens_or_overview(
+            req.has_param("lens") ? req.get_param_value("lens") : std::string{}, deps_.containment_ui);
         const bool lens_only = req.has_param("lens_only") && req.get_param_value("lens_only") == "1";
         if (!deps_.ci_detail_fn) {
             res.status = 503;
@@ -400,7 +402,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // bar re-swapped (the active tab hasn't changed), so it's skipped there.
             std::string body = render_hardware_lens_body(id, detail, lens, now_secs(), aff);
             if (!await_since)
-                body = render_hardware_lens_bar(id, lens, /*oob=*/true) + body;
+                body = render_hardware_lens_bar(id, lens, /*oob=*/true, aff.containment_ui) + body;
             send_html(res, body);
         } else {
             send_html(res, render_hardware_ci_fragment(id, detail, lens, now_secs(), aff));
