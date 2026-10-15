@@ -4700,14 +4700,16 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Permission:** `Infrastructure:Write`
 
-**Audit:** the change is applied before it is audited and is never rolled back. When the `config.update` audit row could not be written the response stays `200` and carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)).
+**Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
+
+**Cross-site writes.** A session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API, MCP and engine token callers are exempt.
 
 **Allowed keys** (the full set; source of truth is `kAllowedKeys` in
 `server/core/src/runtime_config_store.cpp`):
 
 | Key | Type | Takes effect | Description |
 |---|---|---|---|
-| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline |
+| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline. Minimum 30 (the default agent heartbeat interval); a lower value is refused `400` |
 | `response_retention_days` | integer | **stored only, not enforced - see note** | Days to retain command response data |
 | `audit_retention_days` | integer | **stored only, not enforced - see note** | Days to retain audit log entries |
 | `guardian_event_retention_days` | integer | **stored only, not enforced - see note** | Days to retain guaranteed-state events |
@@ -4848,6 +4850,10 @@ from caller-input validation at the seam so it never returns a `400`-shaped body
 A value of `0` for `heartbeat_timeout`, `response_retention_days` or `audit_retention_days` passes
 the route's `>= 0` pre-check and is then rejected by the store's own `> 0` check, so it returns the
 **bare** shape with a different message: `{ "error": "value must be a positive integer" }`.
+A `heartbeat_timeout` of `1` to `29` is refused the same way with
+`{ "error": "heartbeat_timeout must be at least 30 seconds (the default agent heartbeat interval)" }`:
+a window shorter than the agent heartbeat interval would mark every directly connected agent offline
+between two heartbeats.
 
 **Error (400) - the redaction placeholder submitted as a secret.** `GET /api/config` omits a
 secret's value and the startup log prints `<redacted>` in its place. Any value **containing** that
@@ -4862,7 +4868,7 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 { "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
 
-**Audit:** a successful write emits `config.update` / `RuntimeConfig` with `target_id` = the key.
+**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` before the change, then `success` (or `failure`). Only `success` carries the `detail`.
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
@@ -6740,7 +6746,7 @@ Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` con
 
 #### Developer and API page
 
-Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a read-only front for the discovery routes above. It adds no REST route and no MCP tool: its four panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process and take the same `Infrastructure:Read` gate as the REST twins.
+Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a read-only front for the discovery routes above. It adds no REST route and no MCP tool: its four panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row.
 
 - **API:** the OpenAPI document link and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes.
 - **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown.
@@ -10620,6 +10626,12 @@ A `from_result_set:<id-or-alias>` reference in the expression is resolved agains
 #### `POST /api/export/json-to-csv`
 
 Convert a JSON result set to CSV format for download.
+
+**Permission:** `Response:Read`. **Body:** a JSON array of objects, up to 100 MiB (the pre-auth body cap, [`json_to_csv_export`](#pre-auth-request-body-caps-2407)). The header row is the first object's keys.
+
+**Cells.** A string cell and every header have a leading `=`, `+`, `-`, `@`, tab or carriage return neutralised with a leading `'` (CWE-1236), then RFC 4180 quoting. A missing or `null` cell is empty. Any other non-string cell (number, boolean, nested value) is written as its JSON text with RFC 4180 quoting only, so `-5` stays `-5` and a nested object keeps its commas inside one cell; those values cannot spell a formula.
+
+**Errors.** `400` `request body nests too deeply` when the raw text nests more than 32 levels (checked before parsing); `400` `invalid JSON array` when the body is not an array of objects; `403` without `Response:Read`. The reply is `text/csv` with `Content-Disposition: attachment; filename="export.csv"`.
 
 ---
 

@@ -246,9 +246,10 @@ separately.
   (`log_level`). Both apply to this server process only, are stored, and are re-applied at restart;
   the log level then wins over `--log-level`. Neither is the dashboard sign-in expiry: that is the
   read-only **Dashboard idle timeout** (`--session-inactivity-secs`) and **Dashboard session
-  lifetime** (fixed, 8 hours) rows in the server-configuration table below the form. The audit row
-  for a runtime change is best-effort: if the audit write fails the change still applies and the
-  page shows a banner.
+  lifetime** (fixed, 8 hours) rows in the server-configuration table below the form. The heartbeat
+  timeout must be 30 seconds or more. Runtime changes are audited first: if the `attempted` audit
+  row cannot be written the change is refused and the page shows the error; if only the outcome row
+  is lost the change stays applied and the page shows a banner.
 - **Analytics** shows the event-collection status and the most recent buffered events (type,
   source, severity, time; no host or user).
 
