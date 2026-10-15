@@ -4762,7 +4762,7 @@ keys with a stored override, so a key can appear in `config` without appearing i
 
 Update a single runtime configuration value. The key must be one of the allowed runtime-configurable keys.
 
-**Permission:** `Infrastructure:Write`
+**Permission:** `Infrastructure:Write`. Writing an `oidc_*` key also needs the caller's own administrator role (the local account role, or the role mapped from the identity provider) from an interactive session: any session whose own role is not `admin` (an administrator only through a temporary elevation, or a non-administrator holding `Infrastructure:Write`) and any MCP-tier token gets `403` and the audit row `config.update / denied`, detail `elevated_session_oidc_setting_blocked` (elevation) or `admin_role_required_oidc_setting_blocked`. Every other key stays writable under `Infrastructure:Write`.
 
 **Audit:** audit-first (ADR-0033 section 9, no audit row, no mutation). An `attempted` `config.update` row is written before anything changes; if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and the key is neither stored nor applied. A `success` row follows a change, or a `failure` row a store refusal. If only that outcome row is lost the change stays applied and the `200` carries `Sec-Audit-Failed: true` (see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture)). Each accepted call therefore leaves two rows.
 
@@ -4827,17 +4827,19 @@ most keys:
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
   appear to have no effect - because it has none. Manage auto-approve through its own rules API.
-- **OIDC keys (see note)** - persisted only, and **a restart does not apply them either.** The
-  `OidcProvider` is constructed early in server startup (`server.cpp:1894`) from CLI/environment
-  configuration, whereas the stored runtime-config overrides are not read until much later in the
-  same startup (`server.cpp:3466`); nothing rebuilds the provider afterwards. So a value written
+- **OIDC keys (see note)** - persisted only for the provider, and **a restart does not rebuild it from
+  them.** The `OidcProvider` is constructed early in server startup from CLI/environment
+  configuration, whereas the stored runtime-config overrides are applied later in the same startup
+  (`apply_runtime_config_overrides()`); nothing rebuilds the provider afterwards. So a value written
   through this API never reaches the live provider, on this boot or any later one.
   **Only Settings -> OIDC (`POST /api/settings/oidc`) applies OIDC settings**, because that handler
   constructs a new provider and swaps it in - but that swap is **process-local**. The startup path
-  DOES read these keys out of the store, just too late to matter - the provider is already built and
-  nothing rebuilds it - so a restart runs on whatever the command line or environment supplies. To
+  DOES read these keys out of the store, just too late to matter to the provider - it is already built and
+  nothing rebuilds it - so a restart builds the provider from whatever the command line or environment supplies. To
   change OIDC durably, update that value as well as saving through Settings. This matters most for a credential rotation: a `PUT` of
   `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, never *in use*.
+  The stored `oidc_admin_group` is the exception: it does take effect after a restart, which is why
+  writing any `oidc_*` key needs your own administrator role.
 
 **Request body:**
 
@@ -4884,10 +4886,11 @@ another OIDC field, restart first so the process is not holding the old value.
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
 > 'value' in request body", `400` "invalid JSON body", `400` "request body nests too deeply"
-> (over 32 levels, `kMcpMaxJsonDepth`), and a `503` "runtime config store unavailable"
+> (over 32 levels, `kMcpMaxJsonDepth`), a `403` "changing sign-in provider settings needs your own
+> administrator role" (an `oidc_*` key written by a session whose own role is not `admin`), and a `503` "runtime config store unavailable"
 > when the runtime-config store is unavailable (`GET` and `PUT` now share the identical message; an
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
-> deliberate distinction, and has been unified). Note `503` is emitted by **both** sources, so status
+> deliberate distinction, and has been unified). Note `503` and `403` are emitted by **both** sources, so status
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
 > it, on every status. Two refusals added with the audit-first and same-site gates use the A4 envelope
 > (`correlation_id` present): `403` `cross-site request refused` and `503` `audit log unavailable; the
@@ -4938,7 +4941,7 @@ client secret contains `<redacted>`, rotate it at the IdP to a value that does n
 { "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
 
-**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error).
+**Audit:** a write emits `config.update` / `RuntimeConfig` with `target_id` = the key: `attempted` (empty `detail`) before the change, then `success` (`detail` is `value=<new value>`, redacted for a secret key) or `failure` (`detail` is the store's refusal text, or `store error; outcome unknown` for a database error). A refused `oidc_*` write (the caller's own role is not `admin`) emits `config.update` / `denied` (detail `elevated_session_oidc_setting_blocked` or `admin_role_required_oidc_setting_blocked`), stores nothing and is not preceded by an `attempted` row.
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
@@ -9508,7 +9511,7 @@ outcome's granularity.
 
 **`POST /api/settings/oidc`** — Save OIDC / Entra ID SSO configuration.
 
-- **Permission:** Admin only
+- **Permission:** Admin only, on the caller's own account (the local account role, or the administrator role mapped from the identity provider). A session that is administrator only through a temporary elevation gets `403`; audit `oidc.configure / denied / elevated_session_oidc_change_blocked`.
 - **Request body (form-encoded):**
 
 | Field | Type | Required | Description |
@@ -9521,7 +9524,7 @@ outcome's granularity.
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 - **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts to that value. Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
+- **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts the provider to that value (the stored `oidc_admin_group` still applies after a restart; see [When a change takes effect](#when-a-change-takes-effect)). Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
 **`POST /api/settings/oidc/test`** — Test OIDC discovery connectivity.
 
