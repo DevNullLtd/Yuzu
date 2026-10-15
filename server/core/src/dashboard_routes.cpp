@@ -3373,13 +3373,13 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // (corruption / tampering / pre-tri-state agent) instead of the source
         // being silently absent from the list.
         if (r.value_error) {
-            html += "<td><span class=\"source-pill\">" + html_escape(r.source) +
+            html += "<td><span class=\"badge badge-warning\">" + html_escape(r.source) +
                     "</span> <span class=\"badge badge-danger\" title=\"agent reported "
                     "&#39;" + html_escape(r.enabled_raw) +
                     "&#39; for this source's enabled flag — expected true/false; check the "
                     "agent's tar.db\">value error</span></td>";
         } else {
-            html += "<td><span class=\"source-pill\">" + html_escape(r.source) + "</span></td>";
+            html += "<td><span class=\"badge badge-warning\">" + html_escape(r.source) + "</span></td>";
         }
         // #558 — an agent that reported the source disabled but no paused_at
         // (paused_at == 0) is a pre-v0.12.0 agent that lacks the field. Render an
