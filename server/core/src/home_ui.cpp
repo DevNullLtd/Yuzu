@@ -37,7 +37,7 @@ constexpr Screen kPosture[] = {
      "M3 12a9 9 0 109-9 M3 4v5h5 M12 7v5l3 2"},
 };
 constexpr Screen kEstate[] = {
-    {"devices", "Devices", "/devices", "Every device, with tags, properties and quarantine.",
+    {"devices", "Devices", "/devices", "Every device, with tags and properties.",
      "M3 4h18v12H3z M8 20h8 M12 16v4"},
     {"hardware", "Hardware", "/hardware", "CPU, memory, disks and firmware across the fleet.",
      "M7 7h10v10H7z M9 3v4 M15 3v4 M9 17v4 M15 17v4 M3 9h4 M3 15h4 M17 9h4 M17 15h4"},
@@ -232,7 +232,8 @@ std::string render_landing(const LandingView& v) {
     out += R"(<span class="srv">)";
     // The page is reachable without a session, so the server name and the running
     // version (what an attacker looks up CVEs against) are shown to a signed-in
-    // user only: a signed-out visitor sees the brand, the form and the tiles.
+    // user only: a signed-out visitor sees the brand, the headline and the form, and the
+    // tiles (the screens behind the sign-in) only once signed in.
     if (v.who) {
         out += host;
         if (!host.empty())
@@ -250,7 +251,8 @@ std::string render_landing(const LandingView& v) {
     else
         append_sign_in(out, v);
     out += "</div></section>";
-    append_tiles(out);
+    if (v.who)
+        append_tiles(out);
     out += "</div>\n";
     if (!v.who)
         out += login_ui::sign_in_script();

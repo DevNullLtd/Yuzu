@@ -1,7 +1,7 @@
 /// @file test_home_ui.cpp
 /// Page pins for the landing and sign-in page (home_ui.{hpp,cpp}, login_ui.cpp):
-/// the fifteen tiles with the design's exact names and sentences, the family
-/// tokens, no shell (no sidebar, header bar, search, bell, badge or account
+/// the fifteen tiles (signed in only) with the design's exact names and sentences,
+/// the family tokens, no shell (no sidebar, header bar, search, bell, badge or account
 /// menu), no fragment loads, the signed-out and signed-in variants, the
 /// `next` allow-list, and the redirect location the auth chokepoint uses.
 
@@ -60,7 +60,7 @@ constexpr Expected kTable[] = {
     {"Posture", "Guardian", "/guardian", "Hold settings to the state you set and undo drift."},
     {"Posture", "DEX", "/dex", "See crashes, slow starts and noisy apps as users feel them."},
     {"Posture", "TAR", "/tar", "A recorded history of what ran and connected on each device."},
-    {"Estate", "Devices", "/devices", "Every device, with tags, properties and quarantine."},
+    {"Estate", "Devices", "/devices", "Every device, with tags and properties."},
     {"Estate", "Hardware", "/hardware", "CPU, memory, disks and firmware across the fleet."},
     {"Estate", "Software", "/software", "What is installed, how current it is, and roll out updates."},
     {"Estate", "Fleet", "/viz/fleet", "The estate as a 3D map. Open any machine and its processes."},
@@ -93,7 +93,7 @@ TEST_CASE("landing: fifteen tiles in five families with the design's exact names
     }
     CHECK(i == 15);
 
-    const auto html = home_ui::render_landing(signed_out());
+    const auto html = home_ui::render_landing(signed_in());
     CHECK(count_of(html, "<a class=\"tile\" href=\"") == 15);
     for (const auto& row : kTable) {
         CHECK_THAT(html, ContainsSubstring(std::string("<span class=\"tt\">") + row.name + "</span>"));
@@ -214,9 +214,26 @@ TEST_CASE("landing signed out with next: notice above the form and the key on th
     const auto html = home_ui::render_landing(v);
     CHECK_THAT(html, ContainsSubstring("id=\"signin\" aria-label=\"Sign in\" data-next=\"devices\">"));
     CHECK_THAT(html, ContainsSubstring("<div class=\"note\" id=\"signin-notice\">Sign in to open <b>Devices</b>.</div>"));
-    // Tiles stay real links to their screens; the server, not the tile, sends a signed-out click here.
-    CHECK_THAT(html, ContainsSubstring("<a class=\"tile\" href=\"/devices\">"));
+    // No tiles before sign-in: the screens sit behind the form.
+    CHECK(count_of(html, "class=\"tile\"") == 0);
     CHECK(count_of(html, "href=\"#signin\"") == 0);
+}
+
+TEST_CASE("landing signed out: brand, headline and sign-in only; no tiles", "[home][ui][login]") {
+    auto with_next = signed_out();
+    with_next.next = home_ui::screen_by_key("devices");
+    for (const auto& v : {signed_out(), with_next}) {
+        const auto html = home_ui::render_landing(v);
+        CHECK_THAT(html, ContainsSubstring("<a class=\"brand\" href=\"/home\""));
+        CHECK_THAT(html, ContainsSubstring("<h1>Ask every device a question.<br>Hold it to the state you set.</h1>"));
+        CHECK_THAT(html, ContainsSubstring("id=\"signin\""));
+        CHECK(count_of(html, "class=\"tiles") == 0);
+        CHECK(count_of(html, "class=\"tile\"") == 0);
+        CHECK(count_of(html, "class=\"fam ") == 0);
+        CHECK(count_of(html, "What you can do in Yuzu") == 0);
+        for (const auto& row : kTable)
+            CHECK(count_of(html, std::string("<span class=\"tt\">") + row.name + "</span>") == 0);
+    }
 }
 
 TEST_CASE("landing signed in: the signed-in region replaces the form, Open <area> or Open Dashboard, Sign out",
