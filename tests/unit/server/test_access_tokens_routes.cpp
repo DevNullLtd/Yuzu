@@ -337,6 +337,10 @@ TEST_CASE("principals routes: the EnginePrincipal:Read gate and the engine/MCP b
             CHECK(h.principal_list_calls == 0);
             CHECK(h.get_calls.empty());
             CHECK(h.audit_actions.size() == 1);  // the denial is recorded
+            // The A4 envelope (correlation id in body and header), not a hand-built string.
+            CHECK_THAT(res->body, ContainsSubstring("this credential cannot access this endpoint"));
+            CHECK_THAT(res->body, ContainsSubstring("\"correlation_id\""));
+            CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
             CHECK(h.audit_details.at(0) ==
                   (std::string(shape) == "mcp_tier" ? "mcp_session_denied" : "engine_session_denied"));
         }
@@ -536,6 +540,21 @@ TEST_CASE("principals routes: the audit trail's text and the REST check need Aud
     res = h.sink.dispatch("GET", "/fragments/access/principals/list");
     REQUIRE(res);
     CHECK_THAT(res->body, ContainsSubstring("data-check=\"1\""));
+}
+
+TEST_CASE("principals routes: an unanswered audit store for the revoke detail is unavailable not withheld",
+          "[access-tokens][routes]") {
+    Harness h;
+    h.got = std::optional<EnginePrincipalRow>{principal("bot", "revoked")};
+    h.revoke_detail = std::unexpected(std::string("audit down"));
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("(unavailable)"));
+    CHECK_THAT(res->body, !ContainsSubstring("withheld"));
+    CHECK_THAT(res->body, !ContainsSubstring("audit down"));
+    CHECK(h.revoke_calls == 1);
 }
 
 TEST_CASE("tokens routes: the static glue is served uncached as JavaScript",

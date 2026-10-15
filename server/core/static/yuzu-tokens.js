@@ -82,7 +82,7 @@
       .then(function (r) {
         if (r.status === 401) { location.assign('/login'); return null; }
         if (r.status === 403) {
-          setNote([noteBox('Running this check needs the AuditLog:Read permission.')]);
+          setNote([noteBox('Running this check needs the AuditLog:Read permission, or it could not be confirmed.')]);
           return null;
         }
         if (!r.ok) {

@@ -224,7 +224,7 @@ TEST_CASE("tokens page authz: a plain user with RBAC off sees only their own tok
 }
 
 TEST_CASE("tokens page authz: RBAC on and ApiTokenManager sees own tokens only (the filter follows "
-          "the account role, not the grant)",
+          "the account role and not the grant)",
           "[pg][access-tokens][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
     Rig r{db_.dsn()};
