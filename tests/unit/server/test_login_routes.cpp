@@ -104,7 +104,7 @@ TEST_CASE("GET /home?next=<key>: a known key drives the notice; paths, URLs and 
     }
 }
 
-TEST_CASE("GET /home signed in: the signed-in region in place, Open Console or Open <area>, no redirect",
+TEST_CASE("GET /home signed in: the signed-in region in place; Open Console or Open <area>; no redirect",
           "[login][home][route][next]") {
     Harness h;
     h.wire();

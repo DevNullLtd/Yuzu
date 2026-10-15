@@ -408,7 +408,7 @@ TEST_CASE("general page: both confirms and the audit-failure header are present"
     CHECK(section_end < feedback);
 }
 
-TEST_CASE("general page: six colour schemes as radios, whitelisted on read and write, guarded",
+TEST_CASE("general page: six colour schemes as radios; whitelisted on read and write; guarded",
           "[general][settings][page][theme]") {
     const std::string html = kSettingsGeneralHtml;
     // One radio per scheme, slate pre-checked, each with its own inline swatch colours (the live

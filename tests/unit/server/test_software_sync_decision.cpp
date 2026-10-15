@@ -103,7 +103,7 @@ TEST_CASE("sync request: each scope spelling lands on exactly one arm", "[server
     }
 }
 
-TEST_CASE("sync request: ambiguous, empty or mistyped selectors are refused", "[server][software_sync]") {
+TEST_CASE("sync request: ambiguous; empty or mistyped selectors are refused", "[server][software_sync]") {
     const char* bad[] = {
         R"({})",                                                   // names nothing: never "everyone"
         R"({"scope":""})",                                         // present but empty
@@ -154,7 +154,7 @@ TEST_CASE("sync request: both spellings of an empty group name are refused with 
     CHECK(one->arm == DispatchArm::Group);
 }
 
-TEST_CASE("sync request: only a group, scope or fleet run needs the run guard", "[server][software_sync]") {
+TEST_CASE("sync request: only a group; scope or fleet run needs the run guard", "[server][software_sync]") {
     CHECK_FALSE(ss::needs_run_guard(DispatchArm::Ids));
     CHECK(ss::needs_run_guard(DispatchArm::Group));
     CHECK(ss::needs_run_guard(DispatchArm::Scope));
@@ -163,7 +163,7 @@ TEST_CASE("sync request: only a group, scope or fleet run needs the run guard", 
 
 // ── partition ─────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync partition: offline, other-replica, too-old and unparseable are counted, not sent",
+TEST_CASE("sync partition: offline; other-replica; too-old and unparseable are counted; not sent",
           "[server][software_sync]") {
     const std::vector<ss::Candidate> in = {
         cand("a", "0.13.1"),          // exactly the floor
@@ -212,7 +212,7 @@ TEST_CASE("sync partition: an agent on another replica is never sent to and neve
           ss::Verdict::Proceed);
 }
 
-TEST_CASE("sync partition: nothing in, nothing out", "[server][software_sync]") {
+TEST_CASE("sync partition: nothing in; nothing out", "[server][software_sync]") {
     const auto p = ss::partition({}, floor_ok);
     CHECK(p.targets.empty());
     CHECK(p.counts.requested == 0);
@@ -255,7 +255,7 @@ TEST_CASE("sync decide: only an unfiltered caller may name the whole fleet", "[s
     CHECK_FALSE(ss::fleet_wide_denied(DispatchArm::Group, false));
 }
 
-TEST_CASE("sync decide: the cap is on what is reached, and 500 itself is allowed", "[server][software_sync]") {
+TEST_CASE("sync decide: the cap is on what is reached; and 500 itself is allowed", "[server][software_sync]") {
     CHECK(ss::kMaxTargets == 500);
     CHECK(ss::decide(DispatchArm::Group, true, {.requested = 500, .reached = 500}) == ss::Verdict::Proceed);
     CHECK(ss::decide(DispatchArm::Group, true, {.requested = 501, .reached = 501}) == ss::Verdict::TooMany);
@@ -270,7 +270,7 @@ TEST_CASE("sync decide: the cap is on what is reached, and 500 itself is allowed
 
 // ── cooldown ──────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync cooldown: 60 s per operator, boundary exact, a stamp from the future is stale",
+TEST_CASE("sync cooldown: 60 s per operator; boundary exact; a stamp from the future is stale",
           "[server][software_sync]") {
     CHECK(ss::kCooldownSecs == 60);
     CHECK(ss::cooldown_remaining(std::nullopt, 1000) == 0);       // never ran
@@ -284,7 +284,7 @@ TEST_CASE("sync cooldown: 60 s per operator, boundary exact, a stamp from the fu
     CHECK(ss::cooldown_remaining(1000, -5) == 0);
 }
 
-TEST_CASE("sync cooldown state: bounded, oldest stamp evicted, a returning operator never evicts",
+TEST_CASE("sync cooldown state: bounded; oldest stamp evicted; a returning operator never evicts",
           "[server][software_sync]") {
     std::unordered_map<std::string, std::int64_t> state;
     CHECK_FALSE(ss::last_run_of(state, "alice").has_value());
@@ -311,7 +311,7 @@ TEST_CASE("sync cooldown state: bounded, oldest stamp evicted, a returning opera
 
 // ── wording ───────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync audit token: control bytes and field delimiters defanged, length bounded",
+TEST_CASE("sync audit token: control bytes and field delimiters defanged; length bounded",
           "[server][software_sync]") {
     CHECK(ss::audit_token("plain") == "plain");
     CHECK(ss::audit_token("a\r\nb\tc\x7f") == "a__b_c_");
@@ -330,7 +330,7 @@ TEST_CASE("sync audit target: an expression never becomes an identifier", "[serv
     CHECK(ss::target_label({DispatchArm::Ids, "host-01"}) == "host-01");
 }
 
-TEST_CASE("sync audit detail carries scope, arm and all four counts", "[server][software_sync]") {
+TEST_CASE("sync audit detail carries scope; arm and all four counts", "[server][software_sync]") {
     ss::Selector sel{DispatchArm::Group, "group:finance"};
     const ss::Counts c{.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2,
                        .skipped_other_replica = 4};
@@ -371,7 +371,7 @@ TEST_CASE("sync audit detail: a hostile expression cannot forge a neighbouring c
     }
 }
 
-TEST_CASE("sync summary: counts only, never a per-device list", "[server][software_sync]") {
+TEST_CASE("sync summary: counts only; never a per-device list", "[server][software_sync]") {
     const auto j = ss::summary_json({.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2,
                                      .skipped_other_replica = 4},
                                     "__sync__-fleet-1-ab", 1700000000);
@@ -405,7 +405,7 @@ TEST_CASE("sync resolve: a group and a scope are confined to the caller's visibl
     }
 }
 
-TEST_CASE("sync resolve: present-but-empty visible set is deny-all, nullopt is unfiltered",
+TEST_CASE("sync resolve: present-but-empty visible set is deny-all; nullopt is unfiltered",
           "[server][software_sync][security]") {
     Fakes f;
     const ss::Selector sel{DispatchArm::Broadcast, "__all__"};
@@ -422,7 +422,7 @@ TEST_CASE("sync resolve: present-but-empty visible set is deny-all, nullopt is u
     CHECK(all.caller_unfiltered);
 }
 
-TEST_CASE("sync resolve: an Ids-arm device the caller cannot see is dropped, never reported",
+TEST_CASE("sync resolve: an Ids-arm device the caller cannot see is dropped; never reported",
           "[server][software_sync][security]") {
     Fakes f;
     const ss::Selector sel{DispatchArm::Ids, "hidden-host"};
@@ -464,7 +464,7 @@ TEST_CASE("sync resolve: broadcast reads the fleet once and nothing else", "[ser
     CHECK(f.scope_calls == 0);
 }
 
-TEST_CASE("sync resolve: a group asks the store for the id after the prefix, and a degraded store aborts",
+TEST_CASE("sync resolve: a group asks the store for the id after the prefix; and a degraded store aborts",
           "[server][software_sync][security]") {
     Fakes f;
     f.group = Ids{"m1", "m2"};
@@ -498,7 +498,7 @@ TEST_CASE("sync resolve: a group asks the store for the id after the prefix, and
     CHECK(g.group_calls == 0);
 }
 
-TEST_CASE("sync resolve: a scope is invalid, aborted, or matched - and only matched is Ok",
+TEST_CASE("sync resolve: a scope is invalid; aborted; or matched - and only matched is Ok",
           "[server][software_sync][security]") {
     const ss::Selector sel{DispatchArm::Scope, R"(tag:prod AND ostype == "linux")"};
     Fakes f;
@@ -532,7 +532,7 @@ TEST_CASE("sync resolve: a scope is invalid, aborted, or matched - and only matc
     CHECK(unknown.detail == "unknown");
 }
 
-TEST_CASE("sync resolve: an abort still reports the caller's filter state, with no ids",
+TEST_CASE("sync resolve: an abort still reports the caller's filter state; with no ids",
           "[server][software_sync][security]") {
     Fakes f;
     f.group = std::nullopt;
@@ -544,7 +544,7 @@ TEST_CASE("sync resolve: an abort still reports the caller's filter state, with 
     CHECK(open.caller_unfiltered);
 }
 
-TEST_CASE("sync resolve: no target, or an unwired store read, is Aborted - never an empty Ok",
+TEST_CASE("sync resolve: no target; or an unwired store read; is Aborted - never an empty Ok",
           "[server][software_sync][security]") {
     Fakes f;
     const auto none = ss::resolve_targets({DispatchArm::None, ""}, authz::VisibleSet{}, f.expansion());
@@ -605,7 +605,7 @@ struct FanOutProbe {
 
 } // namespace
 
-TEST_CASE("sync fan_out: ONE command id is minted, prepared once and shared by every send",
+TEST_CASE("sync fan_out: ONE command id is minted; prepared once and shared by every send",
           "[server][software_sync]") {
     FanOutProbe p;
     const auto r = p.run({"a", "b", "c"});
@@ -715,7 +715,7 @@ TEST_CASE("sync resolve: a named device is checked against the live set too", "[
     CHECK(gone.fleet_live.empty()); // offline everywhere
 }
 
-TEST_CASE("sync resolve: without a live read nothing is claimed to be attached elsewhere, and an empty "
+TEST_CASE("sync resolve: without a live read nothing is claimed to be attached elsewhere; and an empty "
           "answer reads nothing",
           "[server][software_sync]") {
     Fakes f;

@@ -1254,7 +1254,7 @@ void check_list_has_no_containment_ui(const std::string& body) {
 
 // Kills: a pill, row link or banner leaking back in, or the quarantine store / Security:Read
 // gate still being consulted (cost + denied-audit noise) for a surface nobody can see.
-TEST_CASE("route: list — no quarantine pill or row link and no quarantine read, even with active records",
+TEST_CASE("route: list — no quarantine pill or row link and no quarantine read; even with active records",
           "[hardware][route][quarantine]") {
     HwHarness h(false, false, /*quarantine_list_wired=*/true);
     h.roster_rows = {make_row("a-on-page", "PAGE-HOST", "linux", true),
@@ -1310,7 +1310,7 @@ TEST_CASE("route: list — neither the full render nor results_only carries the 
 
 // Kills: the fragment writing an attacker `lens` into the audit detail / echoed markup, and
 // `lens=containment` still reaching the containment lens placeholder.
-TEST_CASE("route: ci fragment — lens is allowlisted; unknown, oversized or containment falls back to overview",
+TEST_CASE("route: ci fragment — lens is allowlisted; unknown; oversized or containment falls back to overview",
           "[hardware][route][quarantine]") {
     HwHarness h;
     h.ci_detail.identity = make_row("agent-1", "HOST-1", "linux", true);

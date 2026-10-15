@@ -433,7 +433,7 @@ TEST_CASE("app shell: re-baking keeps exactly one bell, style and script", "[nav
     CHECK(twice.find("var POLL_MS=") < twice.find(kShellEnd));
 }
 
-TEST_CASE("app shell: the colour-scheme boot script runs first, whitelisted and guarded",
+TEST_CASE("app shell: the colour-scheme boot script runs first; whitelisted and guarded",
           "[nav][shell][theme]") {
     const auto html = render_shell({});
     // First thing inside the chrome: before the shell CSS and sidebar, so a saved scheme is

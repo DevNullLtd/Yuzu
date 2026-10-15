@@ -72,7 +72,7 @@ TEST_CASE("dashboard page: rows appear in the delta's order", "[dashboard][ui]")
     CHECK(count_of(html, "<!--yuzu:shell-->") == 1);
 }
 
-TEST_CASE("dashboard page: the user-visible name is Console, not Dashboard", "[dashboard][ui]") {
+TEST_CASE("dashboard page: the user-visible name is Console; not Dashboard", "[dashboard][ui]") {
     const std::string html = page();
     // Title, heading, footer and the command-palette entry for `/`.
     CHECK(count_of(html, "<title>Yuzu — Console</title>") == 1);

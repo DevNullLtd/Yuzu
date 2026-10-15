@@ -158,7 +158,7 @@ nlohmann::json parse(const std::string& s) { return nlohmann::json::parse(s, nul
 
 // ── happy path ────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync route: a fleet run is 202 with counts only, audited before anything is sent",
+TEST_CASE("sync route: a fleet run is 202 with counts only; audited before anything is sent",
           "[hardware][sync_fanout][route]") {
     SyncHarness h;
     h.live(4);
@@ -193,7 +193,7 @@ TEST_CASE("sync route: a fleet run is 202 with counts only, audited before anyth
           "skipped_other_replica=0");
 }
 
-TEST_CASE("sync route: a device connected to another replica is reported on its own, never as offline",
+TEST_CASE("sync route: a device connected to another replica is reported on its own; never as offline",
           "[hardware][sync_fanout][route]") {
     SyncHarness h;
     h.live(6); // d0..d5
@@ -272,7 +272,7 @@ TEST_CASE("sync route: a single named device is allowed and needs no cooldown",
     CHECK(h.audit_rows.back() == "inventory.sync.request|requested|Agent|host-01");
 }
 
-TEST_CASE("sync route: nothing live to reach is 202 with reached 0, audited no_agents, nothing sent",
+TEST_CASE("sync route: nothing live to reach is 202 with reached 0; audited no_agents; nothing sent",
           "[hardware][sync_fanout][route]") {
     SyncHarness h;
     h.live(3);
@@ -390,7 +390,7 @@ TEST_CASE("sync route: only a fleet request asks the pre-check", "[hardware][syn
     CHECK(h.precheck_calls == 1);
 }
 
-TEST_CASE("sync route: malformed requests are 400, audited denied, and never reach the resolver",
+TEST_CASE("sync route: malformed requests are 400; audited denied; and never reach the resolver",
           "[hardware][sync_fanout][route]") {
     const char* bad[] = {
         "",                                                   // no body
@@ -426,7 +426,7 @@ TEST_CASE("sync route: an unparseable scope expression is 400 and sends nothing"
     CHECK(h.audited("denied"));
 }
 
-TEST_CASE("sync route: a scope that could not be evaluated is 503, never 'no matches'",
+TEST_CASE("sync route: a scope that could not be evaluated is 503; never 'no matches'",
           "[hardware][sync_fanout][route][security]") {
     SyncHarness h;
     h.resolved.status = ss::Resolved::Status::Aborted;
@@ -442,7 +442,7 @@ TEST_CASE("sync route: a scope that could not be evaluated is 503, never 'no mat
 
 // ── bounds ────────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync route: 501 reachable devices is 413 with the count, 500 is allowed",
+TEST_CASE("sync route: 501 reachable devices is 413 with the count; 500 is allowed",
           "[hardware][sync_fanout][route][security]") {
     {
         SyncHarness h;
@@ -470,7 +470,7 @@ TEST_CASE("sync route: 501 reachable devices is 413 with the count, 500 is allow
     }
 }
 
-TEST_CASE("sync route: the cap counts devices that will be sent to, not devices merely named",
+TEST_CASE("sync route: the cap counts devices that will be sent to; not devices merely named",
           "[hardware][sync_fanout][route]") {
     SyncHarness h;
     h.live(700);
@@ -485,7 +485,7 @@ TEST_CASE("sync route: the cap counts devices that will be sent to, not devices 
     CHECK(d["skipped_offline"] == 300);
 }
 
-TEST_CASE("sync route: the cooldown is exactly 60 s per operator, on the injected clock",
+TEST_CASE("sync route: the cooldown is exactly 60 s per operator; on the injected clock",
           "[hardware][sync_fanout][route]") {
     SyncHarness h;
     h.live(2);
@@ -572,7 +572,7 @@ TEST_CASE("sync route: a run already in flight makes a second one 409 and sends 
     CHECK(h.post(R"({"scope":"__all__"})")->status == 202);
 }
 
-TEST_CASE("sync route: the same operator overlapping a run gets 409 from the slot, not a second run",
+TEST_CASE("sync route: the same operator overlapping a run gets 409 from the slot; not a second run",
           "[hardware][sync_fanout][route]") {
     SyncHarness h;
     h.live(2);
@@ -706,7 +706,7 @@ TEST_CASE("sync route: a missing dependency is an AUDITED 500 and nothing runs",
     }
 }
 
-TEST_CASE("sync route: with no audit sink the unwired refusal is still a 500, and audit-off still serves",
+TEST_CASE("sync route: with no audit sink the unwired refusal is still a 500; and audit-off still serves",
           "[hardware][sync_fanout][route]") {
     {
         SyncWiring w;

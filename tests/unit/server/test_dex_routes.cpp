@@ -1293,7 +1293,7 @@ TEST_CASE("DEX routes: /dex lights DEX in the sidebar and ends the breadcrumb on
 // Kills: the Trends depth rules in the page shell (guardian_page_ui.cpp) going missing or turning
 // into literal colours. They sit in the baked page, not in a /fragments/dex payload, so the
 // fragment goldens never see them. Same Postgres-free harness as the sidebar test above.
-TEST_CASE("DEX routes: /dex page shell carries the Trends depth rules, tokens only",
+TEST_CASE("DEX routes: /dex page shell carries the Trends depth rules; tokens only",
           "[dex][routes][ui]") {
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});

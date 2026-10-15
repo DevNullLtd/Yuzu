@@ -112,7 +112,7 @@ TEST_CASE("landing: fifteen tiles in five families with the design's exact names
     CHECK(count_of(html, "<img") == 0);
 }
 
-TEST_CASE("landing: the head carries the first-paint theme boot, one inline script, whitelisted",
+TEST_CASE("landing: the head carries the first-paint theme boot; one inline script; whitelisted",
           "[home][ui][theme]") {
     for (const auto& html : {home_ui::render_landing(signed_out()), home_ui::render_landing(signed_in())}) {
         const auto head_end = html.find("</head><body>");
@@ -244,7 +244,7 @@ TEST_CASE("landing signed out with next: notice above the form and the key on th
     CHECK(count_of(html, "href=\"#signin\"") == 0);
 }
 
-TEST_CASE("landing signed out: brand, headline and sign-in only; no tiles", "[home][ui][login]") {
+TEST_CASE("landing signed out: brand; headline and sign-in only; no tiles", "[home][ui][login]") {
     auto with_next = signed_out();
     with_next.next = home_ui::screen_by_key("devices");
     for (const auto& v : {signed_out(), with_next}) {
@@ -261,7 +261,7 @@ TEST_CASE("landing signed out: brand, headline and sign-in only; no tiles", "[ho
     }
 }
 
-TEST_CASE("landing signed in: the signed-in region replaces the form, Open <area> or Open Console, Sign out",
+TEST_CASE("landing signed in: the signed-in region replaces the form; Open <area> or Open Console; Sign out",
           "[home][ui][login]") {
     const auto html = home_ui::render_landing(signed_in());
     CHECK_THAT(html, ContainsSubstring("<section class=\"panel login\" id=\"signed-in\" aria-label=\"Signed in\">"));

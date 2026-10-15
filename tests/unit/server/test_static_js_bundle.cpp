@@ -1290,7 +1290,7 @@ TEST_CASE("static_js_bundle: the contrast calculator matches the WCAG reference 
     CHECK(std::abs(wcag_contrast({0x76, 0x76, 0x76}, {255, 255, 255}) - 4.54) < 0.01);
 }
 
-TEST_CASE("static_js_bundle: every colour scheme keeps text, action and heading colours legible",
+TEST_CASE("static_js_bundle: every colour scheme keeps text; action and heading colours legible",
           "[static-js][yuzu-css][theme][contrast]") {
     const std::string_view css = yuzu::server::kYuzuCss;
     for (const std::string_view scheme : {"slate", "navy", "jade", "light", "light-baby", "light-hot"}) {
