@@ -44,8 +44,10 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
   lands. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
   plugin and the role-gated quarantine instructions on the Instructions page all work as
   before, and server-side enforcement does not depend on the UI. While the controls are
-  hidden, an operator who needs to see or release a quarantined device uses
-  `GET`/`DELETE /api/v1/quarantine` (or the MCP tools). No configuration change is needed.
+  hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
+  ends the server record only; to remove the device's firewall rules, run the quarantine
+  plugin's `unquarantine` instruction from the Instructions page (or through
+  `execute_instruction`) and confirm with `status`. No configuration change is needed.
 - **Colour schemes.** Settings > General > Appearance now offers six schemes (Slate stays
   the default). The choice is stored in the browser, not on the server.
 
