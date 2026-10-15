@@ -276,7 +276,31 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # Merged onto the Estate changes: the count is the value the checker reports on the merged
 # tree, set from its output.
-BASELINE_UNTWINNED = 209
+#
+# Access Users page (#5880): re-surfaces the untwinned Settings users list as two read-only
+# fragments, GET /fragments/access/users/list (planned:#2146) and .../detail (composed-of the
+# list), +2. A GET /api/v1/users twin is not built here; the Settings rows and these two
+# are retired together when that twin lands.
+#
+# Tokens and principals page (#5880): re-surfaces the untwinned Settings token and principal
+# lists as three read-only fragments, GET /fragments/access/tokens/list, .../principals/list
+# and .../principals/detail (each planned:#2146), +3. The token list is not a twin of the
+# self-only GET /api/v1/tokens (an administrator on a cookie session sees every owner). The two
+# principal fragments share GET /api/v1/engine-principals' EnginePrincipal:Read gate but add the
+# page's roles/credentials composition and an audit-gated revocation detail, so they are not
+# ledgered as twins here. Merged with the 207 above, the two Access pages make 212 (207 + 2 + 3),
+# the value the checker reports on the merged tree, not hand-picked. The ADR-1005 exception
+# recorded for the four Dashboard fragments does not cover these rows; whether to extend it is
+# the owner's decision on #5880.
+#
+# Access pages merged onto the Estate changes: the count is the value the checker reports on the
+# merged tree, set from its output.
+#
+# System General and Data pages (#5873): re-surfaces the untwinned General runtime and analytics
+# events settings as GET /fragments/settings/general-runtime and /fragments/settings/analytics-events,
+# +2. Merged with the Access pages (212 above), the count is 214, the value the checker reports on the
+# merged tree, not hand-picked. Whether the ADR-1005 exception extends to these rows is the owner's decision on #5873.
+BASELINE_UNTWINNED = 214
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

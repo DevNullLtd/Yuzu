@@ -1145,6 +1145,8 @@ log "═════════════════════════
 SETTINGS_FRAGMENTS=(
     "/fragments/settings/tls"
     "/fragments/settings/users"
+    "/fragments/access/users/list"
+    "/fragments/access/users/detail"
     "/fragments/settings/tokens"
     "/fragments/settings/pending"
     "/fragments/settings/auto-approve"
@@ -1171,6 +1173,9 @@ SETTINGS_FRAGMENTS=(
     "/fragments/workflow-runs/e2e-no-such-run"
     "/fragments/settings/general-runtime"
     "/fragments/settings/analytics-events"
+    "/fragments/access/tokens/list"
+    "/fragments/access/principals/list"
+    "/fragments/access/principals/detail"
 )
 
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do
