@@ -112,6 +112,31 @@ TEST_CASE("landing: fifteen tiles in five families with the design's exact names
     CHECK(count_of(html, "<img") == 0);
 }
 
+TEST_CASE("landing: the head carries the first-paint theme boot, one inline script, whitelisted",
+          "[home][ui][theme]") {
+    for (const auto& html : {home_ui::render_landing(signed_out()), home_ui::render_landing(signed_in())}) {
+        const auto head_end = html.find("</head><body>");
+        REQUIRE(head_end != std::string::npos);
+        const auto head = html.substr(0, head_end);
+        // Exactly one inline script (the only other head script is the htmx src), and it runs
+        // in the head, before any body content paints.
+        std::size_t inline_scripts = 0;
+        for (auto p = head.find("<script>"); p != std::string::npos; p = head.find("<script>", p + 1))
+            ++inline_scripts;
+        CHECK(inline_scripts == 1);
+        const auto from = head.find("<script>");
+        REQUIRE(from != std::string::npos);
+        const auto script = head.substr(from, head.find("</script>", from) - from);
+        // Reads the stored key inside try/catch, accepts an EXACT whitelist of the six names,
+        // and sets data-theme on the root element.
+        CHECK_THAT(script, ContainsSubstring("try{"));
+        CHECK_THAT(script, ContainsSubstring("}catch(e){}"));
+        CHECK_THAT(script, ContainsSubstring("localStorage.getItem('yuzu-theme')"));
+        CHECK_THAT(script, ContainsSubstring("/^(slate|navy|jade|light|light-baby|light-hot)$/.test("));
+        CHECK_THAT(script, ContainsSubstring("document.documentElement.setAttribute('data-theme',"));
+    }
+}
+
 TEST_CASE("landing: no shell, no header-bar controls, no bell, no fragment loads, no data",
           "[home][ui]") {
     for (const auto& html : {home_ui::render_landing(signed_out()), home_ui::render_landing(signed_in())}) {
