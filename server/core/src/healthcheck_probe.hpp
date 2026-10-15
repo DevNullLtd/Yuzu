@@ -35,8 +35,10 @@ static_assert(kProbeDeadline < std::chrono::seconds(5),
 [[nodiscard]] std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& target);
 #endif
 
-/// One GET against `target`. Never throws; a transport or TLS failure is
-/// reported as status 0 plus a reason. `max_total_ms` is the request-phase
+/// One GET against `target`. A transport or TLS failure is reported as status 0
+/// plus a reason; an exception escaping httplib (0.37.1 reserves the response
+/// body on a peer-claimed Content-Length before its payload ceiling applies) is
+/// translated by run_healthcheck, never propagated. `max_total_ms` is the request-phase
 /// ceiling handed to httplib::set_max_timeout; it does not cover name
 /// resolution or the TLS handshake (see probe_bounded).
 [[nodiscard]] HealthcheckOutcome probe_once(const HealthcheckTarget& target,
@@ -54,7 +56,8 @@ probe_bounded(std::chrono::milliseconds deadline, std::function<HealthcheckOutco
 /// Entry point for `yuzu-server --healthcheck`. Writes one diagnostic line to
 /// `diag` on failure and nothing on success; returns the process exit code. The
 /// whole probe is cut off at `deadline` (a timeout calls `hard_exit`, which does
-/// not return in production). The three trailing parameters are the injection
+/// not return in production). An exception thrown by `probe` is reported as a
+/// failure (exit 1, one line naming it). The three trailing parameters are the injection
 /// points a test drives; the defaults ARE production: `probe_once`,
 /// `kProbeDeadline` and `std::_Exit`. On POSIX it also sets SIGPIPE to ignored
 /// before the first socket write (see healthcheck_probe.cpp).

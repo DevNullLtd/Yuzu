@@ -4,6 +4,7 @@
 
 #include <csignal>
 #include <cstdlib>
+#include <exception>
 #include <future>
 #include <ostream>
 #include <string>
@@ -122,8 +123,19 @@ int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag
     const auto target =
         resolve_healthcheck_target(cfg, path, auth::default_cert_dir(), kTlsSupported);
     // The worker owns its copy of `probe` and `target`, so abandoning it (deadline first) is safe.
-    const auto outcome =
-        probe_bounded(deadline, [probe = std::move(probe), target] { return probe(target); });
+    const auto outcome = probe_bounded(
+        deadline, [probe = std::move(probe), target]() -> HealthcheckOutcome {
+            try {
+                return probe(target);
+            } catch (const std::exception& e) {
+                // httplib can throw: 0.37.1 reserves res.body on a peer-claimed Content-Length
+                // before its payload ceiling applies (std::bad_alloc). The exit contract is
+                // exit 1 plus one line, never an abort.
+                return HealthcheckOutcome{.status = 0, .error = e.what()};
+            } catch (...) {
+                return HealthcheckOutcome{.status = 0, .error = "unknown exception"};
+            }
+        });
     const HealthcheckOutcome timed_out{
         .status = 0, .error = "timed out after " + std::to_string(deadline.count()) + " ms"};
     const HealthcheckOutcome& result = outcome ? *outcome : timed_out;

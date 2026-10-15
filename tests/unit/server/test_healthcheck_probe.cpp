@@ -20,6 +20,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -28,7 +29,9 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -331,6 +334,47 @@ TEST_CASE("healthcheck: run_healthcheck with a probe that answers in time prints
     CHECK(code == 0);
     CHECK(diag.str().empty());
     CHECK(g_recorded_exit.load() == -1);
+}
+
+TEST_CASE("healthcheck: run_healthcheck turns an exception from the probe into exit 1 and one "
+          "line",
+          "[server][healthcheck]") {
+    // httplib 0.37.1 reserves the response body on a peer-claimed Content-Length before its
+    // payload ceiling applies, so a hostile or buggy peer can make the real probe throw
+    // std::bad_alloc. Mutation: without the try/catch in run_healthcheck's worker, the exception
+    // is stored by probe_bounded's packaged_task and rethrown by done.get() into Catch2, which
+    // reports these sections failed (unexpected exception) rather than the process aborting.
+    Config cfg{};
+    cfg.https_enabled = false;
+    const auto run = [&cfg](std::function<HealthcheckOutcome(const HealthcheckTarget&)> probe,
+                            const std::string& reason) {
+        g_recorded_exit = -1;
+        std::ostringstream diag;
+        const int code = run_healthcheck(cfg, "/readyz", diag, std::move(probe),
+                                         std::chrono::seconds(2), &record_exit);
+        const std::string line = diag.str();
+        CHECK(code == 1);
+        CHECK(g_recorded_exit.load() == -1); // the outcome has a value, so no hard_exit
+        CHECK(std::count(line.begin(), line.end(), '\n') == 1);
+        CHECK(line == "healthcheck: GET http://127.0.0.1:" + std::to_string(cfg.web_port) +
+                          "/readyz -> " + reason + " (trust anchor: none)\n");
+    };
+
+    SECTION("std::bad_alloc, as httplib throws it on a huge Content-Length") {
+        // what() is implementation-defined ("std::bad_alloc" vs MSVC's "bad allocation").
+        run([](const HealthcheckTarget&) -> HealthcheckOutcome { throw std::bad_alloc{}; },
+            std::string{std::bad_alloc{}.what()});
+    }
+    SECTION("another std::exception") {
+        run([](const HealthcheckTarget&) -> HealthcheckOutcome {
+            throw std::runtime_error{"boom"};
+        }, "boom");
+    }
+    SECTION("a non-std exception type") {
+        struct NotStd {};
+        run([](const HealthcheckTarget&) -> HealthcheckOutcome { throw NotStd{}; },
+            "unknown exception");
+    }
 }
 
 #ifndef _WIN32
