@@ -1395,6 +1395,14 @@ if build_server
       'unit/server/test_page_routes.cpp',
       'unit/server/test_dialog_module.cpp',
       'unit/server/test_dashboard_api_routes.cpp',
+      'unit/server/test_access_render.cpp', # Access pages (Phase 2): Users list + Account panel renderers
+      'unit/server/test_access_routes.cpp', # Access pages: /access/users + fragments + static glue (gate order, degraded states)
+      'unit/server/test_access_js.cpp', # Access pages: string pins on the template and yuzu-access.js
+      'unit/server/test_access_golden.cpp', # Access pages: four rendered-fragment goldens
+      'unit/server/test_access_tokens_render.cpp', # Tokens and principals page: pure renderers
+      'unit/server/test_access_tokens_routes.cpp', # Tokens and principals page: routes, gates, audit, degraded states
+      'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
+      'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
@@ -3432,6 +3440,17 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   _python3_test,
   args: [files('test_agent_ota_wiring_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# Access Users page: pins the production wiring in server.cpp (the real require_admin gate and the
+# AuthDB::list_users() account source), which every route test stubs. Source-text only, so Python.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# no-build gate labelled 'server' fails that check on the Windows legs.
+test('access users production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_wiring_lexical.py')],
+  suite: 'docs',
   timeout: 30,
 )
 

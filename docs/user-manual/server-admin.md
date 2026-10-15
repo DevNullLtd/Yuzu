@@ -2835,7 +2835,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Section | Fragment Route | Description |
 |---|---|---|
 | TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
-| User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. |
+| User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The accounts are also listed, read-only, on the **Users** page (`/access/users`) in the Access section of the sidebar. |
 | Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. |
 | Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
@@ -5072,6 +5072,19 @@ The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin r
 | `GET` | `/fragments/settings/api-tokens` | Render the API tokens management fragment (HTMX). |
 | `POST` | `/api/settings/api-tokens` | Create a new API bearer token. Body: `{ "name", "role", "scopes" }`. |
 | `DELETE` | `/api/settings/api-tokens/{id}` | Revoke an API token by ID. |
+
+### Tokens and principals page
+
+`/access/tokens` (Access group in the navigation) lists API tokens and engine principals. It is read-only: creating, rotating and revoking stay in Settings. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/access/tokens` | The page. Redirects to `/login` without a session. |
+| `GET` | `/fragments/access/tokens/list` | API token list (HTMX). `?state=active` (default) or `all`. Gated on `ApiToken:Read`. Administrators on a cookie session see every owner; every other caller, including an administrator's API or MCP token, sees their own tokens only, as `GET /api/v1/tokens` does. Capped at 500 rows with a banner. |
+| `GET` | `/fragments/access/principals/list` | Engine principal list (HTMX). Gated on `EnginePrincipal:Read`, as `GET /api/v1/engine-principals`; engine and MCP-tier credentials are refused. Writes an `engine_principal.list` audit row, plus `engine_principal.role.listed` when the Roles column was read. |
+| `GET` | `/fragments/access/principals/detail` | One principal with its active credentials and roles (HTMX). `?id=engine:<slug>`. Same gate. Writes an `engine_principal.get` audit row, plus `engine_principal.role.listed` when the roles were read. A revoked principal's revocation detail needs `AuditLog:Read` and is otherwise shown as withheld (also when the grant could not be confirmed). |
+
+Each panel loads on its own. A refused browser session writes no denied-access audit row for any of them (the panels load automatically, so opening the page must not fill the audit log); a refused API or MCP token that reaches a fragment URL does. The no-administrator check at the top of the principals panel (a call to `/api/v1/engine-principals/audit/no-admin`, which needs `AuditLog:Read`) runs only when the principals fragment reports that the caller holds that permission. The `AuditLog:Read` checks that decide this (and whether a revoked principal's free-text detail is shown) are quiet for browser sessions only: a non-browser caller that holds `EnginePrincipal:Read` but not `AuditLog:Read` writes one ordinary permission-denied row per principals-list load and per revoked-principal detail load. The no-administrator result is a statement about the roles and grants the server could read: a role read that degrades is not distinguishable from "no roles" on that route, so the page words a clean result accordingly. Device tokens are not shown on this page.
 
 ### OTA Updates
 
