@@ -32,8 +32,9 @@ This applies to every macOS `.pkg`, including the release package.
     and the package contains an unsigned plugin. Every release `.pkg` does.
 - A first install of the stock package is **installed but not started**,
   because the agent will not run without a server trust anchor. An agent that
-  was stopped is left stopped, and so is one disabled with
-  `launchctl disable system/com.yuzu.agent`. Previously the installer loaded
+  was stopped is left stopped, including one disabled with
+  `launchctl disable system/com.yuzu.agent`; a disabled agent that was still
+  running is restarted and stays disabled for the next boot. Previously the installer loaded
   the service every time.
 - Upgrades keep the existing service definition's arguments, every `YUZU_*`
   environment variable and the standard proxy variables. Previously an upgrade
@@ -59,7 +60,9 @@ This applies to every macOS `.pkg`, including the release package.
 - Fleet deployment: pre-stage the server address and trust anchor so the first
   install starts the agent. See
   [Deploying with MDM](../../deploy/packaging/macos/README.md#deploying-with-mdm).
-- Rolling a fleet back to an older package and forward again is supported.
+- Rolling a fleet back to an older package and forward again is supported. A
+  package from before this installer replaces the service definition with its
+  default, so re-apply the server and trust settings after such a rollback.
 - After a failed install there is nothing to clean up: the next package run
   repairs or discards any recovery state it finds under `/var/db/yuzu-agent`.
 

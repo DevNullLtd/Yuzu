@@ -3720,7 +3720,7 @@ editing the unit:
 | Platform | How |
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
-| macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. Package upgrades keep every `YUZU_*` variable there. |
+| macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. Package upgrades keep every `YUZU_*` variable there, except `YUZU_PLUGIN_DIR` and `YUZU_DATA_DIR`, which the package sets. |
 | Windows | Set them in the service's own environment, a `REG_MULTI_SZ` value named `Environment` under the service's registry key, then restart the service. **Not in its binary path:** every installer run rewrites that path and drops them, and signing is then silently off (#5196). See *Windows: the service's `Environment` value* below for the commands and the cases that remove the value. |
 
 Every flag below has the environment variable shown beside it:

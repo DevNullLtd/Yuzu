@@ -147,7 +147,7 @@ Whether the new agent is started depends on what it replaces:
   restored and restarted. If an administrator had disabled it while it ran, the
   override is put back for the next boot. If its definition could not be read,
   so its settings were lost, the new agent is installed but not started, and the
-  Installer output says so.
+  Installer log (`/var/log/install.log`) says so.
 - **A service an administrator disabled** (`launchctl disable`) and not
   running. It is installed and left stopped.
 - **Nothing running, but a server trust anchor is configured** (`--ca-cert`,
@@ -156,7 +156,7 @@ Whether the new agent is started depends on what it replaces:
   no rollback, since nothing running was replaced.
 - **Nothing configured** (a first install of the stock package). It is installed
   but not started, because the agent refuses to run without a trust anchor. The
-  Installer output says how to configure and start it. The definition is in
+  Installer log (`/var/log/install.log`) says how to configure and start it. The definition is in
   `/Library/LaunchDaemons`, so after a reboot launchd starts it and it exits
   and retries every 10 seconds until configured, as earlier packages did.
   Disable the service if it should stay off until then.
@@ -268,7 +268,9 @@ is reported and dropped, and a phase that cannot be read is treated as an
 interrupted promotion, so no recovery state can block later installs. Installs
 and `uninstall.sh` take one lock (`/var/db/.yuzu-agent-transition.lock`, readable
 only by root, so no other account can hold it), so an
-uninstall waits for an install in progress rather than racing it.
+uninstall waits while either install script is running. Installer lays down the
+payload between the two scripts without the lock; an uninstall in that gap
+removes the incoming files, and the install's `postinstall` then refuses.
 
 Older loose packages did not ship `package-files.list`. Their first upgrade
 derives that manifest only from the system Installer receipt for `com.yuzu.agent`
@@ -297,16 +299,28 @@ sudo /usr/local/lib/yuzu/uninstall.sh
 ```
 
 It removes Yuzu's manifest-listed plugin files (except ones an operator
-changed), both package-owned code lanes and the updater's rollback file. It
-retains operational data, logs, configuration, trust anchors, and third-party
-plugins. It first discards any interrupted-install recovery state, so a later
+changed), both package-owned code lanes, the updater's rollback file and the
+service definition, `/Library/LaunchDaemons/com.yuzu.agent.plist`. It retains
+operational data, logs, `/etc/yuzu-agent`, trust anchors, and third-party
+plugins. The server address and any other setting kept only in the service
+definition is removed with it: keep a copy if you will reinstall, or pre-stage
+it as in "Deploying with MDM". It first discards any interrupted-install recovery state, so a later
 install can never restore the agent it removed. An unrecognized legacy app in
 the data root is quarantined, as the installer does, and the uninstall
 continues. `/var/db/yuzu-agent` is removed unless its `quarantine/` directory
 holds something; then it is kept, and the script names it.
 
+To decommission a Mac completely, run `uninstall.sh`, then remove
+`/Library/Application Support/Yuzu` (the agent's identity, enrolment and local
+databases), `/Library/Logs/Yuzu` and `/etc/yuzu-agent`, and remove or revoke the
+device on the Yuzu server so its certificate is no longer trusted.
+
 If an installation reports an error, keep the Installer log
-(`/var/log/install.log`) for diagnosis. The installer has already restored the
+(`/var/log/install.log`) for diagnosis. macOS rotates that log by size, so it
+is not an evidence store: forward it (or the installer's lines from it) to your
+log collection if you need refusals, quarantines and recoveries as audit
+evidence. Treat anything in `/var/db/yuzu-agent/quarantine/` as untrusted code:
+hand it to your security team before deleting it. The installer has already restored the
 previous state. You do not need to clear `/var/db/yuzu-agent` by hand, because
 the next package run repairs or discards whatever it finds there.
 
@@ -347,6 +361,35 @@ because a trust anchor is configured. A minimal plist:
 A LaunchDaemon plist is readable by every local account, so use a single-use,
 short-lived enrollment token there. It is only needed until the agent has
 enrolled.
+
+After the agent has enrolled, the token is no longer needed: remove it so it
+does not stay readable and carried forward by upgrades
+(`sudo /usr/libexec/PlistBuddy -c 'Delete :ProgramArguments:N'` for its two
+entries, or `Delete :EnvironmentVariables:YUZU_ENROLLMENT_TOKEN`), then
+`sudo launchctl kickstart -k system/com.yuzu.agent`.
+
+The service definition is the only place the package reads settings from. It
+does not read configuration profiles, so an MDM's custom-settings payload has
+no effect; deliver the plist as a file instead.
+
+Other points for an MDM rollout:
+
+- **Signature.** Release packages are product-signed and notarized only when
+  the release pipeline has the macOS signing and notarization credentials.
+  Check a package with `pkgutil --check-signature` before uploading it to an
+  MDM that requires signed packages. Development packages are never signed.
+- **Privacy permissions.** Plugins that read data macOS protects with
+  Transparency, Consent and Control (for example the privacy-permissions
+  inventory) need Full Disk Access for the agent. Grant it with a PPPC profile
+  naming `/usr/local/bin/yuzu-agent` (release package) or the app bundle's
+  identifier (development lane); without it those reads report constrained
+  results rather than failing.
+- **Success is not "running".** An install that is refused fails, but an
+  unconfigured first install succeeds with the agent not started. Check the
+  outcome with `sudo launchctl print system/com.yuzu.agent` (or your MDM's
+  script runner) rather than the install status alone.
+- **Rollback.** Installing a package from before this installer replaces the
+  service definition with its own default, so re-apply the settings afterwards.
 
 Without step 2, the package installs the agent but does not start it. A later
 script can add the settings to the installed plist and run
