@@ -288,6 +288,8 @@ Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. En
 | `--oidc-admin-group` | Entra group object ID that maps to the admin role (the value is trimmed automatically, same as `--saml-admin-group` — #1830) |
 | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
+Saving the OIDC settings in the dashboard, or writing an `oidc_*` key through `PUT /api/config/{key}`, needs the administrator role on your own account: a session that is administrator only through a temporary elevation is refused with `403`. A stored `oidc_admin_group` still applies after a restart.
+
 Example startup:
 
 ```bash
@@ -1081,7 +1083,7 @@ and `.../confirm` for the full error matrix.
 
 To reduce **standing** privilege (SOC 2 CC6.3/CC6.6), an operator can hold a non-admin role day-to-day and **activate** admin **just-in-time** for a short, justified window — so a compromised everyday session is not a standing admin session. Two steps:
 
-**1. An admin grants eligibility** (one-time, per operator):
+**1. An admin grants eligibility** (one-time, per operator). The granting administrator must hold the administrator role on their own account; a session that is administrator only through an elevation can revoke eligibility but not grant it:
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \

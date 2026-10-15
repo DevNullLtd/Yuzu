@@ -1356,6 +1356,184 @@ TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 
     CHECK(h.registry.trusted_gateway_peer_count() == 0);
 }
 
+// ── agent_id charset gate: NEW ids only; ids already in the store are exempt ──
+
+namespace {
+apb::RegisterRequest make_plain_register(const std::string& agent_id) {
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(agent_id);
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    return req;
+}
+const std::vector<std::string> kBadNewAgentIds = {
+    "./bulk-approve?", "../auto-approve/mode?", "a/b", "..", ".", "x?y", "a b", "a#b", "%2e%2e",
+    "caf\xC3\xA9",     "a\"b",                 "a;b",
+};
+} // namespace
+
+TEST_CASE("Register: a NEW agent_id outside [A-Za-z0-9._:-] (or dot-only) is refused and never queued",
+          "[pg][agent_service][register][agent_id_charset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    double expected = 0;
+    for (const auto& id : kBadNewAgentIds) {
+        INFO("id=" << id);
+        auto req = make_plain_register(id);
+        apb::RegisterResponse resp;
+        auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+        CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+        CHECK_FALSE(resp.accepted());
+        ++expected;
+        yuzu::Labels labels{{"reason", "charset"}};
+        CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == expected);
+        // Nothing was written: the id is not in the pending queue.
+        auto st = h.auth_mgr.get_pending_status(id);
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->has_value());
+    }
+}
+
+TEST_CASE("Register: a comma or control byte in an id is still refused by the store read",
+          "[pg][agent_service][register][agent_id_charset]") {
+    // Not the charset gate: the enrollment store rejects these outright (audit-unsafe bytes),
+    // so the handler never reaches the gate. Pinned so a refactor cannot let them through.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    for (const std::string id : {std::string("a,b"), std::string("a\nb"), std::string("a\0b", 3)}) {
+        auto req = make_plain_register(id);
+        apb::RegisterResponse resp;
+        auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+        CHECK_FALSE(status.ok());
+        CHECK_FALSE(resp.accepted());
+    }
+}
+
+TEST_CASE("Register: the agent's own UUID and hostname-style ids are accepted as new ids",
+          "[pg][agent_service][register][agent_id_charset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    for (const std::string id : {"550e8400-e29b-41d4-a716-446655440000", "host-01.example.com",
+                                 "san-test-agent", "node_7:50051"}) {
+        INFO("id=" << id);
+        auto req = make_plain_register(id);
+        req.set_enrollment_token(mint_enrollment_token(h.auth_mgr, "t", 0, std::chrono::hours(1)));
+        apb::RegisterResponse resp;
+        auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+        CHECK(status.ok());
+        CHECK(resp.accepted());
+    }
+    yuzu::Labels labels{{"reason", "charset"}};
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 0.0);
+}
+
+TEST_CASE("Register: an id already in the store with unusual characters is never locked out",
+          "[pg][agent_service][register][agent_id_charset][legacy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    // Rows created before the charset gate existed: pending, approved and denied.
+    const std::string pending_id = "legacy/pending id";
+    const std::string approved_id = "legacy\\approved?";
+    const std::string denied_id = "..";
+    for (const auto* id : {&pending_id, &approved_id, &denied_id})
+        REQUIRE(h.auth_mgr.add_pending_agent(*id, "h", "linux", "x86_64", "1").value());
+    REQUIRE(h.auth_mgr.approve_pending_agent(approved_id, "admin").value());
+    REQUIRE(h.auth_mgr.deny_pending_agent(denied_id, "admin").value());
+
+    auto run = [&](const std::string& id, apb::RegisterResponse& resp) {
+        auto req = make_plain_register(id);
+        return h.svc.Register(/*context=*/nullptr, &req, &resp);
+    };
+    {
+        apb::RegisterResponse resp;
+        CHECK(run(pending_id, resp).ok()); // answered "still awaiting", not INVALID_ARGUMENT
+        CHECK_FALSE(resp.accepted());
+        CHECK(resp.enrollment_status() == "pending");
+    }
+    {
+        apb::RegisterResponse resp;
+        CHECK(run(approved_id, resp).ok());
+        CHECK(resp.accepted()); // already-enrolled agent with an unusual id still registers
+    }
+    {
+        apb::RegisterResponse resp;
+        CHECK(run(denied_id, resp).ok());
+        CHECK_FALSE(resp.accepted());
+        CHECK(resp.enrollment_status() == "denied");
+    }
+    yuzu::Labels labels{{"reason", "charset"}};
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 0.0);
+}
+
+TEST_CASE("ProxyRegister: the same charset gate, new ids only, with the gateway_proxy label",
+          "[pg][agent_service][register][gateway][agent_id_charset]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    double expected = 0;
+    for (const auto& id : kBadNewAgentIds) {
+        INFO("id=" << id);
+        auto req = make_plain_register(id);
+        apb::RegisterResponse resp;
+        auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+        CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+        ++expected;
+        yuzu::Labels labels{{"reason", "charset"}, {"source", "gateway_proxy"}};
+        CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == expected);
+        auto st = h.auth_mgr.get_pending_status(id);
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->has_value());
+    }
+
+    // An id the store already holds keeps working through the gateway.
+    const std::string legacy_id = "legacy/enrolled";
+    REQUIRE(h.auth_mgr.add_pending_agent(legacy_id, "h", "linux", "x86_64", "1").value());
+    REQUIRE(h.auth_mgr.approve_pending_agent(legacy_id, "admin").value());
+    auto req = make_plain_register(legacy_id);
+    apb::RegisterResponse resp;
+    CHECK(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    CHECK(resp.accepted());
+}
+
+TEST_CASE("is_valid_new_agent_id: the charset table", "[agent_service][agent_id_charset]") {
+    using yuzu::server::auth::is_valid_new_agent_id;
+    using yuzu::server::auth::kMaxAgentIdLength;
+    CHECK(is_valid_new_agent_id("550e8400-e29b-41d4-a716-446655440000"));
+    CHECK(is_valid_new_agent_id("host.example.com"));
+    CHECK(is_valid_new_agent_id("a_b:c-d.e"));
+    CHECK(is_valid_new_agent_id("a.."));
+    CHECK(is_valid_new_agent_id("..a"));
+    CHECK(is_valid_new_agent_id(std::string(kMaxAgentIdLength, 'a')));
+    CHECK_FALSE(is_valid_new_agent_id(std::string(kMaxAgentIdLength + 1, 'a')));
+    CHECK_FALSE(is_valid_new_agent_id(""));
+    CHECK_FALSE(is_valid_new_agent_id("."));
+    CHECK_FALSE(is_valid_new_agent_id(".."));
+    CHECK_FALSE(is_valid_new_agent_id("..."));
+    CHECK_FALSE(is_valid_new_agent_id("a/b"));
+    CHECK_FALSE(is_valid_new_agent_id("a b"));
+    CHECK_FALSE(is_valid_new_agent_id("a?b"));
+    CHECK_FALSE(is_valid_new_agent_id("a#b"));
+    CHECK_FALSE(is_valid_new_agent_id("a%b"));
+    CHECK_FALSE(is_valid_new_agent_id("a,b"));
+    CHECK_FALSE(is_valid_new_agent_id("a;b"));
+    CHECK_FALSE(is_valid_new_agent_id("a\\b"));
+    CHECK_FALSE(is_valid_new_agent_id("caf\xC3\xA9"));
+    CHECK_FALSE(is_valid_new_agent_id(std::string("a\0b", 3)));
+    CHECK_FALSE(is_valid_new_agent_id("a\nb"));
+}
+
 // ── PR5d — ProxyRegister issues a per-agent cert through the gateway ────────
 //
 // The boot-test gap: a gateway-enrolled agent registered fine but never got a

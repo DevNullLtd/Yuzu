@@ -1896,3 +1896,44 @@ TEST_CASE("update_agent_status with expected_gen is a fenced write: the owning g
     REQUIRE(s3->has_value());
     CHECK((*s3)->status == "compliant");
 }
+
+// ============================================================================
+// Explicit ids at creation: [A-Za-z0-9._-]{1,128}, not dot-only (new records only)
+// ============================================================================
+
+namespace {
+std::string with_id_line(const std::string& yaml, const std::string& id) {
+    // Insert `id: <id>` after the `kind:` line (extract_yaml_value reads the first `id:`).
+    const auto kind_end = yaml.find('\n', yaml.find("kind:"));
+    return yaml.substr(0, kind_end + 1) + "id: " + id + "\n" + yaml.substr(kind_end + 1);
+}
+} // namespace
+
+TEST_CASE("PolicyStore: an explicit policy or fragment id must be a safe path segment",
+          "[policy_store][pg][policy][fragment][url_path_segment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    const std::vector<std::string> bad = {"..", ".", "a/b", "../x", "a?b", "a b",
+                                          "a%2Fb", "x\"y", std::string(129, 'a')};
+    for (const auto& id : bad) {
+        INFO("id=" << id);
+        auto p = store.create_policy(with_id_line(make_policy_yaml(frag.value()), id));
+        CHECK_FALSE(p.has_value());
+        auto f = store.create_fragment(with_id_line(kCheckOnlyFragment, id));
+        CHECK_FALSE(f.has_value());
+    }
+
+    // Generated ids and ordinary explicit ids still work, including dots/underscores/dashes.
+    const std::vector<std::string> good = {"pol-1", "my.policy_v2", "a..b", std::string(128, 'a')};
+    for (const auto& id : good) {
+        INFO("id=" << id);
+        auto p = store.create_policy(with_id_line(make_policy_yaml(frag.value()), id));
+        REQUIRE(p.has_value());
+        CHECK(p.value() == id);
+    }
+    CHECK(store.create_policy(make_policy_yaml(frag.value())).has_value());
+}
