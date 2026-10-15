@@ -345,5 +345,9 @@ TEST_CASE("REST webhooks[pg]: an id that overflows int64 is a 404 not a 500",
     auto dl = h.sink.Get("/api/webhooks/99999999999999999999/deliveries");
     REQUIRE(dl);
     CHECK(dl->status == 404);
-    CHECK(h.audit_log.empty()); // nothing was deleted, so nothing is audited as a deletion
+    // The delete attempt is audited as a failure (like an absent id); the GET is not audited.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "webhook.delete");
+    CHECK(h.audit_log[0].result == "failure");
+    CHECK(h.audit_log[0].detail == "id_not_representable");
 }

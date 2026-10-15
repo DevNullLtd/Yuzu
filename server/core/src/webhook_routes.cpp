@@ -147,9 +147,13 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                        return;
                    }
                    // A 21-digit `(\d+)` id made `stoll` throw (500): not representable => 404.
+                   // Audited like an absent id: a delete attempt on this surface leaves a row
+                   // whichever way it fails. The id is digits only (the route regex) and capped.
                    const auto id_parsed =
                        yuzu::server::parse_query_int<long long>(req.matches[1].str());
                    if (!id_parsed) {
+                       audit_fn(req, "webhook.delete", "failure", "webhook",
+                                req.matches[1].str().substr(0, 32), "id_not_representable");
                        res.status = 404;
                        res.set_content(detail::a4_error(res, "webhook not found"),
                                        "application/json");
