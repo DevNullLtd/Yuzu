@@ -2,7 +2,7 @@
 
 /// @file outbound_url_policy.hpp
 /// Pure checks for operator-supplied outbound destination URLs (webhooks and
-/// offload targets). Header-only (OpenSSL's EVP digest is the only dependency,
+/// offload targets). Header-only (OpenSSL's SHA-256 is the only dependency,
 /// for the audit fingerprint) so the stores, routes and unit tests share one
 /// definition.
 ///
@@ -13,9 +13,10 @@
 /// create time: embedded userinfo (`https://user:pass@host`) and control bytes
 /// (CR/LF/NUL would split an audit row). Existing rows are not rewritten.
 
-#include <openssl/evp.h>
+#include <openssl/sha.h>
 
 #include <array>
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -96,15 +97,13 @@ struct UrlDeliveryParts {
 
 /// First 12 lowercase hex characters (48 bits) of SHA-256 over the whole URL:
 /// enough to tell whether two audit rows, or a row and a candidate URL, name the
-/// same destination, too little to recover the secret. Empty if the digest fails.
+/// same destination, too little to recover the secret. 
 [[nodiscard]] inline std::string url_fingerprint(std::string_view url) {
-    std::array<unsigned char, EVP_MAX_MD_SIZE> md{};
-    unsigned int len = 0;
-    if (EVP_Digest(url.data(), url.size(), md.data(), &len, EVP_sha256(), nullptr) != 1)
-        return {};
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> md{};
+    SHA256(reinterpret_cast<const unsigned char*>(url.data()), url.size(), md.data());
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
-    for (unsigned int i = 0; i < 6 && i < len; ++i) {
+    for (std::size_t i = 0; i < 6; ++i) {
         out.push_back(kHex[md[i] >> 4]);
         out.push_back(kHex[md[i] & 0x0f]);
     }
