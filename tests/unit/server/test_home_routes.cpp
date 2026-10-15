@@ -68,6 +68,7 @@ struct HomeHarness {
     std::optional<std::int64_t> enrolment = 0;
     int roster_calls = 0, estate_calls = 0, compliance_calls = 0, failed_calls = 0, approvals_calls = 0,
         enrolment_calls = 0, service_denials = 0;
+    std::string last_deny_message;
 
     HomeHarness() {
         Deps d;
@@ -83,9 +84,10 @@ struct HomeHarness {
             return s;
         };
         d.deny_service_scoped_fn = [this](const httplib::Request&, httplib::Response& res,
-                                          const std::string& action, const std::string&,
+                                          const std::string& action, const std::string& message,
                                           const std::string&, const std::string&) {
             order.push_back("deny_service");
+            last_deny_message = message;
             if (!service_scoped)
                 return false;
             ++service_denials;
@@ -186,6 +188,7 @@ TEST_CASE("summary: service-scoped denial runs first and nothing is read", "[hom
     REQUIRE(out);
     CHECK(out->status == 403);
     CHECK(h.service_denials == 1);
+    CHECK(h.last_deny_message == "service-scoped tokens may not read the Dashboard summary");
     CHECK(h.gate_calls.empty());
     CHECK(h.roster_calls == 0);
     CHECK(h.compliance_calls == 0);
