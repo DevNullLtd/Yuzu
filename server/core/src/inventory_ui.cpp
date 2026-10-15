@@ -946,8 +946,7 @@ function swSyncDone(r) {
     return;
   }
   msg = 'Sync requested for ' + d.agents_reached + ' device' + (d.agents_reached === 1 ? '' : 's');
-  if (d.skipped_offline) skip.push(d.skipped_offline + ' offline');
-  if (d.skipped_other_replica) skip.push(d.skipped_other_replica + ' connected to another server');
+  if (d.skipped_offline) skip.push(d.skipped_offline + ' not connected to this server');
   if (d.skipped_version) skip.push(d.skipped_version + ' on an agent older than 0.13.1');
   if (skip.length) msg += ' (skipped: ' + skip.join(', ') + ')';
   if (typeof showToast === 'function') showToast(msg, d.agents_reached ? 'success' : 'warning');

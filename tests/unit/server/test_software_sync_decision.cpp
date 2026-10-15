@@ -24,9 +24,7 @@ using nlohmann::json;
 
 namespace {
 
-ss::Candidate cand(std::string id, std::optional<std::string> v, bool other_replica = false) {
-    return {std::move(id), std::move(v), other_replica};
-}
+ss::Candidate cand(std::string id, std::optional<std::string> v) { return {std::move(id), std::move(v)}; }
 
 bool floor_ok(std::string_view v) { return agent_supports_sync_now(v); }
 
@@ -40,9 +38,6 @@ authz::VisibleSet visible_of(Ids ids) {
 // not) happen, and what it was asked.
 struct Fakes {
     Ids all{"a", "b", "c"};
-    Ids live{"a", "b", "c"}; // the presence-widened live set the non-broadcast arms ask for
-    bool live_wired = true;
-    int live_calls = 0;
     std::optional<Ids> group{Ids{"a", "b", "c"}};
     ss::ScopeExpansion scope{.matched = Ids{"a", "b", "c"}};
     int all_calls = 0, group_calls = 0, scope_calls = 0;
@@ -54,11 +49,6 @@ struct Fakes {
             ++all_calls;
             return all;
         };
-        if (live_wired)
-            ex.live_ids = [this] {
-                ++live_calls;
-                return live;
-            };
         ex.group_members = [this](const std::string& id) {
             ++group_calls;
             last_group = id;
@@ -71,7 +61,7 @@ struct Fakes {
         };
         return ex;
     }
-    int reads() const { return all_calls + group_calls + scope_calls + live_calls; }
+    int reads() const { return all_calls + group_calls + scope_calls; }
 };
 
 } // namespace
@@ -163,53 +153,26 @@ TEST_CASE("sync request: only a group; scope or fleet run needs the run guard", 
 
 // ── partition ─────────────────────────────────────────────────────────────────────
 
-TEST_CASE("sync partition: offline; other-replica; too-old and unparseable are counted; not sent",
+TEST_CASE("sync partition: offline; too-old and unparseable are counted; not sent",
           "[server][software_sync]") {
     const std::vector<ss::Candidate> in = {
-        cand("a", "0.13.1"),          // exactly the floor
-        cand("b", std::nullopt),      // no session here, not connected anywhere: offline
-        cand("c", "0.13.0"),          // one patch below
+        cand("a", "0.13.1"),     // exactly the floor
+        cand("b", std::nullopt), // no session on this server process: offline
+        cand("c", "0.13.0"),     // one patch below
         cand("d", "0.14.0"),
-        cand("e", "banana"),          // unparseable: never reachable
+        cand("e", "banana"),     // unparseable: never reachable
         cand("f", "1.0.0"),
-        cand("g", std::nullopt),      // offline
-        cand("h", ""),                // live session that reported nothing
-        cand("i", std::nullopt, true),  // connected to another replica
-        cand("j", std::nullopt, true),
-        cand("k", "0.13.1", true),    // a local session wins: the flag is for sessionless ids only
+        cand("g", std::nullopt),
+        cand("h", ""),           // live session that reported nothing
     };
     const auto p = ss::partition(in, floor_ok);
-    CHECK(p.targets == std::vector<std::string>{"a", "d", "f", "k"}); // input order preserved
-    CHECK(p.counts.requested == 11);
-    CHECK(p.counts.reached == 4);
+    CHECK(p.targets == std::vector<std::string>{"a", "d", "f"}); // input order preserved
+    CHECK(p.counts.requested == 8);
+    CHECK(p.counts.reached == 3);
     CHECK(p.counts.skipped_offline == 2);
     CHECK(p.counts.skipped_version == 3);
-    CHECK(p.counts.skipped_other_replica == 2);
-    CHECK(p.counts.requested == p.counts.reached + p.counts.skipped_offline + p.counts.skipped_version +
-                                    p.counts.skipped_other_replica);
-}
-
-TEST_CASE("sync partition: an agent on another replica is never sent to and never called offline",
-          "[server][software_sync]") {
-    // One of each fate, side by side.
-    const auto p = ss::partition({cand("here", "0.13.1"), cand("away", std::nullopt, true),
-                                  cand("gone", std::nullopt, false), cand("old", "0.12.0")},
-                                 floor_ok);
-    CHECK(p.targets == std::vector<std::string>{"here"});
-    CHECK(p.counts.reached == 1);
-    CHECK(p.counts.skipped_other_replica == 1);
-    CHECK(p.counts.skipped_offline == 1);
-    CHECK(p.counts.skipped_version == 1);
-    CHECK(p.counts.requested == 4);
-    // Nothing but sessionless "away" devices: reached 0, nothing to dispatch, all reported.
-    const auto none = ss::partition({cand("x", std::nullopt, true), cand("y", std::nullopt, true)}, floor_ok);
-    CHECK(none.targets.empty());
-    CHECK(none.counts.skipped_other_replica == 2);
-    CHECK(none.counts.skipped_offline == 0);
-    CHECK(std::string(ss::audit_result(none.counts)) == "no_agents");
-    // The cap counts what is sent, so devices on other replicas never count towards it.
-    CHECK(ss::decide(DispatchArm::Group, true, {.requested = 900, .reached = 10, .skipped_other_replica = 890}) ==
-          ss::Verdict::Proceed);
+    CHECK(p.counts.requested ==
+          p.counts.reached + p.counts.skipped_offline + p.counts.skipped_version);
 }
 
 TEST_CASE("sync partition: nothing in; nothing out", "[server][software_sync]") {
@@ -220,8 +183,7 @@ TEST_CASE("sync partition: nothing in; nothing out", "[server][software_sync]") 
 }
 
 TEST_CASE("sync finalize: a refused send moves a target to skipped_offline", "[server][software_sync]") {
-    ss::Counts planned{.requested = 14, .reached = 6, .skipped_offline = 3, .skipped_version = 1,
-                       .skipped_other_replica = 4};
+    ss::Counts planned{.requested = 10, .reached = 6, .skipped_offline = 3, .skipped_version = 1};
     const auto all = ss::finalize(planned, 6);
     CHECK(all.reached == 6);
     CHECK(all.skipped_offline == 3);
@@ -229,8 +191,7 @@ TEST_CASE("sync finalize: a refused send moves a target to skipped_offline", "[s
     CHECK(some.reached == 4);
     CHECK(some.skipped_offline == 5);
     CHECK(some.skipped_version == 1);
-    CHECK(some.skipped_other_replica == 4); // a refused send is not an other-replica device
-    CHECK(some.requested == 14);
+    CHECK(some.requested == 10);
     const auto none = ss::finalize(planned, 0);
     CHECK(none.reached == 0);
     CHECK(none.skipped_offline == 9);
@@ -332,11 +293,9 @@ TEST_CASE("sync audit target: an expression never becomes an identifier", "[serv
 
 TEST_CASE("sync audit detail carries scope; arm and all four counts", "[server][software_sync]") {
     ss::Selector sel{DispatchArm::Group, "group:finance"};
-    const ss::Counts c{.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2,
-                       .skipped_other_replica = 4};
+    const ss::Counts c{.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2};
     CHECK(ss::audit_detail(sel, c) ==
-          "scope=group:finance arm=group requested=12 reached=7 skipped_offline=3 skipped_version=2 "
-          "skipped_other_replica=4");
+          "scope=group:finance arm=group requested=12 reached=7 skipped_offline=3 skipped_version=2");
     // A hostile expression cannot forge a second field or a new line.
     sel = {DispatchArm::Scope, "x\nrequested=0"};
     const auto d = ss::audit_detail(sel, c);
@@ -362,8 +321,7 @@ TEST_CASE("sync audit detail: a hostile expression cannot forge a neighbouring c
         sel = {DispatchArm::Scope, hostile};
         const auto d = ss::audit_detail(sel, c);
         // Exactly one of each count key, and it is the real one, after the scope token.
-        for (const char* key : {"requested=", "reached=", "skipped_offline=", "skipped_version=",
-                                "skipped_other_replica=", "arm="})
+        for (const char* key : {"requested=", "reached=", "skipped_offline=", "skipped_version=", "arm="})
             CHECK(occurrences(d, key) == 1);
         CHECK(d.find("reached=7 skipped_offline=3 skipped_version=2") != std::string::npos);
         CHECK(d.find('\n') == std::string::npos);
@@ -372,11 +330,10 @@ TEST_CASE("sync audit detail: a hostile expression cannot forge a neighbouring c
 }
 
 TEST_CASE("sync summary: counts only; never a per-device list", "[server][software_sync]") {
-    const auto j = ss::summary_json({.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2,
-                                     .skipped_other_replica = 4},
+    const auto j = ss::summary_json({.requested = 12, .reached = 7, .skipped_offline = 3, .skipped_version = 2},
                                     "__sync__-fleet-1-ab", 1700000000);
-    CHECK(j.size() == 8);
-    CHECK(j["skipped_other_replica"] == 4);
+    CHECK(j.size() == 7);
+    CHECK_FALSE(j.contains("skipped_other_replica")); // this route cannot tell a replica-attached device from an offline one
     CHECK(j["requested"] == 12);
     CHECK(j["agents_reached"] == 7);
     CHECK_FALSE(j.contains("reached")); // the dispatch routes call it agents_reached
@@ -666,68 +623,4 @@ TEST_CASE("sync fan_out: a single id behaves as the per-device push", "[server][
     const auto refused = q.run({"only"});
     CHECK(refused.sent == 0);
     CHECK(refused.command_id == "cmd-1"); // route maps sent==0 to "not reachable"
-}
-
-// ── target resolution: which confined ids are connected somewhere ─────────────────
-
-TEST_CASE("sync resolve: fleet_live marks the confined ids connected to some replica",
-          "[server][software_sync]") {
-    // A group of {a, b, c}: only a and c are connected anywhere (b is offline everywhere).
-    Fakes f;
-    f.live = {"a", "c", "elsewhere-only"};
-    const auto r = ss::resolve_targets({DispatchArm::Group, "group:g"}, authz::VisibleSet{}, f.expansion());
-    CHECK(r.status == ss::Resolved::Status::Ok);
-    CHECK(r.ids == Ids{"a", "b", "c"});
-    CHECK(r.fleet_live == std::unordered_set<std::string>{"a", "c"}); // not b, and not ids outside the group
-    CHECK(f.live_calls == 1);
-}
-
-TEST_CASE("sync resolve: fleet_live never names a device the caller cannot see",
-          "[server][software_sync][security]") {
-    Fakes f;
-    f.scope = {.matched = Ids{"a", "b", "c"}};
-    f.live = {"a", "b", "c"};
-    const auto r = ss::resolve_targets({DispatchArm::Scope, "ostype == \"linux\""}, visible_of({"a"}),
-                                       f.expansion());
-    CHECK(r.ids == Ids{"a"});
-    CHECK(r.fleet_live == std::unordered_set<std::string>{"a"}); // b and c are hidden, so not in it either
-}
-
-TEST_CASE("sync resolve: a fleet request takes fleet_live from the set it already read",
-          "[server][software_sync]") {
-    Fakes f;
-    f.all = {"x", "y"};
-    f.live = {"unrelated"};
-    const auto r = ss::resolve_targets({DispatchArm::Broadcast, "__all__"}, authz::VisibleSet{}, f.expansion());
-    CHECK(r.ids == Ids{"x", "y"});
-    CHECK(r.fleet_live == std::unordered_set<std::string>{"x", "y"}); // every fleet id is connected somewhere
-    CHECK(f.live_calls == 0);
-    CHECK(f.all_calls == 1);
-}
-
-TEST_CASE("sync resolve: a named device is checked against the live set too", "[server][software_sync]") {
-    Fakes f;
-    f.live = {"away"};
-    const auto here = ss::resolve_targets({DispatchArm::Ids, "away"}, authz::VisibleSet{}, f.expansion());
-    CHECK(here.fleet_live == std::unordered_set<std::string>{"away"});
-    const auto gone = ss::resolve_targets({DispatchArm::Ids, "gone"}, authz::VisibleSet{}, f.expansion());
-    CHECK(gone.ids == Ids{"gone"});
-    CHECK(gone.fleet_live.empty()); // offline everywhere
-}
-
-TEST_CASE("sync resolve: without a live read nothing is claimed to be attached elsewhere; and an empty "
-          "answer reads nothing",
-          "[server][software_sync]") {
-    Fakes f;
-    f.live_wired = false;
-    const auto r = ss::resolve_targets({DispatchArm::Group, "group:g"}, authz::VisibleSet{}, f.expansion());
-    CHECK(r.status == ss::Resolved::Status::Ok);
-    CHECK(r.ids == Ids{"a", "b", "c"});
-    CHECK(r.fleet_live.empty());
-
-    Fakes g;
-    g.group = Ids{};
-    const auto none = ss::resolve_targets({DispatchArm::Group, "group:g"}, authz::VisibleSet{}, g.expansion());
-    CHECK(none.ids.empty());
-    CHECK(g.live_calls == 0); // nothing to classify, no read
 }

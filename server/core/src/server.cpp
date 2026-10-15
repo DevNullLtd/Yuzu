@@ -18574,9 +18574,6 @@ private:
                                      // fail-closed branch are software_sync::resolve_targets.
                                      software_sync::Expansion ex;
                                      ex.all_ids = [this] { return registry_.all_ids(); };
-                                     // local sessions UNION cross-replica presence: what tells
-                                     // "connected to another replica" from "offline everywhere"
-                                     ex.live_ids = [this] { return registry_.all_ids(); };
                                      ex.group_members =
                                          [this](const std::string& group_id)
                                          -> std::optional<std::vector<std::string>> {

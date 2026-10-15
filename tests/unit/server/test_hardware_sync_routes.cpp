@@ -189,57 +189,29 @@ TEST_CASE("sync route: a fleet run is 202 with counts only; audited before anyth
     REQUIRE(h.audit_rows.size() == 1);
     CHECK(h.audit_rows[0] == "inventory.sync.request|requested|Scope|__all__");
     CHECK(h.audit_details[0] ==
-          "scope=__all__ arm=broadcast requested=4 reached=2 skipped_offline=1 skipped_version=1 "
-          "skipped_other_replica=0");
+          "scope=__all__ arm=broadcast requested=4 reached=2 skipped_offline=1 skipped_version=1");
 }
 
-TEST_CASE("sync route: a device connected to another replica is reported on its own; never as offline",
+TEST_CASE("sync route: a device with no session on this server is skipped_offline; whatever its reason",
           "[hardware][sync_fanout][route]") {
     SyncHarness h;
-    h.live(6); // d0..d5
-    // d1: no session here and connected nowhere (offline). d2, d3: no session here but connected to
-    // another replica. d4: below the version floor. d5: reachable.
+    h.live(4);
+    // d1 is disconnected; d2 is attached to another replica. This route sees the same thing for
+    // both (no session on this process), counts both in skipped_offline and never sends to them.
     h.version_by_id["d1"] = std::nullopt;
     h.version_by_id["d2"] = std::nullopt;
-    h.version_by_id["d3"] = std::nullopt;
-    h.version_by_id["d4"] = std::string("0.12.0");
-    h.resolved.fleet_live = {"d0", "d2", "d3", "d4", "d5"};
     auto res = h.post(R"({"scope":"group:g"})");
     REQUIRE(res);
     REQUIRE(res->status == 202);
     const auto d = parse(res->body)["data"];
-    CHECK(d["requested"] == 6);
-    CHECK(d["agents_reached"] == 2); // d0 and d5, the only sessions on this server
-    CHECK(d["skipped_offline"] == 1);
-    CHECK(d["skipped_version"] == 1);
-    CHECK(d["skipped_other_replica"] == 2);
-    CHECK(h.dispatched == std::vector<std::string>{"d0", "d5"}); // d2 and d3 are never sent to
-    // The audit row says the same, with the plan's own count.
+    CHECK(d["requested"] == 4);
+    CHECK(d["agents_reached"] == 2);
+    CHECK(d["skipped_offline"] == 2);
+    CHECK_FALSE(d.contains("skipped_other_replica"));
+    CHECK(h.dispatched == std::vector<std::string>{"d0", "d3"});
     REQUIRE(h.audit_details.size() == 1);
     CHECK(h.audit_details[0] ==
-          "scope=group:g arm=group requested=6 reached=2 skipped_offline=1 skipped_version=1 "
-          "skipped_other_replica=2");
-    CHECK(h.audit_rows[0] == "inventory.sync.request|requested|Scope|group:g");
-}
-
-TEST_CASE("sync route: devices that are all on other replicas make a 202 that reaches nobody here",
-          "[hardware][sync_fanout][route]") {
-    SyncHarness h;
-    h.live(3);
-    h.default_version = std::nullopt; // no local session for any of them
-    h.resolved.fleet_live = {"d0", "d1", "d2"};
-    auto res = h.post(R"({"scope":"__all__"})");
-    REQUIRE(res);
-    REQUIRE(res->status == 202);
-    const auto d = parse(res->body)["data"];
-    CHECK(d["requested"] == 3);
-    CHECK(d["agents_reached"] == 0);
-    CHECK(d["skipped_offline"] == 0);
-    CHECK(d["skipped_other_replica"] == 3);
-    CHECK(h.dispatch_calls == 0);
-    CHECK(h.audited("no_agents"));
-    // Nothing was sent, so the operator's cooldown is not spent.
-    CHECK(h.post(R"({"scope":"__all__"})")->status == 202);
+          "scope=group:g arm=group requested=4 reached=2 skipped_offline=2 skipped_version=0");
 }
 
 TEST_CASE("sync route: the resolver sees the parsed selector and the caller's session",

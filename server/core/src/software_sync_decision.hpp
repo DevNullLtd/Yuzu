@@ -42,7 +42,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -190,16 +189,11 @@ struct Selector {
 /// `caller_unfiltered` == that visible set is unfiltered, i.e. the caller holds a
 /// fleet-wide Execution:Execute (or RBAC is off). `Aborted` is a degraded store or a
 /// failed scope owner check: never "no matches".
-///
-/// `fleet_live` is the subset of `ids` that is connected to SOME server (this process or
-/// another replica). Sessions are per process, so an id with no local session is either
-/// offline everywhere or attached to another replica; this set is what tells the two apart.
 struct Resolved {
     enum class Status { Ok, InvalidScope, Aborted } status{Status::Aborted};
     std::string detail; // InvalidScope: the parse error; Aborted: the abort reason
     bool caller_unfiltered{false};
     std::vector<std::string> ids;
-    std::unordered_set<std::string> fleet_live;
 };
 
 struct DispatchResult {
@@ -220,11 +214,7 @@ struct ScopeExpansion {
 /// testable with fakes. An EMPTY callable is a missing dependency and resolves to Aborted
 /// (fail closed), never to an empty target list.
 struct Expansion {
-    /// Every device connected anywhere (this process plus cross-replica presence).
     std::function<std::vector<std::string>()> all_ids;
-    /// The same presence-widened live set, asked for by the arms that do not already hold it.
-    /// Empty == unknown: nothing is then reported as attached elsewhere.
-    std::function<std::vector<std::string>()> live_ids;
     /// nullopt == the group store is absent or degraded (distinct from a group with no members).
     std::function<std::optional<std::vector<std::string>>(const std::string& group_id)> group_members;
     std::function<ScopeExpansion(const std::string& expression)> scope_matches;
@@ -301,17 +291,6 @@ struct Expansion {
         return out;
     }
     out.ids = authz::filter_to_scope(ids, visible);
-    // Which of the confined ids are connected somewhere. A fleet request came from that very
-    // set, so it needs no second read.
-    if (sel.arm == DispatchArm::Broadcast) {
-        out.fleet_live.insert(out.ids.begin(), out.ids.end());
-    } else if (ex.live_ids && !out.ids.empty()) {
-        const auto live = ex.live_ids();
-        const std::unordered_set<std::string> live_set(live.begin(), live.end());
-        for (const auto& id : out.ids)
-            if (live_set.contains(id))
-                out.fleet_live.insert(id);
-    }
     out.status = Resolved::Status::Ok;
     return out;
 }
@@ -347,18 +326,18 @@ template <class MintId, class Prepare, class SendOne>
 
 struct Candidate {
     std::string id;
-    std::optional<std::string> version; // nullopt == no session on THIS server process
-    /// Meaningful only when `version` is empty: connected to another replica (presence says
-    /// live), so not offline, but not reachable from here either.
-    bool other_replica{false};
+    /// nullopt == no live session on THIS server process. That is all this route can know: a
+    /// device attached to another replica of an active-active deployment looks the same as a
+    /// disconnected one, and is counted with it.
+    std::optional<std::string> version;
 };
 
 struct Counts {
     std::size_t requested{0};
     std::size_t reached{0};
+    /// No live session on THIS server process (disconnected, or attached to another replica).
     std::size_t skipped_offline{0};
     std::size_t skipped_version{0};
-    std::size_t skipped_other_replica{0};
 };
 
 struct Plan {
@@ -366,21 +345,17 @@ struct Plan {
     Counts counts;
 };
 
-/// Split candidates into targets / offline / attached to another replica / too-old.
-/// `supports(version)` is the sync-now version floor (`agent_supports_sync_now`: 0.13.1+); an
-/// unparseable version fails it, so it counts as too old, never as reachable. Only a device
-/// with a session on THIS process is a target: a run cannot reach an agent attached to another
-/// replica, and reports it separately instead of as offline.
+/// Split candidates into targets / offline / too-old. `supports(version)` is the sync-now
+/// version floor (`agent_supports_sync_now`: 0.13.1+); an unparseable version fails it, so it
+/// counts as too old, never as reachable. Only a device with a session on THIS process is a
+/// target; one with none is counted offline, including a device attached to another replica.
 template <class SupportsFn>
 [[nodiscard]] Plan partition(const std::vector<Candidate>& candidates, SupportsFn&& supports) {
     Plan p;
     p.counts.requested = candidates.size();
     for (const auto& c : candidates) {
         if (!c.version) {
-            if (c.other_replica)
-                ++p.counts.skipped_other_replica;
-            else
-                ++p.counts.skipped_offline;
+            ++p.counts.skipped_offline;
         } else if (!supports(std::string_view(*c.version))) {
             ++p.counts.skipped_version;
         } else {
@@ -450,15 +425,14 @@ inline void stamp(std::unordered_map<std::string, std::int64_t>& state, const st
 
 // ── wording ───────────────────────────────────────────────────────────────────────
 
-/// The pre-dispatch audit `detail`: scope, arm and the five counts. `reached` here is the
+/// The pre-dispatch audit `detail`: scope, arm and the four counts. `reached` here is the
 /// PLAN (devices the run will send to); the 202's `agents_reached` is what was accepted.
 [[nodiscard]] inline std::string audit_detail(const Selector& sel, const Counts& c) {
     return "scope=" + audit_token(sel.expr) + " arm=" + std::string(dispatch_arm_label(sel.arm)) +
            " requested=" + std::to_string(c.requested) +
            " reached=" + std::to_string(c.reached) +
            " skipped_offline=" + std::to_string(c.skipped_offline) +
-           " skipped_version=" + std::to_string(c.skipped_version) +
-           " skipped_other_replica=" + std::to_string(c.skipped_other_replica);
+           " skipped_version=" + std::to_string(c.skipped_version);
 }
 
 /// "requested" when something will be sent, "no_agents" when nothing can be (the same two
@@ -475,7 +449,6 @@ inline void stamp(std::unordered_map<std::string, std::int64_t>& state, const st
             {"agents_reached", c.reached}, // the name /api/command and the per-device route use
             {"skipped_offline", c.skipped_offline},
             {"skipped_version", c.skipped_version},
-            {"skipped_other_replica", c.skipped_other_replica},
             {"command_id", command_id},
             {"source", std::string(kSource)},
             {"requested_at", requested_at}};

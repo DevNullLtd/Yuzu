@@ -626,11 +626,12 @@ place, **Hardware** and **Software**, each its own page:
       **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
       changes the outcome today, and both stay in place as defence in depth for when the
       gate becomes scope-aware.
-    - **Which devices.** Only agents attached to the server that handles the request are
-      contacted. Offline devices, agents older than 0.13.1 and devices that are connected to
-      a *different* server (active-active) are skipped and counted separately in the notice
-      and the `202` body; a device on another server is reported as such, never as offline.
-      One request reaches at most 500 devices (`413` above that, counted after the skips:
+    - **Which devices.** A run reaches agents attached to **this server process** only. A
+      device with no live session on this server is skipped and counted as not connected to
+      this server (`skipped_offline`): that is a disconnected device, and it is also a device
+      attached to another server of an active-active deployment, which this route cannot tell
+      apart from a disconnected one and does not contact. Agents older than 0.13.1 are skipped
+      and counted separately (`skipped_version`). One request reaches at most 500 devices (`413` above that, counted after the skips:
       narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
       up to 256 bytes.
     - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds

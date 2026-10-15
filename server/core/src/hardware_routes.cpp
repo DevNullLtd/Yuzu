@@ -547,7 +547,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // gate: with a global grant neither changes the outcome today, and they are wired for when the
     // gate becomes scope-aware.
     // REACH: this server process only. Sessions and sends are per process, so an agent attached to
-    // another replica is counted as skipped_other_replica, not offline, and is not sent to.
+    // another replica has no session here, is counted in skipped_offline with the disconnected ones
+    // (this route cannot tell them apart) and is not sent to.
     // Audit BEFORE dispatch, fail closed. 202 means REQUESTED: `agents_reached` is sessions that
     // accepted the frame, not devices that have synced.
     static_assert(software_sync::kMaxIdLen == auth::kMaxAgentIdLength);
@@ -675,11 +676,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // the 500 cap applies; ADR-3007's paced run replaces both when the fleet outgrows it.
         std::vector<ss::Candidate> candidates;
         candidates.reserve(resolved.ids.size());
-        for (const auto& id : resolved.ids) {
-            auto version = deps_.agent_version_fn(id); // a session on THIS process, or nullopt
-            const bool elsewhere = !version && resolved.fleet_live.contains(id);
-            candidates.push_back({id, std::move(version), elsewhere});
-        }
+        for (const auto& id : resolved.ids)
+            candidates.push_back({id, deps_.agent_version_fn(id)}); // a session on THIS process, or nullopt
         const auto plan = ss::partition(
             candidates, [](std::string_view v) { return agent_supports_sync_now(v); });
 
