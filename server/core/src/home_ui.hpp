@@ -4,12 +4,13 @@
 /// The landing and sign-in page (`GET /home`; `GET /login` redirects here). No
 /// shell: no sidebar, no header bar, no bell — there may be no session yet. Top
 /// to bottom: a slim bar (Yuzu mark; once signed in, also the server name and version), the hero (rule,
-/// headline, one sentence, the sign-in panel), then the fifteen screens as
-/// colour-coded tiles in five families. The page fetches nothing: the tiles say
-/// what each area does, not live figures.
+/// headline, one sentence, the sign-in panel), then — signed in only — the fifteen
+/// screens as colour-coded tiles in five families. Signed out the page is the brand,
+/// the headline and the sign-in panel and nothing else. The page fetches nothing: the
+/// tiles say what each area does, not live figures.
 ///
-/// Signed out, a tile links to its screen; the pre-routing auth gate answers a
-/// screen request without a session with `sign_in_location(path)`, i.e.
+/// The pre-routing auth gate answers a screen request without a session with
+/// `sign_in_location(path)`, i.e.
 /// `/home?next=<key>`, and the page shows "Sign in to open <area>." above the
 /// form and labels the post-sign-in button "Open <area>". `next` is only ever a
 /// key from `families()` — never a path or URL — so there is no open redirect,

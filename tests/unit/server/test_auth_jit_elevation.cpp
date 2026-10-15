@@ -860,6 +860,30 @@ TEST_CASE("revoking eligibility terminates an active elevation", "[pg][jit][rout
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(alice))); // elevation cleared
 }
 
+TEST_CASE("an elevated operator cannot grant elevation eligibility, but can revoke it",
+          "[pg][jit][routes]") {
+    JitHarness h;
+    REQUIRE(h.auth_db->set_elevation_eligible("bob", false).has_value());
+    auto alice = h.session_for("alice");
+    REQUIRE(h.post("/api/v1/elevate", alice, R"({"justification":"x"})")->status == 200);
+    auto res = h.post("/api/v1/users/bob/elevation-eligibility", alice, R"({"eligible":true})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_detail("user.elevation_eligibility.set", "alice") ==
+          "elevated_session_eligibility_grant_blocked");
+    CHECK(h.auth_db->is_elevation_eligible("bob").value() == false);
+    // Revoking stays open to the elevated session.
+    REQUIRE(h.auth_db->set_elevation_eligible("bob", true).has_value());
+    REQUIRE(h.post("/api/v1/users/bob/elevation-eligibility", alice, R"({"eligible":false})")
+                ->status == 200);
+    CHECK(h.auth_db->is_elevation_eligible("bob").value() == false);
+    // An administrator's own role still grants it.
+    auto admin = h.session_for("admin", Role::admin);
+    REQUIRE(h.post("/api/v1/users/bob/elevation-eligibility", admin, R"({"eligible":true})")
+                ->status == 200);
+    CHECK(h.auth_db->is_elevation_eligible("bob").value() == true);
+}
+
 TEST_CASE("an operator cannot set their own elevation eligibility", "[pg][jit][routes]") {
     JitHarness h;
     // Self-grant is blocked (review UP-6) so a temporary admin window cannot

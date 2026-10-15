@@ -273,12 +273,12 @@ const char* const kSettingsPageTemplate =
       </div>
     </div>
 
-    <!-- ── HTTPS Dashboard ────────────────────────────────── -->
+    <!-- ── HTTPS Console ────────────────────────────────── -->
     <div class="section">
-      <div class="section-header">HTTPS Dashboard</div>
+      <div class="section-header">HTTPS Console</div>
       <div class="section-body">
         <p class="section-intro">
-          TLS termination for the web dashboard and REST API.
+          TLS termination for the web Console and REST API.
         </p>
         <div id="https-section"
              hx-get="/fragments/settings/https"
@@ -295,7 +295,7 @@ const char* const kSettingsPageTemplate =
       <div class="section-body">
         <p class="section-intro">
           The built-in CA that issues the default server certificates and per-agent
-          mTLS client certificates. Download the root to trust the dashboard, review
+          mTLS client certificates. Download the root to trust the Console, review
           issued certificates, and revoke a compromised agent.
         </p>
         <div id="ca-section"

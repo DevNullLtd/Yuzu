@@ -253,7 +253,7 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
     const std::string sortv = app_perf_sort_token(sort);
 
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("app_perf", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Application performance "
          "over time</h1></div><div class=\"gp-sub\">Per-application CPU &amp; memory across the "

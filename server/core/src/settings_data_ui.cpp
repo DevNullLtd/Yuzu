@@ -37,7 +37,7 @@ const char* const kSettingsDataPageTemplate =
     </div>
   </div>
 
-  <div class="note">Retention periods are set when the server starts, with a command-line option or an environment variable. The dashboard shows them but cannot change them.</div>
+  <div class="note">Retention periods are set when the server starts, with a command-line option or an environment variable. The Console shows them but cannot change them.</div>
 
   <section class="panel" aria-labelledby="retention-h">
     <div class="hd"><h2 id="retention-h">Data retention</h2></div>

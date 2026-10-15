@@ -28,6 +28,35 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)
+
+- **"Dashboard" is now "Console".** The navigation item, the Home tile, the page title,
+  the "back to" links and the related Settings labels use the new name. Routes
+  (`/`, `/fragments/dashboard/...`), API paths, MCP tool names and permission names are
+  unchanged, so bookmarks and scripts keep working. Prose elsewhere in this manual still
+  says "dashboard" for the web UI as a whole.
+- **Home lists the screens only after sign-in.** Signed out, `/home` shows the sign-in
+  form and nothing else; the fifteen screen tiles appear once you are signed in. Health
+  probes that fetch `/home` still receive `200`.
+- **The Hardware pages no longer show quarantine controls.** The Quarantine link, the
+  Quarantined pill, the Quarantined devices panel, the containment banner and tab, and the
+  quarantine plugin's rows in the Actions lens are hidden until an approval workflow for containment actions is added. Quarantine itself is unchanged: the REST API, the MCP tools, the quarantine
+  plugin and the role-gated quarantine instructions on the Instructions page all work as
+  before, and server-side enforcement does not depend on the UI. While the controls are
+  hidden, use `GET /api/v1/quarantine` to list records. `DELETE /api/v1/quarantine/{agent_id}`
+  ends the server record only; to remove the device's firewall rules, run the quarantine
+  plugin's release instruction (`security.quarantine.release`, "Release Device from Quarantine")
+  from the Instructions page (or through `execute_instruction`) and confirm with the
+  status instruction. No configuration change is needed.
+- **Colour schemes.** Settings > General > Appearance now offers six schemes (Slate stays
+  the default). The choice is stored in the browser, not on the server.
+
+## Behaviour change: new agent, policy and fragment identifiers are restricted; page links encode identifiers
+
+- A `Register` (direct or through the gateway) with an agent id the server has not seen before is now refused with `INVALID_ARGUMENT` unless the id uses only letters, digits, `.`, `_`, `:` and `-` and is not only dots (counted in `yuzu_register_invalid_agent_id_total{reason="charset"}`). Agents that are already enrolled, pending or denied are not affected, and the agent's own generated UUID always passes. If you set `--agent-id` or `YUZU_AGENT_ID` to a value with other characters (for example `DOMAIN\HOST`, `user@host` or a space), change it before the agent first registers. An agent whose enrollment row no longer exists is treated as new again: a pending row an administrator removed, or an enrollment store restored from an older backup, reset or rebuilt. Such an agent, if its id has other characters, gets the refusal on every attempt (retrying with backoff up to 300 seconds) until you change its `--agent-id` / `YUZU_AGENT_ID` to a conforming value. Through the gateway the agent sees the server message wrapped in an `INTERNAL` status. Before upgrading, check any explicit agent ids you set against the rule.
+- A new policy or policy fragment with an explicit `id` must use letters, digits, `.`, `_` and `-` (up to 128 characters) and not only dots, the same rule instruction definitions use. Existing records are not changed.
+- Dashboard links and actions that carry an agent, policy or update-package identifier now percent-encode it. A row whose identifier is empty, `.` or `..` is shown without actions, and the pending-agent approve, deny and remove routes answer `400` for such an identifier.
+
 ## Behaviour change: the Settings link follows the server's own admin decision (#5779, #4208)
 
 `GET /api/me` and `GET /api/v1/me` now report `effective_role`, `elevated`,
@@ -81,6 +110,12 @@ ignoring it.
 `GET /api/v1/rbac/roles/{role}/permissions` now answer `503` when the permission
 store is degraded (previously an empty `200`) and `404` for an unknown role
 (previously `200 {"data":[]}`).
+
+## Behaviour change: `POST /api/v1/hardware/{id}/sync` refuses cross-site cookie writes
+
+**What changed.** A call to `POST /api/v1/hardware/{id}/sync` (and the new fleet form `POST /api/v1/hardware/sync`) authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise it answers `403 cross-site request refused` and is audited as `csrf.denied`. API, MCP and engine token callers are not affected.
+
+**What to check.** A script that signs in with a cookie and calls the per-device sync route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. The Hardware and Software pages already send it. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`.
 
 ## Behaviour change: `PUT /api/config/{key}` is audit-first, refuses cross-site cookie writes and floors `heartbeat_timeout` at 30 seconds
 
