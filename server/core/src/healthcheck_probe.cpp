@@ -2,9 +2,8 @@
 
 #include <yuzu/server/auth.hpp>
 
-#include <condition_variable>
 #include <cstdlib>
-#include <mutex>
+#include <future>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -91,35 +90,18 @@ HealthcheckOutcome probe_once(const HealthcheckTarget& t, int max_total_ms) {
 
 std::optional<HealthcheckOutcome> probe_bounded(std::chrono::milliseconds deadline,
                                                 std::function<HealthcheckOutcome()> probe) {
-    // Everything the worker touches lives in `st`, which the worker co-owns: an abandoned
-    // worker (deadline first) can finish long after this frame is gone.
-    struct State {
-        std::mutex mu;
-        std::condition_variable cv;
-        bool done{false};
-        HealthcheckOutcome outcome;
-    };
-    auto st = std::make_shared<State>();
-    std::thread worker([st, probe = std::move(probe)] {
-        auto out = probe();
-        {
-            std::lock_guard<std::mutex> lk(st->mu);
-            st->outcome = std::move(out);
-            st->done = true;
-        }
-        st->cv.notify_one();
-    });
-    bool finished = false;
-    {
-        std::unique_lock<std::mutex> lk(st->mu);
-        finished = st->cv.wait_for(lk, deadline, [&] { return st->done; });
-    }
-    if (!finished) {
+    // The packaged_task owns the probe and co-owns the shared state with `done`, so an
+    // abandoned worker (deadline first) can finish long after this frame is gone. Unlike a
+    // std::async future, a packaged_task future does not block in its destructor.
+    std::packaged_task<HealthcheckOutcome()> task(std::move(probe));
+    auto done = task.get_future();
+    std::thread worker(std::move(task));
+    if (done.wait_for(deadline) != std::future_status::ready) {
         worker.detach();
         return std::nullopt;
     }
     worker.join();
-    return std::move(st->outcome);
+    return done.get();
 }
 
 int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag) {
