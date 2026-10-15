@@ -13,10 +13,10 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 ## Login and session management
 
 - **RBAC login** — session-cookie auth with PBKDF2-hashed passwords stored in the AuthDB (Postgres schema `auth`, `auth.users`). `yuzu-server.cfg` is a **seed only**: it provisions the first administrator into an empty `auth` schema and is never consulted for an existing account's credentials (#5274 — see "Local password change and reset" below). Legacy roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials and writes the seed file.
-- **Login page** — dark-themed, with greyed-out OIDC SSO stub where appropriate. Yuzu does not support Light Mode.
+- **Login page** — the landing page at `/home` (`GET /login` redirects there), dark-themed, with a single-sign-on button when an OIDC or SAML provider is enabled. Yuzu does not support Light Mode.
 - **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, enrollment tokens, pending agent approvals, AD/Entra section.
 - **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
-- **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
+- **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated page requests to `/home` (carrying the validated `next` screen key; `/login` itself now redirects there), and returns 401 for API calls and htmx panel requests (with `HX-Redirect`).
 - **HTMX paradigm** — Settings page uses HTMX for server interactions; server renders HTML fragments. Vanilla JS is reserved for what htmx cannot do CSP-safely: clipboard copy and `fetch()` to JSON REST v1 routes (engine principals, password change/reset). Never `hx-on` (the CSP has no `unsafe-eval`). Dominant UI pattern going forward.
 - **Session revocation REST surface (CC6.3 revocation, CC6.7 disposition, CC6.8 termination).**
   - `DELETE /api/v1/sessions?username=<name>` — admin-only via `UserManagement:Write`. Cookie sessions only; API tokens deliberately not revoked.
@@ -1380,9 +1380,9 @@ Example startup:
 SP-initiated via HTTP-Redirect binding; assertion consumed via HTTP-POST
 binding.
 
-1. The operator navigates to `GET /auth/saml/start`. There is no "Sign in with
-   SAML" button on the login page in this release — the login-page SSO button
-   for SAML is a deferred item (see Deferred items below).
+1. The operator navigates to `GET /auth/saml/start`, or clicks the single-sign-on
+   button on the sign-in page (`/home`), which links there when SAML is enabled
+   and no OIDC provider is.
 2. The server builds a `<samlp:AuthnRequest>` (SP entity ID, ACS URL,
    `ID`=random, `IssueInstant`, `ForceAuthn=false`) and redirects the browser
    to the IdP's SSO URL via HTTP-Redirect binding (deflate-compressed,
@@ -1568,10 +1568,10 @@ visible without a local-password fallback):
   (`POST /api/v1/elevate`) is unavailable to it. A SAML-only deployment that
   needs elevation should grant standing admin via the group→role mapping
   (`--saml-admin-group`) rather than rely on JIT.
-- **No SAML button on the login page.** `/login` still renders a password form
-  (which always returns the generic 401 under `sso-only`) and, if OIDC is also
-  configured, its SSO button; SAML operators navigate to `GET /auth/saml/start`
-  directly.
+- **SAML button on the sign-in page only without OIDC.** `/home` renders the
+  password form (which always returns the generic 401 under `sso-only`) and one
+  SSO button: OIDC when an OIDC provider is enabled, otherwise SAML; with both
+  enabled SAML operators navigate to `GET /auth/saml/start` directly.
 
 ### OIDC browser binding
 
@@ -1636,8 +1636,8 @@ key. Design:
 
 ### Deferred items (not in this slice)
 
-- **Login-page SSO button.** There is no "Sign in with SAML" button on the
-  login page; users must navigate directly to `GET /auth/saml/start`.
+- **Login-page SSO button for both providers.** The sign-in page shows one SSO
+  button (OIDC, else SAML); a second button when both are enabled is not built.
 - **AttributeStatement parsing beyond group/name/email.** Group→role mapping
   (`--saml-group-attribute`) plus the display-name/email session-enrichment
   attributes (`--saml-name-attribute`/`--saml-email-attribute`, see

@@ -234,7 +234,7 @@ jobs:
 
       - name: Test — Dashboard reachable
         run: |
-          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-qa/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-qa/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/home)
           [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE (verified against the install CA)" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
       - name: Test — Gateway health
@@ -1503,7 +1503,7 @@ jobs:
           bash scripts/ci/qa-stack.sh check-stable
           echo "PASS: 4/4 services running, none restarted"
 
-          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-upgrade/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-upgrade/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/home)
           [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
           curl -sf --max-time 10 http://127.0.0.1:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }

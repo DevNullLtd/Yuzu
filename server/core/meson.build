@@ -514,6 +514,8 @@ yuzu_server_core_lib = static_library(
     'src/execution_model.cpp',
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
+    'src/home_panels_render.cpp',
+    'src/home_panels_routes.cpp',
     'src/leader_elector.cpp',
     'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
@@ -531,6 +533,9 @@ yuzu_server_core_lib = static_library(
     'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
     'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
+    'src/home_ui.cpp',     # Home (/home): the sign-in landing page, rendered per request
+    'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
+    'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
@@ -623,6 +628,8 @@ yuzu_server_core_lib = static_library(
     'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
     'src/network_routes.cpp',
     'src/network_ui.cpp',
+    'src/discovered_devices_model.cpp',
+    'src/discovered_devices_reader.cpp',
     'src/device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
     'src/device_routes.cpp',
     'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
@@ -654,6 +661,7 @@ yuzu_server_core_lib = static_library(
     'src/dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
+    'src/deployments_render.cpp',
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/tar_process_tree.cpp',

@@ -1062,7 +1062,7 @@ TEST_CASE("DEX golden: observation fragment — every field, byte-exact", "[dex]
     r.platform = "windows";
 
     const auto html = render_dex_observation_fragment(r);
-    CHECK(html == "<div class=\"gp-sech\">App crash <span class=\"gp-mute dx-mono\">"
+    CHECK(html == "<div class=\"gp-sech\">App crash <span class=\"gp-mute mono\">"
                   "process.crashed</span></div><div class=\"gp-spec\"><span class=\"k\">When"
                   "</span><code>2026-01-01T00:00:00Z</code><span class=\"k\">Subject</span>"
                   "<code>notepad.exe</code><span class=\"k\">Code</span><code>0xC0000005</code>"

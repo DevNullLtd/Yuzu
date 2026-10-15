@@ -65,6 +65,17 @@ history.
   and answered "no" — recorded here per that section's requirement that the split be argued
   explicitly, not just asserted in a header comment.
 
+  **Update (2026-10-15, PR #5859 review).** The operator-facing bell now reports a failed read
+  as an error: `GET /api/notifications` answers `503` instead of an empty list, and the two
+  mutations distinguish a store error (`503`) from an unknown id (`404`). The store gains
+  failure-distinguishing readers and mutators (`list_unread_checked`, `list_all_checked`,
+  `count_unread_checked`, `mark_read_checked`, `dismiss_checked`, each
+  `std::expected<T, std::string>`), and the bell routes use them. The plain methods remain,
+  as thin `value_or` wrappers, for callers that only draw a badge or assert in tests; none of
+  the original reasoning above changes for them. The surface still feeds no authorization,
+  targeting or enforcement decision, so this tightens how a failure is shown, not what the
+  store decides.
+
 ### Backfill (ADR-0009, mandatory)
 
 One-time, idempotent `migrate_from_sqlite()`, right-sized from `RbacStore`'s (#2703)
