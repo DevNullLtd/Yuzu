@@ -533,6 +533,41 @@ TEST_CASE("POST /api/schedules: invalid parameters are rejected with 400 and cre
     CHECK(h.audits.empty()); // body/param-validation 400s are unaudited
 }
 
+// json-dump-depth-guard fix (#2437-class): nlohmann::json::dump() is
+// unboundedly recursive. This body is an otherwise-VALID request (name,
+// definition_id, frequency_type all present) with "parameters" nested past
+// the depth limit - the exact field this handler calls .dump() on
+// (params_raw = j["parameters"].dump()). Both status AND message are
+// asserted deliberately: validate_and_canonicalize_schedule_params has its
+// OWN, entirely independent scalar-value check downstream that ALSO 400s a
+// non-scalar "deep" field regardless of nesting depth ("parameter values
+// must be a string, number, or boolean") - so status alone cannot tell this
+// guard apart from that unrelated check. Only the specific depth-guard
+// message proves THIS check fired first, before params_raw was ever built.
+// depth 40 is trivially safe to build/dump directly in this test process;
+// the real attack depth this guard exists for is many orders of magnitude
+// higher (~100,000 levels).
+TEST_CASE("POST /api/schedules: a parameters value nested past the depth limit is "
+          "rejected, no row created",
+          "[server][routes][schedule_routes][params][rest][pg][security][depth]") {
+    ScheduleRouteHarness h;
+    auto headers = h.session_headers_for("sched-op", "ScheduleAndExecute",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+
+    const std::string deep_array = std::string(40, '[') + std::string(40, ']');
+    const std::string body =
+        R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily",)"
+        R"("parameters":{"deep":)" + deep_array + "}}";
+    auto res = h.sink.dispatch("POST", "/api/schedules", body, "application/json", headers);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(j.is_discarded());
+    CHECK(j["error"].get<std::string>().find("nests too deeply") != std::string::npos);
+    CHECK(h.schedule_engine->query_schedules().empty());
+    CHECK(h.audits.empty());
+}
+
 TEST_CASE("POST /api/schedules: an omitted parameters field defaults to the canonical empty "
           "object",
           "[server][routes][schedule_routes][params][rest][pg]") {

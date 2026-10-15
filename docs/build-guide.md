@@ -12,10 +12,15 @@ comment carries the same usage block).
 Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory** and verify the build compiles.
 
 ### Prerequisites
-- Meson 1.11.1, Ninja
+- Meson 1.12.0 (the pin in `requirements-ci.txt`, used by the Linux CI legs; the Windows runner
+  contract `deploy/windows/toolchain-contract.json` pins 1.11.1; the build's hard floor is
+  `meson_version: '>=1.3.0'`), Ninja
 - CMake (required by Meson's cmake dependency method — not used as a build system)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - vcpkg (set `VCPKG_ROOT`)
+- Optional, for the Erlang gateway: Erlang/OTP 28.4 or any later 28.x, plus rebar3. `meson setup`
+  finds it (kerl, asdf, mise, Homebrew `erlang@28`, distro packages, the Windows installer) and skips
+  the gateway with a warning if none matches; see `docs/erlang-gateway-build.md`.
 - For vcpkg's libpq port (Postgres substrate, ADR-0006; builds postgresql from source): **Linux** needs `bison flex` (apt); **macOS** needs `autoconf automake libtool` (brew); **Windows** none extra (vcpkg auto-acquires winflexbison)
 
 ### Quick start (setup script)
@@ -45,7 +50,7 @@ out-of-tree build dir (a review worktree, a scratch checkout) needs the same two
 pointing at a populated `vcpkg_installed`.
 
 ### Build options
-`-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true — gates only the four demo plugins: `example`, `chargen`, `procfetch`, `netprobe`; every other plugin builds under `-Dbuild_agent` regardless) / `-Dbuild_tests` (default false), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
+`-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true — gates only the four demo plugins: `example`, `chargen`, `procfetch`, `netprobe`; every other plugin builds under `-Dbuild_agent` regardless) / `-Dbuild_tests` (default false) / `-Drequire_gateway` (default false; when true, a gateway that cannot be built - no `rebar3`, or no Erlang/OTP 28.4 or later 28.x - is a configure error instead of skipping the Erlang gateway build and its `gateway eunit`/`gateway ct` tests — for local fresh setups; CI legs instead run `scripts/ci/assert-gateway-tests.py` after configure, because a non-default option stored in a persistent CI build dir breaks older branches' reconfigures (see the comment above the `require_gateway` error in `meson.build` and PR #4851; #4841 is the separate macOS gap, where CI had no Erlang at all). The CI check guards only the workflow files: a local or shared build dir that has stored `-Drequire_gateway=true` must be reset to `false` from a checkout that still has the option (`meson configure -Drequire_gateway=false <dir>`) or wiped (`./scripts/setup.sh --wipe`) before another branch reconfigures it, because Meson validates `-D` against the dir's stored options and a branch whose `meson.options` lacks the option then fails with `Unknown options`), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
 
 ### Per-OS build directory convention
 
@@ -53,7 +58,7 @@ Per-OS build dirs prevent clobbering when one tree is built from multiple hosts 
 
 ### Windows build
 
-`docs/windows-build.md` is the source of truth — MSYS2 bash sequence, the `setup_msvc_env.sh` + `scripts/ensure-erlang.sh` activation pair, path inventory, and two hard rules: **never `vcvars64.bat`** (extension exit-1 corrupts wrappers), **never Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe/MSVC). `cross-platform` + `build-ci` load this on any Windows-touching change.
+`docs/windows-build.md` is the source of truth — MSYS2 bash sequence, `setup_msvc_env.sh` (the gateway's Erlang/OTP needs no activation: Meson resolves it), path inventory, and two hard rules: **never `vcvars64.bat`** (extension exit-1 corrupts wrappers), **never Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe/MSVC). `cross-platform` + `build-ci` load this on any Windows-touching change.
 
 **Provisioning a native Windows CI runner** — see `deploy/windows/README.md` (provisioning spec, `toolchain-manifest.json`, runner self-test; gateway toolchain via `YUZU_ESCRIPT`/`YUZU_REBAR3`; the 4 runners share one vcpkg cache via `RUNNER_TOOL_CACHE`).
 
@@ -91,8 +96,9 @@ Every `dependency()` is marked `include_type: 'system'` so vcpkg/gRPC/abseil/pro
 - OpenSSL is **required on every platform including Windows** — gRPC's TLS/JWT/PEM paths compile against OpenSSL headers regardless of linkage, so `grpc.lib` needs `libssl`+`libcrypto`; it is an unconditional top-level dep (the old `!windows`/schannel filter was disproven, #375).
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
 - **libpq (ADR-0006/0008):** on Windows it is a **DLL** (the static override covers only the grpc stack), shipped via the release zip's vcpkg-DLL sweep; `libpq_dep` is gated on `build_server` (agent stays SQLite); manifest pins `default-features: false, features: [openssl]`; the buildtype-conditional `_vcpkg_lib_win` pick is load-bearing (pure-C libpq has no `detect_mismatch`, so a wrong-CRT lib links silently). No cmake target carries static libpq's full closure (`libpgcommon`/`libpgport` live in `libpq.pc`'s `Libs.private`) — `meson.build`'s `libpq_dep` block wires it explicitly.
-- **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND meson's hand-wired `protobuf_dep`/`grpcpp_dep` (`cxx.find_library()`) are the only config that avoids both LNK2038 and LNK2005 — don't simplify either half without reading `.claude/agents/build-ci.md` (full #375 timeline + #376 QUIC escape). Linux/macOS unaffected.
+- **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND meson's hand-wired `protobuf_dep`/`grpcpp_dep` (`cxx.find_library()`) are the only config that avoids both LNK2038 and LNK2005 — don't simplify either half without reading `.claude/agents/build-ci.md` (full #375 timeline; the configuration is permanent — the #376 QUIC escape was withdrawn, ADR-0066). Linux/macOS unaffected.
 - **Linux sanitizer triplets (`x64-linux-asan`/`x64-linux-tsan`) are STATIC (#4019), matching the stock `x64-linux` triplet.** Dynamic linkage (the setting from each triplet's introduction through #4019) split grpc/protobuf/re2 into separate `.so` images in the sanitizer test binaries, each independently embedding abseil's `MixingHashState::kSeed` (self-referential, so copies legitimately diverge) — a `protobuf::Map` populated via one image's hash and queried via another's silently missed an existing key, corrupting Guardian spark-validation lookups nondeterministically under both ASan and TSan. Don't revert to dynamic linkage without reading the triplet files' own header comments — the `-fsanitize=...` flag propagation both triplets exist for works identically under static linkage. This is CI/test-tooling only; no shipped artifact is built from these triplets.
+- **TSan on vendored libpq**: `pqSaveParameterStatus` (`fe-exec.c`) races two connections' initial `ParameterStatus` writes into two process-wide statics; suppressed via a compiled-in `__tsan_default_suppressions` hook in `tests/unit/test_runner_main.cpp`, kept honest by the `tests/test_no_connless_pq_escape.py` tripwire (#1611).
 
 ## Instruction Engine build-time dependency
 

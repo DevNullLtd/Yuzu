@@ -156,22 +156,23 @@ TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silent
     // literal at the call site, so exceeding kMaxSources means literally
     // writing kMaxSources + 1 elements. The static_assert keeps that literal
     // count honest if kMaxSources ever changes.
-    static_assert(CommandCapabilityRegistry::kMaxSources == 16,
-                 "this test hardcodes 17 literal sources (kMaxSources + 1); update the "
+    static_assert(CommandCapabilityRegistry::kMaxSources == 32,
+                 "this test hardcodes 33 literal sources (kMaxSources + 1); update the "
                  "literal list below if kMaxSources changes");
     const auto s = std::span<const CommandCapability>(kFragmentAlpha);
     CHECK_THROWS_AS(
-        CommandCapabilityRegistry({s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s}),
+        CommandCapabilityRegistry({s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s,
+                                    s, s, s, s, s, s, s, s, s, s, s, s}),
         std::invalid_argument);
 }
 
 // ── core_dispatch_capabilities() ─────────────────────────────────────────
 
-TEST_CASE("capdecls::core_dispatch_capabilities: exactly the three system-initiated dispatches, "
+TEST_CASE("capdecls::core_dispatch_capabilities: exactly the four system-initiated dispatches, "
           "all system_reserved",
           "[server][dispatch][capability]") {
     auto rows = capdecls::core_dispatch_capabilities();
-    REQUIRE(rows.size() == 3);
+    REQUIRE(rows.size() == 4);
     for (const auto& row : rows)
         CHECK(row.system_reserved);
 
@@ -191,6 +192,16 @@ TEST_CASE("capdecls::core_dispatch_capabilities: exactly the three system-initia
     REQUIRE(tags.has_value());
     CHECK(tags->securable == "Tag");
     CHECK(tags->operation == authz::Operation::Write);
+
+    // Sync-on-demand (__sync__.now): read-only, system-reserved, lands under Inventory.
+    auto sync = registry.classify("__sync__", "now");
+    REQUIRE(sync.has_value());
+    CHECK(sync->dispatch_class == DispatchClass::ReadOnly);
+    CHECK(sync->mutability == Mutability::None);
+    CHECK(sync->securable == "Inventory");
+    CHECK(sync->operation == authz::Operation::Read);
+    CHECK(sync->system_reserved);
+    CHECK(sync->execute_gate == ExecuteGate::None);
 }
 
 // ── normalize_action_key ─────────────────────────────────────────────────

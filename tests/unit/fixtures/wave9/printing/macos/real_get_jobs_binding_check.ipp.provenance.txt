@@ -1,0 +1,32 @@
+status: REAL CAPTURE
+
+host: this Mac (macOS, arm64), live cupsd at /private/var/run/cupsd
+date: 2026-09-21 (UTC)
+identity: id -u = 501 (alex, non-root). The scratch queues were created with
+`lpadmin` (alex is in _lpadmin) and removed afterwards.
+
+setup: two scratch queues `yuzu4616a` and `yuzu4616b` on a dead socket device
+(socket://127.0.0.1:9), both disabled so nothing can print; held jobs (lp -H
+hold): ids 16 and 17 on yuzu4616a, id 18 on yuzu4616b.
+
+request: Get-Jobs (0x000A), request-id 1, printer-uri
+ipp://localhost/printers/yuzu4616a, which-jobs=not-completed,
+requested-attributes=job-id + job-printer-uri -- the exact operation attributes
+`job_binding_check_attrs("yuzu4616a")` builds, encoded with `ipp::encode_request`
+(a throwaway program that only calls those two functions wrote req.bin).
+
+exact command:
+  curl -s --unix-socket /private/var/run/cupsd \
+      -H 'Content-Type: application/ipp' --data-binary @req.bin \
+      http://localhost/ -o real_get_jobs_binding_check.ipp
+
+decoded result: 220 bytes; status-code 0x0000 (successful-ok); two job
+groups: job-id 16 and job-id 17, each with job-printer-uri
+ipp://localhost:631/printers/yuzu4616a. Nothing else is returned (the
+requested-attributes list was honoured); job 18 (yuzu4616b) is not listed.
+
+why it exists: `clear_queue` lists the named printer's not-completed jobs
+before Cancel-Job because cupsd's Cancel-Job looks a job up by id alone and
+ignores the printer named. This is the real response the membership check
+consumes. The real not-found answer for a nonexistent printer (0x0406, "The
+printer or class does not exist.") is real_get_jobs_no_printer.ipp.

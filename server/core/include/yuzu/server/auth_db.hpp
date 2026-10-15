@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "yuzu/server/auth.hpp"  // For Role, UserEntry, PendingAgent, etc.
+#include "yuzu/server/enrollment_cfg_import.hpp" // legacy-import row/result types (pure)
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -110,6 +111,17 @@ enum class AuthDBError : std::uint8_t {
     /// timeout as `QueryFailed`/`WriteFailed`; they emit no degrade metric, so
     /// the reason split does not reach them — see `is_store_unavailable`.)
     StoreBusy,
+    /// #5342 Gate 8 (F2/F4): an MFA enrolment write (`mfa_init_enrollment`'s
+    /// mint or `mfa_verify_enrollment`'s enrol) found the account's stored
+    /// password hash no longer equals the credential anchor — the caller's
+    /// proven hash (login bootstrap) or the hash read earlier in the SAME call
+    /// (Settings, `std::nullopt`). The password was changed or reset after the
+    /// enrolment's credential was established, or while the write waited on the
+    /// credential change's row lock. A business outcome, NOT a store fault
+    /// (`is_store_unavailable` is false): the caller refuses (generic 401 at
+    /// login, a "sign in again" fragment in Settings), reveals nothing and
+    /// spends any pending token.
+    CredentialChanged,
 };
 
 /// True iff `e` reflects the AuthDB store itself being unavailable (PG
@@ -208,10 +220,18 @@ public:
 
     // ── User Operations ──────────────────────────────────────────────────
 
-    /// Create or update a user.
-    /// Username is validated (alphanumeric + ._- only, 1-64 chars).
-    /// For new users: password_hash and salt_hex are required.
-    /// For existing users: all fields are updated (password + role).
+    /// Create a user. Username is validated (alphanumeric + ._- only, 1-64
+    /// chars); `password_hash` and `salt_hex` are required.
+    ///
+    /// INSERT-ONLY despite the name: the statement is `INSERT ... ON CONFLICT
+    /// (username) DO NOTHING`, so an EXISTING row is never touched — not its
+    /// password, not its role — and the call returns `UserAlreadyExists`.
+    /// (Never DO UPDATE: that reopens the TOCTOU where two concurrent creates
+    /// both pass a `user_exists()` check and one silently overwrites the
+    /// other's credentials.) Role changes go through `update_role()`;
+    /// password changes go through `CredentialChangeOwner`
+    /// (credential_change_owner.hpp, #5342) — the ONLY writer of an existing
+    /// row's `password_hash`; this store has no credential-write method.
     std::expected<void, AuthDBError> upsert_user(
         const std::string& username,
         const std::string& password_hash,
@@ -221,7 +241,18 @@ public:
 
     /// Seed the very first (admin) user, atomically, iff the `users` table
     /// is genuinely empty — the born-on-PG replacement for the config-file/
-    /// first-boot admin bootstrap. `INSERT ... SELECT ... WHERE NOT EXISTS`
+    /// first-boot admin bootstrap. **Production seeding calls
+    /// `RbacStore::provision_first_admin` instead** — `main.cpp`'s
+    /// fresh-start block atomically inserts this same account plus its
+    /// Administrator RBAC grant via that method, and no longer calls THIS
+    /// function at all (a redundant second no-op call was removed;
+    /// governance round, 2026-09-28). This function stays exported for its
+    /// own unit tests and as an available primitive should a genuine
+    /// "seed the first admin, no grant" need ever arise elsewhere — but it
+    /// has no production caller today. Do NOT add a new fresh-start-seeding
+    /// call site here — the grant-less account it would create is the exact
+    /// stranded-account hazard `provision_first_admin` exists to close.
+    /// `INSERT ... SELECT ... WHERE NOT EXISTS`
     /// alone is NOT race-free under READ COMMITTED (two concurrent server
     /// instances racing first boot can both see zero rows and both insert);
     /// the statement runs inside a transaction guarded by a
@@ -309,6 +340,12 @@ public:
     /// has already succeeded at the call site).
     void touch_last_login(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::remove_user_checked (#4966).
+    /// This writes the soft delete WITHOUT the last-Administrator guard. tests/test_rbac_query_owner_seam.py
+    /// scans server/core/src and server/core/include for calls through a receiver whose name
+    /// contains `db` (or a `(*...)` dereference) outside auth_db.cpp; it is a textual tripwire
+    /// for those spellings, not a proof that no other path reaches this method.
+    ///
     /// Soft-delete a user (sets is_active = false), clears MFA enrollment
     /// state (SOC 2 CC6.8 credential revocation on termination). Does NOT
     /// touch sessions (no session surface on this class — see file header;
@@ -319,6 +356,10 @@ public:
     /// Check if a user exists (active only).
     std::expected<bool, AuthDBError> user_exists(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::update_role_checked (#4966).
+    /// This writes the role column WITHOUT the last-Administrator guard; the same seam test scans
+    /// for calls through those receiver spellings (a textual tripwire, not a proof).
+    ///
     /// Change a user's role. ONLY updates the role column — never touches
     /// password_hash or salt_hex. This is critical for security: role changes
     /// must never overwrite credentials (C1 fix, Red Team finding).
@@ -327,8 +368,9 @@ public:
         auth::Role new_role
     );
 
-    /// Row-locked role re-check (#4107): `SELECT role FROM auth.users WHERE
-    /// username = $1 AND is_active FOR UPDATE`, same technique
+    /// Row-locked role + credential re-check (#4107, extended by #5274):
+    /// `SELECT role, password_hash FROM auth.users WHERE username = $1 AND
+    /// is_active FOR UPDATE`, same technique
     /// `mfa_verify_login_code` already uses to close ITS OWN replay race.
     /// Serializes against ANY concurrent `update_role()` write to this row:
     /// if one is already committed, this call's SELECT sees it directly; if
@@ -362,6 +404,19 @@ public:
     /// `reactivate_user()` call starting against an already-inactive row —
     /// there is no lock to contend for at that point.
     ///
+    /// #5274: `under_row_lock` also receives the row's CURRENT
+    /// `password_hash`, read under the same lock, so the credential check can
+    /// deny when the hash it just verified the password against is no longer
+    /// the stored one (a credential change committed between the caller's read
+    /// and this lock — a password change racing a login). The credential
+    /// change (`CredentialChangeOwner`, #5342) holds the same row lock for its
+    /// whole transaction, so the hash seen here is never one another writer's
+    /// in-flight commit can invalidate a moment later — and a caller that
+    /// arrives while that transaction holds the lock WAITS for its commit
+    /// (bounded by this call's txn-scoped `lock_timeout`) and then reads the
+    /// new hash. `AuthManager::post_mint_role_recheck` relies on exactly that
+    /// wait (#5342 Gate 8, M1).
+    ///
     /// `under_row_lock` runs WHILE the row lock is held, immediately before
     /// this call commits (releasing the lock) — use it to update
     /// AuthManager's in-process cache under `mu_` before the lock is
@@ -389,8 +444,9 @@ public:
     /// does). `InvalidUsername` / `QueryFailed` on the usual input/store
     /// failures, callback not invoked either way.
     std::expected<void, AuthDBError>
-    recheck_role_locked(const std::string& username,
-                        const std::function<void(auth::Role)>& under_row_lock);
+    recheck_role_locked(
+        const std::string& username,
+        const std::function<void(auth::Role, const std::string& password_hash)>& under_row_lock);
 
     /// Set/clear the per-user JIT-elevation eligibility flag (SOC 2 CC6.3/CC6.6):
     /// who may activate a time-boxed admin elevation via POST /api/v1/elevate,
@@ -428,6 +484,13 @@ public:
     /// for malformed input.
     std::expected<std::string, AuthDBError>
     get_provisioning_source(const std::string& username);
+
+    /// Read a user's role column REGARDLESS of `is_active` (soft-deleted rows included). SCIM's
+    /// revive path (#4966) reads the tombstone's role BEFORE `reactivate_user`, so an
+    /// out-of-band-elevated account is refused without ever being made active again. UserNotFound
+    /// only when no row (active or not) matched; InvalidUsername for malformed input; QueryFailed
+    /// on a lease/query failure (callers fail closed).
+    std::expected<auth::Role, AuthDBError> get_role_including_inactive(const std::string& username);
 
     /// Set the `identity_source` marker (auth.db migration v6, carried
     /// unchanged into `auth.users`) directly — distinct from
@@ -633,11 +696,24 @@ public:
     /// Generate a fresh TOTP secret and write it as provisional (encrypted).
     /// Returns the base32 form + otpauth URI for the enrollment UI.
     /// Idempotent on provisional rows (reuse, not rotate — see the file
-    /// header MFA note); returns UserAlreadyExists — er, MfaAlreadyEnrolled —
-    /// on already-enrolled rows; returns SecretUnavailable (never a fresh
-    /// mint) if an existing provisional secret fails to decrypt.
+    /// header MFA note); returns MfaAlreadyEnrolled on already-enrolled rows;
+    /// returns SecretUnavailable (never a fresh mint) if an existing
+    /// provisional secret fails to decrypt.
+    ///
+    /// `expected_password_hash_hex` (#5342 Gate 8, F4 — REQUIRED, no default,
+    /// so every caller decides) is the CREDENTIAL ANCHOR: the login bootstrap
+    /// passes the hash its password was proven against; Settings passes
+    /// `std::nullopt`, which anchors to the hash read in this same call. An
+    /// engaged anchor that no longer equals the stored hash is
+    /// `CredentialChanged` BEFORE any reveal or mint, and the mint itself is a
+    /// guarded `UPDATE ... WHERE mfa_totp_secret IS NULL AND mfa_enrolled_at IS
+    /// NULL AND password_hash = <anchor>` — so a mint that waited behind a
+    /// credential change's row lock lands as `CredentialChanged`, never as a
+    /// secret written over the change (and never over a secret a concurrent
+    /// init or verify just wrote).
     std::expected<MfaEnrollmentInit, AuthDBError>
-    mfa_init_enrollment(const std::string& username, std::string_view issuer);
+    mfa_init_enrollment(const std::string& username, std::string_view issuer,
+                        const std::optional<std::string>& expected_password_hash_hex);
 
     /// Verify the first code against the provisional secret. On success,
     /// stamps mfa_enrolled_at = now(), generates 10 recovery codes (returned
@@ -645,8 +721,21 @@ public:
     /// Idempotent on already-enrolled rows: returns MfaAlreadyEnrolled.
     /// Returns SecretUnavailable if the provisional secret fails to decrypt
     /// (never silently rejects the code as wrong).
+    ///
+    /// `expected_password_hash_hex` (#5342 Gate 8, F2/F4 — REQUIRED, no
+    /// default, so every caller decides) is the CREDENTIAL ANCHOR, always
+    /// bound: the guarded enrolment UPDATE requires `password_hash` to still
+    /// equal `expected_password_hash_hex.value_or(<hash read in this call>)`.
+    /// The login-enforcement bootstrap (`POST /login/mfa/enroll`) passes the
+    /// pending login's verified hash, so an enrolment started under a password
+    /// that was since changed or reset cannot complete. The Settings enrolment
+    /// passes `std::nullopt` and anchors to the hash read in this call, so a
+    /// change committed while its UPDATE waited on the credential change's row
+    /// lock is refused too. A 0-row result on an active, un-enrolled row whose
+    /// hash differs from the anchor is `CredentialChanged`.
     std::expected<std::vector<std::string>, AuthDBError>
-    mfa_verify_enrollment(const std::string& username, std::string_view code);
+    mfa_verify_enrollment(const std::string& username, std::string_view code,
+                          const std::optional<std::string>& expected_password_hash_hex);
 
     /// Verify a TOTP code for login or step-up. Persists the matched
     /// counter to mfa_last_counter on success. Returns `true` on match,
@@ -686,44 +775,127 @@ public:
     /// not-enrolled rows.
     std::expected<void, AuthDBError> mfa_disable(const std::string& username);
 
-    // ── Enrollment Token Operations ───────────────────────────────────────
+    // ── Enrollment tokens + pending agents (WS-6 slice 6.2, ADR-2002 §8) ─────
+    //
+    // Authoritative, fleet-wide (every replica shares one PG), and FAIL-CLOSED:
+    // every method returns `std::expected<_, StoreError>` so a store outage is a
+    // typed error the caller maps to gRPC UNAVAILABLE / HTTP 503 — NEVER an empty
+    // list, a `0` count, "absent", or "rejected" (an unreadable pending row that
+    // read as "absent" would let a denied agent fall through to add_pending/
+    // consume, #3401). Timestamps are authored from PG `now()` in SQL and token
+    // expiry is evaluated in SQL (DB-clock authority, ADR-2002 §4) — never the
+    // replica's `system_clock`. Raw tokens are hashed on entry (SHA-256) and are
+    // never logged, never a column; only the 8-hex `token_id` appears in logs.
+    // Text inputs are length-capped (`kMaxEnrollmentTextLength`) and rejected on
+    // an embedded NUL (`StoreError::InvalidInput`), never silently truncated.
 
-    /// Create a new enrollment token. Returns the raw token (show once).
-    /// The token is stored as a SHA-256 hash — plaintext never persisted.
-    std::expected<std::string, AuthDBError> create_enrollment_token(
-        const std::string& created_by,
-        std::chrono::seconds validity
-    );
+    /// Shared with `auth::AuthManager` (defined in auth.hpp, which must not
+    /// include this header): the create result and the atomic-consume outcome.
+    using CreatedEnrollmentToken = auth::CreatedEnrollmentToken;
+    using ConsumeEnrollResult = auth::ConsumeEnrollResult;
 
-    /// Validate an enrollment token without consuming it.
-    /// Returns true if token exists, is unused, and hasn't expired.
-    std::expected<bool, AuthDBError> validate_enrollment_token(const std::string& plain_token);
+    /// Maximum length of any free-text field (label, hostname, os, arch,
+    /// agent_version, principal) accepted by the enrollment/pending store.
+    /// `agent_id` uses `auth::kMaxAgentIdLength`, the raw token
+    /// `auth::kMaxEnrollmentTokenLength`.
+    static constexpr std::size_t kMaxEnrollmentTextLength = auth::kMaxEnrollmentTextLength;
 
-    /// Consume an enrollment token atomically.
-    /// Returns true if token was valid and consumed, false if already used/invalid.
-    /// Persists to DB BEFORE returning — survives server restart.
-    /// Defense-in-depth: Also checks expiry in same atomic operation.
-    std::expected<bool, AuthDBError> consume_enrollment_token(
-        const std::string& plain_token,
-        const std::string& agent_id
-    );
+    /// Upper bound on a token TTL (~100 years). `0` = never expires.
+    static constexpr std::int64_t kMaxEnrollmentTtlSeconds = 3'153'600'000;
 
-    // ── Pending Agent Operations ─────────────────────────────────────────
+    /// Create a token. `max_uses` 0 = unlimited; `ttl` 0 = never expires.
+    /// The token_id (8 hex of the hash) is regenerated on a UNIQUE violation —
+    /// an existing token is never overwritten.
+    std::expected<CreatedEnrollmentToken, StoreError>
+    create_token(const std::string& label, int max_uses, std::chrono::seconds ttl,
+                 const std::string& created_by);
 
-    /// Add an agent to the pending approval queue.
-    std::expected<void, AuthDBError> add_pending_agent(const auth::PendingAgent& agent);
+    /// Test seam for `create_token`'s regenerate-on-collision loop: `entropy`
+    /// supplies the 32 raw bytes for each attempt. Production callers use
+    /// `create_token` (CSPRNG).
+    std::expected<CreatedEnrollmentToken, StoreError>
+    create_token_with_entropy(const std::string& label, int max_uses, std::chrono::seconds ttl,
+                              const std::string& created_by,
+                              const std::function<std::vector<std::uint8_t>()>& entropy);
 
-    /// List all pending agents.
-    std::expected<std::vector<auth::PendingAgent>, AuthDBError> list_pending_agents();
+    /// Revoke by token_id. true = a row exists (idempotent), false = unknown id.
+    std::expected<bool, StoreError> revoke_token(const std::string& token_id);
 
-    /// Approve a pending agent.
-    std::expected<void, AuthDBError> approve_agent(
-        const std::string& agent_id,
-        const std::string& approved_by
-    );
+    /// All tokens, newest first. `expires_at == time_point::max()` = never.
+    std::expected<std::vector<auth::EnrollmentToken>, StoreError> list_tokens();
 
-    /// Reject a pending agent.
-    std::expected<void, AuthDBError> reject_agent(const std::string& agent_id);
+    /// THE atomic enrollment claim: ONE transaction that (1) counts a use of the
+    /// token (single guarded UPDATE — exactly-N winners across replicas), then
+    /// (2) upserts the agent row to `approved` unless an admin denied it; a
+    /// denial ROLLS BACK step 1. A miss on step 1 is classified in the same txn.
+    std::expected<ConsumeEnrollResult, StoreError>
+    consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
+                       const std::string& hostname, const std::string& os,
+                       const std::string& arch, const std::string& agent_version);
+
+    /// Five-state pending lookup: a value = approved/denied/pending; `nullopt` =
+    /// absent; `unexpected` = ERROR (callers MUST NOT treat as absent).
+    std::expected<std::optional<auth::PendingStatus>, StoreError>
+    pending_status(const std::string& agent_id);
+
+    /// Queue an unenrolled agent as `pending`. `true` = NEWLY added (gates the
+    /// analytics event + SSE publish); `false` = a row already existed (unchanged).
+    std::expected<bool, StoreError> add_pending(const auth::PendingAgent& agent);
+
+    /// No-token enrollment path: upsert to `approved` unless denied. `true` =
+    /// enrolled, `false` = admin-denied (tokens/no-token paths never override a
+    /// denial). `by` is recorded as `status_changed_by`.
+    std::expected<bool, StoreError> ensure_enrolled(const auth::PendingAgent& agent,
+                                                    const std::string& by);
+
+    /// Rows newest-first; `only` filters to one status.
+    std::expected<std::vector<auth::PendingAgent>, StoreError>
+    list_pending(std::optional<auth::PendingStatus> only = std::nullopt);
+
+    /// Set status approved/denied for an existing row. `true` = row existed.
+    std::expected<bool, StoreError> approve_pending(const std::string& agent_id,
+                                                    const std::string& principal);
+    std::expected<bool, StoreError> deny_pending(const std::string& agent_id,
+                                                 const std::string& principal);
+
+    /// Bulk: every currently-`pending` row -> approved/denied in one statement
+    /// (`UPDATE .. WHERE status='pending' RETURNING agent_id`). Returns the
+    /// agent_ids affected (for audit + SSE).
+    std::expected<std::vector<std::string>, StoreError>
+    approve_all_pending(const std::string& principal);
+    std::expected<std::vector<std::string>, StoreError>
+    deny_all_pending(const std::string& principal);
+
+    /// Hard-delete a row, but ONLY when its status is `pending` — see
+    /// `auth::RemovePendingOutcome`'s doc comment for why an `approved`/`denied`
+    /// row is refused instead of deleted.
+    std::expected<auth::RemovePendingOutcome, StoreError>
+    remove_pending(const std::string& agent_id);
+
+    // ── One-time legacy .cfg import (WS-6 6.2; see enrollment_cfg_import.hpp) ──
+    //
+    // Each call is ONE transaction under a dedicated advisory lock
+    // (`pg_advisory_xact_lock(2037545589, 2)`, auth_db.cpp), so two replicas racing
+    // first boot with identical files serialise: the loser sees the winner's marker
+    // and returns `already_imported`. `marker_key` is the per-FILE-KIND key in
+    // `auth.import_meta`; `fingerprint` the sha256 of the file bytes. Marker
+    // present + same fingerprint => `already_imported`; present + DIFFERENT =>
+    // `fingerprint_mismatch` (nothing written - restored-old-backup case, "refused,
+    // not merged"); absent => rows inserted and the marker stamped in the SAME txn.
+    // Rows are INSERT .. ON CONFLICT DO NOTHING keyed on token_hash / agent_id, so
+    // Postgres state (a higher use_count, a revoke, a deny, a removal) ALWAYS wins
+    // over the file. Any PG error rolls the whole txn back (no marker) and returns
+    // `StoreError` - the caller refuses to start. Never uses the file's token_id:
+    // the id is the hash prefix, lengthened per row on a collision with a DIFFERENT
+    // token so both survive.
+    std::expected<enrollment_import::ImportDbResult, StoreError>
+    import_legacy_tokens(std::string_view marker_key, std::string_view fingerprint,
+                         const std::vector<enrollment_import::LegacyToken>& rows,
+                         std::string_view imported_by);
+    std::expected<enrollment_import::ImportDbResult, StoreError>
+    import_legacy_pending(std::string_view marker_key, std::string_view fingerprint,
+                          const std::vector<enrollment_import::LegacyPending>& rows,
+                          std::string_view imported_by);
 
 private:
     struct Impl;

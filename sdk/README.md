@@ -9,7 +9,20 @@ plugins that load into the Yuzu agent at runtime.
 |------|---------|
 | `include/yuzu/plugin.h` | Stable C ABI — the only supported boundary for third-party plugin authors |
 | `include/yuzu/plugin.hpp` | C++23 convenience wrapper (inline, header-only) |
-| `include/yuzu/sdk.hpp` | Common helpers (JSON, logging, metrics, secure-zero, string utilities) |
+| `include/yuzu/sdk_utilities.hpp` | Pipe-delimited-table ↔ JSON conversion helpers |
+| `include/yuzu/json_log_formatter.hpp` | Structured JSON log formatting |
+| `include/yuzu/metrics.hpp` | `MetricsRegistry` — counters, gauges, histograms |
+| `include/yuzu/secure_zero.hpp` | Guaranteed-not-elided memory scrubbing |
+| `include/yuzu/string_utils.hpp` | Common string helpers |
+| `include/yuzu/version_string.hpp` | Application-version normalisation for DEX (name, version) identity (`yuzu::util`), shared by agent and server |
+| `include/yuzu/version.hpp` | Build version constants (`kVersionString`, …), generated from `version.hpp.in` at configure time |
+
+Only `plugin.h` is ABI-stable. `plugin.hpp` and every other header here are header-only C++
+compiled into your plugin: they carry no ABI or API stability promise, are not covered by
+`YUZU_PLUGIN_ABI_VERSION`, may change between releases, and none of their types may cross the
+plugin boundary. `json_log_formatter.hpp` needs spdlog and `sdk_utilities.hpp` needs nlohmann_json;
+`yuzu_sdk_dep` provides neither. (The licence exception in `LICENSE-SDK.md` still covers every
+header under `sdk/include/`; this note is about stability, not licensing.)
 
 ## ABI compatibility
 
@@ -59,9 +72,9 @@ guide in `docs/plugin-author-guide.md` (if present). In short:
 2. Implement your plugin class using the `YUZU_PLUGIN_EXPORT` macro
    from `plugin.hpp`.
 3. Add a `meson.build` that produces a shared library.
-4. Register the plugin directory in `agents/plugins/meson.build` (or
-   distribute your plugin independently and drop it into the agent's
-   plugin directory at runtime).
+4. Register the plugin directory with `subdir('agents/plugins/<name>')`
+   in the root `meson.build` (or distribute your plugin independently and
+   drop it into the agent's plugin directory at runtime).
 
 The `plugin-developer` agent (`.claude/agents/plugin-developer.md`)
 reviews any change that touches the SDK or adds a plugin.

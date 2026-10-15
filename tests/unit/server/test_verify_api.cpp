@@ -108,6 +108,31 @@ TEST_CASE("VerifyApi: null cohort reader is the AUTHORITATIVE degrade", "[pg][ve
     CHECK_FALSE(result.has_value()); // nullopt, not an empty/insufficient comparison
 }
 
+// #1762: a degraded ManagementGroupStore member-resolution read must fail
+// compare() closed to nullopt — never render as member_count == 0, which is
+// indistinguishable from a genuinely empty/unknown group. No live database
+// needed: an invalid pool makes ManagementGroupStore::is_open() false, so
+// get_members_checked() degrades before compare() ever reaches the cohort
+// reader.
+TEST_CASE("VerifyApi: degraded member-resolution read fails closed, not member_count 0 (#1762)",
+          "[verify_api]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore groups{pool};
+    REQUIRE(!groups.is_open());
+    AppPerfCohortReader reader{pool};
+
+    auto api = make_local_verify_api(groups, &reader);
+
+    VerifyCompareQuery q;
+    q.group_id = "g1";
+    q.app = "AcmeVPN.exe";
+    q.baseline_version = "4.2.0.0";
+    q.candidate_version = "4.3.0.0";
+    q.window_days = 7;
+    const auto result = api->compare(q);
+    CHECK_FALSE(result.has_value());
+}
+
 TEST_CASE("VerifyApi: unknown/empty group is a precondition miss, NOT a degrade",
           "[pg][verify_api]") {
     YUZU_REQUIRE_PG_DB_TPL(db, verify_api_tpl);

@@ -45,6 +45,7 @@
 /// `legacy_sqlite_probe::warn_if_legacy_rows` over `ca_root`/`ca_issued`/`ca_crl_versions`
 /// instead — silent unless real rows are found, never blocks boot.
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -159,6 +160,9 @@ struct CrlVersionRecord {
     /// STABLE key-based identity of the signing CA (#1296, see IssuedCertRecord).
     /// Invariant across a subordinate re-key; empty on pre-v5 rows.
     std::string issuer_key_id;
+    /// Number of revoked certs this CRL was built from (migration v3). `nullopt` on rows
+    /// published before v3 and on test-seeded rows that don't set it.
+    std::optional<int64_t> revoked_count;
 };
 
 /// Canonicalise a certificate serial to the engine's stored form — uppercase
@@ -304,34 +308,35 @@ public:
     /// is revoked".
     [[nodiscard]] std::expected<std::vector<std::string>, std::string> list_revoked_serials();
 
-    /// Delete all issued-cert rows with the given issued_by — used to purge stale default-cert
-    /// inventory on regeneration so the store reflects only the live set. Best-effort / non-fatal
-    /// by design (the caller already logs+continues on failure — a purge miss leaves stale rows,
-    /// not a security or correctness defect); stays a plain `bool`.
+    /// Delete the NON-revoked issued-cert rows with the given issued_by — used to purge stale
+    /// default-cert inventory on regeneration. Revoked rows are always kept: deleting one would
+    /// make `is_revoked()` accept that cert again and drop it from every later CRL, and the
+    /// revoked set must stay append-only for `has_unpublished_revocations()`. Best-effort /
+    /// non-fatal by design (the caller logs and continues on failure); stays a plain `bool`.
     [[nodiscard]] bool delete_issued_by(const std::string& issued_by);
 
     // ── CRL versions ────────────────────────────────────────────────────────────
 
-    /// Next CRL sequence number = MAX(version)+1. NOT durable across the allocate→record gap on
-    /// its own: callers MUST serialise allocate+record externally (the server holds its own
-    /// `crl_publish_mu_` for exactly this) so two publishers can't compute the same number and
-    /// have `record_crl` collide. `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read
-    /// failure — **the caller MUST abort the publish attempt, never substitute a default number**
-    /// (the pre-migration SQLite version silently returned 1 on any error; that default is UNSAFE
-    /// once the CRL table can hold real history, per ADR-0053 "CRL version continuity" — a
-    /// resumed-from-1 sequence after real versions already exist would either collide loudly
-    /// against `record_crl`'s duplicate-refusal, in the best case, or, before any real CRL has
-    /// ever been published, would silently proceed on stale information). In an HA / multi-
-    /// instance / DB-restore scenario this single-DB counter can still collide across instances —
-    /// durable cross-instance CRL numbering remains a tracked follow-up (#1240 UP-4), unchanged
-    /// (not newly introduced) by this migration; `record_crl()`'s duplicate-refusal keeps a
-    /// collision LOUD, never a silent clobber, both before and after this migration.
+    /// Next CRL sequence number = MAX(version)+1, as a plain READ (tests / diagnostics). NOT an
+    /// allocator: another publisher on any replica can take the number first. Production
+    /// publishing goes through `publish_next_crl`, which allocates under the table lock.
+    /// `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read failure — never
+    /// substitute a default number (ADR-0053 "CRL version continuity").
     [[nodiscard]] std::expected<std::uint64_t, std::string> next_crl_number();
 
-    /// Persist an allocated CRL version. Plain INSERT (never "ON CONFLICT ... DO UPDATE"): a
-    /// duplicate version is a real conflict (two publishers raced a number) — refused so the
-    /// caller re-allocates, rather than silently clobbering an existing generation.
-    [[nodiscard]] bool record_crl(const CrlVersionRecord& rec);
+    /// TEST SEEDING ONLY: persist a CRL version with a caller-chosen number. Plain autocommit
+    /// INSERT with none of publish_next_crl's transaction-scoped timeouts (it queues behind the
+    /// CRL table lock bounded only by the pool's own lock_timeout). Never a production
+    /// publish path — composing this with `next_crl_number()` reads the revoked set outside the
+    /// lock and breaks the superset guarantee `publish_next_crl` gives (PKI routed concern).
+    /// Refuses version < 1, empty DER, and a duplicate version (never a silent clobber).
+    [[nodiscard]] bool record_crl_for_test(const CrlVersionRecord& rec);
+
+    /// True when the latest CRL was not built from the current revoked set — no CRL yet, a
+    /// pre-v3 row, or a revocation (e.g. one whose own publish failed) that no committed CRL
+    /// covers. Compares counts in one statement, never timestamps from different replicas'
+    /// clocks. `unexpected(msg)` is a genuine read failure.
+    [[nodiscard]] std::expected<bool, std::string> has_unpublished_revocations();
 
     /// The most recently published CRL, if any. Both "genuinely none published yet" and "a
     /// genuine read failure" already degrade safely to the SAME caller behaviour (the public
@@ -340,36 +345,124 @@ public:
     /// `std::optional` rather than `std::expected` (ADR-0053).
     [[nodiscard]] std::optional<CrlVersionRecord> latest_crl();
 
-    /// Builds the signed CRL DER for an allocated `crl_number` over the supplied `revoked`
-    /// inventory. Returns empty to abort (e.g. a bad serial — fail closed). Runs under
-    /// `crl_publish_mu_` only (NOT a DB lease), so it may load the CA key + sign without blocking
-    /// issuance. It MUST NOT call `publish_next_crl` itself (`crl_publish_mu_` is a plain,
-    /// non-recursive mutex).
-    using CrlBuilder =
-        std::function<std::vector<uint8_t>(uint64_t crl_number,
-                                           const std::vector<IssuedCertRecord>& revoked)>;
+    /// What a `CrlBuilder` returns: the signed DER plus the validity window it signed.
+    struct BuiltCrl {
+        std::vector<uint8_t> der;
+        int64_t this_update{0};
+        int64_t next_update{0};
+    };
 
-    /// Allocate the next CRL number, build the DER for THAT number, and persist it — serialised by
-    /// `crl_publish_mu_` so two concurrent same-process publishers can never claim the same number
-    /// or clobber a generation. **Zero production callers as of this migration** (verified:
-    /// `server.cpp`'s `publish_crl()` calls `next_crl_number()`/`record_crl()` directly under its
-    /// OWN `crl_publish_mu_` member instead, so it can load the CA key + sign in between with no
-    /// store-held lock at all) — kept for API/test parity; internally now aborts (returns
-    /// `nullopt`, consumes nothing) on a `next_crl_number()`/`list_revoked()` read failure rather
-    /// than silently building over a wrong number or an empty revoked set.
-    [[nodiscard]] std::optional<CrlVersionRecord>
-    publish_next_crl(const CrlBuilder& build, int64_t this_update, int64_t next_update,
-                     const std::string& issuer_fingerprint = {},
-                     const std::string& issuer_key_id = {});
+    /// Builds and signs the CRL for an allocated `crl_number` over the supplied `revoked`
+    /// inventory. Runs INSIDE `publish_next_crl`'s transaction while the CRL table lock is held,
+    /// so it must be pure CPU work — load the CA key BEFORE calling `publish_next_crl`, never in
+    /// here. Returning `nullopt` or empty DER aborts the publish (e.g. a bad serial — fail closed)
+    /// and consumes no number. It must not call back into this store.
+    using CrlBuilder = std::function<std::optional<BuiltCrl>(
+        uint64_t crl_number, const std::vector<IssuedCertRecord>& revoked)>;
+
+    /// Why a publish did not commit. `RootChanged` is the only retryable outcome: the caller's
+    /// expected issuer fingerprint no longer matches `ca_root` (a subordinate import landed
+    /// between the caller's root read and the lock), so it must re-read the root, reload the
+    /// key and try again.
+    enum class PublishError { Failed, Busy, RootChanged };
+
+    /// #4830: finer-grained cause underneath a `PublishError` — a bounded, metrics/audit-facing
+    /// label, not a substitute for `kind`'s retry/skip control flow. The first 7 values are set
+    /// inside `publish_next_crl`, at the site the corresponding `std::unexpected(...)` is
+    /// returned; the last 4 belong to `CrlPublisher` (`server/core/src/crl_publisher.hpp`) for
+    /// failures that never reach this store at all. Closed set — extend `kPublishFailReasonLabels`
+    /// below in the same change as any new value, and keep the two declarations in lock-step
+    /// order (indexed by `static_cast<size_t>(reason)`).
+    enum class PublishFailReason {
+        NoConnection,          ///< no pool connection within local_wait, or the txn-scoped
+                               ///< bounds (set_config) themselves could not be applied
+        LockTimeout,           ///< `LOCK TABLE ... SHARE ROW EXCLUSIVE MODE` timed out
+        RootReadFailed,        ///< the under-lock root re-read query failed, OR (kind ==
+                               ///< RootChanged) it succeeded but disagreed with the caller's
+                               ///< expected fingerprint
+        NumberReadFailed,      ///< `MAX(version)+1` read failed
+        DegradedRevokedRead,   ///< the revoked-set read (`query_revoked_on`) failed
+        BuildFailed,           ///< the `CrlBuilder` returned nullopt or an empty DER
+        InsertOrCommitFailed,  ///< the INSERT failed, or the txn body returned true but COMMIT
+                               ///< did not durably confirm (a lost COMMIT acknowledgement)
+        KeyLoad,               ///< CrlPublisher: the CA key failed to load
+        RootChangedTwice,      ///< CrlPublisher: the root changed on both attempts — giving up
+        Busy,                  ///< the process-local `publish_mu_` was held past `local_wait`
+        Exception,             ///< CrlPublisher: the build/signing step threw
+        kCount,                ///< sentinel only — NOT a real reason; must stay last. Ties
+                               ///< `kPublishFailReasonLabels`'s size to this enum's cardinality
+                               ///< at compile time (governance #4828-#4832 follow-up) so a future
+                               ///< 12th value that forgets to extend the label array fails the
+                               ///< build instead of an unchecked out-of-bounds `operator[]` read
+                               ///< at first occurrence.
+    };
+
+    /// Compact labels for `PublishFailReason`, in enum-declaration order. Drives both a metrics
+    /// pre-seed loop and every increment site (`server.cpp`/`crl_publisher.cpp`) so a label
+    /// string can never drift between the two — index with `static_cast<size_t>(reason)`.
+    static constexpr std::array<std::string_view, 11> kPublishFailReasonLabels{
+        "no_connection",         "lock_timeout",       "root_read_failed",
+        "number_read_failed",    "degraded_revoked_read", "build_failed",
+        "insert_or_commit_failed", "key_load",         "root_changed_twice",
+        "busy",                  "exception",
+    };
+    static_assert(kPublishFailReasonLabels.size() ==
+                      static_cast<std::size_t>(PublishFailReason::kCount),
+                  "kPublishFailReasonLabels must have exactly one entry per PublishFailReason "
+                  "value (excluding the kCount sentinel) — extend both in the same change");
+
+    /// `publish_next_crl`'s error type: `kind` drives retry/skip control flow (unchanged since HA
+    /// WS-6 6.1 — callers must keep branching on it, not on `reason`); `reason` is the finer
+    /// #4830 cause. A 2-arg constructor (rather than relying on aggregate init) makes an
+    /// incomplete `PublishFailure{kind}` a genuine compile error — aggregate init would otherwise
+    /// silently value-initialize `reason` to `PublishFailReason::NoConnection` (enum value 0) on
+    /// any future call site that forgets to supply it, mislabeling a real failure's Prometheus
+    /// cause and audit detail.
+    struct PublishFailure {
+        PublishError kind;
+        PublishFailReason reason;
+
+        constexpr PublishFailure(PublishError k, PublishFailReason r) : kind(k), reason(r) {}
+    };
+
+    /// Upper bound on waiting for the CRL table lock, applied per transaction with
+    /// `set_config('lock_timeout', …, true)` so it holds even when the DSN's `options=` /
+    /// PGOPTIONS stops the pool from setting its own. `statement_timeout` is set the same way.
+    static constexpr std::chrono::milliseconds kCrlLockTimeout{5000};
+    static constexpr std::chrono::milliseconds kCrlLeaseTimeout{2500}; // == the store's write-lease bound
+    static constexpr std::chrono::milliseconds kCrlStatementTimeout{30000};
+
+    /// The ONE production CRL publish path (HA WS-6 slice 6.1, closes #4126). Extend it; never
+    /// compose `next_crl_number()` + `record_crl_for_test()` into a second one.
+    ///
+    /// One transaction: take `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE`,
+    /// check `ca_root`'s fingerprint still equals `issuer_fingerprint` (when non-empty), read
+    /// MAX+1, read the revoked set, build, INSERT, COMMIT. The lock serialises every publisher on
+    /// every replica sharing the database — including writers that don't opt in, which an
+    /// advisory lock would not stop — so crlNumbers are strictly increasing with no duplicates
+    /// or gaps, and each new CRL contains every revocation the previous one did. A process-local
+    /// timed mutex is taken first, so one process parks at most one pool connection on the
+    /// lock. Not epoch-fenced: operator revocation publishes through here synchronously
+    /// (two-dispatch-planes rule).
+    ///
+    /// Errors: `Busy` (another publish in this process still held the local mutex after
+    /// `local_wait` — a holder can legitimately take longer, so this is an honest failure the
+    /// freshness pass heals, not a stuck publisher),
+    /// `RootChanged` (see above), `Failed` (lock timeout, read failure, build abort, insert
+    /// failure, lost COMMIT ack). Nothing is reported as published unless the txn committed.
+    /// `local_wait` bounds the wait for another publish in this process; pass zero from a
+    /// background pass, which should skip rather than queue behind an operator publish.
+    [[nodiscard]] std::expected<CrlVersionRecord, PublishFailure>
+    publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint = {},
+                     const std::string& issuer_key_id = {},
+                     std::chrono::milliseconds local_wait = kCrlLeaseTimeout + kCrlLockTimeout);
 
 private:
     pg::PgPool& pool_;
     bool open_{false};
-    /// Serialises `publish_next_crl` callers against each other (see that method's doc — it has no
-    /// production caller today, but keeps its pre-migration atomicity contract for whoever calls
-    /// it directly / tests). Acquire only at the top of `publish_next_crl`, never while holding a
-    /// DB lease, to keep lock order consistent.
-    std::mutex crl_publish_mu_;
+    /// Taken (bounded) before `publish_next_crl` acquires a lease, so concurrent publishers in
+    /// one process queue here instead of each parking a shared-pool connection on the table lock.
+    std::timed_mutex publish_mu_;
 };
 
 } // namespace yuzu::server

@@ -1,0 +1,24 @@
+Directory: tests/unit/fixtures/wave10/pkg_inventory/macos/
+Captured 2026-09-21 for the pkg_inventory macOS leg tests (test_pkg_inventory_macos_parsers.cpp).
+
+tree.manifest
+  Status: REAL CAPTURE (formulae only; see Not exercised below)
+  host:     bare-metal Apple-silicon Mac
+  os:       macOS 26.6.2 (Darwin 25.6.0), Apple silicon
+  identity: an ordinary non-root local user (uid 501), no privilege used
+  command:  ls /opt/homebrew/Cellar/<formula> for each of the ten formulae below;
+            ls -ld /opt/homebrew/Caskroom; ls /opt/homebrew/Library/Taps
+  date:     2026-09-21
+  Reduced:  this Mac's /opt/homebrew/Cellar holds 66 formulae; ten were kept (ccache cmake fmt lz4 meson
+            ninja openssl@3 sqlite xz zstd), each with the exact version directory name reported by ls.
+            Every kept directory holds real files (INSTALL_RECEIPT.json, bin/, ...) that the leg never
+            reads, so the manifest records the directory only (payload D:).
+  Caskroom: /opt/homebrew/Caskroom exists and is EMPTY on this host (recorded as an empty directory, so
+            casks=0 is a real "exists, zero casks" reading).
+  Taps:     /opt/homebrew/Library/Taps does NOT exist on this host (ls: No such file or directory), so no
+            Taps entry is recorded and taps=0 is a real "absent" reading.
+
+Not exercised against real data: Homebrew cask rows and tap counts above zero. This capture host has no
+installed cask and no tap directory, and populated Caskroom/Taps trees would be invented. They need a
+reconstruction sign-off (not given) or a host that has them; the cask and tap counting logic is covered
+only by the SYNTHETIC in-code layouts in test_pkg_inventory_parsers.cpp, which are not captures.

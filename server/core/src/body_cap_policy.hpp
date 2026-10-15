@@ -478,6 +478,58 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     {"POST", "/api/instructions/validate-yaml", 3149824u, false, "instruction_yaml"},
     {"POST", "/fragments/instructions/yaml-preview", 3149824u, false, "instruction_yaml"},
 
+    // /api/v1/hardware — the Hardware CI list/record/sync REST v1 twin
+    // (hardware_routes.cpp). ANY method: GET /api/v1/hardware and
+    // GET /api/v1/hardware/{id} are bodyless list/record reads; only
+    // POST /api/v1/hardware/{id}/sync carries a body, and it is a single
+    // JSON object with one short "source" token (one of 5 fixed literals,
+    // e.g. "installed_software") — a few dozen bytes at most. 4 KiB leaves
+    // generous headroom over that real shape while keeping this three orders
+    // of magnitude under the 4 MiB catch-all (governance Gate 2: this route
+    // had no reviewed entry, per the routed-concern row's requirement that
+    // every new mutating route get one). requires_measurable = true: the
+    // route's own `scoped_perm_fn` gate lives in the HANDLER, after httplib
+    // buffers the body, so without a pre-read bound an unauthenticated
+    // caller reaching this prefix with a chunked (no Content-Length) body
+    // would be uncapped up to httplib's 100 MiB default — the same class the
+    // /api/v1/uploads entry above closes.
+    {kBodyCapAnyMethod, "/api/v1/hardware", 4u * 1024, true, "hardware"},
+
+    // /api/v1/rbac/roles/{name}/assignments[/{principal_id}] — A2 global
+    // human role assignment (rest_api_v1.cpp). POST's body is
+    // {principal_type, principal_id}, two short strings well under a KiB;
+    // DELETE carries no body. ANY method: the DELETE sibling shares this
+    // literal prefix once past the role-name path segment the URL regex
+    // captures — see the file header's MATCHING section for the same
+    // reasoning applied to every other any-method entry with a same-prefix
+    // sibling. 4 KiB leaves generous headroom over the real shape.
+    {kBodyCapAnyMethod, "/api/v1/rbac/roles/", 4u * 1024, false, "rbac_role_assignment"},
+
+    // /api/v1/rbac/enforcement — A1 enforcement enable/disable toggle
+    // (rest_api_v1.cpp). Body is {"enabled": true}, under 64 bytes even
+    // pretty-printed; 1 KiB is 16x headroom. Segment-boundary matching
+    // means this path does NOT inherit the rbac_role_assignment row above
+    // (different literal prefix) — without its own entry it would fall to
+    // the 4 MiB catch-all, which a toggle this small does not need.
+    {kBodyCapAnyMethod, "/api/v1/rbac/enforcement", 1u * 1024, false, "rbac_enforcement"},
+
+    // /api/v1/users — the local-account user-management REST v1 subtree
+    // (#5342): POST /api/v1/users/me/password {current_password,
+    // new_password}, POST /api/v1/users/{name}/password {new_password}
+    // (rest_api_v1.cpp register_password_routes), plus the pre-existing
+    // POST /api/v1/users/{name}/unlock (bodyless) and
+    // POST /api/v1/users[/{name}]/elevation-eligibility ({"eligible": bool},
+    // auth_routes.cpp). The largest legitimate body is two passwords at
+    // password_policy.hpp's kMaxPasswordBytes (1024) each — worst-case JSON
+    // escaping (6 bytes per control byte as \u00XX) puts that near 12.3 KiB,
+    // so 16 KiB admits every policy-conformant request with framing headroom
+    // while keeping an unauthenticated flood against this subtree (whose
+    // gates all run in the handler, after httplib buffers the body) 256x
+    // under the 4 MiB catch-all it previously fell to. ANY method: the
+    // bodyless siblings share the prefix (rule 4 in the routed-concern row).
+    // requires_measurable stays OFF per the file-header default.
+    {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
+
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.

@@ -54,6 +54,24 @@ TEST_CASE("canonical_thumbprint is a fold: lower and upper canonicalize identica
     CHECK(canonical_thumbprint(lower) == canonical_thumbprint(upper));
 }
 
+// ── win_store_fallback_allowed ───────────────────────────────────────────────
+
+// #4377 asymmetry: the read path (list/details, via enumerate_store) may
+// disclose a LocalMachine->CurrentUser fallback; the delete path may not --
+// a destructive action must never target a store the caller did not name.
+// delete_cert_win does not actually call this predicate at all (it has no
+// fallback branch to guard): its CURRENT_USER exclusion is enforced
+// structurally (exactly one CertOpenStore call, no CERT_SYSTEM_STORE_
+// CURRENT_USER reference in the function body) -- verified manually by
+// reviewers reading the function, not by an automated check. The kDelete
+// vector below is therefore a decision-record of the asymmetry, not a test
+// that exercises delete's production path.
+TEST_CASE("win_store_fallback_allowed: read may fall back, delete may not",
+          "[certificates][honesty]") {
+    CHECK(win_store_fallback_allowed(WinStoreAction::kRead));
+    CHECK_FALSE(win_store_fallback_allowed(WinStoreAction::kDelete));
+}
+
 // ── is_cert_entry_name ───────────────────────────────────────────────────────
 
 TEST_CASE("is_cert_entry_name accepts .pem/.crt suffixed names", "[certificates][honesty]") {
@@ -93,10 +111,15 @@ TEST_CASE("classify_cert_dir_open: ok is always kOpened regardless of err",
     CHECK(classify_cert_dir_open(true, 0) == CertDirOpen::kOpened);
 }
 
-TEST_CASE("classify_cert_dir_open: ENOENT/ENOTDIR mean the store is simply absent",
+TEST_CASE("classify_cert_dir_open: ENOENT means the store is simply absent",
           "[certificates][honesty]") {
     CHECK(classify_cert_dir_open(false, ENOENT) == CertDirOpen::kAbsent);
-    CHECK(classify_cert_dir_open(false, ENOTDIR) == CertDirOpen::kAbsent);
+}
+
+TEST_CASE("classify_cert_dir_open: ENOTDIR is unreadable, not absent -- something "
+          "non-directory sits at the store path",
+          "[certificates][honesty]") {
+    CHECK(classify_cert_dir_open(false, ENOTDIR) == CertDirOpen::kUnreadable);
 }
 
 TEST_CASE("classify_cert_dir_open: EACCES/EPERM/EIO are unreadable, not absent",

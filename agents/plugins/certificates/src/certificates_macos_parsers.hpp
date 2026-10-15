@@ -27,6 +27,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -37,6 +38,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <yuzu/agent/keychain_read.hpp> // yuzu::agent::KeychainReadStatus (enum use only, header-only)
 
 namespace yuzu::certificates_macos {
 
@@ -76,6 +79,27 @@ inline std::string canonical_thumbprint(std::string_view s) {
     return out;
 }
 
+/// Whether a Windows CryptoAPI store read/delete is allowed to fall back
+/// from LOCAL_MACHINE to CURRENT_USER when the LOCAL_MACHINE open fails.
+/// #4377: a destructive action must never target a store the caller did not
+/// name -- delete_cert_win therefore opens LOCAL_MACHINE only and has NO
+/// fallback branch that consults this predicate at all; its CURRENT_USER
+/// exclusion is enforced STRUCTURALLY (exactly one CertOpenStore call in the
+/// function body), not by a runtime check of kDelete here. This predicate is
+/// consumed ONLY by enumerate_store (the read path, list/details), where a
+/// disclosed fallback is acceptable because nothing is being removed.
+/// win_store_fallback_allowed(kDelete) == false is therefore a decision-record
+/// oracle for that asymmetry, not a production-path test of delete's
+/// behaviour. Delete's actual CURRENT_USER exclusion is verified manually by
+/// reviewers reading delete_cert_win's body for exactly one CertOpenStore
+/// call (see test_certificates_store_honesty.cpp's comment on this) -- there
+/// is no automated check enforcing it today, so a future regression here
+/// would not be caught by CI.
+enum class WinStoreAction { kRead, kDelete };
+inline bool win_store_fallback_allowed(WinStoreAction a) {
+    return a == WinStoreAction::kRead;
+}
+
 /// The Linux cert-store directory filter: true iff `name` contains a '.' at
 /// an index > 0 and the suffix after the LAST '.' is exactly "pem" or "crt"
 /// (case-sensitive) -- byte-for-byte parity with the retired
@@ -96,16 +120,18 @@ inline bool is_cert_entry_name(std::string_view name) {
 /// Classifies the outcome of opening the Linux cert-store directory (or a
 /// `readdir(3)` call mid-enumeration, which reports failure the same way:
 /// errno set, nullptr returned). `ok` is whether the open/readdir succeeded;
-/// `err` is the resulting `errno` when it did not. ENOENT/ENOTDIR means the
+/// `err` is the resulting `errno` when it did not. ENOENT alone means the
 /// store simply doesn't exist -- today's "no store" semantics (list emits the
-/// header only; details/delete emit status|not_found). Anything else (EACCES,
-/// EPERM, EIO, ELOOP, ...) is a real, reportable failure to open a store that
+/// header only; details/delete emit status|not_found). Anything else,
+/// INCLUDING ENOTDIR (something non-directory sitting at the store path --
+/// a real, reportable misconfiguration, not "no store") -- EACCES, EPERM,
+/// EIO, ELOOP, ... -- is a real, reportable failure to open a store that
 /// does exist.
 enum class CertDirOpen { kOpened, kAbsent, kUnreadable };
 inline CertDirOpen classify_cert_dir_open(bool ok, int err) {
     if (ok)
         return CertDirOpen::kOpened;
-    if (err == ENOENT || err == ENOTDIR)
+    if (err == ENOENT)
         return CertDirOpen::kAbsent;
     return CertDirOpen::kUnreadable;
 }
@@ -474,6 +500,137 @@ inline std::chrono::milliseconds clamp_to_action_budget(
         return std::chrono::milliseconds::zero();
     auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
     return remaining_ms < per_call_cap ? remaining_ms : per_call_cap;
+}
+
+// ── macOS keychain seam mapping (#3246 / #2318 / TerminationReason) ────────
+
+/**
+ * Map a bounded SecItem keychain read's outcome (yuzu::agent::
+ * KeychainReadStatus, keychain_read.hpp) to the human-readable detail text
+ * certificates_plugin.cpp writes alongside a `not_available` row -- or
+ * nullopt for Completed, which needs no explanatory row at all.
+ * `keychain_label` is the plugin's own literal ("System.keychain" /
+ * "SystemRootCertificates.keychain", certificates_plugin.cpp:1295-1307), not
+ * derived from anything the OS returns.
+ */
+inline std::optional<std::string> secitem_failure_reason(yuzu::agent::KeychainReadStatus status,
+                                                          std::string_view keychain_label) {
+    switch (status) {
+    case yuzu::agent::KeychainReadStatus::Completed:
+        return std::nullopt;
+    case yuzu::agent::KeychainReadStatus::Truncated:
+        return std::format("{} scan incomplete", keychain_label);
+    case yuzu::agent::KeychainReadStatus::OpenFailed:
+        return std::format("{} read failed", keychain_label);
+    case yuzu::agent::KeychainReadStatus::NotReadable:
+        return std::format("{} not readable (no read permission)", keychain_label);
+    case yuzu::agent::KeychainReadStatus::TimedOut:
+        return std::format("{} read timed out", keychain_label);
+    case yuzu::agent::KeychainReadStatus::Rejected:
+        return std::format("{} read refused (bounded-call ceiling)", keychain_label);
+    }
+    return std::format("{} read failed", keychain_label); // unreachable -- exhaustive switch above
+}
+
+/// The provenance tag a caller passes to mark_result_partial for a
+/// secitem_failure_reason-flagged row -- kept alongside it so the two can
+/// never drift on the "secitem:" prefix.
+inline std::string secitem_provenance(std::string_view keychain_label) {
+    return std::format("secitem:{}", keychain_label);
+}
+
+/// Whether a post-action recheck of the console-session owner found the same
+/// uid still logged in, a DIFFERENT uid (the session changed out from under
+/// the action -- e.g. a fast-user-switch), or the recheck itself could not be
+/// trusted. Fails closed by construction: every input shape that isn't a
+/// clean, in-range, all-digit comparison lands on kUnknown, never
+/// kUnchanged.
+enum class ConsoleOwnerRecheck { kUnchanged, kChanged, kUnknown };
+
+/**
+ * Pure comparison for a console-owner recheck: `stat_ok` is whether the
+ * console device could be stat'd at all; `current_uid` is the uid the action
+ * started against; `resolved_uid` is the freshly re-resolved console owner's
+ * uid as text. `resolved_uid` must be a non-empty run of ASCII digits (same
+ * rule as macos_console_user.hpp's is_valid_uid, reproduced inline here
+ * rather than including that header) and parse without overflow, or the
+ * result is kUnknown rather than a guess.
+ */
+inline ConsoleOwnerRecheck classify_console_owner_recheck(bool stat_ok,
+                                                          unsigned long long current_uid,
+                                                          std::string_view resolved_uid) {
+    if (!stat_ok)
+        return ConsoleOwnerRecheck::kUnknown;
+    if (resolved_uid.empty())
+        return ConsoleOwnerRecheck::kUnknown;
+    for (char c : resolved_uid) {
+        if (c < '0' || c > '9')
+            return ConsoleOwnerRecheck::kUnknown;
+    }
+
+    unsigned long long parsed = 0;
+    auto [ptr, ec] =
+        std::from_chars(resolved_uid.data(), resolved_uid.data() + resolved_uid.size(), parsed);
+    if (ec != std::errc{} || ptr != resolved_uid.data() + resolved_uid.size())
+        return ConsoleOwnerRecheck::kUnknown; // overflow or trailing garbage
+    return parsed == current_uid ? ConsoleOwnerRecheck::kUnchanged : ConsoleOwnerRecheck::kChanged;
+}
+
+/**
+ * Render a one-line reason a bounded subprocess capture is not usable
+ * (is_usable_capture's negative case), for the `not_available|<detail>` row
+ * certificates_plugin.cpp writes. `termination` is the TerminationReason
+ * name the plugin passes as text ("exited"/"signaled"/"deadline"/
+ * "cancelled"/"line_limit"/"spawn_error", subprocess_runner.hpp:61-72).
+ * Checked in priority order: a call that never spawned pre-empts every other
+ * signal, and an explicit deadline/timeout pre-empts the raw termination
+ * reason since `timed_out` can be set even when the runner's own reason text
+ * lags. A capture for which is_usable_capture(tool_ran, timed_out,
+ * output_truncated, exit_code) returns true -- i.e. tool_ran && !timed_out &&
+ * !output_truncated && exit_code == 0, which also implies termination ==
+ * "exited" -- returns "" here: a usable capture has no detail to report.
+ */
+inline std::string capture_failure_detail(bool tool_ran, bool timed_out, bool output_truncated,
+                                          int exit_code, std::string_view termination) {
+    if (!tool_ran)
+        return "spawn failed";
+    if (termination == "deadline" || timed_out)
+        return "killed at deadline";
+    if (termination == "cancelled")
+        return "cancelled";
+    if (termination == "line_limit")
+        return "output truncated (line limit)";
+    if (output_truncated)
+        return "output truncated";
+    if (termination == "signaled")
+        return "killed by signal";
+    if (exit_code != 0)
+        return std::format("exit {}", exit_code);
+    return "";
+}
+
+/// Folds a read_keychain_secitem()-backed scan into the presence verdict
+/// keychain_contains_thumbprint() returns (post code-review F1, #2318a).
+/// `matched` is true iff the caller already found a definitive thumbprint
+/// match among the read's parsed certs -- a match is proof of presence
+/// regardless of `status` (mirrors the old fold_presence_scan's kMatch
+/// short-circuit: a positive identification is never invalidated by an
+/// otherwise-degraded read). With no match: a Completed read genuinely
+/// proves absence; anything else -- NotReadable, OpenFailed, TimedOut,
+/// Rejected, or Truncated (a DER blob Security.framework accepted but
+/// libcrypto rejected, or the per-keychain cert cap) -- can only narrow
+/// future certainty, never manufacture it, so it stays std::nullopt. This
+/// is the fold that closes the gap a subprocess-based read could not: an
+/// unreadable keychain (locked-but-inaccessible, permission-denied, or a
+/// transient SecItem failure) is `NotReadable`/`OpenFailed`, never folded
+/// into "no certs found" the way an empty `security` stdout used to be.
+inline std::optional<bool> fold_secitem_presence(yuzu::agent::KeychainReadStatus status,
+                                                 bool matched) {
+    if (matched)
+        return true;
+    if (status == yuzu::agent::KeychainReadStatus::Completed)
+        return false;
+    return std::nullopt;
 }
 
 } // namespace yuzu::certificates_macos

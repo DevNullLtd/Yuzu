@@ -1,0 +1,26 @@
+status: SYNTHETIC — hand-assembled against this plugin's own
+printing_ipp.hpp wire grammar. It exercises decoder group/attribute/bounds
+logic. It is NOT evidence of cupsd behaviour and MUST NOT be cited in a
+descriptor note, README sentence, or code comment as though it were.
+
+What this file is: a byte-accurate Cancel-Job successful-ok response
+(status 0x0000, request-id 19) — the operation-attributes group only, no
+job/printer-attributes group, matching cupsd's ordinary Cancel-Job success
+shape. It exercises the decoder's success-status path (op_or_status <=
+0x00FF), which no Tier A real capture reaches: every real capture in this
+set targets a job id or printer that does not exist, so all five decode to
+0x0406, never 0x0000. This fixture is the ONLY coverage in the tree for
+the plugin's successful-cancel branch (`format_clear_queue_row(...,
+"canceled", "-")`).
+
+This fixture is NOT evidence that `Authorization: PeerCred` authorises a
+cancellation of another principal's job — it is a hand-built shape, not a
+capture, and asserts nothing about cupsd's real authorisation behaviour.
+
+Promotion path: Phase B (`bash capture.sh --phase-b`, requires sudo)
+performs a real Cancel-Job against a job the capture-shell principal (or,
+with PeerCred, another principal) owns and replaces this file with a
+genuine capture, at which point this provenance file is rewritten to
+`status: REAL CAPTURE`. Until Phase B runs, this fixture stays SYNTHETIC.
+
+identity (of this synthetic construction): id -u = 501 (alex)

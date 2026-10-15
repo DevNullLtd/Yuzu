@@ -43,6 +43,8 @@
 /// this slice — slice 2 (dashboard/REST/MCP) consumes it and ships REST+MCP
 /// lockstep (agentic-first A1–A4).
 
+#include "app_perf_types.hpp" // AppPerfAppSummary (ADR-0031 WS-A4 DexPerfApi split)
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -77,13 +79,8 @@ struct AppPerfFleetRow {
     int hist_version{0};
 };
 
-/// One row of the app picker: an app with retained fleet data, plus how many
-/// distinct versions it carries and the most recent UTC day it was seen.
-struct AppPerfAppSummary {
-    std::string app_name;
-    std::int64_t versions{0}; ///< distinct retained versions
-    std::int64_t last_day{0}; ///< most recent UTC-midnight epoch day with data
-};
+// AppPerfAppSummary relocated to app_perf_types.hpp (ADR-0031 WS-A4 DexPerfApi
+// split, PR #4582-review) — re-exported transitively via the #include above.
 
 class AppPerfFleetStore {
 public:

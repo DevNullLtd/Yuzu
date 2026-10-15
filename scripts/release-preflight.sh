@@ -54,8 +54,23 @@ fi
 FRAG_COUNT=$(find changelog.d -maxdepth 1 -name '*.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$FRAG_COUNT" -eq 0 ]; then
     pass "changelog.d/ has no unpromoted fragments"
+    if [ "$VERSION" = "$BASE_VERSION" ]; then
+        # A final release whose RCs already folded every fragment still needs
+        # its own date on the header (#5221); 4b cannot tell, so say it.
+        HEADER=$(grep -m1 "^## \[${BASE_VERSION//./\\.}\]" CHANGELOG.md 2>/dev/null | tr -d '\r' || true)
+        echo "        note: header is '${HEADER:-missing}' — if that is not the release date, run: python3 scripts/assemble-changelog.py promote $BASE_VERSION --append --date YYYY-MM-DD, commit, and re-run preflight"
+    fi
 else
-    fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION"
+    if grep -q "^## \[${BASE_VERSION//./\\.}\]" CHANGELOG.md 2>/dev/null; then
+        if [ "$VERSION" = "$BASE_VERSION" ]; then
+            APPEND_DATE=" --date YYYY-MM-DD  (the final release date)"
+        else
+            APPEND_DATE="  (omit --date for an RC; pass it only at the final release)"
+        fi
+        fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) and ## [$BASE_VERSION] already exists — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION --append$APPEND_DATE"
+    else
+        fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION"
+    fi
 fi
 
 # ── 5. Clean working tree ─────────────────────────────────────────────────
@@ -139,17 +154,20 @@ if [ "$FULL" = "--full" ]; then
         BUILDDIR="build-linux"
     fi
 
-    # Erlang toolchain — required by both the standalone rebar3 step and the
-    # gateway custom_target inside meson, so it must be on PATH before the C++
-    # compile too. ensure-erlang.sh probes kerl, asdf, Homebrew, and the MSYS2
-    # installer paths in turn; it always returns 0, so we verify with command -v.
-    # The explicit "28" arg is load-bearing: a sourced script inherits the
+    # Erlang toolchain for the standalone rebar3 step below (the Meson gateway
+    # target resolves the pinned OTP itself at configure). ensure-erlang.sh
+    # asks scripts/erlang_toolchain.py find-otp and activates what it picks; it
+    # always returns 0, and leaves PATH unchanged when nothing passes the pin,
+    # so `command -v erl` below only checks presence: a wrong-version erl
+    # already on PATH still passes it. The standalone rebar3 step does not
+    # enforce the floor; the Meson build does (it skips the gateway otherwise).
+    # The explicit "" arg is load-bearing: a sourced script inherits the
     # caller's positional args, so without it the helper would receive "$1"
-    # from THIS script (e.g. "v0.10.0") and search for a kerl install with
-    # that name. Pass the major version explicitly to track release.yml's
-    # erlef/setup-beam otp-version.
+    # from THIS script (e.g. "v0.10.0") as its version. "" selects the pinned
+    # default (scripts/erlang_toolchain.py DEFAULT_OTP_VERSION, 28.4 or any
+    # later 28.x) - the same floor Meson enforces - not a looser "any 28.x".
     # shellcheck source=ensure-erlang.sh
-    source "$(dirname "$0")/ensure-erlang.sh" 28
+    source "$(dirname "$0")/ensure-erlang.sh" ""
     HAVE_ERL=0
     if command -v erl > /dev/null 2>&1; then
         HAVE_ERL=1

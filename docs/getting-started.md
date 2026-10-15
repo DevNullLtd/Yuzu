@@ -20,7 +20,7 @@ Here are the key concepts you will use in this tutorial:
 
 - **Question vs. Action** -- Definitions have a `type` field. A `question` is read-only: it gathers information without modifying endpoint state (list services, read OS info, check disk space). An `action` may modify state (restart a service, install a package, change a registry value). This distinction drives the approval workflow -- questions can auto-execute, while actions can require sign-off.
 
-- **Parameters** -- Typed inputs with validation rules. Parameters are declared with a JSON Schema-style syntax (type, required fields, max length, allowed values) and validated before the command is dispatched to any agent.
+- **Parameters** -- Typed inputs with validation rules. Parameters are declared with a JSON Schema-style syntax (type, required fields, max length, allowed values) and `POST /api/instructions/{id}/execute` validates them before the command is dispatched to any agent (no other dispatch surface does yet).
 
 - **Result Schema** -- Typed output columns (string, int32, int64, bool, datetime) that describe the structure of response data. Typed results enable server-side aggregation (COUNT, SUM, AVG grouped by column) and clean export to CSV, JSON, ClickHouse, or Splunk.
 
@@ -62,8 +62,11 @@ This YAML is the canonical authoring format. Post the file itself: the `yaml_sou
 
 ### Import it via the API
 
+Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
+
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/yaml \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   --data-urlencode "yaml_source@hello-system-info.yaml"
 ```
@@ -162,7 +165,7 @@ Expected response:
 2. It constructed a gRPC `CommandRequest` with `plugin=os_info` and `action=os_name`.
 3. The request was dispatched to all connected agents over the bidirectional gRPC stream.
 4. Each agent's plugin host loaded the `os_info` plugin, invoked the `os_name` action, and streamed the result back as a `CommandResponse`.
-5. The server's `ResponseStore` persisted each response in SQLite with the command ID, agent ID, timestamp, status, and output.
+5. The server's `ResponseStore` persisted each response in PostgreSQL with the command ID, agent ID, timestamp, status, and output.
 6. An audit event was logged with your username, the action taken, and the number of agents targeted.
 
 ---
@@ -211,6 +214,7 @@ Key additions:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/yaml \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   --data-urlencode "yaml_source@service-inspect.yaml"
 ```
@@ -365,6 +369,15 @@ This downloads a CSV file with headers:
 id,instruction_id,agent_id,timestamp,status,output,error_detail
 ```
 
+An export is capped at 10,000 rows and at 50 MiB of output. A cut CSV ends with one extra record
+beginning `# result_truncated_by_cap` (parse the file as CSV and read the final record before
+trusting a bulk pull; a quoted cell can contain text that looks like it, so do not regex-match
+lines), and a cut JSON export has a top-level `result_truncated_by_cap: true` in the response body
+on this legacy route (under `pagination` on the v1 route). A cut export is also saved under a
+`-truncated` name by `-OJ` and carries `X-Result-Truncated-By-Cap: true`; a plain `-o` keeps neither
+the name nor the header, so add `-D -` to print the headers (`curl -sS -D - -o service-results.csv
+...`).
+
 ### Export as JSON
 
 ```bash
@@ -440,6 +453,7 @@ Key differences from a question:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instructions/yaml \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   --data-urlencode "yaml_source@service-restart.yaml"
 ```
@@ -582,6 +596,7 @@ The `permissions` block is the key governance feature:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/instruction-sets \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -625,6 +640,7 @@ When creating or updating an instruction definition, set the `instruction_set_id
 
 ```bash
 curl -s -X PUT http://localhost:8080/api/instructions/tutorial.service.inspect \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -863,7 +879,7 @@ Expected response:
 
 ## Step 8: Exporting Results
 
-Yuzu stores every response in its SQLite-backed ResponseStore. You can query, aggregate, and export this data through the REST API.
+Yuzu stores every response in its PostgreSQL-backed ResponseStore. You can query, aggregate, and export this data through the REST API.
 
 ### Query responses for an instruction
 
@@ -896,6 +912,8 @@ curl -s "http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8?status=1&
 curl -s "http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/export?format=csv" \
   -b "$COOKIE" -o responses.csv
 ```
+
+(A cut export is marked; the first "Export as CSV" section in this guide shows how to tell a cut export from a complete one.)
 
 The CSV file contains one row per agent response with headers:
 

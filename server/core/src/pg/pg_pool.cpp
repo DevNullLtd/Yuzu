@@ -33,7 +33,8 @@ PgPool::PgPool(Options opts)
     : conninfo_(std::move(opts.conninfo)), size_(opts.size > 0 ? opts.size : 1),
       connect_timeout_s_(opts.connect_timeout_s), statement_timeout_ms_(opts.statement_timeout_ms),
       lock_timeout_ms_(opts.lock_timeout_ms), keepalives_idle_s_(opts.keepalives_idle_s),
-      tcp_user_timeout_ms_(opts.tcp_user_timeout_ms), observer_(std::move(opts.observer)),
+      tcp_user_timeout_ms_(opts.tcp_user_timeout_ms),
+      saturated_fast_fail_(opts.saturated_fast_fail), observer_(std::move(opts.observer)),
       backoff_base_(opts.connect_backoff_base),
       backoff_cap_(opts.connect_backoff_cap) {
     // Parse up front so a malformed conninfo is caught here, once, with a
@@ -116,6 +117,36 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
     std::unique_lock lk{mu_};
     if (!valid_)
         return {};
+
+    // Fast-fail-on-saturation (#2146 gov sre finding
+    // up-2146-a2r1-httplib-worker-cascade): checked ONCE, here, before the
+    // wait loop below -- `idle_.empty() && open_ + connecting_ >= size_` is
+    // exactly the condition the loop already requires before it will ever
+    // reach its `cv_.wait_until` branch, so this is equivalent to clamping
+    // the wait at that branch, without duplicating the branch's own
+    // bookkeeping. If a BOUNDED acquire (`deadline != nullptr`) observes the
+    // pool already in that state, the caller's own timeout is very unlikely
+    // to be honoured by an actual release in time -- clamp the wait to
+    // `saturated_fast_fail_` instead, so the calling thread (often an
+    // httplib worker for a REST route, but any caller of a bounded acquire
+    // backed by this pool) is freed almost immediately rather than pinned
+    // for the full timeout. Measured from `t0` (taken
+    // before the lock, above) rather than "now" here, so time already spent
+    // waiting on `mu_` counts against the budget too -- the caller's thread
+    // has been unavailable to its own caller since `t0`. Unbounded
+    // `acquire()` (`deadline == nullptr`) and a bounded acquire that is NOT
+    // already saturated at entry are both unaffected. See
+    // Options::saturated_fast_fail's doc comment for why its default is
+    // 500ms rather than a smaller "near-zero" value -- several existing
+    // callers already pick a deliberately short timeout for reasons
+    // unrelated to this finding, and 500ms is chosen to sit AT OR ABOVE every
+    // one of them (a few tie at exactly 500ms; see the doc comment for the
+    // full survey).
+    std::chrono::steady_clock::time_point fast_fail_deadline;
+    if (deadline && idle_.empty() && open_ + connecting_ >= size_) {
+        fast_fail_deadline = std::min(*deadline, t0 + saturated_fast_fail_);
+        deadline = &fast_fail_deadline;
+    }
 
     for (;;) {
         if (shutdown_) {

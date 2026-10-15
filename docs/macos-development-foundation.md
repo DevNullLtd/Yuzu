@@ -7,9 +7,10 @@ app with external plugins, and disables executable-replacement OTA.
 
 ## Build and package from a checkout
 
-1. Select full Xcode, not only Command Line Tools. `xcode-select -p` must identify
-   the intended Xcode installation. Configure must report the EndpointSecurity
-   library found; otherwise TAR deliberately compiles polling fallback.
+1. Use an SDK that ships the Endpoint Security header and library stub (both the
+   Command Line Tools and full Xcode SDKs do). Configure must not print
+   "EndpointSecurity library or header not found"; otherwise TAR deliberately
+   compiles the polling fallback.
 2. Follow [the build guide](build-guide.md) for Meson, the C++23 toolchain and
    vcpkg prerequisites. Use the pinned manifest and repository `arm64-osx` triplet.
    In a fresh checkout, rebuild target dependencies without binary-cache restores:

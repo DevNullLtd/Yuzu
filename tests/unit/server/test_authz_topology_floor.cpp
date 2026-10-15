@@ -110,7 +110,7 @@ struct FloorFixture {
     /// is keyed by username).
     httplib::Request session_request(const std::string& username, auth::Role role) {
         REQUIRE(auth_mgr.upsert_user(username, "password1234", role));
-        auto token = auth_mgr.create_local_session(username, role, /*mfa_verified=*/true);
+        auto token = auth_mgr.create_local_session_for_test(username, role, /*mfa_verified=*/true);
         httplib::Request req;
         req.headers.emplace("Cookie", "yuzu_session=" + token);
         return req;
@@ -122,7 +122,7 @@ struct FloorFixture {
     /// `elevate_session`'s own contract puts eligibility on the caller).
     httplib::Request elevated_session_request(const std::string& username) {
         REQUIRE(auth_mgr.upsert_user(username, "password1234", auth::Role::user));
-        auto token = auth_mgr.create_local_session(username, auth::Role::user, /*mfa_verified=*/true);
+        auto token = auth_mgr.create_local_session_for_test(username, auth::Role::user, /*mfa_verified=*/true);
         REQUIRE(auth_mgr.elevate_session(token, std::chrono::seconds(300)).has_value());
         httplib::Request req;
         req.headers.emplace("Cookie", "yuzu_session=" + token);
@@ -157,20 +157,23 @@ constexpr FloorPair kExpectedFloorPairs[] = {
     // doesn't silently widen admin-only to any-authenticated-user.
     {"Enrollment", "Read"},
     {"OidcConfig", "Read"},
+    // Wave 7 PR7.2 (app_usage) — see authz_topology_floor.hpp's kTopologyFloor
+    // comment for the rationale.
+    {"Forensics", "Read"},
 };
 
 } // namespace
 
 // ── 1. Lock the set ──────────────────────────────────────────────────────
 
-TEST_CASE("topology_floor_applies: exactly the nine documented pairs are floored",
+TEST_CASE("topology_floor_applies: exactly the ten documented pairs are floored",
           "[authz][floor]") {
-    // Positive: the nine floored pairs (a change to kTopologyFloor's
+    // Positive: the ten floored pairs (a change to kTopologyFloor's
     // MEMBERSHIP must break these). #4028 (api-parity programme #2146)
     // added the four Settings read-twin securables to the original three;
-    // #4031 added Enrollment/OidcConfig — see authz_topology_floor.hpp's
-    // file-header note on why these PRs extended this floor beyond its
-    // original "authorization topology" framing.
+    // #4031 added Enrollment/OidcConfig; Wave 7 PR7.2 added Forensics — see
+    // authz_topology_floor.hpp's file-header note on why these PRs extended
+    // this floor beyond its original "authorization topology" framing.
     CHECK(topology_floor_applies("AccessReview", "Read"));
     CHECK(topology_floor_applies("UserManagement", "Read"));
     CHECK(topology_floor_applies("EnginePrincipal", "Read"));
@@ -180,6 +183,7 @@ TEST_CASE("topology_floor_applies: exactly the nine documented pairs are floored
     CHECK(topology_floor_applies("AnalyticsConfig", "Read"));
     CHECK(topology_floor_applies("Enrollment", "Read"));
     CHECK(topology_floor_applies("OidcConfig", "Read"));
+    CHECK(topology_floor_applies("Forensics", "Read"));
 
     // Negative: a representative spread of pairs that must NOT be floored —
     // proves the set is narrow, not "every Read" or "every op on these
@@ -192,11 +196,12 @@ TEST_CASE("topology_floor_applies: exactly the nine documented pairs are floored
     CHECK_FALSE(topology_floor_applies("PluginConfig", "Read")); // unrelated securable, not floored
     CHECK_FALSE(topology_floor_applies("Directory", "Read")); // #4031: NOT floored, see PR notes
     CHECK_FALSE(topology_floor_applies("Enrollment", "Write"));
+    CHECK_FALSE(topology_floor_applies("Forensics", "Write"));
 
-    // Cardinality lock: a tenth pair silently added to kTopologyFloor
+    // Cardinality lock: an eleventh pair silently added to kTopologyFloor
     // without updating this file's positive/negative lists must still break
     // this test even though every entry it DOES check still round-trips.
-    CHECK(std::size(kTopologyFloor) == 9);
+    CHECK(std::size(kTopologyFloor) == 10);
 }
 
 // ── 1b. Every floored securable must actually EXIST in the catalogue ─────
@@ -383,6 +388,201 @@ TEST_CASE("require_permission: a floored denial's audit reason and counter are d
     }
 }
 
+// ── 9b. has_permission: the render-time probe (PR #5846 review; #5792) ─────
+
+TEST_CASE("has_permission: gives require_permission's verdict and writes no denial row, while "
+          "the gate still does (mutation: drop the probe guard in audit_log and the first "
+          "assertion fails)",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    const AuditQuery denied_rows{.action = "auth.permission_required", .limit = 10};
+
+    SECTION("a denied probe leaves no auth.permission_required row; the gate leaves one") {
+        auto req = fix.session_request("kim", auth::Role::user);
+        CHECK_FALSE(fix.ar->has_permission(req, "Infrastructure", "Write"));
+        auto after_probe = fix.audit_store->query(denied_rows);
+        REQUIRE(after_probe.has_value());
+        CHECK(after_probe->empty());
+
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "Infrastructure", "Write"));
+        auto after_gate = fix.audit_store->query(denied_rows);
+        REQUIRE(after_gate.has_value());
+        CHECK(after_gate->size() == 1);
+
+        // The suppression does not outlive the probe: a second probe adds nothing and a later
+        // gate denial is recorded again.
+        CHECK_FALSE(fix.ar->has_permission(req, "Infrastructure", "Write"));
+        httplib::Response res2;
+        CHECK_FALSE(fix.ar->require_permission(req, res2, "Infrastructure", "Write"));
+        auto after_both = fix.audit_store->query(denied_rows);
+        REQUIRE(after_both.has_value());
+        CHECK(after_both->size() == 2);
+    }
+
+    SECTION("the probe answers exactly as the gate does: admit, role denial, floored denial, "
+            "elevation") {
+        struct Case {
+            const char* user;
+            auth::Role role;
+            const char* securable;
+            const char* operation;
+            bool elevated;
+        };
+        const Case cases[] = {
+            {"lee", auth::Role::user, "Infrastructure", "Read", false},    // legacy Read allowed
+            {"mo", auth::Role::user, "Execution", "Execute", false},       // legacy needs admin
+            {"ned", auth::Role::user, "AccessReview", "Read", false},      // topology floor
+            {"ola", auth::Role::admin, "Execution", "Execute", false},     // admin
+            {"pat", auth::Role::user, "Execution", "Execute", true},       // JIT elevation
+        };
+        for (const auto& c : cases) {
+            INFO(c.user << " " << c.securable << ":" << c.operation);
+            auto req = c.elevated ? fix.elevated_session_request(c.user)
+                                  : fix.session_request(c.user, c.role);
+            httplib::Response res;
+            const bool gate = fix.ar->require_permission(req, res, c.securable, c.operation);
+            const bool probe = fix.ar->has_permission(req, c.securable, c.operation);
+            CHECK(probe == gate);
+        }
+    }
+
+    SECTION("an unauthenticated request is simply not permitted, and nothing is written") {
+        httplib::Request anon;
+        CHECK_FALSE(fix.ar->has_permission(anon, "Infrastructure", "Read"));
+        auto rows = fix.audit_store->query(denied_rows);
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+    }
+}
+
+TEST_CASE("probe_fleet_read / probe_permission: the gate's verdict with no denial row (PR #5859 "
+          "review; mutation: drop the AuditProbeScope in either and the row counts fail)",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    const AuditQuery fleet_rows{.action = "auth.fleet_read_required", .limit = 10};
+    const AuditQuery perm_rows{.action = "auth.permission_required", .limit = 10};
+
+    SECTION("a denied fleet-read probe writes no row; the gate writes one") {
+        auto req = fix.session_request("quin", auth::Role::user);
+        httplib::Response probe_res;
+        // A non-Read operation is the gate's deterministic, audited refusal.
+        auto probed = fix.ar->probe_fleet_read(req, probe_res, "Infrastructure", "Write");
+        CHECK_FALSE(probed.has_value());
+        CHECK(probe_res.status == 403); // the response is still written, for the caller to read
+        auto after_probe = fix.audit_store->query(fleet_rows);
+        REQUIRE(after_probe.has_value());
+        CHECK(after_probe->empty());
+
+        httplib::Response gate_res;
+        auto gated = fix.ar->require_fleet_read(req, gate_res, "Infrastructure", "Write");
+        CHECK_FALSE(gated.has_value());
+        auto after_gate = fix.audit_store->query(fleet_rows);
+        REQUIRE(after_gate.has_value());
+        CHECK(after_gate->size() == 1);
+    }
+
+    SECTION("the probe answers with the gate's own verdict and status (this fixture has no "
+            "management-group store, so the fleet gate fails closed for both; the admit path "
+            "of the shared decision is covered by the has_permission cases above)") {
+        for (auto role : {auth::Role::user, auth::Role::admin}) {
+            auto req = fix.session_request(role == auth::Role::admin ? "rae" : "ray", role);
+            httplib::Response a, b;
+            auto probed = fix.ar->probe_fleet_read(req, a, "Infrastructure", "Read");
+            auto gated = fix.ar->require_fleet_read(req, b, "Infrastructure", "Read");
+            CHECK(probed.has_value() == gated.has_value());
+            CHECK(a.status == b.status);
+            if (probed && gated)
+                CHECK(probed->visible_for_query() == gated->visible_for_query());
+        }
+    }
+
+    SECTION("probe_permission keeps the gate's status and writes no row") {
+        auto req = fix.session_request("sam", auth::Role::user);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->probe_permission(req, res, "Execution", "Execute"));
+        CHECK(res.status == 403);
+        auto rows = fix.audit_store->query(perm_rows);
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+    }
+}
+
+TEST_CASE("probe_permission / probe_fleet_read: a token caller keeps its denial row while a cookie "
+          "sign-in does not (mutation: install the probe scope unconditionally)",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    yuzu::server::ApiTokenStore tokens{*fix.audit_pool};
+    REQUIRE(tokens.is_open());
+    REQUIRE(fix.auth_mgr.upsert_user("tess", "password1234", auth::Role::user));
+    const auto expiry = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() +
+                        3600;
+    auto raw = tokens.create_token("probe-token", "tess", expiry);
+    REQUIRE(raw.has_value());
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, &fix.rbac_store, &tokens, fix.audit_store.get(),
+                  /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr, /*analytics_store=*/nullptr,
+                  fix.oidc_mu, fix.oidc_provider);
+    const AuditQuery perm_rows{.action = "auth.permission_required", .limit = 20};
+    const AuditQuery fleet_rows{.action = "auth.fleet_read_required", .limit = 20};
+    auto count = [&](const AuditQuery& q) {
+        auto r = fix.audit_store->query(q);
+        REQUIRE(r.has_value());
+        return r->size();
+    };
+
+    httplib::Request bearer;
+    bearer.headers.emplace("Authorization", "Bearer " + *raw);
+
+    httplib::Response r1;
+    CHECK_FALSE(ar.probe_permission(bearer, r1, "Execution", "Execute"));
+    CHECK(count(perm_rows) == 1); // the token caller's denial is on the record
+
+    httplib::Response r2;
+    CHECK_FALSE(ar.probe_fleet_read(bearer, r2, "Infrastructure", "Write").has_value());
+    CHECK(count(fleet_rows) == 1);
+
+    // The same questions from an interactive cookie sign-in add nothing.
+    auto cookie = fix.session_request("cora", auth::Role::user);
+    httplib::Response r3, r4;
+    CHECK_FALSE(ar.probe_permission(cookie, r3, "Execution", "Execute"));
+    CHECK_FALSE(ar.probe_fleet_read(cookie, r4, "Infrastructure", "Write").has_value());
+    CHECK(count(perm_rows) == 1);
+    CHECK(count(fleet_rows) == 1);
+}
+
+TEST_CASE("probe_fleet_read: an elevated session is admitted exactly as the gate admits it, "
+          "with the same scope",
+          "[pg][authz][probe]") {
+    FloorFixture fix;
+    auto req = fix.elevated_session_request("elena");
+    httplib::Response a, b;
+    auto probed = fix.ar->probe_fleet_read(req, a, "Infrastructure", "Read");
+    auto gated = fix.ar->require_fleet_read(req, b, "Infrastructure", "Read");
+    REQUIRE(gated.has_value()); // guard: a vacuous both-denied must not pass
+    REQUIRE(probed.has_value());
+    CHECK(probed->visible_for_query() == gated->visible_for_query());
+}
+
+TEST_CASE("denial_row_may_be_withheld: only an interactive cookie sign-in qualifies",
+          "[authz][probe]") {
+    auto session = [](const char* source, const char* kind) {
+        auth::Session s;
+        s.auth_source = source;
+        s.principal_kind = kind;
+        return s;
+    };
+    CHECK(yuzu::server::denial_row_may_be_withheld(session("local", "user")));
+    CHECK(yuzu::server::denial_row_may_be_withheld(session("oidc", "user")));
+    CHECK(yuzu::server::denial_row_may_be_withheld(session("saml", "user")));
+    // A machine credential or an engine principal keeps its denial rows.
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("api_token", "user")));
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("mcp_token", "user")));
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("engine_token", "engine")));
+    CHECK_FALSE(yuzu::server::denial_row_may_be_withheld(session("local", "engine")));
+}
+
 // ── 10. Securable seeding ─────────────────────────────────────────────────
 
 TEST_CASE("RbacStore::seed_defaults: EnginePrincipal is seeded with Administrator+Viewer Read",
@@ -534,6 +734,45 @@ TEST_CASE("require_permission: an engine principal is still denied Read on every
         httplib::Response res;
         INFO("securable=" << entry.securable << " operation=" << entry.operation);
         CHECK_FALSE(ar.require_permission(req, res, entry.securable, entry.operation));
+        CHECK(res.status == 403);
+    }
+}
+
+// ── 11. Forensics:Read (Wave 7 PR7.2) — the new pair's own matrix ────────
+//
+// Forensics is deliberately absent from the Viewer read-list (rbac_store.cpp
+// seed_defaults) — Administrator-only by design (docs/authz-model.md §4).
+// This locks all three legs the app_usage read path depends on: the
+// RBAC-off admin allow (the ordinary admin-role fast path, unaffected by the
+// floor), the RBAC-on seeded-Administrator allow (the floor must never run
+// ahead of a live grant — same principle section 5 locks for AccessReview),
+// and the RBAC-on no-grant deny (a plain user, even with RBAC on, never
+// gets Forensics:Read without an explicit grant).
+
+TEST_CASE("require_permission: Forensics:Read — RBAC-off admin allowed, RBAC-on seeded "
+          "Administrator grant allowed, RBAC-on no grant denied",
+          "[pg][authz][floor]") {
+    FloorFixture fix;
+
+    SECTION("RBAC off: an admin cookie session is allowed") {
+        auto req = fix.session_request("oscar", auth::Role::admin);
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "Forensics", "Read"));
+    }
+
+    SECTION("RBAC on: a user assigned the seeded Administrator role is allowed") {
+        REQUIRE(fix.rbac_store.assign_role({"user", "peggy", "Administrator"}).has_value());
+        fix.rbac_store.set_rbac_enabled(true);
+        auto req = fix.session_request("peggy", auth::Role::user);
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "Forensics", "Read"));
+    }
+
+    SECTION("RBAC on: a non-admin with no Forensics grant is denied") {
+        fix.rbac_store.set_rbac_enabled(true);
+        auto req = fix.session_request("quentin", auth::Role::user);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "Forensics", "Read"));
         CHECK(res.status == 403);
     }
 }

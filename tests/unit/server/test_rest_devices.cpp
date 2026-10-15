@@ -8,26 +8,23 @@
 // uses — see test_rest_inventory_software.cpp's InvHarness for the pattern
 // this file borrows) as their SOLE gate; this harness fakes that gate the
 // same way. No Postgres substrate is needed for the paths under test here:
-// `agents_fn` is a plain in-memory lambda (mirrors registry_.to_json_obj()'s
-// shape). `TagStore` itself is Postgres-only (`explicit TagStore(pg::PgPool&)`,
-// tag_store.hpp) and cannot be constructed in a plain unit test, so the HTTP
-// harness below always wires `tag_store=nullptr` — the "tag_store present"
-// case is instead covered directly against the PURE builder function
-// `device_agent_detail_json` (no TagStore/HTTP/store needed at all — see the
-// "PURE builder coverage" section below), not through this harness.
+// ADR-0031 WS-A4 wave 2 sources both routes from a `FakeDeviceApi` test double
+// (this file's own DeviceApi implementation) instead of a raw registry
+// snapshot — `agents_fn` stays wired (still used by POST /api/v1/scope/preview,
+// untested in this file) but is no longer these two routes' data source.
 //
 // What's covered:
 //   - GET /api/v1/devices: gate deny (401/403/503-unwired) -> no rows; gate
 //     admit + scope filter -> only in-scope rows, correct devices_omitted
 //     count; row shape matches list_agents' 5-field contract.
-//   - GET /api/v1/devices/{id}: found in-scope -> 200 w/ fields; out-of-scope
-//     match collapses to the SAME 404 as a genuinely nonexistent agent_id
-//     (#1700-style existence-oracle closure); tag_store unwired (this file's
-//     HTTP harness only) -> no `tags` key.
+//   - GET /api/v1/devices/{id}: found in-scope -> 200 w/ fields (tags key
+//     always present, possibly empty — see the PURE builder section below for
+//     why); out-of-scope match collapses to the SAME 404 as a genuinely
+//     nonexistent agent_id (#1700-style existence-oracle closure).
 //   - device_agent_row_json / device_agent_detail_json (PURE, no HTTP/store):
-//     5-field row shape; tags omitted when the tags pointer is null; tags
-//     array populated (key/value/source per entry) when it is not — this is
-//     the "tag_store present" coverage the HTTP harness above cannot provide.
+//     5-field row shape; tags array populated (key/value/source per entry)
+//     — the DeviceApi seam (device_api.hpp) always returns an (possibly
+//     empty) tags vector, so the emitted JSON always carries the key.
 //   - GET /api/v1/management-groups/agent-count-preview: perm_fn/auth_fn gate;
 //     empty filters -> agent_count 0 with NO store call (works even with
 //     response_store == nullptr); non-empty filters + response_store ==
@@ -46,9 +43,12 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <expected>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -58,6 +58,30 @@ namespace {
 
 struct AuditRecord {
     std::string action, result, target_id, detail;
+};
+
+// Minimal DeviceApi test double (ADR-0031 WS-A4 wave 2) — backs GET
+// /api/v1/devices[/{id}] in place of the retired raw `agents_fn` read on this
+// pair. `rows` is UNSCOPED (fleet_read_fn's own gate.scope is the sole filter,
+// matching the real seam's contract); `details` backs the point lookup by id.
+class FakeDeviceApi : public DeviceApi {
+public:
+    std::vector<DeviceListRow> rows;
+    std::unordered_map<std::string, DeviceDetail> details;
+    bool degrade = false;         ///< when true, lookup_device returns kDegraded (tag-store outage)
+    mutable int lookup_calls = 0; ///< #3564: assert an out-of-scope id short-circuits BEFORE any read
+
+    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override { return rows; }
+
+    [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
+    lookup_device(const std::string& id) const override {
+        ++lookup_calls;
+        if (degrade)
+            return std::unexpected(DeviceReadError::kDegraded);
+        if (auto it = details.find(id); it != details.end())
+            return std::optional<DeviceDetail>{it->second};
+        return std::optional<DeviceDetail>{std::nullopt};
+    }
 };
 
 // Minimal harness wiring only what the three routes under test need. Every
@@ -74,8 +98,14 @@ struct DeviceRestHarness {
     authz::VisibleSet fleet_scope{std::nullopt}; // nullopt = TOP/unfiltered
     int fleet_deny_status{403};
 
-    // Raw agent registry snapshot the two device routes filter.
+    // Raw agent registry snapshot — still wired for POST /api/v1/scope/preview
+    // (agents_fn's other live consumer); NOT this file's device-route tests'
+    // data source any more (see device_api below).
     nlohmann::json agents = nlohmann::json::array();
+
+    // ADR-0031 WS-A4 wave 2: the DeviceApi seam backing GET
+    // /api/v1/devices[/{id}] under test in this file.
+    std::shared_ptr<FakeDeviceApi> device_api = std::make_shared<FakeDeviceApi>();
 
     // D3 Response:Read-visible scope for the group-preview route.
     std::optional<std::set<std::string>> response_visible_scope; // nullopt = TOP
@@ -144,11 +174,12 @@ struct DeviceRestHarness {
             /*command_dispatch_fn=*/{}, /*step_up_fn=*/{}, /*guardian_push_fn=*/{},
             /*dex_perf_fn=*/{}, /*network_api=*/{}, /*lockout_clear_fn=*/{},
             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
-            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
-            /*app_perf_providers=*/{}, /*engine_principal_store=*/nullptr,
+            /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{}, /*engine_principal_store=*/nullptr,
             /*access_review_store=*/nullptr, /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
             /*stream_budget=*/nullptr, /*exec_visible_fn=*/{}, /*list_read_fn=*/{},
-            std::move(fleet_read_fn), std::move(agents_fn), std::move(response_visible_set_fn));
+            std::move(fleet_read_fn), std::move(agents_fn), std::move(response_visible_set_fn),
+            /*verify_api=*/{}, /*device_api=*/device_api,
+            /*dex_api=*/{});
     }
 
     void add_agent(const std::string& id, const std::string& hostname) {
@@ -157,6 +188,10 @@ struct DeviceRestHarness {
                           {"os", "linux"},
                           {"arch", "x86_64"},
                           {"agent_version", "1.0.0"}});
+        DeviceListRow row{.agent_id = id, .hostname = hostname, .os = "linux", .arch = "x86_64",
+                         .agent_version = "1.0.0"};
+        device_api->rows.push_back(row);
+        device_api->details[id] = DeviceDetail{.row = row, .tags = {}};
     }
 };
 
@@ -230,7 +265,12 @@ TEST_CASE("GET /api/v1/devices/{id} — found and in-scope returns the row", "[r
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["data"]["agent_id"] == "a1");
     CHECK(body["data"]["hostname"] == "host1");
-    CHECK_FALSE(body["data"].contains("tags")); // no tag_store wired
+    // ADR-0031 WS-A4 wave 2: DeviceApi always returns a (possibly empty) tags
+    // vector — "tags" is now ALWAYS present, never omitted (deliberate,
+    // already-committed wave-1 seam decision; see device_routes.hpp's doc
+    // comment on device_agent_detail_json).
+    REQUIRE(body["data"].contains("tags"));
+    CHECK(body["data"]["tags"].empty());
 }
 
 TEST_CASE("GET /api/v1/devices/{id} — nonexistent agent_id is a 404", "[rest][devices]") {
@@ -260,17 +300,44 @@ TEST_CASE("GET /api/v1/devices/{id} — out-of-scope match collapses to the SAME
     CHECK(res2->status == 404);
 }
 
-// ── PURE builder coverage: device_agent_row_json / device_agent_detail_json ──
-// No HTTP, no store, no TagStore (which is Postgres-only and cannot be
-// constructed here) — direct calls against the pure functions declared in
-// device_routes.hpp. This is the ONLY coverage of the tags-populated branch;
-// the HTTP harness above always wires tag_store=nullptr (see file header).
+TEST_CASE("GET /api/v1/devices/{id} — an out-of-scope id is denied with ZERO backing read "
+          "(#3564 timing-oracle closure; security-guardian + architect)",
+          "[rest][devices]") {
+    DeviceRestHarness h;
+    h.fleet_scope = std::unordered_set<std::string>{}; // engaged-empty: nothing in scope
+    h.add_agent("a1", "host1"); // EXISTS in the registry + device_api->details, but out of scope
+    auto res = h.sink.Get("/api/v1/devices/a1");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 404);
+    // The fix: `in_scope` is checked FIRST, so an out-of-scope id short-circuits
+    // to 404 without ever calling lookup_device — no registry/tag-store read, so
+    // an existent-but-out-of-scope id is indistinguishable from a nonexistent one
+    // by TIMING as well as by response. This assertion fails against a
+    // lookup-then-scope ordering (which would read for the existent id).
+    CHECK(h.device_api->lookup_calls == 0);
+}
 
-TEST_CASE("device_agent_row_json: exactly the 5 list_agents fields, defensively extracted",
-          "[devices][pure]") {
-    nlohmann::json agent = {{"agent_id", "a1"}, {"hostname", "host1"},
-                            {"os", "linux"},    {"arch", "x86_64"},
-                            {"agent_version", "1.0.0"}};
+TEST_CASE("GET /api/v1/devices/{id} — in-scope degraded tag-store read is a 503, not a false 404/200",
+          "[rest][devices]") {
+    DeviceRestHarness h; // fleet_scope defaults to nullopt = in scope
+    h.add_agent("a1", "host1");
+    h.device_api->degrade = true; // tag-store outage on the detail read
+    auto res = h.sink.Get("/api/v1/devices/a1");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 503);
+    CHECK(h.device_api->lookup_calls == 1); // in-scope DOES reach the lookup (only out-of-scope skips it)
+}
+
+// ── PURE builder coverage: device_agent_row_json / device_agent_detail_json ──
+// No HTTP, no store — direct calls against the pure functions declared in
+// device_routes.hpp, now over DeviceApi's typed rows (ADR-0031 WS-A4 wave 2).
+// `tags` is ALWAYS present in the emitted JSON post-rewire (never omitted) —
+// see device_routes.hpp's doc comment on device_agent_detail_json for why
+// this is a deliberate, already-committed (wave 1) seam decision.
+
+TEST_CASE("device_agent_row_json: exactly the 5 list_agents fields", "[devices][pure]") {
+    DeviceListRow agent{.agent_id = "a1", .hostname = "host1", .os = "linux", .arch = "x86_64",
+                       .agent_version = "1.0.0"};
     auto row = device_agent_row_json(agent);
     CHECK(row["agent_id"] == "a1");
     CHECK(row["hostname"] == "host1");
@@ -280,45 +347,34 @@ TEST_CASE("device_agent_row_json: exactly the 5 list_agents fields, defensively 
     CHECK(row.size() == 5);
 }
 
-TEST_CASE("device_agent_row_json: a short/malformed source object degrades to empty fields, "
-          "never throws",
+TEST_CASE("device_agent_row_json: a default-constructed row degrades to empty fields",
           "[devices][pure]") {
-    nlohmann::json agent = {{"agent_id", "a1"}}; // hostname/os/arch/agent_version all missing
+    DeviceListRow agent{.agent_id = "a1"}; // hostname/os/arch/agent_version all default-empty
     auto row = device_agent_row_json(agent);
     CHECK(row["agent_id"] == "a1");
     CHECK(row["hostname"] == "");
     CHECK(row["os"] == "");
 }
 
-TEST_CASE("device_agent_detail_json: null tags pointer omits the tags key entirely (never an "
-          "empty array)",
+TEST_CASE("device_agent_detail_json: an empty tags vector produces an empty array",
           "[devices][pure]") {
-    nlohmann::json agent = {{"agent_id", "a1"}, {"hostname", "host1"}};
-    auto detail = device_agent_detail_json(agent, /*tags=*/nullptr);
-    CHECK_FALSE(detail.contains("tags"));
-}
-
-TEST_CASE("device_agent_detail_json: an engaged-but-empty tags vector produces an empty array, "
-          "distinguishable from a null pointer",
-          "[devices][pure]") {
-    nlohmann::json agent = {{"agent_id", "a1"}};
-    std::vector<DeviceTag> tags; // present, TagStore succeeded, agent just has no tags
-    auto detail = device_agent_detail_json(agent, &tags);
+    DeviceDetail detail_in{.row = {.agent_id = "a1"}, .tags = {}};
+    auto detail = device_agent_detail_json(detail_in);
     REQUIRE(detail.contains("tags"));
     CHECK(detail["tags"].is_array());
     CHECK(detail["tags"].empty());
 }
 
 TEST_CASE("device_agent_detail_json: a populated tags vector serialises key/value/source per "
-          "entry — the 'tag_store present' case the HTTP harness above cannot cover",
+          "entry",
           "[devices][pure]") {
-    nlohmann::json agent = {{"agent_id", "a1"}, {"hostname", "host1"}, {"os", "linux"},
-                            {"arch", "x86_64"}, {"agent_version", "1.0.0"}};
-    std::vector<DeviceTag> tags{
-        DeviceTag{.agent_id = "a1", .key = "environment", .value = "production", .source = "server"},
-        DeviceTag{.agent_id = "a1", .key = "owner", .value = "sre-team", .source = "agent"},
+    DeviceDetail detail_in{
+        .row = {.agent_id = "a1", .hostname = "host1", .os = "linux", .arch = "x86_64",
+               .agent_version = "1.0.0"},
+        .tags = {DeviceTagRow{.key = "environment", .value = "production", .source = "server"},
+                DeviceTagRow{.key = "owner", .value = "sre-team", .source = "agent"}},
     };
-    auto detail = device_agent_detail_json(agent, &tags);
+    auto detail = device_agent_detail_json(detail_in);
     REQUIRE(detail.contains("tags"));
     REQUIRE(detail["tags"].size() == 2);
     CHECK(detail["tags"][0]["key"] == "environment");

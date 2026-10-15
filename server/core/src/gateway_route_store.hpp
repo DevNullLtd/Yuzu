@@ -34,18 +34,189 @@
 /// guarded by `session_id`, not by epoch — they only touch the row if it still
 /// belongs to THIS session. A stale CONNECTED/DISCONNECTED from a DIFFERENT,
 /// already-superseded session therefore cannot overwrite or tear down a
-/// newer re-home: `announce_connected` no-ops (falls through to an
-/// `ON CONFLICT DO NOTHING` insert) if the session doesn't match, and
+/// newer re-home IN THIS STORE: `announce_connected` no-ops (falls through to
+/// an `ON CONFLICT DO NOTHING` insert) if the session doesn't match, and
 /// `deregister` tombstones zero rows.
-/// LIMIT — a SAME-session late notification is NOT fenced by this guard: the
-/// re-announce path deliberately REUSES the session id, so `session_id`
-/// equality alone cannot distinguish an old home's teardown from a newer
-/// re-home under the same id. This is unreachable under the shipped gateway
-/// (at most one `CONNECTED(S)` and one `DISCONNECTED(S)` per session — see the
-/// #4246 #4 bullet in ADR-2002 §7), and the per-home generation that would
-/// fence it is a precondition of the first slice that re-CONNECTs under a
-/// reused session id — NOT a 4.2a change. Invariant to preserve:
-/// `session_id` ≡ exactly one gateway stream placement.
+///
+/// This guarantee was DURABLE-STORE-ONLY through HA WS-4 4.4's initial push
+/// (PR #4636 FortitudeEtc post-build review, BLOCKER 2): the IN-MEMORY
+/// `AgentRegistry::set_gateway_route` (agent_registry.cpp) had NO session
+/// check at all — a delayed CONNECTED for a session already superseded by a
+/// genuine newer registration could still clobber the newer session's
+/// `gateway_node`/capabilities/`stream_home_id` in memory even though this
+/// store's own row stayed correct, a real end-to-end gap this file's own
+/// prose read as already closed. Fixed in the same PR:
+/// `AgentRegistry::set_gateway_route` now takes and checks `session_id`
+/// against the currently-installed session (mirroring
+/// `gateway_stream_home_id`'s own pre-existing guard) and returns `false`
+/// (nothing written) on a mismatch; `NotifyStreamStatus`'s CONNECTED handler
+/// rejects the RPC outright on `false` rather than falling through to this
+/// store's own (already-correct) `announce_connected` write. The claim below
+/// is therefore now genuinely end-to-end — memory AND store both refuse a
+/// stale session — not store-only as it was when first written.
+/// LIMIT (as of 4.2a) — a SAME-session late notification was NOT fenced by
+/// `session_id` alone: the re-announce path deliberately REUSES the session
+/// id, so `session_id` equality cannot distinguish an old home's teardown
+/// from a newer re-home under the same id. This was unreachable under the
+/// shipped gateway (at most one `CONNECTED(S)` and one `DISCONNECTED(S)` per
+/// session — see the #4246 #4 bullet in ADR-2002 §7). SLICE #4324 below adds
+/// the per-home generation (`stream_home_id`) that closes this gap
+/// end-to-end (store predicate below AND the RPC-handler wiring in
+/// `gateway_service_impl.cpp` — CLOSED, both halves, as of #4324 task 3/3).
+/// Invariant to preserve: `session_id` ≡ exactly one gateway stream
+/// placement.
+///
+/// SLICE #4324 (HA WS-4, store layer) — `stream_home_id` is an opaque,
+/// per-connection-instance id (minted once per gateway process instance,
+/// task 1 of #4324) stamped on both the CONNECTED and DISCONNECTED
+/// notification a given stream instance ever sends. `announce_connected`
+/// writes it into the row on every winning placement write, exactly like
+/// `cluster_id`/`gateway_node` (it IS placement, not a session property —
+/// `announce_connected` stays the sole writer of it); `register_fresh` NULLs
+/// it on a winning re-register for the same reason it NULLs `cluster_id`/
+/// `gateway_node` (4.2b Task A). `deregister`'s tombstone predicate is
+/// `stream_home_id IS NULL OR stream_home_id = $3` — an EMPTY/NULL stored
+/// home ADMITS ANY incoming `$3` (stamped or not); a STAMPED stored home
+/// requires an EXACT match. This closes the SESSION GUARDS LIMIT above for a
+/// rolling gateway upgrade (mixed-version cluster is the NORMAL state of
+/// one): an old-build gateway node's late DISCONNECTED — unstamped — must
+/// not tombstone a new-build node's stamped re-home reusing the same session
+/// id (a stamped `$3` never satisfies `stream_home_id IS NULL` against a
+/// stamped stored value, and `stream_home_id = $3` needs an exact match), but
+/// a genuinely-matching stamped DISCONNECTED must still tear down its own
+/// stamped row, and a legacy DISCONNECTED against a legacy (never-stamped,
+/// stored-NULL) row must still behave exactly as before. The naive symmetric
+/// predicate (`$3 = '' OR stream_home_id = $3`) would let ANY unstamped
+/// DISCONNECTED tear down ANY row regardless of its stamped home id,
+/// re-opening exactly this race — do not "fix" this predicate back to that
+/// shape. `reap_stale_routes`'s tombstone sweep NULLs `stream_home_id`
+/// alongside `session_id`/`lease_until`/`cluster_id`/`gateway_node` for the
+/// same reason: a tombstoned row must have a fully cleared placement. CLOSED
+/// under today's shipped-gateway producer invariant (#4324 task 3/3): the
+/// RPC handler (`gateway_service_impl.cpp`'s `NotifyStreamStatus`) threads
+/// the caller's REAL `stream_home_id` into both `announce_connected` and
+/// `deregister`, AND resolves an identical fence against `AgentRegistry`'s
+/// in-memory `gateway_stream_home_id` — resolved ONCE, at the top of the
+/// DISCONNECTED branch, before ANY of the registry-clear/store-deregister/
+/// session-map-erase effects run (all-or-nothing; see that handler's own
+/// comment for why splitting them is a correctness bug, not a style choice).
+/// A gateway build predating #4324 (empty `stream_home_id` on every call) is
+/// unaffected — a stored-NULL row always admits an empty incoming value too.
+///
+/// PREDICATE FIX (PR #4492 review, HIGH, fixed pre-merge): the ORIGINAL form
+/// of this predicate was `stream_home_id = $3 OR (stream_home_id IS NULL AND
+/// $3 = '')` — requiring the INCOMING value to ALSO be empty before a
+/// stored-NULL row would admit it. That was wrong: a stored-NULL home does
+/// NOT only mean "legacy, never stamped" — under the single-producer
+/// invariant it can equally mean "this session's own `announce_connected`
+/// (called from the CONNECTED branch) simply hasn't run yet." The gateway
+/// dispatches CONNECTED and DISCONNECTED as two independently
+/// `spawn_monitor`'d RPC workers with NO ordering guarantee between them
+/// (`yuzu_gw_upstream.erl`), so an ORDINARY connect/disconnect — no re-home,
+/// no second CONNECTED/DISCONNECTED pair, just the FIRST and ONLY one for a
+/// brand-new session — can have its DISCONNECTED reach this server before
+/// its own paired CONNECTED. The original predicate rejected that stamped,
+/// entirely legitimate DISCONNECTED (stored NULL, incoming non-empty), so
+/// the deregister/fence silently no-opped, and the delayed CONNECTED then
+/// published a route for an already-dead stream — a regression vs. the
+/// pre-#4324 unfenced behavior, where the same reordering self-corrected.
+/// This is DIFFERENT FROM, and reachable WITHOUT, the FORWARD NOTE gaps
+/// below (which all require a producer of a SECOND CONNECTED/DISCONNECTED
+/// pair for the same session — live re-home, not shipped until 4.3/4.4); it
+/// needed only the ordinary FIRST pair, reordered, which is reachable today
+/// under ordinary operational churn. The identical gap existed in the
+/// in-memory fence (`gateway_service_impl.cpp`'s `home_matches`) and is
+/// fixed there the same way — the two predicates must never diverge.
+///
+/// SCOPE OF "CLOSED" (adversarial review, 2026-09-17): the fence is a
+/// check-then-act, not a single atomic operation — `gateway_stream_home_id()`
+/// reads and releases `stream_mu` before the three DISCONNECTED effects run
+/// under their own separate lock acquisitions. Under the CURRENT shipped
+/// gateway this remains safe with the predicate fix above, because at most
+/// one `CONNECTED(S)` and one `DISCONNECTED(S)` are ever emitted per session
+/// id (see the SESSION GUARDS LIMIT above) — there is no producer of a
+/// second, genuinely concurrent `CONNECTED(S, home2)` for the fence's
+/// read-then-act window to race against. "CLOSED end-to-end" means closed
+/// against every interleaving that invariant permits (which, after the
+/// predicate fix, now correctly includes an out-of-order first pair), NOT
+/// atomic against arbitrary concurrent RPC execution for a SECOND pair. See
+/// the FORWARD NOTE immediately below for what 4.3/4.4 must add before
+/// same-session re-home makes that second-pair producer real.
+///
+/// FORWARD NOTE for #4324's 4.3/4.4, RESOLVED (enterprise-architect
+/// adjudication, 2026-09-18, confidence HIGH, spot-checked against the cited
+/// call sites): all three directions below share ONE precondition — a
+/// same-session, different-home CONNECTED (`CONNECTED(S, home2)` published
+/// for a session `S` already at `home1`) — and NO producer of that
+/// precondition exists today, nor is one planned for 4.3/4.4. The agent
+/// reconnect loop always re-`Register`s on a new connection (a new
+/// `session_id`, `agent.cpp`'s Register-retry loop), and the gateway's
+/// `Subscribe` REFUSES any presented session with no pending registration
+/// (`yuzu_gw_agent_service.erl`, `NOT_FOUND` on a `take_pending` miss) — a
+/// gRPC stream cannot migrate BEAM nodes, so a physical stream move is
+/// ALWAYS agent-reconnect-shaped: new session, new `stream_home_id`. The
+/// EARLIER draft of this note proposed "the gateway mints a fresh session on
+/// re-home" as a design choice; that was WRONG — a gateway-synthesized
+/// session the agent does not hold starves on the next heartbeat (heartbeats
+/// carry the agent's OWN `session_id_`; `BatchHeartbeat` excludes an unknown
+/// session from `renew_leases`), reproducing the `#4246` #6 S′-vs-S desync
+/// deliberately. The invariant is agent-driven reconnect, never a
+/// server/gateway-synthesized session substitution.
+///
+/// (a) STORE-SIDE ordering: unreachable — `home2` never gets a CONNECTED
+/// under a `session_id` that already published `home1`; a genuine re-home
+/// arrives as `register_fresh(S_new)`, not `CONNECTED(S, home2)`.
+///
+/// (b) IN-MEMORY check-then-act: unreachable, and closed WITHOUT a new CAS
+/// primitive — the check-then-act window only matters when ONE `session_id`
+/// key is shared across two homes. With a distinct `session_id` per
+/// placement, every DISCONNECTED-branch effect is already an individually
+/// atomic, session-guarded conditional (`remove_agent_if_session`,
+/// `clear_stream_if_session`, `gateway_stream_home_id`'s nullopt-on-mismatch,
+/// the store's session-guarded `deregister` UPDATE, `gateway_sessions_`
+/// erase-by-key) — a stale `DISCONNECTED(S_old, home1)` interleaved anywhere
+/// around `register_agent(S_new)`/`CONNECTED(S_new, home2)` either no-ops
+/// per effect or tears down only `S_old` state, never `S_new`'s.
+///
+/// (c) CONNECTED-reorder: unreachable for the same reason as (a) — there is
+/// no second CONNECTED for the same session to reorder against.
+///
+/// STANDING INVARIANT (load-bearing going forward, not just historical
+/// analysis): 4.3/4.4 MUST NOT introduce ANY path that emits
+/// `CONNECTED(S, home2)` for a session `S` already published at `home1` —
+/// every physical placement change is agent-originated re-`Register`. This
+/// replaces the former "atomic home-CAS primitive" acceptance criterion
+/// (`#4490`) with a server-side TRIPWIRE instead: a CONNECTED for a known
+/// `(agent_id, session_id)` whose stored `stream_home_id` is non-empty and
+/// differs from the incoming one must be REJECTED (not published) and
+/// counted (folds into `#4464`'s `duplicate_connected` tripwire), backed by
+/// a deterministic interleaving test (the existing
+/// `register_agent_interleave_hook_for_test_` seam) proving a stale
+/// `DISCONNECTED(S_old, home1)` interleaved at every point of
+/// `register_agent(S_new)`/`map_session`/`CONNECTED(S_new, home2)` leaves
+/// `S_new` live in registry, store, and `gateway_sessions_`. `4.4`'s `#4246`
+/// #6 fix (SHIPPED) follows this rule: `ProxyRegister` ADOPTS a presented
+/// session into `gateway_sessions_`/registry only if the directory
+/// `renew_leases` call matched >= 1 row (a store-side CAS proving the row
+/// still belongs to that session) OR the new guarded CAS
+/// `reclaim_tombstoned_session` re-arms a row this session's row was
+/// TOMBSTONED under (never a row a DIFFERENT, live session holds) —
+/// NEVER writing back a server-minted session to a gateway whose agent
+/// still holds the original. An ADOPT is followed by the gateway's own
+/// still-live `yuzu_gw_agent` process re-sending its OWN, already-stamped
+/// CONNECTED (`yuzu_gw_agent:reannounce/2`) — a SAME-session, SAME-home
+/// re-publish, never a `CONNECTED(S, home2)` for a different home, so this
+/// does not reopen the tripwire above.
+///
+/// WOULD REOPEN THIS: a 4.3 design where the logical home (the
+/// `yuzu_gw_agent` process / `stream_home_id`) moves or is re-spawned
+/// WITHOUT the agent reconnecting — e.g. a node-A-holds-socket/
+/// node-B-owns-agent proxy hop. That would create a same-session
+/// different-home producer this analysis assumes does not exist, and the
+/// full atomic home-CAS primitive + store-side re-arm this note originally
+/// proposed would become necessary again. Treat "no such producer" as a
+/// design CONSTRAINT on 4.3, not an assumption to re-verify only after the
+/// fact.
 ///
 /// `renew_leases` is a single batched statement, correlated on BOTH
 /// `agent_id` AND `session_id` (a parallel-array unnest() join — #4246 #10) —
@@ -70,20 +241,29 @@
 /// only intra-replica with a live session. The epoch orders by server PROCESSING
 /// time, so a stale replay whose session has left `gateway_sessions_` takes the
 /// fresh branch and wins; the re-announce reuses the session id (a late
-/// DISCONNECTED then tombstones — logically tears down — the re-homed route,
-/// #4/#4324, RE-SCOPED) and its known-session check is
-/// per-replica in-memory; re-announce refreshes the lease, not cluster/node; and
-/// a stale-lease reaper plus the fail-open->fail-closed flip must land before 4.2
-/// trusts this directory for routing.
+/// DISCONNECTED would otherwise tombstone — logically tear down — the
+/// re-homed route, #4/#4324 — CLOSED under today's single-producer
+/// invariant by SLICE #4324 below: both the store's asymmetric predicate AND
+/// the RPC-handler's `stream_home_id` wiring + `AgentRegistry` in-memory
+/// fence — see the SCOPE OF "CLOSED" note above for the check-then-act
+/// residual 4.3/4.4 must still close) and its known-session check is
+/// per-replica in-memory; re-announce refreshes the lease, not cluster/node.
+/// The stale-lease reaper (`reap_stale_routes`) has since landed, and the write
+/// posture is settled PER SITE rather than pending a uniform flip:
+/// `register_fresh` and the replay-ADOPT decision's renew/reclaim calls are
+/// fail-CLOSED; every other writer stays fail-OPEN by design, with the
+/// reader's `routable` predicate as the integrity backstop (see
+/// `record_route_store_failure` in gateway_service_impl.cpp).
 ///
 /// SLICE 4.2a — `deregister` TOMBSTONES instead of deleting. This closes the
 /// late-CONNECTED RESURRECTION direction (#5 in the 4.2 design doc): a late
 /// CONNECTED for a now-gone session no-ops against the tombstone instead of
-/// reviving a dead route. It does NOT close #4 (a same-session late
-/// DISCONNECTED tombstoning a newer re-home) — that needs a per-home
-/// generation fence and is RE-SCOPED to the first same-session re-CONNECT
-/// slice (unreachable under the shipped gateway today; see the SESSION GUARDS
-/// LIMIT above and ADR-2002 §7 #4246 #4). A tombstone is `session_id IS NULL
+/// reviving a dead route. It did NOT close #4 (a same-session late
+/// DISCONNECTED tombstoning a newer re-home) on its own — that needed the
+/// per-home generation fence SLICE #4324 below adds, now closed under
+/// today's single-producer invariant (see the SESSION GUARDS LIMIT above,
+/// its SCOPE OF "CLOSED" note, and ADR-2002 §7 #4246 #4). A
+/// tombstone is `session_id IS NULL
 /// AND lease_until IS NULL`; `connection_epoch` is retained. Rationale: a bare
 /// DELETE lets `announce_connected`'s fallback `ON CONFLICT DO NOTHING`
 /// INSERT resurrect a dead route if a late/reordered CONNECTED notification
@@ -105,6 +285,14 @@
 /// tombstoned/never-announced row (`lease_until IS NULL`) old enough that it
 /// is definitely not mid-handshake. See the header comment on
 /// `reap_stale_routes` for the clock-guarded-retention adoption record.
+/// #4669: sweep (a)'s tombstone UPDATE now ALSO NULLs `home_cluster_id`
+/// (alongside cluster_id/gateway_node/stream_home_id/session_id/lease_until)
+/// — this is the "row expired" legitimate re-home trigger from the file
+/// header's "AGENT<->CLUSTER AFFINITY" note: an agent genuinely unreachable
+/// from its home cluster for the full grace window (>= 1 lease TTL) is
+/// eligible to bind a new affinity on its next `announce_connected`, from
+/// ANY cluster. Sweep (b)'s hard DELETE already achieves the same by removing
+/// the row (and therefore the affinity) entirely.
 ///
 /// SLICE 4.2b — TASK A: `announce_connected` is the SOLE writer of
 /// placement. `register_fresh`'s guarded UPSERT used to COALESCE-preserve a
@@ -122,6 +310,58 @@
 ///
 /// Born-on-Postgres (ADR-0009 fresh-start): no legacy SQLite file, no
 /// backfill — this store never existed before WS-4.
+///
+/// AGENT<->CLUSTER AFFINITY (#4669, migration v4's `home_cluster_id` column).
+/// `announce_connected` is the sole writer of `cluster_id` (the EPHEMERAL,
+/// per-connection placement, NULLed on every `register_fresh`); `home_cluster_id`
+/// is a SEPARATE, STICKY column `register_fresh`/`deregister` never touch —
+/// it survives a fresh registration/session churn on purpose, because that
+/// churn is exactly the mechanism a rogue gateway abuses (#4669's finding:
+/// `ProxyRegister` re-registers any already-approved agent_id with no
+/// per-agent secret, and `register_fresh`'s newer-epoch-wins rule lets that
+/// registration unconditionally claim the row). Semantics:
+///   - `home_cluster_id IS NULL` (never bound, or explicitly cleared — see
+///     below) admits ANY `cluster_id` and BINDS it (TOFU: trust the first
+///     cluster to legitimately confirm this agent's connection).
+///   - `home_cluster_id IS NOT NULL` admits ONLY a matching `cluster_id`. A
+///     session-matched `announce_connected` presenting a DIFFERENT
+///     `cluster_id` is refused — see that method's doc comment for the exact
+///     guarded-UPDATE shape (WHERE-clause enforced, atomic, no read-then-write
+///     TOCTOU) — and `AnnounceResult::cluster_affinity_violation` reports it
+///     distinctly from an ordinary session mismatch so the caller
+///     (`gateway_service_impl.cpp`'s `NotifyStreamStatus`) can refuse the
+///     whole CONNECTED outright (fail-closed) rather than publish an
+///     unconfirmed cross-cluster claim into the in-memory registry too.
+///   - This is a NARROWER guarantee than "the row can never move clusters":
+///     it prevents an INSTANT claim-then-answer hijack of an agent already
+///     bound to a cluster. Two LEGITIMATE re-home paths exist, matching the
+///     issue's own design: (1) genuine staleness — `reap_stale_routes`' sweep
+///     (a) (expired-lease tombstone, >= grace window past the lease TTL) NOW
+///     ALSO NULLs `home_cluster_id` alongside the rest of the tombstoned
+///     placement, and sweep (b)'s hard DELETE removes the row (and therefore
+///     the affinity) entirely — either way this requires the REAL cluster to
+///     have been genuinely unreachable for the full grace window, not
+///     something a rogue can force instantaneously; (2) `clear_cluster_affinity`,
+///     an explicit, separately-callable operator action (the caller is
+///     responsible for auditing it — this store only performs the write).
+///   - Deliberately NOT gated on multi-cluster mode: `gateway_route_store_` is
+///     wired whenever a gateway upstream is configured AT ALL (server.cpp),
+///     single-cluster included, and single-cluster gateways announce a
+///     STABLE `cluster_id` (`YUZU_GW_CLUSTER_ID`, defaulting to the literal
+///     "default") on every connection — so TOFU-bind-then-match costs
+///     single-cluster deployments nothing and changes no observable behavior
+///     there, while still hardening the (already-shared) store/write path.
+///   - Does NOT (on its own) prevent `register_fresh` itself from letting a
+///     rogue claim a NEW session_id for an already-approved agent — that
+///     churn is a pre-existing, accepted DoS-shaped weakness (ADR-2002 §7d:
+///     "at worst a DoS" pre-4.3). What this closes is the FOLLOW-ON step that
+///     made post-4.3 multi-cluster fan-out upgrade that DoS into real
+///     command-payload interception: a rogue's own claimed session can no
+///     longer make `cluster_id` (and therefore `GatewayMgmtStubPool::resolve()`'s
+///     dispatch target) move to the rogue's cluster. The genuine agent's own
+///     later reconnect (its own fresh `register_fresh`, strictly-higher epoch,
+///     eventually wins per the anti-replay fence) still announces the
+///     matching `cluster_id` and self-heals the row.
 
 #include "pg/pg_migration_runner.hpp"
 
@@ -188,6 +428,24 @@ struct RegisterFreshResult {
 /// Outcome of `announce_connected`.
 struct AnnounceResult {
     bool matched{false}; ///< true iff the UPDATE hit a row owned by this session
+    /// #4669: true iff the write was refused SPECIFICALLY because the row is
+    /// owned by this session but its durable `home_cluster_id` differs from
+    /// the `cluster_id` this call presented — a same-session, different-
+    /// cluster claim. Distinct from an ordinary `matched == false` session
+    /// mismatch (a benign, expected race/desync — see
+    /// `record_directory_desync`'s header comment in gateway_service_impl.cpp):
+    /// this is a SECURITY-relevant refusal the caller must treat as
+    /// fail-closed (refuse to publish the claimed placement anywhere, incl.
+    /// the in-memory registry), never merely logged as a desync. Mutually
+    /// exclusive with `matched` (a violation never also matches).
+    bool cluster_affinity_violation{false};
+};
+
+/// Outcome of `reclaim_tombstoned_session`; a degraded store is the error channel.
+enum class ReclaimOutcome {
+    adopted,             ///< the caller's row was absent or tombstoned and is now armed
+    superseded,          ///< the caller's own row holds a live session (see the reclaim doc)
+    held_by_other_agent, ///< another agent's row already holds the presented session id
 };
 
 /// Outcome of `deregister`.
@@ -245,7 +503,36 @@ struct DeregisterResult {
 /// adoption register for why acceleration is declined here.
 struct ReapRoutesResult {
     int expired_leases_reaped{0}; ///< predicate (a): lease_until past the grace window
-    int tombstones_reaped{0};     ///< predicate (b): NULL-lease rows past the purge age
+    int tombstones_reaped{0};     ///< predicate (b): NULL-lease, NULL-affinity rows past the
+                                  ///< purge age, hard-deleted
+    /// pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22, empirically
+    /// confirmed): predicate (b)'s ORIGINAL scope (any NULL-lease row past the purge
+    /// age, hard-deleted regardless of session_id/home_cluster_id) let a single rogue
+    /// `register_fresh` -- which sets `lease_until = NULL` but leaves `home_cluster_id`
+    /// untouched -- manufacture this exact predicate on a row whose STICKY affinity was
+    /// never actually stale, turning "the real cluster must be unreachable that long"
+    /// into "a rogue registers once and waits kTombstonePurgeAgeSecs" (a Kimi-authored
+    /// store-level repro against real Postgres confirmed the full sequence: rogue
+    /// register_fresh -> purge -> rogue TOFU-rebind, home_cluster_id ends AT the
+    /// rogue's cluster). Predicate (b) now hard-deletes ONLY a row with NO sticky
+    /// affinity to protect (`home_cluster_id IS NULL`); a session-bearing,
+    /// never-announced row whose affinity is STILL bound is soft-tombstoned instead
+    /// (session_id/cluster_id/gateway_node/stream_home_id cleared, home_cluster_id
+    /// preserved) and counted here, never hard-deleted by this predicate again on any
+    /// LATER pass (home_cluster_id staying non-null permanently excludes it). This is a
+    /// deliberate tradeoff, not an oversight: such a row's ONLY remaining clears are a
+    /// genuine register_fresh+announce_connected re-establishing it, or an explicit
+    /// `clear_cluster_affinity` call (no caller until #4696) -- a rogue registering
+    /// again does not restart this timer against the row's affinity, since the
+    /// preserved home_cluster_id already excludes it from predicate (b) regardless of
+    /// how many more times session_id churns. A row that reaches `session_id IS NULL`
+    /// via an ORDINARY `deregister()` (not this soft-tombstone) rather than via a rogue's
+    /// abandoned claim is likewise excluded from predicate (b) by its own preserved
+    /// `home_cluster_id` -- and is NOT counted here either, since predicate (b') itself
+    /// requires `session_id IS NOT NULL` and never touches it. Such a row is simply left
+    /// untouched by both predicates on every pass (it was already tombstoned by the
+    /// `deregister()` call itself) -- not a gap, since nothing further needs clearing.
+    int affinity_preserved_soft_tombstones{0};
     bool clock_anomaly{false};
     bool recovered{false};
     bool skipped{false};
@@ -262,6 +549,13 @@ struct RouteRow {
     std::optional<std::string> session_id;
     std::optional<std::int64_t> lease_until_ms; ///< epoch-ms, or nullopt if unset
     bool is_stale{false}; ///< computed IN-SQL: lease_until IS NOT NULL AND lease_until < now()
+    /// #4669: the STICKY agent<->cluster affinity anchor — distinct from
+    /// `cluster_id` above (which is the EPHEMERAL current placement, NULLed
+    /// on every `register_fresh`). `nullopt` means "never bound" (a brand-new
+    /// agent, or a row whose affinity was cleared by staleness/an explicit
+    /// operator re-home) — the NEXT `announce_connected` binds it (TOFU). See
+    /// the file header "AGENT<->CLUSTER AFFINITY" note.
+    std::optional<std::string> home_cluster_id;
 };
 
 /// A route paired with the `routable` verdict computed by `lookup_routes`.
@@ -294,10 +588,11 @@ public:
     /// previously stored (the CAS in the file header) — a caller whose
     /// `register_fresh` reports `won == false` lost to a newer connection
     /// and MUST NOT proceed to `announce_connected` with this epoch/session.
-    /// `cluster_id`/`gateway_node` are NULLed (4.2b) on a winning re-register
-    /// — `announce_connected` is the SOLE writer of placement, so a fresh
-    /// registration never carries forward a superseded connection's cluster/
-    /// node until its own CONNECTED confirms them.
+    /// `cluster_id`/`gateway_node`/`stream_home_id` are NULLed (4.2b; #4324
+    /// for the last) on a winning re-register — `announce_connected` is the
+    /// SOLE writer of placement, so a fresh registration never carries
+    /// forward a superseded connection's cluster/node/home-id until its own
+    /// CONNECTED confirms them.
     [[nodiscard]] std::expected<RegisterFreshResult, GatewayRouteStoreError>
     register_fresh(std::string_view agent_id, std::string_view session_id);
 
@@ -306,19 +601,150 @@ public:
     /// Session-guarded (see file header): a no-op against a row now held by a
     /// DIFFERENT session. If no row exists yet for `agent_id` at all, inserts
     /// one (`ON CONFLICT DO NOTHING`) rather than overwriting a differently-
-    /// sessioned row.
+    /// sessioned row. `stream_home_id` (SLICE #4324, file header) is this
+    /// connection instance's opaque per-home generation id — written into the
+    /// row exactly like `cluster_id`/`gateway_node`, since it IS placement;
+    /// an empty string (the default — a gateway build predating #4324, or a
+    /// caller not yet threading it through) means "unknown", same convention
+    /// as `cluster_id`.
+    ///
+    /// #4669 AFFINITY GUARD (see file header "AGENT<->CLUSTER AFFINITY"): the
+    /// session-guarded UPDATE additionally requires `home_cluster_id IS NULL
+    /// OR home_cluster_id = cluster_id` — a SAME-session claim presenting a
+    /// DIFFERENT cluster than the durable home is refused ATOMICALLY (the
+    /// affinity check is part of the guarded UPDATE's WHERE clause, not a
+    /// separate read-then-write — no TOCTOU window). On a genuine mismatch
+    /// the row is left COMPLETELY UNTOUCHED (no lease/placement write at
+    /// all, unlike an ordinary session mismatch which is otherwise
+    /// indistinguishable at the SQL level) and the returned
+    /// `AnnounceResult::cluster_affinity_violation` is set so the caller can
+    /// tell "session doesn't match" apart from "session matches, but this
+    /// is a cross-cluster claim" — the caller (`gateway_service_impl.cpp`)
+    /// treats the latter as fail-closed. A `home_cluster_id IS NULL` row
+    /// (never bound, or cleared by staleness/an operator re-home) BINDS on
+    /// this call (`home_cluster_id = COALESCE(home_cluster_id, cluster_id)`,
+    /// TOFU) — this never regresses single-cluster deployments, which
+    /// present a stable `cluster_id` on every connection (file header).
     [[nodiscard]] std::expected<AnnounceResult, GatewayRouteStoreError>
     announce_connected(std::string_view agent_id, std::string_view session_id,
                        std::string_view cluster_id, std::string_view gateway_node,
-                       int lease_ttl_secs);
+                       int lease_ttl_secs, std::string_view stream_home_id = {});
+
+    /// #4669: the explicit-operator-action re-home path (file header "AGENT
+    /// <->CLUSTER AFFINITY", trigger 2). Clears `home_cluster_id` for
+    /// `agent_id` UNCONDITIONALLY (no session/epoch guard — this is a
+    /// deliberate operator override, not a connection-lifecycle event), so
+    /// the NEXT `announce_connected` for this agent — from ANY cluster —
+    /// binds a fresh affinity via TOFU. Does NOT touch `cluster_id`/
+    /// `gateway_node`/`session_id`/`lease_until`: an in-progress connection's
+    /// CURRENT placement is left alone; only the sticky trust anchor is
+    /// reset. Returns `true` iff a row existed for `agent_id` (`false` is not
+    /// an error — clearing affinity for an agent with no row yet is a no-op,
+    /// since a future first `announce_connected` already binds via TOFU
+    /// regardless). AUDITING this action is the CALLER's responsibility
+    /// (this store performs the write only, like every other method here) —
+    /// a caller wiring this into an operator-facing surface MUST emit an
+    /// audit event, per the issue's "an explicit operator re-home action is
+    /// recorded" requirement.
+    [[nodiscard]] std::expected<bool, GatewayRouteStoreError>
+    clear_cluster_affinity(std::string_view agent_id);
+
+    /// #4669: a lightweight, READ-ONLY pre-check — true iff `agent_id`'s row
+    /// is CURRENTLY owned by `session_id` (a match), OR its durable
+    /// `session_id` is NULL (session-orphaned — pr-rev round 2 fix below),
+    /// AND its durable `home_cluster_id` is bound to a DIFFERENT, non-null
+    /// cluster than `cluster_id` (an empty `cluster_id` never conflicts —
+    /// same "unknown" convention as `announce_connected`). The `session_id
+    /// IS NULL` disjunct (FortitudeEtc/Codex+Kimi, CRITICAL, pr-rev round 2,
+    /// 2026-09-22, empirically reproduced twice independently) closes a
+    /// second hijack the round-1 fix's soft-tombstone sweep (b') itself
+    /// opened: once (b') clears a session-bearing affinity-bound row's
+    /// durable `session_id` while preserving `home_cluster_id`, the ORIGINAL
+    /// rogue's still-live in-memory gateway session can resend CONNECTED
+    /// under that same session id — `session_id=$2` alone can never match a
+    /// durable NULL, so without this disjunct the resend was invisible to
+    /// this pre-check and fell through to the ordinary, unaudited
+    /// `session_mismatch` bucket. Safe for a genuine first-ever TOFU contact
+    /// — that row has `home_cluster_id IS NULL`, already excluded by this
+    /// predicate's own `IS NOT NULL` clause regardless of session_id, so an
+    /// ordinary slow first CONNECTED is unaffected. Lets a caller refuse EARLY,
+    /// before publishing anything to its OWN non-durable state (e.g. an
+    /// in-memory registry), without paying for a write. NOT the security
+    /// boundary by itself — `announce_connected`'s own guarded UPDATE
+    /// enforces the SAME affinity atomically at write time regardless of
+    /// whether a caller uses this pre-check first: this read and the
+    /// eventual write can never let a mismatched cluster_id persist
+    /// DURABLY, only let a caller's own transient state briefly disagree
+    /// with the store — exactly the pre-#4669 fail-open posture, never the
+    /// reverse. Gate 2 security-guardian correction (2026-09-21): the
+    /// CALLER's own transient state (e.g. an in-memory registry) CAN diverge
+    /// from the store for longer than a microsecond race if this pre-check
+    /// degrades. pr-rev fix (FortitudeEtc/Codex+Kimi, BLOCKER, 2026-09-22):
+    /// the caller (`gateway_service_impl.cpp`'s `NotifyStreamStatus`) now
+    /// reverts that transient publish on a definitive write-time refusal, so
+    /// "briefly" is accurate again for the ORDINARY case (this read degrades,
+    /// the later write still succeeds and correctly refuses). It stays
+    /// open-ended only if THIS read and the later write BOTH degrade in the
+    /// same window — see the caller's own comment for the concrete
+    /// consequence and the alert that measures that compound case.
+    [[nodiscard]] std::expected<bool, GatewayRouteStoreError>
+    has_cluster_affinity_conflict(std::string_view agent_id, std::string_view session_id,
+                                  std::string_view cluster_id);
 
     /// TOMBSTONE the agent's route row (session_id/lease_until/cluster_id/
-    /// gateway_node -> NULL; `connection_epoch` retained), but ONLY if the row
-    /// still belongs to `session_id` (a stale DISCONNECTED from a superseded
-    /// session must not tear down a newer re-home). See the file header
-    /// "SLICE 4.2a" note for why this is an UPDATE, not a DELETE.
+    /// gateway_node/stream_home_id -> NULL; `connection_epoch` retained), but
+    /// ONLY if the row still belongs to `session_id` AND the incoming
+    /// `stream_home_id` clears the fence (file header SLICE #4324):
+    /// `stream_home_id IS NULL OR stream_home_id = $3` — a NULL/empty
+    /// STORED home admits ANY incoming value (it never represents a live
+    /// placement worth protecting — see the file header's PREDICATE FIX
+    /// note); a STAMPED stored home requires an EXACT match against `$3`, so
+    /// it can never be torn down by an unstamped or differently-stamped
+    /// incoming value from a superseded home. See the file header "SLICE
+    /// 4.2a" note for why this is an UPDATE, not a DELETE.
     [[nodiscard]] std::expected<DeregisterResult, GatewayRouteStoreError>
-    deregister(std::string_view agent_id, std::string_view session_id);
+    deregister(std::string_view agent_id, std::string_view session_id,
+              std::string_view stream_home_id = {});
+
+    /// HA WS-4 4.4 (`#4246` #6, gateway-side session-writeback fix): re-arm a
+    /// TOMBSTONED (or entirely absent) row under `session_id`, for a gateway
+    /// circuit-recovery replay whose presented session this replica no longer
+    /// recognizes in memory (a core restart / replica failover / post-
+    /// DISCONNECT eviction) but which was never superseded by a genuinely
+    /// newer connection. Returns `adopted` iff the row was tombstoned
+    /// (`session_id IS NULL`) or absent and no other agent's row holds
+    /// `session_id`; `superseded` when a LIVE (non-NULL) session already holds
+    /// the caller's own row — normally a DIFFERENT one, a genuine stale/zombie
+    /// replay (a concurrent reclaim that already re-armed the row with this
+    /// SAME id also lands here, because the guard needs `session_id IS NULL`);
+    /// `held_by_other_agent` iff another agent's row already carries
+    /// `session_id` (a forged or colliding id). For either refusal the caller
+    /// MUST NOT install anything. The cross-agent guard is a same-statement
+    /// NOT EXISTS and is best-effort: `session_id` has no UNIQUE index, so two
+    /// concurrent reclaims of one unheld id under READ COMMITTED can both win.
+    ///
+    /// Deliberately does NOT mint a fresh `connection_epoch` (unlike
+    /// `register_fresh`): this is not a new connection racing for the row,
+    /// it is the exact same session being resurrected, so there is no
+    /// concurrent-fresh-registration ordering to fence. `connection_epoch`
+    /// is `0` on a brand-new row (no prior row existed at all); on a
+    /// re-armed EXISTING tombstone it is left UNTOUCHED (retains whatever
+    /// `register_fresh` last minted for that row) — either way it is safe:
+    /// `register_fresh`'s `nextval` sequence starts above `0` and is
+    /// strictly monotonic, so it always exceeds a brand-new row's `0`, and
+    /// a tombstone's retained epoch is exactly what `register_fresh`
+    /// already tolerated overwriting before this method existed. ANY later
+    /// genuine `register_fresh` for this agent still wins the guarded
+    /// upsert regardless of ordering, exactly as if this reclaim had never
+    /// run. `cluster_id`/`gateway_node`/`stream_home_id` are left NULL (they
+    /// are already NULL on a tombstone, and a never-existed row has nothing
+    /// to carry forward) — `announce_connected` remains the sole writer of
+    /// placement; this slice's gateway-side fix (re-sending the process's
+    /// own CONNECTED after a successful reclaim) is what converges them,
+    /// not this call.
+    [[nodiscard]] std::expected<ReclaimOutcome, GatewayRouteStoreError>
+    reclaim_tombstoned_session(std::string_view agent_id, std::string_view session_id,
+                               int lease_ttl_secs);
 
     /// Batched lease renewal: bumps `lease_until` for every row whose
     /// `(agent_id, session_id)` matches a pair in the two PARALLEL arrays
@@ -346,6 +772,28 @@ public:
     /// `RoutableRoute` for the `routable` computation.
     [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
     lookup_routes(std::span<const std::string> agent_ids);
+
+    /// Batched SESSION-keyed read (WS-5, #4246 #3): every row whose
+    /// `session_id` is in `session_ids`. Empty ids and ids longer than 64
+    /// bytes are dropped before the query (returned as absent; the caller
+    /// counts them malformed) and duplicate ids are collapsed, so a repeat can
+    /// never come back twice. The rest are read in ceil(n/1024) statements
+    /// (`session_id = ANY($1)`, served by `agent_routes_session_id_idx`, each
+    /// `ORDER BY agent_id`) on ONE lease: `kHotReadTimeout` (500 ms) bounds
+    /// only the lease ACQUISITION, each statement is bounded by the pool's
+    /// `statement_timeout`, and there is no aggregate deadline.
+    /// `RoutableRoute::route.session_id` is the matched id and
+    /// `route.agent_id` the owning agent; `routable` is computed IN-SQL on the
+    /// DB clock exactly as in `lookup_routes`. A session with no row is simply
+    /// absent. **`session_id` is NOT unique** (`register_fresh` guards only
+    /// the caller's own row and `reclaim_tombstoned_session`'s cross-agent
+    /// guard is best-effort), so one id can legitimately come back on SEVERAL
+    /// rows — the CALLER must treat more than one row per id as ambiguous and
+    /// refuse to resolve it; this method deliberately returns every match
+    /// rather than picking one. Use `lookup_route(agent_id)` (PK, unambiguous)
+    /// whenever the agent_id is already known.
+    [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
+    lookup_by_sessions(std::span<const std::string> session_ids);
 
     /// Directory-hygiene reaper (4.2a, #7 in the ADR-2002 §7 "4.2 design
     /// obligations" list). CLOCK-GUARDED-RETENTION ADOPTION RECORD (routed
@@ -419,9 +867,11 @@ public:
     [[nodiscard]] std::expected<ReapRoutesResult, GatewayRouteStoreError>
     reap_stale_routes();
 
-    /// The schema migrations for this store (version 2: v1 the `agent_routes`
-    /// table, v2 the `route_meta` reaper-anchor table). Exposed for tests and
-    /// the migration ladder.
+    /// The schema migrations for this store (version 4: v1 the `agent_routes`
+    /// table, v2 the `route_meta` reaper-anchor table, v3 the nullable
+    /// `stream_home_id` column — SLICE #4324, v4 the nullable
+    /// `home_cluster_id` column — #4669). Exposed for tests and the migration
+    /// ladder.
     static const std::vector<pg::PgMigration>& migrations();
 
 private:

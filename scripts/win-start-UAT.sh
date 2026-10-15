@@ -304,11 +304,15 @@ start_all() {
     # ── 2. Server ─────────────────────────────────────────────────────────
     echo ""
     echo "[2/4] Starting yuzu-server..."
+    # Plaintext rig: --insecure-gateway-peer explicitly acknowledges that peer
+    # authorization on the gateway-upstream service is disabled. Not for
+    # production.
     "$BUILDDIR/server/core/yuzu-server.exe" \
         --no-tls \
         --no-https \
         --listen 0.0.0.0:50054 \
         --gateway-upstream 0.0.0.0:50055 \
+        --insecure-gateway-peer \
         --gateway-mode \
         --gateway-command-addr localhost:50063 \
         --web-address 0.0.0.0 \

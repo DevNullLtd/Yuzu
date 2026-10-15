@@ -1,0 +1,11 @@
+kernel.randomize_va_space	ok	2
+kernel.kptr_restrict	ok	0
+kernel.yama.ptrace_scope	err	cat: /proc/sys/kernel/yama/ptrace_scope: No such file or directory
+kernel.dmesg_restrict	ok	1
+kernel.unprivileged_bpf_disabled	ok	0
+kernel.sysrq	ok	1
+fs.protected_hardlinks	ok	1
+fs.protected_symlinks	ok	1
+fs.protected_fifos	ok	0
+fs.protected_regular	ok	0
+fs.suid_dumpable	ok	0

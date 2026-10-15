@@ -23,26 +23,37 @@
 /// fleet data — only a title + the fragment URL to load), matching the sibling
 /// `/dex` shell. The DATA-bearing routes are gated like `/api/agents`:
 ///   * the fleet LIST (`/fragments/devices/list`) requires global Infrastructure:Read
-///     (`perm_fn`) and is sourced from the per-operator-SCOPED provider
-///     (`get_visible_agents_json` in server.cpp) — exact parity with `/api/agents`;
-///   * every PER-DEVICE route (page/info + the DEX/Guardian lenses + the live pull)
-///     gates on `scoped_perm_fn` = `require_scoped_permission(<securable>,<op>,id)`,
-///     the codebase's tier + management-group chokepoint, so an operator can only
-///     open / read / live-query a device inside their management scope (a global
-///     grant OR a role assigned on the device's group / an ancestor). The DEX +
-///     Guardian lenses additionally audit-on-open (behavioural PII); the live pull
-///     keeps its Execute probe (htmx-friendly note) on top of the scoped Read floor.
+///     (`perm_fn`) and is filtered against `visible_set_fn` (the SAME confinement
+///     `get_visible_agents_json` in server.cpp applies) — exact parity with
+///     `/api/agents`;
+///   * every PER-DEVICE route (page/info + the live pull) gates on `scoped_perm_fn`
+///     = `require_scoped_permission(<securable>,<op>,id)`, the codebase's tier +
+///     management-group chokepoint, so an operator can only open / read /
+///     live-query a device inside their management scope (a global grant OR a role
+///     assigned on the device's group / an ancestor). The live pull keeps its
+///     Execute probe (htmx-friendly note) on top of the scoped Read floor.
+///
+/// ADR-0031 WS-A4 wave 2: identity/list data is sourced from the store-free
+/// `DeviceApi` seam (`device_api.hpp`) rather than a direct `AgentRegistry`/
+/// `TagStore` reach — this TU is part of the `device` family's seam-closure
+/// enforced set (`scripts/ci/check-seam-closure.py`). The DEX + Guardian device
+/// lenses (`/fragments/device/dex`, `/fragments/device/guardian`) moved OUT to
+/// `device_lens_routes.{hpp,cpp}` — deliberately outside that enforced set, see
+/// that file's own banner for why.
 
 #include <yuzu/server/auth.hpp>
 
-#include "dex_routes.hpp"      // DexRoutes::DispatchFn/ResponsesFn/AuditFn + DexAgentResponse
-#include "tag_store.hpp"       // DeviceTag — device_agent_detail_json's optional tags
+#include "device_api.hpp"      // DeviceApi, DeviceListRow, DeviceDetail, DeviceReadError (ADR-0031 WS-A4)
+#include "dex_view_types.hpp"  // DexDispatchFn/DexResponsesFn/DexAuditFn/DexAgentResponse (store-free)
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,7 +61,6 @@
 namespace yuzu::server {
 
 class HttpRouteSink;
-class GuaranteedStateStore;
 
 // ── Shared builders (REST-only today; #4033/#2146 Batch A) ─────────────────
 // PURE JSON builders — no httplib.h, no mcp_jsonrpc.hpp — used TODAY only by
@@ -66,40 +76,62 @@ class GuaranteedStateStore;
 // weaker, verified capability-level definition (docs/api-parity-ledger.md:
 // "a twin exists and is verified against the current source" — the 5-field
 // shape IS byte-identical across REST/MCP today), not Rule-1 same-function
-// conformance. Built from a single AgentRegistry JSON entry — the SAME
-// 5-field shape `AgentRegistry::to_json_obj()`/MCP's `agents_fn()` already
-// produce (agent_id/hostname/os/arch/agent_version) — deliberately NOT
-// `DeviceRow` (the dashboard-fragment-only richer shape with online/segment/
-// tags/dex_score; see this file's header). The builders exist so the NEW
-// REST routes match those tools' served shape byte-for-byte from day one,
-// and so a future refactor of the MCP handlers has a function to call
-// instead of a third inline copy.
+// conformance. Built from `DeviceApi`'s own typed rows (ADR-0031 WS-A4 wave 2
+// rewire — previously a raw `AgentRegistry` JSON entry; the served field set
+// is unchanged: agent_id/hostname/os/arch/agent_version) — deliberately NOT
+// `DeviceRow` (the dashboard-fragment-only richer shape with online/tags/
+// dex_score; see this file's header). The builders exist so the NEW REST
+// routes match those tools' served shape byte-for-byte from day one, and so
+// a future refactor of the MCP handlers has a function to call instead of a
+// third inline copy.
 
 /// PURE: one device row — `agent_id`/`hostname`/`os`/`arch`/`agent_version`,
-/// defensively extracted (`.value(key, "")`) so a short/malformed source
-/// object degrades to empty fields rather than throwing. Mirrors MCP
-/// `list_agents`'/`get_agent_details`'s existing inline row-building exactly.
-nlohmann::json device_agent_row_json(const nlohmann::json& agent);
+/// straight off `DeviceApi::DeviceListRow`'s fields (already defensively
+/// extracted at the seam — see `device_api.hpp`). Mirrors MCP
+/// `list_agents`'s inline row-building exactly.
+nlohmann::json device_agent_row_json(const DeviceListRow& row);
 
 /// PURE: the device DETAIL object — `device_agent_row_json`'s fields plus a
-/// `tags` array (`{key,value,source}` per entry). `tags` is `nullptr` when no
-/// TagStore is wired, in which case the `tags` key is OMITTED entirely (never
-/// a synthesised empty array) — mirrors `get_agent_details`'s conditional-tags
-/// posture on a null store.
-nlohmann::json device_agent_detail_json(const nlohmann::json& agent,
-                                        const std::vector<DeviceTag>* tags);
+/// `tags` array (`{key,value,source}` per entry) built from
+/// `DeviceApi::DeviceDetail::tags`. ADR-0031 WS-A4 wave 2: `DeviceApi` always
+/// returns an (possibly empty) tags vector — a null/unwired `TagStore` at the
+/// seam degrades to an empty vector, not an omitted key (see
+/// `device_api_local.hpp`'s own doc comment on `make_local_device_api`) — so,
+/// unlike the pre-rewire version of this function, `tags` is now ALWAYS
+/// present in the emitted JSON, never omitted. This is a deliberate,
+/// already-committed (wave 1) seam decision, not a new one made here.
+nlohmann::json device_agent_detail_json(const DeviceDetail& detail);
 
 /// One row of the fleet device list / the identity of one device. SLICE 1 carries
 /// only what the thin AgentInfo + registry session provide for real; richer CI /
 /// DEX / Guardian columns are added by later slices (see file header).
+///
+/// ADR-0031 WS-A4 wave 2: built consumer-side from `DeviceApi`'s narrower
+/// public rows (`DeviceListRow`/`DeviceDetail`), which do not carry a
+/// management-group/segment or the agent's live-session `scopable_tags`.
+/// `segment` is DELETED (never assigned anywhere in the tree even before this
+/// rewire — confirmed by a full-tree grep, not merely unused by this file).
+/// `tags` is KEPT for source compatibility with the renderers but is now
+/// ALWAYS empty: `DeviceApi` has no bulk/live "scopable tags" read (that was
+/// the AgentRegistry session's OWN ephemeral tag set, a different concept
+/// from the persistent `TagStore` operator tags `DeviceApi::DeviceDetail`
+/// carries) — this HONESTLY DROPS the dashboard list's tag-search capability
+/// (`matches()` in device_routes.cpp), a deliberate, documented behaviour
+/// change, not an oversight. `online`/`last_seen` are UNCHANGED in effect:
+/// server.cpp's pre-rewire provider hardcoded them to `true`/"now" for every
+/// registry-backed row (a connected agent is always "online" there), so this
+/// rewire reproduces the exact same constants render-side instead of via a
+/// provider closure — a refactor, not a behaviour change.
 struct DeviceRow {
     std::string agent_id;
     std::string hostname;
     std::string os;       ///< "windows" | "linux" | "darwin" | "?"
     std::string arch;     ///< "x86_64" | "arm64" | "?"
     std::string agent_version;
-    std::string segment;  ///< management group / segment ("" if none) — best-effort
-    std::vector<std::string> tags;
+    std::vector<std::string> tags; ///< EMPTY on the list path (DeviceApi has no bulk
+                                   ///< all-agents tag read); POPULATED "key=value" on the
+                                   ///< single-device page/info path from the detail's
+                                   ///< TagStore tags (see get_one) — struct doc comment
     bool online = false;          ///< has a live Subscribe stream right now
     std::string last_seen;        ///< human-ish ("now", "12m ago") or ISO; "" if unknown
     int dex_score = -1;           ///< per-device DEX experience score 0–100; -1 = n/a
@@ -126,9 +158,10 @@ std::string render_device_page(const DeviceRow& d);
 
 /// PURE: a lens panel that isn't built yet (DEX/Guardian in slice 1) — renders the
 /// lens tab bar (so switching back works) + an honest "coming in a later slice"
-/// message. `active` is the tab id ("dex" | "guardian").
+/// message. `active` is the tab id ("dex" | "guardian"). `tabs=false` suppresses the
+/// own 3-chip bar (Hardware CI record mounts this lens under its own 7-tab bar).
 std::string render_device_lens_placeholder(const std::string& active, const std::string& agent_id,
-                                           const std::string& message);
+                                           const std::string& message, bool tabs = true);
 
 /// One guard's compliance state on a device (Guardian lens row).
 struct DeviceGuardRow {
@@ -139,12 +172,15 @@ struct DeviceGuardRow {
 
 /// PURE: the DEX lens for one device — the per-device score + its signal summary
 /// (obs_type → count, already fetched) + a link to the full /dex device drill.
+/// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
 std::string render_device_dex_lens(const std::string& agent_id, int score,
-                                    const std::vector<std::pair<std::string, std::int64_t>>& signals);
+                                    const std::vector<std::pair<std::string, std::int64_t>>& signals,
+                                    bool tabs = true);
 
 /// PURE: the Guardian lens for one device — compliance summary + per-guard state.
+/// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true);
 
 /// PURE: the "Get live info" snapshot SHELL — a header + one auto-loading panel per
 /// live instruction (each div hx-gets /fragments/device/live/run?kind=…, which
@@ -228,8 +264,31 @@ std::string render_device_live_netconfig(const std::vector<LiveNetAddr>& rows);
 std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows);
 std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows);
 
+/// PURE: generic pipe-row renderer (round-3 item 11 -- physical-kit panels) for the ten
+/// hardware-detail live kinds (disks/memory/processors/drivers/battery/thermal/smart/
+/// volumes/adapters/wifi) whose wire format is a flat `<row_prefix>|field1|field2|...`
+/// table with no bespoke typed-row struct. `columns` is the ordered raw column-name
+/// list from live_kinds.hpp's LiveKind::columns (drives both the table header labels
+/// and each row's expected width); `rows` are the already-split, already-padded field
+/// vectors (device_routes.cpp render_live_result, one per matched line, prefix token
+/// dropped). `raw_rows` are lines that did NOT match the row_prefix, preserved
+/// verbatim (full original line text) instead of being silently dropped -- each
+/// renders as its own full-width diagnostic row at the end of the table.
+/// Defined in device_ui.cpp.
+std::string render_device_live_generic(const std::vector<std::string>& columns,
+                                       const std::vector<std::vector<std::string>>& rows,
+                                       const std::vector<std::string>& raw_rows);
+
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).
 std::string render_device_not_found(const std::string& agent_id);
+
+/// PURE: honest degraded body — the device resolves in the registry, but the
+/// backing tag-store read failed (`DeviceReadError::kDegraded`; see
+/// `device_api.hpp`). A dashboard-fragment "503-equivalent" placeholder — the
+/// fragment still renders (HTMX swap contract), it just says so honestly
+/// rather than collapsing to the not-found body (which would misreport a
+/// live, existing device as unenrolled).
+std::string render_device_degraded(const std::string& agent_id);
 
 /// `/devices` + `/device` routes — page shells + read-only HTMX fragments.
 class DeviceRoutes {
@@ -251,52 +310,62 @@ public:
                            const std::string& securable_type, const std::string& operation,
                            const std::string& agent_id)>;
 
-    /// Resolve the fleet device list VISIBLE to `username`, assembled in server.cpp
-    /// from the SAME per-operator scoping path as `/api/agents`
-    /// (`get_visible_agents_json`): all-when-global-Infrastructure:Read, else the
-    /// caller's management-group members. Empty when no provider is wired → the
-    /// list renders an honest "unavailable" placeholder.
-    using DevicesFn = std::function<std::vector<DeviceRow>(const std::string& username)>;
+    /// The caller's confinement set, keyed by username — the SAME semantics
+    /// `get_visible_agents_json`/server.cpp's `visible_set_fn` apply:
+    /// `nullopt` = sees the whole fleet (global Infrastructure:Read grant, or
+    /// RBAC enforcement is off); a present set = exactly those agent_ids (a
+    /// present-EMPTY set on a degraded confinement read, fail-closed —
+    /// ADR-0042). Applied via `authz::in_scope` against `DeviceApi::list_devices()`'s
+    /// UNSCOPED rows — ADR-0031 WS-A4 wave 2 replaces the old pre-scoped
+    /// `DevicesFn` provider with "unscoped API read + this seam's own filter",
+    /// matching the REST/MCP siblings' pattern. An unwired closure is treated
+    /// as a present-EMPTY (deny-all) set, never `nullopt` — the same
+    /// fail-closed posture the old `DevicesFn`'s "empty closure -> list renders
+    /// an honest 'unavailable' placeholder" contract gave.
+    using VisibleSetFn =
+        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
 
-    /// Resolve ONE device's identity row by agent_id, UNSCOPED (straight from the
-    /// registry — the `get_one(id)` resolver the list scan was always meant to
-    /// become). Authz is the caller's responsibility: per-device routes gate on
-    /// `scoped_perm_fn` FIRST, so this is a pure post-authz row fetch. It must NOT
-    /// re-apply list scoping — the list filter (`get_visible_agents`) is a flat
-    /// group-member JOIN with no ancestor walk, whereas `require_scoped_permission`
-    /// IS ancestor-aware; re-scoping here would wrongly 404 a device a parent-group
-    /// role legitimately authorizes. Returns nullopt for an unknown/offline agent.
-    using LookupFn = std::function<std::optional<DeviceRow>(const std::string& agent_id)>;
+    /// Per-device DEX experience score 0-100 (-1 = n/a / unscored). Wraps
+    /// `dex_device_score` against a fixed window server.cpp's closure owns —
+    /// called ONLY on the page's rendered rows (post filter, for the list; the
+    /// single opened device, for the page), never the whole roster — same
+    /// discipline `hardware_routes.hpp`'s own `DexScoreFn` documents.
+    using DexScoreFn = std::function<int(const std::string& agent_id)>;
 
     /// The "Get live info" snapshot dispatches REAL plugin instructions to the device
     /// (Execute-gated, audited) and polls the response store — the same shared
     /// chokepoint + ResponseStore seam DexRoutes uses. Empty → live info unavailable.
-    using DispatchFn = DexRoutes::DispatchFn;
-    using ResponsesFn = DexRoutes::ResponsesFn;
-    using AuditFn = DexRoutes::AuditFn;
+    using DispatchFn = DexDispatchFn;
+    using ResponsesFn = DexResponsesFn;
+    using AuditFn = DexAuditFn;
 
-    /// `store` backs the DEX/Guardian lenses; `dispatch_fn`/`responses_fn`/`audit_fn`
-    /// back the live-info instruction dispatch (all borrowed/may be empty/null →
+    /// `api` is the store-free `DeviceApi` seam (identity/list data — ADR-0031
+    /// WS-A4 wave 2); `visible_set_fn` is this route's OWN confinement filter
+    /// over `api->list_devices()`'s unscoped rows; `dex_score_fn` backs the
+    /// per-row/per-page DEX score; `dispatch_fn`/`responses_fn`/`audit_fn` back
+    /// the live-info instruction dispatch (all borrowed/may be empty/null →
     /// graceful placeholder).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                         ScopedPermFn scoped_perm_fn, DevicesFn devices_fn, LookupFn lookup_fn,
-                         const GuaranteedStateStore* store, DispatchFn dispatch_fn = {},
-                         ResponsesFn responses_fn = {}, AuditFn audit_fn = {});
+                         ScopedPermFn scoped_perm_fn, std::shared_ptr<const DeviceApi> api,
+                         VisibleSetFn visible_set_fn = {}, DexScoreFn dex_score_fn = {},
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
+                         AuditFn audit_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                         ScopedPermFn scoped_perm_fn, DevicesFn devices_fn, LookupFn lookup_fn,
-                         const GuaranteedStateStore* store, DispatchFn dispatch_fn = {},
-                         ResponsesFn responses_fn = {}, AuditFn audit_fn = {});
+                         ScopedPermFn scoped_perm_fn, std::shared_ptr<const DeviceApi> api,
+                         VisibleSetFn visible_set_fn = {}, DexScoreFn dex_score_fn = {},
+                         DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
+                         AuditFn audit_fn = {});
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
     ScopedPermFn scoped_perm_fn_;
-    DevicesFn devices_fn_;
-    LookupFn lookup_fn_;
-    const GuaranteedStateStore* store_ = nullptr;
+    std::shared_ptr<const DeviceApi> api_;
+    VisibleSetFn visible_set_fn_;
+    DexScoreFn dex_score_fn_;
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
     AuditFn audit_fn_;

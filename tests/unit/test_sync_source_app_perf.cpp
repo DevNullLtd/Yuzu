@@ -27,6 +27,20 @@ TEST_CASE("build_app_perf_query targets $ProcPerf_Hourly over the window", "[app
     CHECK(q.size() < 4096); // tar sql 4KB limit
 }
 
+TEST_CASE("build_app_perf_query excludes kernel-thread / Windows System rows",
+          "[app_perf][agent]") {
+    // Kernel threads (Linux PF_KTHREAD) and the Windows System process (pid 4)
+    // are recorded unfiltered into procperf_live/_hourly (the live TAR tier
+    // keeps them by design); this daily rollup is the one place that excludes
+    // them from the app-perf-over-time history sent to the server.
+    const std::string q = build_app_perf_query(86400, 259200);
+    CHECK(q.find("AND NOT is_kthread") != std::string::npos);
+    // Must sit inside the WHERE clause, not the SELECT list or GROUP BY — the
+    // wire/parse contract (9 positional columns) never changes shape.
+    CHECK(q.find("is_kthread") > q.find("WHERE"));
+    CHECK(q.find("is_kthread") < q.find("GROUP BY"));
+}
+
 TEST_CASE("parse_app_perf_sql_output skips markers and parses data rows", "[app_perf][agent]") {
     const std::string out =
         "__schema__|name|version|day|samples|instances_max|cpu_avg|cpu_max|ws_avg_bytes|ws_max_bytes\n"

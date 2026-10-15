@@ -1,0 +1,232 @@
+## Package Inventory Definitions
+## Reports which package managers are present on an endpoint and, on macOS,
+## the Homebrew formulae and casks installed. Read-only, zero subprocess.
+## Plugin: pkg_inventory | Actions: managers, packages
+##
+## Sources by platform:
+##   Linux:   managers -- PLANNED (not implemented in this release): the status row reports
+##            `status|managers|unsupported|linux:planned` and there are no
+##            manager rows. The leg follows in a later release and will report
+##            package-manager identity and manager-level config facts only (tool
+##            presence for dpkg/apt/rpm/dnf/pacman/apk, the dpkg architecture
+##            list, apt/dnf source-file counts, pacman.conf and mirrorlist line
+##            counts, apk repository counts); the names and facts keys below
+##            already describe that shape.
+##            packages -- UNSUPPORTED by design: installed_apps owns the Linux
+##            package roster, and this plugin never enumerates an individual
+##            Linux package in any form.
+##   macOS:   managers/packages -- Homebrew Library/Taps, Cellar and Caskroom
+##            directory names under BOTH /opt/homebrew (Apple silicon) and
+##            /usr/local (Intel).
+##   Windows: PLANNED (not implemented in this release) -- both actions report
+##            `status|<action>|unsupported|windows:planned`. The Chocolatey and
+##            winget legs follow as their own PR.
+##
+## SCOPE: Machine scope only: per-user package stores are out of scope, deferred to the user-session helper (ADR-3003).
+## No overlap claim with installed_apps on macOS: Homebrew casks install .app
+## bundles that installed_apps' macOS `list` also reports via system_profiler, and
+## installed_apps' `list_per_user` lists Homebrew formulae per user (user_app|brew|...);
+## this plugin is the machine-scope, zero-subprocess view of the same store and
+## adds the manager identity and the cask version.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.software.package_managers
+  displayName: Package Manager Inventory
+  version: 1.0.0
+  description: >
+    Reports which package managers are present on the endpoint and their
+    manager-level configuration facts, read from the filesystem with no
+    subprocess. macOS reports each Homebrew prefix found under
+    /opt/homebrew and /usr/local with tap, formula and cask counts. The Linux
+    leg (dpkg, apt, rpm, dnf, pacman and apk identity and config facts, never
+    a package roster) follows in a later release: until then Linux reports
+    `status|managers|unsupported|linux:planned` and no manager rows. Windows
+    is not implemented in this release and reports
+    `status|managers|unsupported|windows:planned`. Machine scope only:
+    per-user package stores are out of scope, deferred to the user-session
+    helper (ADR-3003). A status row always comes first; a genuinely absent manager
+    produces no manager row, while an unreadable location makes the status
+    row `constrained` with a failure token.
+  tags: [software, package-managers, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: pkg_inventory
+    action: managers
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|managers|<supported|constrained|unsupported>|<failure tokens or ->
+    # manager|<name>|<present|unavailable>|<version or ->|<root_path or ->|<facts k=v;... or ->|<reason or ->
+    # Two row shapes on one stream, discriminated by field 0; a status row
+    # populates only row_kind..version and leaves the remaining columns unset.
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator. Values: status (exactly one per result, always first), manager (one per package manager detected).'
+        values: [status, manager]
+        example: manager
+        platforms: [windows, linux, darwin]
+      - name: name
+        type: string
+        description: 'Manager rows: the package manager. Values: dpkg, apt, rpm, dnf, pacman, apk, homebrew. Only homebrew is emitted in this release: Linux managers leg planned; on Linux the status row reports unsupported|linux:planned and there are no manager rows. Status rows: the action name, always managers.'
+        example: homebrew
+        platforms: [windows, linux, darwin]
+      - name: state
+        type: string
+        description: 'Manager rows: present means at least one Homebrew marker directory (Library/Taps, Cellar, Caskroom) under the prefix was readable; unavailable means a marker exists but none could be read (see reason); a prefix root that cannot be opened counts as Homebrew only for /opt/homebrew, since /usr/local exists on every Mac and there the status tokens appear with no manager row. Status rows: the completeness level. Values: supported, constrained (at least one read failed), unsupported (Windows and Linux planned legs).'
+        values: [present, unavailable, supported, constrained, unsupported]
+        example: present
+        platforms: [windows, linux, darwin]
+      - name: version
+        type: string
+        description: 'Manager rows: the manager version, or "-" (versions are not read in this release, so always "-"). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:permission_denied, macos:homebrew_taps:walk_budget or macos:managers:busy), linux:planned, windows:planned or pkg_inventory:exception (a leg threw).'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: root_path
+        type: string
+        description: 'Manager rows only: the logical root the facts were read from (e.g. /opt/homebrew, /usr/local; /etc/apt once the Linux managers leg lands), never an injected test root; "-" when the manager has no single root (Linux rpm).'
+        example: /opt/homebrew
+        platforms: [darwin]
+      - name: facts
+        type: string
+        description: 'Manager rows only: semicolon-separated key=value manager-level facts, or "-". Keys by manager: dpkg architectures=<a,b>; apt sources_list_lines, sources_d_files; dnf repo_files, dnf_conf_lines; pacman pacman_conf_lines, mirrors; apk repositories, tagged, arch; homebrew taps, formulae, casks. A key is omitted when its source could not be read completely (unreadable, truncated at the entry cap, or out of walk budget). Only the homebrew keys are emitted in this release (Linux managers leg planned).'
+        example: "taps=0;formulae=66;casks=0"
+        platforms: [darwin]
+      - name: reason
+        type: string
+        description: 'Manager rows only: failure tokens for an unavailable manager, or "-".'
+        example: "-"
+        platforms: [darwin]
+    aggregation:
+      groupBy:
+      # row_kind (autoruns.yaml precedent): a status row is its own group, never a bogus manager/package named after the action.
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "List package managers"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [pkg_inventory]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.software.package_manager_packages
+  displayName: Package Manager Packages
+  version: 1.0.0
+  description: >
+    Reports the packages installed under a package manager, read from
+    directory names with no subprocess. macOS reports Homebrew formulae
+    (Cellar/<formula>/<version>) and casks (Caskroom/<cask>/<version>) over
+    both /opt/homebrew and /usr/local. A formula or cask present under both
+    prefixes yields one row per prefix. Linux is UNSUPPORTED by design:
+    installed_apps owns the Linux package roster, so this action reports
+    `status|packages|unsupported|linux:owned_by_installed_apps` and no
+    package row. Windows is not implemented in this release and reports
+    `status|packages|unsupported|windows:planned`. Machine scope only:
+    per-user package stores are out of scope, deferred to the user-session
+    helper (ADR-3003). Homebrew casks install .app bundles that installed_apps' macOS
+    `list` also reports via system_profiler, and installed_apps'
+    `list_per_user` lists Homebrew formulae per user, so this action does not
+    claim to be disjoint from either; it adds the manager identity and the
+    cask version.
+  tags: [software, package-managers, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: pkg_inventory
+    action: packages
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|packages|<supported|constrained|unsupported>|<failure tokens or ->
+    # package|homebrew|<id>|<version>|<formula|cask>
+    # Two row shapes on one stream, discriminated by field 0; a status row
+    # populates only row_kind..version and leaves the kind column unset.
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator. Values: status (exactly one per result, always first), package (one per installed formula or cask version directory).'
+        values: [status, package]
+        example: package
+        platforms: [windows, linux, darwin]
+      - name: manager
+        type: string
+        description: 'Package rows: the owning package manager, always homebrew in this release. Status rows: the action name, always packages.'
+        example: homebrew
+        platforms: [windows, linux, darwin]
+      - name: id
+        type: string
+        description: 'Package rows: the formula or cask directory name (e.g. openssl@3). Status rows: the completeness level. Values: supported, constrained (at least one read failed or the row cap or walk budget was hit), unsupported (Linux by design, Windows planned).'
+        example: openssl@3
+        platforms: [windows, linux, darwin]
+      - name: version
+        type: string
+        description: 'Package rows: the version directory name under the formula or cask (cask versions may carry commas or colons). Status rows: the comma-joined failure tokens, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. macos:homebrew_cellar:row_cap, macos:homebrew_cellar:byte_cap, macos:homebrew_caskroom:walk_budget or macos:packages:busy), linux:owned_by_installed_apps, windows:planned or pkg_inventory:exception (a leg threw).'
+        example: "3.4.1"
+        platforms: [windows, linux, darwin]
+      - name: kind
+        type: string
+        description: 'Package rows only: whether the directory came from the Cellar or the Caskroom. Values: formula, cask.'
+        values: [formula, cask]
+        example: formula
+        platforms: [darwin]
+    aggregation:
+      groupBy:
+      # row_kind (autoruns.yaml precedent): a status row is its own group, never a bogus manager/package named after the action.
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "List packages by package manager"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [pkg_inventory]
+
+status:
+  phase: active

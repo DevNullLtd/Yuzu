@@ -409,9 +409,21 @@ TEST_CASE("perf: collect-status tokens are a pinned operator contract", "[tar][p
     // a deliberate contract change that must update doc + pin together.
     CHECK(kCollectStatusSourceDisabled == "source_disabled");
     CHECK(kCollectStatusUnsupportedPlatform == "unsupported_platform");
+    CHECK(kCollectStatusCountersUnavailable == "counters_unavailable");
     CHECK(kCollectStatusBaseline == "baseline");
     CHECK(kCollectStatusSampleRecorded == "sample_recorded");
     CHECK(kCollectStatusAppsRecorded == "apps_recorded");
+}
+
+TEST_CASE("perf: a failed counter read maps to a token by registry support (#1846)",
+          "[tar][perf]") {
+    // Supported OS whose read failed -> counters_unavailable; no collector on the
+    // OS (planned/unsupported/unknown) -> unsupported_platform.
+    CHECK(read_failure_token(OsSupportStatus::kSupported) == "counters_unavailable");
+    CHECK(read_failure_token(OsSupportStatus::kSupportedConstrained) == "counters_unavailable");
+    CHECK(read_failure_token(OsSupportStatus::kPlanned) == "unsupported_platform");
+    CHECK(read_failure_token(OsSupportStatus::kUnsupported) == "unsupported_platform");
+    CHECK(read_failure_token(std::nullopt) == "unsupported_platform");
 }
 
 // ── Schema registry pins ─────────────────────────────────────────────────────

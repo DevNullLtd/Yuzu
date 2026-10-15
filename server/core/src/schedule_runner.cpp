@@ -371,10 +371,19 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
         outcome = d_.enqueue_fn(req);
     } catch (...) {
         if (d_.execution_tracker && !exec_id.empty() &&
-            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by))
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
             spdlog::error("schedule_runner: mark_cancelled failed for execution_id={} after "
                           "enqueue_fn threw",
                           exec_id);
+            // #4982 fix round 2 (Fix 5): log-only swallowed the failure with no
+            // observable signal — count it alongside the log line, matching Part
+            // A's REST/MCP instrumentation pattern.
+            if (d_.metrics)
+                d_.metrics
+                    ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                             {{"op", "mark_cancelled"}, {"surface", "schedule"}})
+                    .increment();
+        }
         throw;
     }
     switch (outcome) {
@@ -390,9 +399,16 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
         // advance are separate writes — see the ADR-2002 §6 "documented exception"
         // note). A log line records the idempotent recovery instead.
         if (d_.execution_tracker && !exec_id.empty() &&
-            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by))
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
             spdlog::error("schedule_runner: mark_cancelled failed for duplicate execution_id={}",
                           exec_id);
+            // #4982 fix round 2 (Fix 5)
+            if (d_.metrics)
+                d_.metrics
+                    ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                             {{"op", "mark_cancelled"}, {"surface", "schedule"}})
+                    .increment();
+        }
         count("yuzu_schedule_fires_idempotent_refire_total");
         spdlog::info("schedule_runner: schedule '{}' (id={}) idempotent re-fire — occurrence_id={} "
                      "already enqueued; advancing without a duplicate audit",
@@ -417,8 +433,15 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
                      "moved) — deferring",
                      s.name, s.id);
         if (d_.execution_tracker && !exec_id.empty() &&
-            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by))
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
             spdlog::error("schedule_runner: mark_cancelled failed for execution_id={}", exec_id);
+            // #4982 fix round 2 (Fix 5)
+            if (d_.metrics)
+                d_.metrics
+                    ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                             {{"op", "mark_cancelled"}, {"surface", "schedule"}})
+                    .increment();
+        }
         return false;
     case OutboxEnqueueOutcome::Degraded:
     default:
@@ -428,8 +451,15 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
         spdlog::warn("schedule_runner: schedule '{}' (id={}) enqueue degraded — retrying next tick",
                      s.name, s.id);
         if (d_.execution_tracker && !exec_id.empty() &&
-            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by))
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
             spdlog::error("schedule_runner: mark_cancelled failed for execution_id={}", exec_id);
+            // #4982 fix round 2 (Fix 5)
+            if (d_.metrics)
+                d_.metrics
+                    ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                             {{"op", "mark_cancelled"}, {"surface", "schedule"}})
+                    .increment();
+        }
         audit(s, "instruction.schedule_fired", "failure",
               "enqueue_degraded schedule_id=" + s.id + " execution_id=" + exec_id);
         return false;

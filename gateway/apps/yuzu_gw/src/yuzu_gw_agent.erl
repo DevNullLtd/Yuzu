@@ -28,10 +28,11 @@
 -export([start_link/1,
          dispatch/3,
          get_info/1,
-         disconnect/1]).
+         disconnect/1,
+         reannounce/2]).
 
 %% gen_statem callbacks
--export([callback_mode/0, init/1, terminate/3, code_change/4]).
+-export([callback_mode/0, init/1, terminate/3, code_change/4, format_status/1]).
 -export([connecting/3, streaming/3, disconnected/3]).
 
 -record(data, {
@@ -44,7 +45,14 @@
     plugins     :: [binary()],
     pending     :: #{binary() => {pid(), reference(), integer()}},  %% command_id => {reply_to, fanout_ref, dispatched_at}
     connected_at :: integer() | undefined,
-    peer_addr   :: binary()
+    peer_addr   :: binary(),
+    %% Opaque random id minted ONCE per process instance (HA WS-4, #4324) —
+    %% stamped on both the CONNECTED (init/1) and DISCONNECTED (do_cleanup)
+    %% StreamStatusNotification this process ever sends, so the server can
+    %% fence a stale DISCONNECTED from a torn-down placement against a
+    %% newer re-home reusing the same session id. NOT a counter — must stay
+    %% collision-safe across gateway nodes and mixed-version clusters.
+    stream_home_id :: binary()
 }).
 
 %%%===================================================================
@@ -70,6 +78,28 @@ get_info(Pid) ->
 disconnect(Pid) ->
     gen_statem:cast(Pid, disconnect).
 
+%% @doc HA WS-4 4.4 (`#4246` #6): tell this agent process its upstream
+%% `ProxyRegister` replay was ADOPTED under `SessionId` (the server
+%% published S, never a fresh mint) — so this process should RE-SEND its
+%% own CONNECTED notification, republishing `gateway_node`/
+%% `wire_capabilities`/`stream_home_id` through the existing, session-
+%% guarded `NotifyStreamStatus` -> `set_gateway_route` path. This is the
+%% mechanism that converges the server's in-memory placement after
+%% `ProxyRegister` (which always installs a brand-new `AgentSession`,
+%% wiping that trio — see gateway_service_impl.cpp's ProxyRegister) —
+%% NOT a new state or a second `CONNECTED` for a DIFFERENT home; the
+%% `streaming` clause below only acts when `SessionId` still matches this
+%% process's OWN session, so a superseded/dead process ignores it (a cast
+%% to a dead pid is silently dropped by the runtime; a cast to a pid that
+%% has since moved on to a DIFFERENT session is dropped by the match
+%% guard below), and it always resends the SAME `stream_home_id` this
+%% process already holds — never a new one — so the standing invariant
+%% against a same-session `CONNECTED(S, home2)` (gateway_route_store.hpp's
+%% FORWARD NOTE) is not violated.
+-spec reannounce(pid(), binary()) -> ok.
+reannounce(Pid, SessionId) ->
+    gen_statem:cast(Pid, {upstream_reannounced, SessionId}).
+
 %%%===================================================================
 %%% gen_statem callbacks
 %%%===================================================================
@@ -84,6 +114,17 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     %% Defaulted so an agent started without it (older callers, tests)
     %% still works — replay just skips agents whose req is empty.
     RegisterReq = maps:get(register_req, Args, #{}),
+    %% Connection key of the Subscribe stream that created this session
+    %% (yuzu_gw_conn). Defaulted so a caller without one still starts; such
+    %% a session is held but admits no heartbeat.
+    ConnKey = maps:get(conn_key, Args, undefined),
+
+    %% Opaque per-process-instance id (HA WS-4, #4324): minted once here,
+    %% never regenerated, and reused verbatim on the DISCONNECTED
+    %% notification in do_cleanup/1. A CSPRNG value, not a counter —
+    %% erlang:unique_integer/1 was rejected as per-BEAM-node and therefore
+    %% collision-prone across gateway cluster nodes.
+    StreamHomeId = string:lowercase(binary:encode_hex(crypto:strong_rand_bytes(16))),
 
     %% Monitor the stream handler process.
     StreamMon = case StreamPid of
@@ -101,7 +142,8 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
         plugins     = Plugins,
         pending     = #{},
         connected_at = erlang:system_time(millisecond),
-        peer_addr   = PeerAddr
+        peer_addr   = PeerAddr,
+        stream_home_id = StreamHomeId
     },
 
     %% Register in routing table and join pg groups. The RegisterRequest
@@ -109,9 +151,24 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     %% when the upstream connection re-establishes.
     Hostname = maps:get(<<"hostname">>, AgentInfo,
                         maps:get(hostname, AgentInfo, <<>>)),
-    yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
-                                    Hostname, RegisterReq),
+    case yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
+                                         Hostname, RegisterReq, ConnKey) of
+        ok ->
+            announce_connected(Data);
+        {error, registry_unavailable} ->
+            %% A fixed reason: an init failure is printed by the supervisor and
+            %% by the Subscribe handler, and must not carry the request.
+            {stop, registry_unavailable};
+        {error, session_limit} ->
+            %% The connection holds its quota of other agents' sessions (the
+            %% registry counted and logged it): refuse this one. A fixed reason,
+            %% for the same reason as above.
+            {stop, session_limit}
+    end.
 
+%% The rest of init/1, once the agent is in the routing table.
+announce_connected(#data{agent_id = AgentId, session_id = SessionId, peer_addr = PeerAddr,
+                         stream_pid = StreamPid, stream_home_id = StreamHomeId} = Data) ->
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,
                       occurred_at => #{millis_epoch => erlang:system_time(millisecond)},
@@ -122,11 +179,12 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
                       #{agent_id => AgentId, node => node(),
                         session_id => SessionId}),
 
-    logger:info("Agent ~s connected from ~s (session=~s)",
-                [AgentId, PeerAddr, SessionId]),
+    logger:info("Agent ~s connected from ~s",
+                [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(PeerAddr)]),
 
     %% Notify C++ server about the stream connection.
-    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                           StreamHomeId),
 
     case StreamPid of
         undefined -> {ok, connecting, Data};
@@ -165,7 +223,31 @@ connecting(info, {'DOWN', MonRef, process, _Pid, _Reason},
     {next_state, disconnected, Data};
 
 connecting(cast, disconnect, Data) ->
-    {next_state, disconnected, Data}.
+    {next_state, disconnected, Data};
+
+connecting(cast, {upstream_reannounced, SessionId},
+           #data{session_id = SessionId, agent_id = AgentId, peer_addr = PeerAddr,
+                stream_home_id = StreamHomeId}) ->
+    %% HA WS-4 4.4 review fix (N1): init/1 sends this process's ONLY
+    %% CONNECTED before the state machine ever reaches `connecting`
+    %% (neither `connecting` nor `stream_ready`'s transition to
+    %% `streaming` sends a second one) — so an ADOPT landing in this
+    %% narrow window, before Subscribe's stream_pid arrives, must still
+    %% re-announce here, or the server's placement (wiped by
+    %% `register_agent`) stays unrecovered until this session eventually
+    %% disconnects and reconnects. Same payload, same mechanism as the
+    %% `streaming` clause below — only the state differs.
+    logger:debug("Agent ~s: upstream adopted replay under session ~s — re-announcing "
+                "CONNECTED (still connecting) to converge server-side placement",
+                [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(SessionId)]),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                          StreamHomeId),
+    keep_state_and_data;
+
+connecting(cast, {upstream_reannounced, _OtherSessionId}, _Data) ->
+    %% A superseded session — same rationale as streaming's own mismatch
+    %% clause below.
+    keep_state_and_data.
 
 %%--------------------------------------------------------------------
 %% State: streaming — the hot path
@@ -212,12 +294,14 @@ streaming(info, stream_closed, Data) ->
     {next_state, disconnected, Data};
 
 streaming(info, {stream_error, Reason}, Data) ->
-    logger:warning("Stream error for agent ~s: ~p", [Data#data.agent_id, Reason]),
+    logger:warning("Stream error for agent ~s: ~p",
+                   [yuzu_gw_env:log_text(Data#data.agent_id), Reason]),
     {next_state, disconnected, Data};
 
 streaming(info, {'DOWN', MonRef, process, _Pid, _Reason},
           #data{stream_mon = MonRef} = Data) ->
-    logger:warning("Stream handler died for agent ~s", [Data#data.agent_id]),
+    logger:warning("Stream handler died for agent ~s",
+                   [yuzu_gw_env:log_text(Data#data.agent_id)]),
     {next_state, disconnected, Data};
 
 streaming({call, From}, get_info, Data) ->
@@ -233,7 +317,33 @@ streaming(cast, disconnect, Data) ->
         undefined -> ok;
         _         -> StreamPid ! close_stream
     end,
-    {next_state, disconnected, Data}.
+    {next_state, disconnected, Data};
+
+streaming(cast, {upstream_reannounced, SessionId},
+          #data{session_id = SessionId, agent_id = AgentId, peer_addr = PeerAddr,
+               stream_home_id = StreamHomeId}) ->
+    %% HA WS-4 4.4 (`#4246` #6, reannounce/2's doc comment): SessionId still
+    %% matches this process's own session (the equality is enforced by the
+    %% pattern match, not a guard) — re-send the SAME CONNECTED payload this
+    %% process already advertised at init/1, republishing gateway_node/
+    %% wire_capabilities/stream_home_id through the ordinary session-guarded
+    %% path. Does not change `Data` (nothing about THIS process's own state
+    %% changed — only the server's independently-installed placement did).
+    logger:debug("Agent ~s: upstream adopted replay under session ~s — re-announcing "
+                "CONNECTED to converge server-side placement",
+                [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(SessionId)]),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                          StreamHomeId),
+    keep_state_and_data;
+
+streaming(cast, {upstream_reannounced, _OtherSessionId}, Data) ->
+    %% This process has since moved on to a DIFFERENT session than the one
+    %% the (now-stale) replay drip entry adopted — a benign race between the
+    %% drip and a genuine agent reconnect. Ignore; the reconnect's own
+    %% CONNECTED already carries the correct, current placement.
+    logger:debug("Agent ~s: ignoring stale upstream_reannounced for a superseded session",
+                [yuzu_gw_env:log_text(Data#data.agent_id)]),
+    keep_state_and_data.
 
 %%--------------------------------------------------------------------
 %% State: disconnected — cleanup and terminate
@@ -259,6 +369,48 @@ terminate(_Reason, _State, Data) ->
 
 code_change(_OldVsn, State, Data, _Extra) ->
     {ok, State, Data}.
+
+%% What OTP prints for this process in a terminate or crash report and in
+%% sys:get_status/1: the data without the stored RegisterRequest, which holds
+%% the enrollment token, machine certificate and CSR (and is only the replay
+%% copy the registry also keeps). Only the reports are affected:
+%% sys:get_state/1 still returns the real record.
+%%
+%% NOT covered here, because OTP prints it from raw data outside this callback
+%% (the `reason' stacktrace, whose frames carry the argument list of a failing
+%% call and so the whole data record; the mailbox; the init arguments in the
+%% supervisor report): yuzu_gw_crash_redact, the logger primary filter
+%% yuzu_gw_app installs, rewrites those for the processes of this module. It is
+%% NOT in place when this module is used without the application.
+%%
+%% The queued events (`queue', whose head is the "Last event" of a terminate
+%% report) and the postponed ones are reduced to their type: an event can carry
+%% a request. No production sender delivers one to this process; this is the
+%% belt to that braces.
+-spec format_status(map()) -> map().
+format_status(Status) ->
+    maps:map(fun(data, Data)         -> redact_data(Data);
+                (queue, Events)      -> redact_events(Events);
+                (postponed, Events)  -> redact_events(Events);
+                (_Key, Value)        -> Value
+             end, Status).
+
+%% A gen_statem event is {Type, Content}; only the type is kept.
+redact_events(Events) when is_list(Events) ->
+    [redact_event(E) || E <- Events];
+redact_events(_Other) ->
+    '$redacted'.
+
+redact_event({Type, _Content}) -> {Type, '$redacted'};
+redact_event(_Other)           -> '$redacted'.
+
+%% Shown as a map of the fields (a record with register_req replaced would
+%% violate the field's declared type), the way yuzu_gw_upstream shows its state.
+redact_data(#data{} = Data) ->
+    Fields = maps:from_list(lists:zip(record_info(fields, data), tl(tuple_to_list(Data)))),
+    Fields#{register_req := '$redacted'};
+redact_data(_Other) ->
+    '$redacted'.
 
 %%%===================================================================
 %%% Internal functions
@@ -288,34 +440,52 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
                     telemetry:execute([yuzu, gw, command, completed],
                                       #{duration_ms => Duration},
                                       #{agent_id => AgentId, plugin => Plugin, status => Status}),
-                    %% Notify router so it can complete the fanout.
-                    case whereis(yuzu_gw_router) of
-                        undefined  -> ok;
-                        RouterPid  -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
-                    end,
+                    %% Notify the router that is actually TRACKING this
+                    %% fanout. HA WS-4 4.3a fix: that router lives on the
+                    %% DISPATCHING node, which — once cross-node routing
+                    %% exists (`yuzu_gw_registry:lookup/1`'s `pg` fallback)
+                    %% — is not necessarily THIS (the agent process's) node.
+                    %% `ReplyTo` is the fanout's `CallerPid` (mgmt-service
+                    %% handler process, `yuzu_gw_router.erl`'s `#fanout.from`),
+                    %% always co-located with its own node's `yuzu_gw_router`
+                    %% (`yuzu_gw_router.erl`'s `?SERVER` is a LOCAL-only
+                    %% `gen_server:start_link({local, ...})`) — so
+                    %% `node(ReplyTo)` names the right node. The prior local
+                    %% `whereis(yuzu_gw_router)` silently no-oped on a
+                    %% cross-node dispatch (this agent's OWN node's router,
+                    %% which was never tracking a fanout it didn't originate),
+                    %% stranding the fanout until the 300s `fanout_timeout`
+                    %% fallback — invisible until cross-node routing made this
+                    %% reachable. `{Name, Node} ! Msg` is fire-and-forget: an
+                    %% unreachable node or unregistered name is silently
+                    %% dropped, matching the previous local `undefined -> ok`
+                    %% no-op semantics exactly.
+                    {yuzu_gw_router, node(ReplyTo)} ! {fanout_terminal, FanoutRef, AgentId},
                     maps:remove(CmdId, Pending)
             end,
             {keep_state, Data#data{pending = Pending2}};
 
         error ->
-            logger:debug("Orphaned response from ~s for cmd ~s", [AgentId, CmdId]),
+            logger:debug("Orphaned response from ~s for cmd ~s",
+                         [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(CmdId)]),
             keep_state_and_data
     end.
 
 do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                   connected_at = ConnectedAt, pending = Pending,
-                  peer_addr = PeerAddr}) ->
-    %% Deregister from routing table and pg groups.
-    yuzu_gw_registry:deregister_agent(AgentId),
+                  peer_addr = PeerAddr, stream_home_id = StreamHomeId}) ->
+    %% Deregister from routing table and pg groups. Fenced on this process
+    %% and its own session: if the agent already reconnected under a newer
+    %% session, only this session's index entry goes.
+    yuzu_gw_registry:deregister_agent(AgentId, self(), SessionId),
 
     %% Notify pending command waiters that the agent disconnected,
     %% and notify router so it can complete fanout tracking.
     maps:foreach(fun(_CmdId, {ReplyTo, FanoutRef, _DispatchedAt}) ->
         ReplyTo ! {command_error, FanoutRef, AgentId, agent_disconnected},
-        case whereis(yuzu_gw_router) of
-            undefined -> ok;
-            RouterPid -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
-        end
+        %% HA WS-4 4.3a fix: route to the DISPATCHING node's router, same
+        %% reasoning as handle_stream_response/2 above.
+        {yuzu_gw_router, node(ReplyTo)} ! {fanout_terminal, FanoutRef, AgentId}
     end, Pending),
 
     Duration = case ConnectedAt of
@@ -327,18 +497,22 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                       #{count => 1, duration_ms => Duration},
                       #{agent_id => AgentId, reason => normal}),
 
-    %% Notify C++ server.
+    %% Notify C++ server. Same StreamHomeId minted at CONNECTED (init/1) —
+    %% never a freshly-minted value — so the server can match this
+    %% DISCONNECTED to the placement it actually tears down (HA WS-4).
     yuzu_gw_upstream:notify_stream_status(AgentId,
                                            SessionId,
                                            disconnected,
-                                           PeerAddr),
+                                           PeerAddr,
+                                           StreamHomeId),
 
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,
                       occurred_at => #{millis_epoch => erlang:system_time(millisecond)},
                       event       => {disconnected, #{reason => <<"normal">>}}}),
 
-    logger:info("Agent ~s disconnected (was connected ~bms)", [AgentId, Duration]),
+    logger:info("Agent ~s disconnected (was connected ~bms)",
+                [yuzu_gw_env:log_text(AgentId), Duration]),
     ok.
 
 notify_watchers(Event) ->

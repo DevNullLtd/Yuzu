@@ -1,0 +1,7 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-23 · euid 0 (container seeded with two synthetic Chrome policy files for this capture; see the note under the samples) · leg-hash 3349c5d2765b
+== action=policies
+policy|chrome|mandatory|machine|ExtensionInstallForcelist|list|["aaaabbbbccccddddeeeeffffgggghhhh;https://clients2.google.com/service/update2/crx"]|/etc/opt/chrome/policies/managed/seeded.json|-
+policy|chrome|mandatory|machine|HomepageLocation|string|https://intranet.example.com/|/etc/opt/chrome/policies/managed/seeded.json|-
+policy|chrome|mandatory|machine|RestoreOnStartup|int|4|/etc/opt/chrome/policies/managed/seeded.json|-
+policy|chrome|recommended|machine|BookmarkBarEnabled|bool|true|/etc/opt/chrome/policies/recommended/seeded.json|-
+[result_status] OK / FULL /

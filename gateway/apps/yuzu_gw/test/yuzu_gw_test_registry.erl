@@ -8,7 +8,7 @@
 %%% death is *asynchronous*. So when the next module's `setup/0' runs
 %%% there is a window where `whereis(yuzu_gw_registry) =:= undefined' but
 %%% the named tables the dead registry owned (`yuzu_gw_agents' /
-%%% `yuzu_gw_pending') are not yet reaped. A naive `start_link' in that
+%%% `yuzu_gw_pending' / `yuzu_gw_sessions') are not yet reaped. A naive `start_link' in that
 %%% window crashes in `init/1' with
 %%%
 %%%     ets:new(yuzu_gw_pending, ...) → {badarg, ... table name already exists}
@@ -31,11 +31,14 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_test_registry).
 
--export([ensure/0, ensure_fresh/0]).
+-export([ensure/0, ensure_fresh/0, stop_agent_sup/1]).
+-export([mock_registry_loop/0, mock_registry_drop_index/1,
+         mock_registry_restore_index/1]).
 
 %% Tables owned by the registry gen_server (see yuzu_gw_registry:init/1).
 -define(AGENTS_TABLE,  yuzu_gw_agents).
 -define(PENDING_TABLE, yuzu_gw_pending).
+-define(SESSIONS_TABLE, yuzu_gw_sessions).
 
 -define(START_RETRIES,    20).
 -define(REAP_TIMEOUT_MS, 1000).
@@ -75,6 +78,87 @@ ensure_fresh() ->
     end,
     start_fresh(?START_RETRIES).
 
+%% @doc Stop an agent supervisor that a fixture started, and wait until it is
+%% gone. `undefined' (the fixture reused a supervisor it did not start) is a
+%% no-op. The next fixture's setup reuses `yuzu_gw_agent_sup' when the name is
+%% registered, so it must not find one that is still shutting down: stop it
+%% synchronously and wait for its exit. Returns `ok'.
+-spec stop_agent_sup(pid() | undefined) -> ok.
+stop_agent_sup(undefined) ->
+    ok;
+stop_agent_sup(AgentSup) ->
+    Ref = monitor(process, AgentSup),
+    catch gen_server:stop(AgentSup, shutdown, 5000),
+    receive {'DOWN', Ref, process, AgentSup, _} -> ok
+    after 5000 ->
+        exit(AgentSup, kill),
+        receive {'DOWN', Ref, process, AgentSup, _} -> ok
+        after 1000 -> demonitor(Ref, [flush]), ok
+        end
+    end.
+
+%%%===================================================================
+%%% Stand-in registry for readiness tests
+%%%===================================================================
+
+%% @doc Body of a process registered as `yuzu_gw_registry' by a test that
+%% needs the name to exist but not the real gen_server (the health tests).
+%% Like the real registry it owns a `yuzu_gw_sessions' table, because
+%% readiness reports a registry without that table as not ready. It swallows
+%% every other message, as the plain `mock_loop' stand-ins do.
+-spec mock_registry_loop() -> ok.
+mock_registry_loop() ->
+    ensure_index_table(?START_RETRIES),
+    mock_registry_receive().
+
+%% Drop / recreate the stand-in's table from the owning process, and wait for
+%% it. Returns `ok'.
+-spec mock_registry_drop_index(pid()) -> ok.
+mock_registry_drop_index(Pid) ->
+    mock_registry_call(Pid, drop_index).
+
+-spec mock_registry_restore_index(pid()) -> ok.
+mock_registry_restore_index(Pid) ->
+    mock_registry_call(Pid, restore_index).
+
+mock_registry_call(Pid, Msg) ->
+    Ref = make_ref(),
+    Pid ! {Msg, self(), Ref},
+    receive {done, Ref} -> ok
+    after 5000 -> error({mock_registry_timeout, Msg})
+    end.
+
+mock_registry_receive() ->
+    receive
+        {drop_index, From, Ref} ->
+            catch ets:delete(?SESSIONS_TABLE),
+            From ! {done, Ref},
+            mock_registry_receive();
+        {restore_index, From, Ref} ->
+            ensure_index_table(?START_RETRIES),
+            From ! {done, Ref},
+            mock_registry_receive();
+        stop ->
+            ok;
+        _ ->
+            mock_registry_receive()
+    after 60000 -> ok
+    end.
+
+%% A table of the same name owned by a just-killed process can outlive it for
+%% a moment: retry the create rather than crash the stand-in.
+ensure_index_table(Retries) ->
+    case ets:whereis(?SESSIONS_TABLE) of
+        undefined ->
+            try ets:new(?SESSIONS_TABLE, [named_table, set, public]), ok
+            catch error:badarg when Retries > 0 ->
+                timer:sleep(?RETRY_BACKOFF_MS),
+                ensure_index_table(Retries - 1)
+            end;
+        _ ->
+            ok
+    end.
+
 %%%===================================================================
 %%% Internal
 %%%===================================================================
@@ -86,11 +170,31 @@ ensure_pg() ->
     end,
     ok.
 
+%% A kill signal travels down every link the target process still holds, and a
+%% registry started by an earlier module's fixture process is linked to that
+%% (possibly still running) process: killing it cancels that module's tests.
+%% So a real registry is first stopped with a normal exit reason, which a
+%% non-trapping linked process ignores. The kill remains the fallback for a
+%% process that is not a gen_server (the #336 `mock_loop' impostor) or that
+%% does not stop in time.
 evict(Pid) ->
     catch unlink(Pid),
     catch unregister(yuzu_gw_registry),
-    catch exit(Pid, kill),
+    case started_by_proc_lib(Pid) of
+        true ->
+            try gen_server:stop(Pid, normal, 1000)
+            catch _:_ -> catch exit(Pid, kill)
+            end;
+        false ->
+            catch exit(Pid, kill)
+    end,
     ok.
+
+%% True for a process started through proc_lib (every OTP behaviour, so the
+%% real registry); false for a plain `spawn' such as the `mock_loop' impostor,
+%% which would swallow the stop request and only burn the timeout.
+started_by_proc_lib(Pid) ->
+    proc_lib:initial_call(Pid) =/= false.
 
 %% `start_link' can race a dying registry that still owns the named ETS
 %% tables; the fresh `init/1' then crashes with a `{badarg, ...}' EXIT
@@ -116,7 +220,8 @@ do_start_fresh(Retries) ->
     %% the named tables — once they are gone, start_link is clean.
     _ = wait_until(fun() ->
         ets:info(?AGENTS_TABLE, size) =:= undefined andalso
-        ets:info(?PENDING_TABLE, size) =:= undefined
+        ets:info(?PENDING_TABLE, size) =:= undefined andalso
+        ets:info(?SESSIONS_TABLE, size) =:= undefined
     end, ?REAP_TIMEOUT_MS),
     case yuzu_gw_registry:start_link() of
         {ok, _Pid} ->

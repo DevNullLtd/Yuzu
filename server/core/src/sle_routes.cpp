@@ -205,12 +205,14 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // exists). Gate: ONE SCOPED securable, `Decommission:Delete` (ADR-0024 Decision
     // 9, amended Wave 7 PR7.2) — a device-level erasure grant that authorizes for
     // the cascade's WHOLE blast radius, not the individual securables that govern
-    // each store's READ. The radius is FIVE stores: InventoryStore,
+    // each store's READ. The radius is SEVEN stores: InventoryStore,
     // SoftwareInventoryStore, DeviceInventoryStore (all three read-gated by
     // `Inventory`), AppPerfDailyStore (read-gated by `GuaranteedState` — DEX
-    // behavioural PII), and SoftwareLicensingStore (read-gated by
-    // `SoftwareLicensing`). A companion package (Wave 7 PR7.2) adds a sixth store,
-    // AppUsageStore (read-gated by `Forensics`). Compat: the seeded
+    // behavioural PII), SoftwareLicensingStore (read-gated by
+    // `SoftwareLicensing`), AppUsageStore (read-gated by `Forensics`,
+    // Wave 7 PR7.2), and OfflineEndpointStore (#5682: the endpoint_state
+    // presence row, read on /hardware under `Inventory` and /viz/fleet under
+    // `Response`). Compat: the seeded
     // matrix is unchanged (Administrator + ITServiceOwner keep the ability, granted
     // via seed_defaults() with no migration); an operator-authored custom role that
     // had assembled the old per-store Delete grants is refused (403 naming
@@ -247,7 +249,8 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
             // ONE scoped gate for the cascade's whole blast radius (ADR-0024
             // Decision 9, amended Wave 7 PR7.2). Keep this in lockstep with
             // AgentDecommissionStores (the drift guard in test_agent_decommission.cpp
-            // fails if a store is added without bumping kCascadeStoreCount).
+            // pins the COUNT of registered targets via kCascadeStoreCount; it does
+            // not verify that every member is wired).
             if (!scoped_perm_fn_(req, res, "Decommission", "Delete", agent_id))
                 return; // the gate wrote its own 401/403
             if (!decommission_fn_) {
@@ -279,9 +282,12 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 breakdown += to_string(s.outcome);
                 breakdown += ' ';
             }
-            (void)detail::try_persist_audit(
-                audit_fn_, req, "sle.agent.decommission", r.ok() ? "success" : "partial", "Agent",
-                agent_id,
+            // The attempt row above is the fail-closed evidence; a lost OUTCOME row is
+            // signalled by Sec-Audit-Failed (set on the 200 and the partial 500 alike), which
+            // the page's client reads to warn that the per-store outcome is unrecorded.
+            (void)detail::emit_behavioral_audit(
+                audit_fn_, req, res, "sle.agent.decommission", r.ok() ? "success" : "partial",
+                "Agent", agent_id,
                 breakdown + "deleted=" + std::to_string(r.deleted) +
                     " skipped=" + std::to_string(r.skipped) +
                     " failed=" + std::to_string(r.failed) + " cid=" + cid);

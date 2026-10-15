@@ -133,7 +133,7 @@ function, never in `applies_*` collectors.
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | tar.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe TAR data, delete `<data_dir>/tar.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing tar.db, runs migration if the schema version differs, and resumes collection. State in `tar_state` may be stale (see §5). |
 | **`data_dir` change** (config update) | The new directory has no tar.db — the next collect_fast creates it from scratch. The old tar.db at the previous path is orphaned but not deleted. Operator concern, not TAR's. |
-| **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Observability gap (tracked follow-up):** corruption is currently **log-only** — no Prometheus metric, no server audit event, no heartbeat tag surfaces it fleet-side; an operator learns of it only from the agent log. |
+| **Corruption detected at open** (#559) | `TarDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm` sidecars are renamed to `tar.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `tar_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `tar.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — TAR refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.tar.*` heartbeat tags; the server exposes `yuzu_fleet_tar_db_corruption_agents` and writes a `tar.db.corruption_quarantined` audit row — see docs/user-manual/tar.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
 state stores. If a customer asks for "delete tar data on uninstall",
@@ -346,10 +346,15 @@ header):
    never only in a code comment. Do not read the paragraph above as licence to
    ship a new source opt-in without asking; the ruling is the current posture.
 6. **`tar_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
-   gated on `source_enabled(*db_, "<source>")`: enumerate → diff → insert →
-   `set_state` (advance the diff baseline **only on insert success**). For an
-   opt-in source, an insert failure is non-fatal (log + skip — don't fail the
-   always-on legs' tick). Add `do_query`/`do_export` `type` branches if the source
+   gated on `source_enabled(*db_, "<source>")`: enumerate → diff →
+   `typed.empty() ? db_->set_state(key, json) : db_->insert_<src>_events(typed,
+   StateWrite{key, json})` (events and baseline commit in one transaction, #1654).
+   On failure emit `error|<src> insert failed` (had events) or
+   `error|<src> state_save_failed` (baseline-only) and call
+   `note_health(<registry name>, "insert_failed"|"state_save_failed")`; on success
+   `note_health(<registry name>, "events_recorded")`. A leg that never calls
+   `note_health` reads `never_ran` in status. For an opt-in source a failure is
+   non-fatal (no `error|` line — don't fail the always-on legs' tick). Add `do_query`/`do_export` `type` branches if the source
    should appear in those actions.
 7. **`agents/plugins/tar/meson.build`** — add the new `.cpp` to the
    `shared_library` sources; add any new Windows import lib (`dnsapi` for DNS).

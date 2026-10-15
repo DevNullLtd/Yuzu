@@ -40,7 +40,20 @@ registry_test_() ->
       {"pending sweep removes expired entries", fun pending_sweep_expired/0},
       {"pending sweep preserves fresh entries", fun pending_sweep_preserves_fresh/0},
       %% Monitor ref leak test
-      {"re-register does not leak monitor refs", fun reregister_no_monitor_leak/0}
+      {"re-register does not leak monitor refs", fun reregister_no_monitor_leak/0},
+      %% #1197: the replay entries for sessions this node holds
+      {"entries_for_sessions returns the replay entry of each held session, read only",
+       fun entries_for_held_sessions/0},
+      {"entries_for_sessions drops an id whose routing row holds a different pid",
+       fun entries_drop_pid_mismatch/0},
+      {"entries_for_sessions drops an id whose routing row holds a different session",
+       fun entries_drop_session_mismatch/0},
+      {"entries_for_sessions drops an id whose process has died",
+       fun entries_drop_dead_process/0},
+      {"entries_for_sessions returns [] when the session index is missing",
+       fun entries_without_session_index/0},
+      {"lookup_local_session reports unavailable when the routing table is missing",
+       fun lookup_local_session_without_table/0}
      ]}.
 
 setup() ->
@@ -71,7 +84,7 @@ deregister_removes() ->
     ok = yuzu_gw_registry:register_agent(<<"agent-2">>, Pid, <<"s">>, [], <<>>),
     ?assertMatch({ok, _}, yuzu_gw_registry:lookup(<<"agent-2">>)),
     yuzu_gw_registry:deregister_agent(<<"agent-2">>),
-    timer:sleep(20),  %% cast is async
+    registry_barrier(),  %% the deregister cast is async
     ?assertEqual(error, yuzu_gw_registry:lookup(<<"agent-2">>)),
     kill_dummy(Pid).
 
@@ -81,8 +94,7 @@ monitor_cleanup() ->
     ?assertMatch({ok, _}, yuzu_gw_registry:lookup(<<"agent-3">>)),
     %% Kill the process — registry should auto-clean via DOWN monitor.
     kill_dummy(Pid),
-    timer:sleep(50),
-    ?assertEqual(error, yuzu_gw_registry:lookup(<<"agent-3">>)).
+    ?assertEqual(error, await(fun() -> yuzu_gw_registry:lookup(<<"agent-3">>) end, error)).
 
 reregister_replaces() ->
     Pid1 = spawn_dummy(),
@@ -115,8 +127,8 @@ agent_count_accurate() ->
     ?assertEqual(InitialCount + 10, yuzu_gw_registry:agent_count()),
     %% Cleanup
     lists:foreach(fun(Pid) -> kill_dummy(Pid) end, Pids),
-    timer:sleep(100),
-    ?assertEqual(InitialCount, yuzu_gw_registry:agent_count()).
+    ?assertEqual(InitialCount,
+                 await(fun yuzu_gw_registry:agent_count/0, InitialCount)).
 
 pg_plugin_groups() ->
     Pid = spawn_dummy(),
@@ -162,7 +174,7 @@ pagination_cursor() ->
 deregister_nonexistent() ->
     %% Should not crash.
     yuzu_gw_registry:deregister_agent(<<"does-not-exist">>),
-    timer:sleep(20),
+    registry_barrier(),  %% also proves the registry survived the cast
     ?assertEqual(error, yuzu_gw_registry:lookup(<<"does-not-exist">>)).
 
 lookup_dead_process() ->
@@ -240,28 +252,28 @@ pending_take_concurrent_single_winner() ->
 
 pending_sweep_expired() ->
     %% Directly insert an expired entry into the ETS table.
-    ExpiredTime = erlang:system_time(millisecond) - 200000,  %% 200s ago (TTL is 120s)
+    ExpiredTime = erlang:monotonic_time(millisecond) - 200000,  %% 200s ago (TTL is 120s)
     ets:insert(yuzu_gw_pending, {<<"sweep-expired-1">>, #{agent_id => <<"x">>}, ExpiredTime}),
 
     %% Trigger sweep.
     yuzu_gw_registry ! sweep_pending,
-    timer:sleep(50),
+    registry_barrier(),
 
     %% Expired entry should be gone.
     ?assertEqual([], ets:lookup(yuzu_gw_pending, <<"sweep-expired-1">>)).
 
 pending_sweep_preserves_fresh() ->
     %% Insert a fresh entry.
-    FreshTime = erlang:system_time(millisecond),
+    FreshTime = erlang:monotonic_time(millisecond),
     ets:insert(yuzu_gw_pending, {<<"sweep-fresh-1">>, #{agent_id => <<"y">>}, FreshTime}),
 
     %% Also insert an expired one.
-    ExpiredTime = erlang:system_time(millisecond) - 200000,
+    ExpiredTime = erlang:monotonic_time(millisecond) - 200000,
     ets:insert(yuzu_gw_pending, {<<"sweep-expired-2">>, #{agent_id => <<"z">>}, ExpiredTime}),
 
     %% Trigger sweep.
     yuzu_gw_registry ! sweep_pending,
-    timer:sleep(50),
+    registry_barrier(),
 
     %% Fresh entry should still exist.
     ?assertMatch([{_, _, _}], ets:lookup(yuzu_gw_pending, <<"sweep-fresh-1">>)),
@@ -284,7 +296,8 @@ reregister_no_monitor_leak() ->
     ok = yuzu_gw_registry:register_agent(<<"leak-test">>, Pid2, <<"s2">>, [], <<>>),
 
     %% Inspect the gen_server state via sys:get_state.
-    {state, MonRefs, _SweepTimer} = sys:get_state(yuzu_gw_registry),
+    %% The agent monitors are the second field of the state.
+    MonRefs = element(2, sys:get_state(yuzu_gw_registry)),
 
     %% There should be exactly one monitor ref for <<"leak-test">>.
     RefCount = length([V || {_, V} <- maps:to_list(MonRefs), V =:= <<"leak-test">>]),
@@ -294,8 +307,161 @@ reregister_no_monitor_leak() ->
     kill_dummy(Pid2).
 
 %%%===================================================================
+%%% #1197: entries_for_sessions/1
+%%%===================================================================
+
+%% Each held session resolves, through the session index, to the agent id, the
+%% session and the stored RegisterRequest, in the shape all_register_reqs/0
+%% returns. Ids this node does not hold are dropped. The lookup writes nothing.
+entries_for_held_sessions() ->
+    {A1, P1, S1, R1} = efs_register(<<"a">>),
+    {A2, P2, S2, R2} = efs_register(<<"b">>),
+    AgentsBefore = lists:sort(ets:tab2list(yuzu_gw_agents)),
+    IndexBefore = lists:sort(ets:tab2list(yuzu_gw_sessions)),
+    Got = yuzu_gw_registry:entries_for_sessions([S2, <<"efs-unknown-session">>, S1]),
+    ?assertEqual(lists:sort([{A1, S1, R1}, {A2, S2, R2}]), lists:sort(Got)),
+    ?assertEqual([], yuzu_gw_registry:entries_for_sessions([<<"efs-unknown-session">>])),
+    ?assertEqual([], yuzu_gw_registry:entries_for_sessions([])),
+    ?assertEqual(AgentsBefore, lists:sort(ets:tab2list(yuzu_gw_agents))),
+    ?assertEqual(IndexBefore, lists:sort(ets:tab2list(yuzu_gw_sessions))),
+    efs_cleanup([{A1, P1, S1}, {A2, P2, S2}]).
+
+%% The routing table is public, so a row can be replaced under the index: the
+%% index still says S -> P1 while the routing row now holds P2. The id must
+%% not resolve; the control line first shows it does while they agree.
+entries_drop_pid_mismatch() ->
+    {A, P1, S, R} = efs_register(<<"pm">>),
+    ?assertEqual([{A, S, R}], yuzu_gw_registry:entries_for_sessions([S])),
+    P2 = spawn_dummy(),
+    true = ets:insert(yuzu_gw_agents, {A, P2, node(P2), S, [], 0, <<>>, R}),
+    ?assertEqual([], yuzu_gw_registry:entries_for_sessions([S])),
+    efs_cleanup([{A, P1, S}]),
+    kill_dummy(P2).
+
+%% Same, with the routing row holding the right pid but another session.
+entries_drop_session_mismatch() ->
+    {A, P, S, R} = efs_register(<<"sm">>),
+    ?assertEqual([{A, S, R}], yuzu_gw_registry:entries_for_sessions([S])),
+    true = ets:insert(yuzu_gw_agents, {A, P, node(P), <<"efs-other-session">>, [], 0, <<>>, R}),
+    ?assertEqual([], yuzu_gw_registry:entries_for_sessions([S])),
+    efs_cleanup([{A, P, S}]).
+
+%% The process is dead: judged by this test's own monitor, so no registry
+%% cleanup has to have run for the answer to be [].
+entries_drop_dead_process() ->
+    {A, P, S, R} = efs_register(<<"dp">>),
+    ?assertEqual([{A, S, R}], yuzu_gw_registry:entries_for_sessions([S])),
+    Ref = monitor(process, P),
+    exit(P, kill),
+    receive {'DOWN', Ref, process, P, _} -> ok
+    after 2000 -> erlang:error(dummy_did_not_die)
+    end,
+    ?assertEqual([], yuzu_gw_registry:entries_for_sessions([S])),
+    efs_cleanup([{A, P, S}]).
+
+%% A registry running without its index (new code loaded into a running node)
+%% must answer [], not raise. The table is owned by the registry: drop and
+%% restore it from inside.
+entries_without_session_index() ->
+    {A, P, S, R} = efs_register(<<"ni">>),
+    ?assertEqual([{A, S, R}], yuzu_gw_registry:entries_for_sessions([S])),
+    _ = sys:replace_state(yuzu_gw_registry,
+                          fun(St) -> catch ets:delete(yuzu_gw_sessions), St end),
+    try
+        ?assertEqual([], yuzu_gw_registry:entries_for_sessions([S]))
+    after
+        _ = sys:replace_state(yuzu_gw_registry, fun(St) ->
+            case ets:whereis(yuzu_gw_sessions) of
+                undefined ->
+                    ets:new(yuzu_gw_sessions,
+                            [named_table, set, protected, {read_concurrency, true}]);
+                _ ->
+                    ok
+            end,
+            St
+        end)
+    end,
+    efs_cleanup([{A, P, S}]).
+
+%% lookup_local_session/1 is read by the replay drip at pop time. A missing
+%% routing table must be an explicit answer the drip can act on, not a crash
+%% of the upstream process.
+lookup_local_session_without_table() ->
+    {A, P, S, _R} = efs_register(<<"lu">>),
+    ?assertEqual({ok, {P, S}}, yuzu_gw_registry:lookup_local_session(A)),
+    _ = sys:replace_state(yuzu_gw_registry,
+                          fun(St) -> catch ets:delete(yuzu_gw_agents), St end),
+    try
+        ?assertEqual({error, unavailable}, yuzu_gw_registry:lookup_local_session(A))
+    after
+        _ = sys:replace_state(yuzu_gw_registry, fun(St) ->
+            case ets:whereis(yuzu_gw_agents) of
+                undefined ->
+                    ets:new(yuzu_gw_agents, [named_table, set, public, {read_concurrency, true}]);
+                _ ->
+                    ok
+            end,
+            St
+        end)
+    end,
+    efs_cleanup([{A, P, S}]).
+
+%% A live agent bound with register_agent/7 (so the session index row exists)
+%% and a request that is unique to it.
+efs_register(Suffix) ->
+    N = integer_to_binary(erlang:unique_integer([positive])),
+    Id = <<"efs-", Suffix/binary, "-", N/binary>>,
+    S = <<"efs-session-", Suffix/binary, "-", N/binary>>,
+    R = #{info => #{agent_id => Id, hostname => <<"efs-host">>}},
+    P = spawn_dummy(),
+    ok = yuzu_gw_registry:register_agent(Id, P, S, [], <<"efs-host">>, R, efs_conn),
+    {Id, P, S, R}.
+
+%% Fenced then unfenced removal, so a replaced routing row and its stale index
+%% row both go; the registry barrier drains the casts.
+efs_cleanup(Agents) ->
+    lists:foreach(fun({A, P, S}) ->
+        yuzu_gw_registry:deregister_agent(A, P, S),
+        yuzu_gw_registry:deregister_agent(A),
+        kill_dummy(P)
+    end, Agents),
+    registry_barrier().
+
+%%%===================================================================
 %%% Helpers
 %%%===================================================================
+
+%% Two ways to wait for the registry, replacing fixed `timer:sleep(N)` calls
+%% that are UPPER-bound races on a loaded runner (#4851 runs this suite on
+%% macOS CI for the first time; BigMags shares its CPU between two agents, and
+%% fixed sleeps have already flaked twice there).
+%%
+%% registry_barrier/0 is for a cast or message THIS process sent the registry
+%% (deregister_agent/1, sweep_pending). sys:get_state/1 is a system message
+%% queued behind it, so its reply proves the handler has fully run, and the
+%% registry's ETS writes are visible as soon as they are made. No deadline is
+%% involved, so it also backs the negative checks that follow a sweep.
+%%
+%% await/2 is for effects driven by ANOTHER process: the registry's monitor
+%% 'DOWN' when a dummy agent exits. It polls Fun every 10ms until it returns
+%% Want or a 2s deadline passes, and returns the last value. Callers only claim
+%% "the cleanup happens", so the deadline changes nothing they assert.
+registry_barrier() ->
+    _ = sys:get_state(yuzu_gw_registry),
+    ok.
+
+await(Fun, Want) ->
+    await(Fun, Want, erlang:monotonic_time(millisecond) + 2000).
+
+await(Fun, Want, Deadline) ->
+    case Fun() of
+        Want -> Want;
+        Other ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> Other;
+                false -> timer:sleep(10), await(Fun, Want, Deadline)
+            end
+    end.
 
 spawn_dummy() ->
     spawn(fun() -> receive stop -> ok end end).

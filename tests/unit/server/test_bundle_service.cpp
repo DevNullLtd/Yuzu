@@ -83,6 +83,23 @@ TEST_CASE("validate_bundle_steps allows duplicate (plugin,action) in request ord
     CHECK(ok->size() == 2);
 }
 
+// json-dump-depth-guard fix (#2437-class): validate_bundle_steps has its OWN
+// raw-text depth check, independent of the REST /api/v1/bundles caller's
+// guard - this is the function's OWN falsifier, so the two guards cannot
+// mask each other in a single combined test. depth 40 is trivially safe to
+// build/dump directly in this test process; the real attack depth this guard
+// exists for is many orders of magnitude higher (~100,000 levels).
+TEST_CASE("validate_bundle_steps rejects a params value nested past the depth limit, "
+          "before its own parse",
+          "[bundle][validate][security][depth]") {
+    const std::string deep_array = std::string(40, '[') + std::string(40, ']');
+    const std::string steps =
+        R"([{"plugin":"p","action":"a","params":{"deep":)" + deep_array + "}}]";
+    auto r = validate_bundle_steps(steps);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("nests too deeply") != std::string::npos);
+}
+
 TEST_CASE("validate_bundle_steps enforces the step cap", "[bundle][validate][unhappy]") {
     std::string over = "[";
     for (std::size_t i = 0; i < kMaxBundleSteps + 1; ++i) {

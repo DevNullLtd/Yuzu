@@ -32,7 +32,12 @@ namespace yuzu::agent {
 
 /// Distinct from hard_exit's other production codes (1 = second-signal escalation,
 /// main.cpp; 3 = F3 orphan-exit, main.cpp/service_win.cpp) so exit-code monitoring can
-/// tell the three termination reasons apart.
+/// tell the three termination reasons apart. Also reused (#4666 PR-2, not via
+/// ShutdownDeadlineGuard itself) by service_win.cpp's run_service(): a timeout on its
+/// post-dispatcher-return wait for service_main's completion handshake
+/// (service_completion.hpp) is the same "something past its own internal watchdogs is
+/// wedged" condition this code already denotes, so it shares the code rather than
+/// minting a new one.
 inline constexpr int kShutdownDeadlineExitCode = 4;
 
 /// Templated on Action rather than std::function, for the exact reason

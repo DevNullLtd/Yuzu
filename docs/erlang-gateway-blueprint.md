@@ -320,9 +320,12 @@ Pids = pg:get_members(yuzu_gw, {plugin, Plugin}).
 
 ### Cross-Node Routing (Clustering)
 
-pg is cluster-aware out of the box. When a gateway node joins the Erlang
-cluster, its agent processes automatically appear in pg groups visible to all
-other nodes. No external service discovery needed.
+pg is cluster-aware once nodes are actually connected — but nothing in this
+document connected them, and until HA WS-4 `#4555` shipped, nothing in
+`gateway/` did either (verified: zero `net_kernel`/`net_adm`/discovery code
+existed anywhere in the tree). "No external service discovery needed" below
+was aspirational, not built — cluster FORMATION (getting nodes connected in
+the first place) is net-new work, not a `pg` side-effect.
 
 ```erlang
 %% In sys.config — Erlang distribution
@@ -330,12 +333,30 @@ other nodes. No external service discovery needed.
     {connect_all, false},          % Don't auto-mesh; use explicit connections
     {net_ticktime, 30}             % Failure detection: 30s × 4 = 120s
 ]}].
-
-%% Node discovery (choose one):
-%% Option A: Static seed nodes
-%% Option B: Kubernetes headless service via inet_res
-%% Option C: AWS Cloud Map / Consul via a discovery module
 ```
+
+**Node discovery — IMPLEMENTED (HA WS-4 `#4555`, ADR-2002 §7b):** of the three
+options originally sketched here, only **Option A (static/DNS-based)**
+shipped — this repo has zero Kubernetes deployment artifacts, so Options B
+(Kubernetes headless service) and C (AWS Cloud Map/Consul) remain a
+documented, explicitly deferred, pluggable seam rather than v1 scope.
+`yuzu_gw_cluster_discovery` resolves a configurable DNS seed name
+(`YUZU_GW_SEED_DNS_NAME`, default `gateway`) to A records — which, via Docker
+Compose's own embedded DNS for a scaled service, turns out to be the SAME
+underlying mechanism Option B's "headless service via `inet_res`" describes,
+achieved with zero Kubernetes-specific code. An explicit `YUZU_GW_SEED_NODES`
+address list REPLACES DNS resolution outright when set (never merged), for a
+no-DNS/air-gapped deployment. Because `{connect_all, false}` above means
+nothing else in the VM ever self-heals a partial mesh, the redial loop runs
+ALWAYS-ON (fixed interval, forever — not a one-time boot-time attempt),
+subtracting already-connected nodes each tick so the steady-state cost is one
+DNS query plus cheap no-ops. See ADR-2002 §7b for the full mechanism-choice
+record, including the node-identity change this required (every replica
+shares one fixed short name, distinguished only by a boot-time-resolved IP
+literal — never a hostname, and never the pre-`#4555` hardcoded
+per-node `vm.args` name) and the distribution-cookie hardening it added
+(DNS-sourced dial targets otherwise let a compromised DNS answer mount an
+offline cookie brute-force from a legitimately dialing node).
 
 ### Routing Table for Partitioned Agents
 

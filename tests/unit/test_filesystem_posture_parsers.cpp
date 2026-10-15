@@ -297,18 +297,22 @@ TEST_CASE("filesystem_posture: normalize_mount_flags -- fixed order, unknown tok
 
 TEST_CASE("filesystem_posture: is_network_fstype -- fixed network fstype set",
          "[filesystem_posture]") {
-    CHECK(is_network_fstype("nfs"));
-    CHECK(is_network_fstype("nfs4"));
-    CHECK(is_network_fstype("cifs"));
-    CHECK(is_network_fstype("smb3"));
-    CHECK(is_network_fstype("ceph"));
-    CHECK(is_network_fstype("glusterfs"));
-    CHECK(is_network_fstype("fuse.sshfs"));
-    CHECK(is_network_fstype("fuse.s3fs"));
-    // Real VM-native capture row -- a FUSE mount, but not in the network suffix set.
-    CHECK_FALSE(is_network_fstype("fuse.rosetta-mount"));
-    CHECK_FALSE(is_network_fstype("ext4"));
-    CHECK_FALSE(is_network_fstype("overlay"));
+    // The shared predicate (agents/shared/network_fstype.hpp), pinned entry by entry: dropping
+    // or misspelling one name silently re-exposes a hang-prone mount type.
+    for (const char* t : {"nfs", "nfs3", "nfs4", "cifs", "smb3", "smbfs", "afs", "ceph", "glusterfs",
+                          "9p", "virtiofs", "lustre", "beegfs", "gfs2", "ocfs2", "gpfs", "panfs",
+                          "vboxsf", "vmhgfs", "prl_fs", "autofs", "fuse.sshfs", "fuse.s3fs", "fuse.davfs",
+                          "fuse.rclone", "fuse.cephfs", "fuse.glusterfs", "fuse.nfs", "fuse.smb",
+                          "fuse.ceph-fuse", "fuse.vmhgfs-fuse", "fuse.prl_fsd"}) {
+        INFO("fstype: " << t);
+        CHECK(is_network_fstype(t));
+    }
+    // Negatives; fuse.rosetta-mount is a real VM-native capture row (a FUSE mount, not a network one).
+    for (const char* t : {"", "fuse.rosetta-mount", "ext4", "xfs", "tmpfs", "overlay", "nfsd", "fuse",
+                          "fuse.", "fuse.overlayfs", "fuse.sshfsx", "cifsx", "NFS"}) {
+        INFO("fstype: " << t);
+        CHECK_FALSE(is_network_fstype(t));
+    }
 }
 
 TEST_CASE("filesystem_posture: parse_fs_snapshot_list_buffer -- real macOS fs_snapshot_list "

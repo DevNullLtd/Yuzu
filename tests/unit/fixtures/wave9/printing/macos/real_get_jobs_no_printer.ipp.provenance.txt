@@ -1,0 +1,26 @@
+status: REAL CAPTURE
+
+host: this Mac (macOS, arm64)
+date: 2026-09-08 (UTC, see `date -u` at capture time)
+identity: id -u = 501 (alex, non-root — no sudo used or required)
+
+request: Get-Jobs (0x000A), printer `no_such_queue`, which-jobs=
+not-completed, request-id 1, built by `build_request.py get-jobs
+no_such_queue`.
+
+exact command:
+  cd tests/unit/fixtures/wave9/printing/macos
+  python3 build_request.py get-jobs no_such_queue > /tmp/req_jobs.ipp
+  curl --unix-socket /private/var/run/cupsd -s -X POST \
+      -H 'Content-Type: application/ipp' \
+      --data-binary @/tmp/req_jobs.ipp \
+      http://localhost/ -o real_get_jobs_no_printer.ipp
+
+decoded result: 127 bytes; status-code 0x0406 (client-error-not-found);
+status-message = "The printer or class does not exist." — cupsd validates
+the printer-uri before it enumerates jobs; a nonexistent printer name
+fails deterministically without a queue.
+
+This is a REAL, unprivileged capture against the live `/private/var/run/
+cupsd` socket — no sudo, no queue creation. Captured by `capture.sh`
+Phase A.

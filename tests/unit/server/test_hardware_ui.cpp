@@ -1,0 +1,665 @@
+/// @file test_hardware_ui.cpp
+/// Unit tests for the /hardware PURE renderers (hardware_ui.cpp): the list
+/// fragment (search box, sortable columns, OS/status chips, pagination,
+/// checkbox/bulk-tag bar, per-row cells) and the CI record (lens tab bar,
+/// lens-body permission gating, the Overview identity block, MAC chips).
+/// Data in, HTML out — no store, no network, no httplib request/response.
+///
+/// Coverage, per the code review's own named gaps:
+///  - the search input's exact htmx attributes, incl. a literal-`[`-absence
+///    regression guard for the CSP-incompatible event-filter defect
+///    (round-3 item 5 — `[key=='Enter']` compiles via `Function()`, which the
+///    dashboard CSP silently refuses at runtime).
+///  - #hw-results' `data-url` round-tripping the current query.
+///  - every sortable `<th>`/filter chip/pager control carrying
+///    `hx-include="#hw-q"` and never ALSO embedding its own `q=` — httplib
+///    keeps only the first of two same-named query params, so a control
+///    emitting both would silently clobber whatever the user typed.
+///  - the checkbox column + sticky #hw-selbar bulk-tag bar markup.
+///  - the DEX badge (scored vs the -1 sentinel), the IP cell (single / +N /
+///    empty), and the Tags cell's one-chip-per-tag shape.
+///  - MAC address chips: one `.hw-tag` span per address (round-3 item 12),
+///    never one unbroken comma-joined blob.
+///  - the lens tab bar: fixed 7-tab order, the active-tab class, and the OOB
+///    swap attribute gated strictly on the `oob` parameter.
+///  - the DEX/Guardian/Live lenses' `can_read_guaranteed_state` gate: an
+///    honest permission note when false, the real bare=1 fragment hx-get
+///    when true.
+///  - the Overview "General" identity block's agent id/OS/version/arch.
+
+#include "hardware_routes.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace yuzu::server;
+
+namespace {
+
+/// Every occurrence of `open` in `html`, each expanded to the full opening
+/// tag text (from `open` through the next `>`). Used to pull out every
+/// `<th class="sortable" ...>`, `<a class="gp-chip...` or pager `<button
+/// class="gp-btn" ...>` so each can be checked independently.
+std::vector<std::string> all_opening_tags(const std::string& html, const std::string& open) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while ((pos = html.find(open, pos)) != std::string::npos) {
+        const auto close = html.find('>', pos);
+        REQUIRE(close != std::string::npos);
+        out.push_back(html.substr(pos, close - pos + 1));
+        pos = close + 1;
+    }
+    return out;
+}
+
+/// The value of attribute `attr="..."` inside one opening-tag string, or ""
+/// if absent.
+std::string attr_value(const std::string& tag, const std::string& attr) {
+    const std::string needle = attr + "=\"";
+    const auto p = tag.find(needle);
+    if (p == std::string::npos) return {};
+    const auto start = p + needle.size();
+    const auto end = tag.find('"', start);
+    return tag.substr(start, end - start);
+}
+
+/// The inner HTML of the (0-based) `index`-th `<td...>...</td>` cell in a
+/// rendered `<tr>`. Every cell in row_html() is a self-closed span/anchor
+/// with no nested `</td>`, so "up to the first </td>" is exact.
+std::string nth_td(const std::string& row, int index) {
+    std::size_t pos = 0;
+    for (int i = 0; i <= index; ++i) {
+        pos = row.find("<td", pos);
+        REQUIRE(pos != std::string::npos);
+        pos = row.find('>', pos);
+        REQUIRE(pos != std::string::npos);
+        ++pos;
+    }
+    const auto end = row.find("</td>", pos);
+    REQUIRE(end != std::string::npos);
+    return row.substr(pos, end - pos);
+}
+
+/// The first (and, in every test here, only) `<tr class="click" ...>...</tr>`
+/// data row in a rendered results region.
+std::string first_row(const std::string& html) {
+    const auto start = html.find("<tr class=\"click\"");
+    REQUIRE(start != std::string::npos);
+    const auto end = html.find("</tr>", start);
+    REQUIRE(end != std::string::npos);
+    return html.substr(start, end + 5 - start);
+}
+
+std::size_t count_occurrences(const std::string& hay, const std::string& needle) {
+    std::size_t count = 0;
+    std::size_t pos = 0;
+    while ((pos = hay.find(needle, pos)) != std::string::npos) {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
+
+/// Renders the results-only region for a single row — the shared shape every
+/// per-cell test below needs.
+std::string render_row(const InventoryDeviceRow& row) {
+    HardwareListPage page;
+    page.rows = {row};
+    page.total_matching = 1;
+    return render_hardware_list_fragment(page, /*ci_degraded=*/false, /*roster_unavailable=*/false,
+                                         /*results_only=*/true);
+}
+
+} // namespace
+
+// ── Search box (round-2/round-3 CSP-safety) ───────────────────────────────────
+
+TEST_CASE("hardware list: search input is CSP-safe — plain trigger, no event filter",
+          "[hardware][ui]") {
+    HardwareListPage page; // default query, no rows
+    const auto html = render_hardware_list_fragment(page, false, false, /*results_only=*/false);
+
+    const auto open = html.find("<input id=\"hw-q\"");
+    REQUIRE(open != std::string::npos);
+    const auto close = html.find('>', open);
+    REQUIRE(close != std::string::npos);
+    const std::string tag = html.substr(open, close - open + 1);
+
+    CHECK(tag.find("hx-target=\"#hw-results\"") != std::string::npos);
+    CHECK(tag.find("hx-swap=\"outerHTML\"") != std::string::npos);
+    CHECK(tag.find("hx-trigger=\"keyup changed delay:400ms, search\"") != std::string::npos);
+    // Round-3 item 5 regression guard: an htmx `[key=='Enter']`-style event
+    // filter compiles via `Function()`, which the dashboard's no-unsafe-eval
+    // CSP silently refuses at runtime (htmx drops the filter and fires on
+    // every keystroke instead) — the trigger value must never contain `[`.
+    CHECK(tag.find('[') == std::string::npos);
+}
+
+// ── #hw-results data-url ──────────────────────────────────────────────────────
+
+TEST_CASE("hardware results region: #hw-results data-url round-trips the current query",
+          "[hardware][ui]") {
+    HardwareListPage page;
+    page.query.q = "chrome";
+    page.query.os = "windows";
+    page.query.status = "online";
+    page.query.sort = "model";
+    page.query.desc = true;
+    page.query.offset = 50;
+    page.query.limit = 25;
+
+    const auto html = render_hardware_list_fragment(page, false, false, /*results_only=*/true);
+
+    // list_url()'s own field order — os, status, sort, dir, offset, limit,
+    // [q], [results_only] — each attribute value HTML-escaped, so "&" -> "&amp;".
+    const std::string expected =
+        "data-url=\"/fragments/hardware/list?os=windows&amp;status=online&amp;sort=model"
+        "&amp;dir=desc&amp;offset=50&amp;limit=25&amp;q=chrome&amp;results_only=1\"";
+    CHECK(html.find(expected) != std::string::npos);
+}
+
+// ── Sortable th / filter chip / pager: hx-include, never a duplicate q= ───────
+
+TEST_CASE("hardware results region: sortable th / filter chip / pager always hx-include "
+          "the search box and never duplicate its q= param",
+          "[hardware][ui]") {
+    HardwareListPage page;
+    page.query.q = "chrome"; // a LIVE, non-empty search — the case that actually
+                             // exercises httplib's duplicate-same-name-param hazard.
+    page.query.offset = 10;
+    page.query.limit = 5;
+    page.total_matching = 100; // offset>0 -> Prev renders; offset+limit<total -> Next renders
+    InventoryDeviceRow r1;
+    r1.agent_id = "a1";
+    r1.hostname = "WS-1";
+    InventoryDeviceRow r2;
+    r2.agent_id = "a2";
+    r2.hostname = "WS-2";
+    page.rows = {r1, r2};
+
+    const auto html = render_hardware_list_fragment(page, false, false, /*results_only=*/true);
+
+    auto assert_controls = [](const std::vector<std::string>& tags, std::size_t expected_count) {
+        CHECK(tags.size() == expected_count);
+        for (const auto& tag : tags) {
+            CHECK(attr_value(tag, "hx-get").find("q=") == std::string::npos);
+            CHECK(tag.find("hx-include=\"#hw-q\"") != std::string::npos);
+        }
+    };
+
+    // 12 sortable columns: Name/IP/OS/Status/Version/Last seen/Manufacturer/
+    // Model/Serial/CPU/RAM/OS version (DEX and Tags are NOT sortable).
+    assert_controls(all_opening_tags(html, "<th class=\"sortable\""), 12);
+    // 4 OS chips + 3 status chips.
+    assert_controls(all_opening_tags(html, "<a class=\"gp-chip"), 7);
+
+    const auto pagers = all_opening_tags(html, "<button class=\"gp-btn\" hx-get=\"");
+    REQUIRE(pagers.size() == 2); // both Prev and Next are showing
+    assert_controls(pagers, 2);
+}
+
+// ── Checkbox column + sticky bulk-tag bar ─────────────────────────────────────
+
+TEST_CASE("hardware results region: checkbox column + sticky #hw-selbar bulk-tag bar",
+          "[hardware][ui]") {
+    InventoryDeviceRow row;
+    row.agent_id = "agent-abc123";
+    row.hostname = "WS-9";
+    const auto html = render_row(row);
+
+    // Select-all header checkbox + per-row checkbox.
+    CHECK(html.find("<input type=\"checkbox\" onclick=\"hwSelAll(this)\"") != std::string::npos);
+    CHECK(html.find("class=\"hw-sel\" value=\"agent-abc123\" onclick=\"hwSelToggle(this)\"") !=
+          std::string::npos);
+
+    // Sticky bulk-tag action bar and its real input ids / onclick handlers.
+    CHECK(html.find("id=\"hw-selbar\" class=\"hw-selbar\"") != std::string::npos);
+    CHECK(html.find("id=\"hw-bulk-key\"") != std::string::npos);
+    CHECK(html.find("id=\"hw-bulk-value\"") != std::string::npos);
+    CHECK(html.find("id=\"hw-bulk-rkey\"") != std::string::npos);
+    CHECK(html.find("onclick=\"hwBulkTag(this,'set')\"") != std::string::npos);
+    CHECK(html.find("onclick=\"hwBulkTag(this,'delete')\"") != std::string::npos);
+    CHECK(html.find("onclick=\"hwSelClear()\"") != std::string::npos);
+}
+
+// ── DEX badge ──────────────────────────────────────────────────────────────────
+
+TEST_CASE("hardware row: DEX badge for a scored row; honest dash for the -1 sentinel",
+          "[hardware][ui]") {
+    InventoryDeviceRow scored;
+    scored.agent_id = "a1";
+    scored.hostname = "WS-1";
+    scored.dex_score = 82;
+    CHECK(nth_td(first_row(render_row(scored)), 5).find(">82<") != std::string::npos);
+
+    InventoryDeviceRow unscored;
+    unscored.agent_id = "a2";
+    unscored.hostname = "WS-2";
+    unscored.dex_score = -1; // "not scored / no GuaranteedStateStore wired"
+    CHECK(nth_td(first_row(render_row(unscored)), 5) == "<span class=\"hw-grey\">&mdash;</span>");
+}
+
+// Kills: swapping or dropping the DEX tone classes, or moving a threshold (>=90 ok, >=75 warn,
+// else bad). The score text alone survives all of those.
+TEST_CASE("hardware row: DEX badge tone — ok from 90 and warn from 75 and bad below",
+          "[hardware][ui]") {
+    const std::pair<int, const char*> cases[] = {
+        {95, "ok"}, {90, "ok"}, {82, "warn"}, {75, "warn"}, {74, "bad"}, {60, "bad"}};
+    for (const auto& [score, tone] : cases) {
+        InventoryDeviceRow row;
+        row.agent_id = "a1";
+        row.hostname = "WS-1";
+        row.dex_score = score;
+        CHECK(nth_td(first_row(render_row(row)), 5) ==
+              std::string("<span class=\"pill ") + tone + "\">" + std::to_string(score) + "</span>");
+    }
+}
+
+// ── Status pill ────────────────────────────────────────────────────────────────
+
+// The Status cell is the pill followed by the row's Containment link (es-1); these pins are
+// about the pill, so compare only what precedes the link.
+std::string status_pill_only(const std::string& cell) {
+    const auto link = cell.find(" <a class=\"hw-lab\" data-act=\"row-containment\"");
+    return link == std::string::npos ? cell : cell.substr(0, link);
+}
+
+// Kills: dropping or swapping the status pill tone, or collapsing the stale branch into offline.
+// Online wins over stale; offline (not stale) is the neutral pill with no tone class.
+TEST_CASE("hardware row: status pill — online ok and stale warn and offline neutral",
+          "[hardware][ui]") {
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    row.hostname = "WS-1";
+
+    row.online = true;
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill ok\">online</span>");
+
+    row.online = true;
+    row.stale = true; // a live stream outranks a stale heartbeat
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill ok\">online</span>");
+
+    row.online = false;
+    row.stale = true;
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill warn\">stale</span>");
+
+    row.online = false;
+    row.stale = false;
+    CHECK(status_pill_only(nth_td(first_row(render_row(row)), 4)) == "<span class=\"pill idle\">offline</span>");
+}
+
+// ── IP cell ────────────────────────────────────────────────────────────────────
+
+TEST_CASE("hardware row: IP cell — single IP, +N suffix for multiple, honest empty",
+          "[hardware][ui]") {
+    InventoryDeviceRow single;
+    single.agent_id = "a1";
+    single.hostname = "WS-1";
+    single.ips = {"10.0.0.5"};
+    CHECK(nth_td(first_row(render_row(single)), 2) == "<span title=\"10.0.0.5\">10.0.0.5</span>");
+
+    InventoryDeviceRow many;
+    many.agent_id = "a2";
+    many.hostname = "WS-2";
+    many.ips = {"10.0.0.5", "10.0.0.6", "10.0.0.7"};
+    CHECK(nth_td(first_row(render_row(many)), 2) ==
+          "<span title=\"10.0.0.5, 10.0.0.6, 10.0.0.7\">10.0.0.5 +2</span>");
+
+    InventoryDeviceRow none;
+    none.agent_id = "a3";
+    none.hostname = "WS-3";
+    CHECK(nth_td(first_row(render_row(none)), 2) == "<span class=\"hw-grey\">&mdash;</span>");
+}
+
+// ── Tags cell ──────────────────────────────────────────────────────────────────
+
+TEST_CASE("hardware row: Tags cell renders one chip per tag, each targeting #hw-results",
+          "[hardware][ui]") {
+    InventoryDeviceRow none;
+    none.agent_id = "a0";
+    none.hostname = "WS-0";
+    CHECK(nth_td(first_row(render_row(none)), 8) == "<span class=\"hw-grey\">&mdash;</span>");
+
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    row.hostname = "WS-1";
+    row.tags = {{"env", "prod"}, {"role", ""}};
+    const auto tags_cell = nth_td(first_row(render_row(row)), 8);
+
+    // Visible label carries the full key[=value].
+    CHECK(tags_cell.find(">env=prod<") != std::string::npos);
+    CHECK(tags_cell.find(">role<") != std::string::npos);
+
+    const auto chips = all_opening_tags(tags_cell, "<a class=\"hw-tag link\"");
+    REQUIRE(chips.size() == 2);
+    for (const auto& chip : chips) {
+        CHECK(chip.find("hx-target=\"#hw-results\"") != std::string::npos);
+        CHECK(chip.find("hx-swap=\"outerHTML\"") != std::string::npos);
+        CHECK(chip.find("hx-include=\"#hw-q\"") != std::string::npos);
+        // Same httplib duplicate-param hazard as every other list control.
+        CHECK(attr_value(chip, "hx-get").find("q=") == std::string::npos);
+    }
+
+    // FLAGGED FOR THE ORCHESTRATOR (out of this file's scope to fix):
+    // tag_chip()'s own doc comment promises "narrows the list to this exact
+    // key[=value]", but hardware_ui.cpp's list_url() never serialises
+    // HardwareListQuery::tag into the URL it builds (only os/status/sort/dir/
+    // offset/limit/[q]/[results_only] — grep list_url() in hardware_ui.cpp).
+    // So BOTH chips resolve to the byte-identical hx-get target today, and
+    // clicking either one narrows nothing. This asserts the CURRENT behaviour
+    // rather than silently encoding a stronger claim this test file has no
+    // way to make true; the one-line fix is
+    // `if (!q.tag.empty()) u += "&tag=" + url_encode(q.tag);` in list_url().
+    // If that ships, THIS check starts failing — that failure is the signal
+    // to replace it with a real key[=value]-differs-per-chip assertion.
+    CHECK(attr_value(chips[0], "hx-get") == attr_value(chips[1], "hx-get"));
+}
+
+// ── MAC address chips (round-3 item 12) ───────────────────────────────────────
+
+TEST_CASE("hardware CI overview lens: MAC chips render one span per address",
+          "[hardware][ui]") {
+    DeviceCiRecord rec;
+    rec.macs_summary = "aa:bb:cc:dd:ee:01, aa:bb:cc:dd:ee:02, aa:bb:cc:dd:ee:03";
+    HardwareCiDetail detail;
+    detail.ci = std::optional<DeviceCiRecord>(rec);
+    HwCiAffordances aff;
+
+    const auto html = render_hardware_lens_body("a1", detail, /*lens=*/"", /*now_secs=*/0, aff);
+    CHECK(count_occurrences(html, "<span class=\"hw-tag\">") == 3);
+    CHECK(html.find(">aa:bb:cc:dd:ee:01<") != std::string::npos);
+    CHECK(html.find(">aa:bb:cc:dd:ee:02<") != std::string::npos);
+    CHECK(html.find(">aa:bb:cc:dd:ee:03<") != std::string::npos);
+    // Never one unbroken comma-joined blob — the round-3-item-12 defect this
+    // rendering exists to fix.
+    CHECK(html.find("aa:bb:cc:dd:ee:01, aa:bb:cc:dd:ee:02") == std::string::npos);
+
+    DeviceCiRecord empty_rec; // macs_summary defaults to ""
+    HardwareCiDetail empty_detail;
+    empty_detail.ci = std::optional<DeviceCiRecord>(empty_rec);
+    const auto empty_html = render_hardware_lens_body("a1", empty_detail, "", 0, aff);
+    CHECK(empty_html.find("<span class=\"inv-grey\">&mdash;</span>") != std::string::npos);
+    CHECK(empty_html.find("<span class=\"hw-tag\">") == std::string::npos);
+}
+
+TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unknown is a dash",
+          "[hardware][ui]") {
+    DeviceCiRecord rec;
+    rec.cpu_cores = "8";
+    rec.cpu_threads = "16";
+    rec.ram_bytes = "17179869184"; // 16 GiB
+    HardwareCiDetail detail;
+    detail.ci = std::optional<DeviceCiRecord>(rec);
+    HwCiAffordances aff;
+
+    const auto html = render_hardware_lens_body("a1", detail, /*lens=*/"", /*now_secs=*/0, aff);
+    CHECK(html.find("Cores / threads</span>8c/16t") != std::string::npos);
+    CHECK(html.find("Memory</span>16.0 GB") != std::string::npos);
+
+    DeviceCiRecord unk;
+    unk.cpu_cores = "unknown";
+    unk.cpu_threads = "unknown";
+    unk.ram_bytes = "unknown";
+    HardwareCiDetail unk_detail;
+    unk_detail.ci = std::optional<DeviceCiRecord>(unk);
+    const auto unk_html = render_hardware_lens_body("a1", unk_detail, "", 0, aff);
+    CHECK(unk_html.find("8c/16t") == std::string::npos);
+    CHECK(unk_html.find(" GB") == std::string::npos);
+    CHECK(unk_html.find("Cores / threads</span><span class=\"inv-grey\">&mdash;</span>") !=
+          std::string::npos);
+    CHECK(unk_html.find("Memory</span><span class=\"inv-grey\">&mdash;</span>") !=
+          std::string::npos);
+}
+
+TEST_CASE("hardware CI record: store degrade, not-yet-synced and found render distinct states",
+          "[hardware][ui]") {
+    // ADR-0016 §7: an empty page must never mean failure. The three Overview states
+    // must stay distinguishable (this replaces the HTML-level pins that lived with the
+    // retired /inventory device renderers).
+    HwCiAffordances aff;
+
+    HardwareCiDetail degraded; // default ci = std::unexpected(kDegraded): store unreadable
+    const auto deg = render_hardware_lens_body("a1", degraded, "", 0, aff);
+    CHECK(deg.find("CI record unavailable") != std::string::npos);
+    CHECK(deg.find("hw-degrade") != std::string::npos);
+    CHECK(deg.find("No CI record synced") == std::string::npos);
+
+    HardwareCiDetail absent;
+    absent.ci = std::optional<DeviceCiRecord>{}; // read fine, device has not synced yet
+    const auto abs = render_hardware_lens_body("a1", absent, "", 0, aff);
+    CHECK(abs.find("No CI record synced yet") != std::string::npos);
+    CHECK(abs.find("CI record unavailable") == std::string::npos);
+
+    HardwareCiDetail found;
+    found.ci = std::optional<DeviceCiRecord>(DeviceCiRecord{});
+    const auto ok = render_hardware_lens_body("a1", found, "", 0, aff);
+    CHECK(ok.find("CI record unavailable") == std::string::npos);
+    CHECK(ok.find("No CI record synced") == std::string::npos);
+
+    HardwareCiDetail sw_degraded; // software == nullopt on the Installed software lens
+    const auto sw = render_hardware_lens_body("a1", sw_degraded, "software", 0, aff);
+    CHECK(sw.find("Installed software unavailable") != std::string::npos);
+    HardwareCiDetail sw_empty;
+    sw_empty.software.emplace();
+    const auto sw_none = render_hardware_lens_body("a1", sw_empty, "software", 0, aff);
+    CHECK(sw_none.find("Installed software unavailable") == std::string::npos);
+    CHECK(sw_none.find("No installed-software inventory") != std::string::npos);
+}
+
+// ── Lens tab bar ───────────────────────────────────────────────────────────────
+
+TEST_CASE("hardware lens bar: id, fixed 7-tab order, active class, oob gated on the parameter",
+          "[hardware][ui]") {
+    const auto html = render_hardware_lens_bar("a1", "dex", /*oob=*/false);
+    REQUIRE(html.find("<div class=\"gp-subnav\" id=\"hw-lens-bar\">") != std::string::npos);
+    CHECK(html.find("hx-swap-oob") == std::string::npos);
+
+    // Fixed order + exact labels.
+    const std::vector<std::string> labels = {"Overview", "Installed software", "Tags and properties",
+                                              "DEX",      "Guardian",           "Live",
+                                              "Actions"};
+    std::size_t pos = 0;
+    for (const auto& label : labels) {
+        const auto found = html.find(">" + label + "<", pos);
+        REQUIRE(found != std::string::npos);
+        pos = found + 1;
+    }
+
+    // The active tab ("dex") carries the distinguishing "on" class; note
+    // device_lens_tab()'s own hx-get is built by plain concatenation, not
+    // list_url()/esc(), so "&" stays literal here (unlike the list controls).
+    CHECK(html.find("<a class=\" on\" hx-get=\"/fragments/hardware/ci?id=a1&lens=dex"
+                    "&lens_only=1\" hx-target=\"#hw-ci-lens\" hx-swap=\"innerHTML\">DEX</a>") !=
+          std::string::npos);
+    // A non-active tab carries no "on" class.
+    CHECK(html.find("<a class=\"\" hx-get=\"/fragments/hardware/ci?id=a1&lens=overview") !=
+          std::string::npos);
+
+    const auto oob_html = render_hardware_lens_bar("a1", "overview", /*oob=*/true);
+    CHECK(oob_html.find("hx-swap-oob=\"true\"") != std::string::npos);
+}
+
+// ── DEX/Guardian/Live lens gating on can_read_guaranteed_state ────────────────
+
+TEST_CASE("hardware lens body: DEX/Guardian/Live honor the GuaranteedState:Read probe",
+          "[hardware][ui]") {
+    HardwareCiDetail detail; // identity/ci irrelevant to these three lenses
+
+    HwCiAffordances denied;
+    denied.can_read_guaranteed_state = false;
+    for (const std::string& lens : {std::string("dex"), std::string("guardian"), std::string("live")}) {
+        const auto html = render_hardware_lens_body("a1", detail, lens, 0, denied);
+        CHECK(html.find("GuaranteedState:Read") != std::string::npos);
+        CHECK(html.find("hx-get=\"/fragments/device/" + lens) == std::string::npos);
+    }
+
+    HwCiAffordances allowed;
+    allowed.can_read_guaranteed_state = true;
+    // Plain concatenation again (no esc()) — "&" stays literal.
+    CHECK(render_hardware_lens_body("a1", detail, "dex", 0, allowed)
+              .find("hx-get=\"/fragments/device/dex?id=a1&bare=1\"") != std::string::npos);
+    CHECK(render_hardware_lens_body("a1", detail, "guardian", 0, allowed)
+              .find("hx-get=\"/fragments/device/guardian?id=a1&bare=1\"") != std::string::npos);
+    CHECK(render_hardware_lens_body("a1", detail, "live", 0, allowed)
+              .find("hx-get=\"/fragments/device/live?id=a1\"") != std::string::npos);
+}
+
+// ── Overview "General" identity block ─────────────────────────────────────────
+
+TEST_CASE("hardware lens body (overview): General block renders agent identity fields",
+          "[hardware][ui]") {
+    InventoryDeviceRow identity;
+    identity.os = "linux";
+    identity.arch = "x86_64";
+    identity.agent_version = "0.14.2";
+    HardwareCiDetail detail;
+    detail.identity = identity;
+    HwCiAffordances aff;
+
+    const auto html = render_hardware_lens_body("agent-42", detail, /*lens=*/"", 0, aff);
+    CHECK(html.find("<h4>General</h4>") != std::string::npos);
+    CHECK(html.find("Agent id</span>agent-42") != std::string::npos);
+    CHECK(html.find("OS</span>Linux") != std::string::npos); // os_label("linux")
+    CHECK(html.find("Agent version</span>0.14.2") != std::string::npos);
+    CHECK(html.find("Architecture</span>x86_64") != std::string::npos);
+}
+
+// Kills: dropping the stored_data_placeholder() call from the Overview lens (the feature's
+// only entry point) or rendering it on a non-Overview lens.
+TEST_CASE("hardware lens body: Stored data placeholder is on Overview only, click-triggered",
+          "[hardware][ui][estate]") {
+    InventoryDeviceRow identity;
+    identity.os = "linux";
+    HardwareCiDetail detail;
+    detail.identity = identity;
+    HwCiAffordances aff;
+
+    const auto overview = render_hardware_lens_body("agent-42", detail, "", 0, aff);
+    CHECK(overview.find("hx-get=\"/fragments/hardware/ci/stored-data?id=agent-42\"") !=
+          std::string::npos);
+    CHECK(overview.find("hx-trigger=\"click\"") != std::string::npos);
+    CHECK(render_hardware_lens_body("agent-42", detail, "tags", 0, aff).find("hw-stored-data") ==
+          std::string::npos);
+}
+
+// ── #5531: failed roster read is never an empty fleet / "not found" ───────────
+
+// Kills: collapsing the CI fragment's not-found arms without the identity_degraded split.
+TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreadable; "
+          "+ record -> record with identity note; not degraded -> not found",
+          "[hardware][ui]") {
+    HwCiAffordances aff;
+    HardwareCiDetail d;
+    d.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(std::optional<DeviceCiRecord>{});
+
+    SECTION("degraded, no record") {
+        d.identity_degraded = true;
+        const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+        CHECK(html.find("roster unreadable") != std::string::npos);
+        CHECK(html.find("Device not found") == std::string::npos);
+    }
+    SECTION("degraded, readable record") {
+        d.identity_degraded = true;
+        DeviceCiRecord rec;
+        rec.model = "CI-MODEL-5531";
+        d.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+            std::optional<DeviceCiRecord>(rec));
+        const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+        CHECK(html.find("Device identity unavailable") != std::string::npos);
+        CHECK(html.find("CI-MODEL-5531") != std::string::npos);
+        CHECK(html.find("style=\"margin:0\">agent-x") != std::string::npos);
+    }
+    SECTION("not degraded, no record") {
+        const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+        CHECK(html.find("Device not found") != std::string::npos);
+        CHECK(html.find("last 30 days") != std::string::npos);
+    }
+}
+
+// Kills: dropping the CI header's online/offline text pill (status must never be colour alone), or
+// inverting its tone. The header has no stale state: anything not online reads "offline".
+TEST_CASE("hardware CI fragment: header status pill — online ok and otherwise neutral offline",
+          "[hardware][ui]") {
+    HwCiAffordances aff;
+    InventoryDeviceRow identity;
+    identity.hostname = "WS-1";
+    HardwareCiDetail d;
+
+    identity.online = true;
+    d.identity = identity;
+    const auto on = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+    CHECK(on.find("<span class=\"pill ok\">online</span>") != std::string::npos);
+    CHECK(on.find("<span class=\"pill idle\">offline</span>") == std::string::npos);
+
+    identity.online = false;
+    d.identity = identity;
+    const auto off = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+    CHECK(off.find("<span class=\"pill idle\">offline</span>") != std::string::npos);
+    CHECK(off.find("<span class=\"pill ok\">online</span>") == std::string::npos);
+}
+
+// Kills: rendering the KPI strip (all zeros) above the roster-unavailable banner. The marker is
+// the class-use `<div class="gp-tiles">`.
+TEST_CASE("hardware list fragment: a degraded full-form list renders no KPI strip",
+          "[hardware][ui]") {
+    const std::string marker = "<div class=\"gp-tiles\">";
+    const auto degraded = render_hardware_list_fragment(HardwareListPage{}, false, true, false);
+    CHECK(degraded.find("Hardware roster unavailable") != std::string::npos);
+    CHECK(degraded.find(marker) == std::string::npos);
+    // Control: the marker is present on a healthy render, so the negative above is not vacuous.
+    const auto healthy = render_hardware_list_fragment(HardwareListPage{}, false, false, false);
+    CHECK(healthy.find(marker) != std::string::npos);
+}
+
+// Kills: leaving the CI / Tags degrade banners in the page shell (outside #hw-results), where a
+// results_only htmx swap drops them; passing a hardcoded false for tags_degraded on either path;
+// emitting a banner in both the shell and the region (the exactly-once check).
+TEST_CASE("hardware list fragment: degrade banners live inside #hw-results, once, on every path",
+          "[hardware][ui]") {
+    const std::string ci_banner = "CI columns unavailable";
+    const std::string tags_banner = "Tags unavailable";
+    const std::string region = "id=\"hw-results\"";
+
+    SECTION("full render: each banner exactly once, after the region opens") {
+        const auto html = render_hardware_list_fragment(HardwareListPage{}, /*ci_degraded=*/true,
+                                                        /*roster_unavailable=*/false,
+                                                        /*results_only=*/false,
+                                                        /*tags_degraded=*/true);
+        const auto open = html.find(region);
+        REQUIRE(open != std::string::npos);
+        CHECK(count_occurrences(html, ci_banner) == 1);
+        CHECK(count_occurrences(html, tags_banner) == 1);
+        CHECK(html.find(ci_banner) > open);
+        CHECK(html.find(tags_banner) > open);
+    }
+    SECTION("results_only: Tags banner survives the refresh") {
+        const auto html = render_hardware_list_fragment(HardwareListPage{}, false, false,
+                                                        /*results_only=*/true,
+                                                        /*tags_degraded=*/true);
+        CHECK(html.starts_with("<div id=\"hw-results\""));
+        CHECK(count_occurrences(html, tags_banner) == 1);
+        CHECK(html.find(ci_banner) == std::string::npos);
+    }
+    SECTION("results_only: CI banner survives the refresh") {
+        const auto html = render_hardware_list_fragment(HardwareListPage{}, /*ci_degraded=*/true,
+                                                        false, /*results_only=*/true, false);
+        CHECK(html.starts_with("<div id=\"hw-results\""));
+        CHECK(count_occurrences(html, ci_banner) == 1);
+        CHECK(html.find(tags_banner) == std::string::npos);
+    }
+    SECTION("healthy: no banner on either form") {
+        for (const bool results_only : {false, true}) {
+            const auto html = render_hardware_list_fragment(HardwareListPage{}, false, false,
+                                                            results_only, false);
+            CHECK(html.find(ci_banner) == std::string::npos);
+            CHECK(html.find(tags_banner) == std::string::npos);
+        }
+    }
+}

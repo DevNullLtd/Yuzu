@@ -5,6 +5,7 @@
  *         sync_legacy_definitions (create, skip existing, idempotency).
  */
 
+#include "instruction_param_schema.hpp"
 #include "legacy_shim.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -71,15 +72,17 @@ TEST_CASE("LegacyShim: generated definitions have correct id format", "[legacy_s
     CHECK(find_by_id("legacy.network.dns") != defs.end());
 }
 
-TEST_CASE("LegacyShim: generated definitions have open parameter schema", "[legacy_shim]") {
+TEST_CASE("LegacyShim: generated definitions store no parameter schema", "[legacy_shim]") {
     auto caps = make_test_capabilities();
     auto defs = generate_legacy_definitions(caps);
 
     for (const auto& def : defs) {
-        CHECK_FALSE(def.parameter_schema.empty());
-
-        // The parameter schema should allow additionalProperties (open schema)
-        CHECK(def.parameter_schema.find("additionalProperties") != std::string::npos);
+        // "{}" means "none stored": the execute route does not validate the definition, so it
+        // keeps accepting arbitrary string params, and the store accepts it at write time.
+        CHECK(def.parameter_schema == "{}");
+        auto validator = yuzu::server::instr::prepare_param_validator(def.parameter_schema);
+        REQUIRE(validator.has_value());
+        CHECK(validator->absent());
     }
 }
 

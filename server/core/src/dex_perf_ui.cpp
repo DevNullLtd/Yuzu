@@ -11,8 +11,17 @@
 /// absent metrics render "—" (never 0), aggregates carry their reporting
 /// population, sub-floor cohorts render "n too small", untagged devices are
 /// an explicit residual row.
+///
+/// #4626 Concern B: includes the PURE `dex_perf_model.hpp` directly rather
+/// than the httplib-coupled `dex_routes.hpp` (which still transitively pulls
+/// store headers via its own `#include "dex_read_builders.hpp"`; the former
+/// `dex_app_perf_ui.hpp` -> `dex_app_perf_model.hpp` chain was severed in
+/// #4626). This TU's include-closure store-freedom is enforced by
+/// `scripts/ci/check-seam-closure.py`'s `dex_perf` family — a header-closure
+/// check over include basenames; it does not scan this file's text for store
+/// type names.
 
-#include "dex_routes.hpp"
+#include "dex_perf_model.hpp"
 
 #include "web_utils.hpp"
 
@@ -83,8 +92,8 @@ std::string delta_pill(const std::optional<DexPerfStat>& cohort,
     if (!cohort || !fleet || fleet->p50 < 1e-9)
         return {};
     const double pct = (cohort->p50 - fleet->p50) / fleet->p50 * 100.0;
-    const char* color = pct > 5.0 ? "var(--red)" : pct < -5.0 ? "var(--green)" : "var(--muted)";
-    return " <span style=\"font-size:.85em;color:" + std::string(color) + ";\">" +
+    const char* tone = pct > 5.0 ? "gp-err" : pct < -5.0 ? "gp-ok" : "gp-mute";
+    return " <span class=\"" + std::string(tone) + "\">" +
            std::format("{}{:.0f}%", pct > 0 ? "+" : "", pct) + "</span>";
 }
 
@@ -165,7 +174,7 @@ std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
         {"Memory commit", &ctx.commit, false},
         {"Disk I/O latency", &ctx.disk_lat, true},
     };
-    h += "<div style=\"border:1px solid var(--border);border-radius:.55rem;padding:.6rem 1rem\">";
+    h += "<div class=\"dx-strips\">";
     for (const auto& s : strips) {
         if (!s.m->value || !s.m->fleet)
             continue; // device or fleet lacks this metric — skip the row, no fake bar
@@ -180,20 +189,13 @@ std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
                          std::to_string(s.m->fleet_pctile) + "th</b> pctile";
         if (s.m->cohort_pctile >= 0)
             pv += " &middot; cohort <b>" + std::to_string(s.m->cohort_pctile) + "th</b>";
-        h += "<div style=\"display:grid;grid-template-columns:9rem 1fr 17rem;gap:.8rem;"
-             "align-items:center;margin:.45rem 0;font-size:.85rem\">"
-             "<span>" + std::string(s.label) + "</span>"
-             "<span style=\"position:relative;display:block;height:12px;border-radius:4px;"
-             "background:var(--surface2,#243553)\">"
-             "<span style=\"position:absolute;top:0;bottom:0;left:" +
+        h += "<div class=\"dx-strip\"><span>" + std::string(s.label) + "</span>"
+             "<span class=\"dx-track\"><span class=\"band\" style=\"left:" +
              std::format("{:.1f}", x(f.p50)) + "%;width:" +
              std::format("{:.1f}", (std::max)(0.5, x(f.p90) - x(f.p50))) +
-             "%;background:rgba(0,188,235,.22);border-left:1px solid rgba(0,188,235,.5);"
-             "border-right:1px solid rgba(0,188,235,.5)\"></span>"
-             "<span style=\"position:absolute;top:-2px;bottom:-2px;width:3px;border-radius:2px;"
-             "left:" + std::format("{:.1f}", x(*s.m->value)) + "%;background:" +
-             (hot ? "var(--red,#ff5765)" : "var(--yellow,#ffcc00)") + "\"></span></span>"
-             "<span class=\"gp-mute\" style=\"text-align:right\">" + pv + "</span></div>";
+             "%\"></span><span class=\"mark" + (hot ? " hot" : "") + "\" style=\"left:" +
+             std::format("{:.1f}", x(*s.m->value)) + "%\"></span></span>"
+             "<span class=\"pv\">" + pv + "</span></div>";
     }
     h += "</div>";
 
@@ -234,21 +236,21 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
          "aggregate carries its reporting population; click any card or cohort to open the "
          "devices behind it.</div></div></div>";
 
-    // ── Over-time entry (F2b) ── the retained per-app, per-version trend lives
-    // on its own fragment (Postgres-backed); the now-view links into it.
-    h += "<div class=\"gp-note\">Looking for performance <b>over time, by application &amp; "
-         "version</b>? " +
-         drill("/fragments/dex/perf/apps?window=" + w, "Open application performance over time "
-                                                       "&rarr;") +
-         " &mdash; the retained daily roll-up, per app and version, fleet-wide or by group.</div>";
+    // ── Over-time cross-reference (F2b) ── the retained per-app, per-version
+    // trend has its own top-level "App Performance" sub-nav tab (dex_subnav)
+    // now, so this is a plain pointer, not a special call-to-action — the tab
+    // itself is the primary path there.
+    h += "<div class=\"gp-note\">Performance <b>over time, by application &amp; version</b> is "
+         "on the <b>App Performance</b> tab above &mdash; the retained daily roll-up, per app "
+         "and version, fleet-wide or by group.</div>";
 
     // ── Fleet now ──
     h += "<div class=\"gp-sech\">Fleet now (last rollup cycle)</div>";
     if (now.reporting == 0) {
         h += placeholder("No perf telemetry yet",
                          "No device reported a perf heartbeat this cycle. Perf telemetry is "
-                         "collected by Windows agents (TAR perf capture source); devices appear "
-                         "here within a heartbeat of coming online.");
+                         "collected on Windows and Linux (TAR perf capture source; macOS support "
+                         "is planned); devices appear here within a heartbeat of coming online.");
     } else {
         h += "<div class=\"gp-tiles\">";
         if (now.cpu)
@@ -264,14 +266,19 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
                             stat_strip(*now.disk_lat, true), "metric=disk_lat&window=" + w,
                             "worst devices by disk latency");
         h += fleet_card("Reporting", std::to_string(now.reporting),
-                        "of " + std::to_string(now.windows_online) + " Windows online",
+                        "of " + std::to_string(now.perf_capable_online) +
+                            " perf-capable online (Windows " + std::to_string(now.windows_online) +
+                            " &middot; Linux " + std::to_string(now.linux_online) + "; macOS " +
+                            std::to_string(now.macos_online) + " online, no collector yet)",
                         "filter=not_reporting&window=" + w, "devices not reporting");
         h += "</div>";
-        h += "<div class=\"gp-note\">Perf telemetry is collected by <b>Windows agents only</b> "
-             "today &mdash; macOS and Linux devices are absent from these numbers, not zero. "
-             "The Reporting card is the denominator for every stat above. The same numbers are "
-             "exported as the <span style=\"font-family:var(--mono)\">yuzu_fleet_perf_*</span> "
-             "Prometheus gauges.</div>";
+        h += "<div class=\"gp-note\">Perf telemetry is collected on <b>Windows and Linux</b> "
+             "today (macOS support is planned; macOS devices show as online above but never "
+             "reporting). The Reporting card is the denominator for every stat above. The same "
+             "numbers are exported as the "
+             "<span style=\"font-family:var(--mono)\">yuzu_fleet_perf_*</span> and per-OS "
+             "<span style=\"font-family:var(--mono)\">yuzu_fleet_perf_os_*</span> Prometheus "
+             "gauges.</div>";
     }
 
     // ── Cohort benchmarking ──
@@ -287,9 +294,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
     // Key picker — htmx submits the select's own name=value on change.
     h += "<div class=\"gp-note\">cohort by tag key: <select name=\"key\" "
          "hx-get=\"/fragments/dex/perf?window=" + w + "\" hx-target=\"#guardian-detail\" "
-         "hx-swap=\"innerHTML\" hx-trigger=\"change\" "
-         "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-         "border-radius:.35rem;padding:.15rem .4rem;\">";
+         "hx-swap=\"innerHTML\" hx-trigger=\"change\" class=\"dx-ctl\">";
     bool key_listed = false;
     for (const auto& k : snap.available_keys) {
         const bool on = (k == snap.cohort_key);
@@ -352,8 +357,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
             std::string s = "<select name=\"" + std::string(nm) + "\" hx-get=\"" + base +
                             "\" hx-trigger=\"change\" hx-include=\"#dex-cohort-pick\" "
                             "hx-target=\"#dex-cohort-diff\" hx-swap=\"innerHTML\" "
-                            "style=\"background:var(--surface);color:var(--fg);border:1px solid "
-                            "var(--border);border-radius:.35rem;padding:.15rem .4rem;\">";
+                            "class=\"dx-ctl\">";
             for (const auto& c : cohorts) {
                 const std::string lbl = c.cohort.empty() ? "(untagged)" : esc(c.cohort);
                 s += "<option value=\"" + esc(c.cohort) + "\"" +
@@ -391,8 +395,8 @@ std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
     auto delta = [](const std::optional<double>& dv) {
         if (!dv)
             return std::string("&mdash;");
-        const char* color = *dv > 5.0 ? "var(--red)" : *dv < -5.0 ? "var(--green)" : "var(--muted)";
-        return "<span style=\"color:" + std::string(color) + ";\">" +
+        const char* tone = *dv > 5.0 ? "gp-err" : *dv < -5.0 ? "gp-ok" : "gp-mute";
+        return "<span class=\"" + std::string(tone) + "\">" +
                std::format("{}{:.0f}%", *dv > 0 ? "+" : "", *dv) + "</span>";
     };
     auto row = [&](const char* name, const std::optional<DexPerfStat>& sa,
@@ -457,7 +461,7 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
     if (rows.empty())
         return h + placeholder(not_reporting ? "Everyone is reporting" : "No devices",
                                not_reporting
-                                   ? "Every online Windows agent contributed a perf sample "
+                                   ? "Every online Windows/Linux agent contributed a perf sample "
                                      "this cycle."
                                    : "No reporting devices match this view.");
 

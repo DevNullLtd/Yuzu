@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Yuzu Team <noreply@yuzu.io>
 Build-Depends: debhelper (>= 13), meson (>= 1.0), g++ (>= 13), cmake
 Standards-Version: 4.6.2
-Homepage: https://github.com/Tr3kkR/Yuzu
+Homepage: https://github.com/DevNullLtd/Yuzu
 
 Package: yuzu-server
 Architecture: amd64 arm64

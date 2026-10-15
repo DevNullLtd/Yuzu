@@ -153,6 +153,17 @@ spec:
         default: "3"
         validation:
           pattern: "^[0-9]+$"
+      timeout_ms:
+        type: int32
+        displayName: Probe Timeout (ms)
+        description: >
+          Per-sample probe timeout in milliseconds (100-5000). Default: 1000.
+          The server rejects a value outside the range with a 400; the plugin
+          on its own would silently reset it to 1000.
+        default: 1000
+        validation:
+          minimum: 100
+          maximum: 5000
 
   result:
     columns:

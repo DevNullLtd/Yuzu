@@ -3,7 +3,7 @@
   "name": "yuzu",
   "version": "0.1.0",
   "description": "Multi-platform agent and server framework",
-  "homepage": "https://github.com/Tr3kkR/Yuzu",
+  "homepage": "https://github.com/DevNullLtd/Yuzu",
   "license": "AGPL-3.0-or-later",
   "builtin-baseline": "4b77da7fed37817f124936239197833469f1b9a8",
   "dependencies": [

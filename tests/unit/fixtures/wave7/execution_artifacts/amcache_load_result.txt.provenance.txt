@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: reg load HKLM\YuzuAmcacheProbe <amcache copy>, then reg unload HKLM\YuzuAmcacheProbe
+date: 2026-09-06
+status: REAL CAPTURE
+note: first unload attempt (same PowerShell process that ran the load) returned "Access is denied" because the process's own registry-provider handle was still open; a fresh SSH/PowerShell process's reg unload succeeded immediately. Verified clean afterward: reg query HKLM\YuzuAmcacheProbe returns "unable to find the specified registry key" (rig left clean).

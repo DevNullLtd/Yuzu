@@ -9,13 +9,27 @@ name: CLA Assistant
 # pull request and require every commit author to sign the CLA before merge.
 #
 # ─────────────────────────────────────────────────────────────────────────
-#  ACTIVE on Tr3kkR/Yuzu (activated 2026-05-21).
+#  ACTIVE on DevNullLtd/Yuzu (activated 2026-05-21, while the repo was
+#  Tr3kkR/Yuzu; transferred to the DevNullLtd org 2026-09-28).
 # ─────────────────────────────────────────────────────────────────────────
 # Provisioning (in place):
 #   - Secret `CLA_REPO_ACCESS_TOKEN`: classic PAT (`repo` scope) able to
 #     write the signatures store.
+#
+#     KNOWN POSTURE DEBT (raised in review of PR #5101, not introduced by it).
+#     A classic `repo`-scope PAT is org-wide once its owner is a DevNullLtd
+#     owner: its authority is NOT confined to the signatures repo, and it is
+#     consumed here in a `pull_request_target` job, which runs with repository
+#     secrets against a pull request's base. Durable shape is a fine-grained
+#     token limited to `contents: write` on `Yuzu-cla-signatures` alone, held
+#     by an org machine account (or a GitHub App installation), rotated on a
+#     schedule. Do this when the signatures store moves into the org.
 #   - Signatures store: private repo `Tr3kkR/Yuzu-cla-signatures`, branch
 #     `main`, file `signatures/cla.json` (auto-created on first signature).
+#     DELIBERATELY still on the personal account after the DevNullLtd
+#     transfer — the signatures are the licensing record and moving them is
+#     a separate, deliberate decision, not a rename. Do not "fix" the
+#     `remote-organization-name` below to match the new repo owner.
 #   - Guard: runs only on the canonical repo; forks of Yuzu are skipped.
 #
 # To make the CLA *block* merges (not just comment), add this job's status
@@ -43,7 +57,7 @@ jobs:
       pull-requests: write
       statuses: write
     # Live on the canonical repo only; forks of Yuzu skip the CLA gate.
-    if: github.repository == 'Tr3kkR/Yuzu'
+    if: github.repository == 'DevNullLtd/Yuzu'
     steps:
       - name: CLA Assistant
         if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
@@ -56,14 +70,16 @@ jobs:
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_REPO_ACCESS_TOKEN }}
         with:
           path-to-signatures: 'signatures/cla.json'
-          path-to-document: 'https://github.com/Tr3kkR/Yuzu/blob/main/CLA.md'
+          path-to-document: 'https://github.com/DevNullLtd/Yuzu/blob/main/CLA.md'
           branch: 'main'
           allowlist: Tr3kkR,dependabot[bot]
+          # Intentionally NOT DevNullLtd — see the signatures-store note in
+          # the header block.
           remote-organization-name: Tr3kkR
           remote-repository-name: Yuzu-cla-signatures
           custom-notsigned-prcomment: |
             Thanks for your pull request! Before we can merge it, we need you to
-            accept the Yuzu [Contributor License Agreement](https://github.com/Tr3kkR/Yuzu/blob/main/CLA.md).
+            accept the Yuzu [Contributor License Agreement](https://github.com/DevNullLtd/Yuzu/blob/main/CLA.md).
             Please read the document, then reply to this comment with:
             `I have read the CLA Document and I hereby sign the CLA`
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'

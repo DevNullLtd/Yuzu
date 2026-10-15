@@ -297,6 +297,15 @@ public:
     [[nodiscard]] std::vector<ApiToken>
     list_active_for_principal(const std::string& principal_id) const;
 
+    /// Checked twin of `list_active_for_principal` (#5342 Gate 7): the SAME
+    /// query, but a closed store, a pool-lease timeout or a query failure is
+    /// `unexpected(reason)` instead of an empty vector — so a caller that
+    /// REPORTS the count (the admin password reset's `api_tokens_active`) can
+    /// say "could not confirm" rather than a false "0 active tokens". An empty
+    /// `principal_id` is a genuine empty result (no principal, no tokens).
+    [[nodiscard]] std::expected<std::vector<ApiToken>, std::string>
+    list_active_for_principal_checked(const std::string& principal_id) const;
+
     /// Overlap-pair credential rotation for an engine principal (design doc
     /// §7). `now` is caller-supplied epoch seconds (not read from the wall
     /// clock internally) so callers control the instant every window/floor
@@ -556,14 +565,29 @@ public:
     /// `synthesize_token_session` — never client-controllable); rotation is
     /// refused unless they are EQUAL (not "no broader than" — an ordering
     /// needs a tier-lattice assumption a future tier could break) to the
-    /// freshly-read predecessor's own `mcp_tier`/`scope_service`. A cookie
-    /// or JIT-elevated interactive caller carries empty tier/scope, which
-    /// matches an untiered predecessor naturally — no special-casing. The
-    /// refusal is folded into the SAME "no such token to rotate" wording
-    /// used for absent/not-owned so this is not an authority-probing
-    /// oracle. Enforced authoritatively under the advisory-locked
-    /// transaction against a FRESH re-read of the predecessor row; the
-    /// pre-txn check below is an early-rejection mirror only.
+    /// freshly-read predecessor's own `mcp_tier`/`scope_service`, WITH ONE
+    /// #2963 exception: a caller presenting empty `""`/`""` (a plain cookie
+    /// or JIT-elevated interactive session, holding no standing tier/scope
+    /// authority at all) may rotate ANY of its own tokens regardless of
+    /// THAT token's tier/scope — see `caller_may_act_on_tiered_token`'s doc
+    /// comment (api_token_store.cpp) for why this is a single special case,
+    /// not a tier lattice: such a caller already holds a strict superset of
+    /// what any tiered/scoped token can do, and the successor still
+    /// inherits the TOKEN's own narrower tier/scope verbatim, never the
+    /// caller's — nothing is escalated. This is what makes it possible to
+    /// rotate a possibly-compromised MCP-tiered or service-scoped token
+    /// from an ordinary dashboard session, which could not reach it before
+    /// #2963 (the tier-equality check made it structurally unrotatable
+    /// except by presenting that exact token's own credential — backwards
+    /// precisely when the reason to rotate is that the secret may be
+    /// compromised). Every OTHER pairing (a caller holding SOME non-empty
+    /// tier/scope against a predecessor with a DIFFERENT one) still refuses
+    /// on exact equality, no lattice. The refusal is folded into the SAME
+    /// "no such token to rotate" wording used for absent/not-owned so this
+    /// is not an authority-probing oracle. Enforced authoritatively under
+    /// the advisory-locked transaction against a FRESH re-read of the
+    /// predecessor row; the pre-txn check below is an early-rejection
+    /// mirror only.
     ///
     /// `caller_mcp_tier`/`caller_scope_service` are REQUIRED, not defaulted
     /// (governance Gate 8 fix) — an untiered `""`/`""` is the predecessor
@@ -599,12 +623,22 @@ public:
     /// read reasoning, distinct from the principal-scoped original.
     ///
     /// `caller_mcp_tier`/`caller_scope_service` re-check the SAME
-    /// authority-inheritance invariant `rotate_token` enforces, as DEFENCE
-    /// IN DEPTH ONLY — a successor's tier/scope are fixed at mint time and
-    /// cannot legitimately diverge from what the caller who initiated the
-    /// rotation already held, so `rotate_token`'s own guard is the
+    /// authority-inheritance invariant `rotate_token` enforces, INCLUDING
+    /// the #2963 empty-tier/scope exception (see that doc comment) — as
+    /// DEFENCE IN DEPTH ONLY — a successor's tier/scope are fixed at mint
+    /// time and cannot legitimately diverge from the authority a caller
+    /// confirming it currently holds (NOT necessarily the same SESSION that
+    /// initiated the rotation — ownership + the #3015 proof-of-possession
+    /// check are what actually gate who may confirm; a second session
+    /// belonging to the same principal, with a matching or empty tier/scope
+    /// AND the raw successor secret, may legitimately confirm a rotation a
+    /// different session started), so `rotate_token`'s own guard is the
     /// load-bearing one; this catches only a hypothetical future bypass of
-    /// it, never a live path today. REQUIRED, not defaulted, for the same
+    /// it, never a live path today (governance Gate 4 UP-4). Both checks
+    /// MUST stay in sync — a caller presenting a given tier/scope that can
+    /// successfully `rotate_token` a pair must also be able to
+    /// `confirm_token_rotation` it presenting the SAME tier/scope, or the
+    /// two calls disagree on an identical caller/token. REQUIRED, not defaulted, for the same
     /// reason as `rotate_token`'s own pair (governance Gate 8 fix) — see
     /// that doc comment.
     ///

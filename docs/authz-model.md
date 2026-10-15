@@ -90,13 +90,14 @@ classifies a capability; it never grants one.
 
 ### Seed catalogue
 
-`kSeedCatalogue` is five representative rows, not a full mirror of `RbacStore`'s 23 securables × 7
+`kSeedCatalogue` is eight representative rows, not a full mirror of `RbacStore`'s 38 securables × 8
 operations — it exists so PR1.9 has real rows to migrate and so this header's own tests exercise
 `is_valid`, not to be the registry itself. It includes an ordinary CRUD read (`Response:Read`), a
 `Tag:Write` (mirrors `mcp_policy.hpp`'s existing Tag special-case), `Execution:Execute` (the
 combination the #1788 fix below narrows), the Guardian-only `Push` narrow op
-(`GuaranteedState:Push`), and — required by this PR's spec — `AccessReview:Attest`, deliberately
-outside every CRUD loop, exactly as seeded in `rbac_store.cpp`.
+(`GuaranteedState:Push`), — required by this PR's spec — `AccessReview:Attest`, deliberately
+outside every CRUD loop, exactly as seeded in `rbac_store.cpp`, and three later additions:
+`PluginConfig:Write`, `PluginSecret:Write` and `UploadGrant:Write`.
 
 ### Composition with the frozen #1715 lattice
 
@@ -126,7 +127,7 @@ live consequence and one forward-wired one**, which the fix below deliberately c
 - **Live (the exploit #1788 actually closes):** a **service-scoped token** reaches this route because
   `require_permission` admits it via the `ITServiceOwner` role's `Execution:Execute` grant —
   independent of the minting principal's own grants (`auth_routes.cpp`
-  `check_role_has_permission("ITServiceOwner", …)`). So before this fix the token dispatched to the
+  `RbacStore::role_permission_allowed_checked("ITServiceOwner", …)` via `authz::service_ceiling_check`). So before this fix the token dispatched to the
   whole fleet through any arm, most directly by naming a foreign-service device in `agent_ids`,
   ignoring the very confinement `require_scoped_permission` enforces per-target on the non-generic
   paths. (Separately, because the minter *may* also hold a global `Execution:Execute` grant, the
@@ -324,14 +325,14 @@ Administrator-only, unlike `PluginConfig`/`UploadGrant` where Operator gets read
 day-to-day triage. No other role (Viewer, ITServiceOwner, ApiTokenManager, Reviewer) is touched by
 this PR.
 
-## 4. Wave 7 PR7.2: `Forensics` and `Decommission` (34th/35th securables)
+## 4. Wave 7 PR7.2: `Forensics` and `Decommission` (37th/38th securables)
 
-Two more securables appended to `rbac_store.cpp`'s `types[]` (33→35) and its `mcp_server.cpp`
+Two more securables appended to `rbac_store.cpp`'s `types[]` (36→38) and its `mcp_server.cpp`
 mirror (`kRbacSecurables`):
 
 | Securable | Purpose | Consumed operations | Roles |
 |---|---|---|---|
-| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator only. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); deliberately ABSENT from the Viewer read-list — a forensic read is never a Viewer-tier operation |
+| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage, per-app privacy-permission grants). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator by default; the stored rows of a dispatched read follow `Response:Read`. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); deliberately ABSENT from the Viewer read-list — dispatching a forensic read is never a Viewer-tier operation (the stored results, though, follow `Response:Read`, which Viewer holds) |
 | `Decommission` | The whole-device erasure cascade (`DELETE /api/v1/sle/agents/{id}`). Replaces the three-way `SoftwareLicensing`∧`Inventory`∧`GuaranteedState:Delete` conjunction ADR-0024 Decision 9 originally rejected promoting a dedicated securable for. | `Delete` is the ONLY consumed operation — `Read`/`Write`/`Execute`/`Approve` are meaningless on this securable and are never widened onto it | Administrator (CRUD via the loop, PowerManagement/PluginConfig precedent); ITServiceOwner gets a TARGETED `Decommission:Delete` grant only (preserves the population that could decommission under the old conjunction — ITServiceOwner held CRUD on all three of its members) |
 
 `Decommission` has **no MCP consumer by design** — the erasure verb is REST-only (ADR-1005
@@ -368,6 +369,30 @@ Forensics-class plugin, but its default-off posture, its kill-switch mechanism, 
 endpoint are planned, not yet designed in detail — there is no `seed_kill_switch_default_off` (or
 equivalent) anywhere in this tree today. Until it lands, `Forensics` exists as authorization
 infrastructure only.
+
+**Wave 7 PR7b: application usage is the first live `Forensics` consumer, not `execution_artifacts`.**
+The `app_usage` plugin's dedicated read surface (single-target, `Forensics:Read`) is the first row
+to actually classify anything `Forensics` — application usage history (TAR's `usage_live`/
+`usage_daily`/`usage_daily_user` tables, retained on a 31-day rolling window) is designed to be
+reachable only through that surface (see the residual read-path caveat below). It is deliberately
+unreachable through the generic `tar.sql` endpoint (`Infrastructure:Read`,
+`plugin_action_catalogue_a.hpp`): the three usage tables are excluded from `is_queryable_table()`'s
+allowlist in `tar_schema_registry.cpp`, so the read-only connection's SQLite authorizer denies every
+access path to them — direct name, `$Usage_*` placeholder, alias, JOIN, or subquery — with the same
+no-existence-oracle posture `tar_events` already gets (#760 UP-8). #4260 tracked this gap; closed by
+this exclusion. #2744 (the app_usage measurand ADR) is superseded by the machine-scope decision
+above and closes without a code change.
+
+**Residual read path, accepted not closed:** `app_usage` is also a typed daily-sync source
+(`typed_inventory_sources.hpp`) excluded from the generic `InventoryStore` only on the gateway's
+*write* path, with a boot-time purge cleaning up any stray row from a mixed-version deployment
+window (an older gateway writing before an upgraded server's boot purge runs). The generic *read*
+path (`InventoryStore::get`/`query`/`list_tables`) carries no typed-source filter, so a stray row
+from that window — or a failed purge — stays readable via the far lower-privileged
+`Infrastructure:Read`/`Inventory:Read` securable until the next boot purge. This is the same
+architectural gap `device_ci` already carries (per `typed_inventory_sources.hpp`'s own header
+comment) and is not being retrofitted here either; it was accepted at this feature's planning gate
+in favor of purge-on-upgrade over a read-time filter.
 
 ## Testing
 

@@ -295,6 +295,67 @@ TEST_CASE("execute_user_query: software_live and software_daily are sandbox-read
     CHECK(daily->rows[0][0] == "3");
 }
 
+TEST_CASE("execute_user_query: usage tables are denied to generic tar.sql (#4260)",
+          "[tar][store][security][usage]") {
+    // usage/usage_daily/usage_daily_user are read ONLY through the
+    // Forensics-gated app_usage plugin reads (p2.1/p2.2), which never go
+    // through execute_user_query. A generic tar.sql query touching any of
+    // them -- direct name, $Usage_* placeholder, alias, or JOIN/subquery --
+    // must be rejected by the read-only connection's SQLite authorizer, not
+    // silently return rows or an empty success.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs) VALUES "
+        "(86400, 'a.exe', 1, 10, 1000, 1010, 1, 0, 0)"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily_user (day_ts, exe_key, user) VALUES (86400, 'a.exe', 'alice')"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) VALUES "
+        "(1000, 0, 'open', 1, 'a.exe', 'alice', 1000)"));
+    REQUIRE(t.db.insert_process_events({[] {
+        ProcessEvent p;
+        p.ts = 1000;
+        p.snapshot_id = 1;
+        p.action = "started";
+        p.pid = 1;
+        p.name = "p.exe";
+        return p;
+    }()}));
+
+    CHECK_FALSE(t.db.execute_user_query("SELECT * FROM usage_daily").has_value());
+
+    // Translation stays intact ($Usage_Daily -> usage_daily resolves) -- the
+    // authorizer denies post-translation, not the translator pre-emptively.
+    auto translated = validate_and_translate_sql("SELECT * FROM $Usage_Daily");
+    REQUIRE(translated.has_value());
+    CHECK(translated->find("usage_daily") != std::string::npos);
+    CHECK_FALSE(t.db.execute_user_query(*translated).has_value());
+
+    CHECK_FALSE(t.db.execute_user_query("SELECT u.exe_key FROM usage_live u").has_value());
+    CHECK_FALSE(t.db
+                    .execute_user_query("SELECT p.name FROM process_live p JOIN usage_daily d "
+                                         "ON d.exe_key = p.name")
+                    .has_value());
+    CHECK_FALSE(
+        t.db.execute_user_query("SELECT (SELECT COUNT(*) FROM usage_daily_user)").has_value());
+
+    // Positive control: the authorizer isn't wedged shut -- a non-usage
+    // table via its dollar name still works. execute_user_query never
+    // translates $-names itself (confirmed against its implementation --
+    // it passes the raw string straight to sqlite3_prepare_v2), so this
+    // query must go through validate_and_translate_sql first, exactly like
+    // the $Usage_Daily denial check above; passing the bare $Process_Live
+    // string here previously hit SQLite's own "near $Process_Live: syntax
+    // error" before the authorizer ever ran.
+    auto ctrl_sql = validate_and_translate_sql("SELECT COUNT(*) FROM $Process_Live");
+    REQUIRE(ctrl_sql.has_value());
+    auto ctrl = t.db.execute_user_query(*ctrl_sql);
+    REQUIRE(ctrl.has_value());
+    REQUIRE(ctrl->rows.size() == 1);
+    CHECK(ctrl->rows[0][0] == "1");
+}
+
 TEST_CASE("tar.export $Software summary projection references only existing columns",
           "[tar][store][software][export]") {
     // Regression guard (#1620): do_export's `software` UNION branch builds a summary
@@ -851,18 +912,23 @@ TEST_CASE("TarDatabase: insert_proc_perf_samples batch round-trips", "[tar][stor
         r.instances = i + 1;
         r.cpu_pct = 10.0 * (i + 1);
         r.ws_bytes = (100 << 20) * (i + 1);
+        r.is_kthread = (i == 1); // one kernel-thread row among ordinary ones
         rows.push_back(std::move(r));
     }
     REQUIRE(t.db.insert_proc_perf_samples(rows));
     REQUIRE(t.db.insert_proc_perf_samples({})); // empty batch is a no-op success
 
-    auto q = t.db.execute_query("SELECT name, version, instances, cpu_pct, ws_bytes FROM procperf_live "
-                                "ORDER BY name");
+    auto q = t.db.execute_query(
+        "SELECT name, version, instances, cpu_pct, ws_bytes, is_kthread FROM procperf_live "
+        "ORDER BY name");
     REQUIRE(q.has_value());
     REQUIRE(q->rows.size() == 3);
     CHECK(q->rows[0][0] == "app0.exe");
     CHECK(q->rows[0][1] == "1.2.0.0"); // version round-trips
     CHECK(q->rows[2][2] == "3");
+    CHECK(q->rows[0][5] == "0");
+    CHECK(q->rows[1][5] == "1"); // app1.exe's is_kthread round-trips
+    CHECK(q->rows[2][5] == "0");
 }
 
 TEST_CASE("TarDatabase: insert_netqual_samples batch round-trips", "[tar][store][netqual]") {
@@ -1305,7 +1371,7 @@ TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
     { TarDatabase discard = std::move(t.db); }
     auto reopened = TarDatabase::open(t.path);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->schema_version() == 6);
+    CHECK(reopened->schema_version() == 7);
     auto q2 = reopened->execute_query(count_sql);
     REQUIRE(q2.has_value());
     CHECK(q2->rows[0][0] == "0");
@@ -1339,7 +1405,7 @@ TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 6); // the 2→3→4→5→6 walk ran
+        CHECK(db->schema_version() == 7); // the 2→3→4→5→6→7 walk ran
         auto q =
             db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
                               "name LIKE 'idx_tar_events%'");
@@ -1379,7 +1445,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 6);
+        CHECK(db->schema_version() == 7);
         auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
                                    "OR name LIKE 'idx_tar_events%'");
         REQUIRE(q.has_value());
@@ -1456,7 +1522,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 6); // the v3→v4→v5→v6 walk ran
+        CHECK(db->schema_version() == 7); // the v3→v4→v5→v6→v7 walk ran
 
         // Both tiers now carry `version` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -1481,6 +1547,70 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
         REQUIRE(q.has_value());
         REQUIRE(q->rows.size() == 1);
         CHECK(q->rows[0][0] == "124.0.6367.91");
+    }
+
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+TEST_CASE("TarDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf tier "
+          "(upgrade path)",
+          "[tar][store][lifecycle][procperf]") {
+    // Isolates the v7 step specifically: seed the exact POST-v6 shape (both
+    // tiers already carry `version`, from the v4 ALTER; schema_version=6) so
+    // create_warehouse_tables' IF-NOT-EXISTS leaves them alone and only the
+    // v7 block's ALTER TABLE ADD COLUMN is exercised.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v7_");
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
+        const char* seed = R"(
+            CREATE TABLE tar_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+            INSERT INTO tar_config (key, value) VALUES ('schema_version', '6');
+            CREATE TABLE procperf_live (
+                ts INTEGER, snapshot_id INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '',
+                instances INTEGER, cpu_pct REAL, ws_bytes INTEGER);
+            CREATE TABLE procperf_hourly (
+                hour_ts INTEGER, name TEXT, version TEXT NOT NULL DEFAULT '', samples INTEGER,
+                instances_max INTEGER, cpu_avg REAL, cpu_max REAL, ws_avg_bytes INTEGER,
+                ws_max_bytes INTEGER);
+        )";
+        REQUIRE(sqlite3_exec(raw, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 7); // the v6→v7 walk ran
+
+        // Both tiers now carry `is_kthread` (added by the ALTER, not the DDL).
+        for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
+            auto info = db->execute_query(std::string{"PRAGMA table_info("} + tbl + ")");
+            REQUIRE(info.has_value());
+            bool has_is_kthread = false;
+            for (const auto& row : info->rows)
+                if (row.size() > 1 && row[1] == "is_kthread")
+                    has_is_kthread = true;
+            CHECK(has_is_kthread);
+        }
+
+        // A real insert carrying is_kthread=true round-trips through the migrated
+        // table (stored as SQLite's INTEGER 0/1).
+        ProcPerfRow r;
+        r.ts = 21;
+        r.snapshot_id = 1;
+        r.name = "kworker/0:1";
+        r.instances = 1;
+        r.is_kthread = true;
+        REQUIRE(db->insert_proc_perf_samples({r}));
+        auto q =
+            db->execute_query("SELECT is_kthread FROM procperf_live WHERE name = 'kworker/0:1'");
+        REQUIRE(q.has_value());
+        REQUIRE(q->rows.size() == 1);
+        CHECK(q->rows[0][0] == "1");
     }
 
     std::error_code ec;
@@ -1587,6 +1717,37 @@ TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh
         }
     }
     CHECK(found_quarantine);
+
+    // #1567: this open knows it quarantined, and the fact is persisted (epoch +
+    // basename only) so it survives a restart and can be published fleet-wide.
+    REQUIRE(db2.quarantined_this_open().has_value());
+    const auto q_epoch = db2.get_config("db_health_last_quarantine_epoch", "");
+    CHECK_FALSE(q_epoch.empty());
+    CHECK(q_epoch.find_first_not_of("0123456789") == std::string::npos);
+    CHECK(q_epoch == std::to_string(*db2.quarantined_this_open()));
+    const auto q_file = db2.get_config("db_health_last_quarantine_file", "");
+    CHECK(q_file.rfind(tmp.filename().string() + ".corrupt-", 0) == 0);
+    CHECK(q_file.find_first_of("/\\") == std::string::npos);
+
+    // A clean re-open of the same path reports no quarantine, but both config
+    // rows persist (tar_config is the durable source of truth).
+    { TarDatabase discard = std::move(db2); }
+    auto clean = TarDatabase::open(tmp);
+    REQUIRE(clean.has_value());
+    CHECK_FALSE(clean->quarantined_this_open().has_value());
+    CHECK(clean->get_config("db_health_last_quarantine_epoch", "") == q_epoch);
+    CHECK(clean->get_config("db_health_last_quarantine_file", "") == q_file);
+    { TarDatabase discard = std::move(*clean); }
+    for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
+        if (entry.path().filename().string().rfind(tmp.filename().string() + ".corrupt-", 0) == 0) {
+            std::error_code ec;
+            fs::remove(entry.path(), ec);
+        }
+    }
+    {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+    }
 }
 
 TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantine (#559 collision-safe)",
@@ -1954,4 +2115,173 @@ TEST_CASE("checked_transaction: every statement individually succeeding does not
     CHECK_FALSE(result.has_value());
     CHECK(result.error().find("COMMIT failed") != std::string::npos);
     CHECK(row_count(t.db, "fk_child") == 0);
+}
+
+// ── #1654: events + baseline commit atomically ─────────────────────────────────
+//
+// The failure is injected with RAISE(ABORT) triggers (deterministic, in-process,
+// no timing) on tar_state, both the INSERT and the UPDATE form so the test does
+// not depend on which UPSERT branch SQLite takes. It hits the same
+// `rc != SQLITE_DONE -> ROLLBACK` path a real SQLITE_BUSY would.
+
+static void install_state_fault(TarDatabase& db, const std::string& collector) {
+    REQUIRE(db.execute_sql("CREATE TRIGGER yuzu_test_fail_state_i BEFORE INSERT ON tar_state "
+                           "WHEN NEW.collector='" + collector +
+                           "' BEGIN SELECT RAISE(ABORT,'injected'); END"));
+    REQUIRE(db.execute_sql("CREATE TRIGGER yuzu_test_fail_state_u BEFORE UPDATE ON tar_state "
+                           "WHEN NEW.collector='" + collector +
+                           "' BEGIN SELECT RAISE(ABORT,'injected'); END"));
+}
+
+static void drop_state_fault(TarDatabase& db) {
+    REQUIRE(db.execute_sql("DROP TRIGGER yuzu_test_fail_state_i"));
+    REQUIRE(db.execute_sql("DROP TRIGGER yuzu_test_fail_state_u"));
+}
+
+static int64_t count_rows(TarDatabase& db, const std::string& table) {
+    auto r = db.execute_query("SELECT COUNT(*) FROM " + table, 1);
+    REQUIRE(r.has_value());
+    return std::stoll(r->rows[0][0]);
+}
+
+TEST_CASE("TarDatabase: process events + baseline are one transaction (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.set_state("process", "baseline-1"));
+
+    ProcessEvent a;
+    a.ts = 1000;
+    a.snapshot_id = 1;
+    a.action = "started";
+    a.pid = 1;
+    a.name = "a.exe";
+    ProcessEvent b = a;
+    b.pid = 2;
+    b.name = "b.exe";
+
+    install_state_fault(t.db, "process");
+    CHECK_FALSE(t.db.insert_process_events({a, b}, StateWrite{"process", "baseline-2"}));
+    // Nothing durable: no events, baseline unchanged -> the next tick re-diffs the
+    // identical delta instead of double-emitting.
+    CHECK(count_rows(t.db, "process_live") == 0);
+    CHECK(t.db.get_state("process") == "baseline-1");
+
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_process_events({a, b}, StateWrite{"process", "baseline-2"}));
+    CHECK(count_rows(t.db, "process_live") == 2);
+    CHECK(t.db.get_state("process") == "baseline-2");
+}
+
+TEST_CASE("TarDatabase: software + network events + baseline are one transaction (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+
+    SoftwareEvent sw;
+    sw.ts = 1000;
+    sw.snapshot_id = 1;
+    sw.action = "installed";
+    sw.name = "app";
+    install_state_fault(t.db, "software");
+    CHECK_FALSE(t.db.insert_software_events({sw}, StateWrite{"software", "s2"}));
+    CHECK(count_rows(t.db, "software_live") == 0);
+    CHECK(t.db.get_state("software").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_software_events({sw}, StateWrite{"software", "s2"}));
+    CHECK(count_rows(t.db, "software_live") == 1);
+    CHECK(t.db.get_state("software") == "s2");
+
+    NetworkEvent ne;
+    ne.ts = 1000;
+    ne.snapshot_id = 1;
+    ne.action = "connected";
+    ne.proto = "tcp";
+    install_state_fault(t.db, "network");
+    CHECK_FALSE(t.db.insert_network_events({ne}, StateWrite{"network", "n2"}));
+    CHECK(count_rows(t.db, "tcp_live") == 0);
+    CHECK(t.db.get_state("network").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_network_events({ne}, StateWrite{"network", "n2"}));
+    CHECK(count_rows(t.db, "tcp_live") == 1);
+    CHECK(t.db.get_state("network") == "n2");
+}
+
+TEST_CASE("TarDatabase: service/user/arp/dns/mapdrive events + baseline are one transaction (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+
+    ServiceEvent se; se.ts = 1000; se.snapshot_id = 1; se.action = "started"; se.name = "svc";
+    install_state_fault(t.db, "service");
+    CHECK_FALSE(t.db.insert_service_events({se}, StateWrite{"service", "b2"}));
+    CHECK(count_rows(t.db, "service_live") == 0);
+    CHECK(t.db.get_state("service").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_service_events({se}, StateWrite{"service", "b2"}));
+    CHECK(count_rows(t.db, "service_live") == 1);
+    CHECK(t.db.get_state("service") == "b2");
+
+    UserEvent ue; ue.ts = 1000; ue.snapshot_id = 1; ue.action = "login"; ue.user = "alice";
+    install_state_fault(t.db, "user");
+    CHECK_FALSE(t.db.insert_user_events({ue}, StateWrite{"user", "b2"}));
+    CHECK(count_rows(t.db, "user_live") == 0);
+    CHECK(t.db.get_state("user").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_user_events({ue}, StateWrite{"user", "b2"}));
+    CHECK(count_rows(t.db, "user_live") == 1);
+    CHECK(t.db.get_state("user") == "b2");
+
+    ArpEvent ae; ae.ts = 3000; ae.snapshot_id = 1; ae.action = "appeared"; ae.iface = "Ethernet";
+    ae.ip_address = "192.168.1.1"; ae.mac_address = "aa:bb:cc:dd:ee:ff"; ae.entry_type = "dynamic";
+    install_state_fault(t.db, "arp");
+    CHECK_FALSE(t.db.insert_arp_events({ae}, StateWrite{"arp", "b2"}));
+    CHECK(count_rows(t.db, "arp_live") == 0);
+    CHECK(t.db.get_state("arp").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_arp_events({ae}, StateWrite{"arp", "b2"}));
+    CHECK(count_rows(t.db, "arp_live") == 1);
+    CHECK(t.db.get_state("arp") == "b2");
+
+    DnsEvent de; de.ts = 3100; de.snapshot_id = 1; de.action = "appeared"; de.name = "example.com";
+    de.record_type = "A"; de.data = "93.184.216.34"; de.ttl_remaining_s = 60; de.source = "cache";
+    install_state_fault(t.db, "dns");
+    CHECK_FALSE(t.db.insert_dns_events({de}, StateWrite{"dns", "b2"}));
+    CHECK(count_rows(t.db, "dns_live") == 0);
+    CHECK(t.db.get_state("dns").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_dns_events({de}, StateWrite{"dns", "b2"}));
+    CHECK(count_rows(t.db, "dns_live") == 1);
+    CHECK(t.db.get_state("dns") == "b2");
+
+    MapDriveEvent me{1000, 5, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB", "historical"};
+    install_state_fault(t.db, "mapdrive");
+    CHECK_FALSE(t.db.insert_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
+    CHECK(count_rows(t.db, "mapdrive_live") == 0);
+    CHECK(t.db.get_state("mapdrive").empty());
+    drop_state_fault(t.db);
+    CHECK(t.db.insert_mapdrive_events({me}, StateWrite{"mapdrive", "b2"}));
+    CHECK(count_rows(t.db, "mapdrive_live") == 1);
+    CHECK(t.db.get_state("mapdrive") == "b2");
+}
+
+TEST_CASE("TarDatabase: StateWrite with empty events writes only the baseline (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+    CHECK(t.db.insert_process_events({}, StateWrite{"process", "only-state"}));
+    CHECK(t.db.get_state("process") == "only-state");
+    CHECK(count_rows(t.db, "process_live") == 0);
+
+    // nullopt state keeps the historical contract for an open handle byte-for-byte
+    // (a closed handle now returns false for the state-carrying overloads).
+    CHECK(t.db.insert_process_events({}));
+    CHECK(t.db.insert_process_events({}, std::nullopt));
+    CHECK(t.db.get_state("process") == "only-state");
+}
+
+TEST_CASE("TarDatabase: set_state reports a failed baseline write (#1654)",
+          "[tar][store][corruption][atomic]") {
+    auto t = make_test_db();
+    install_state_fault(t.db, "process");
+    CHECK_FALSE(t.db.set_state("process", "x"));
+    drop_state_fault(t.db);
+    CHECK(t.db.set_state("process", "x"));
+    CHECK(t.db.get_state("process") == "x");
 }

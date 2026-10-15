@@ -19,7 +19,7 @@
 # Validated end-to-end on BigMags (2026-08-17): both agents registered + online.
 set -euo pipefail
 
-REPO="Tr3kkR/Yuzu"
+REPO="DevNullLtd/Yuzu"
 CI_USER="yuzuci"
 CI_ROOT="/opt/ci"
 POOL_LABELS="self-hosted,macOS,ARM64,yuzu-bigmags-macos"

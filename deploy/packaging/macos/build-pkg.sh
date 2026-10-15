@@ -124,8 +124,9 @@ else
     install -m 755 "$AGENT_BIN" "${STAGING}/usr/local/bin/.yuzu-agent.incoming"
     for candidate in "$BIN_DIR/libyuzu_agent_core.dylib" "$BIN_DIR/agents/core/libyuzu_agent_core.dylib"; do
         [[ -f "$candidate" ]] || continue
-        install -d "${STAGING}/usr/local/lib"
-        install -m 755 "$candidate" "${STAGING}/usr/local/lib/.libyuzu_agent_core.incoming.dylib"
+        # Beside the binary, not in /usr/local/lib (#5144): yuzu-agent loads
+        # @rpath/libyuzu_agent_core.dylib and its only LC_RPATH is @loader_path/.
+        install -m 755 "$candidate" "${STAGING}/usr/local/bin/.libyuzu_agent_core.incoming.dylib"
         break
     done
     if [[ -d "$BIN_DIR/plugins" ]]; then

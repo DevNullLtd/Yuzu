@@ -15,7 +15,7 @@
 
 #include "device_routes.hpp"
 
-#include "dex_routes.hpp"        // dex_signal_label for the DEX lens
+#include "dex_view_types.hpp"    // dex_signal_label for the DEX lens (store-free)
 #include "tar_process_tree.hpp"  // tar_is_suspicious_spawn — shared LOLBin/shell denylist
 #include "web_utils.hpp"
 
@@ -35,6 +35,60 @@ namespace yuzu::server {
 namespace {
 
 std::string esc(const std::string& s) { return html_escape(s); }
+
+// raw column name -> display header text, for render_device_live_generic's <th>.
+// Backs the round-3 item 11 "physical-kit" kinds only; an unrecognised key falls
+// back to itself unchanged — never crash on a column a future kind introduces.
+std::string column_label(const std::string& raw) {
+    static const std::unordered_map<std::string, std::string> kLabels{
+        {"index", "#"},
+        {"model", "Model"},
+        {"size_gb", "Size (GB)"},
+        {"media_type", "Media"},
+        {"interface", "Interface"},
+        {"slot", "Slot"},
+        {"size_mb", "Size (MB)"},
+        {"type", "Type"},
+        {"speed_mhz", "Speed (MHz)"},
+        {"cores", "Cores"},
+        {"threads", "Threads"},
+        {"clock_mhz", "Clock (MHz)"},
+        {"name", "Name"},
+        {"version", "Version"},
+        {"date", "Date"},
+        {"provider", "Provider"},
+        {"device_class", "Class"},
+        {"present", "Present"},
+        {"state", "State"},
+        {"percent", "Percent"},
+        {"time_to_empty_min", "Time to empty (min)"},
+        {"cycle_count", "Cycle count"},
+        {"health_percent", "Health %"},
+        {"status", "Status"},
+        {"zone_or_detail", "Zone / detail"},
+        {"celsius", "degC"},
+        {"device", "Device"},
+        {"bus", "Bus"},
+        {"media", "Media"},
+        {"health", "Health"},
+        {"pct_used", "% used"},
+        {"spare_pct", "Spare %"},
+        {"detail", "Detail"},
+        {"volume", "Volume"},
+        {"mount_points", "Mount points"},
+        {"fstype", "FS type"},
+        {"total_bytes", "Size"},
+        {"mac", "MAC"},
+        {"speed_mbps", "Speed (Mbps)"},
+        {"ssid", "SSID"},
+        {"signal", "Signal"},
+        {"security", "Security"},
+        {"bssid", "BSSID"},
+        {"interface_or_channel", "Interface / channel"},
+    };
+    const auto it = kLabels.find(raw);
+    return it == kLabels.end() ? raw : it->second;
+}
 
 std::string url_encode(const std::string& s) {
     static const char* kHex = "0123456789ABCDEF";
@@ -59,15 +113,21 @@ std::string os_label(const std::string& os) {
     return os.empty() ? std::string("&mdash;") : esc(os);
 }
 
-// A small online/offline status dot + word. Inline style (CSP allows style attrs)
-// so it doesn't depend on dashboard-only CSS classes.
+// A small online/offline status square (yuzu.css `.sd`) + word.
 std::string status_cell(bool online) {
-    const char* color = online ? "#4ed27e" : "#6f86a6";
-    return "<span style=\"display:inline-block;width:.5rem;height:.5rem;border-radius:50%;"
-           "background:" +
-           std::string(color) + ";margin-right:.4rem\"></span>" +
-           (online ? "<span style=\"color:#4ed27e\">online</span>"
+    return std::string("<span class=\"sd ") + (online ? "s-on" : "s-off") + "\"></span>" +
+           (online ? "<span style=\"color:var(--ok)\">online</span>"
                    : "<span class=\"gp-mute\">offline</span>");
+}
+
+// A tinted status pill in inline style (token colours). Same look as the shared `.pill`
+// except the warn tint (14% here, 15% there); inline so these lens fragments stay
+// self-contained.
+std::string tone_pill(const char* tone, const std::string& text) {
+    return "<span style=\"display:inline-block;padding:1px 8px;border-radius:3px;font-size:12.5px;"
+           "font-weight:500;color:var(--" + std::string(tone) +
+           ");background:color-mix(in srgb,var(--" + tone + ") 14%,transparent)\">" + text +
+           "</span>";
 }
 
 // The per-device lens tab bar. Each tab hx-gets its lens fragment into #device-lens
@@ -89,31 +149,26 @@ std::string device_lens_tabs(const std::string& active, const std::string& agent
 std::string score_badge(int score) {
     if (score < 0)
         return "<span class=\"gp-mute\">&mdash;</span>";
-    const char* color = score >= 90 ? "#4ed27e" : (score >= 75 ? "#ffcc00" : "#ff5765");
-    return "<span style=\"display:inline-block;min-width:1.7rem;text-align:center;font-weight:700;"
-           "font-size:.68rem;border-radius:.3rem;padding:.05rem .4rem;color:#06121f;background:" +
-           std::string(color) + "\">" + std::to_string(score) + "</span>";
+    return tone_pill(score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"), std::to_string(score));
 }
 
 // Guardian compliance-state badge: compliant=green, drifted=amber, errored=red.
 std::string guard_state_badge(const std::string& state) {
-    const char* color = state == "compliant" ? "#4ed27e"
-                        : state == "errored"  ? "#ff5765"
-                                              : "#ffcc00"; // drifted / anything else
-    return "<span style=\"font-size:.6rem;font-weight:700;border-radius:.3rem;padding:.05rem .4rem;"
-           "color:#06121f;background:" +
-           std::string(color) + "\">" + esc(state.empty() ? "unknown" : state) + "</span>";
+    const char* tone = state == "compliant" ? "ok"
+                       : state == "errored"  ? "bad"
+                                             : "warn"; // drifted / anything else
+    return tone_pill(tone, esc(state.empty() ? "unknown" : state));
 }
 
 std::string ci_group(const std::string& title, const std::string& rows) {
     return "<div class=\"gp-tile\" style=\"min-width:240px;text-align:left\">"
-           "<div class=\"l\" style=\"color:#a5d6ff;margin-bottom:.3rem\">" +
+           "<div class=\"l\" style=\"color:var(--ink);margin-bottom:.3rem\">" +
            esc(title) + "</div>" + rows + "</div>";
 }
 std::string kv(const std::string& k, const std::string& v) {
     return "<div style=\"display:flex;justify-content:space-between;gap:.8rem;font-size:.78rem;"
-           "padding:.15rem 0;border-bottom:1px dotted #2d4068\"><span class=\"gp-mute\">" +
-           esc(k) + "</span><span style=\"color:#cfdbe8\">" + v + "</span></div>";
+           "padding:.15rem 0;border-bottom:1px solid var(--line)\"><span class=\"gp-mute\">" +
+           esc(k) + "</span><span style=\"color:var(--ink)\">" + v + "</span></div>";
 }
 
 } // namespace
@@ -141,7 +196,7 @@ std::string render_devices_list_fragment(const std::vector<DeviceRow>& rows, con
     h += "<div class=\"gp-tiles\">";
     h += "<div class=\"gp-tile\"><div class=\"n\">" + std::to_string(total_devices) +
          "</div><div class=\"l\">Devices</div></div>";
-    h += "<div class=\"gp-tile\"><div class=\"n\" style=\"color:#4ed27e\">" +
+    h += "<div class=\"gp-tile\"><div class=\"n\" style=\"color:var(--ok)\">" +
          std::to_string(total_online) + "</div><div class=\"l\">Online</div></div>";
     h += "</div>";
 
@@ -151,8 +206,8 @@ std::string render_devices_list_fragment(const std::vector<DeviceRow>& rows, con
          "<input name=\"q\" value=\"" +
          esc(q) +
          "\" placeholder=\"Search hostname, OS, tag\xE2\x80\xA6\" "
-         "style=\"background:#0e1a2d;border:1px solid #2d4068;border-radius:.4rem;color:#cfdbe8;"
-         "padding:.3rem .6rem;font-size:.78rem;min-width:240px\" "
+         "style=\"height:28px;border:1px solid var(--line2);border-radius:3px;background:var(--bg);"
+         "color:var(--ink);padding:0 10px;font-size:13px;min-width:240px\" "
          "hx-get=\"/fragments/devices/list?os=" +
          url_encode(os_token) + "&status=" + url_encode(status_token) +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
@@ -181,13 +236,11 @@ std::string render_devices_list_fragment(const std::vector<DeviceRow>& rows, con
     for (const auto& d : rows) {
         const std::string label = d.hostname.empty() ? d.agent_id : d.hostname;
         std::string tagline = esc(d.agent_id.substr(0, 12));
-        if (!d.segment.empty())
-            tagline += " &middot; " + esc(d.segment);
         h += "<tr class=\"gp-rowlink\" style=\"cursor:pointer\" "
              "onclick=\"location.href='/device?id=" +
              url_encode(d.agent_id) + "'\">";
         h += "<td><a href=\"/device?id=" + url_encode(d.agent_id) +
-             "\" style=\"font-weight:600;color:#fff\">" + esc(label) +
+             "\" style=\"font-weight:600;color:var(--ink)\">" + esc(label) +
              "</a><div class=\"gp-mute\" style=\"font-size:.66rem\">" + tagline + "</div></td>";
         h += "<td>" + status_cell(d.online) + "</td>";
         h += "<td>" + score_badge(d.dex_score) + "</td>";
@@ -217,19 +270,16 @@ std::string render_device_info_fragment(const DeviceRow& d) {
     std::string h = device_lens_tabs("info", d.agent_id);
     h += "<div class=\"gp-tiles\" style=\"align-items:stretch\">";
     h += ci_group("Identity", kv("Hostname", esc(d.hostname.empty() ? "&mdash;" : d.hostname)) +
-                                  kv("Agent ID", "<span style=\"font-family:var(--mono),Consolas,"
-                                                 "monospace;font-size:.7rem\">" +
+                                  kv("Agent ID", "<span style=\"font-family:var(--mds-font-family-mono);"
+                                                 "font-size:12.5px\">" +
                                                      esc(d.agent_id) + "</span>") +
                                   kv("OS", os_label(d.os)) +
                                   kv("Architecture", esc(d.arch.empty() ? "&mdash;" : d.arch)));
     h += ci_group("Management",
-                  kv("Segment", d.segment.empty() ? std::string("<span class=\"gp-mute\">&mdash;"
-                                                                "</span>")
-                                                  : esc(d.segment)) +
-                      kv("Tags", tags) +
+                  kv("Tags", tags) +
                       kv("Agent version", d.agent_version.empty() ? std::string("&mdash;")
                                                                   : esc(d.agent_version)) +
-                      kv("Status", d.online ? "<span style=\"color:#4ed27e\">online</span>"
+                      kv("Status", d.online ? "<span style=\"color:var(--ok)\">online</span>"
                                             : "<span class=\"gp-mute\">offline</span>") +
                       kv("Last seen", d.last_seen.empty() ? std::string("&mdash;")
                                                           : esc(d.last_seen)));
@@ -241,14 +291,15 @@ std::string render_device_info_fragment(const DeviceRow& d) {
 }
 
 std::string render_device_lens_placeholder(const std::string& active, const std::string& agent_id,
-                                           const std::string& message) {
-    return device_lens_tabs(active, agent_id) +
+                                           const std::string& message, bool tabs) {
+    return (tabs ? device_lens_tabs(active, agent_id) : std::string()) +
            "<div class=\"gp-placeholder\"><b>Coming in a later slice</b>" + esc(message) + "</div>";
 }
 
 std::string render_device_dex_lens(const std::string& agent_id, int score,
-                                   const std::vector<std::pair<std::string, std::int64_t>>& signals) {
-    std::string h = device_lens_tabs("dex", agent_id);
+                                   const std::vector<std::pair<std::string, std::int64_t>>& signals,
+                                   bool tabs) {
+    std::string h = tabs ? device_lens_tabs("dex", agent_id) : std::string();
     h += "<div class=\"gp-tiles\"><div class=\"gp-tile\">";
     if (score < 0)
         h += "<div class=\"n\">&mdash;</div>";
@@ -265,7 +316,7 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
              "<th class=\"gp-num\">Events</th></tr></thead><tbody>";
         for (const auto& [obs, count] : signals)
             h += "<tr><td>" + dex_signal_label(obs) +
-                 "</td><td class=\"gp-mute\" style=\"font-family:Consolas,monospace;font-size:.7rem\">" +
+                 "</td><td class=\"gp-mute\" style=\"font-family:var(--mds-font-family-mono);font-size:12.5px\">" +
                  esc(obs) + "</td><td class=\"gp-num\">" + std::to_string(count) + "</td></tr>";
         h += "</tbody></table>";
     }
@@ -287,77 +338,79 @@ const char* live_snapshot_css() {
     // that container and must stay styled. Generic names are prefixed (.ls-pill/.ls-sw)
     // and `.name` is scoped to `.ls-tbl` to avoid colliding with shared dashboard CSS.
     return R"CSS(<style>
-    .ls-kpis{display:flex;flex-wrap:wrap;gap:.45rem;margin:.5rem 0 .8rem}
-    .ls-kpi{background:var(--surface);border:1px solid var(--border);border-radius:.45rem;padding:.4rem .65rem;flex:1;min-width:104px}
-    .ls-kpi .n{font-size:1.1rem;font-weight:700;color:var(--fg);line-height:1.1;font-variant-numeric:tabular-nums}
-    .ls-kpi .l{font-size:.55rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-top:.1rem}
-    .grp-row{display:flex;align-items:center;justify-content:space-between;gap:.6rem;margin:.6rem 0 .3rem}
-    .ls-toggle{background:var(--mds-color-state-hover);border:1px solid var(--border);color:var(--fg);border-radius:.35rem;font-size:.66rem;padding:.2rem .55rem;cursor:pointer}
-    .ls-toggle:hover{color:var(--accent);border-color:var(--accent)}
-    .ls-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:.6rem;align-items:start}
-    .ls-card{background:var(--surface);border:1px solid var(--border);border-radius:.5rem;overflow:hidden}
-    .ls-card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:.45rem;padding:.45rem .55rem}
+    .ls-kpis{display:flex;flex-wrap:wrap;margin:12px 0 16px;border:1px solid var(--line);border-radius:var(--rad-panel);background:var(--surface)}
+    .ls-kpi{flex:1 1 104px;min-width:104px;padding:12px 16px;border-left:1px solid var(--line)}
+    .ls-kpi:first-child{border-left:0}
+    .ls-kpi .n{display:block;font-size:22px;font-weight:500;letter-spacing:-.02em;line-height:1.15;color:var(--ink);font-variant-numeric:tabular-nums}
+    .ls-kpi .l{margin-top:2px;font-size:13px;color:var(--mut)}
+    .grp-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0 8px}
+    .ls-toggle{height:28px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--raise);color:var(--ink);font-size:13px;font-weight:500;cursor:pointer}
+    .ls-toggle:hover{border-color:var(--mut);background:var(--surface2)}
+    .ls-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px;align-items:start}
+    .ls-card{border:1px solid var(--line);border-radius:var(--rad-panel);background:var(--surface);overflow:hidden}
+    .ls-card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:10px 14px}
     .ls-card>summary::-webkit-details-marker{display:none}
-    .ls-card>summary::before{content:"\25B8";color:var(--muted);font-size:.66rem;flex:0 0 .7rem}
-    .ls-card[open]>summary{border-bottom:1px solid var(--border)}
+    .ls-card>summary::before{content:"\25B8";flex:0 0 12px;color:var(--faint);font-size:12px}
+    .ls-card[open]>summary{border-bottom:1px solid var(--line)}
     .ls-card[open]>summary::before{content:"\25BE"}
-    .ls-card>summary:hover{background:var(--mds-color-state-hover)}
-    .ls-ttl{font-size:.76rem;font-weight:700;color:var(--fg);white-space:nowrap}
-    .ls-cnt{font-size:.6rem;color:var(--muted);background:var(--mds-color-state-hover);border-radius:.6rem;padding:.02rem .4rem;font-variant-numeric:tabular-nums}
+    .ls-card>summary:hover{background:var(--surface2)}
+    .ls-ttl{font-size:14px;font-weight:600;color:var(--ink);white-space:nowrap}
+    .ls-cnt{padding:0 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-variant-numeric:tabular-nums}
     .ls-cnt:empty{display:none}
-    .ls-os{font-size:.54rem;color:var(--muted);border:1px solid var(--border);border-radius:.25rem;padding:0 .3rem;text-transform:uppercase}
-    .ls-prev{flex:1 1 auto;font-size:.66rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right}
-    .ls-pop{flex:0 0 auto;background:none;border:1px solid var(--border);color:var(--muted);border-radius:.3rem;font-size:.74rem;line-height:1;padding:.12rem .35rem;cursor:pointer}
-    .ls-pop:hover{color:var(--accent);border-color:var(--accent)}
-    .ls-body{max-height:260px;overflow:auto;padding:.3rem .55rem .5rem}
-    .ls-tbl{width:100%;border-collapse:collapse;font-size:.74rem}
-    .ls-tbl th{position:sticky;top:0;background:var(--surface);text-align:left;padding:.26rem .45rem;border-bottom:1px solid var(--border);color:var(--muted);font-size:.56rem;text-transform:uppercase;letter-spacing:.05em;font-weight:700}
-    .ls-tbl td{padding:.22rem .45rem;border-bottom:1px solid rgba(45,64,104,.5)}
-    .ls-tbl .name{color:var(--fg);font-weight:600}
+    .ls-prev{flex:1 1 auto;overflow:hidden;color:var(--mut);font-size:13px;text-align:right;text-overflow:ellipsis;white-space:nowrap}
+    .ls-pop{flex:0 0 auto;padding:2px 8px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:none;color:var(--mut);font-size:13px;line-height:1;cursor:pointer}
+    .ls-pop:hover{border-color:var(--mut);color:var(--ink)}
+    .ls-body{max-height:260px;overflow:auto}
+    .ls-body>:not(table){margin-left:14px;margin-right:14px}
+    .ls-body>:not(table):first-child{margin-top:10px}
+    .ls-body>:not(table):last-child{margin-bottom:10px}
+    .ls-tbl{width:100%;border-collapse:collapse;font-size:13px}
+    .ls-tbl th{position:sticky;top:0;padding:6px 14px;border-bottom:1px solid var(--line);background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500;text-align:left}
+    .ls-tbl td{padding:7px 14px;border-bottom:1px solid var(--line);color:var(--ink2)}
+    .ls-tbl tbody tr:last-child td{border-bottom:0}
+    .ls-tbl code{font-family:var(--mds-font-family-mono);font-size:12.5px}
+    .ls-tbl .name{color:var(--ink);font-weight:600}
     .ls-num{text-align:right;font-variant-numeric:tabular-nums}
-    .ls-search{background:var(--bg);border:1px solid var(--border);border-radius:.35rem;color:var(--fg);padding:.22rem .45rem;font-size:.72rem;width:100%;margin:0 0 .35rem;box-sizing:border-box}
-    .ls-pill{font-size:.58rem;font-weight:700;border-radius:.25rem;padding:.02rem .35rem;border:1px solid var(--border)}
-    .ls-pill.dyn,.ls-pill.type{color:#a5d6ff}
-    .ls-pill.stat{color:var(--green);border-color:rgba(78,210,126,.5)}
-    .ls-pill.inc,.ls-pill.cat{color:var(--muted)}
-    .ls-sw{display:inline-block;width:1.7rem;height:.85rem;border-radius:.6rem;background:var(--border);position:relative;vertical-align:middle}
-    .ls-sw.on{background:rgba(78,210,126,.35)}
-    .ls-sw::after{content:"";position:absolute;top:.13rem;left:.14rem;width:.58rem;height:.58rem;border-radius:50%;background:var(--muted)}
-    .ls-sw.on::after{left:.98rem;background:var(--green)}
-    .src-on{color:var(--green);font-weight:600}.src-off{color:var(--muted)}
+    .ls-search{width:calc(100% - 28px);height:28px;margin-bottom:8px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font-size:13px}
+    .ls-pill{padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500}
+    .ls-sw{display:inline-block;position:relative;width:36px;height:20px;border-radius:3px;background:var(--line2);vertical-align:middle}
+    .ls-sw.on{background:var(--primary)}
+    .ls-sw::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:2px;background:var(--raise)}
+    .ls-sw.on::after{left:18px;background:var(--on-primary)}
+    .src-on{color:var(--ok);font-weight:600}.src-off{color:var(--mut)}
     .tar-tree-node{margin:0}
-    .tar-tree-node>summary{display:flex;align-items:center;list-style:none;cursor:pointer;padding:.05rem 0}
+    .tar-tree-node>summary{display:flex;align-items:center;list-style:none;cursor:pointer;padding:1px 0}
     .tar-tree-node>summary::-webkit-details-marker{display:none}
-    .tar-tree-node>summary::before{content:"\25B8";flex:0 0 1rem;text-align:center;color:var(--muted);font-size:.7rem}
+    .tar-tree-node>summary::before{content:"\25B8";flex:0 0 16px;text-align:center;color:var(--faint);font-size:12px}
     .tar-tree-node[open]>summary::before{content:"\25BE"}
-    .tar-tree-children{margin-left:.5rem;padding-left:.7rem;border-left:1px solid var(--border)}
-    .tar-tree-leaf{display:flex;align-items:center;padding:.05rem 0 .05rem 1rem}
-    .tar-tree-row{display:inline-flex;align-items:center;gap:.45rem;flex:1 1 auto;min-width:0;color:var(--fg);padding:.05rem .3rem;border-radius:.2rem;font-size:.74rem}
-    .tar-tree-row:hover{background:var(--mds-color-state-hover)}
-    .tar-tree-row[data-anom="1"]{box-shadow:inset 2px 0 0 var(--red)}
-    .tt-dot{width:.5rem;height:.5rem;border-radius:50%;flex:0 0 auto;background:var(--green);box-shadow:0 0 4px rgba(60,200,120,.5)}
-    .tt-pid{color:var(--muted);flex:0 0 auto;min-width:3.4rem;text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono)}
-    .tt-name{flex:1 1 auto;min-width:0;color:var(--fg);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .tt-hash{flex:0 0 auto;color:var(--muted);font-family:var(--mono);font-size:.64rem;white-space:nowrap;padding-left:.6rem}
-    .tt-anom{color:var(--red);flex:0 0 auto}
-    .tt-net{display:inline-flex;align-items:center;gap:.25rem;font-size:.66rem;color:var(--muted);flex:0 0 auto}
-    .tt-net-ico{color:var(--accent)}.tt-net-pub .tt-net-ico{color:var(--yellow)}
-    .tt-ep{background:var(--mds-color-state-hover);border-radius:.6rem;padding:0 .35rem;white-space:nowrap}
-    .tt-ep-pub{color:var(--yellow)}.tt-ep-more{opacity:.7}
-    .tt-group .tt-name{color:var(--fg)}
-    .tt-group-ico{color:var(--accent);flex:0 0 auto;font-size:.7rem}
-    .tt-group-count{color:var(--fg);font-weight:600;background:var(--mds-color-state-hover);border-radius:.6rem;padding:0 .4rem;font-size:.7rem}
-    .tt-meta{color:var(--muted);font-size:.7rem;white-space:nowrap}
-    dialog.ls-po{border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:.6rem;padding:0;width:82vw;max-width:1040px}
-    dialog.ls-po::backdrop{background:rgba(4,12,24,.66)}
-    .ls-po .po-head{display:flex;align-items:center;justify-content:space-between;gap:.6rem;padding:.55rem .8rem;border-bottom:1px solid var(--border)}
-    .ls-po .po-head .t{font-size:.92rem;font-weight:700;color:var(--fg)}
-    .ls-po .po-close{background:none;border:1px solid var(--border);color:var(--fg);border-radius:.35rem;padding:.2rem .55rem;cursor:pointer}
-    .ls-po .po-body{padding:.6rem .8rem;max-height:76vh;overflow:auto}
-    .ls-bar{display:inline-block;width:84px;height:.5rem;background:var(--border);border-radius:.3rem;overflow:hidden;vertical-align:middle;margin-right:.4rem}
-    .ls-bar>span{display:block;height:100%;background:var(--accent)}
-    .ls-bar-warn>span{background:var(--yellow)}.ls-bar-bad>span{background:var(--red)}
-    .ls-barlbl{font-size:.64rem;color:var(--muted);font-variant-numeric:tabular-nums}
+    .tar-tree-children{margin-left:8px;padding-left:12px;border-left:1px solid var(--line2)}
+    .tar-tree-leaf{display:flex;align-items:center;padding:1px 0 1px 16px}
+    .tar-tree-row{display:inline-flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;padding:1px 6px;border-radius:3px;color:var(--ink);font-size:13px}
+    .tar-tree-row:hover{background:var(--surface2)}
+    .tar-tree-row[data-anom="1"]{box-shadow:inset 2px 0 0 var(--bad)}
+    .tt-dot{flex:0 0 auto;width:8px;height:8px;background:var(--ok)}
+    .tt-pid{flex:0 0 auto;min-width:54px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums}
+    .tt-name{flex:1 1 auto;min-width:0;overflow:hidden;color:var(--ink);font-weight:600;text-overflow:ellipsis;white-space:nowrap}
+    .tt-hash{flex:0 0 auto;padding-left:10px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:12px;white-space:nowrap}
+    .tt-anom{flex:0 0 auto;color:var(--bad)}
+    .tt-net{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;color:var(--mut);font-size:12.5px}
+    .tt-net-ico{color:var(--primary)}.tt-net-pub .tt-net-ico{color:var(--warn)}
+    .tt-ep{padding:0 6px;border-radius:3px;background:var(--surface2);white-space:nowrap}
+    .tt-ep-pub{color:var(--warn)}.tt-ep-more{opacity:.7}
+    .tt-group .tt-name{color:var(--ink)}
+    .tt-group-ico{flex:0 0 auto;color:var(--primary);font-size:12px}
+    .tt-group-count{padding:0 6px;border-radius:3px;background:var(--surface2);color:var(--ink);font-size:12.5px;font-weight:600}
+    .tt-meta{color:var(--mut);font-size:12.5px;white-space:nowrap}
+    dialog.ls-po{width:82vw;max-width:1040px;margin:auto;padding:0;border:1px solid var(--line2);border-radius:var(--rad-over);background:var(--surface);color:var(--ink);box-shadow:var(--shadow)}
+    dialog.ls-po::backdrop{background:var(--mds-color-state-overlay-scrim)}
+    .ls-po .po-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line)}
+    .ls-po .po-head .t{font-size:14px;font-weight:600;color:var(--ink)}
+    .ls-po .po-close{height:28px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--raise);color:var(--ink);font-size:13px;font-weight:500;cursor:pointer}
+    .ls-po .po-body{max-height:76vh;overflow:auto;padding:12px 16px}
+    .ls-bar{display:inline-block;width:84px;height:6px;margin-right:8px;overflow:hidden;border-radius:2px;background:var(--line);vertical-align:middle}
+    .ls-bar>span{display:block;height:100%;background:var(--primary)}
+    .ls-bar-warn>span{background:var(--warn)}.ls-bar-bad>span{background:var(--bad)}
+    .ls-barlbl{color:var(--mut);font-size:12.5px;font-variant-numeric:tabular-nums}
     </style>)CSS";
 }
 
@@ -386,23 +439,38 @@ std::string render_device_live_shell(const std::string& agent_id) {
     // Hidden uptime loader: fills the Uptime KPI (uptime has no card of its own).
     h += "<div style=\"display:none\" hx-get=\"/fragments/device/live/run?id=" + e +
          "&amp;kind=uptime\" hx-trigger=\"load\" hx-swap=\"innerHTML\"></div>";
+    // Each card group (Live cards / Physical) is its own [data-lsgroup] container so
+    // lsToggleAll (guardian_page_ui.cpp) can scope its "expand all" to the button's
+    // OWN group only — a document-wide querySelectorAll would also snap open the
+    // OTHER group's lazy cards, firing every one of their dispatches at once (the
+    // exact storm the lazy toggle-once:closest-details design exists to prevent).
+    h += "<div class=\"ls-group\" data-lsgroup=\"live\">";
     h += "<div class=\"grp-row\"><h2 class=\"gp-sech\" style=\"margin:0\">Live cards</h2>"
          "<button class=\"ls-toggle\" onclick=\"lsToggleAll(this)\">Expand all</button></div>";
     h += "<div class=\"ls-grid\">";
     // One collapsed card per kind; its body auto-dispatches the live query on load
     // (same proven run/poll seam as before) and renders into the scrollable body.
-    auto card = [&](const char* kind, const char* title, const char* os_tag, const char* preview) {
+    auto card = [&](const char* kind, const char* title, const char* os_tag, const char* preview,
+                    bool lazy = false) {
         std::string c = "<details class=\"ls-card\"><summary><span class=\"ls-ttl\">" +
                         std::string(title) + "</span><span class=\"ls-cnt\" id=\"ls-cnt-" + kind +
                         "\"></span>";
         if (os_tag && *os_tag)
-            c += "<span class=\"ls-os\">" + std::string(os_tag) + "</span>";
+            c += "<span class=\"os-tag\">" + std::string(os_tag) + "</span>";
+        // Eager cards dispatch on load (the proven run/poll seam); the new Physical
+        // cards are behind a collapsed <details> by default, so lazy=true defers
+        // dispatch to first expand (htmx 2.0.4 `EVENT MODIFIER from:SELECTOR`
+        // grammar — see dashboard_ui.cpp/settings_ui.cpp's "... from:body" and
+        // tar_tree_routes.cpp's "change from:#tar-tree-host" for the same "from:"
+        // usage already relied on in this codebase; "closest details" is htmx's
+        // standard extended CSS selector for the nearest ancestor <details>).
         c += "<span class=\"ls-prev\">" + std::string(preview) +
              "</span><button class=\"ls-pop\" title=\"Pop out\" onclick=\"lsPopOut(event,this)\">"
              "&#10530;</button></summary>"
              "<div class=\"ls-body\" hx-get=\"/fragments/device/live/run?id=" +
-             e + "&amp;kind=" + kind +
-             "\" hx-trigger=\"load\" hx-swap=\"innerHTML\"><div class=\"gp-mute\">Loading&hellip;"
+             e + "&amp;kind=" + kind + "\" hx-trigger=\"" +
+             (lazy ? "toggle once from:closest details" : "load") +
+             "\" hx-swap=\"innerHTML\"><div class=\"gp-mute\">Loading&hellip;"
              "</div></div></details>";
         return c;
     };
@@ -419,7 +487,31 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("connections", "Active connections", "", "established");
     h += card("capture_sources", "Capture sources", "", "TAR local capture");
     h += card("disk", "Disk space", "", "system volume only");
-    h += "</div></div>";
+    h += "</div>"; // close .ls-grid (live)
+    h += "</div>"; // close .ls-group[data-lsgroup=live]
+    // Physical cards are lazy (dispatch only on individual expand) — their OWN
+    // "Expand all" reuses lsToggleAll(this), scoped to this group by data-lsgroup
+    // above, so a deliberate click here mass-expands only these 10 (a legitimate,
+    // explicit dispatch of all 10), never as a side effect of the Live-cards button.
+    h += "<div class=\"ls-group\" data-lsgroup=\"physical\">";
+    h += "<div class=\"grp-row\"><h2 class=\"gp-sech\" style=\"margin:0\">Physical</h2>"
+         "<button class=\"ls-toggle\" onclick=\"lsToggleAll(this)\">Expand all</button></div>";
+    h += "<div class=\"ls-grid\">";
+    h += card("hw_disks", "Disks", "", "model &middot; size &middot; interface", true);
+    h += card("hw_memory", "Memory", "", "slots &middot; size &middot; speed", true);
+    h += card("hw_processors", "Processors", "", "cores &middot; threads &middot; clock", true);
+    h += card("hw_drivers", "Drivers", "Win and Linux", "name &middot; version &middot; provider",
+              true);
+    h += card("battery", "Battery", "", "state &middot; percent &middot; health", true);
+    h += card("thermal", "Thermal", "", "zones &middot; temperature", true);
+    h += card("smart", "Disk health (SMART)", "Win and macOS", "health &middot; wear &middot; spare",
+              true);
+    h += card("volumes", "Volumes", "Win and macOS", "mounts &middot; filesystem &middot; size", true);
+    h += card("adapters", "Network adapters", "", "MAC &middot; speed &middot; status", true);
+    h += card("wifi", "Wi-Fi", "", "SSID &middot; signal &middot; security", true);
+    h += "</div>"; // close .ls-grid (physical)
+    h += "</div>"; // close .ls-group[data-lsgroup=physical]
+    h += "</div>"; // close #device-live-snapshot
     return h;
 }
 
@@ -458,12 +550,12 @@ std::string render_device_live_processes(const std::vector<LiveProcess>& procs) 
         h += "<td class=\"gp-num\">" + std::to_string(p.pid) + "</td>";
         h += "<td><div class=\"name\">" + esc(p.name) + "</div>";
         if (!p.path.empty())
-            h += "<div class=\"gp-mute\" style=\"font-family:var(--mono);font-size:.62rem;"
+            h += "<div class=\"gp-mute\" style=\"font-family:var(--mds-font-family-mono);font-size:12px;"
                  "overflow-wrap:anywhere\">" +
                  esc(p.path) + "</div>";
         h += "</td>";
         if (!p.sha256.empty())
-            h += "<td><code style=\"font-family:var(--mono);font-size:.66rem\" title=\"" +
+            h += "<td><code style=\"font-family:var(--mds-font-family-mono);font-size:12.5px\" title=\"" +
                  esc(p.sha256) + "\">" + esc(p.sha256.substr(0, 16)) + "\xE2\x80\xA6</code></td>";
         else
             h += "<td class=\"gp-mute\">&mdash;</td>";
@@ -703,11 +795,10 @@ std::string render_device_live_arp(const std::vector<LiveArpEntry>& rows) {
     std::string h = "<table class=\"ls-tbl\"><thead><tr><th>Interface</th><th>IP</th><th>MAC</th>"
                     "<th>Type</th></tr></thead><tbody>";
     for (const auto& r : rows) {
-        const char* cls = r.type == "static" ? "stat" : r.type == "incomplete" ? "inc" : "dyn";
         h += tr(lc(r.iface + " " + r.ip + " " + r.mac),
                 {"<span class=\"name\">" + esc(r.iface) + "</span>", "<code>" + esc(r.ip) + "</code>",
                  r.mac.empty() ? "<span class=\"gp-mute\">-</span>" : "<code>" + esc(r.mac) + "</code>",
-                 "<span class=\"ls-pill " + std::string(cls) + "\">" + esc(r.type) + "</span>"});
+                 "<span class=\"ls-pill\">" + esc(r.type) + "</span>"});
     }
     h += "</tbody></table>";
     return h;
@@ -723,7 +814,7 @@ std::string render_device_live_dns(const std::vector<LiveDnsEntry>& rows) {
     for (const auto& r : rows)
         h += tr(lc(r.name + " " + r.record_type),
                 {"<span class=\"name\">" + esc(r.name) + "</span>",
-                 "<span class=\"ls-pill type\">" + esc(r.record_type) + "</span>"});
+                 "<span class=\"ls-pill\">" + esc(r.record_type) + "</span>"});
     h += "</tbody></table>";
     return h;
 }
@@ -854,6 +945,43 @@ std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows) {
     return h;
 }
 
+/// Generic table renderer backing the 10 round-3 item 11 "physical-kit" live-info
+/// kinds (disks, memory, processors, drivers, battery, thermal, disk health,
+/// volumes, network adapters, Wi-Fi) added via a data-only LiveKind.columns /
+/// .row_prefix extension in live_kinds.hpp — no per-kind bespoke renderer needed
+/// since the wire shape is uniform pipe-delimited rows whose field order already
+/// matches the declared column order. Parsing/prefix filtering happens in
+/// device_routes.cpp's render_live_result, NOT here — this function is pure over
+/// already-parsed rows, matching every other render_device_live_* function in
+/// this file. `raw_rows` are lines that did NOT match the kind's row_prefix
+/// (e.g. a plugin-emitted "warning|..."/"error|..." diagnostic alongside its
+/// data rows) — preserved verbatim rather than silently dropped, rendered as
+/// their own full-width diagnostic row at the end of the table body, muted via
+/// this file's established `gp-mute` convention for a diagnostic/placeholder
+/// cell (see e.g. dex_perf_ui.cpp / dex_app_perf_ui.cpp's `colspan` + `gp-mute`
+/// "n too small" rows) rather than inventing a new one.
+std::string render_device_live_generic(const std::vector<std::string>& columns,
+                                       const std::vector<std::vector<std::string>>& rows,
+                                       const std::vector<std::string>& raw_rows) {
+    if (rows.empty() && raw_rows.empty())
+        return "<div class=\"gp-note\">Not available on this platform, or the table is empty.</div>";
+    const std::string colspan = std::to_string(columns.size());
+    std::string h = "<table class=\"ls-tbl\"><thead><tr>";
+    for (const auto& c : columns) h += "<th>" + esc(column_label(c)) + "</th>";
+    h += "</tr></thead><tbody>";
+    for (const auto& row : rows) {
+        h += "<tr>";
+        for (const auto& cell : row)
+            h += "<td>" + (cell.empty() ? "<span class=\"gp-mute\">&mdash;</span>" : esc(cell)) + "</td>";
+        h += "</tr>";
+    }
+    for (const auto& raw : raw_rows)
+        h += "<tr class=\"ls-raw\"><td colspan=\"" + colspan + "\" class=\"gp-mute\">" + esc(raw) +
+             "</td></tr>";
+    h += "</tbody></table>";
+    return h;
+}
+
 std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows) {
     if (rows.empty())
         return "<div class=\"gp-note\">TAR is not running on this device, or it reported no "
@@ -873,15 +1001,15 @@ std::string render_device_live_capture_sources(const std::vector<LiveCaptureSour
                                           : std::to_string(r.live_rows);
         h += "<tr><td>" + sw + "</td><td>" + nm + "</td><td><code>$" + esc(r.dollar) +
              "_Live</code></td><td class=\"ls-num\">" + rows_cell +
-             "</td><td><span class=\"ls-pill cat\">" + esc(r.category) + "</span></td></tr>";
+             "</td><td><span class=\"ls-pill\">" + esc(r.category) + "</span></td></tr>";
     }
     h += "</tbody></table>";
     return h;
 }
 
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards) {
-    std::string h = device_lens_tabs("guardian", agent_id);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs) {
+    std::string h = tabs ? device_lens_tabs("guardian", agent_id) : std::string();
     if (guards.empty()) {
         h += "<div class=\"gp-placeholder\"><b>No guards evaluated</b>No Guardian guards have been "
              "evaluated on this device yet.</div>";
@@ -904,7 +1032,7 @@ std::string render_device_guardian_lens(const std::string& agent_id,
              "</td><td class=\"gp-mute\">" + esc(g.updated_at) + "</td></tr>";
     h += "</tbody></table>";
     h += "<div class=\"gp-note\">Per-guard state from "
-         "<span style=\"font-family:Consolas,monospace\">guardian_agent_rule_status</span>. "
+         "<span style=\"font-family:var(--mds-font-family-mono)\">guardian_agent_rule_status</span>. "
          "Baseline grouping + a live re-evaluate are follow-ups.</div>";
     return h;
 }
@@ -941,6 +1069,13 @@ std::string render_device_not_found(const std::string& agent_id) {
     return "<a class=\"gp-back\" href=\"/devices\">&larr; Devices</a>"
            "<div class=\"gp-placeholder\"><b>Device not found</b>No enrolled device with id " +
            esc(agent_id) + ".</div>";
+}
+
+std::string render_device_degraded(const std::string& agent_id) {
+    return "<a class=\"gp-back\" href=\"/devices\">&larr; Devices</a>"
+           "<div class=\"gp-placeholder\"><b>Device data unavailable</b>The device store is "
+           "temporarily degraded &mdash; try again shortly (" +
+           esc(agent_id) + ").</div>";
 }
 
 } // namespace yuzu::server

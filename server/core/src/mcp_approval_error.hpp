@@ -76,4 +76,27 @@ template <ApprovalA4Error A4Error>
                     5000);
 }
 
+/// Read-only counterpart of `approval_store_error_body` above, for
+/// `list_pending_approvals`/`get_pending_approval_count` (review finding, PR
+/// #4656): both previously answered EVERY store failure with the transient
+/// `approval store degraded` + `retry_after_ms=5000`, the same unbounded
+/// "retry forever" bug the ticket-consume path already had a fix for. Not
+/// simply reusing `approval_store_error_body` here: its remediation text is
+/// about a specific TICKET's consumption state ("the approval was not
+/// consumed", "do NOT request a fresh one"), which is meaningless for a
+/// plain list/count read that never named a ticket. Same permanent-vs-
+/// transient classification, generic read-appropriate wording; REST's
+/// `approval_store_error_json` (rest_api_v1.cpp) is this function's REST
+/// counterpart and intentionally uses the same two messages.
+template <ApprovalA4Error A4Error>
+[[nodiscard]] std::string approval_store_read_error_body(const ApprovalManager& mgr,
+                                                          const A4Error& a4_error,
+                                                          std::string_view sqlstate) {
+    if (!mgr.is_open() || is_permanent_pg_error(sqlstate))
+        return a4_error(kInternalError, "approval store unavailable",
+                        "this will NOT clear on retry; escalate to an operator");
+    return a4_error(kInternalError, "approval store degraded",
+                    "retry shortly; if this persists, escalate to an operator", 5000);
+}
+
 } // namespace yuzu::server::mcp

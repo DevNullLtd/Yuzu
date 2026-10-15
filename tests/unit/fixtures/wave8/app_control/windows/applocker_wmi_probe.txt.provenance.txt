@@ -1,0 +1,6 @@
+host: the-rig (Microsoft Windows 11 Pro 10.0.26200 build 26200, x64)
+identity: nt authority\system (scheduled task, RunLevel Highest)
+date: 2026-09-21T15:29:55.4194287+01:00
+command: throwaway MSVC probe (not committed) calling yuzu::shared::wmi::run_bounded_wmi_query(L"root\StandardCimv2\Security\ApplicationControl", L"SELECT * FROM MSFT_ApplockerPolicy") - the SAME bounded helper agents/plugins/app_control uses; output: error=wmi_connect_failed_0x8004100e rows=0 truncated=0
+status: REAL CAPTURE (rig session A) - class-ABSENT outcome (WBEM_E_INVALID_NAMESPACE 0x8004100e), the case classify_cim_error maps to the SrpV2 registry fallback
+cross-checks from the same task: Get-CimClass root\StandardCimv2\Security\ApplicationControl MSFT_ApplockerPolicy -> 'Invalid namespace' (PowerShell surfaces the managed HRESULT 0x80131500, not the raw WMI code); root\StandardCimv2 contains only: MS_809 MS_409 embedded; reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2 /s -> ERROR: The system was unable to find the specified registry key or value.

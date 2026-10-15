@@ -1,0 +1,45 @@
+status: REAL CAPTURE
+
+host: ubuntu:26.04 (linux/arm64) Docker container on this Mac, cupsd 2.4.16
+      (`Require user @OWNER @SYSTEM` on Cancel-Job; `SystemGroup root
+      lpadmin` — nobody is in neither)
+date: 2026-09-08 (UTC, see `date -u` at capture time)
+identity: `su -s /bin/sh nobody -c 'id -u'` = 65534 (nobody, real container
+          identity — the capturing shell itself is nobody, not merely a
+          spoofed header)
+
+request: Cancel-Job (0x0008), printer `yuzu_test`, job-id 2, requesting-
+user-name=nobody, request-id 1 — plus header `Authorization: PeerCred
+nobody`. Job 2 was submitted as `root` (`lp -d yuzu_test /etc/hosts`).
+
+exact command:
+  cd tests/unit/fixtures/wave9/printing/linux
+  python3 build_request.py cancel-job yuzu_test 2 nobody > /tmp/reqs/req2.ipp
+  su -s /bin/sh nobody -c \
+    'curl --unix-socket /run/cups/cups.sock -s -X POST \
+        -H "Content-Type: application/ipp" \
+        -H "Authorization: PeerCred nobody" \
+        --data-binary @/tmp/reqs/req2.ipp \
+        http://localhost/ -o cancel_job_nobody_vs_root.ipp'
+
+decoded result: 395 bytes; HTTP 403 Forbidden. The body is NOT an IPP
+message — cupsd refused the request at the HTTP/auth layer before ever
+reaching the IPP Cancel-Job handler, and returned its standard HTML
+"Forbidden - CUPS v2.4.16 ... Your account does not have the necessary
+privileges." error page (verified: `curl -w '%{http_code}'` against the
+same request body returns literal `403`; `ipp::decode()` on this fixture's
+bytes returns `std::nullopt` — the leading `<!DOCTYPE HTML ...` bytes are
+not a valid IPP delimiter tag and no attribute group is ever open, so
+decode's "value tag before any group has opened" bounds check rejects it
+immediately, safely). Verified afterward: `lpstat -o yuzu_test` still
+lists job 2 — the cancel did NOT take effect.
+
+WHAT THIS PROVES: the identity-mismatch control P93-1's macOS capture
+explicitly could not reach. `nobody` is neither the job's owner nor a
+member of `@SYSTEM` (SystemGroup root lpadmin), so cupsd's `Require user
+@OWNER @SYSTEM` policy on Cancel-Job refuses the request outright — this
+is real evidence that CUPS/cupsd DOES enforce ownership on Linux, and that
+printing_plugin.cpp's own `result.http_status == 401 || result.http_status
+== 403` branch (which never calls `ipp::decode()` on a refused response's
+body) is the correct handling: this fixture's body is exactly the kind of
+non-IPP payload that branch exists to avoid feeding to the decoder.

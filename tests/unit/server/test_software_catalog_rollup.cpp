@@ -17,8 +17,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <yuzu/metrics.hpp>
+
 #include <chrono>
 #include <stdexcept>
+#include <thread>
 
 using yuzu::server::SoftwareCatalogRollup;
 using yuzu::server::SoftwareInventoryStore;
@@ -29,14 +32,17 @@ namespace {
 // identical setup as test_software_inventory_store.cpp (first build wins) —
 // the store set here is exactly {SoftwareInventoryStore}.
 yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
-    PgPool pool{{.conninfo = dsn, .size = 1}};
-    SoftwareInventoryStore store{pool};
-    // Throw, don't return: a silently-unmigrated template would make every
-    // clone fall back to in-test migration — correct but slow, defeating the
-    // point. PgTestTemplate::build records the throw as a fixture error.
-    if (!store.is_open())
-        throw std::runtime_error("swinv template: store failed to migrate");
-}};
+                                         PgPool pool{{.conninfo = dsn, .size = 1}};
+                                         SoftwareInventoryStore store{pool};
+                                         // Throw, don't return: a silently-unmigrated template
+                                         // would make every clone fall back to in-test migration —
+                                         // correct but slow, defeating the point.
+                                         // PgTestTemplate::build records the throw as a fixture
+                                         // error.
+                                         if (!store.is_open())
+                                             throw std::runtime_error(
+                                                 "swinv template: store failed to migrate");
+                                     }};
 } // namespace
 
 TEST_CASE("SoftwareCatalogRollup thread lifecycle", "[pg][software_inventory][rollup]") {
@@ -75,4 +81,39 @@ TEST_CASE("SoftwareCatalogRollup thread lifecycle", "[pg][software_inventory][ro
         } // dtor → stop() → join
         SUCCEED("dtor joined the running thread");
     }
+}
+
+TEST_CASE("SoftwareCatalogRollup::request_stop — no NEW recompute starts, the thread exits, stop() "
+          "still joins",
+          "[pg][software_inventory][rollup]") {
+    // HA WS-8 (RD-1): stop() calls request_stop() when draining begins so an hourly
+    // recompute cannot START inside the drain grace and then run its full statement
+    // budget after it. A 1s interval makes the loop re-arm after one 5s sleep step,
+    // so without request_stop() a second recompute would run inside the window below.
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    auto recomputes = [&] {
+        return metrics.counter("yuzu_inventory_catalog_rollup_total", {{"outcome", "success"}})
+                   .value() +
+               metrics.counter("yuzu_inventory_catalog_rollup_total", {{"outcome", "error"}})
+                   .value();
+    };
+
+    SoftwareCatalogRollup rollup{store, std::chrono::seconds{1}, &metrics};
+    rollup.start();
+    for (int i = 0; i < 100 && recomputes() < 1; ++i) // the immediate first recompute
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    REQUIRE(recomputes() == 1);
+
+    rollup.request_stop();                                // must not block
+    std::this_thread::sleep_for(std::chrono::seconds{7}); // > one 5s re-arm step
+    CHECK(recomputes() == 1);                             // no new recompute started
+
+    const auto t = std::chrono::steady_clock::now();
+    rollup.stop(); // the thread already exited on the flag; the join is immediate
+    CHECK(std::chrono::steady_clock::now() - t < std::chrono::seconds{1});
 }

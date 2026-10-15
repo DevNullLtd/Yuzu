@@ -1,0 +1,16 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-17 · euid 501 · leg-hash 421f7d82a099
+== action=shimcache
+shimcache|unsupported|windows_only_artefact
+[result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
+[rc] 1
+
+== action=amcache
+amcache|unsupported|windows_only_artefact
+[result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
+[rc] 1
+
+== action=prefetch
+prefetch|unsupported|windows_only_artefact
+[result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
+[rc] 1
+

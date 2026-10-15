@@ -47,13 +47,13 @@ struct BreakGlassFixture {
     // Complete a real MFA enrollment for `name` so break_glass_account_problem
     // sees an enrolled second factor.
     void enroll_mfa(const std::string& name) {
-        auto init = db->mfa_init_enrollment(name, "Yuzu");
+        auto init = db->mfa_init_enrollment(name, "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         auto bytes = mfa::base32_decode(init->secret_base32);
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(db->mfa_verify_enrollment(name, code).has_value());
+        REQUIRE(db->mfa_verify_enrollment(name, code, std::nullopt).has_value());
     }
 };
 

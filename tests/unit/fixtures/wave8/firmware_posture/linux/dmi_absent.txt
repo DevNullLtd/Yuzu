@@ -1,0 +1,4 @@
+bios_vendor=!ENOENT
+bios_version=!ENOENT
+bios_date=!ENOENT
+bios_release=!ENOENT

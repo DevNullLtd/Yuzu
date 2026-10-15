@@ -173,5 +173,4 @@ connected|unknown|Wi-Fi connection state could not be determined (NetworkManager
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: `tests/unit/test_wifi_corewlan.cpp` · `tests/unit/test_wifi_local_dispatcher.cpp` · `tests/unit/test_wifi_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2215-wifi-connected-corewlan.added.md` · `changelog.d/wave4-pr41b-wifi-native-dbus.changed.md`
 <!-- END GENERATED -->

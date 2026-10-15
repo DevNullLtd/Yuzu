@@ -1,6 +1,8 @@
 #pragma once
 
-// installed_apps_macos_enrich.hpp -- #2273 macOS `list_inventory` enrichment:
+// installed_apps_macos_enrich.hpp -- #2273 macOS `list_inventory` enrichment (and, since
+// ADR-0028's binding condition, the `list` action's bundle_id -- now read by the
+// agent-core bounded pass, see installed_apps_bundle_ids.hpp):
 // per-app bundle identifier + signer + integrity, read NATIVELY (CFBundle +
 // Security.framework's SecStaticCode API), never a subprocess. Modeled on
 // certificates_plugin.cpp's read_keychain_secitem() for the
@@ -39,6 +41,11 @@
 // open decision for the repo owner, recorded here and in the gate report,
 // deliberately not taken unilaterally in this PR.
 //
+// ADR-0028 binding condition (list-only): the `list` action's trailing bundle_id
+// column is an operator-facing column only (read by yuzu::agent::
+// read_bundle_ids_bounded, NOT by this header); the ADR-0016 InvRecord is
+// untouched (see the next paragraph).
+//
 // ADR-0016 CRITICAL: the blob-v2 12-field row (installed_apps_inventory.hpp)
 // is hashed byte-identically on agent and server. This header hands its
 // caller a bundle id, publisher, and a binary signed/unsigned verdict; the
@@ -53,6 +60,7 @@
 
 #include <string>
 
+#include <yuzu/agent/cf_bundle_id.hpp>
 #include <yuzu/agent/scoped_cfref.hpp>
 
 #ifdef YUZU_HAVE_SECURITY_FRAMEWORK
@@ -74,34 +82,6 @@ struct EnrichResult {
 
 #ifdef YUZU_HAVE_SECURITY_FRAMEWORK
 
-namespace detail {
-
-inline std::string cfstring_to_utf8(CFStringRef s) {
-    if (!s)
-        return {};
-    // CFStringGetCStringPtr is a fast-path that may return null even for a
-    // valid string (no guaranteed backing UTF-8 buffer); CFStringGetCString
-    // always works and is what's used here, matching read_keychain_secitem's
-    // sibling code in certificates_plugin.cpp for CF string extraction.
-    const CFIndex len = CFStringGetLength(s);
-    if (len <= 0)
-        return {};
-    const CFIndex raw_max = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8);
-    // Documented to return kCFNotFound (-1) if the conversion size cannot be
-    // computed; +1 would then make a 0-sized buffer and CFStringGetCString
-    // would be handed a zero capacity.
-    if (raw_max <= 0)
-        return {};
-    const CFIndex max_bytes = raw_max + 1;
-    std::string out(static_cast<std::size_t>(max_bytes), '\0');
-    if (!CFStringGetCString(s, out.data(), max_bytes, kCFStringEncodingUTF8))
-        return {};
-    out.resize(std::char_traits<char>::length(out.c_str()));
-    return out;
-}
-
-} // namespace detail
-
 // Enrich one app bundle at `app_path` (an absolute .app path, taken from a
 // system_profiler "Location:" line -- see installed_apps_parsers.hpp).
 // Every CoreFoundation object here is ScopedCFRef-owned (scoped_cfref.hpp) --
@@ -120,15 +100,8 @@ inline EnrichResult enrich_app(const std::string& app_path) {
     if (!url)
         return out;
 
-    // -- bundle identifier via CFBundle --
-    if (auto* raw_bundle = CFBundleCreate(nullptr, url.get())) {
-        yuzu::agent::ScopedCFRef<CFBundleRef> bundle(raw_bundle);
-        // CFBundleGetIdentifier returns a BORROWED (Get-rule) reference owned
-        // by the bundle -- never itself ScopedCFRef-wrapped, matching
-        // certificates_plugin.cpp's own borrowed-vs-owned discipline.
-        if (CFStringRef ident = CFBundleGetIdentifier(bundle.get()))
-            out.bundle_id = detail::cfstring_to_utf8(ident);
-    }
+    // -- bundle identifier via CFBundle (shared read, see yuzu/agent/cf_bundle_id.hpp) --
+    out.bundle_id = yuzu::agent::bundle_id_for_url(url.get());
 
     // -- signer + integrity via SecStaticCode --
     // ADOPT FIRST, TEST SECOND. Testing the status before adopting leaves a
@@ -204,7 +177,7 @@ inline EnrichResult enrich_app(const std::string& app_path) {
         CFStringRef raw_name = nullptr;
         if (SecCertificateCopyCommonName(leaf, &raw_name) == errSecSuccess && raw_name) {
             yuzu::agent::ScopedCFRef<CFStringRef> common_name(raw_name);
-            out.publisher = detail::cfstring_to_utf8(common_name.get());
+            out.publisher = yuzu::agent::cfstring_to_utf8(common_name.get());
         }
     }
     return out;

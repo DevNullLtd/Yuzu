@@ -90,8 +90,9 @@ Do not install the root LaunchDaemon, grant Full Disk Access, or test live
 Endpoint Security without explicit test-rig authorization. A valid signature, a
 running process, or polling fallback does not prove live ES: `tar.status` must
 report `process_capture_method|endpoint_security`, followed by a unique observed
-exec and exit with checked drop counters. The full Xcode SDK is required; Command
-Line Tools builds only TAR's polling fallback. CMS sidecars must cover final
+exec and exit with checked drop counters. The active SDK must ship the Endpoint
+Security header and library stub; both the Command Line Tools and full Xcode
+SDKs do. CMS sidecars must cover final
 Apple-signed plugin bytes; stale sidecars are rejected. When input plugins carry
 sidecars, provide `--final-plugin-sig-dir`, `--plugin-trust-bundle` and
 `--runtime-plugin-trust-bundle`. The helper invokes Yuzu's shared CMS verifier on

@@ -281,7 +281,7 @@ Operator                     Server                                  Agent
 
 **Why a single-flight cache?** A topology fetch fans out to every agent in scope, so concurrent operator requests would otherwise dispatch N parallel `tar.fleet_snapshot` storms. The store coalesces concurrent misses onto one refill goroutine; in-flight waiters block on a condition variable up to a bounded timeout; subsequent gets within the 5 s TTL hit the cache.
 
-**Why ES modules + importmap rather than UMD?** Three.js dropped UMD in r150+ — modern releases only publish `three.module.min.js`. The page declares an importmap mapping the bare specifier `"three"` to the vendored bundle, so OrbitControls' own `import { ... } from 'three'` resolves through the same map without a build-time bundler. Browser support floor: Chrome 89 / Firefox 108 / Safari 16.4 (importmap), all comfortably below the dashboard's existing baseline.
+**Why ES modules + importmap rather than UMD?** Three.js dropped UMD in r150+ — modern releases only publish `three.module.min.js`. The page declares an importmap mapping the bare specifier `"three"` to the vendored bundle, so OrbitControls' own `import { ... } from 'three'` resolves through the same map without a build-time bundler. Importmap alone needs Chrome 89 / Firefox 108 / Safari 16.4, but the shared dashboard stylesheet (`color-mix()`, `:has()`) sets the real floor for every page: Chrome/Edge 111, Firefox 121, Safari 16.2, with this page's importmap raising Safari to 16.4 (see "Browser requirements" in `docs/user-manual/server-admin.md`).
 
 **Why a kill switch?** WebGL has a much larger attack surface than HTML, the renderer module is large (~6 KB hand-written + ~717 KB vendored), and the data path fans out to every agent. Operators who never use the feature should be able to disable it cleanly. `--viz-disable` (or `YUZU_VIZ_DISABLE=1`) makes both the page and the REST surface return 503 with an audit row, ahead of any RBAC check (tier-before-permission per `docs/auth-architecture.md` §3).
 
@@ -300,7 +300,7 @@ in-process-untestable handler is an authorization/CSRF/scope-check blind spot) i
 surfaces this prose previously credited to this inline count have moved to their own
 `HttpRouteSink` modules: `POST /api/command` is `command_routes.cpp` (#2557); the
 page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
-`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is
+`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 29 routes — is
 `page_routes.{hpp,cpp}` (#2542 PR-2); a #2542 follow-up split 10 further scattered routes into
 `dashboard_api_routes.{hpp,cpp}` (`/api/me`, `/api/agents`, `/api/audit`, `POST
 /api/export/json-to-csv`, `POST /api/scope/validate`, `/api/analytics/{status,recent}`; 7 routes)
@@ -444,20 +444,22 @@ campaign's inline-route-extraction goal is complete.
 | Agent identity | SQLite (`agent.db`) | Persistent agent_id, enrollment state |
 | Agent KV storage | SQLite (`agent.db`) | Cross-instruction persistent state |
 | Server substrate | **PostgreSQL** (shared `PgPool`) | Server storage substrate (ADR-0006/0007); server **fails closed** without it |
-| Server offline-endpoint state | **PostgreSQL** (`endpoint_state`) | Last-known per-agent identity + last-seen; renders offline hosts stale-flagged on `/viz/fleet` (first born-on-Postgres store) |
-| Server responses | SQLite (sharded) | Command response persistence with TTL *(SQLite today; per-store PG migration pending)* |
-| Server audit | SQLite | User action audit trail *(SQLite today; per-store PG migration pending)* |
-| Server identity/auth | AuthDB (`auth.db`) + config files (`.cfg`) | Users, tokens, enrollment, settings *(AuthDB since v0.12.0; per-store PG migration pending)* |
-| NVD/CVE data | SQLite | Vulnerability database |
-| Policy state | SQLite | Rule evaluation history, compliance |
-| Threat-graph recommendations *(proposed, §28.9)* | SQLite (`recommendations.db`) | Agentic-AI-produced hardening suggestions awaiting operator accept/dismiss/apply |
-| VirusTotal hash cache *(proposed, §28.8)* | SQLite (`virustotal_cache.db`) | Rate-limited hash→verdict cache; 7-day TTL; keyed on SHA-256 |
+| Server offline-endpoint state | **PostgreSQL** (`endpoint_state`) | Last-known per-agent identity + last-seen; renders offline hosts stale-flagged on `/viz/fleet` (first born-on-Postgres store); erased per device by the decommission cascade (#5682) |
+| Server responses | **PostgreSQL** (shared `PgPool`) | Command response persistence with TTL |
+| Server audit | **PostgreSQL** (shared `PgPool`) | User action audit trail |
+| Server identity/auth | **PostgreSQL** (`auth` + `scim_store` schemas) + config files (`.cfg`) | Users, tokens, enrollment, settings |
+| NVD/CVE data | SQLite (`nvd_cves.db`) | Vulnerability database *(the one server store still on SQLite — a recorded deferral, not an exemption; see `docs/postgres-migration-ladder.md`)* |
+| Policy state | **PostgreSQL** (shared `PgPool`) | Rule evaluation history, compliance |
+| Threat-graph recommendations *(proposed, §28.9)* | **PostgreSQL** (born-on-PG, ADR-0006) | Agentic-AI-produced hardening suggestions awaiting operator accept/dismiss/apply |
+| VirusTotal hash cache *(proposed, §28.8)* | **PostgreSQL** (born-on-PG, ADR-0006) | Rate-limited hash→verdict cache; 7-day TTL; keyed on SHA-256 |
 
 **Substrate: PostgreSQL on the server, SQLite on the agent (ADR-0006, 2026-06-09).** As of the
 flip (#1320 PR 3) the server **constructs a shared PostgreSQL pool at startup and fails closed
-without it** — the substrate is live, not aspirational, and the rows above marked "per-store PG
-migration pending" still open their own SQLite files only because each store migrates
-incrementally behind its own ADR. The SQLite-everywhere principle has been **retired for the
+without it** — the substrate is live, not aspirational. Every server store except the NVD/CVE
+cache is on the shared pool. `NvdDatabase` is a **recorded deferral, not an exemption**: it was
+kept on SQLite to ship matching precision sooner, and its born-on-PG reshape stays queued as
+vuln-scan milestone M1a (`docs/postgres-migration-ladder.md`) — ADR-0006's end state, no server
+store on SQLite, still applies to it. The SQLite-everywhere principle has been **retired for the
 server**. PostgreSQL is the standard server-side storage substrate, driven by cross-store
 joins (the vuln-graph scoring join `edges ⨝ findings ⨝ value ⨝ guardian_state`), >1M-agent
 scale (1.2M at HSBC), durable offline-endpoint state, and pgvector identity matching. **SQLite
@@ -465,13 +467,14 @@ is retained on the agent** — embedded-on-endpoint, zero-config, ~600KB, the fe
 warehouse (ADR-0003) and `agent.db` KV/identity — because endpoint locality is exactly what
 makes SQLite right there.
 
-New server stores default to Postgres; the existing server SQLite stores migrate
-incrementally, each behind its own per-store ADR + migration plan (`SqliteTxn`/`SqliteStmt`
-→ a pg transaction owner; `MigrationRunner` → a pg schema-migration mechanism). This is a
-**breaking deployment change** — the server gains an external database dependency (compose,
-Dockerfile, systemd, UAT/demo rigs, install docs, a CI Postgres service). Secrets are **not**
-a plain Postgres column (envelope encryption / KMS / `pgcrypto`, separate review). Substrate
-decision of record: `docs/adr/0006-server-postgresql-substrate.md` (generalising ADR-0004).
+New server stores default to Postgres. The existing server stores other than `NvdDatabase` were
+migrated incrementally, each behind its own per-store ADR + migration plan
+(`SqliteTxn`/`SqliteStmt` → a pg transaction owner; `MigrationRunner` → a pg schema-migration
+mechanism). This is a **breaking deployment change** — the server gains an external database
+dependency (compose, Dockerfile, systemd, UAT/demo rigs, install docs, a CI Postgres service).
+Secrets are **not** a plain Postgres column (envelope encryption / KMS / `pgcrypto`, separate
+review). Substrate decision of record: `docs/adr/0006-server-postgresql-substrate.md`
+(generalising ADR-0004).
 
 ## Plugin Architecture
 

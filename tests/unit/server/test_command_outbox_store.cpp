@@ -15,6 +15,7 @@
 // a live elector (mirrors test_leader_elector.cpp's own fence cases).
 
 #include "command_outbox_store.hpp"
+#include "execution_tracker.hpp" // #4982 round 3: mark_sent_with_target's cross-schema target write
 #include "leader_elector.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -50,6 +51,12 @@ yuzu::test::PgTestTemplate command_outbox_tpl{"commandoutbox", [](const std::str
         yuzu::server::LeaderElector::Config{.dsn = dsn, .holder_id = "template"}};
     if (!le.is_open())
         throw std::runtime_error("command_outbox template: leader_elector failed to migrate");
+    // #4982 round 3: mark_sent_with_target writes cross-schema into
+    // execution_tracker.executions — migrate that schema too so the fixture DB
+    // has the table.
+    yuzu::server::ExecutionTracker et{pool};
+    if (!et.is_open())
+        throw std::runtime_error("command_outbox template: execution_tracker failed to migrate");
 }};
 
 // RAII bundle: ephemeral DB + pool + store + a LIVE elector holding leadership,
@@ -67,6 +74,10 @@ public:
         REQUIRE(pool_->valid());
         store_ = std::make_unique<CommandOutboxStore>(*pool_);
         REQUIRE(store_->is_open());
+        // #4982 round 3: mark_sent_with_target's target-count write needs a
+        // real execution row to update.
+        tracker_ = std::make_unique<yuzu::server::ExecutionTracker>(*pool_);
+        REQUIRE(tracker_->is_open());
         elector_ = std::make_unique<LeaderElector>(
             LeaderElector::Config{.dsn = db_->dsn(), .holder_id = "test-leader"});
         REQUIRE(elector_->is_open());
@@ -79,6 +90,7 @@ public:
     CommandOutboxPg& operator=(const CommandOutboxPg&) = delete;
 
     CommandOutboxStore& store() noexcept { return *store_; }
+    yuzu::server::ExecutionTracker& tracker() noexcept { return *tracker_; }
     std::string dsn() const { return db_->dsn(); }
     std::int64_t epoch() const noexcept { return epoch_; }
     static std::string lock() { return kServerBackgroundLeaderLock; }
@@ -112,9 +124,22 @@ private:
     std::optional<yuzu::test::PostgresTestDb> db_;
     std::optional<yuzu::server::pg::PgPool> pool_;
     std::unique_ptr<CommandOutboxStore> store_;
+    std::unique_ptr<yuzu::server::ExecutionTracker> tracker_;
     std::unique_ptr<LeaderElector> elector_;
     std::int64_t epoch_{0};
 };
+
+// #4982 round 3: a minimal running execution row for mark_sent_with_target's
+// target-count write to land on (mirrors test_execution_tracker.cpp's own
+// make_execution()).
+yuzu::server::Execution make_running_execution() {
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-outbox-target";
+    exec.scope_expression = "tag:linux";
+    exec.dispatched_by = "svc-scheduler";
+    exec.status = "running";
+    return exec;
+}
 
 OutboxEnqueueRequest make_req(const std::string& occurrence_id, const std::string& command_id) {
     OutboxEnqueueRequest r;
@@ -265,6 +290,73 @@ TEST_CASE("CommandOutboxStore[pg]: reschedule backs off and bumps attempts",
     CHECK(row.present);
     CHECK(row.state == "pending");
     CHECK(row.attempts == 1);
+}
+
+TEST_CASE("CommandOutboxStore[pg]: mark_sent_with_target commits the "
+          "sent-transition and the real agents_targeted count atomically "
+          "(#4982 round 3)",
+          "[command_outbox][pg][store]") {
+    CommandOutboxPg fx;
+    auto exec_id = fx.tracker().create_execution(make_running_execution());
+    REQUIRE(exec_id.has_value());
+
+    OutboxEnqueueRequest req = make_req("occ-target-1", "cmd-target-1");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    auto marked =
+        fx.store().mark_sent_with_target("occ-target-1", fx.lock(), fx.epoch(), *exec_id, 3);
+    REQUIRE(marked.has_value());
+    CHECK(*marked);
+
+    // Both writes landed: the outbox row is 'sent' AND the execution's real
+    // target count is set — never observable as one without the other.
+    CHECK(fx.raw_row("occ-target-1").state == "sent");
+    auto exec = fx.tracker().get_execution(*exec_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->agents_targeted == 3);
+    CHECK(exec->status == "running"); // untouched — this is the success path, not a cancel
+
+    auto pending = fx.store().list_pending();
+    REQUIRE(pending.has_value());
+    CHECK(pending->empty()); // no longer re-driven
+
+    // A second call is a clean no-op — already terminal, false, not an error,
+    // and does NOT re-write the target count.
+    auto again = fx.store().mark_sent_with_target("occ-target-1", fx.lock(), fx.epoch(), *exec_id,
+                                                  7);
+    REQUIRE(again.has_value());
+    CHECK_FALSE(*again);
+    auto exec_after = fx.tracker().get_execution(*exec_id);
+    REQUIRE(exec_after.has_value());
+    CHECK(exec_after->agents_targeted == 3); // unchanged by the no-op retry
+}
+
+TEST_CASE("CommandOutboxStore[pg]: a stale mark_sent_with_target is fenced "
+          "out; row stays pending and the target count is untouched",
+          "[command_outbox][pg][store]") {
+    CommandOutboxPg fx;
+    auto exec_id = fx.tracker().create_execution(make_running_execution());
+    REQUIRE(exec_id.has_value());
+
+    OutboxEnqueueRequest req = make_req("occ-target-stale", "cmd-target-stale");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    // A stale ex-leader's mark_sent_with_target is fenced out (0 rows on the
+    // sent-transition) — NEITHER write happens, matching mark_sent's own
+    // fenced-out contract.
+    auto stale = fx.store().mark_sent_with_target("occ-target-stale", fx.lock(), fx.epoch() - 1,
+                                                  *exec_id, 5);
+    REQUIRE(stale.has_value());
+    CHECK_FALSE(*stale);
+
+    CHECK(fx.raw_row("occ-target-stale").state == "pending");
+    auto exec = fx.tracker().get_execution(*exec_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->agents_targeted == 0);
 }
 
 TEST_CASE("CommandOutboxStore[pg]: migrates from an empty database",

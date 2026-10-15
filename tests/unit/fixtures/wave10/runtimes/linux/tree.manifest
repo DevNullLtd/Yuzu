@@ -1,0 +1,35 @@
+# tree.manifest -- portable description of a Linux filesystem subtree for the runtimes
+# Linux-leg walk tests (tests/unit/test_runtimes_linux_parsers.cpp materializes it onto
+# disk under a yuzu_test_runtimes_ TempDir at run time; nothing here is tracked as real
+# directories or symlinks, so a Windows checkout is unaffected).
+#
+# Line grammar (a blank line or a line starting '#' is ignored):
+#   <relative-path> TAB <payload>
+# payload:
+#   T:<text>       regular file with that text (escapes: \n newline, \t tab, \\ backslash)
+#   L:<target>     symlink to <target> (verbatim, may be relative or dangling)
+#   D:             (empty) directory
+#
+# PROVENANCE (per-section labels; the directory-level provenance.txt holds the capture
+# commands, images and dates for the release sources and the listings):
+#   REAL CAPTURE     -- structure and names taken from a command-only Docker container
+#   RECONSTRUCTION   -- a link kind or empty placeholder file content that the capture did
+#                       not record; named as such
+#
+# -- JVM ----------------------------------------------------------------------------
+# REAL CAPTURE: eclipse-temurin:17 -- /opt/java/openjdk/release (content: T: below, the
+#   verbatim file as recorded in temurin17_release.txt).
+# REAL CAPTURE: debian:bookworm + openjdk-17-jre-headless --
+#   /usr/lib/jvm/java-17-openjdk-arm64/release (content: T: below, the verbatim file as
+#   recorded in debian_openjdk17_release.txt).
+# RECONSTRUCTION: java-1.17.0-openjdk-arm64 is recorded in provenance.txt as a second entry
+#   for the same install; that it is a symlink to java-17-openjdk-arm64 is Debian packaging
+#   behaviour, not something the capture listed.
+opt/java/openjdk/release	T:IMPLEMENTOR="Eclipse Adoptium"\nIMPLEMENTOR_VERSION="Temurin-17.0.20+8"\nJAVA_RUNTIME_VERSION="17.0.20+8"\nJAVA_VERSION="17.0.20"\nJAVA_VERSION_DATE="2026-07-21"\nLIBC="gnu"\nMODULES="java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.jvmstat jdk.attach jdk.charsets jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.incubator.foreign jdk.incubator.vector jdk.internal.le jdk.internal.opt jdk.internal.vm.ci jdk.internal.vm.compiler jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jpackage jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.rmi jdk.net jdk.nio.mapmode jdk.random jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported jdk.unsupported.desktop jdk.xml.dom jdk.zipfs"\nOS_ARCH="aarch64"\nOS_NAME="Linux"\nSOURCE=".:git:34e8d43603b8"\nBUILD_SOURCE="git:e6ba7dec3d07654074559310376a3ae89da5f4ac"\nBUILD_SOURCE_REPO="https://github.com/adoptium/temurin-build.git"\nSOURCE_REPO="https://github.com/adoptium/jdk17u.git"\nFULL_VERSION="17.0.20+8"\nSEMANTIC_VERSION="17.0.20+8"\nBUILD_INFO="OS: Linux Version: 6.8.0-101-generic"\nJVM_VARIANT="Hotspot"\nJVM_VERSION="17.0.20+8"\nIMAGE_TYPE="JDK"\n
+usr/lib/jvm/java-17-openjdk-arm64/release	T:IMPLEMENTOR="Debian"\nJAVA_RUNTIME_VERSION="17.0.20.1+1-1-deb12u1-Debian"\nJAVA_VERSION="17.0.20.1"\nJAVA_VERSION_DATE="2026-08-18"\nLIBC="gnu"\nMODULES="java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.jvmstat jdk.attach jdk.charsets jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.incubator.foreign jdk.incubator.vector jdk.internal.le jdk.internal.opt jdk.internal.vm.ci jdk.internal.vm.compiler jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jpackage jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.rmi jdk.net jdk.nio.mapmode jdk.random jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported jdk.unsupported.desktop jdk.xml.dom jdk.zipfs"\nOS_ARCH="aarch64"\nOS_NAME="Linux"\nSOURCE=""\n
+usr/lib/jvm/java-1.17.0-openjdk-arm64	L:java-17-openjdk-arm64
+# -- .NET ---------------------------------------------------------------------------
+# REAL CAPTURE: mcr.microsoft.com/dotnet/runtime:8.0 -- `find shared -mindepth 2 -maxdepth 2`
+#   under /usr/share/dotnet (a runtime image: no sdk/). The version directory's own contents
+#   were not captured, so it is an empty directory here (RECONSTRUCTION of its contents only).
+usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31	D:

@@ -32,6 +32,7 @@
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -42,6 +43,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <map>
@@ -447,10 +449,27 @@ TEST_CASE("GuaranteedStateStore: matching-fields redelivery is quiet + counted a
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     auto e = make_event("evt-r", "rule-1", "agent-A");
-    CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Inserted);
+    const std::int64_t before_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+    const auto inserted = store.insert_event_classified(e);
+    const std::int64_t after_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+    CHECK(inserted.outcome == EventInsertOutcome::Inserted);
+    // #4606 criterion-10 T_server: a fresh Inserted result carries a real, recent
+    // wall-clock commit instant (benchmark-diagnostic field, not a precision
+    // assertion) — bounded between the timestamps taken immediately either side
+    // of the call, with generous slack for scheduler jitter.
+    CHECK(inserted.committed_wall_ns > 0);
+    CHECK(inserted.committed_wall_ns >= before_ns);
+    CHECK(inserted.committed_wall_ns <= after_ns + std::chrono::nanoseconds(std::chrono::seconds(5)).count());
 
     // Exact redelivery: identical row, same event_id.
-    CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Redelivered);
+    const auto redelivered = store.insert_event_classified(e);
+    CHECK(redelivered.outcome == EventInsertOutcome::Redelivered);
+    // committed_wall_ns is populated for Inserted only — 0 for every other outcome.
+    CHECK(redelivered.committed_wall_ns == 0);
     CHECK(store.event_count() == 1);
     CHECK(store.events_written_total() == 1);
     CHECK(store.events_redelivered_total() == 1);
@@ -675,6 +694,98 @@ TEST_CASE("GuaranteedStateStore: observation projects uniform detail_json keys",
     CHECK(obs[0].component == "ntdll.dll");
     CHECK(obs[0].version == "11.0.26100.1"); // slice 2b: per-version stability projects
     CHECK(obs[0].platform == "windows");
+}
+
+// ── #4665: log-injection neutralisation on the rule_id/event_id error paths ─
+//
+// guaranteed_state_store.cpp wraps every rule_id/event_id it hands to
+// spdlog:: on these best-effort warn/error paths with yuzu::log_id_token (a
+// hostile value cannot forge a log line or smuggle extra key=value tokens
+// onto it). Each case below forces a GENUINE SQL-level failure via a
+// second-connection exec_sql, rather than faking the log call, so it
+// exercises the real production code path. agent_id is deliberately left
+// unwrapped everywhere in this file (issue #489, a separate fleet-wide
+// outcome) and is not asserted on here.
+//
+// Each assertion below checks the id= FIELD carries the neutralised form,
+// not that the raw hostile string is globally absent from the captured
+// text: the trailing {} in both log lines is PQerrorMessage()/pr.error()
+// (deliberately unwrapped, same reasoning as `why` in
+// guardian_push_builder.cpp) and Postgres's own constraint-violation DETAIL
+// text ("Failing row contains (...)" / "Key (...)=(...) already exists")
+// echoes the raw offending value back through THAT channel -- confirmed
+// empirically while writing this test. That is a separate, out-of-scope
+// exposure through the SQL diagnostic text itself (not an id/key field, and
+// not something log_id_token/log_key_token is meant to touch); see the PR
+// report for a note on it.
+
+TEST_CASE("GuaranteedStateStore: a hostile rule_id is neutralised on a failed "
+          "compliance-census upsert",
+          "[pg][guaranteed_state_store][events][log_hygiene]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    // A CHECK constraint the public API can never violate on its own — added
+    // directly so upsert_rule_status's INSERT...ON CONFLICT genuinely fails,
+    // exercising the real "status upsert failed" warn path rather than
+    // mocking the log call.
+    exec_sql(db.dsn(),
+             "ALTER TABLE guaranteed_state_store.guardian_agent_rule_status "
+             "ADD CONSTRAINT chk_test_no_newline_rule_id "
+             "CHECK (rule_id NOT LIKE '%' || chr(10) || '%')");
+
+    const std::string hostile_rule_id = "rule\ninjected-line";
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    // drift.remediated -> "compliant" state, so the census upsert fires.
+    REQUIRE(store.insert_event(make_event("evt-census-1", hostile_rule_id, "agent-A")));
+    cap.stop();
+
+    const std::string logs = cap.text();
+    CHECK(logs.find("status upsert failed") != std::string::npos);
+    // log_id_token(rule_id) is inserted correctly at the rule_id= field: the
+    // embedded newline is folded to '_' rather than splitting the log line
+    // or leaking a second, forged rule_id= token.
+    CHECK(logs.find("rule_id=rule_injected-line") != std::string::npos);
+    CHECK(logs.find("rule_id=rule\ninjected-line") == std::string::npos);
+}
+
+TEST_CASE("GuaranteedStateStore: a hostile event_id is neutralised on a failed "
+          "observation projection",
+          "[pg][guaranteed_state_store][events][crash][dex][log_hygiene]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    const std::string hostile_event_id = "obs-collide\ninjected-line";
+    // Pre-seed a colliding PK directly in the read-model table -- the public
+    // API can never produce two rows sharing an event_id, so this is the only
+    // way to force project_observation's INSERT to genuinely fail rather than
+    // faking the log call.
+    exec_sql(db.dsn(), "INSERT INTO guaranteed_state_store.guardian_observations "
+                       "(event_id, agent_id, observed_at, obs_type) VALUES ('" +
+                           hostile_event_id +
+                           "', 'agent-B', '2026-06-08T12:00:00Z', 'process.crashed')");
+
+    GuaranteedStateEventRow crash;
+    crash.event_id = hostile_event_id;
+    crash.rule_id = "__observation__";
+    crash.agent_id = "agent-B";
+    crash.event_type = "process.crashed";
+    crash.severity = "info";
+    crash.detail_json = R"({"subject":"notepad.exe"})";
+    crash.timestamp = "2026-06-08T12:00:00Z";
+
+    yuzu::test::LogCapture cap(spdlog::level::err);
+    REQUIRE(store.insert_event(crash)); // event itself is kept even though projection fails
+    cap.stop();
+
+    const std::string logs = cap.text();
+    CHECK(logs.find("observation projection failed") != std::string::npos);
+    // log_id_token(row.event_id) is inserted correctly at the event_id=
+    // field, same reasoning as the rule_id case above.
+    CHECK(logs.find("event_id=obs-collide_injected-line") != std::string::npos);
+    CHECK(logs.find("event_id=obs-collide\ninjected-line") == std::string::npos);
 }
 
 TEST_CASE("GuaranteedStateStore: dex_device_top_apps splits crashes/hangs by version",
@@ -1525,8 +1636,14 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     // No live rig needed for this one (deliberately NOT gated behind
     // YUZU_REQUIRE_PG_DB_TPL) — an unroutable address fails fast everywhere.
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    // metrics is declared BEFORE bad so it outlives the store: bad only holds
+    // a borrowed MetricsRegistry* (set_metrics), and C++ destroys locals in
+    // reverse declaration order — declaring metrics first means bad's
+    // destructor runs while metrics is still alive, never after.
+    yuzu::MetricsRegistry metrics;
     GuaranteedStateStore bad(bad_pool);
     CHECK_FALSE(bad.is_open());
+    bad.set_metrics(&metrics);
 
     CHECK_FALSE(bad.create_rule(make_rule("x", "x")));
     CHECK_FALSE(bad.update_rule(make_rule("x", "x")));
@@ -1562,6 +1679,85 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     auto empty_scope = bad.errored_rule_count(std::vector<std::string>{});
     REQUIRE(empty_scope.has_value());
     CHECK(*empty_scope == 0);
+
+    // #4856: the AUTHORITATIVE rule/status reads must ALSO bump the shared
+    // yuzu_server_guardian_read_degrade_total counter, distinguished by
+    // source="guardian_rules" from the DEX/observation family's
+    // source="guardian_state" (query_events above) — previously these seven
+    // reads surfaced a typed error WITHOUT bumping anything, so a sustained
+    // read degrade on the catastrophic-read set was invisible on /metrics.
+    CHECK_FALSE(bad.agent_rule_statuses("").has_value());
+    CHECK_FALSE(bad.agent_rule_statuses_for_agent("agent-a").has_value());
+    CHECK_FALSE(bad.rule_names().has_value());
+    CHECK_FALSE(bad.rule_names_for(std::vector<std::string>{"r1"}).has_value());
+    // rule_names_for's own empty-input short-circuit (success, not degrade —
+    // mirrored by errored_rule_count's empty-scope case above) must NOT
+    // increment either.
+    auto empty_names = bad.rule_names_for(std::vector<std::string>{});
+    REQUIRE(empty_names.has_value());
+    CHECK(empty_names->empty());
+    // 8 authoritative-read degrades total: get_rule, list_rules,
+    // agent_rule_statuses, agent_rule_statuses_for_agent, rule_names,
+    // rule_names_for, and errored_rule_count's two non-empty-scope calls
+    // above — the metric label itself, not just the typed-error return, is
+    // what a regression here would silently drop.
+    CHECK(metrics
+              .counter("yuzu_server_guardian_read_degrade_total",
+                       {{"reason", "store_not_open"}, {"source", "guardian_rules"}})
+              .value() == 8.0);
+    // The DEX/observation family's own store_not_open degrade (query_events
+    // above) stays on the ORIGINAL source — proof the two families are
+    // counted separately rather than merged into one undifferentiated total.
+    CHECK(metrics
+              .counter("yuzu_server_guardian_read_degrade_total",
+                       {{"reason", "store_not_open"}, {"source", "guardian_state"}})
+              .value() == 1.0);
+    // #4855: dex_device_signal_summary_checked is the type-distinguishable
+    // twin — a closed store degrades to std::nullopt, never a silent empty
+    // vector indistinguishable from "no signals" (that indistinguishability
+    // is exactly what fabricated the healthy score-100 bug this twin fixes).
+    CHECK_FALSE(bad.dex_device_signal_summary_checked("a1").has_value());
+    // The plain form stays #2659-style empty-on-degrade (unchanged, byte-
+    // identical to every other DEX/analytics read on a closed store).
+    CHECK(bad.dex_device_signal_summary("a1").empty());
+}
+
+// #4855: dex_device_signal_summary_checked must distinguish a genuine
+// QUERY-LEVEL failure (not just store-not-open above) from "no signals" —
+// dropping the underlying table mid-test (guardian_agent_rule_status's own
+// degrade tests use the identical DROP-TABLE-on-a-second-connection
+// technique) forces exactly that failure mode while the store itself stays
+// open (every OTHER table is intact).
+TEST_CASE("GuaranteedStateStore: dex_device_signal_summary_checked distinguishes a query-level "
+          "degrade from genuinely no signals",
+          "[pg][guaranteed_state_store][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    // Baseline: a real (empty) result is Some(empty), not None — the ONLY
+    // thing this twin exists to distinguish is the degrade case below.
+    {
+        auto ok = store.dex_device_signal_summary_checked("no-such-agent");
+        REQUIRE(ok.has_value());
+        CHECK(ok->empty());
+    }
+
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    auto degraded = store.dex_device_signal_summary_checked("no-such-agent");
+    CHECK_FALSE(degraded.has_value());
+    // The plain form still collapses the SAME degrade to empty (#2659
+    // posture, unchanged) — the two forms must read the identical failure
+    // differently ONLY at the type level, not the underlying query.
+    CHECK(store.dex_device_signal_summary("no-such-agent").empty());
 }
 
 TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",
@@ -2622,6 +2818,96 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
         CHECK(m.count({"a1", "r1"}) == 0); // gone with the rule
         CHECK(m.count({"a2", "r1"}) == 0);
         CHECK(m.count({"a1", "r2"}) == 1); // an unrelated rule's status is untouched
+    }
+}
+
+TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state (C-1)",
+          "[pg][guaranteed_state_store][census]") {
+    // guard.errored is the #2818 spark subscription-death detach lifecycle event. It
+    // must set the per-(agent, rule) census state to "errored" exactly as
+    // guard.unhealthy does. The upsert is ordered by updated_at with `>=` (equal
+    // timestamps overwrite), so D4 characterises that existing tie behaviour.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store{pool, /*retention_days=*/30};
+    REQUIRE(store.is_open());
+
+    auto ev = [&](std::string id, std::string rule, std::string agent, std::string type,
+                  std::string ts) {
+        auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
+        e.event_type = std::move(type);
+        return e;
+    };
+    auto census = [&] {
+        std::map<std::pair<std::string, std::string>, std::string> m;
+        auto rows = store.agent_rule_statuses();
+        REQUIRE(rows.has_value());
+        for (auto& s : *rows)
+            m[{s.agent_id, s.rule_id}] = s.state;
+        return m;
+    };
+
+    SECTION("D1: a later guard.errored replaces a compliant verdict") {
+        REQUIRE(store.insert_event(ev("d1a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d1b", "r1", "a1", "guard.errored", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+    }
+    SECTION("D2: a later guard.compliant recovers an errored pair") {
+        REQUIRE(store.insert_event(ev("d2a", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+        REQUIRE(store.insert_event(ev("d2b", "r1", "a1", "guard.compliant", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("D3: an OLDER guard.errored does not regress a newer compliant verdict") {
+        REQUIRE(store.insert_event(ev("d3a", "r1", "a1", "guard.compliant", "2026-06-04T10:02:00Z")));
+        REQUIRE(store.insert_event(ev("d3b", "r1", "a1", "guard.errored", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("D4: equal timestamps, distinct event ids: the later arrival wins (existing >=)") {
+        REQUIRE(store.insert_event(ev("d4a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d4b", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+
+        REQUIRE(store.insert_event(ev("d4c", "r2", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d4d", "r2", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r2"}] == "compliant");
+    }
+    SECTION("D5: an exact redelivery of the errored event never reaches the census write") {
+        // Equal timestamps (compliant arrives after errored, so it wins the >= tie): had the
+        // redelivery reached the upsert, the tie would flip the row to errored, so the final
+        // census assertion can observe a reached census write.
+        const auto errored = ev("d5x", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z");
+        CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Inserted);
+        REQUIRE(store.insert_event(ev("d5y", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+        CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Redelivered);
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("D6: the batch path applies the mapping inside its transaction") {
+        std::vector<GuaranteedStateEventRow> batch = {
+            ev("d6a", "r1", "a1", "guard.compliant", "2026-06-04T11:00:00Z"),
+            ev("d6b", "r1", "a1", "guard.errored", "2026-06-04T11:01:00Z"),
+        };
+        REQUIRE(store.insert_events(batch));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+    }
+    SECTION("D7: the reserved ruleless sentinel never gets a census row from guard.errored") {
+        REQUIRE(store.insert_event(
+            ev("d7a", "__observation__", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        std::vector<GuaranteedStateEventRow> batch = {
+            ev("d7b", "__observation__", "a2", "guard.errored", "2026-06-04T10:00:00Z"),
+        };
+        REQUIRE(store.insert_events(batch));
+        auto sentinel = store.agent_rule_statuses("__observation__");
+        REQUIRE(sentinel.has_value());
+        CHECK(sentinel->empty());
+        CHECK(census().empty());
+    }
+    SECTION("D8: guard.armed, guard.disarmed and guard.healthy remain no-census-change") {
+        REQUIRE(store.insert_event(ev("d8a", "r1", "a1", "guard.armed", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d8b", "r2", "a1", "guard.disarmed", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d8c", "r3", "a1", "guard.healthy", "2026-06-04T10:00:00Z")));
+        CHECK(census().empty());
     }
 }
 

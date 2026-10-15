@@ -1,0 +1,23 @@
+identity: DESKTOP-04DNSIG\Alex (admin, elevated SSH session)
+
+probe job id resolved=5
+== SetJobW(JOB_CONTROL_CANCEL, real job, JobId=5), full-access handle ==
+SetJobW returned=1 GetLastError=0
+== GetJobW readback (after cancel, JobId=5) ==
+GetJobW (size probe) failed, GetLastError=87
+== SetJobW(JOB_CONTROL_CANCEL, nonexistent job id, JobId=99999), full-access handle ==
+SetJobW returned=0 GetLastError=87
+== SetJobW(JOB_CONTROL_CANCEL) via PRINTER_ACCESS_USE-only handle, JobId=6 ==
+SetJobW (USE-only handle) returned=1 GetLastError=0
+
+identity: NT AUTHORITY\SYSTEM (scheduled task yuzu-wave9-print-probe, ServiceAccount)
+
+probe job id resolved=7
+== SetJobW(JOB_CONTROL_CANCEL, real job, JobId=7), full-access handle ==
+SetJobW returned=1 GetLastError=0
+== GetJobW readback (after cancel, JobId=7) ==
+GetJobW (size probe) failed, GetLastError=87
+== SetJobW(JOB_CONTROL_CANCEL, nonexistent job id, JobId=99999), full-access handle ==
+SetJobW returned=0 GetLastError=87
+== SetJobW(JOB_CONTROL_CANCEL) via PRINTER_ACCESS_USE-only handle, JobId=8 ==
+SetJobW (USE-only handle) returned=1 GetLastError=0

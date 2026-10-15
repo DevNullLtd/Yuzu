@@ -206,5 +206,4 @@ tcp|203.0.113.66|52785|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: `tests/unit/agent/test_netstat_attribution.cpp` · `tests/unit/test_netstat_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/3403-netstat-attribution-action.added.md`
 <!-- END GENERATED -->

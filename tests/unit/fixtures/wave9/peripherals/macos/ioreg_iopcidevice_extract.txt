@@ -1,0 +1,54 @@
++-o pci-bridge0@0  <class IOPCIDevice, id 0x10000091b, registered, matched, active, busy 0 (8915 ms), retain 12>
+      "IOName" = "pci-bridge"
+      "class-code" = <00040600>
+      "device-id" = <0c100000>
+      "pcidebug" = "0:0:0(2:2)"
+      "vendor-id" = <6b100000>
++-o wlan@0  <class IOPCIDevice, id 0x1000009fb, registered, matched, active, busy 0 (8896 ms), retain 22>
+      "vendor-id" = <e4140000>
+      "class-code" = <00800200>
+      "subsystem-vendor-id" = <6b100000>
+      "IOName" = "pci14e4,4434"
+      "pcidebug" = "2:0:0"
+      "subsystem-id" = <88430000>
+      "device-id" = <34440000>
++-o bluetooth-pcie@0,1  <class IOPCIDevice, id 0x1000009fc, registered, matched, active, busy 0 (3 ms), retain 16>
+      "vendor-id" = <e4140000>
+      "class-code" = <00800200>
+      "subsystem-vendor-id" = <6b100000>
+      "IOName" = "pci14e4,5f72"
+      "pcidebug" = "2:0:1"
+      "subsystem-id" = <88430000>
+      "device-id" = <725f0000>
++-o pci-bridge2@2  <class IOPCIDevice, id 0x10000091c, registered, matched, active, busy 0 (144 ms), retain 11>
+      "IOName" = "pci-bridge"
+      "class-code" = <00040600>
+      "device-id" = <0c100000>
+      "pcidebug" = "0:2:0(1:1)"
+      "vendor-id" = <6b100000>
++-o lan-1gb@0  <class IOPCIDevice, id 0x10000091d, registered, matched, active, busy 0 (132 ms), retain 14>
+      "vendor-id" = <e4140000>
+      "class-code" = <00000200>
+      "subsystem-vendor-id" = <e4140000>
+      "IOName" = "ethernet"
+      "pcidebug" = "1:0:0"
+      "subsystem-id" = <82160000>
+      "device-id" = <82160000>
++-o pcic0-bridge@0  <class IOPCIDevice, id 0x1000008c3, registered, matched, active, busy 0 (4 ms), retain 12>
+      "IOName" = "pci-bridge"
+      "class-code" = <00040600>
+      "device-id" = <17100000>
+      "pcidebug" = "0:0:0(1:128)"
+      "vendor-id" = <6b100000>
++-o pcic1-bridge@0  <class IOPCIDevice, id 0x100000887, registered, matched, active, busy 0 (31 ms), retain 12>
+      "IOName" = "pci-bridge"
+      "class-code" = <00040600>
+      "device-id" = <17100000>
+      "pcidebug" = "0:0:0(1:128)"
+      "vendor-id" = <6b100000>
++-o pcic3-bridge@0  <class IOPCIDevice, id 0x100000918, registered, matched, active, busy 0 (10 ms), retain 12>
+      "IOName" = "pci-bridge"
+      "class-code" = <00040600>
+      "device-id" = <17100000>
+      "pcidebug" = "0:0:0(1:128)"
+      "vendor-id" = <6b100000>

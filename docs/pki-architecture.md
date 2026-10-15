@@ -7,11 +7,11 @@ required — while still letting enterprises root Yuzu in their own CA later
 subsystem; the auth-facing detail lives in `docs/auth-architecture.md`
 ("Default certificates", "Per-agent mTLS").
 
-**Algorithm policy (locked):** ECDSA P-256 leaves, P-384 root. ECDSA is
-roadmap-aligned for the gRPC→QUIC move (#376): QUIC mandates TLS 1.3, which
-treats `ecdsa_secp256r1_sha256` / `ecdsa_secp384r1_sha384` as first-class, and
-the smaller certs cost fewer bytes under QUIC's anti-amplification limit. The
-signature digest follows the *issuer* key strength (P-384 → SHA-384, P-256 →
+**Algorithm policy (locked):** ECDSA P-256 leaves, P-384 root. TLS 1.3 (supported
+end to end once #1293 lands; the floor stays 1.2 per #4722) treats `ecdsa_secp256r1_sha256` /
+`ecdsa_secp384r1_sha384` as first-class, and ECDSA certs are smaller than RSA.
+(Originally also chosen for a gRPC→QUIC move; that move was withdrawn by ADR-0066.)
+The signature digest follows the *issuer* key strength (P-384 → SHA-384, P-256 →
 SHA-256). **100% OpenSSL 3.x** — no hand-rolled cryptographic primitives. RSA and
 a configurable key algorithm are explicit non-goals for Milestone 1.
 
@@ -35,7 +35,9 @@ may be comma-separated). `--cert-san` is the supported way to make the built-in 
 valid for a deployment name a client actually dials — e.g. `--cert-san dns:gateway` so
 an agent reaching the gateway by that service name passes SNI hostname verification.
 Changing `--cert-san` does **not** rotate an existing set (the marker fast path returns
-the prior certs); clear the cert dir or replace the certs for new SANs to take effect.
+the prior certs). For new SANs to take effect, rename `default-marker.json` in the cert dir aside
+(moving it back undoes this) and restart (the leaves are re-minted under the SAME root), or replace the certs. Re-minting issues every default leaf with a **new key, the gateway's `default-gateway` leaf included**: the restarted server auto-pins the new gateway key (`docs/user-manual/server-admin.md`, "Gateway upstream peer authorization"), and a gateway that dialled before the restart keeps presenting its old certificate until it redials, so it is refused (`not_pinned`) until then. The server restart drops the connection and forces that redial, so first check whether the gateway already presents the new certificate (cause class B in that runbook; the circuit state does not decide it), and restart that gateway node, one node at a time, only if denials continue and its agents can take the disconnect, because unless the agents run a build with the #5183 fix (in no release yet) released agents stay wedged afterwards. Never clear
+the whole cert dir: it also holds the CA key and the secrets KEK (`secrets-kek-*.key`, #5370).
 (Implementation: `parse_extra_sans` validates the flag/`YUZU_CERT_SAN` values,
 `merge_sans` injects them into every default leaf, `pki::is_valid_ip_literal` does the
 IP-shape check.)
@@ -53,7 +55,7 @@ client-identity binding becomes cryptographic with no new mechanism.
 | `server/core/src/key_provider.{hpp,cpp}` | `KeyProvider` interface + `FileKeyProvider` (0600 PEM in a 0700 dir). The HSM/PKCS#11 seam — `key_ref` is an opaque token (the absolute path today). |
 | `server/core/src/ca_store.{hpp,cpp}` (Postgres schema `ca_store`, ADR-0053) | Inventory + lifecycle: `ca_root`, `ca_issued`, `ca_crl_versions`. **Metadata only — the root private key is never in the DB**, only its opaque `key_ref`. |
 | `server/core/src/default_certs.{hpp,cpp}` | First-boot bootstrap: root + 3 server leaves + `default-marker.json`. Idempotent; regenerate-whole-set on corruption / clock-skew. |
-| `agents/core/src/agent_csr.{hpp,cpp}` | Agent-side, self-contained OpenSSL (the agent cannot link `x509_ca`): EC P-256 keypair + CSR generation, 0600 leaf persistence, renew-at-2/3 inspection. |
+| `agents/core/src/agent_csr.{hpp,cpp}` | Agent-side, self-contained OpenSSL (the agent cannot link `x509_ca`): EC P-256 keypair + CSR generation, 0600 key persistence (leaf and chain 0644), renew-at-2/3 inspection (a cert/key mismatch or unreadable key counts as missing and re-enrols). |
 | `server/core/src/ca_routes.{hpp,cpp}` | The `/api/v1/ca/*` REST surface (PR4). |
 
 ## The `ca_store` Postgres schema (schema + invariants)
@@ -75,7 +77,15 @@ holds key material, only metadata; see "Key custody + threat model" below. Table
   revocation_reason, revoked_at, issued_at, issued_by, enrollment_request_id,
   cert_pem, issuer_fingerprint, issuer_key_id)`.
 - `ca_crl_versions(version PRIMARY KEY, der BYTEA, this_update, next_update,
-  published_at, issuer_fingerprint, issuer_key_id)`.
+  published_at, issuer_fingerprint, issuer_key_id, revoked_count)` — `revoked_count`
+  (migration v3, nullable) is how many revoked certs the CRL was built from.
+- Trigger `ca_issued_keep_revoked` (migration v4): any `DELETE`, or `UPDATE`, of a
+  row whose `status` is `revoked` is rejected, so the revoked set is append-only in
+  the database itself. Row triggers do not fire on `TRUNCATE`, so the clean
+  re-root below still works. Because it blocks any update of a revoked row, a
+  future migration backfilling a `ca_issued` column must skip revoked rows (or
+  disable the trigger inside that migration's own transaction), and pruning
+  expired revoked rows would need a deliberate change to the trigger.
 
 Invariants: `key_ref` is opaque (pass to `load_key`, never parse). `revoke()` uses `RETURNING` for
 change detection — never `sqlite3_changes()`-style counting (#1033's Postgres analogue: trust
@@ -156,6 +166,81 @@ republish propagates it to external consumers. A republish failure is honest:
 cannot be persisted, so the response reports `crl_republished:false`, the
 `ca.crl.published` `result=failure` audit fires, and the failure counter
 increments — the revocation itself is NOT undone (already enforced server-side).
+
+**CRL numbering across replicas (HA WS-6 slice 6.1).** Every CRL publish — the
+boot-time pre-publish, an operator revoke (REST or MCP), a subordinate-CA import
+(REST, MCP or dashboard), and the leader-gated freshness re-publish — goes through
+`CaStore::publish_next_crl`, the single CRL publisher. It runs as one Postgres
+transaction under `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE`,
+re-checks that `ca_root` is still the root the caller loaded (a subordinate import
+in between makes it retry once with the new root), and reads the revoked set only
+after the lock is held. Server replicas sharing one database therefore publish
+strictly increasing crlNumbers with no duplicates or gaps, and each CRL includes
+every revocation the previous one did. The lock does not block `GET /api/v1/ca/crl`.
+
+- **Failure.** A publish that waits more than 5 s for the lock (a transaction-scoped
+  `lock_timeout`, so it holds even when the DSN's `options=` suppresses the pool's
+  own) fails and consumes no number. A publisher frozen mid-transaction loses its
+  session after 30 s idle (`idle_in_transaction_session_timeout`), releasing the
+  lock for everyone else. Within one server process, concurrent publishes take a
+  local lock first, so at most one pool connection waits on the table lock; any
+  other publish (operator, import or startup) that cannot get the local lock
+  within 7.5 s fails, and the background freshness pass skips instead of waiting. Every failed publish increments `yuzu_server_ca_crl_publish_failures_total` (a background skip is not a failure and does not) and
+  the finer-grained, reason-labelled `yuzu_server_ca_crl_publish_failure_reason_total{reason}`
+  sibling (#4830 — a bounded, closed cause set: `key_load`, `root_read_failed`,
+  `no_connection`, `lock_timeout`, `number_read_failed`, `degraded_revoked_read`,
+  `build_failed`, `insert_or_commit_failed`, `root_changed_twice`, `busy`,
+  `exception` — see `docs/user-manual/metrics.md`). **Every CRL publish now writes
+  a `ca.crl.published` audit row, success or failure (#4829)** — the two
+  operator-triggered paths (revoke, import-chain, each on REST/MCP/dashboard as
+  applicable) carry the caller's own request context and a `reason=` token
+  (`revoke` or `import_chain`); the three paths with no live request — startup,
+  the freshness re-publish, and the count-compare self-heal — are audited by
+  `CrlPublisher` itself under a `principal=system` row with `reason=startup`,
+  `reason=freshness`, or `reason=self_heal` respectively, so a self-heal that
+  resolves an earlier revoke-triggered failure row leaves its own
+  `result=success reason=self_heal` row as the resolution. A failure of the
+  freshness pass's own unpublished-revocation *check* is not a publish failure:
+  it is logged (warn, at most once a minute), not counted against either publish
+  counter, and instead increments the separate
+  `yuzu_server_ca_unpublished_revocation_check_failures_total` (#4830) — a
+  sustained non-zero rate means self-heal is effectively disabled. Repeated
+  subordinate-CA imports can make publishes fail with "CA root changed" (logged
+  distinctly; admin-only) until the imports stop.
+- **Self-heal.** Each CRL row records how many revoked certs it was built from
+  (`revoked_count`, migration v3). The leader's freshness pass republishes, on its
+  next 15 s tick (or up to 5 minutes later after a failed attempt), whenever that
+  count differs from the current revoked count — so a revocation whose own publish
+  failed reaches the served CRL without a second revoke (which would return
+  "already revoked"). The check compares counts, never timestamps written by
+  different replicas' clocks. It relies on the revoked set being append-only,
+  which the database enforces (trigger `ca_issued_keep_revoked`, migration v4) —
+  so even an older binary's unconditional default-cert purge during a rolling
+  upgrade cannot delete a revoked row; that purge statement fails instead and the
+  older binary logs "failed to purge prior default-cert inventory rows" and
+  continues with a few stale non-revoked rows.
+- **Boot.** Replicas booting together each publish once, leaving up to N
+  consecutive CRL versions for N replicas — harmless.
+- **What the lock does not cover.** Restoring the database to an earlier point in
+  time, losing an asynchronously replicated commit in a failover, or the
+  `default_certs` runbook clearing `ca_crl_versions`, all restart numbering from
+  the surviving `MAX(version)+1`, which can reuse a crlNumber that was already
+  served. Separately, **never delete a revoked `ca_issued` row by hand** (the
+  database refuses it; disabling the trigger to force it un-revokes that
+  certificate — `is_revoked()` no longer sees it, it drops out of every later CRL —
+  and defeats the self-heal count). It does not affect numbering. During a rolling upgrade, a publish from an older binary does not take
+  the lock. Until slice 6.3, the freshness pass runs only on the elected leader, so
+  a leader whose CA directory lacks the CA key cannot keep the CRL fresh.
+  `scripts/ha/ha-crl-publish-failover.sh` (WS-9, #4832) exercises the deterministic-lost-ack and
+  connection-reset cases live against a real Patroni cluster — but its deterministic-lost-ack case
+  catches the REVOCATION's own commit ack, not `publish_next_crl`'s CRL-publish transaction itself
+  (see the script's own CORRECTNESS NOTE); a recipe targeting the publish transaction specifically is
+  a disclosed follow-up (#5032). Its async-durability case confirms the `YUZU_PG_DURABILITY=async` toggle is
+  real and reachable but does not live-exercise the asynchronously-replicated-commit-loss residual
+  described above — that residual is asserted by this paragraph, not by a live repro. The
+  connection-reset case's own final self-heal-coverage assertion timed out once at 60s (after three
+  real script bugs preceding it were fixed) and has not yet been root-caused — a disclosed follow-up,
+  #5031, tracked alongside #5032 in `docs/ha-delivery-matrix.md`'s WS-6 row.
 
 **curl examples:**
 
@@ -284,8 +369,8 @@ source:
 
 | Hop | M1 TLS | Why |
 |---|---|---|
-| gateway → server upstream (`GatewayUpstream`, :50055) | **mutual TLS** | Both peers hold CA-issued certs (the gateway uses the `default-gateway` leaf, which has `serverAuth`+`clientAuth`). No bootstrap problem. |
-| agent → gateway (:50051) | **one-way TLS (PR5c; live in the reference composes, #1314)** | The vendored+patched grpcbox (`_checkouts/grpcbox`) lets the agent listener run **server-authenticated** TLS (`verify_none` + `fail_if_no_peer_cert=false`) — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod` and shipped live in `docker-compose.reference-gateway.yml`: the gateway mounts the grpcbox TLS `sys.config` + the shared CA volume, and the agent auto-discovers the install CA at `/etc/yuzu/certs/default-ca.pem` (#1314). **Caveat (#1291):** the transport is driven by the mounted grpcbox `sys.config`, NOT the `YUZU_GW_TLS_*` env vars, which are still inert — an operator who only sets those env vars has NOT enabled gateway TLS. Agent identity stays app-layer (`gateway_observed_peer`, #1064), not transport. |
+| gateway → server upstream (`GatewayUpstream`, :50055) | **mutual TLS + SPKI peer pin on the server** | Both peers hold CA-issued certs (the gateway uses the `default-gateway` leaf, which has `serverAuth`+`clientAuth`). No bootstrap problem. The server authorizes the caller as a gateway before any request is processed: the leaf's public key (SPKI SHA-256) must be in the pin set and the leaf must carry `serverAuth` (a bring-your-own gateway leaf needs both `serverAuth` and `clientAuth`), and must be inside its validity window at the time of the call. Pins are fixed at server boot and withdrawn by removing the pin and restarting; there is no reload and no CRL or CA-store revocation read on this path. The pin is derived automatically only when the gRPC listener runs on the server's generated default certificates (it pins `default-gateway.pem`); with operator-supplied certificates the server refuses to start until a pin (`--gateway-peer-pin`, `--gateway-peer-pin-file`) is given. A plaintext (`--no-tls`) deployment can start only with the explicit `--insecure-gateway-peer` acknowledgement, which disables the check on every port the service is reachable on. See `docs/user-manual/server-admin.md`. |
+| agent → gateway (:50051) | **one-way TLS (PR5c; live in the reference gateway compose, #1314)** | The vendored+patched grpcbox (`_checkouts/grpcbox`) lets the agent listener run **server-authenticated** TLS (`verify_none` + `fail_if_no_peer_cert=false`) — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod` and shipped live in `docker-compose.reference-gateway.yml`: the gateway mounts the grpcbox TLS `sys.config` + the shared CA volume, and the agent auto-discovers the install CA at `/etc/yuzu/certs/default-ca.pem` (#1314). **Caveat (#1291):** the transport is driven by the mounted grpcbox `sys.config`, NOT the `YUZU_GW_TLS_*` env vars, which are still inert — an operator who only sets those env vars has NOT enabled gateway TLS. Agent identity stays app-layer (`gateway_observed_peer`, #1064), not transport. Agent `Heartbeat` admission is bound to the HTTP/2 connection that opened the session's `Subscribe` stream (connection key = the connection process, not a certificate); the listener still does not authenticate agents. |
 | server → gateway mgmt (:50063) | **strict mutual TLS + SPKI peer pin (#1314, #1422)** | The privileged command-fan-out plane. Strict mTLS (the patched grpcbox's `verify_peer`+`fail_if_no_peer_cert` defaults) admits only CA-issued client certs; the C++ server's command-forwarding client presents its server leaf and verifies the gateway against the install CA (`build_gateway_command_credentials`, fail-closed if the certs are missing). On top of that, the mgmt listener's grpcbox `auth_fun` (`yuzu_gw_authz:check_mgmt_peer/1`) **pins the peer to the server's KEY** — SPKI SHA-256 against `{yuzu_gw, mgmt_peer_pins}` — and requires the `serverAuth` EKU (agent leaves are `clientAuth`-only by construction, so no agent leaf can ever qualify). This closes the #1314 M-1 residual: a stolen per-agent leaf, an enrollment-minted CN-collision leaf (`--agent-id` is endpoint-chosen and lands in the CN verbatim), and the group-readable `default-gateway` leaf all get `UNAUTHENTICATED` — pre-handler, so the RPC never executes. Pins: `{cert_file, Path}` (default `default-server.pem` in the shared cert volume; mtime+size-cached re-read, so server leaf rotation self-heals; a same-second, same-size rewrite is the one undetected shape — fail-closed (stale pin rejects, never admits wrongly), a gateway restart recovers — the pin is the **first** certificate in the PEM, so REPLACE the file on rotation, never append the new leaf below the old) or `{spki_sha256, "hex"}` for bring-your-own-cert installs (`openssl x509 -in cert.pem -pubkey -noout \| openssl pkey -pubin -outform DER \| openssl dgst -sha256`); list two pins to overlap a rotation; empty/unresolvable pins fail **closed**. A `yuzu_gw_app` boot guard refuses a network-reachable mgmt listener lacking this posture (loopback exempt; `{allow_insecure_mgmt, true}` is the lab-rig acknowledgement, seeded in the UAT/demo configs whose composes keep :50063 unpublished). **Residual (#1422):** no CRL/OCSP on this path — a revoked-but-stolen *server* leaf passes until rotation. A plaintext stack (`--no-tls`) keeps the plane insecure and must stay on a trusted network. |
 
 > **⚠ SECURITY — do not expose the plaintext gateway agent edge to an untrusted
@@ -311,11 +396,20 @@ source:
 > the UAT/demo/sanitizer rigs (which pass `--no-tls` deliberately), a hand-rolled
 > compose, or one that relied on the still-inert `YUZU_GW_TLS_*` env vars (#1291)
 > instead of a mounted `sys.config` — has an unprotected `:50051`.** For any such
-> gateway exposed to an untrusted network, MUST still do one of: (a) terminate TLS
-> in front of the gateway (reverse proxy on :50051, forwarding plaintext only over
-> loopback/a trusted segment); or (b) keep the agent port on a trusted network
-> (VPN / private subnet / service mesh). The QUIC transport (#376) is the
-> longer-term native path.
+> gateway exposed to an untrusted network, MUST still do one of: (a) front the
+> gateway at L4 or with TLS passthrough only (one TCP connection per agent end to
+> end, with the gateway's own agent-listener TLS enabled; an HTTP/2-terminating
+> reverse proxy, including a service-mesh sidecar that terminates HTTP/2, is not
+> supported for heartbeat admission, see
+> [Heartbeat admission](user-manual/gateway.md#heartbeat-admission)); or (b) keep
+> the agent port on a trusted network (VPN / private subnet / a mesh policy that does not
+> terminate HTTP/2; see [Heartbeat admission](user-manual/gateway.md#heartbeat-admission)).
+> Observed in a test with two agents: behind an HTTP/2-terminating proxy (nginx
+> `grpc_pass`) every heartbeat was rejected as a connection mismatch (counted, never
+> forwarded) while the agents still enrolled and received commands; behind an L4 TCP
+> forwarder (nginx `stream`) there were no rejections. The agent sees the same
+> `unknown session` for every rejection reason, so diagnose from the gateway
+> counters and summary log. The native fix is a vendored grpcbox accessor that exposes the transport peer to the gateway's handlers (#1172); gRPC is the permanent transport (ADR-0066).
 
 The canonical correct gateway TLS config is `gateway/config/sys.config.prod`
 (upstream `{https,...}` mutual TLS + **one-way TLS on the agent listener** (PR5c) +
@@ -337,14 +431,14 @@ own config at boot).
   cross-container/host dialing, either dial the server's hostname and set that service's
   `hostname:` so its SAN matches, or add the dialled name with `--cert-san dns:<name>`
   (shipped — extends every default leaf's SAN).
-- **Leaf rotation** — grpcbox reads the cert/key/CA files at channel *connect* time
-  (lazy), so replacing `default-gateway.{pem,key}` on disk is picked up on the next
-  upstream reconnect; an *established* channel keeps the old cert until it drops, so a
-  `systemctl restart yuzu-gateway` is the deterministic way to force a rotation.
+- **Leaf rotation.** From reading the grpcbox code (not tested), grpcbox reads the cert/key/CA files at channel *connect* time (lazy), so replacing `default-gateway.{pem,key}` on disk is picked up on the next upstream reconnect; an *established* channel keeps the old cert until it drops. A redial can still present the previous certificate for up to about 2 minutes after the files change, because the Erlang ssl PEM cache cleans every 120 s (measured on OTP 28.4.2 with a stub by a reviewer, not on a Yuzu gateway); a node restart clears the cache. A `systemctl restart yuzu-gateway` therefore forces a rotation deterministically, but restart a gateway only if denials continue after the redial window and its agents can take the disconnect: unless the agents run a build with the #5183 fix (in no release yet), released agents stay wedged afterwards (see the gateway peer-authorization runbook in `docs/user-manual/server-admin.md`).
 - **Observability** — an upstream TLS-handshake failure currently surfaces only as the
   generic circuit-breaker open state; a dedicated handshake-failure metric is a tracked
-  follow-up. See the consolidated residual-risk register + follow-ups in
-  `docs/security-reviews/pki-pr5-gateway-tls.md`.
+  follow-up. A server-side pin refusal is not a handshake failure: the TLS session
+  completes and the server answers with gRPC `UNAUTHENTICATED`, which the gateway counts
+  as an `rpc_error` rather than a transport failure (server-side signal:
+  `yuzu_server_gateway_peer_denied_total`). See the consolidated residual-risk register
+  + follow-ups in `docs/security-reviews/pki-pr5-gateway-tls.md`.
 
 ### Per-agent enrollment through the gateway (proto regen)
 
@@ -380,7 +474,8 @@ presented leaf); **denying** the agent is what stops re-enrollment/re-issuance
 agent↔gateway hop is one-way TLS (PR5c), so the issued leaf is presented to a
 non-verifying listener for now — issuing it completes per-agent-mTLS day-one
 (records the cert for inventory/revocation, future-proofs gateway mTLS), but
-*cryptographic* through-gateway identity binding remains the QUIC-era follow-up
+*cryptographic* through-gateway identity binding remains a follow-up (the gRPC
+gateway-hop identity design, #5578, ADR-0066)
 (agent identity across the gateway is still the app-layer `gateway_observed_peer`).
 
 ### Distribution flip — shipped as #1314
@@ -532,14 +627,20 @@ CA already in the system store; it logs a loud warning and is never the default.
 `--no-tls` remains the dev/demo opt-out.
 
 **Cross-container cert sharing — `--cert-group`.** A multi-container deploy
-(server + Erlang gateway + agents) runs the three as DIFFERENT non-root uids but
-shares ONE `/etc/yuzu/certs` volume. The server creates that dir `0700` and each
-leaf key `0600` owned by itself, so a different-uid sibling can neither traverse
-the dir nor read its key (the gateway's grpcbox crashes `eacces`). The
+(server + Erlang gateway + agents) runs the three as DIFFERENT non-root uids. The
+server and the gateway share the `/etc/yuzu/certs` volume (the reference
+compose also mounts it a third time, read-only, into a one-shot `ca-export`
+service); the agent container mounts the `ca-public` volume, into which that
+service copies `default-ca.pem`. The server creates the cert
+dir `0700` and each leaf key `0600` owned by itself, so a different-uid sibling can
+neither traverse the dir nor read its key (the gateway's grpcbox crashes `eacces`). The
 **`--cert-group <name|gid>`** flag (`YUZU_CERT_GROUP`) fixes this at cert-gen
 time: it chgrp's the cert dir (`0750`) and **only** `default-gateway.key`
 (`0640`) to a shared group — the FIXED gid 2000 `yuzu-pki` group baked into all
-three images, of which each image's user is a member. The CA key, server key,
+three images. The gateway key is the credential that authorizes a gateway to the
+server's gateway-upstream service: keep it readable only by the server and gateway
+processes, never mount the key-bearing volume into other containers, and never
+widen `--cert-group` membership beyond them. The CA key, server key,
 and HTTPS key stay `0600` owner-only — never group-shared; the CA + leaf certs
 are public `0644`. Empty (the default, single-host) keeps the tight 0700/0600
 posture. POSIX-only (Windows uses ACLs). This is `apply_cert_group_share()` in
@@ -577,8 +678,9 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   `<ca-dir>/default-ca.pem`) and add it to the OS/browser trust store. Verify
   with `openssl x509 -in default-ca.pem -noout -fingerprint -sha256` against the
   fingerprint in the startup banner / `/health`.
-- **Distribute the CA to agents:** pass `--ca-cert <default-ca.pem>` (PR5 ships a
-  shared cert volume so this is automatic in container deployments).
+- **Distribute the CA to agents:** pass `--ca-cert <default-ca.pem>` (in container
+  deployments the reference compose mounts the `ca-public` volume into the agent
+  container, so this is automatic).
 - **Inventory:** `GET /api/v1/ca/issued` (or the dashboard CA panel, PR4b).
 - **Revoke a compromised agent:** `POST /api/v1/ca/revoke {"serial_hex":"…"}`, or
   use the **Settings → Internal CA** dashboard panel (find the agent's row in the
@@ -609,11 +711,13 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   past `nextUpdate`) until leadership is re-acquired. On a single-replica deployment
   a *transient* coordination loss is momentary, but a *persistent* one keeps it
   paused until leadership returns — investigate the coordination connection, don't
-  wait it out. The *operator revoke* publish path is unfenced and always
-  republishes promptly. A failed republish
-  increments `yuzu_server_ca_crl_publish_failures_total` and audits
-  `ca.crl.published` `result=failure` — alert on it: the public CRL is stale while
-  server-side enforcement is already live.
+  wait it out. The *operator revoke* publish path is unfenced and republishes
+  immediately. If that republish fails, it increments
+  `yuzu_server_ca_crl_publish_failures_total` and audits `ca.crl.published`
+  `result=failure` — alert on it: the public CRL is stale while server-side
+  enforcement is already live. The leader's freshness pass then republishes on its
+  next tick once the failure clears (it detects a revocation the latest CRL does
+  not cover); a second revoke is not a retry path — it returns "already revoked".
 - **Back up** `<ca-dir>/default-ca.key` (0600) to offline storage — losing the root key forces a
   full fleet re-enrollment. The issued-cert inventory + CRL history live in the server's Postgres
   substrate (`ca_store` schema) — back it up with the rest of the database (`docs/postgres-store-
@@ -637,9 +741,22 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   Postgres substrate (`docs/postgres-store-playbook.md` for connecting) — and removes the on-disk
   `<ca-dir>/default-*.{pem,key}` + `default-marker.json` on every instance, then restarts all of
   them together. This orphans every currently-enrolled agent (their leaves chain to the destroyed
-  root); a full fleet re-enrollment follows, same as a root-key loss. Prefer `POST /ca/import-chain`
+  root); a full fleet re-enrollment follows, same as a root-key loss. On the Docker reference
+  gateway compose, prefer `docker compose up -d`: the agent mounts
+  the `ca-public` volume that the one-shot `ca-export` service fills, and the compose file's
+  documented refresh path is that service re-running on every `up`, after the server is healthy
+  (its `depends_on`). `restart` also restarts the one-shot container but without that ordering, so
+  the agent can keep the OLD CA in `ca-public` (inferred from the compose file, not tested). The
+  new gateway leaf also has a new key, which the restarted server auto-pins; a gateway presents
+  its new certificate only after it redials (inferred from reading the grpcbox code, not tested),
+  so check first whether it has already redialled (a server restart forces one), and restart that
+  gateway node, one at a time, only if denials continue and its agents can take the disconnect
+  (unless the agents run a build with the #5183 fix, in no release yet, released agents stay wedged
+  afterwards), as cause class B of the gateway peer-authorization runbook describes. Prefer `POST /ca/import-chain`
   (Subordinate-CA, PR6) when the
-  goal is re-keying under a new authority without an enrollment outage.
+  goal is re-keying under a new authority without an enrollment outage. **Not** when the goal is
+  to stop trusting a leaf whose revocation was lost: import-chain keeps the issuing key, so that
+  leaf still chains — only this clean re-root removes it.
 - **A bootstrap that seems permanently stuck** (multi-replica default-cert self-heal, ADR-0053
   C5-1/Gate 8 — an unsupported topology, `docs/user-manual/upgrading.md`'s HA note): check
   `pg_locks` for a lingering `yuzu:default_certs_bootstrap` session advisory lock —
@@ -690,18 +807,19 @@ direct gateway-bypassing reconnect — or strip `csr_pem` to downgrade the agent
 no-mTLS. **PR5d shipped the gateway-path signing without this gate, so the CSR-swap
 forgery is now a LIVE, bounded, accepted M1 residual** — see R-5 in
 `docs/security-reviews/pki-pr5-gateway-tls.md`; compensating controls are that the
-gateway is upstream-mTLS-authenticated and every forged leaf is recorded in
+gateway-upstream service authenticates its caller as an authorized gateway by SPKI
+pin (which establishes WHICH gateway is calling, not which agents it may relay for)
+and every forged leaf is recorded in
 `ca_issued` + revocable, and a revoked `agent_id` is then re-issue-blocked by the
-#1239 HIGH-2 guard. Closed durably by gateway-mTLS / the QUIC through-gateway
-identity migration, #376); **gateway `_pb.erl` regen CI guard** — gpb generates
+#1239 HIGH-2 guard. Closed durably by gateway-hop mTLS + attestation — #1292,
+on the gRPC design #5578, ADR-0066); **gateway `_pb.erl` regen CI guard** — gpb generates
 self-contained modules, so a field added to the agent-listener `agent_pb` but not
 the `ProxyRegister` marshaller `gateway_pb` is silently stripped in transit (the
 PR5 `csr_pem` catch; `agent.proto:96`); a per-module roundtrip test covers it but a
 CI regen+diff job (elevated **before PR5d**) is the structural fix; **durable
-cross-instance CRL numbering** (`next_crl_number()` = `MAX(version)+1` is serialised
-within one instance via `crl_publish_mu_`, but an HA/multi-instance/DB-restore
-scenario can still collide — `record_crl` rejects a duplicate rather than
-clobbering, #1240 UP-4); revoke-superseded-cert-on-renewal; the `is_revoked`
+cross-instance CRL numbering** — **done** in HA WS-6 slice 6.1 (#4126, #1240 UP-4),
+except after a point-in-time restore, an async-failover commit loss or a runbook
+clear of `ca_crl_versions`: see "CRL numbering across replicas" above; revoke-superseded-cert-on-renewal; the `is_revoked`
 heartbeat hot-path in-memory revoked-set memoization (pairs with the open-stream
 sweep); a distinct gateway **upstream TLS-handshake-failure metric**
 (`yuzu_gw_upstream_tls_handshake_failures_total`, R-3) so cert-expiry / CA-rotation

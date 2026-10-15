@@ -39,13 +39,20 @@ def wait_for(exec_id, timeout=120):
     raise TimeoutError(f"Execution {exec_id} did not complete in {timeout}s")
 
 def get_responses(definition_id, exec_id=None, limit=1000):
-    """Fetch result rows for a definition (optionally filtered by execution)."""
-    params = {"limit": limit}
+    """Fetch result rows for a definition (optionally filtered by execution).
+
+    The route serves at most 1000 rows per request, so a full page means rows
+    may be missing: fail loudly rather than analyse a partial result.
+    """
+    params = {"limit": min(limit, 1000)}
     if exec_id:
         params["execution_id"] = exec_id
     r = requests.get(f"{YUZU}/api/responses/{definition_id}", headers=HEADERS, params=params)
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    if body.get("result_truncated_by_cap") or body["count"] >= params["limit"]:
+        raise RuntimeError("response page is full: narrow the scope or filter, or fetch it in pages")
+    return body
 ```
 
 ### Scope Expression Cheat Sheet
@@ -473,20 +480,27 @@ wait_for(exec_id)
 responses = get_responses("crossplatform.software.inventory", exec_id)
 
 # Find machines with outdated Java
+# `output` holds many newline-joined rows, each app|name|version|publisher|install_date|
+# install_location|bundle_id (seven escape-aware tokens on plugin >= 1.2.0; an older
+# agent emits five and does not escape `|`, so only 5- or 7-token lines are accepted).
+import re
+def split_row(line):
+    return [t.replace("\\|", "|") for t in re.split(r"(?<!\\)\|", line)]
 for row in responses:
-    name = row["output"].get("name", "")
-    version = row["output"].get("version", "")
-    if "java" in name.lower() and version < "21.0":
-        print(f"OUTDATED JAVA: {row['agent_id']} has {name} {version}")
+    for line in row["output"].splitlines():
+        if not line:
+            continue
+        tokens = split_row(line)
+        if tokens[0] != "app" or len(tokens) not in (5, 7):
+            continue
+        name, version = tokens[1], tokens[2]
+        if "java" in name.lower() and version < "21.0":
+            print(f"OUTDATED JAVA: {row['agent_id']} has {name} {version}")
 ```
 
 #### CEL Compliance Expression
 
-Policy: Java Runtime must be version 21+:
-
-```cel
-result.name.contains('Java') && result.version.startsWith('21.')
-```
+CEL sees this definition's result as one raw `output` string (no `name`/`version` fields), so a version comparison is not expressible there; use the Python route above, or a substring test on `output` with the caveat that it also matches the publisher, install path and bundle identifier.
 
 ---
 
@@ -594,6 +608,8 @@ Policy: no critical vulnerabilities allowed:
 result.severity != 'critical' && result.severity != 'high'
 ```
 
+An `UNREADABLE` row means the check could not run (unreadable `/proc/sys` or `sshd_config`); treat it as not assessed — add `&& result.severity != 'UNREADABLE'` or gate on the `summary|UNREADABLE|<n>` count — rather than letting a "no critical/high" policy pass a host it never measured.
+
 Policy: CVSS score must be below threshold:
 
 ```cel
@@ -685,14 +701,19 @@ def wait_for(exec_id, timeout=300):
         time.sleep(3)
     raise TimeoutError(f"Execution {exec_id} timed out")
 
-def get_responses(definition_id, exec_id=None, limit=10000):
-    params = {"limit": limit}
+def get_responses(definition_id, exec_id=None, limit=1000):
+    # The route serves at most 1000 rows per request; a full page means rows may
+    # be missing, so raise instead of analysing a partial result.
+    params = {"limit": min(limit, 1000)}
     if exec_id:
         params["execution_id"] = exec_id
     r = requests.get(f"{YUZU}/api/responses/{definition_id}",
                      headers=HEADERS, params=params)
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    if body.get("result_truncated_by_cap") or body["count"] >= params["limit"]:
+        raise RuntimeError("response page is full: narrow the scope or filter, or fetch it in pages")
+    return body
 
 # ── Step 1: Query TAR on Windows machines for network events ─────────────
 # Scope to Windows first (cheapest filter — just an attribute check).
@@ -852,6 +873,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.network_config.dns_servers` | dns_servers | Q | WLM | *(none)* | adapter:string, server:string, type:string |
 | `device.network_config.proxy` | proxy | Q | WLM | *(none)* | proxy_type:string, proxy_address:string, bypass:string |
 | `device.network_config.dns_cache` | dns_cache | Q | WLM | *(none)* | name:string, record_type:string, ttl:int32 |
+| `device.network_config.routes` | routes | Q | WLM | *(none)* | family:string, destination:string, prefix_len:int32, gateway:string, interface:string, metric:string, table:string, route_type:string, origin:string |
 | `device.network.netstat_list` | netstat | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32 |
 | `device.network_diag.listening` | listening | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, pid:int32 |
 | `device.network_diag.connections` | connections | Q | WLM | *(none)* | proto:string, local_addr:string, remote_addr:string, remote_port:int32, pid:int32 |
@@ -867,7 +889,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 
 | Definition ID | Action | Type | Platforms | Parameters | Result Columns |
 |---|---|---|---|---|---|
-| `crossplatform.software.inventory` | list | Q | WLM | *(none)* | name:string, version:string, publisher:string, install_date:string |
+| `crossplatform.software.inventory` | list | Q | WLM | *(none)* | name:string, version:string, publisher:string, install_date:string, install_location:string, bundle_id:string |
 | `crossplatform.software.query` | query | Q | WLM | name:string (req) | found:bool, name:string, version:string, publisher:string |
 | `device.software_actions.list_upgradable` | upgradable | Q | WLM | *(none)* | package_name:string, current_version:string, available_version:string |
 | `device.software_actions.installed_count` | count | Q | WLM | *(none)* | count:int32 |

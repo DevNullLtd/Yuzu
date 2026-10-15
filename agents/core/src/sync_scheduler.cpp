@@ -5,7 +5,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
+#include <mutex>
 #include <optional>
+#include <string>
 
 namespace yuzu::agent {
 
@@ -44,7 +47,19 @@ void SyncScheduler::add_source(SyncSource src) {
     states_.emplace_back();
 }
 
-std::string SyncScheduler::kv_key(const std::string& source, const char* field) const {
+std::string sanitize_skip_reason(std::string_view reason) {
+    std::string out;
+    out.reserve(std::min(reason.size(), kPluginHeartbeatMaxValueBytes));
+    for (unsigned char c : reason.substr(0, kPluginHeartbeatMaxValueBytes)) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '.' || c == ':' || c == '=' ||
+                        c == ',' || c == '-';
+        out.push_back(ok ? static_cast<char>(c) : '_');
+    }
+    return out;
+}
+
+std::string SyncScheduler::kv_key(const std::string& source, const char* field) {
     return "sync." + source + "." + field;
 }
 
@@ -83,12 +98,24 @@ SyncScheduler::State& SyncScheduler::load_state(std::size_t idx, std::int64_t no
         st.force_full = kv_get_(kv_key(src.name, "force_full")) == "1";
         st.needfull_streak =
             static_cast<int>(std::strtoll(kv_get_(kv_key(src.name, "nf_streak")).c_str(), nullptr, 10));
+        // Clamp: a corrupt KV value must never reach the backoff shift as a negative.
+        const long long ss =
+            std::strtoll(kv_get_(kv_key(src.name, "skip_streak")).c_str(), nullptr, 10);
+        st.skip_streak =
+            static_cast<int>(std::clamp<long long>(ss, 0, std::numeric_limits<int>::max()));
+        st.last_skip = kv_get_(kv_key(src.name, "last_skip"));
     }
     st.loaded = true;
     return st;
 }
 
 void SyncScheduler::save_state(const SyncSource& src, const State& st) {
+    // KvStore has no multi-set transaction; the writes are ordered so a process
+    // kill between them leaves the skip visible with a stale (past) next_fire —
+    // the next tick simply retries — rather than an advanced next_fire with no
+    // recorded reason, which would hide the skip until the next collection.
+    kv_set_(kv_key(src.name, "skip_streak"), std::to_string(st.skip_streak));
+    kv_set_(kv_key(src.name, "last_skip"), st.last_skip);
     kv_set_(kv_key(src.name, "next_fire"), std::to_string(st.next_fire));
     kv_set_(kv_key(src.name, "last_full"), std::to_string(st.last_full));
     kv_set_(kv_key(src.name, "last_hash"), st.last_hash);
@@ -96,8 +123,186 @@ void SyncScheduler::save_state(const SyncSource& src, const State& st) {
     kv_set_(kv_key(src.name, "nf_streak"), std::to_string(st.needfull_streak));
 }
 
+void SyncScheduler::note_skip(std::size_t idx, std::int64_t now_secs) {
+    const SyncSource& src = sources_[idx];
+    State& st = states_[idx];
+    st.last_skip = src.skip_reason ? sanitize_skip_reason(src.skip_reason()) : std::string{};
+    if (st.skip_streak < std::numeric_limits<int>::max()) // overflow guard, not a cap
+        ++st.skip_streak;
+    const std::int64_t interval = src.interval.count();
+    if (!src.skip_backoff) {
+        st.next_fire = now_secs + interval;
+    } else {
+        const std::int64_t slot = next_slot(now_secs, interval, phase_offset(src.name, interval));
+        if (st.skip_streak <= kSkipRetryBudget)
+            st.next_fire =
+                std::min(slot, now_secs + (static_cast<std::int64_t>(kSkipRetryBase.count())
+                                           << (st.skip_streak - 1)));
+        else
+            st.next_fire = slot; // budget spent: exactly one attempt per slot
+    }
+    save_state(src, st);
+}
+
+void SyncScheduler::note_collected(std::size_t idx) {
+    State& st = states_[idx];
+    // A reason left behind a zero streak (save_state writes skip_streak before last_skip, so an
+    // interrupted clear can leave one) is cleared here too.
+    if (st.skip_streak == 0 && st.last_skip.empty())
+        return;
+    st.skip_streak = 0;
+    st.last_skip.clear();
+    save_state(sources_[idx], st);
+}
+
+std::vector<std::string> SyncScheduler::request_now(std::string_view source_or_all) {
+    std::vector<std::size_t> idx;
+    for (std::size_t i = 0; i < sources_.size(); ++i)
+        if (source_or_all == kAllSources || sources_[i].name == source_or_all)
+            idx.push_back(i);
+    std::vector<std::string> names;
+    if (idx.empty())
+        return names;
+    std::lock_guard<std::mutex> lk(pending_mu_);
+    for (std::size_t i : idx) {
+        if (std::find(pending_.begin(), pending_.end(), i) == pending_.end())
+            pending_.push_back(i);
+        names.push_back(sources_[i].name);
+    }
+    return names;
+}
+
+std::vector<std::string> SyncScheduler::source_names() const {
+    std::vector<std::string> out;
+    out.reserve(sources_.size());
+    for (const auto& s : sources_)
+        out.push_back(s.name);
+    return out;
+}
+
+std::vector<std::size_t> SyncScheduler::drain_pending(std::int64_t now_secs) {
+    std::vector<std::size_t> armed;
+    {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        armed.swap(pending_);
+    }
+    std::vector<std::size_t> valid;
+    valid.reserve(armed.size());
+    for (std::size_t i : armed) {
+        if (i >= sources_.size())
+            continue;
+        State& st = load_state(i, now_secs); // must run first so a never-loaded source is real
+        st.next_fire = now_secs;
+        st.force_full = true;
+        // An operator click deliberately beats the need_full backoff ladder (UP-5):
+        // the ladder exists to stop a FLEET stampeding a cold server, not to
+        // hold one device an operator is looking at.
+        st.needfull_streak = 0;
+        save_state(sources_[i], st); // persisted BEFORE the send: a failed RPC retries full
+        spdlog::info("sync: source '{}' forced by request_now", sources_[i].name);
+        valid.push_back(i);
+    }
+    return valid;
+}
+
+bool SyncScheduler::decide_full(const State& st, const std::string& hash,
+                                std::int64_t now_secs) const {
+    const bool floor_due =
+        (now_secs - st.last_full) >= static_cast<std::int64_t>(kFullFloor.count());
+    return st.force_full || st.last_hash.empty() || floor_due || hash != st.last_hash;
+}
+
+void SyncScheduler::apply_ack(std::size_t idx, const std::string& hash, bool sent_full,
+                              const std::vector<std::string>& need_full, std::int64_t now_secs) {
+    const SyncSource& src = sources_[idx];
+    State& st = states_[idx];
+    const bool nacked = std::find(need_full.begin(), need_full.end(), src.name) != need_full.end();
+    if (nacked) {
+        // Server could not materialise from a hash-only report (cold cache /
+        // drift) OR hit a transient store error — either way it nacked. Resend
+        // full, but with EXPONENTIAL BACKOFF on consecutive nacks so a
+        // sustained fleet-wide cold cache or a store outage does not resend at
+        // a flat 30s cadence forever (governance UP-5). Each nack doubles the
+        // delay from kMinTickSeconds, capped so backoff + the per-(agent,source)
+        // jitter stays within kMaxTickSeconds; reset on the next clean sync
+        // (the else branch). The jitter still de-stampedes a synchronized
+        // fleet-wide nack (e.g. a server DB restore).
+        st.force_full = true;
+        st.needfull_streak += 1;
+        const std::int64_t jitter_cap = kNeedFullJitterWindow.count();
+        const std::int64_t max_backoff = kMaxTickSeconds.count() - jitter_cap;
+        std::int64_t backoff = kMinTickSeconds.count();
+        for (int s = 1; s < st.needfull_streak && backoff < max_backoff; ++s)
+            backoff *= 2;
+        backoff = std::min(backoff, max_backoff);
+        const std::int64_t nf_jitter = static_cast<std::int64_t>(
+            fnv1a(agent_id_ + ":needfull:" + src.name) % static_cast<std::uint64_t>(jitter_cap));
+        st.next_fire = now_secs + backoff + nf_jitter;
+    } else {
+        st.last_hash = hash;
+        st.force_full = false;
+        st.needfull_streak = 0; // clean sync → reset the backoff ladder
+        if (sent_full)
+            st.last_full = now_secs;
+        st.next_fire =
+            next_slot(now_secs, src.interval.count(), phase_offset(src.name, src.interval.count()));
+    }
+    save_state(src, st);
+}
+
 std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
-    // Gather every due source's hash (always) + blob (only when sending full).
+    // Operator-forced sources first, so they are due in THIS pass.
+    const std::vector<std::size_t> forced = drain_pending(now_secs);
+
+    // Round-3 item 4: each forced source gets its OWN immediate ReportInventory
+    // RPC (one source's {name: hash} + optional blob, not the whole due set),
+    // fired as soon as THAT source's own collect() finishes — instead of
+    // folding it into the one shared batch RPC below, which previously made a
+    // fast forced source (device_ci/app_perf/licensing) wait behind a slow
+    // one's collect() (installed_software's macOS system_profiler scan can run
+    // several seconds) whenever more than one source was forced at once (the
+    // header "Sync now" forces every source via kAllSources). `handled` excludes
+    // these indices from the batch pass below regardless of outcome — a
+    // forced source that fails here retries on the NEXT tick (its next_fire/
+    // force_full were already persisted by drain_pending), never a second
+    // attempt in the SAME tick via the batch path. Registration order in
+    // agent.cpp decides processing order here (forced indices come out of
+    // drain_pending in ascending source-index order) — installed_software
+    // registers LAST so a "sync all" reports the four fast sources back to
+    // the server before starting the slow one.
+    std::vector<bool> handled(sources_.size(), false);
+    for (std::size_t i : forced) {
+        handled[i] = true;
+        const SyncSource& src = sources_[i];
+        State& st = load_state(i, now_secs);
+        auto collected = src.collect ? src.collect() : std::nullopt;
+        if (!collected) {
+            spdlog::debug(
+                "sync: forced source '{}' collect returned nothing — will retry next tick",
+                src.name);
+            continue;
+        }
+        note_collected(i);
+        const std::string& blob = collected->first;
+        const std::string& hash = collected->second;
+        const bool full = decide_full(st, hash, now_secs);
+        const std::vector<std::pair<std::string, std::string>> one_hash{{src.name, hash}};
+        std::vector<std::pair<std::string, std::string>> one_blob;
+        if (full)
+            one_blob.emplace_back(src.name, blob);
+        auto need_full = sender_ ? sender_(one_hash, one_blob) : std::nullopt;
+        if (!need_full) {
+            spdlog::debug(
+                "sync: forced source '{}' ReportInventory RPC failed — will retry next tick",
+                src.name);
+            continue;
+        }
+        apply_ack(i, hash, full, *need_full, now_secs);
+    }
+
+    // Gather every REMAINING due (cadence-based, non-forced-this-tick) source's
+    // hash (always) + blob (only when sending full) into ONE batch RPC —
+    // unchanged from before the pass split above.
     std::vector<std::pair<std::string, std::string>> hashes;
     std::vector<std::pair<std::string, std::string>> blobs;
     std::vector<std::size_t> due_idx;
@@ -105,6 +310,8 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
     std::vector<bool> sent_full;
 
     for (std::size_t i = 0; i < sources_.size(); ++i) {
+        if (handled[i])
+            continue;
         const SyncSource& src = sources_[i];
         State& st = load_state(i, now_secs);
         if (now_secs < st.next_fire)
@@ -113,18 +320,17 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
         auto collected = src.collect ? src.collect() : std::nullopt;
         if (!collected) {
             // Source unavailable this cycle (e.g. backing plugin not loaded).
-            // Skip + retry next interval; leave last_hash untouched.
-            spdlog::debug("sync: source '{}' collect returned nothing — skipping", src.name);
-            st.next_fire = now_secs + src.interval.count();
-            save_state(src, st);
+            // Skip; leave last_hash untouched. note_skip picks the retry time.
+            note_skip(i, now_secs);
+            spdlog::debug("sync: source '{}' collect returned nothing — skipping (reason='{}', "
+                          "streak={}, next_fire={})",
+                          src.name, st.last_skip, st.skip_streak, st.next_fire);
             continue;
         }
+        note_collected(i);
         const std::string& blob = collected->first;
         const std::string& hash = collected->second;
-
-        const bool floor_due =
-            (now_secs - st.last_full) >= static_cast<std::int64_t>(kFullFloor.count());
-        const bool full = st.force_full || st.last_hash.empty() || floor_due || hash != st.last_hash;
+        const bool full = decide_full(st, hash, now_secs);
 
         hashes.emplace_back(src.name, hash);
         if (full)
@@ -143,47 +349,8 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
             spdlog::debug("sync: ReportInventory RPC failed — {} source(s) will retry",
                           due_idx.size());
         } else {
-            const auto& nf = *need_full;
-            const auto needs_full = [&](const std::string& n) {
-                return std::find(nf.begin(), nf.end(), n) != nf.end();
-            };
-            for (std::size_t k = 0; k < due_idx.size(); ++k) {
-                const SyncSource& src = sources_[due_idx[k]];
-                State& st = states_[due_idx[k]];
-                if (needs_full(src.name)) {
-                    // Server could not materialise from a hash-only report (cold
-                    // cache / drift) OR hit a transient store error — either way
-                    // it nacked. Resend full, but with EXPONENTIAL BACKOFF on
-                    // consecutive nacks so a sustained fleet-wide cold cache or a
-                    // store outage does not resend at a flat 30s cadence forever
-                    // (governance UP-5). Each nack doubles the delay from
-                    // kMinTickSeconds, capped so backoff + the per-(agent,source)
-                    // jitter stays within kMaxTickSeconds; reset on the next clean
-                    // sync (the else branch). The jitter still de-stampedes a
-                    // synchronized fleet-wide nack (e.g. a server DB restore).
-                    st.force_full = true;
-                    st.needfull_streak += 1;
-                    const std::int64_t jitter_cap = kNeedFullJitterWindow.count();
-                    const std::int64_t max_backoff = kMaxTickSeconds.count() - jitter_cap;
-                    std::int64_t backoff = kMinTickSeconds.count();
-                    for (int s = 1; s < st.needfull_streak && backoff < max_backoff; ++s)
-                        backoff *= 2;
-                    backoff = std::min(backoff, max_backoff);
-                    const std::int64_t nf_jitter = static_cast<std::int64_t>(
-                        fnv1a(agent_id_ + ":needfull:" + src.name) %
-                        static_cast<std::uint64_t>(jitter_cap));
-                    st.next_fire = now_secs + backoff + nf_jitter;
-                } else {
-                    st.last_hash = due_hash[k];
-                    st.force_full = false;
-                    st.needfull_streak = 0; // clean sync → reset the backoff ladder
-                    if (sent_full[k])
-                        st.last_full = now_secs;
-                    st.next_fire = next_slot(now_secs, src.interval.count(),
-                                             phase_offset(src.name, src.interval.count()));
-                }
-                save_state(src, st);
-            }
+            for (std::size_t k = 0; k < due_idx.size(); ++k)
+                apply_ack(due_idx[k], due_hash[k], sent_full[k], *need_full, now_secs);
         }
     }
 

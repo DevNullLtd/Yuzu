@@ -14,11 +14,13 @@
 #include "authz_model.hpp"
 #include "dispatch_caller.hpp"
 #include "device_token_store.hpp"
-#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
-#include "dex_routes.hpp" // DexFleet -- the DexFleetFn provider type below
+#include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
+#include "dex_perf_api.hpp" // ADR-0031 WS-A4: the public in-process DEX app-perf-over-time API seam
+#include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
+#include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
@@ -32,6 +34,8 @@
 #include "response_store.hpp"
 #include "result_set_store.hpp"
 #include "schedule_engine.hpp"
+#include "scope_eval_error.hpp" // #4981 PR-2: ScopeEvalError — ScopeEvaluateFn's typed failure surface
+#include "scope_engine.hpp"     // #4981 PR-2: yuzu::scope::Expression — ScopeEvaluateFn's parsed-expr param
 #include "software_deployment_store.hpp"
 #include "mfa_step_up.hpp"
 #include "tag_store.hpp"
@@ -88,6 +92,7 @@ class DirectorySync;
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <set>
@@ -174,6 +179,44 @@ public:
     /// class branches (see the route's own comment in rest_api_v1.cpp).
     /// Empty/default `{}` = the two routes answer 503 (misconfiguration).
     using AgentsJsonFn = std::function<nlohmann::json()>;
+    /// #4983 — presence-merged agent-id existence check for `POST
+    /// /api/v1/result-sets`'s caller-supplied `device_ids[]`. Deliberately
+    /// NOT `AgentsJsonFn` above: `AgentsJsonFn` is backed by
+    /// `AgentRegistry::to_json_obj()`, which is LOCAL-REPLICA-ONLY, whereas
+    /// this is backed by `AgentRegistry::all_ids()`, which additionally
+    /// merges in any cross-replica agent known only via presence
+    /// (`configure_presence`/`live_presence()`, HA WS-5, ADR-2002 §7a) — the
+    /// SAME domain `evaluate_scope`'s `ScopePopulation::Fleet` path and every
+    /// real dispatch already use. #4981 (PR-3) fixed exactly this local-vs-
+    /// presence domain mismatch on the sibling `scope/preview` route; using
+    /// `AgentsJsonFn`'s local-only snapshot here would reintroduce the same
+    /// bug class one route over — a real device known only via presence
+    /// would be wrongly rejected as nonexistent. Called ONCE per request
+    /// (never per supplied id) and the result cached in an
+    /// `unordered_set` for O(1) per-id membership checks — the
+    /// `device_ids[]` array can be up to `ResultSetStore::kMaxMembersPerSet`
+    /// entries, so a per-id backing call would be its own DoS. Empty/default
+    /// `{}` = the route answers 503 when `device_ids` is non-empty
+    /// (misconfiguration), same fail-closed contract as `FleetReadFn`/
+    /// `ScopeEvaluateFn`. Set via `set_all_agent_ids_fn` (below), BEFORE
+    /// `register_routes()`.
+    using AllAgentIdsFn = std::function<std::vector<std::string>()>;
+    /// #4981 PR-2 — `POST /api/v1/scope/preview`'s SOLE scope-evaluation
+    /// callback: a thin closure over `AgentRegistry::evaluate_scope` with the
+    /// caller's tag/custom-properties/result-set stores already bound (see
+    /// `scope_preview.hpp`'s own `ScopeEvaluateFn` doc comment — the SAME
+    /// binding shape `command_routes.cpp`'s Scope arm and
+    /// `wire_and_dispatch_confined` (dispatch_scope_ladder.hpp) already use).
+    /// Injected rather than threading `AgentRegistry*`/`ResultSetStore*`/
+    /// `CustomPropertiesStore*` raw pointers into this route class, matching
+    /// the codebase convention of injecting `Fn`-typed closures over stores
+    /// rather than the stores themselves (keeps `AgentRegistry`/
+    /// `CustomPropertiesStore` out of this class entirely). Set via
+    /// `set_scope_evaluate_fn` (below), BEFORE `register_routes()`. Unset
+    /// (`{}`, the default) makes the route FAIL CLOSED (503), same contract
+    /// as `FleetReadFn`/`ListReadFn` above.
+    using ScopeEvaluateFn = std::function<std::expected<std::vector<std::string>, ScopeEvalError>(
+        const yuzu::scope::Expression&, const std::string& principal)>;
     /// #4033 — D3 Response:Read-visible agent SET resolver for the create-
     /// group agent-count preview (`GET /api/v1/management-groups/agent-count-
     /// preview` + its MCP twin), mirroring `DashboardRoutes::VisibleSetFn`
@@ -256,36 +299,35 @@ public:
     /// the agent dispatch path. Returns the number of agents pushed to, or -1 on an
     /// invalid scope expression. Injected from server.cpp where the registry/scope live.
     using GuardianPushFn = std::function<int(const std::string& scope, bool full_sync)>;
-    /// #4035: the SAME cross-store fleet denominator DexRoutes::FleetFn already
-    /// supplies to the dashboard fragments (windows/linux/macos-online counts +
-    /// connected-agent list) — reused verbatim (not re-derived) so the new
-    /// GET /api/v1/dex/{health,trends,overview,catalogue/group} twins read the
-    /// exact same fleet snapshot the fragments render against. Injected from
-    /// server.cpp, which already builds one `DexFleet` provider lambda for
-    /// DexRoutes; that SAME lambda is passed here too (see server.cpp). Trailing
-    /// optional (`{}`) for source-stability of existing call sites/tests — a
-    /// route that needs it treats an unwired fn as "no fleet data" (score/
-    /// crash-free suppressed), never a crash.
-    using DexFleetFn = std::function<DexFleet()>;
-    /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
-    /// resolver `DexRoutes::register_routes`'s own `resolve_visible` (dex_routes.cpp)
-    /// already applies to confine `/fragments/dex/app`'s and
-    /// `/fragments/dex/overview`'s device-id lists to the caller's management-group
-    /// scope (ADR-0017 World A) — GET /api/v1/dex/app and GET /api/v1/dex/overview
-    /// enumerate the identical affected/top-devices lists and MUST apply the same
-    /// confinement, not just the sibling service-scoped-token deny belt
-    /// (`deny_fleet_wide_service_scoped`). Two independent belts are required
-    /// together, per the SCOPING NOTE on the `dex_fleet_fn` provider in server.cpp:
-    /// this fn closes the management-group-confined-OPERATOR axis,
-    /// `deny_fleet_wide_service_scoped` closes the service-scoped-API-token axis —
-    /// neither substitutes for the other. `nullopt` = unfiltered (global read /
-    /// RBAC off, or the session could not be resolved); engaged (incl. empty) =
-    /// filter to exactly these agents. Trailing optional (`{}`) for
-    /// source-stability of existing call sites/tests — a route that needs it
-    /// treats an unwired fn as "no confinement" (matching the fragment's own
-    /// unwired-`visible_set_fn_` posture), never a crash.
-    using DexVisibleFn =
-        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
+    // ADR-0031 WS-A4 (fifth family): the former `DexFleetFn` register_routes
+    // param is RETIRED. The DEX read handlers now route through the `DexApi`
+    // seam, which obtains the fleet denominator via its OWN FleetFn (wired into
+    // make_local_dex_api in server.cpp) — so no fleet provider is threaded into
+    // register_routes anymore. (DexRoutes' dashboard fragments still use their
+    // own fleet provider directly; that rewire is deferred, ISSUE #4576.)
+    // #4035 hardening (governance) introduced a bespoke `DexVisibleFn`
+    // resolver for GET /api/v1/dex/app, GET /api/v1/dex/overview, and GET
+    // /api/v1/dex/signals/{obs_type} — retired (WS-A4 PR-1 fix round, sec-1):
+    // the bare `perm_fn(GuaranteedState:Read)` gate in front of it used
+    // `RbacStore::check_permission`, which resolves GLOBAL roles only and
+    // never consults `ManagementGroupStore` — a management-group-confined-
+    // only operator was 403'd by `perm_fn` before this resolver ever ran, so
+    // the confinement it computed was dormant on every admitted call (sec-1),
+    // and an elevated admin got the BASE identity's narrowed/empty set
+    // instead of an unfiltered read (sec-2). A later fix round tried gating
+    // all three onto `FleetReadFn` (`AuthRoutes::require_fleet_read`,
+    // ADR-0017) instead, but every value these three routes return —
+    // `devices[]`/`top_devices[]` INCLUDED, since those lists are built by a
+    // query that runs a fleet-wide LIMIT before any per-caller filter — is a
+    // FLEET-WIDE AGGREGATE (ADR-0017 INV-3 violation if narrowed per caller
+    // without confining the aggregate math itself), so per the WS-A4 PR-1
+    // decision all three REVERTED to base gating: a bare `perm_fn`
+    // (`GuaranteedState:Read`, a global grant; with RBAC off, any authenticated non-service/non-engine session only —
+    // NEVER management-group-confined) plus each route's own
+    // `deny_fleet_wide_service_scoped` call. `DexApi::app`/`overview`/
+    // `signal_detail` no longer take a `visible` parameter at all — there is
+    // no per-caller confinement resolver on these three routes, dormant or
+    // otherwise, to keep in sync with anything.
 
     /// Outcome of a session-revocation REST call. `cookie_sessions_revoked`
     /// is the number of in-memory cookie sessions wiped (the operationally
@@ -433,9 +475,6 @@ public:
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
         ResponseScopeFn response_scope_fn = {},
-        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
-        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
-        AppPerfProviders app_perf_providers = {},
         // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
         // authoring surface (/api/v1/engine-principals/{id}/roles). Trailing
         // optional dep; nullptr leaves the assign/unassign routes answering
@@ -477,23 +516,66 @@ public:
         // Response:Read scope resolver (see ResponseVisibleSetFn's doc
         // comment above). Trailing optional dep; `{}` = legacy-open.
         ResponseVisibleSetFn response_visible_set_fn = {},
-        // #4035: see DexFleetFn's doc comment above. Trailing optional dep; `{}`
-        // degrades the fleet-dependent DEX twins (health/trends/overview/
-        // catalogue-group) to their "no reporting agents" suppressed shape —
-        // never a crash.
-        DexFleetFn dex_fleet_fn = {},
-        // #4035 hardening (governance): see DexVisibleFn's doc comment above.
-        // Trailing optional dep; `{}` degrades GET /api/v1/dex/app and GET
-        // /api/v1/dex/overview to "no confinement" (matching the fragment's own
-        // unwired-`visible_set_fn_` posture), never a crash.
-        DexVisibleFn dex_visible_fn = {},
         // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam (replaces
         // the former AppPerfCohortFn-in-AppPerfProviders ad-hoc cohort provider
         // for GET /api/v1/dex/perf/compare) — the SAME instance the /auto VERIFY
         // dashboard fragments and the MCP compare_app_perf_versions tool call,
         // so REST/dashboard/MCP can never disagree. nullptr = the route answers
         // 503 (provider unwired), same degrade as the retired cohort provider.
-        std::shared_ptr<const VerifyApi> verify_api = nullptr);
+        std::shared_ptr<const VerifyApi> verify_api = nullptr,
+        // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam — backs
+        // GET /api/v1/devices[/{id}] (replaces the raw `agents_fn` read on
+        // this pair only). #4981 PR-2: `agents_fn` no longer has a live
+        // consumer in this file — `POST /api/v1/scope/preview` now sources
+        // matches from `scope_evaluate_fn_` (a real `AgentRegistry::evaluate_scope`
+        // closure) rather than a locally pre-filtered agent snapshot; the
+        // parameter stays for source-stability of existing callers/tests. The
+        // SAME instance `DeviceRoutes`/MCP `list_agents`+`get_agent_details`
+        // use, so REST/dashboard/MCP can never disagree on device identity data.
+        // nullptr = both routes answer 503 (provider unwired).
+        std::shared_ptr<const DeviceApi> device_api = nullptr,
+        // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API
+        // seam — backs the GuaranteedStateStore-backed GET /api/v1/dex/*
+        // signal/experience reads (the SAME instance the MCP DEX signal tools
+        // use). The DEX signal handlers REQUIRE it: nullptr → those routes
+        // answer 503, equivalent to the old `!guaranteed_state_store` readiness
+        // guard (server.cpp wires this iff the store is present).
+        std::shared_ptr<const DexApi> dex_api = nullptr,
+        // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-
+        // over-time API seam — backs the 9 GET /api/v1/dex/perf/* resources
+        // (minus /compare, VerifyApi's) + GET /api/v1/dex/devices/{id}/app-perf
+        // (the SAME instance the MCP DEX perf tools and the dashboard
+        // fragments use, #4626). REQUIRED: nullptr → those routes answer 503,
+        // equivalent to the old `!dex_perf_fn`/`!app_perf_providers.<member>`
+        // readiness guards. Unlike dex_api above, server.cpp constructs this
+        // UNCONDITIONALLY (never null) — each backing store pointer is
+        // checked individually inside the impl, matching the old per-lambda
+        // null-checks, so the route guard is defense-in-depth, never expected
+        // to fire. `AppPerfProviders` (the pre-seam bundle) is retired.
+        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
+        // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read
+        // API seam — backs 8 of the 9 GET /api/v1/guaranteed-state/*
+        // resources (the SAME instance the MCP Guardian tools use;
+        // `schemas` stays outside the seam, store-free — see
+        // guardian_api.hpp). server.cpp constructs this UNCONDITIONALLY
+        // (never null) — each of the two backing store pointers is checked
+        // INDIVIDUALLY inside the impl (guardian_api.cpp), mirroring
+        // dex_perf_api's own multi-dependency posture: a null
+        // `guaranteed_state_store_` degrades every method, a null
+        // `baseline_store_` degrades ONLY device_compliance. The
+        // `!guardian_api` guard the 8 routes still carry is therefore
+        // defense-in-depth only, matching the pre-seam
+        // `!guaranteed_state_store` guard's practical behaviour.
+        // `guaranteed_state_store` above stays wired too, for the
+        // rule/baseline MUTATORS this seam does not cover.
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr,
+        // #5047: closes the cross-transport MCP-tier bypass on the 4
+        // result-set write routes (create/pin/unpin/delete), which have no
+        // `perm_fn`/RBAC gate at all (ownership-only by design — see
+        // TierPolicyFn's doc comment in auth_routes.hpp). Trailing optional
+        // dep; `{}` fails closed (503) for a TIERED caller and passes
+        // through for an untiered one — see TierPolicyFn's own contract.
+        TierPolicyFn tier_policy_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -542,9 +624,6 @@ public:
         // readers (visualization). Trailing optional dep; MUST be wired from
         // server.cpp — `{}` scope = unfiltered fan-out read.
         ResponseScopeFn response_scope_fn = {},
-        // DEX app-perf-over-time read surface (slice 2). One bundle of B1/B2
-        // provider seams; `{}` = the endpoints answer 503 (provider unwired).
-        AppPerfProviders app_perf_providers = {},
         // PR 4.2 (design §4.1) — backs the fleet-wide engine role-assignment
         // routes (/api/v1/engine-principals/{id}/roles), which capture this
         // param. COEXISTENCE (4.2→4.3 rebase): the 4.3 lifecycle routes use the
@@ -573,16 +652,25 @@ public:
         // #4033: see the production overload's doc comment above; identical
         // trailing-optional-dep, legacy-open-when-unwired contract.
         ResponseVisibleSetFn response_visible_set_fn = {},
-        // #4035: see the production overload's doc comment above; identical
-        // trailing-optional-dep, degrade-not-crash contract.
-        DexFleetFn dex_fleet_fn = {},
-        // #4035 hardening (governance): see the production overload's doc
-        // comment above (DexVisibleFn); identical trailing-optional-dep,
-        // degrade-to-no-confinement contract.
-        DexVisibleFn dex_visible_fn = {},
         // ADR-0031 WS-A4 #4250: see the production overload's doc comment
         // above; identical trailing-optional-dep, 503-when-unwired contract.
-        std::shared_ptr<const VerifyApi> verify_api = nullptr);
+        std::shared_ptr<const VerifyApi> verify_api = nullptr,
+        // ADR-0031 WS-A4 wave 2: see the production overload's doc comment
+        // above; identical trailing-optional-dep, 503-when-unwired contract.
+        std::shared_ptr<const DeviceApi> device_api = nullptr,
+        // ADR-0031 WS-A4 (fifth family): see the production overload's doc
+        // comment above; identical trailing-optional-dep, required-or-503.
+        std::shared_ptr<const DexApi> dex_api = nullptr,
+        // ADR-0031 WS-A4 (sixth family): see the production overload's doc
+        // comment above; identical trailing-optional-dep, required-or-503.
+        std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
+        // ADR-0031 WS-A4 (ninth family): see the production overload's doc
+        // comment above; identical trailing-optional-dep, required-or-503.
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr,
+        // #5047: see the production overload's doc comment above; identical
+        // trailing-optional-dep, fail-closed-for-a-tiered-caller-when-unwired
+        // contract (TierPolicyFn's own doc comment, auth_routes.hpp).
+        TierPolicyFn tier_policy_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the
@@ -598,9 +686,95 @@ public:
     /// `set_engine_principal_store`.
     void set_user_exists_fn(UserExistsFn fn) { user_exists_fn_ = std::move(fn); }
 
+    /// #4981 PR-2 — see `ScopeEvaluateFn`'s doc comment above. MUST be called
+    /// BEFORE `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`. Unset (`{}`, the default) makes
+    /// `POST /api/v1/scope/preview` answer 503 (misconfiguration).
+    void set_scope_evaluate_fn(ScopeEvaluateFn fn) { scope_evaluate_fn_ = std::move(fn); }
+
+    /// #4983 — see `AllAgentIdsFn`'s doc comment above. MUST be called
+    /// BEFORE `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`. Unset (`{}`, the default) makes
+    /// `POST /api/v1/result-sets` answer 503 whenever a non-empty
+    /// `device_ids` is supplied (misconfiguration) — a request with no
+    /// `device_ids` is unaffected either way.
+    void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
+
+    /// #5342 Gate 7 (C5) — an audit writer that stamps the principal
+    /// EXPLICITLY instead of re-resolving it from the request's session.
+    /// Wired from `AuthRoutes::audit_log_for_principal`. The password routes
+    /// capture the principal once, up front, and pass it to every REFUSAL row
+    /// they write (the success rows are written inside the credential-change
+    /// transaction from `AuditEventFn`'s event). Returns true iff the row
+    /// persisted (true in audit-off mode).
+    using AuditPrincipalFn = std::function<bool(
+        const httplib::Request& req, const std::string& action, const std::string& result,
+        const std::string& principal, const std::string& principal_role,
+        const std::string& target_type, const std::string& target_id, const std::string& detail)>;
+
+    /// #5342 Gate 8 — builds (does NOT write) the identity/request half of an
+    /// audit row for an explicit principal: `AuthRoutes::
+    /// make_audit_event_for_principal`. The password routes hand it to
+    /// `CredentialChangeOwner` as the template of the success row(s), which are
+    /// persisted INSIDE the credential-change transaction (`AuditStore::
+    /// log_in_txn`) so the change and its evidence commit or abort together.
+    using AuditEventFn = std::function<AuditEvent(
+        const httplib::Request& req, const std::string& principal,
+        const std::string& principal_role, const std::string& target_type,
+        const std::string& target_id)>;
+
+    /// #5342 — the local-account password routes' dependencies:
+    /// `POST /api/v1/users/me/password` (self-service, proves the current
+    /// password) and `POST /api/v1/users/{name}/password` (admin reset).
+    ///   * `auth_mgr` — `commit_password_change`, the ONE credential write
+    ///     (it delegates to `CredentialChangeOwner`: credential + sessions +
+    ///     provisional MFA + lockout + audit in one transaction).
+    ///   * `verify_current_fn` — `AuthRoutes::password_change_verify_fn()`: the
+    ///     ONE lockout-accounted password check `/login` also uses (incl. the
+    ///     sso-only gate), so this file never carries a second copy of the
+    ///     striped-lock section.
+    ///   * `audit_principal_fn` — `AuthRoutes::audit_log_for_principal` (see
+    ///     `AuditPrincipalFn`): every REFUSAL row these routes write goes
+    ///     through it.
+    ///   * `audit_event_fn` — `AuthRoutes::make_audit_event_for_principal` (see
+    ///     `AuditEventFn`): the template of the in-transaction success row(s).
+    ///   * `break_glass_user` — `Config::break_glass_user`; the admin reset
+    ///     refuses it as a target (403 `break_glass_target`) — the sealed
+    ///     escape hatch is re-keyed only out of band, never by a session an
+    ///     IdP compromise could have produced.
+    /// The admin route additionally uses `register_routes`' own `rbac_store`
+    /// and `auth_db` (the `is_rbac_administrator` gate); the lockout clear is
+    /// part of the credential-change transaction itself (not
+    /// `lockout_clear_fn`). Any required member unset ⇒ the route answers 503
+    /// (misconfiguration), never a partial write. MUST be called BEFORE
+    /// `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`.
+    struct PasswordChangeDeps {
+        auth::AuthManager* auth_mgr{nullptr};
+        PasswordVerifyFn verify_current_fn;
+        AuditPrincipalFn audit_principal_fn;
+        std::string break_glass_user;
+        AuditEventFn audit_event_fn;
+    };
+    void set_password_change_deps(PasswordChangeDeps deps) { password_deps_ = std::move(deps); }
+
+    /// #5342 — the operator-declared trusted-origin allowlist (#2537,
+    /// `Config::csrf_trusted_origins`, normalised at boot) for the CSRF
+    /// same-site gate the password routes apply to their cookie sessions —
+    /// the same setter idiom as `CaRoutes`/`DashboardRoutes`. Unset = same-host
+    /// only (fail-closed behind a Host-rewriting proxy, never open). MUST be
+    /// called BEFORE `register_routes()` (captured by value).
+    void set_csrf_trusted_origins(std::vector<std::string> origins) {
+        csrf_trusted_origins_ = std::move(origins);
+    }
+
 private:
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
+    PasswordChangeDeps password_deps_;
+    std::vector<std::string> csrf_trusted_origins_;
+    ScopeEvaluateFn scope_evaluate_fn_;
+    AllAgentIdsFn all_agent_ids_fn_;
 };
 
 } // namespace yuzu::server

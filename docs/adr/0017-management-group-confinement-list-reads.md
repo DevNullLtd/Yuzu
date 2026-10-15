@@ -262,6 +262,23 @@ gate.
     group-write + confined response-read) can use the unscoped facet query to discover and enroll
     out-of-scope agents. Tracked as a follow-up, not fixed by #1712 — see #3489
     (canonical; #3525 tracked the same finding and was closed as its duplicate).
+- **Executions list fragment and MCP `summarize_working_set` (#3526, #4753)**: `GET /fragments/executions`
+  and `summarize_working_set` `kind=execution` migrated onto `require_fleet_read`/`fleet_read_fn_` as
+  the sole gate on `(Execution, Read)` (hardening plus an admission change; an author-run reachability
+  probe, not independently adjudicated, found no leak through the old gate; see
+  `docs/auth-architecture.md`'s "Sixth migration"). With RBAC off both surfaces are unconfined for every
+  authenticated non-service, non-engine caller whose tier allows it (an engine principal is refused
+  with 403 with RBAC off). When the gate refuses the fragment it still audits, but the response is
+  replaced with an HTTP 200 note (`data-denied="true"` for a 403, `data-degraded="gate"` for a 503;
+  a 401 passes through), because the dashboard drops 4xx/5xx bodies; the REST and MCP twins keep the
+  real 403/503. The fragment suppresses the owner disjunct for service-scoped sessions
+  (a service-scoped token's session username is its minter); the other execution read surfaces still show
+  a minter's executions to a service-scoped token (#5557). The fragment pushes the scope into SQL
+  before its LIMIT and bounds the agent-status read to the visible agents; MCP's first gate stays a
+  plain `Infrastructure:Read`. **NOT covered, disclosed:** `summarize_working_set` `kind=fleet` and
+  `kind=result_set` return the whole-registry agent count from `agents_fn()` (#4753, checklist still
+  open), as does `kind=execution`/`kind=agent` with an empty id; REST
+  `GET /api/v1/execution-statistics/agents` (#3526).
 - **Executions (legacy pre-v1 routes)** — `GET /api/executions` (list), `/{id}` (detail),
   `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, `POST /{id}/cancel`
   (`execution_routes.cpp` as of #2542 PR-7, extracted from `server.cpp`) — absent from every prior version of this coverage map; found during #1634's own
@@ -281,10 +298,11 @@ gate.
 - **Inventory** — `query_installed_software` (MCP) + `GET /api/v1/inventory/software` (REST):
   **DONE (#3290, 2026-08-20)** — migrated onto `require_fleet_read`, the admit-then-filter gate
   this ADR designed; confinement is now effective on both surfaces.
-  - **`/inventory` dashboard FIND** (`InventoryRoutes`, `inventory_routes.cpp` find/results) shares
-    the SAME per-row drop filter + omission audit as the REST/MCP siblings above — it converts the
-    same way (swap its `Inventory:Read` gate to admit-then-filter; the per-row filter is already
-    present).
+  - **`/inventory` dashboard FIND** — retired: its routes were deleted. The per-row drop filter +
+    omission audit now live on `/fragments/inventory/software/devices` (`InventoryRoutes`), which
+    shares them with the REST/MCP siblings above. **DONE (M.9 PR-3):** all three Software fragments
+    now gate on `fleet_read_fn` (admit-then-filter); the catalogue and versions refuse a confined
+    caller, while the host view and devices tables are admitted and scoped.
   - **⚠ `SoftwareInventoryStore::software_catalog` / `software_versions`** (the `/inventory`
     Software-tab fleet aggregates) are a DIFFERENT shape: they read a **precomputed, fleet-wide
     rollup** (`catalog_rollup` / `version_rollup`, recomputed across ALL agents by the background
@@ -302,6 +320,23 @@ gate.
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)
 - **DEX / TAR list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
   `dex_routes.hpp:311`) + remaining TAR/dashboard list fragments.
+  - **Update (2026-09-28, WS-A4 PR-1):** `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/app`, and `GET
+    /api/v1/dex/overview` (REST + MCP) stay pinned to a GLOBAL-only `GuaranteedState:Read` permission
+    check — the same bare gate they had before this PR, never migrated onto `require_fleet_read`.
+    Every field they return (`subjects[]`/`by_os[]`/`devices[]`/`by_day[]`/
+    `top_devices[]`/`top_apps[]`, etc.) is a query-time `GROUP BY` over agent-attributed rows —
+    **not** a precomputed rollup like `software_catalog`/`version_rollup` above, so the rationale
+    for pinning it global-only is different: it is simply **not yet confined per-caller** — an
+    INV-3-respecting per-caller SQL slice (a `WHERE agent_id IN (...)` narrowing derived from the
+    caller's visible set, applied INSIDE the aggregation, not a post-aggregate filter) has not been
+    built for these three queries yet; tracked as #5090. The `/fragments/dex/overview`, `/fragments/dex/app`, and
+    `/fragments/dex/catalogue/signal` dashboard fragments are UNCHANGED by this fix round: they also
+    gate on the SAME global `perm_fn` (a group-only operator is denied `403` there too, same as the
+    REST/MCP surfaces) — the residual is the OPPOSITE of a confined-caller leak: among callers who
+    DO hold the global grant, the fragments additionally narrow their device list by the
+    permission-agnostic `Infrastructure:Read` `visible_set_fn` (a DIFFERENT securable from this
+    row's `GuaranteedState:Read` gate) — tracked for the dashboard-rewire follow-up (PR-2), which
+    also owns deciding whether that narrowing is correct or itself a bug.
 
 ### Out of scope (global by design)
 
@@ -463,7 +498,7 @@ ahead of PR-A.)
    fallback (INV-6), replace with the permission-specific set. Six callers across dashboard + server
    + json — consider splitting REST vs dashboard.
 4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` —
-   **DONE (#3290)**. `/inventory` dashboard FIND remains open (its own conversion, see above).
+   **DONE (#3290)**. The `/software` devices expansion (`/fragments/inventory/software/devices`) is **DONE** (M.9 PR-3, see above).
 5. **PR-E — DEX / TAR / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
    the `AuditLog:Read` surface.
 

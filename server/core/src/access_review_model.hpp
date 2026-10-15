@@ -144,17 +144,49 @@ struct AccessReviewRow {
 build_access_review(AuthDB* users, RbacStore* rbac, EnginePrincipalStore* engines,
                     ApiTokenStore* tokens, DirectorySync* dirsync);
 
-/// Serialize rows to CSV (header + one row per principal). `roles` is
-/// semicolon-joined within a field. RFC 4180-style escaping: any field
-/// containing a comma, double-quote, or newline is wrapped in double quotes
-/// with interior double-quotes doubled. CWE-1236 (CSV/formula injection)
-/// hardening: any field whose first byte is one Excel/Sheets treats as a
-/// formula trigger (`=`, `+`, `-`, `@`, tab, CR) is prefixed with a literal
-/// `'` BEFORE the RFC-4180 quoting pass — several fields here
-/// (principal_id/display_name/owner_or_email/role names) are influenceable
-/// by an external identity provider (SCIM username, engine display_name),
-/// so this is not a theoretical input. See the `.cpp` `csv_field` for the
-/// exact character set.
-[[nodiscard]] std::string to_csv(const std::vector<AccessReviewRow>& rows);
+/// Serialize rows to CSV (leading metadata line + header + one row per
+/// principal). `roles` is semicolon-joined within a field. RFC 4180-style
+/// escaping: any field containing a comma, double-quote, or newline is
+/// wrapped in double quotes with interior double-quotes doubled. CWE-1236
+/// (CSV/formula injection) hardening: any field whose first byte is one
+/// Excel/Sheets treats as a formula trigger (`=`, `+`, `-`, `@`, tab, CR) is
+/// prefixed with a literal `'` BEFORE the RFC-4180 quoting pass — several
+/// fields here (principal_id/display_name/owner_or_email/role names) are
+/// influenceable by an external identity provider (SCIM username, engine
+/// display_name), so this is not a theoretical input. See the `.cpp`
+/// `csv_field` for the exact character set.
+///
+/// A3 (RBAC delivery plan): the FIRST line is an unconditional metadata
+/// comment, `# rbac_enforcement=<enabled|disabled|degraded>\r\n`, carrying
+/// `rbac_enforcement` (caller-supplied — typically
+/// `access_review_rbac_enforcement()`'s result, computed once alongside
+/// the same row population; never re-derived here, so this function gains
+/// no `RbacStore` dependency of its own). Present even when `rows` is
+/// empty, so a zero-grant population is never ambiguous with "the stamp
+/// was omitted". This line is emitted verbatim (not `csv_field`-escaped) —
+/// the value is always one of the three fixed literals above, never
+/// externally influenced, so RFC 4180/CWE-1236 handling does not apply to
+/// it. A consumer parsing this file as strict single-header tabular data
+/// skips this first line before the real header row (documented in
+/// `docs/user-manual/rest-api.md`'s CSV section). This CSV is the
+/// RETAINED, OFFLINE evidence artifact an auditor pulls
+/// (`docs/security-reviews/access-reviews-2026-07-21.md`), so the stamp
+/// must travel WITH the file, not only its JSON sibling response.
+[[nodiscard]] std::string to_csv(const std::vector<AccessReviewRow>& rows,
+                                 const std::string& rbac_enforcement);
+
+/// A3 (RBAC delivery plan) — "enabled" | "disabled" | "degraded" enforcement
+/// stamp for the SAME cross-principal export `build_access_review` produces.
+/// Kept as a separate call rather than folded into `AccessReviewRow`/the
+/// returned vector: the value is fleet-wide, not per-row, so every caller
+/// stamps it ONCE alongside the row list — both for the live export (GET
+/// .../export) and for the frozen campaign row `access_review_store.hpp`
+/// persists at `open_campaign` time (SOC 2 CC6.2 evidence should say whether
+/// the grant population it lists was actually enforced when frozen). Thin
+/// wrapper over `rbac_enforcement_label()`/`to_string()` (`rbac_store.hpp`)
+/// — see that pair for the exact three-way derivation and its relationship
+/// to `rbac_enforcement_in_effect()`. `rbac` may be null (degrades to
+/// `"degraded"`, matching `rbac_enforcement_label(nullptr)`).
+[[nodiscard]] std::string access_review_rbac_enforcement(const RbacStore* rbac);
 
 } // namespace yuzu::server

@@ -1,5 +1,6 @@
 #include "execution_routes.hpp"
 
+#include "execution_model.hpp" // #2146 A2-R1: shared execution_child_row_json builder
 #include "execution_scope_rules.hpp"
 #include "execution_tracker.hpp"
 #include "http_route_sink.hpp"
@@ -681,16 +682,26 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // governance PR review (2026-08-31): mark_cancelled now reports
-        // whether the update actually happened — do not tell the
-        // operator "cancelled" (HTTP 200 + a "success" audit row) when
-        // it didn't.
-        if (!deps.execution_tracker->mark_cancelled(id, user)) {
+        // mark_cancelled_checked keeps "nothing to cancel" (already terminal, or the row
+        // vanished between the read above and the guarded UPDATE) apart from a store failure:
+        // the first is a state-guard refusal (409, audited `denied`), only the second is a 503.
+        using Outcome = ExecutionTracker::MarkCancelledOutcome;
+        switch (deps.execution_tracker->mark_cancelled_checked(id, user)) {
+        case Outcome::kFailed:
             (void)deps.audit_fn(req, "execution.cancel", "failure", "execution", id, "");
             res.status = 503;
             res.set_content(detail::a4_error(res, "cancel failed - execution store degraded"),
                             "application/json");
             return;
+        case Outcome::kNoOp:
+            (void)deps.audit_fn(req, "execution.cancel", "denied", "execution", id,
+                                "already finished (no state change)");
+            res.status = 409;
+            res.set_content(detail::a4_error(res, "execution already finished"),
+                            "application/json");
+            return;
+        case Outcome::kCancelled:
+            break;
         }
         (void)deps.audit_fn(req, "execution.cancel", "success", "execution", id, "");
         deps.emit_event_fn("execution.completed", req, {{"status", "cancelled"}},
@@ -715,6 +726,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -734,6 +746,16 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+            // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-visible-agent
+            // admission predicate into get_children_checked's SQL below (this
+            // file's own LIST handler precedent above) -- closes the
+            // cap-before-scope defect where an invisible sibling could
+            // displace this caller's own visible children out of the capped
+            // window.
+            yuzu::server::ExecutionListScope s;
+            s.owner = username;
+            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+            scope_arg = std::move(s);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -776,7 +798,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto children_opt = deps.execution_tracker->get_children_checked(id);
+        auto children_opt = deps.execution_tracker->get_children_checked(id, scope_arg);
         if (!children_opt) {
             res.status = 503;
             res.set_content(
@@ -794,8 +816,8 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             // child passes the same owner-or-visible-agent predicate
             // independently. One batched statuses call, not N+1.
             std::vector<std::string> child_ids;
-            child_ids.reserve(children_opt->size());
-            for (const auto& c : *children_opt)
+            child_ids.reserve(children_opt->children.size());
+            for (const auto& c : children_opt->children)
                 child_ids.push_back(c.id);
             auto child_statuses_opt =
                 deps.execution_tracker->get_agent_statuses_for_executions_checked(child_ids);
@@ -807,22 +829,40 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             static const std::vector<AgentExecStatus> kEmptyStatuses;
-            for (const auto& c : *children_opt) {
+            for (const auto& c : children_opt->children) {
                 auto it = child_statuses_opt->find(c.id);
                 const auto& c_statuses =
                     it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
                 if (!execution_visible(c, c_statuses, gate.scope, username))
                     continue;
-                arr.push_back(
-                    {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+                // #2146 A2-R1: shared builder (execution_model.hpp) - REST v1's
+                // new GET /api/v1/executions/{id}/children and MCP's new
+                // get_execution_children call the SAME function, so this row
+                // shape cannot drift from theirs (docs/api-twin-recipe.md Rule 1).
+                arr.push_back(execution_child_row_json(c));
             }
         } else {
-            for (const auto& c : *children_opt) {
-                arr.push_back(
-                    {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+            for (const auto& c : children_opt->children) {
+                arr.push_back(execution_child_row_json(c));
             }
         }
-        res.set_content(nlohmann::json({{"children", arr}}).dump(), "application/json");
+        nlohmann::json body{{"children", arr}};
+        // #2146 A2-R1 (governance re-review, blocking): get_children_checked
+        // is now hard-capped (execution_tracker.cpp's kExecutionChildrenCap)
+        // -- previously unbounded. Present-only-when-true, matching MCP
+        // list_schedules/query_responses' result_truncated_by_cap
+        // convention -- this route has no `pagination` envelope object to
+        // nest it under (unlike GET /api/v1/schedules), so it sits
+        // top-level next to `children`. #2146 A2-R1 Gate 8 fix: scope_arg
+        // above is now pushed into the SQL BEFORE the cap
+        // (ExecutionChildrenResult's doc comment), so for a confined caller
+        // this reports THEIR OWN visible row set exceeding the cap, not the
+        // fleet-wide one -- the per-child confinement filter above is now
+        // redundant-but-safe defense in depth over an already-scoped result,
+        // never the primary admission decision.
+        if (children_opt->truncated)
+            body["result_truncated_by_cap"] = true;
+        res.set_content(body.dump(), "application/json");
     });
 }
 

@@ -61,6 +61,12 @@ USERNAME="admin"
 PASSWORD=""
 STATE_FILE=""
 REPORT_FILE=""
+# WS-6 6.2 upgrade harness. Both optional; the enrollment_pre62 Postgres-shape
+# checks (and the second-boot idempotency check) are skipped without them —
+# same graceful-skip posture the rest of this script uses.
+PG_CONTAINER=""
+PG_PASSWORD="yuzu-app"
+SERVER_CONTAINER=""
 # Which contract the api_tokens fixture must uphold on THIS upgrade edge.
 # Default `preserved` is the SAFE direction: an unknown or unclassified edge
 # asserts the stronger, non-inverted contract, so it fails loudly rather than
@@ -87,6 +93,15 @@ Optional:
                            edge crossing the ADR-0030 SQLite->Postgres cutover;
                            test-upgrade-stack.sh sets it from an observable.
   --timeout SECONDS        per-call timeout (default: 15)
+  --pg-container ID        docker container id/name of the Postgres the
+                           upgraded server uses. Enables the enrollment_pre62
+                           Postgres-shape checks (WS-6 6.2); omit to skip them.
+  --pg-password PASS       app-role (yuzu) Postgres password (default: the
+                           docker-compose.upgrade-test.yml default, yuzu-app)
+  --server-container ID    docker container id/name of the (NEW, post-upgrade)
+                           server. Enables the second-boot idempotency check
+                           (restarts it and confirms the importer does not
+                           re-run); omit to skip that one sub-check only.
 EOF
 }
 
@@ -99,6 +114,9 @@ while [[ $# -gt 0 ]]; do
         --api-tokens-expect) API_TOKENS_EXPECT="$2"; shift 2 ;;
         --report-file) REPORT_FILE="$2"; shift 2 ;;
         --timeout)     TIMEOUT_S="$2"; shift 2 ;;
+        --pg-container) PG_CONTAINER="$2"; shift 2 ;;
+        --pg-password) PG_PASSWORD="$2"; shift 2 ;;
+        --server-container) SERVER_CONTAINER="$2"; shift 2 ;;
         -h|--help)     usage; exit 0 ;;
         *)             echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -415,6 +433,133 @@ else
     # claims anything. A skip is honest here.
     warn "no API token was written — skipping verify"
     set_result "api_tokens" "skipped"
+fi
+
+# --- enrollment/pending pre-6.2 fixture (WS-6 6.2 upgrade harness) --------
+# Skipped entirely (warn, not fail) unless --pg-container was given AND the
+# writer actually armed the fixture (enrollment_pre62_ok). This is a
+# Postgres-shape check, not a dashboard-HTTP one: there is no REST list for
+# enrollment tokens, and asserting exact max_uses/use_count/revoked shape by
+# scraping the tokens HTML fragment would be brittle across releases —
+# querying auth.enrollment_tokens/auth.pending_agents/auth.import_meta
+# directly is the honest, stable way to prove what actually landed.
+
+info "verifying the pre-6.2 enrollment/pending import (WS-6 6.2)"
+ENROLL_PRE62_ARMED=$(read_state enrollment_pre62_ok)
+if [[ "$ENROLL_PRE62_ARMED" != "True" ]]; then
+    warn "enrollment_pre62 fixture was not armed by the writer — skipping"
+    set_result "enrollment_pre62_import" "skipped (not armed)"
+elif [[ -z "$PG_CONTAINER" ]]; then
+    warn "enrollment_pre62 fixture armed but --pg-container not given — skipping its checks"
+    set_result "enrollment_pre62_import" "skipped (no --pg-container)"
+else
+    pgq() { # <sql> -> scalar via the app role, from inside the PG container
+        docker exec "$PG_CONTAINER" \
+            psql "postgresql://yuzu:${PG_PASSWORD}@localhost:5432/yuzu" -tAc "$1" 2>/dev/null
+    }
+
+    TOK_PLAIN=$(read_state token_label_plain)
+    TOK_REVOKED=$(read_state token_label_revoked)
+    TOK_PARTIAL=$(read_state token_label_partial)
+    AG_APPROVED=$(read_state agent_approved)
+    AG_DENIED=$(read_state agent_denied)
+    AG_PENDING=$(read_state agent_pending)
+
+    # 1. The importer ran EXACTLY ONCE for each file kind (the metric this
+    #    outcome exists to prove — a row-count comparison alone cannot tell
+    #    "ran once" from "ran twice idempotently", but this metric can).
+    IMPORTED_TOKENS=$(pgq "SELECT count(*) FROM auth.import_meta WHERE key='enrollment-tokens.cfg'")
+    IMPORTED_PENDING=$(pgq "SELECT count(*) FROM auth.import_meta WHERE key='pending-agents.cfg'")
+    if [[ "$IMPORTED_TOKENS" == "1" && "$IMPORTED_PENDING" == "1" ]]; then
+        ok "import ran exactly once for both file kinds (auth.import_meta has both markers)"
+        set_result "enrollment_pre62_import_ran_once" "preserved"
+        DATA_OK=$((DATA_OK + 1))
+    else
+        fl "import_meta marker count wrong: tokens=$IMPORTED_TOKENS pending=$IMPORTED_PENDING (want 1/1)"
+        set_result "enrollment_pre62_import_ran_once" "wrong marker count (tokens=$IMPORTED_TOKENS pending=$IMPORTED_PENDING)"
+    fi
+
+    # 2. Every token/pending row landed in Postgres with the right state.
+    PLAIN_SHAPE=$(pgq "SELECT max_uses||'/'||use_count||'/'||revoked FROM auth.enrollment_tokens WHERE label='${TOK_PLAIN}'")
+    REVOKED_SHAPE=$(pgq "SELECT max_uses||'/'||use_count||'/'||revoked FROM auth.enrollment_tokens WHERE label='${TOK_REVOKED}'")
+    PARTIAL_SHAPE=$(pgq "SELECT max_uses||'/'||use_count||'/'||revoked FROM auth.enrollment_tokens WHERE label='${TOK_PARTIAL}'")
+    if [[ "$PLAIN_SHAPE" == "1/0/false" && "$REVOKED_SHAPE" == "1/0/true" && "$PARTIAL_SHAPE" == "3/1/false" ]]; then
+        ok "all three enrollment-token fixture rows landed with the right max_uses/use_count/revoked shape"
+        set_result "enrollment_pre62_tokens" "preserved (plain=$PLAIN_SHAPE revoked=$REVOKED_SHAPE partial=$PARTIAL_SHAPE)"
+        DATA_OK=$((DATA_OK + 1))
+    else
+        fl "enrollment-token fixture rows wrong shape: plain=$PLAIN_SHAPE (want 1/0/false) revoked=$REVOKED_SHAPE (want 1/0/true) partial=$PARTIAL_SHAPE (want 3/1/false)"
+        set_result "enrollment_pre62_tokens" "wrong shape (plain=$PLAIN_SHAPE revoked=$REVOKED_SHAPE partial=$PARTIAL_SHAPE)"
+    fi
+
+    APPROVED_STATUS=$(pgq "SELECT status FROM auth.pending_agents WHERE agent_id='${AG_APPROVED}'")
+    DENIED_STATUS=$(pgq "SELECT status FROM auth.pending_agents WHERE agent_id='${AG_DENIED}'")
+    PENDING_STATUS=$(pgq "SELECT status FROM auth.pending_agents WHERE agent_id='${AG_PENDING}'")
+    if [[ "$APPROVED_STATUS" == "approved" && "$DENIED_STATUS" == "denied" && "$PENDING_STATUS" == "pending" ]]; then
+        ok "all three pending-agent fixture rows landed with the right status"
+        set_result "enrollment_pre62_pending" "preserved"
+        DATA_OK=$((DATA_OK + 1))
+    else
+        fl "pending-agent fixture rows wrong status: approved=$APPROVED_STATUS denied=$DENIED_STATUS pending=$PENDING_STATUS"
+        set_result "enrollment_pre62_pending" "wrong status (approved=$APPROVED_STATUS denied=$DENIED_STATUS pending=$PENDING_STATUS)"
+    fi
+
+    # 3. A second boot against the same on-disk files does not re-import or
+    #    duplicate rows (marker+fingerprint holds). Only runs with
+    #    --server-container; the file-rename-after-import means the files are
+    #    gone from disk by now anyway, so this proves the STORE-side guard
+    #    (marker+fingerprint), not "the files are still there".
+    if [[ -z "$SERVER_CONTAINER" ]]; then
+        warn "second-boot idempotency check skipped (--server-container not given)"
+        set_result "enrollment_pre62_second_boot" "skipped (no --server-container)"
+    else
+        BEFORE_TOKEN_ROWS=$(pgq "SELECT count(*) FROM auth.enrollment_tokens WHERE label IN ('${TOK_PLAIN}','${TOK_REVOKED}','${TOK_PARTIAL}')")
+        BEFORE_PENDING_ROWS=$(pgq "SELECT count(*) FROM auth.pending_agents WHERE agent_id IN ('${AG_APPROVED}','${AG_DENIED}','${AG_PENDING}')")
+        info "second-boot idempotency: restarting $SERVER_CONTAINER"
+        docker restart "$SERVER_CONTAINER" >/dev/null 2>&1
+        # Same re-resolution as test-fixtures-write.sh's restart: an UNPINNED
+        # host port gets freshly reassigned on every container start, not just
+        # at creation (measured empirically). SB_DASHBOARD_URL is local to this
+        # check — the outer $DASHBOARD_URL is left alone since nothing after
+        # this block reuses it.
+        SB_DASHBOARD_URL="$DASHBOARD_URL"
+        SB_NEW_PORT=$(docker port "$SERVER_CONTAINER" 8080/tcp 2>/dev/null | grep -m1 '0\.0\.0\.0:' | sed 's/.*://')
+        if [[ -n "$SB_NEW_PORT" ]]; then
+            SB_DASHBOARD_URL=$(python3 -c "
+import sys
+from urllib.parse import urlsplit, urlunsplit
+u = urlsplit(sys.argv[1])
+print(urlunsplit((u.scheme, f'{u.hostname}:{sys.argv[2]}', u.path, u.query, u.fragment)))
+" "$DASHBOARD_URL" "$SB_NEW_PORT")
+            info "second-boot idempotency: re-resolved dashboard URL after restart: $SB_DASHBOARD_URL"
+        fi
+        SB_WAITED=0
+        SB_READY=0
+        while (( SB_WAITED < TIMEOUT_S * 2 )); do
+            SBB=$(curl -sf --max-time 3 "$SB_DASHBOARD_URL/readyz" 2>/dev/null || echo "")
+            [[ "$SBB" == *'"ready"'* ]] && { SB_READY=1; break; }
+            sleep 1
+            SB_WAITED=$((SB_WAITED + 1))
+        done
+        if [[ $SB_READY -eq 0 ]]; then
+            fl "second boot never became ready (waited ${SB_WAITED}s) — idempotency unproven"
+            set_result "enrollment_pre62_second_boot" "second boot never ready"
+        else
+            AFTER_TOKEN_ROWS=$(pgq "SELECT count(*) FROM auth.enrollment_tokens WHERE label IN ('${TOK_PLAIN}','${TOK_REVOKED}','${TOK_PARTIAL}')")
+            AFTER_PENDING_ROWS=$(pgq "SELECT count(*) FROM auth.pending_agents WHERE agent_id IN ('${AG_APPROVED}','${AG_DENIED}','${AG_PENDING}')")
+            ALREADY_IMPORTED_TOKENS=$(pgq "SELECT count(*) FROM auth.import_meta WHERE key='enrollment-tokens.cfg'")
+            ALREADY_IMPORTED_PENDING=$(pgq "SELECT count(*) FROM auth.import_meta WHERE key='pending-agents.cfg'")
+            if [[ "$AFTER_TOKEN_ROWS" == "$BEFORE_TOKEN_ROWS" && "$AFTER_PENDING_ROWS" == "$BEFORE_PENDING_ROWS" \
+                  && "$ALREADY_IMPORTED_TOKENS" == "1" && "$ALREADY_IMPORTED_PENDING" == "1" ]]; then
+                ok "second boot did not re-import or duplicate rows (marker+fingerprint held: still exactly 1 marker per kind, row counts unchanged: tokens=$AFTER_TOKEN_ROWS pending=$AFTER_PENDING_ROWS)"
+                set_result "enrollment_pre62_second_boot" "preserved (idempotent)"
+                DATA_OK=$((DATA_OK + 1))
+            else
+                fl "second boot changed state: tokens $BEFORE_TOKEN_ROWS -> $AFTER_TOKEN_ROWS, pending $BEFORE_PENDING_ROWS -> $AFTER_PENDING_ROWS, markers tokens=$ALREADY_IMPORTED_TOKENS pending=$ALREADY_IMPORTED_PENDING (want unchanged / 1 / 1) — the import re-ran or duplicated rows"
+                set_result "enrollment_pre62_second_boot" "NOT idempotent (tokens $BEFORE_TOKEN_ROWS->$AFTER_TOKEN_ROWS pending $BEFORE_PENDING_ROWS->$AFTER_PENDING_ROWS)"
+            fi
+        fi
+    fi
 fi
 
 # --- guarantee inversion check (highest-stakes) ---------------------------

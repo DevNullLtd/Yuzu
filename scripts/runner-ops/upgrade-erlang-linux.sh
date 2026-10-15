@@ -2,9 +2,14 @@
 # upgrade-erlang-linux.sh — bring a self-hosted Linux GitHub Actions runner
 # to a specified Erlang/OTP release globally.
 #
-# Works for any runner installed via the standard /opt/actions-runner layout
-# (e.g. yuzu-wsl2-linux). Detects the runner directory,
+# Written for runners installed via the standard /opt/actions-runner layout;
+# it was last used on the retired yuzu-wsl2-linux runner and has not been
+# checked against Big Tam's per-agent layout. Detects the runner directory,
 # the systemd User=, and the runner home automatically.
+#
+# The runner-ops-upgrade-erlang.yml dispatch workflow that wrapped this script
+# was removed when the Shulgi runners were retired (see #5300); run it by hand
+# on the host.
 #
 # What it does:
 #   1. Installs Erlang/OTP $OTP_VERSION + rebar3 $REBAR3_VERSION under the
@@ -21,8 +26,11 @@
 # Why kerl (not apt / esl-erlang):
 #   apt/esl tracks one version system-wide; kerl is per-user, version-
 #   isolated, and matches what scripts/ensure-erlang.sh already probes
-#   for. Bumping in the future is `./kerl build <newver> <newver>` plus
-#   editing one PATH line.
+#   for. Bumping in the future is re-running this script with
+#   OTP_VERSION=<newver>: it rewrites .path itself, and Meson finds the
+#   kerl install on its own. <newver> must satisfy the build's pin (28.4
+#   or later 28.x); a new major is a pin change first (docs/erlang-gateway-
+#   build.md, "Changing the Erlang/OTP pin").
 #
 # Usage:
 #   bash scripts/runner-ops/upgrade-erlang-linux.sh [--yes] [--no-restart]

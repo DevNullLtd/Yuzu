@@ -6,6 +6,9 @@
 # baked into the image, not on the application:
 #
 #   Dockerfile.server         bash + /dev/tcp + grep   (apt-installed bash)
+#                             and, for the reference compose's one-shot
+#                             `ca-export` service (not a healthcheck, the same
+#                             kind of image-borne dependency): /bin/sh + install
 #   Dockerfile.gateway        wget --spider            (alpine busybox, on PATH)
 #   Dockerfile.server.chisel  /bin/busybox wget --spider
 #   Dockerfile.gateway.chisel /bin/busybox wget --spider
@@ -22,9 +25,13 @@
 #   deploy/docker/docker-compose.demo.yml            server/gateway-chisel: /bin/busybox wget
 #   deploy/docker/docker-compose.reference.yml       server: bash /dev/tcp (connect-only)
 #   deploy/docker/docker-compose.reference-gateway.yml  server: bash /dev/tcp
+#   deploy/docker/docker-compose.reference-gateway-cluster.yml  gateway: wget --spider
+#     (same shape/probe as docker-compose.uat.yml's gateway row above — no new
+#     probe branch needed, HA WS-4 #4555)
 #   deploy/docker/docker-compose.viz-uat.yml         server: bash /dev/tcp + head + grep
 #   scripts/test/docker-compose.upgrade-test.yml     server: bash /dev/tcp + grep
-#   .github/workflows/pre-release.yml (3 heredocs)   server: bash /dev/tcp
+#   (.github/workflows/pre-release.yml no longer inlines a stack: its jobs run
+#   docker-compose.reference-gateway.yml above via scripts/ci/qa-stack.sh.)
 #
 # NOT COVERED, deliberately:
 #   - yuzu-postgres is also published and also healthchecked (pg_isready + psql
@@ -59,7 +66,7 @@
 #
 # Example:
 #   scripts/ci/verify-healthcheck-invariants.sh \
-#       server=ghcr.io/tr3kkr/yuzu-server:0.13.0 \
+#       server=ghcr.io/devnullltd/yuzu-server:0.13.0 \
 #       gateway-chisel=yuzu-gateway-chisel:ci
 #
 # Exits non-zero, naming the missing tool, if any invariant is broken.
@@ -115,7 +122,8 @@ usage() {
 usage: $0 <role>=<image> [<role>=<image> ...]
 
 roles:
-  server           requires: bash, /dev/tcp, grep
+  server           requires: bash, /dev/tcp, grep, and /bin/sh with `install`
+                   (the reference compose's `ca-export` service runs this image)
   gateway          requires: wget (busybox applet) supporting --spider
   server-chisel    requires: /bin/busybox with a wget applet supporting --spider
   gateway-chisel   requires: /bin/busybox with a wget applet supporting --spider
@@ -306,6 +314,28 @@ main() {
                     || rc=$?
                 [ "$rc" -eq 0 ] || diagnose "$rc" "$role" "bash" \
                     "its /dev/tcp support (or grep) no longer works."
+                # deploy/docker/docker-compose.reference-gateway.yml's one-shot
+                # `ca-export` service runs THIS image with `/bin/sh -ec` and calls
+                # `install`. It is not a healthcheck, but a base-image change that
+                # drops either one breaks the rig the same silent way (the agent's
+                # `depends_on: ca-export` never completes). The probe checks that
+                # /bin/sh runs and finds `install`; it runs as the image's default
+                # user, whereas ca-export runs as root (0:2000), so it proves
+                # presence and executability, not that user's write access. 127
+                # from the inner test is reported as the tool missing by diagnose.
+                if [ "$rc" -eq 0 ]; then
+                    probe /bin/sh "$image" -c 'command -v install >/dev/null 2>&1 || exit 127' \
+                        || rc=$?
+                    if [ "$rc" -ne 0 ]; then
+                        echo "  NOTE [$role]: this probe is for the reference compose's one-shot ca-export" >&2
+                        echo "        service (/bin/sh -ec + install), not a healthcheck; read 'healthcheck'" >&2
+                        echo "        in the lines below as 'ca-export'." >&2
+                        # 127 here is either /bin/sh itself or `install` missing (the inner
+                        # `exit 127` above, or docker's own exec failure): name both.
+                        diagnose "$rc" "$role" "/bin/sh or install" \
+                            "the shell ran but could not complete the check."
+                    fi
+                fi
                 ;;
             gateway)
                 # The real healthcheck: `wget --spider -q <url>` off PATH.

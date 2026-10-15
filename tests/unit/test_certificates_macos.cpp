@@ -37,7 +37,10 @@
 
 #include <certificates_macos_parsers.hpp> // Gate-7 FIX A: the SHARED pure helpers (no longer replicated)
 #include <macos_console_user.hpp>
+#include <yuzu/agent/keychain_read.hpp> // yuzu::agent::KeychainReadStatus (B2)
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field -- the REAL SDK function, not replicated (BR-07)
+
+#include "scoped_env.hpp" // yuzu::test::ScopedEnv (B2: the system/root keychain-path override vectors below)
 
 #include <array>
 #include <chrono>
@@ -205,6 +208,71 @@ TEST_CASE("system_keychain_path and root_keychain_path are the fixed system path
     CHECK(system_keychain_path() == "/Library/Keychains/System.keychain");
     CHECK(root_keychain_path() ==
          "/System/Library/Keychains/SystemRootCertificates.keychain");
+}
+
+// B2: the test-only injection seams B1 adds so test_certificates_macos_actions.cpp
+// can point the SecItem/console-owner action paths at a fixture keychain and a
+// fixture console session without a real one -- exercised here at the PURE,
+// cross-platform accessor level (no Security.framework, no real environment
+// dependency beyond the env var itself), matching every other vector in this
+// file. A relative override value is deliberately ignored rather than joined
+// against some implicit base: system_keychain_path()/root_keychain_path()'s
+// callers (the SecItem read seam, resolve_delete_keychain_path) always pass
+// the result straight to a keychain-path parameter with no path-resolution
+// step of its own, so a relative override would silently resolve against the
+// daemon's cwd -- exactly the class of bug is_valid_home_dir's own comment
+// above already rejects for the login-keychain path. resolve_delete_keychain_path
+// stays LITERAL under both overrides: a destructive action's target keychain
+// must never move out from under an operator asking for "System"/"MY"/"root"
+// just because a read-path test fixture happens to be armed in the same
+// environment.
+TEST_CASE("system/root keychain overrides redirect reads only; delete resolution stays literal",
+         "[certificates][macos]") {
+    SECTION("SYSTEM override redirects system_keychain_path()") {
+        yuzu::test::ScopedEnv env("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE",
+                                  "/tmp/yuzu_test_override.keychain");
+        CHECK(system_keychain_path() == "/tmp/yuzu_test_override.keychain");
+    }
+    SECTION("ROOT override redirects root_keychain_path()") {
+        yuzu::test::ScopedEnv env("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE",
+                                  "/tmp/yuzu_test_override.keychain");
+        CHECK(root_keychain_path() == "/tmp/yuzu_test_override.keychain");
+    }
+    SECTION("a RELATIVE override value is ignored -- the literal path is kept") {
+        yuzu::test::ScopedEnv sys_env("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE",
+                                      "x.keychain");
+        yuzu::test::ScopedEnv root_env("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE",
+                                       "x.keychain");
+        CHECK(system_keychain_path() == "/Library/Keychains/System.keychain");
+        CHECK(root_keychain_path() ==
+             "/System/Library/Keychains/SystemRootCertificates.keychain");
+    }
+    SECTION("resolve_delete_keychain_path stays literal while both overrides are set") {
+        // The literal paths, hand-pinned rather than compared against
+        // system_keychain_path()/root_keychain_path() themselves: both
+        // overrides are ALSO armed in this scope, so calling those two
+        // accessors here would just compare the overridden value to itself
+        // and prove nothing about resolve_delete_keychain_path staying
+        // literal.
+        const std::string kLiteralSystemPath = "/Library/Keychains/System.keychain";
+        const std::string kLiteralRootPath =
+            "/System/Library/Keychains/SystemRootCertificates.keychain";
+        yuzu::test::ScopedEnv sys_env("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE",
+                                      "/tmp/yuzu_test_override.keychain");
+        yuzu::test::ScopedEnv root_env("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE",
+                                       "/tmp/yuzu_test_override.keychain");
+        auto sys = resolve_delete_keychain_path("System");
+        REQUIRE(sys.has_value());
+        CHECK(*sys == kLiteralSystemPath);
+
+        auto my = resolve_delete_keychain_path("MY");
+        REQUIRE(my.has_value());
+        CHECK(*my == kLiteralSystemPath);
+
+        auto root = resolve_delete_keychain_path("root");
+        REQUIRE(root.has_value());
+        CHECK(*root == kLiteralRootPath);
+    }
 }
 
 TEST_CASE("login_keychain_path builds the keychain path from a resolved home directory",
@@ -1104,4 +1172,155 @@ TEST_CASE("K-7: the delete-failed error message neutralizes hostile multi-line s
             ++bare_pipes;
     }
     CHECK(bare_pipes == 1); // only the literal "error|" prefix's own separator
+}
+
+// ── B2: macOS keychain seam mapping vectors ──────────────────────────────────
+// secitem_failure_reason / secitem_provenance / classify_console_owner_recheck
+// / capture_failure_detail (certificates_macos_parsers.hpp's #3246 / #2318 /
+// TerminationReason section) -- pure mapping helpers, no keychain/process/
+// console session required.
+
+TEST_CASE("secitem_failure_reason: every non-Completed status maps to its detail text, "
+         "System.keychain label",
+         "[certificates][macos]") {
+    using yuzu::agent::KeychainReadStatus;
+    using yuzu::certificates_macos::secitem_failure_reason;
+
+    CHECK(secitem_failure_reason(KeychainReadStatus::Completed, "System.keychain") ==
+          std::nullopt);
+    CHECK(secitem_failure_reason(KeychainReadStatus::Truncated, "System.keychain") ==
+          "System.keychain scan incomplete");
+    CHECK(secitem_failure_reason(KeychainReadStatus::OpenFailed, "System.keychain") ==
+          "System.keychain read failed");
+    CHECK(secitem_failure_reason(KeychainReadStatus::NotReadable, "System.keychain") ==
+          "System.keychain not readable (no read permission)");
+    CHECK(secitem_failure_reason(KeychainReadStatus::TimedOut, "System.keychain") ==
+          "System.keychain read timed out");
+    CHECK(secitem_failure_reason(KeychainReadStatus::Rejected, "System.keychain") ==
+          "System.keychain read refused (bounded-call ceiling)");
+}
+
+TEST_CASE("secitem_failure_reason: every non-Completed status maps to its detail text, "
+         "SystemRootCertificates.keychain label",
+         "[certificates][macos]") {
+    using yuzu::agent::KeychainReadStatus;
+    using yuzu::certificates_macos::secitem_failure_reason;
+
+    CHECK(secitem_failure_reason(KeychainReadStatus::Completed,
+                                  "SystemRootCertificates.keychain") == std::nullopt);
+    CHECK(secitem_failure_reason(KeychainReadStatus::Truncated,
+                                  "SystemRootCertificates.keychain") ==
+          "SystemRootCertificates.keychain scan incomplete");
+    CHECK(secitem_failure_reason(KeychainReadStatus::OpenFailed,
+                                  "SystemRootCertificates.keychain") ==
+          "SystemRootCertificates.keychain read failed");
+    CHECK(secitem_failure_reason(KeychainReadStatus::NotReadable,
+                                  "SystemRootCertificates.keychain") ==
+          "SystemRootCertificates.keychain not readable (no read permission)");
+    CHECK(secitem_failure_reason(KeychainReadStatus::TimedOut,
+                                  "SystemRootCertificates.keychain") ==
+          "SystemRootCertificates.keychain read timed out");
+    CHECK(secitem_failure_reason(KeychainReadStatus::Rejected,
+                                  "SystemRootCertificates.keychain") ==
+          "SystemRootCertificates.keychain read refused (bounded-call ceiling)");
+}
+
+TEST_CASE("secitem_provenance: 'secitem:' prefix matches the tag mark_result_partial expects",
+         "[certificates][macos]") {
+    CHECK(yuzu::certificates_macos::secitem_provenance("System.keychain") ==
+          "secitem:System.keychain");
+    CHECK(yuzu::certificates_macos::secitem_provenance("SystemRootCertificates.keychain") ==
+          "secitem:SystemRootCertificates.keychain");
+}
+
+TEST_CASE("classify_console_owner_recheck: same uid, resolved as decimal text -> kUnchanged",
+         "[certificates][macos]") {
+    using yuzu::certificates_macos::classify_console_owner_recheck;
+    using yuzu::certificates_macos::ConsoleOwnerRecheck;
+
+    CHECK(classify_console_owner_recheck(true, 501, "501") == ConsoleOwnerRecheck::kUnchanged);
+    CHECK(classify_console_owner_recheck(true, 0, "0") == ConsoleOwnerRecheck::kUnchanged);
+}
+
+TEST_CASE("classify_console_owner_recheck: a different resolved uid -> kChanged",
+         "[certificates][macos]") {
+    CHECK(yuzu::certificates_macos::classify_console_owner_recheck(true, 502, "501") ==
+          yuzu::certificates_macos::ConsoleOwnerRecheck::kChanged);
+}
+
+TEST_CASE("classify_console_owner_recheck: fails closed on a bad stat, empty, non-numeric, or "
+         "overflowing resolved uid -- never kUnchanged",
+         "[certificates][macos]") {
+    using yuzu::certificates_macos::classify_console_owner_recheck;
+    using yuzu::certificates_macos::ConsoleOwnerRecheck;
+
+    CHECK(classify_console_owner_recheck(false, 0, "501") == ConsoleOwnerRecheck::kUnknown);
+    CHECK(classify_console_owner_recheck(true, 501, "") == ConsoleOwnerRecheck::kUnknown);
+    CHECK(classify_console_owner_recheck(true, 501, "5o1") == ConsoleOwnerRecheck::kUnknown);
+    CHECK(classify_console_owner_recheck(true, 1, "99999999999999999999999") ==
+          ConsoleOwnerRecheck::kUnknown);
+}
+
+TEST_CASE("capture_failure_detail: each termination reason and the spawn/output-truncation "
+         "cases map to their own detail text",
+         "[certificates][macos]") {
+    using yuzu::certificates_macos::capture_failure_detail;
+
+    // Never spawned pre-empts everything else.
+    CHECK(capture_failure_detail(false, false, false, 0, "spawn_error") == "spawn failed");
+
+    // Deadline/timeout pre-empts the raw termination reason.
+    CHECK(capture_failure_detail(true, false, false, -1, "deadline") == "killed at deadline");
+    CHECK(capture_failure_detail(true, true, false, -1, "exited") == "killed at deadline");
+
+    CHECK(capture_failure_detail(true, false, false, -1, "cancelled") == "cancelled");
+    CHECK(capture_failure_detail(true, false, false, -1, "line_limit") ==
+          "output truncated (line limit)");
+    CHECK(capture_failure_detail(true, false, true, 0, "exited") == "output truncated");
+    CHECK(capture_failure_detail(true, false, false, -1, "signaled") == "killed by signal");
+    CHECK(capture_failure_detail(true, false, false, 7, "exited") == "exit 7");
+
+    // A usable capture (is_usable_capture's positive case) has no detail.
+    CHECK(capture_failure_detail(true, false, false, 0, "exited").empty());
+}
+
+// ── fold_secitem_presence (code-review F1, #2318a delete-path fix) ─────────
+// keychain_contains_thumbprint() no longer shells out to `security
+// find-certificate`; this is the pure fold deciding its return value from a
+// read_keychain_secitem() outcome. The load-bearing vector is the last one:
+// a non-Completed status with no match must NEVER fold to `false` (absent) --
+// that was the exact bug (a permission-denied keychain's empty read folding
+// into "certificate not found", verified reproducible against a real
+// chmod-000 System.keychain copy on macOS 26.6.2 during code review).
+
+TEST_CASE("fold_secitem_presence: a match is present regardless of status",
+          "[certificates][macos]") {
+    using yuzu::agent::KeychainReadStatus;
+    using yuzu::certificates_macos::fold_secitem_presence;
+
+    CHECK(fold_secitem_presence(KeychainReadStatus::Completed, /*matched=*/true) == true);
+    CHECK(fold_secitem_presence(KeychainReadStatus::Truncated, /*matched=*/true) == true);
+}
+
+TEST_CASE("fold_secitem_presence: a Completed read with no match proves absence",
+          "[certificates][macos]") {
+    using yuzu::agent::KeychainReadStatus;
+    using yuzu::certificates_macos::fold_secitem_presence;
+
+    auto result = fold_secitem_presence(KeychainReadStatus::Completed, /*matched=*/false);
+    REQUIRE(result.has_value());
+    CHECK(result.value() == false);
+}
+
+TEST_CASE("fold_secitem_presence: every non-Completed status with no match is nullopt, "
+         "never a false absence -- the exact #2318a delete-path defect this closes",
+         "[certificates][macos]") {
+    using yuzu::agent::KeychainReadStatus;
+    using yuzu::certificates_macos::fold_secitem_presence;
+
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::Truncated, /*matched=*/false).has_value());
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::NotReadable, /*matched=*/false).has_value());
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::OpenFailed, /*matched=*/false).has_value());
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::TimedOut, /*matched=*/false).has_value());
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::Rejected, /*matched=*/false).has_value());
 }

@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: Copy-Item C:\Windows\Prefetch\DOSKEY.EXE-DDFD0A8D.pf (real prefetch file, one of the 3 smallest non-zero-byte .pf files on the-rig)
+date: 2026-09-06
+status: REAL CAPTURE
+note: MAM-compressed (first 4 bytes 4D 41 4D 04). See DOSKEY.EXE-DDFD0A8D.pf.decompressed.provenance.txt for the decompression probe result.

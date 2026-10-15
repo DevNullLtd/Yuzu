@@ -146,19 +146,31 @@ Each parameter descriptor supports:
 | `type` | string | Yes | -- | Parameter type. Values: `string`, `boolean`, `int32`, `int64`, `datetime`, `guid`. See [Section 10](#10-parameter-type-system). |
 | `displayName` | string | No | -- | Human-readable label for the dashboard form. |
 | `description` | string | No | `""` | Parameter description. |
-| `default` | varies | No | -- | Default value if not provided. Must match the declared type. |
+| `default` | varies | No | -- | Default value if not provided. Must match the declared type. The server does not inject it into the dispatched parameters; it only satisfies `required` during `POST /api/instructions/{id}/execute` validation. |
 | `validation` | object | No | -- | Validation constraints. See below. Also summarised into the plugin README's Inputs table (Constraints column, e.g. `enum: a, b · minLength 1`) and carried verbatim in the `content/plugin-docs` manifest (`inputs[].constraints`). |
 
 #### `spec.parameters.properties.<name>.validation`
 
 | Field | Type | Applicable Types | Description |
 |---|---|---|---|
-| `maxLength` | integer | `string` | Maximum string length. |
-| `minLength` | integer | `string` | Minimum string length. |
+| `maxLength` | integer | `string` | Maximum string length in bytes (UTF-8). |
+| `minLength` | integer | `string` | Minimum string length in bytes (UTF-8). |
 | `pattern` | string | `string` | Regular expression the value must match. |
 | `enum` | list | `string` | Allowed values. The value must be one of the listed strings. |
 | `minimum` | number | `int32`, `int64` | Minimum numeric value (inclusive). |
 | `maximum` | number | `int32`, `int64` | Maximum numeric value (inclusive). |
+
+#### Constructs shipped definitions use beyond the tables above
+
+The server's parameter-schema canonicaliser accepts these forms and publishes the result as `input_schema` (`GET /api/v1/discover/instructions`, MCP `discover_instructions`):
+
+- `type: integer` is accepted next to `int32`/`int64`. `int32` is a numeric string on the wire (Section 10) but is published as `integer` with the int32 range.
+- `type: array` with `items: {type: string}`.
+- `required: true` on a property is the same as listing it in the root `required`.
+- `maxLength`, `minLength`, `pattern`, `enum`, `minimum` and `maximum` may be written flat on the property; a flat key beats the same key under `validation`.
+- `hidden: true` is accepted as a no-op hint (no effect on validation; not published). `displayName` is dropped from the published schema.
+
+Shipped definitions under `content/definitions/` and `content/packs/` must meet the description-lint floors enforced by `scripts/ci/check-definition-descriptions.py`: `metadata.description` of at least 40 characters (and not just the name or id), every parameter description at least 10 characters, every result column described, and `metadata.tags` non-empty. To fix a baselined failure, edit the YAML and delete the fixed entry from `scripts/ci/definition-descriptions-baseline.json`, otherwise the STALE check fails.
 
 #### `spec.result`
 
@@ -233,7 +245,7 @@ neither controls anything at runtime.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `enabled` | boolean | No | `false` | When `true`, this definition was auto-generated from a plugin descriptor. The parameter schema uses `additionalProperties: {type: string}` (open schema). |
+| `enabled` | boolean | No | `false` | When `true`, this definition was auto-generated from a plugin descriptor. The generated YAML source declares `additionalProperties: {type: string}` (open schema), but the stored `parameter_schema` is `{}`, so these definitions are not validated by `POST /api/instructions/{id}/execute`. |
 
 #### `spec.visualization`
 
@@ -258,7 +270,7 @@ Optional chart configuration consumed by the dashboard's instruction-response vi
 
 > **Multi-chart definitions.** A definition can declare more than one chart by using the canonical plural form `spec.visualizations: [<vis>, ...]`. The singular `spec.visualization: <vis>` is accepted as syntactic sugar for a single-element list and is normalised at ingest. The dashboard renders all charts as a deck (`<div class="yuzu-chart-deck">`); the REST endpoint takes an optional `?index=N` query parameter (default 0) to address individual charts and includes `chart_index` and `chart_count` in every response payload so callers can iterate.
 
-> **Limitations.** The engine caps each chart at 10 000 underlying response rows; when truncated, the response payload includes `rows_capped: true` so the dashboard can show a banner. The engine also caps total distinct labels at 10 000 (defense-in-depth against a misbehaving plugin emitting unbounded label cardinality).
+> **Limitations.** The engine caps each chart at 10 000 underlying response rows; the read is also capped at 50 MiB of response payload. `rows_capped: true` means the row cap cut the read; when either cap cut it the payload also carries `result_truncated_by_cap: true` and `truncation_cause` (`row_cap` or `byte_cap`), and the dashboard shows a "Partial result" notice in the chart card. The engine also caps total distinct labels at 10 000 (defense-in-depth against a misbehaving plugin emitting unbounded label cardinality).
 
 > **Authoring through the dashboard YAML editor strips visualization.** When saving a definition via the dashboard's CodeMirror editor (`POST /api/instructions/yaml`), the schema-aware extractor (`instruction_yaml::parse_definition_yaml`) indexes `id`, `name`, `plugin`, `action`, `type`, `description`, `concurrency`, `approval` from the YAML source (canonical nested or flat schema) but does NOT extract `spec.visualization` into the indexed `visualization_spec` column. The chart spec is preserved in `yaml_source` (verbatim source of truth) but not indexed, so the chart deck does not render the chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or until the next server restart triggers the bundled-content auto-import. Author chart-bearing definitions through the JSON import path or the in-tree `content/definitions/` library, not the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
 
@@ -1309,7 +1321,7 @@ This lowers to the scope-engine string `from_result_set:windows-chrome-suspects 
 
 1. `fromResultSet` may not be combined with `assignment.managementGroups` — a result set already defines a fixed device set; layering management-group filtering on top is rejected.
 2. When `fromResultSet` is present, `assignment.mode` must be `static` (an omitted mode defaults to static). `dynamic` is rejected — the point of a result set is a fixed target.
-3. References resolve at **invocation** time, not load time. An `InstructionDefinition` carrying a `fromResultSet:` that has since expired is still valid YAML; an invocation-time resolution failure (the set is absent, expired, or not owned) is recorded as an `instruction.scope_resolution_failed` audit row (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`) carrying the result-set id and reason, and — as of governance M1, 2026-07-29 — **aborts the entire dispatch**: zero devices are targeted, including devices matched by other scope atoms (a paired `scope.evaluation_aborted` row records `reason=owner_check_failed`). The previous behavior (proceed with only that reference zeroed) inverted to a fleet-wide match under a `NOT` combinator and is gone.
+3. References resolve at **invocation** time, not load time. An `InstructionDefinition` carrying a `fromResultSet:` that has since expired is still valid YAML; an invocation-time resolution failure (the set is absent, expired, or not owned — including a set deleted in the window between the pre-dispatch owner-check gate and the registry's own membership read, closed as a TOCTOU by #4981 PR-1) is recorded as an `instruction.scope_resolution_failed` audit row (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`) carrying the result-set id and reason, and — as of governance M1, 2026-07-29 — **aborts the entire dispatch**: zero devices are targeted, including devices matched by other scope atoms (a paired `scope.evaluation_aborted` row records `reason=owner_check_failed`, or one of `db_degraded`/`principal_unresolved`/`presence_degraded`/`unresolvable` for the other abort classes — see `docs/user-manual/rest-api.md`'s audit-event table for the full vocabulary). The previous behavior (proceed with only that reference zeroed) inverted to a fleet-wide match under a `NOT` combinator and is gone.
 4. `fromResultSet` (id or alias), `selector.platform`, and each `selector.tags` entry must contain only letters, digits, and `_ . : * -` (the scope-ident charset). A space, quote, or operator character is rejected at load — these values are lowered into a scope-engine token, so anything else would produce an unparseable or ambiguous expression. **Choose result-set aliases (`name`) from this charset**; an alias with a space cannot be referenced from a scope.
 5. The `scope:` block must use **block form** (`scope:` on its own line, children indented beneath). Inline flow-mapping (`scope: {fromResultSet: x}`) is rejected — the runtime YAML scanner reads only the block form.
 
@@ -1438,14 +1450,14 @@ InstructionDefinition parameters and PolicyFragment inputs use the following typ
 | `datetime` | ISO 8601 timestamp | String | `"2026-03-17T18:20:00Z"` |
 | `guid` | UUID / GUID | String | `"550e8400-e29b-41d4-a716-446655440000"` |
 
-Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. The server validates parameter values against the declared type and constraints before dispatch.
+Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. `POST /api/instructions/{id}/execute` validates the request's parameter values against the declared type and constraints before dispatch; no other dispatch surface does yet.
 
 ### Validation Constraints
 
 | Constraint | Applicable Types | Description |
 |---|---|---|
-| `maxLength` | `string` | Maximum character count. |
-| `minLength` | `string` | Minimum character count. |
+| `maxLength` | `string` | Maximum length in bytes (UTF-8). |
+| `minLength` | `string` | Minimum length in bytes (UTF-8). |
 | `pattern` | `string` | Regular expression the value must match. |
 | `enum` | `string` | List of allowed values. |
 | `minimum` | `int32`, `int64` | Minimum value (inclusive). |
@@ -1673,7 +1685,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | Primitive | Backing Plugin | Win | Linux | macOS | Status |
 |---|---|:---:|:---:|:---:|---|
 | `network.config.get` | `network_config` | Y | Y | Y | Verified |
-| `network.route.list` | `network_config` | Y | Y | Y | Verified |
+| `network.route.list` | `network_config` (`routes` action) | Y | Y | Y | Verified |
 | `network.connection.list` | `netstat` | Y | Y | Y | Verified |
 | `network.socket.owner` | `netstat` (`attribution` action) | Y | Y | Y | Verified |
 | `network.dns.flush` | `network_actions` | Y | Y | Y | Verified |
@@ -1837,7 +1849,7 @@ This section enumerates the stable builtin primitives that content authors targe
 
 **`tar.compatibility`** -- Emit the live OS compatibility matrix for every registered capture source (process, tcp, service, user, perf, plus the opt-in procperf, netqual, module, arp, dns). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`; the mechanism actually in force is reported as `network_capture_method_effective` by the `status` action (always `polling` today).
 
-**`tar.collect_perf`** -- Record one device performance sample (CPU/memory/disk/network) into `$Perf_Live`, and — when `procperf_enabled` is set (opt-in, off by default) — one per-application top-N sample into `$ProcPerf_Live` on the same tick (output line `tar|collect_procperf|N|...`). Trigger-driven on the `perf_interval_seconds` cadence (default 30 s; Windows and Linux — macOS records nothing until its collector lands); a manual invocation forces one immediate sample. Note: on Linux, a tick whose core `/proc` reads fail (e.g. a hardened container masking `/proc/stat`) reports `unsupported_platform` for that tick even though the platform is supported — cross-check `tar.compatibility` before concluding a build lacks the collector (a distinct status token is a tracked follow-up). The first sample after agent start is a baseline (records no row). See [the TAR user manual](user-manual/tar.md) for the perf/procperf tiers and their `perf_enabled` / `procperf_enabled` / `perf_interval_seconds` configuration.
+**`tar.collect_perf`** -- Record one device performance sample (CPU/memory/disk/network) into `$Perf_Live`, and — when `procperf_enabled` is set (opt-in, off by default) — one per-application top-N sample into `$ProcPerf_Live` on the same tick (output line `tar|collect_procperf|N|...`). Trigger-driven on the `perf_interval_seconds` cadence (default 30 s; Windows and Linux — macOS records nothing until its collector lands); a manual invocation forces one immediate sample. Note: a tick whose core counter read fails (e.g. a hardened container masking `/proc/stat` on Linux, or an NT-counter read failure on Windows) reports `counters_unavailable` on any OS the registry lists as supported for `perf`/`procperf`, and `unsupported_platform` only where no perf collector exists (macOS today) — so a supported platform whose reads are failing is distinguishable from an unsupported one. The per-source streak is in `tar.status` (`perf_last_status` / `perf_consecutive_failures`, and identically `procperf_last_status` / `procperf_consecutive_failures`). The first sample after agent start is a baseline (records no row). See [the TAR user manual](user-manual/tar.md) for the perf/procperf tiers and their `perf_enabled` / `procperf_enabled` / `perf_interval_seconds` configuration.
 
 **`tar.fleet_snapshot`** -- Enumerate running processes, open network connections, and host-bound IPs and emit a single `fleet_snapshot.v1` JSON document. Each list is capped at 4096 entries; truncation is flagged via `truncated_processes` / `truncated_connections`. Cmdlines are redacted per the active redaction patterns (defaults always apply). When the operator has paused the `process` or `tcp` source, the corresponding list is empty and `process_source_paused` / `tcp_source_paused` markers appear in the document. Consumed by the server-side `FleetTopologyStore` for the `/viz/fleet` 3D renderer (PR ladder 1-11). Dispatched on demand by the server at the topology cache TTL (default 60 s); not typically invoked manually.
 

@@ -337,7 +337,8 @@ TarDatabase::~TarDatabase() {
 }
 
 TarDatabase::TarDatabase(TarDatabase&& other) noexcept
-    : db_{other.db_.load()}, query_db_{other.query_db_} {
+    : db_{other.db_.load()}, query_db_{other.query_db_}, quarantined_at_{other.quarantined_at_} {
+    other.quarantined_at_.reset();
     other.db_ = nullptr;
     other.query_db_ = nullptr;
 }
@@ -350,6 +351,8 @@ TarDatabase& TarDatabase::operator=(TarDatabase&& other) noexcept {
             sqlite3_close(query_db_);
         db_ = other.db_.load();
         query_db_ = other.query_db_;
+        quarantined_at_ = other.quarantined_at_;
+        other.quarantined_at_.reset();
         other.db_ = nullptr;
         other.query_db_ = nullptr;
     }
@@ -367,6 +370,11 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
                 std::format("failed to create directory {}: {}", parent.string(), ec.message()));
         }
     }
+
+    // #1567 — set when this open quarantined a corrupt file; persisted into the
+    // fresh DB's tar_config once it is fully initialised (see end of open()).
+    std::optional<int64_t> quarantined_at;
+    std::string quarantined_file;
 
     sqlite3* raw_db = nullptr;
     int rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
@@ -400,6 +408,8 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
                 "(corrupt and unmovable): {}",
                 path.string()));
         }
+        quarantined_at = now_epoch_seconds();
+        quarantined_file = quarantined->filename().string();
         spdlog::error("TAR: tar.db failed PRAGMA integrity_check (tar.db.corruption_detected) — "
                       "quarantined to {} and re-initialising a fresh database",
                       quarantined->string());
@@ -699,6 +709,59 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         }
     }
 
+    // Version 7: add the `is_kthread` marker column to the procperf tiers —
+    // kernel-thread (Linux PF_KTHREAD) / Windows System-process (pid 4)
+    // exclusion for the daily app-perf-over-time rollup
+    // (sync_source_app_perf.cpp); see tar_proc_perf.hpp's "Kernel-thread
+    // marker" note. Same guarded-ALTER pattern as v4's `version` column: a
+    // FRESH db already has the column (create_warehouse_tables ran above),
+    // so each ALTER is guarded on a PRAGMA table_info existence check.
+    if (db.schema_version() == 6) {
+        std::lock_guard lock(db.mu_);
+        auto has_is_kthread_col = [&](const char* tbl) -> bool {
+            const auto pragma = std::format("PRAGMA table_info({})", tbl);
+            sqlite3_stmt* raw = nullptr;
+            if (sqlite3_prepare_v2(raw_db, pragma.c_str(), -1, &raw, nullptr) != SQLITE_OK)
+                return false;
+            StmtPtr q(raw);
+            while (sqlite3_step(q.get()) == SQLITE_ROW) {
+                const auto* col = reinterpret_cast<const char*>(sqlite3_column_text(q.get(), 1));
+                if (col && std::string_view{col} == "is_kthread")
+                    return true;
+            }
+            return false;
+        };
+        SqliteErrMsg emsg;
+        sqlite3_exec(raw_db, "SAVEPOINT v7_migration", nullptr, nullptr, nullptr);
+        bool ok = true;
+        for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
+            if (has_is_kthread_col(tbl))
+                continue;
+            const auto alter =
+                std::format("ALTER TABLE {} ADD COLUMN is_kthread INTEGER NOT NULL DEFAULT 0", tbl);
+            if (sqlite3_exec(raw_db, alter.c_str(), nullptr, nullptr, emsg.addr()) != SQLITE_OK) {
+                // ERROR, not warn: insert_proc_perf_samples and the hourly rollup
+                // both name `is_kthread` unconditionally, so a stranded v6 DB fails
+                // to prepare EVERY tick and ALL procperf collection stops.
+                spdlog::error("TarDatabase: v7 ALTER {} failed: {} — schema remains at v6; ALL "
+                              "procperf collection will fail until the column is added. Recovery: "
+                              "stop the agent and run `ALTER TABLE {} ADD COLUMN is_kthread INTEGER "
+                              "NOT NULL DEFAULT 0;` on the tar.db, then restart.",
+                              tbl, emsg.text(), tbl);
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            db.set_config_locked("schema_version", "7");
+            sqlite3_exec(raw_db, "RELEASE v7_migration", nullptr, nullptr, nullptr);
+            spdlog::info("TarDatabase: migrated to schema version 7 (procperf is_kthread column)");
+        } else {
+            sqlite3_exec(raw_db, "ROLLBACK TO v7_migration", nullptr, nullptr, nullptr);
+            sqlite3_exec(raw_db, "RELEASE v7_migration", nullptr, nullptr, nullptr);
+        }
+    }
+
     // Open a dedicated read-only, authorizer-sandboxed connection for untrusted
     // operator SQL (the tar.sql action). On this handle writes are structurally
     // impossible and the authorizer restricts reads to registry-known warehouse
@@ -725,6 +788,21 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
             if (ro)
                 sqlite3_close(ro);
         }
+    }
+
+    if (quarantined_at) {
+        // Durable source of truth for the fleet-visible corruption fact; the
+        // plugin reconciles it into its heartbeat KV keys (a crash between the
+        // rename above and this write is one of two windows where the fact is lost;
+        // the other is the config write below failing).
+        // Basename only — never a full path in status or heartbeat.
+        db.quarantined_at_ = quarantined_at;
+        // A failed write loses the durable record (the plugin reconcile and the
+        // status line read these two rows); name the key so it is visible.
+        if (!db.set_config("db_health_last_quarantine_epoch", std::to_string(*quarantined_at)))
+            spdlog::error("TarDatabase: failed to persist db_health_last_quarantine_epoch");
+        if (!db.set_config("db_health_last_quarantine_file", quarantined_file))
+            spdlog::error("TarDatabase: failed to persist db_health_last_quarantine_file");
     }
 
     spdlog::info("TarDatabase opened: {} (schema v{})", path.string(), db.schema_version());
@@ -862,7 +940,11 @@ bool TarDatabase::set_state(const std::string& collector, const std::string& jso
     std::lock_guard lock(mu_);
     if (!db_)
         return false;
+    return upsert_state_locked(db_, collector, json);
+}
 
+bool TarDatabase::upsert_state_locked(sqlite3* db, const std::string& collector,
+                                      const std::string& json) {
     const char* sql = R"(
         INSERT INTO tar_state (collector, state_json, updated_at)
         VALUES (?, ?, ?)
@@ -871,9 +953,9 @@ bool TarDatabase::set_state(const std::string& collector, const std::string& jso
     )";
 
     sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    int rc = sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("TarDatabase::set_state prepare failed: {}", sqlite3_errmsg(db_));
+        spdlog::error("TarDatabase::set_state prepare failed: {}", sqlite3_errmsg(db));
         return false;
     }
     StmtPtr stmt(raw_stmt);
@@ -885,7 +967,7 @@ bool TarDatabase::set_state(const std::string& collector, const std::string& jso
 
     rc = sqlite3_step(stmt.get());
     if (rc != SQLITE_DONE) {
-        spdlog::error("TarDatabase::set_state step failed: {}", sqlite3_errmsg(db_));
+        spdlog::error("TarDatabase::set_state step failed: {}", sqlite3_errmsg(db));
         return false;
     }
     return true;
@@ -1506,10 +1588,13 @@ std::expected<int, std::string> TarDatabase::purge_source(const std::string& sou
 
 // ── Typed inserts ───────────────────────────────────────────────────────────
 
-bool TarDatabase::insert_process_events(const std::vector<ProcessEvent>& events) {
+bool TarDatabase::insert_process_events(const std::vector<ProcessEvent>& events,
+                                       const std::optional<StateWrite>& state) {
     std::lock_guard lock(mu_);
-    if (!db_ || events.empty())
-        return events.empty();
+    if (!db_)
+        return false;
+    if (events.empty())
+        return !state || upsert_state_locked(db_, state->collector, state->json);
 
     char* err_msg = nullptr;
     int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
@@ -1553,6 +1638,11 @@ bool TarDatabase::insert_process_events(const std::vector<ProcessEvent>& events)
         }
     }
 
+    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+
     err_msg = nullptr;
     rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
@@ -1564,10 +1654,13 @@ bool TarDatabase::insert_process_events(const std::vector<ProcessEvent>& events)
     return true;
 }
 
-bool TarDatabase::insert_network_events(const std::vector<NetworkEvent>& events) {
+bool TarDatabase::insert_network_events(const std::vector<NetworkEvent>& events,
+                                       const std::optional<StateWrite>& state) {
     std::lock_guard lock(mu_);
-    if (!db_ || events.empty())
-        return events.empty();
+    if (!db_)
+        return false;
+    if (events.empty())
+        return !state || upsert_state_locked(db_, state->collector, state->json);
 
     char* err_msg = nullptr;
     int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
@@ -1614,6 +1707,11 @@ bool TarDatabase::insert_network_events(const std::vector<NetworkEvent>& events)
             sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
             return false;
         }
+    }
+
+    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
     }
 
     err_msg = nullptr;
@@ -1682,10 +1780,13 @@ TarDatabase::query_recent_tcp_connections(int64_t since_ts) {
     return out;
 }
 
-bool TarDatabase::insert_service_events(const std::vector<ServiceEvent>& events) {
+bool TarDatabase::insert_service_events(const std::vector<ServiceEvent>& events,
+                                       const std::optional<StateWrite>& state) {
     std::lock_guard lock(mu_);
-    if (!db_ || events.empty())
-        return events.empty();
+    if (!db_)
+        return false;
+    if (events.empty())
+        return !state || upsert_state_locked(db_, state->collector, state->json);
 
     char* err_msg = nullptr;
     int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
@@ -1731,6 +1832,11 @@ bool TarDatabase::insert_service_events(const std::vector<ServiceEvent>& events)
         }
     }
 
+    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+
     err_msg = nullptr;
     rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
@@ -1742,10 +1848,13 @@ bool TarDatabase::insert_service_events(const std::vector<ServiceEvent>& events)
     return true;
 }
 
-bool TarDatabase::insert_user_events(const std::vector<UserEvent>& events) {
+bool TarDatabase::insert_user_events(const std::vector<UserEvent>& events,
+                                       const std::optional<StateWrite>& state) {
     std::lock_guard lock(mu_);
-    if (!db_ || events.empty())
-        return events.empty();
+    if (!db_)
+        return false;
+    if (events.empty())
+        return !state || upsert_state_locked(db_, state->collector, state->json);
 
     char* err_msg = nullptr;
     int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
@@ -1788,6 +1897,11 @@ bool TarDatabase::insert_user_events(const std::vector<UserEvent>& events) {
         }
     }
 
+    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+
     err_msg = nullptr;
     rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
@@ -1799,10 +1913,13 @@ bool TarDatabase::insert_user_events(const std::vector<UserEvent>& events) {
     return true;
 }
 
-bool TarDatabase::insert_software_events(const std::vector<SoftwareEvent>& events) {
+bool TarDatabase::insert_software_events(const std::vector<SoftwareEvent>& events,
+                                       const std::optional<StateWrite>& state) {
     std::lock_guard lock(mu_);
-    if (!db_ || events.empty())
-        return events.empty();
+    if (!db_)
+        return false;
+    if (events.empty())
+        return !state || upsert_state_locked(db_, state->collector, state->json);
 
     char* err_msg = nullptr;
     int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
@@ -1847,6 +1964,11 @@ bool TarDatabase::insert_software_events(const std::vector<SoftwareEvent>& event
         }
     }
 
+    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+
     err_msg = nullptr;
     rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
@@ -1858,10 +1980,13 @@ bool TarDatabase::insert_software_events(const std::vector<SoftwareEvent>& event
     return true;
 }
 
-bool TarDatabase::insert_arp_events(const std::vector<ArpEvent>& events) {
+bool TarDatabase::insert_arp_events(const std::vector<ArpEvent>& events,
+                                       const std::optional<StateWrite>& state) {
     std::lock_guard lock(mu_);
-    if (!db_ || events.empty())
-        return events.empty();
+    if (!db_)
+        return false;
+    if (events.empty())
+        return !state || upsert_state_locked(db_, state->collector, state->json);
 
     char* err_msg = nullptr;
     int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
@@ -1904,6 +2029,11 @@ bool TarDatabase::insert_arp_events(const std::vector<ArpEvent>& events) {
         }
     }
 
+    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+
     err_msg = nullptr;
     rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
@@ -1915,10 +2045,13 @@ bool TarDatabase::insert_arp_events(const std::vector<ArpEvent>& events) {
     return true;
 }
 
-bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events) {
+bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events,
+                                       const std::optional<StateWrite>& state) {
     std::lock_guard lock(mu_);
-    if (!db_ || events.empty())
-        return events.empty();
+    if (!db_)
+        return false;
+    if (events.empty())
+        return !state || upsert_state_locked(db_, state->collector, state->json);
 
     char* err_msg = nullptr;
     int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
@@ -1962,6 +2095,11 @@ bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events) {
         }
     }
 
+    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+
     err_msg = nullptr;
     rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
@@ -1973,10 +2111,13 @@ bool TarDatabase::insert_dns_events(const std::vector<DnsEvent>& events) {
     return true;
 }
 
-bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& events) {
+bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& events,
+                                       const std::optional<StateWrite>& state) {
     std::lock_guard lock(mu_);
-    if (!db_ || events.empty())
-        return events.empty();
+    if (!db_)
+        return false;
+    if (events.empty())
+        return !state || upsert_state_locked(db_, state->collector, state->json);
 
     char* err_msg = nullptr;
     int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
@@ -2020,6 +2161,11 @@ bool TarDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& event
             sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
             return false;
         }
+    }
+
+    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
     }
 
     err_msg = nullptr;
@@ -2088,8 +2234,9 @@ bool TarDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows)
     sqlite3_free(err_msg);
 
     const char* sql = R"(
-        INSERT INTO procperf_live (ts, snapshot_id, name, version, instances, cpu_pct, ws_bytes)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO procperf_live (ts, snapshot_id, name, version, instances, cpu_pct, ws_bytes,
+            is_kthread)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* raw_stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
@@ -2107,6 +2254,7 @@ bool TarDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows)
         sqlite3_bind_int(stmt.get(), 5, r.instances);
         sqlite3_bind_double(stmt.get(), 6, r.cpu_pct);
         sqlite3_bind_int64(stmt.get(), 7, r.ws_bytes);
+        sqlite3_bind_int(stmt.get(), 8, r.is_kthread ? 1 : 0);
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
             spdlog::error("insert_proc_perf_samples step: {}", sqlite3_errmsg(db_));
             sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);

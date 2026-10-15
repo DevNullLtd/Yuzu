@@ -2,6 +2,7 @@
 
 #include "custom_properties_store.hpp"
 #include "http_route_sink.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -95,6 +96,17 @@ void register_custom_properties_routes(HttpRouteSink& sink, Deps deps) {
         std::string value;
         std::string type = "string";
         try {
+            // #2437-class guard: raw-text depth check before parse - "value"
+            // is dumped a few lines below (j["value"].dump() when it is not
+            // a string), so the check has to run on the raw text before any
+            // allocation.
+            if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"request body nests too deeply"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             auto j = nlohmann::json::parse(req.body);
             if (j.contains("value"))
                 value =

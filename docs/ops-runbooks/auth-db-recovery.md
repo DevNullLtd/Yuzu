@@ -37,7 +37,7 @@ the Windows event log shows one of these, and they mean different things:
 | `[PG] Refusing to start: no PostgreSQL DSN` | `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset | [Config](#no-dsn-configured) |
 | `[PG] Refusing to start: cannot reach PostgreSQL substrate: …` | Postgres down, wrong DSN, network/auth failure | [Substrate down](#postgres-substrate-unreachable) |
 | `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened | [Migration failure](#auth-schema-migration-failure) |
-| `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
+| `SecretCodec::init() failed for the auth store bootstrap — …` or `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
@@ -83,8 +83,9 @@ exhausted (`FATAL: sorry, too many clients already`).
 
 Yuzu restarts cleanly once Postgres is reachable — no Yuzu-side repair is
 needed, and **no auth data is lost by the outage itself**. Sessions are
-in-memory (see [Sessions](#sessions-are-in-memory-only)), so every operator
-must sign in again after the restart; that is expected, not damage.
+durable rows in Postgres (see [Sessions](#sessions-are-durable)), so an
+operator whose session did not reach its absolute lifetime or idle timeout
+during the outage does not need to sign in again after the restart.
 
 ### `auth` schema migration failure
 
@@ -148,6 +149,25 @@ sudo -u _yuzu ls -l /etc/yuzu/certs/secrets-kek-v*.key
   server generate a new one and consider it fixed: a new KEK cannot decrypt
   existing blobs. Go to [KEK permanently lost](#kek-permanently-lost).
 
+**Docker Compose.** In the container the directory is `/etc/yuzu/certs` (the
+images pass no `--ca-dir`), and it must sit on a named volume: `server-certs`
+in the shipped composes from 0.14.1, `certs` in the two reference composes.
+Check it with `docker compose exec server ls -l /etc/yuzu/certs`; while the
+server is restart-looping, use
+`docker compose run --rm --no-deps -T --user 0 --entrypoint ls server -ln /etc/yuzu/certs`
+(as root, so a wrong owner shows as such instead of `Permission denied`).
+In the affected 0.14.0 stacks there was no volume there, so recreating the
+container (an image upgrade, `down` then `up`, `--force-recreate`) deleted the
+key files, and `kek_unresolvable` follows on the next start (#5370).
+Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the 0.14.0 README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` (which the README quickstart saves as `docker-compose.yml` since #5419) and `docker-compose.reference-gateway.yml` (their `certs` volume).
+A `kek_unresolvable` there does not always mean the files are gone: a compose
+that lost its volume line, files owned by the wrong uid, or keys left behind on
+a dangling anonymous volume give the same error.
+The diagnostic order, the copy-out procedure, and the options if the files are
+already gone are in `docs/user-manual/upgrading.md`, "Docker Compose: copy
+`/etc/yuzu/certs` out of the server container before you recreate it". Run the
+diagnostics before anything destructive.
+
 ## Backup — the KEK pairing rule
 
 **A Postgres dump alone is not a complete auth backup.** TOTP secrets in
@@ -161,21 +181,56 @@ counter climbing.
 So: **capture the database dump and the keys directory as a pair, from the same
 point in time, and restore them as a pair.**
 
+Capture order: take the `pg_dump` first, then the keys directory; do not rotate the KEK between the two (key files only accumulate, so the archive stays a superset of what the dump references). Stopping the server for the pair guarantees it.
+
+**Linux.** Both halves go to `/var/backups/yuzu`, which the block makes a root-owned `0700` directory, and both are written under `umask 077`, so the dump and the key archive are `0600` and owned by root. They stay root-owned: copy them off with `sudo`, keep them together, and encrypt the pair at rest. Use a directory that holds nothing else, since files already in it keep their own permissions. The block prints `OK:` only if both halves were written.
+
 ```bash
-# Linux — run both, keep them together, encrypt the pair at rest.
-STAMP=$(date +%Y%m%dT%H%M%SZ)
-sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
-     > /var/backups/yuzu/yuzu-$STAMP.dump
-sudo tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz \
-     -C /etc/yuzu certs
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+sudo install -d -m 0700 -o root -g root /var/backups/yuzu
+( set -o pipefail
+  sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
+    | sudo sh -c "umask 077; cat > /var/backups/yuzu/yuzu-$STAMP.dump" &&
+  sudo sh -c "umask 077; tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz -C /etc/yuzu certs" ) &&
+  echo "OK: pair written to /var/backups/yuzu"
 ```
 
-```powershell
-# Windows
-$Stamp = Get-Date -Format yyyyMMddTHHmmssZ
-pg_dump $Env:YUZU_POSTGRES_DSN --format=custom > "C:\Backups\Yuzu\yuzu-$Stamp.dump"
-Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "C:\Backups\Yuzu\yuzu-keys-$Stamp.zip"
+**Docker Compose.** Run from the compose directory. The keys directory is the server container's `/etc/yuzu/certs` volume. Both halves go to an owner-only directory outside any git checkout, because the key archive holds the CA private key and the KEK. The server is stopped for the pair, and `docker cp` reads the volume from the stopped container, so this works on the chiselled image too. The last line starts the server again whether or not the backup succeeded.
+
+```bash
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+BK="$HOME/yuzu-keys-backup"; mkdir -p "$BK" && chmod 700 "$BK"
+docker compose stop server
+( umask 077; set -o pipefail
+  docker compose exec -T postgres pg_dump -U yuzu --format=custom yuzu < /dev/null \
+       > "$BK/yuzu-$STAMP.dump" &&
+  docker cp "$(docker compose ps -aq server)":/etc/yuzu/certs - | gzip \
+       > "$BK/yuzu-keys-$STAMP.tar.gz" ) && echo "pair written to $BK"
+docker compose start server
 ```
+
+**Windows** (elevated PowerShell). The Windows installer stores the connection string in a file only Administrators and SYSTEM can read; a hand-configured server may use the `YUZU_POSTGRES_DSN` environment variable instead. The block first locks the backup directory to Administrators and SYSTEM (owner Administrators, inheritance removed, full control for those two only), the same grant the installer gives its own directories, so both halves inherit it. Each run writes to a new, timestamped directory (files already in a directory keep any permissions set on them directly, so the block refuses to reuse one). `pg_dump --file` writes the dump itself, because in Windows PowerShell 5.1 (and PowerShell before 7.4) `>` re-encodes a native command's output as text, which corrupts a custom-format dump.
+
+```powershell
+& {
+  $Stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+  $Bk = "C:\Backups\Yuzu-$Stamp"
+  if (Test-Path -LiteralPath $Bk) { throw "$Bk already exists: use a new, empty folder" }
+  New-Item -ItemType Directory -Path $Bk | Out-Null
+  icacls $Bk /setowner '*S-1-5-32-544' /L /Q | Out-Null
+  if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
+  icacls $Bk /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /L /Q | Out-Null
+  if ($LASTEXITCODE) { throw 'icacls failed: the backup folder is not locked down, stop here' }
+  $DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
+  $Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
+  pg_dump --format=custom --file "$Bk\yuzu-$Stamp.dump" $Dsn
+  if ($LASTEXITCODE) { throw 'pg_dump failed: no pair was written, stop here' }
+  Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "$Bk\yuzu-keys-$Stamp.zip" -ErrorAction Stop
+  Write-Output "OK: pair written to $Bk"
+}
+```
+
+The block is one `& { ... }` script block, so a failure stops everything after it however it is pasted. Go on only after `OK: pair written to ...`.
 
 Rules that follow from the pairing:
 
@@ -194,6 +249,29 @@ Rules that follow from the pairing:
 Postgres backup mechanics (PITR/WAL archiving, base backups, retention) are
 your Postgres platform's concern and out of scope here; what is in scope is
 that the keys directory rides along with whatever you choose.
+
+**A restore rolls credentials and sessions back to the dump.** Passwords live
+only in the auth store (#5274), so restoring a dump puts every local account's
+password back to what it was when the dump was taken — including a password
+changed since because it was exposed — and brings back the session rows and
+lockout state of that moment, so sessions revoked since the dump (a password
+change, **Sign out everywhere**, an admin force-logout) become valid again
+until they expire. After any restore of the auth schema:
+
+1. Revoke every operator session (`DELETE /api/v1/sessions?username=<name>` per
+   account, or the SQL in [Sessions are durable](#sessions-are-durable)).
+2. Re-apply every password change or reset made since the dump — at minimum
+   any made because a password was exposed — in the product.
+3. Review the audit log for `user.password_change` / `user.password_reset`
+   rows after the dump's timestamp to find them (the audit store is not
+   rolled back unless you restored it from the same dump).
+
+**Restoring onto an empty database instead re-seeds `yuzu-server.cfg`.** If the
+`auth` schema is empty when the server starts (a recreated Postgres, a dump
+that did not include it), the server provisions the first administrator from
+the password hash in `yuzu-server.cfg` — usually the original first-boot
+password, not the current one. Keep that file protected, and change the
+administrator password in the product right after such a rebuild.
 
 ## Post-restore verification
 
@@ -221,20 +299,23 @@ Step 3 is the one people skip. It is the only cheap check that distinguishes
 "restored correctly" from "restored, and every MFA user will be locked out the
 moment they try to log in".
 
-## Sessions are in-memory only
+## Sessions are durable
 
-There is no sessions table. `AuthManager` holds sessions in memory
-(`sessions_`), so:
+Operator sessions are rows in the Postgres `session_store.sessions` table
+(`SessionStore`, HA WS-1/1a, ADR-2002 §4). `AuthManager`'s in-memory
+`sessions_` map is only a per-replica validate cache in front of those rows:
+on a cache miss the server re-reads the row and rebuilds the session from it.
+So:
 
-- **A server restart revokes every session, fleet-wide.** That is the fastest
-  emergency revocation there is, and it needs no database access.
-- Nothing about a session survives a crash, a restart, or a failover.
-- The old "verify persistence after Revoke sessions" procedure no longer
-  applies — there is nothing to verify and nothing that can resurrect a
-  revoked session.
+- **A server restart is NOT a revocation.** The restart empties the cache, and
+  the next request rebuilds each session from its row. The same holds for a
+  crash or a failover to another replica.
+- A row is removed only by an explicit revoke (sign-out, or the REST calls
+  below, which delete by token or by username) or by the reaper once the
+  session passes its absolute lifetime (8 hours). An idle-timed-out session
+  is refused on every replica, but its row stays until the reaper removes it.
 
-For targeted revocation while the server is running, use the REST surface
-rather than a restart:
+To revoke sessions, use the REST surface:
 
 ```bash
 # Revoke every session for one operator (admin).
@@ -246,8 +327,52 @@ curl -fsS -X DELETE https://yuzu.internal/api/v1/sessions/me \
      -H "Authorization: Bearer $TOKEN"
 ```
 
-API tokens are a separate credential class and are **not** revoked by either
-of those, nor by a restart — revoke them explicitly via the token endpoints.
+**Check that the revoke persisted.** Both calls delete the durable rows first,
+then clear this replica's cache. If the response body reports
+`db_persisted: false` (the audit row shows `result=partial` with
+`db_error=true`), only this replica's cache was cleared. The rows survive, and
+any replica that misses its cache, including this one after a restart, will
+rebuild those sessions from them. Retry the revoke once the database is
+healthy.
+
+API tokens are a separate credential class. The admin `?username=` call does
+**not** revoke them, and neither does a restart. `/sessions/me` ("Sign out
+everywhere") revokes the caller's API tokens as well as their sessions (check
+`api_tokens_db_persisted` in its response). Otherwise revoke tokens explicitly
+via the token endpoints.
+
+**Emergency fleet-wide revocation.** There is no single admin route that
+revokes every operator's sessions. The audited path is the admin
+`?username=` call above, once per operator. If that is not practical, delete
+the rows directly in Postgres. This is a direct database operation: it
+bypasses the server, **writes no audit row** (record it manually), and signs
+out every operator including you. Take a backup first (see
+[Backup — the KEK pairing rule](#backup--the-kek-pairing-rule)).
+
+```bash
+psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
+BEGIN;
+DELETE FROM session_store.sessions;
+-- Bump the write-generation exactly as SessionStore does, so every
+-- replica drops its cached sessions on its next generation poll (~1s).
+INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')
+ON CONFLICT (key) DO UPDATE SET value = (session_store.session_meta.value::bigint + 1)::text;
+COMMIT;
+SQL
+```
+
+The generation bump is required. A running replica serves a cached session
+without re-reading its row, and clears its cache only when it sees the
+write-generation advance. A bare `DELETE` therefore leaves every cached
+session valid on the replica that holds it, until some later session change
+advances the generation, the session expires, or that replica restarts.
+
+`ON_ERROR_STOP` makes `psql` exit non-zero if any statement fails, in which
+case the whole transaction has rolled back and nothing changed. Afterwards,
+confirm `SELECT count(*) FROM session_store.sessions;` returns 0 and that
+`write_generation` in `session_store.session_meta` went up. This revokes
+sessions only: API tokens stay valid and must be revoked through the token
+endpoints.
 
 ## Account lockout recovery
 
@@ -288,6 +413,150 @@ psql "$YUZU_POSTGRES_DSN" -c \
   "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL;"
 ```
 
+**Bulk unlock after an auth-store blip.** Before #5342 a login whose account
+row could not be read was answered as a wrong password and counted a lockout
+strike, so a Postgres blip during busy sign-in traffic could lock many
+legitimate accounts at once. A server on this release answers those logins
+`503` with no strike, but a wave of `auth.lockout.applied` audit rows clustered
+around a store outage can still happen (a server not yet upgraded, or
+automation retrying a stale password through the outage). Unlock only the
+accounts whose last failure falls inside the outage window, after confirming
+from the audit log that the window is right:
+
+```bash
+# Inspect: accounts locked by a failure inside the window (UTC).
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT username, failed_login_count, last_failed_login_at, locked_until FROM auth.users
+   WHERE locked_until > now()
+     AND last_failed_login_at BETWEEN '2026-10-04 09:00:00+00' AND '2026-10-04 09:20:00+00';"
+
+# Clear exactly those.
+psql "$YUZU_POSTGRES_DSN" -c \
+  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL
+   WHERE locked_until > now()
+     AND last_failed_login_at BETWEEN '2026-10-04 09:00:00+00' AND '2026-10-04 09:20:00+00';"
+```
+
+Like the single-account fallback, this writes no audit row; record it. The
+locks expire on their own after `--auth-lockout-window-secs`, so waiting is
+still the zero-risk choice.
+
+## Password reset
+
+A local account's password lives **only** in the PostgreSQL auth store
+(`auth.users.password_hash`/`salt_hex`). `yuzu-server.cfg` seeds the first
+administrator into an *empty* `auth` schema and is never consulted for an
+account that already exists there (#5274) — so **editing or regenerating
+`yuzu-server.cfg` no longer resets anyone's password**, and neither does
+re-running an installer with a new admin password. (Before #5274 a cfg hash
+silently shadowed the stored one on the replica that loaded it, which made a
+cfg edit look like a reset; that path is gone.)
+
+**Preferred — in the product** (audited, no database access):
+
+- An administrator resets it: Settings → User Management → **Reset
+  password**, or
+  ```bash
+  curl -fsS -X POST "https://yuzu.internal/api/v1/users/alice/password" \
+       -H "Cookie: yuzu_session=$COOKIE" -H "Origin: https://yuzu.internal" \
+       -H "Content-Type: application/json" \
+       -d '{"new_password":"<12-1024 bytes>"}'
+  ```
+  This needs an interactive dashboard session of a **durable
+  Administrator** — with RBAC off, an account whose own role is `admin`;
+  with RBAC on, a user `Administrator` grant. A JIT elevation, an IdP-group
+  admin role or a custom role holding `UserManagement:Write` is refused
+  (`403 durable_admin_required`), as are API and MCP tokens; MFA step-up
+  applies when the caller is enrolled. The configured break-glass account
+  cannot be reset this way (`403 break_glass_target`). The new password, the
+  sign-out of the user's sessions, the discarding of an unfinished MFA
+  enrolment, the lockout clear and the audit row are one database
+  transaction — all of it lands, or none of it. Their API tokens and any
+  ENROLLED second factor are **not** touched (the response reports how many
+  tokens remain active); for a compromised account also run
+  `yuzu-server --mfa-reset <user>` and revoke the tokens.
+- A user who still knows their password changes it themselves: Settings →
+  User Management → **Change password**, or `POST /api/v1/users/me/password`.
+  They are signed out everywhere and sign in again with the new password.
+
+Audit: `user.password_reset` / `user.password_change`, written in the same
+transaction as the change (an audit failure makes no change: `503`). A reset
+also clears the account's lockout, recording `auth.lockout.cleared`
+(`detail=password_reset`) only when there was a lockout to clear. There
+is no MCP tool for either (#5357 tracks a temporary-password reset tool).
+
+**Re-running the Windows server installer is not a reset.** On an upgrade it
+refuses `/ADMIN_PASS=` (and the removed `/OPERATOR_PASS=`) with exit code 11
+(the config file it would write only seeds an empty database).
+
+**Fallback — direct SQL**, when no administrator can sign in at all (the only
+admin forgot their password). This writes no audit row and revokes no
+sessions; record it in your change-management system. Like the in-product
+reset, it discards an unfinished (never-enrolled) TOTP enrolment so nobody can
+complete it under the old password; an enrolled second factor is kept. Generate
+the hash the way the server does (PBKDF2-HMAC-SHA256, 100 000 iterations, 32-byte key,
+16-byte random salt, both hex-encoded):
+
+```bash
+read -rs NEWPW   # 12-1024 bytes; not echoed, not in shell history
+# Passed via the environment, not argv (argv is visible to every local user in ps).
+NEWPW="$NEWPW" python3 - <<'PY'
+import hashlib, os
+salt = os.urandom(16)
+dk = hashlib.pbkdf2_hmac('sha256', os.environ['NEWPW'].encode(), salt, 100000, dklen=32)
+print(f"UPDATE auth.users SET password_hash = '{dk.hex()}', salt_hex = '{salt.hex()}', "
+      "failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, "
+      "mfa_totp_secret = CASE WHEN mfa_enrolled_at IS NULL THEN NULL ELSE mfa_totp_secret END, "
+      "mfa_last_counter = CASE WHEN mfa_enrolled_at IS NULL THEN 0 ELSE mfa_last_counter END, "
+      "updated_at = now() WHERE username = 'admin' AND identity_source = 'local' "
+      "AND provisioning_source = 'local' AND is_active;")
+PY
+# Review the printed statement, then run it:
+psql "$YUZU_POSTGRES_DSN" -c "<the printed UPDATE>"
+```
+
+The same on Windows (elevated PowerShell; needs Python 3 and `psql` on
+`PATH`). The connection string is read from the installer's locked file, as in
+the backup example above:
+
+```powershell
+$Secure = Read-Host -AsSecureString 'New password (12-1024 bytes)'
+$Env:NEWPW = [System.Net.NetworkCredential]::new('', $Secure).Password
+@'
+import hashlib, os
+salt = os.urandom(16)
+dk = hashlib.pbkdf2_hmac('sha256', os.environ['NEWPW'].encode(), salt, 100000, dklen=32)
+print(f"UPDATE auth.users SET password_hash = '{dk.hex()}', salt_hex = '{salt.hex()}', "
+      "failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL, "
+      "mfa_totp_secret = CASE WHEN mfa_enrolled_at IS NULL THEN NULL ELSE mfa_totp_secret END, "
+      "mfa_last_counter = CASE WHEN mfa_enrolled_at IS NULL THEN 0 ELSE mfa_last_counter END, "
+      "updated_at = now() WHERE username = 'admin' AND identity_source = 'local' "
+      "AND provisioning_source = 'local' AND is_active;")
+'@ | python -
+Remove-Item Env:NEWPW
+# Review the printed statement, then run it:
+$DsnFile = "C:\ProgramData\Yuzu Server\postgres.dsn"
+$Dsn = if (Test-Path $DsnFile) { (Get-Content -LiteralPath $DsnFile -Raw).Trim() } else { $Env:YUZU_POSTGRES_DSN }
+psql $Dsn -c "<the printed UPDATE>"
+```
+
+With the Docker Compose reference stack, generate the statement on the host
+as above (the server image has no Python), then run it inside the `postgres`
+service, which needs no published port or password:
+
+```bash
+docker compose exec -T postgres psql -U postgres -d yuzu -c "<the printed UPDATE>"
+```
+
+Run it from the directory holding your compose file (or add `-f <file>`);
+adjust `-d` if your server's DSN names a different database.
+
+Expect `UPDATE 1`. No restart is needed: login reads the auth store directly.
+Then sign in, revoke the account's old sessions
+(`DELETE /api/v1/sessions?username=admin`, or **Sign out everywhere**), and
+consider enrolling a second administrator so the in-product reset is
+available next time.
+
 ## Emergency MFA disable (break-glass)
 
 **When to use.** An operator has lost both their authenticator device *and*
@@ -309,7 +578,6 @@ sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --postgres-dsn "$YUZU_POSTGRES_DSN" \
   --ca-dir /etc/yuzu/certs \
-  --data-dir /var/lib/yuzu \
   --mfa-reset alice
 # {"status":"ok","user":"alice","action":"mfa.reset.breakglass"}
 ```
@@ -321,23 +589,11 @@ sudo -u _yuzu yuzu-server \
   anymore. Point `--postgres-dsn` at the real production database or the row
   lands somewhere nobody is looking (SOC 2 CC6.6), same risk as before, wrong
   flag.
-- `--data-dir` is still required, but for a narrower reason than it used to
-  be: it is where this one-shot looks for a **legacy** `audit.db` to migrate
-  from (`<data-dir>/audit.db`), not where it writes to. Pass the same
-  directory the running service uses so the one-shot sees the same legacy
-  file (or its absence) that a real boot would.
-- **One-shot lockout on a never-booted host.** This command refuses — it does
-  NOT silently skip the check — if the mandatory legacy backfill has not
-  completed on `--postgres-dsn` yet (no `backfill_complete` marker in
-  `audit_store.audit_retention_meta`). A one-shot is deliberately not trusted
-  to declare "no legacy trail exists" on its own (ADR-0040: only a server
-  boot may do that), so on a database that has never seen a successful server
-  boot, `--mfa-reset` and `--break-glass-arm` both fail with "refusing to
-  declare the backfill complete from this entry point... Start the server
-  once, then retry." That IS the remediation: start `yuzu-server` normally
-  once (it completes the backfill — real migration or fresh-install stamp —
-  on its own boot path, which this one-shot deliberately cannot do), stop it,
-  then re-run the one-shot command.
+- `--data-dir` is not needed. There is no legacy `audit.db` backfill gate any
+  more (retired by the ADR-0009 hard cutover, 2026-09-04), so the one-shot also
+  works on a database that has never seen a server boot. If a data directory
+  is set (`--data-dir` or `YUZU_DATA_DIR`), it is still created and checked
+  writable, and a failure there aborts the command.
 - `--ca-dir` is required whenever the KEK is not in the platform default
   location, because the command builds the full auth stack (pool → key
   provider → codec → AuthDB) exactly as the server does.
@@ -406,7 +662,6 @@ sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --postgres-dsn "$YUZU_POSTGRES_DSN" \
   --ca-dir /etc/yuzu/certs \
-  --data-dir /var/lib/yuzu \
   --break-glass-user alice \
   --break-glass-arm
 # → arms the named --break-glass-user for --break-glass-window-secs
@@ -421,13 +676,13 @@ whatever the running service passes in its unit file. Omit it and the command
 exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
 arming nothing.
 
-Arming is fail-closed on audit: the store is checked writable *before* the
-mutate, and if the row fails to persist afterwards the arm is rolled back
-(the account ends up NOT armed). That makes the `--postgres-dsn` note above
+Arming is fail-closed on audit: the audit store is checked reachable and
+migrated *before* the mutate, and if the row fails to persist afterwards the
+arm is rolled back (the account ends up NOT armed). If the rollback also fails,
+the command exits non-zero and says so on stderr: the account may still be
+armed, with no audit row. That makes the `--postgres-dsn` note above
 load-bearing here too — point it at the real production database, or you
-will arm the glass and record it somewhere nobody is looking. The one-shot
-lockout note above applies here identically: `--break-glass-arm` refuses on
-a never-booted host the same way `--mfa-reset` does, for the same reason.
+will arm the glass and record it somewhere nobody is looking.
 
 Same flag requirements and the same threat model as `--mfa-reset` above. The
 arm is audited at `kCritical` as `auth.breakglass.armed`, attributed to the OS
@@ -439,6 +694,36 @@ The break-glass account **must** have MFA enrolled: boot fails closed if it
 does not, and an un-enrolled break-glass account is hard-denied at login
 (enrolment is never offered on that path, since that would defeat the second
 factor).
+
+To enrol the break-glass account, restart the server with `--auth-mode=standard`
+and sign in as that account. This re-enables local-password login for every local
+account, so keep the window short: on bare metal consider `--web-address
+127.0.0.1`; in a container, restrict the published port instead (the image binds
+0.0.0.0). The break-glass lockout exemption does not apply in standard mode, so
+failed password attempts can lock the account for `--auth-lockout-window-secs`.
+Only with the listener restricted as above, consider `--auth-lockout-threshold=0`
+for the window (it disables throttling for every local account); otherwise an SSO
+admin, if the IdP is up, can clear a lock with `POST /api/v1/users/{name}/unlock`.
+Under
+`--mfa-enforcement=required` the sign-in itself enrols MFA; otherwise enrol at
+Settings → Multi-Factor Authentication, which needs the admin role. For a
+non-admin break-glass account, also pass `--mfa-enforcement=required` for that
+restart, and note that it applies to every user for the window: un-enrolled local
+users are enrolled at login, and SSO users whose IdP sends no `amr` cannot pass
+step-up. Then restore `--auth-mode=sso-only` and your usual `--mfa-enforcement`.
+If the arm has lapsed by then and you still need break-glass access (the IdP is
+still down), re-run `--break-glass-arm`; do not re-arm for a planned rotation.
+The mode switch itself writes no audit row, so record the window in a change
+ticket; the evidence is the startup WARN that `--break-glass-user` is ignored under
+standard mode, the missing sso-only boot banner, the
+`auth.login` and `mfa.enroll.verified` rows inside the window, and the banner
+returning on the final restart.
+
+To rotate the break-glass TOTP, clear it first with `--mfa-reset <user>` (an
+enrolled account gets a challenge at sign-in, not enrolment, and cannot re-enrol
+from Settings), then follow the enrolment sequence above. Do not restart under
+sso-only between the reset and the re-enrolment: boot refuses until the account
+is enrolled again.
 
 ## Locked out by MFA enforcement misconfiguration
 
@@ -460,19 +745,38 @@ sudo systemctl restart yuzu-server
 ## What you cannot recover from
 
 - **Lost `yuzu-server.cfg` and an empty `auth` schema.** The config is the seed
-  for the admin account on first boot. If both are gone, run
-  `yuzu-server --first-run-setup` to create a new admin interactively and write
-  a fresh config.
+  for the admin account on first boot. If both are gone, start `yuzu-server`
+  interactively on a terminal with no `yuzu-server.cfg` at the configured path
+  (`--config`): it runs first-run setup, prompts for a new administrator and
+  writes a fresh config. (There is no `--first-run-setup` flag; setup runs
+  whenever the config file is absent and needs a TTY.)
 
-- <a id="kek-permanently-lost"></a>**KEK permanently lost.** Painful, but not a
-  total lockout — the blast radius is narrower than it first looks:
-  - **Admin sign-in survives.** MFA recovery codes are verify-only PBKDF2
-    hashes and need no KEK. Sign in with a recovery code, then re-enroll TOTP.
-  - **Password login is unaffected** — password hashes are PBKDF2, not
-    envelope-encrypted.
-  - **TOTP secrets are unrecoverable.** Every enrolled user must re-enroll.
-    Clear the dead ciphertext with the [fallback SQL](#fallback-direct-sql)
-    above (writing NULL needs no key), then have users re-enroll.
+- <a id="kek-permanently-lost"></a>**KEK permanently lost.** First, the server
+  **will not start** on a database that still registers the lost version.
+  Every boot verifies each registered KEK and stops with `kek_unresolvable`.
+  The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check
+  and fail the same way, and there is no supported way to deregister a KEK
+  version. Without the key file, this database cannot be brought back by any
+  supported means; it is usable again only with the key file restored from a
+  backup. **Do not delete rows from `secrets.kek_meta` to force a start.** The
+  server then mints a new key under the same version number, every secret
+  sealed under the lost key (webhook secrets, plugin and runtime config
+  secrets, offload credentials) becomes permanently undecryptable with no error
+  at boot, and a key file you later find cannot be used (#5421). Take a
+  `pg_dump` before you discard the database: it holds the audit log and
+  configuration, but never restore it into a new install, because it registers
+  the lost KEK. Otherwise you start over with a fresh database, and the CA in
+  the same directory is usually gone too, which means a full agent
+  re-enrolment. The Docker Compose case is worked through in
+  `docs/user-manual/upgrading.md` (#5370). What the KEK does and does not
+  protect:
+  - **Not sealed under the KEK:** password hashes and MFA recovery codes are
+    verify-only PBKDF2 hashes. They are lost only if you start over with a
+    fresh database.
+  - **Sealed, and unrecoverable without the key file:** TOTP secrets, so every
+    enrolled user must re-enroll, and the other secret columns listed in
+    `docs/user-manual/server-admin.md` "Key management (secrets KEK)", such as
+    webhook signing secrets.
   - Any future envelope-encrypted column follows the same rule: re-enrollable
     or re-issuable by design, which is why ADR-0010 requires it.
 

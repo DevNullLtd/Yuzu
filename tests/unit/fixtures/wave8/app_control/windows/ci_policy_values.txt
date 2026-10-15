@@ -1,0 +1,4 @@
+EmodePolicyRequired	u32	0
+SkuPolicyRequired	u32	0
+VerifiedAndReputablePolicyState	u32	0
+SAC_PreviousState	u32	4294967295

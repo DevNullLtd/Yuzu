@@ -16,6 +16,8 @@
 -export([client_has_https/1, client_tls_posture/1, servers_have_tls/1]). %% for testing
 -export([evaluate_upstream_posture/2, listener_tls_traps/1]).            %% for testing
 -export([evaluate_mgmt_posture/3]).                                      %% for testing
+-export([evaluate_cluster_id/2, evaluate_cluster_id/3]).                  %% for testing
+-export([apply_env_overrides/1]).                                          %% for testing
 
 %%--------------------------------------------------------------------
 %% application callbacks
@@ -34,6 +36,14 @@ do_start() ->
     %% Apply environment variable overrides (container deployment).
     apply_env_overrides(),
 
+    %% #4632: refuse to boot with a cluster_id that cannot be sent as a protobuf
+    %% string (see check_cluster_id/0), before anything is started.
+    case check_cluster_id() of
+        {error, ClusterReason} -> {error, ClusterReason};
+        ok                     -> do_start_checked()
+    end.
+
+do_start_checked() ->
     %% Log the ACTUAL transport TLS posture. grpcbox reads its own
     %% {grpcbox, client|servers} config at boot and is the source of truth; the
     %% yuzu_gw `tls`/`tls_enabled` env is advisory only (nothing wires it into
@@ -61,15 +71,37 @@ do_start() ->
 do_start_services() ->
     %% Attach telemetry/prometheus handlers.
     yuzu_gw_telemetry:setup(),
+    %% Heartbeat-rejection summary log state: created before the supervision
+    %% tree serves heartbeats, so a burst of first rejections shares one rate
+    %% limit. The agent listener belongs to the grpcbox dependency application,
+    %% which can start first; the lazy path in yuzu_gw_heartbeat_admission
+    %% covers that window.
+    ok = yuzu_gw_heartbeat_admission:init_summary_state(),
+    %% The same for the WARN limit of the calls that carry a registration
+    %% request (yuzu_gw_safe_call): a burst of first failures shares one limit.
+    ok = yuzu_gw_safe_call:init_limits(),
+
+    %% TCP_NODELAY on the upstream channel, before the supervision tree below
+    %% (the only caller of the channel) exists: grpcbox already started the
+    %% channel from sys.config, so this restarts it with the rewritten endpoints.
+    ok = yuzu_gw_upstream_channel:apply_nodelay(),
 
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),
     application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
     {ok, _} = prometheus_httpd:start(),
     logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
+    logger:info("Heartbeat admission is connection-bound: a heartbeat is "
+                "admitted only on the connection that opened its session"),
 
-    %% Start the supervision tree.
-    yuzu_gw_sup:start_link().
+    %% Start the supervision tree. The crash-report filter goes in first so
+    %% the upstream's first crash is already redacted (it holds registration
+    %% credentials in its mailbox); a tree that does not start removes it again.
+    ok = yuzu_gw_crash_redact:install(),
+    case yuzu_gw_sup:start_link() of
+        {ok, _} = Started -> Started;
+        Other             -> ok = yuzu_gw_crash_redact:remove(), Other
+    end.
 
 %%--------------------------------------------------------------------
 %% Distribution cookie guard (#659)
@@ -84,10 +116,29 @@ check_distribution_cookie() ->
     Allow = os:getenv("YUZU_GW_ALLOW_DEFAULT_COOKIE") =:= "1",
     evaluate_cookie(node(), erlang:get_cookie(), Allow).
 
+%% Minimum distribution-cookie length (HA WS-4 #4555, ADR-2002 §7b). DNS-sourced
+%% discovery makes this node DIAL OUT to addresses it did not choose by hand —
+%% and the OTP distribution handshake has the INITIATOR send
+%% MD5(cookie ‖ peer_challenge) first, before the peer proves anything back. So
+%% anything able to influence what the seed name resolves to (a compromised or
+%% misconfigured DNS answer) gets an offline brute-force oracle against the
+%% cookie from a legitimately-configured node dialing out — a stronger position
+%% than an inbound attacker against a normal listener ever gets. 32 is HALF
+%% the output length of the `openssl rand -hex 32` this module's own
+%% guidance already recommends operators generate (that command emits 64
+%% hex characters, i.e. 256 bits) — the floor is comfortably cleared by the
+%% recommended generator, not merely equal to it. This is a LENGTH check
+%% only, not an entropy check: a hand-typed 32-character string that isn't
+%% genuinely random also clears it. That residual is a deliberate,
+%% documented trade-off (ADR-2002 §7b) — going further (mandating a
+%% specific generation method, or verifying character-class distribution)
+%% was judged disproportionate here.
+-define(MIN_COOKIE_LENGTH, 32).
+
 %% @doc Pure cookie policy decision — exported for testing.
 %% A non-distributed node ('nonode@nohost') has no inter-node attack surface,
-%% so any cookie is accepted. Otherwise the known-default and empty cookies
-%% are rejected unless explicitly overridden for dev/CI.
+%% so any cookie is accepted. Otherwise the known-default, empty, and
+%% too-short cookies are rejected unless explicitly overridden for dev/CI.
 -spec evaluate_cookie(node(), atom(), boolean()) ->
           ok | {error, insecure_distribution_cookie}.
 evaluate_cookie('nonode@nohost', _Cookie, _Allow) ->
@@ -101,10 +152,24 @@ evaluate_cookie(_Node, Cookie, Allow) ->
     %% unsubstituted `${...}` env placeholder. Substring (not exact) match is
     %% the #659 UP-1 hardening: an exact-match list would let the unsubstituted
     %% literal through and silently re-open the unauthenticated-RPC surface.
-    Insecure = CookieStr =:= ""
+    IsDefault = CookieStr =:= ""
         orelse string:find(CookieStr, "yuzu_gw_secret_change_me") =/= nomatch
         orelse string:find(CookieStr, "${") =/= nomatch,
+    TooShort = not IsDefault andalso length(CookieStr) < ?MIN_COOKIE_LENGTH,
+    Insecure = IsDefault orelse TooShort,
     case {Insecure, Allow} of
+        {true, false} when TooShort ->
+            logger:critical(
+                "Refusing to start: Erlang distribution cookie is shorter than "
+                "~p characters. DNS-based cluster discovery (#4555) means this "
+                "node dials addresses it did not choose by hand, and the "
+                "distribution handshake's INITIATOR sends the cookie hash "
+                "first — a short cookie is brute-forceable offline from a "
+                "legitimate node dialing out. Set a strong unique cookie via "
+                "the YUZU_GW_COOKIE environment variable (e.g. `openssl rand "
+                "-hex 32`). Dev/CI may override with "
+                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1.", [?MIN_COOKIE_LENGTH]),
+            {error, insecure_distribution_cookie};
         {true, false} ->
             logger:critical(
                 "Refusing to start: Erlang distribution cookie is the insecure default. "
@@ -115,9 +180,24 @@ evaluate_cookie(_Node, Cookie, Allow) ->
                 "YUZU_GW_ALLOW_DEFAULT_COOKIE=1."),
             {error, insecure_distribution_cookie};
         {true, true} ->
+            %% Name WHICH condition(s) triggered — a bare "default or too
+            %% short" reads as one undifferentiated warning, and an operator
+            %% who set this override for a KNOWN-default cookie (low stakes,
+            %% isolated lab) may not register that a short-but-CUSTOM cookie
+            %% is what's actually flagged, leaving the DNS-dial-out
+            %% brute-force oracle #4555 introduces fully open (unhappy-path
+            %% UP-6, #4555 governance run).
+            Reason = case {IsDefault, TooShort} of
+                {true, true}  -> "the insecure default value AND shorter than the minimum length";
+                {true, false} -> "the insecure default value";
+                {false, true} -> "shorter than the minimum length"
+            end,
             logger:warning(
-                "Erlang distribution cookie is the insecure default, but "
-                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set — proceeding (dev/CI only)."),
+                "Erlang distribution cookie is insecure (~s), but "
+                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set — proceeding (dev/CI only). "
+                "A short custom cookie remains brute-forceable via the DNS-based "
+                "cluster discovery dial-out even with this override set.",
+                [Reason]),
             ok;
         {false, _} ->
             ok
@@ -147,6 +227,9 @@ stop(_State) ->
         timer:sleep(500)
     end,
 
+    %% The filter outlives the supervision tree (already down by now), so the
+    %% upstream's shutdown reports are redacted too.
+    ok = yuzu_gw_crash_redact:remove(),
     logger:info("Gateway shutdown complete"),
     ok.
 
@@ -180,6 +263,11 @@ drain_pending(Deadline) ->
 %%--------------------------------------------------------------------
 
 apply_env_overrides() ->
+    apply_env_overrides(file:native_name_encoding()).
+
+%% The environment text is interpreted in the node's native name encoding
+%% (yuzu_gw_env:env_utf8_binary/2); the parameter lets a test run both.
+apply_env_overrides(Encoding) ->
     Overrides = [
         {"YUZU_GW_UPSTREAM_ADDR",    upstream_addr,    fun(V) -> V end},
         {"YUZU_GW_UPSTREAM_PORT",    upstream_port,    fun list_to_integer/1},
@@ -195,7 +283,23 @@ apply_env_overrides() ->
         {"YUZU_GW_CB_MAX_RESET_TIMEOUT_MS", circuit_breaker_max_reset_timeout_ms, fun list_to_integer/1},
         %% HA WS-4 4.1 — trust-zone/region cluster id (ADR-2002 §7), stamped
         %% on every StreamStatusNotification (yuzu_gw_upstream:handle_cast/2).
-        {"YUZU_GW_CLUSTER_ID", cluster_id, fun list_to_binary/1},
+        %% The variable's text is read in the node's native name encoding and
+        %% its bytes must be valid UTF-8 (yuzu_gw_env:env_utf8_binary/2: a latin1
+        %% node, the default of the shipped images, gets the bytes one per
+        %% element, a utf8 node the characters). A value that cannot be
+        %% represented is left unset here, without printing it, and refused by
+        %% check_cluster_id/0 (#4632).
+        {"YUZU_GW_CLUSTER_ID", cluster_id, fun(V) -> cluster_id_from_env(V, Encoding) end},
+        %% HA WS-4 #4555 — gateway cluster FORMATION config (ADR-2002 §7b).
+        {"YUZU_GW_SEED_DNS_NAME", cluster_seed_dns_name, fun list_to_binary/1},
+        %% Explicit peer list; when non-empty REPLACES DNS resolution outright
+        %% (never merged). "10.0.0.1,10.0.0.2" -> [<<"10.0.0.1">>, <<"10.0.0.2">>].
+        {"YUZU_GW_SEED_NODES", cluster_seed_nodes, fun(V) ->
+            [list_to_binary(string:trim(N))
+             || N <- string:split(V, ",", all), string:trim(N) =/= ""]
+        end},
+        {"YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS", cluster_redial_interval_ms,
+         fun list_to_integer/1},
         {"YUZU_GW_TLS_ENABLED", tls_enabled, fun
             ("true")  -> true;
             ("false") -> false;
@@ -213,15 +317,121 @@ apply_env_overrides() ->
                     application:set_env(yuzu_gw, AppKey, Parsed),
                     logger:info("ENV override: ~s = ~p", [EnvVar, Parsed])
                 catch
+                    error:invalid_cluster_id ->
+                        %% Never the value: it is the text that could not be
+                        %% represented, and check_cluster_id/0 refuses to boot
+                        %% for it right after the overrides.
+                        logger:warning("ENV override: ~s cannot be represented as UTF-8; "
+                                       "ignoring it (the value is not logged)", [EnvVar]);
                     _:_ ->
-                        logger:warning("ENV override: ~s has invalid value '~s', ignoring",
+                        logger:warning("ENV override: ~s has invalid value '~ts', ignoring",
                                        [EnvVar, Value])
                 end
         end
     end, Overrides),
 
+    %% HA WS-4 #4555: YUZU_GW_SEED_NODES set but every entry was empty/
+    %% whitespace-only (a stray trailing comma, blank entries) parses to []
+    %% with no error — correct, one bad entry among good ones should not
+    %% abort the whole override — but the generic "ENV override: ... = []"
+    %% info line above is easy to miss and indistinguishable at a skim from
+    %% "operator never set this at all", which silently falls through
+    %% resolve_targets/0 to DNS discovery instead of the intended static
+    %% topology (unhappy-path UP-9, #4555 governance run). Surface it
+    %% distinctly.
+    case os:getenv("YUZU_GW_SEED_NODES") of
+        false ->
+            ok;
+        RawSeedNodes ->
+            case application:get_env(yuzu_gw, cluster_seed_nodes) of
+                {ok, []} ->
+                    logger:warning(
+                        "YUZU_GW_SEED_NODES was set ('~s') but every entry was "
+                        "empty after trimming — falling back to DNS discovery "
+                        "(YUZU_GW_SEED_DNS_NAME) instead of the intended static "
+                        "peer list. Check for a stray comma or blank entry.",
+                        [RawSeedNodes]);
+                _ ->
+                    ok
+            end
+    end,
+
     %% TLS cert overrides (these set the tls proplist)
     apply_tls_overrides().
+
+cluster_id_from_env(Value, Encoding) ->
+    case yuzu_gw_env:env_utf8_binary(Value, Encoding) of
+        {ok, Bin} -> Bin;
+        error     -> error(invalid_cluster_id)
+    end.
+
+%% @private Fail-closed guard (#4632): refuse to boot if the cluster id cannot be
+%% represented as UTF-8. It is stamped on every stream-status notification as a
+%% protobuf string; a value the encoder rejects would fail every notification,
+%% and a notification that is the half_open probe would keep the breaker from
+%% closing. Refusing at boot is preferred over booting with a different id (the
+%% id pins agents to a trust zone) or one that silently loses every
+%% notification. The message names the source, never the value.
+-spec check_cluster_id() -> ok | {error, {invalid_cluster_id, env | app_env}}.
+check_cluster_id() ->
+    AppValue = application:get_env(yuzu_gw, cluster_id, <<"default">>),
+    case evaluate_cluster_id(AppValue, os:getenv("YUZU_GW_CLUSTER_ID"),
+                             file:native_name_encoding()) of
+        {error, {invalid_cluster_id, Source} = Reason} ->
+            logger:critical(
+                "Refusing to start: the cluster id (~s) cannot be represented as UTF-8 "
+                "(a code point above 16#10FFFF, a surrogate, or bytes that are not "
+                "UTF-8). Set YUZU_GW_CLUSTER_ID, or cluster_id in sys.config, to a "
+                "name made of valid Unicode characters.",
+                [case Source of
+                     env     -> "YUZU_GW_CLUSTER_ID";
+                     app_env -> "the cluster_id application setting"
+                 end]),
+            {error, Reason};
+        ok ->
+            ok
+    end.
+
+%% @doc Pure policy of check_cluster_id/0 (exported for testing). When the
+%% environment variable is set it is what applies (the override replaces the
+%% setting), so only it is checked; otherwise the application setting is.
+%%
+%% The two sources are different kinds of text:
+%%  - the ENVIRONMENT value is os:getenv/1 text, interpreted in the node's native
+%%    name encoding (yuzu_gw_env:env_utf8_binary/2): its bytes must be valid
+%%    UTF-8. Only bytes that are not UTF-8 (or, on a latin1 node, a code point
+%%    above 255) are refused, so a refusal from this source is rare;
+%%  - the APPLICATION setting (sys.config) is Erlang data, converted with
+%%    yuzu_gw_env:utf8_binary/1 and independent of the node's locale. The file is
+%%    read as UTF-8 (file:consult), so the working literals for a non-ASCII name
+%%    are a string (code points: the name typed as UTF-8 text, or "Z\x{FC}rich")
+%%    or a binary with the utf8 modifier (<<"Z\x{FC}rich"/utf8>>). A plain binary
+%%    literal (<<"...">>) is not a working form: it holds ONE BYTE per character,
+%%    and a character above 255 is truncated to its low 8 bits (by the compiler,
+%%    and by file:consult for a sys.config literal). It is accepted only if the
+%%    surviving bytes happen to be valid UTF-8, so the name it holds is generally
+%%    not the one typed (<<"\x{4E2D}">> becomes the single byte 45, a hyphen,
+%%    and is accepted); <<"Z\x{FC}rich">> is the byte 252, not valid UTF-8, and is
+%%    refused. Use the utf8 form. Checked with file:consult and with `erl -config'
+%%    plus application:load/1 under LC_ALL=C and LC_ALL=C.UTF-8: the same bytes
+%%    on both. Most refusals come from this source.
+-spec evaluate_cluster_id(term(), string() | false) ->
+          ok | {error, {invalid_cluster_id, env | app_env}}.
+evaluate_cluster_id(AppValue, EnvValue) ->
+    evaluate_cluster_id(AppValue, EnvValue, file:native_name_encoding()).
+
+-spec evaluate_cluster_id(term(), string() | false, latin1 | utf8) ->
+          ok | {error, {invalid_cluster_id, env | app_env}}.
+evaluate_cluster_id(AppValue, false, _Encoding) ->
+    case yuzu_gw_env:utf8_binary(AppValue) of
+        {ok, _}  -> ok;
+        error    -> {error, {invalid_cluster_id, app_env}}
+    end;
+evaluate_cluster_id(_AppValue, EnvValue, Encoding) ->
+    case yuzu_gw_env:env_utf8_binary(EnvValue, Encoding) of
+        {ok, _}  -> ok;
+        error    -> {error, {invalid_cluster_id, env}}
+    end.
 
 apply_tls_overrides() ->
     Cert = os:getenv("YUZU_GW_TLS_CERTFILE"),

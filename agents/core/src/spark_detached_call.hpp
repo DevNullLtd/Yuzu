@@ -719,16 +719,39 @@ public:
         using P = detached_detail::Payload<T, DFn>;
 
         // Phase 1: admission. fn_in is NOT touched anywhere in this phase -
-        // see the header comment. active.fetch_add(1)+1 > cap -> Rejected,
-        // rolled back, fn_in returned unconsumed.
-        const std::size_t prev = state_->active.fetch_add(1, std::memory_order_acq_rel);
-        if (prev + 1 > state_->cap.load(std::memory_order_acquire)) {
-            state_->active.fetch_sub(1, std::memory_order_acq_rel);
-            state_->rejected_total.fetch_add(1, std::memory_order_relaxed);
-            Result r;
-            r.status = DetachedLaunch::Rejected;
-            r.fn.emplace(std::forward<Fn>(fn_in));
-            return r;
+        // see the header comment. Admission is a compare-exchange loop, NOT an
+        // optimistic fetch_add followed by a compare and a rollback (#4660): that
+        // older shape published a count of cap+1 (or more, under concurrent
+        // rejected launches) to every lane-local active_workers() reader (the
+        // probe_workers_active debug counters in spark_file.cpp, spark_registry.cpp
+        // and spark_service.cpp, and the storm test that samples one) although no
+        // worker beyond the cap was ever admitted. The shared F3 counter was never
+        // exposed to that transient: it is incremented only after admission, and
+        // the production F3 grace poll (agent.cpp, guardian_active_io_workers())
+        // reads it, not this gauge. Here `active` is only ever incremented from a
+        // value observed to be below the cap in effect at that load, so the gauge
+        // does not exceed that cap. `cap` is re-read on every iteration so a cap
+        // lowered live (set_cap_for_test, which has no non-test caller) is
+        // honoured by a launch that is retrying. The cap load and the CAS are not
+        // one atomic step, so a launch racing a live lowering can still admit
+        // against the older cap: the overshoot is bounded by cap_old - cap_new. A
+        // cap lowered BELOW the current active count simply rejects (active >=
+        // cap). A rejected launch touches nothing but rejected_total, and fn_in is
+        // returned unconsumed.
+        std::size_t observed = state_->active.load(std::memory_order_acquire);
+        for (;;) {
+            if (observed >= state_->cap.load(std::memory_order_acquire)) {
+                state_->rejected_total.fetch_add(1, std::memory_order_relaxed);
+                Result r;
+                r.status = DetachedLaunch::Rejected;
+                r.fn.emplace(std::forward<Fn>(fn_in));
+                return r;
+            }
+            // On failure `observed` is reloaded with the current value (acquire).
+            if (state_->active.compare_exchange_weak(observed, observed + 1,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire))
+                break;
         }
         if (state_->f3_counter)
             state_->f3_counter->fetch_add(1, std::memory_order_acq_rel);
@@ -876,6 +899,13 @@ public:
 
     /// This LANE's own outstanding-worker count (mirrors the shared F3
     /// counter's contribution from this lane specifically). Lock-free.
+    /// Contract (#4660): the value never exceeds the cap in effect at admission
+    /// time, so a rejected launch is never visible here, even transiently (a
+    /// live cap lowering can leave it above the NEW cap until workers retire,
+    /// and a racing launch can overshoot by at most cap_old - cap_new). It moves
+    /// ahead of the shared F3 counter in both directions (admission raises it
+    /// first, CountGuard lowers it first), so a reader comparing the two sees
+    /// them disagree briefly during worker churn.
     [[nodiscard]] std::size_t active_workers() const noexcept {
         return state_->active.load(std::memory_order_acquire);
     }

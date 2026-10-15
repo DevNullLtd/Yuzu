@@ -1,0 +1,4 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: selection summary for the 3 committed .pf files (name/length/first-8-bytes-hex/LastWriteTime)
+date: 2026-09-06
+status: REAL CAPTURE

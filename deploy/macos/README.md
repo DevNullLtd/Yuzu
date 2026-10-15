@@ -60,10 +60,13 @@ sudo softwareupdate -i "Command Line Tools for Xcode 26.6-26.6"   # match your O
 sudo rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in_progress
 ```
 
-CLT SDK is sufficient for CI parity: full Xcode’s Endpoint Security SDK
-(`EndpointSecurity.h` and `libEndpointSecurity.tbd`) is compiled as a
-`required:false` no-op when absent. Install full Xcode only if you later want to
-exercise the real ES path on-device.
+CLT SDK is sufficient for CI parity: the ES SDK (`usr/lib/libEndpointSecurity.tbd`
++ `usr/include/EndpointSecurity/`) ships with the Command Line Tools SDK too
+(it is not an `.framework` bundle, and "needs full Xcode" is a myth — see
+`docs/darwin-compat.md`'s EndpointSecurity row), and the build probe finds it
+on either SDK, so the real ES client compiles with CLT alone. The `com.apple.developer.endpoint-security.client`
+entitlement + root + a signed/notarized binary are the actual on-device
+gates for the real ES path, not the SDK choice.
 
 ### 2. Shared build substrate
 
@@ -103,7 +106,8 @@ install -m 755 "$(git -C /opt/ci/src/Yuzu rev-parse --show-toplevel)/deploy/maco
 The **pinned per-user toolchain (cmake 4.3.4, meson 1.11.2, PyYAML) and vcpkg are
 NOT provisioned at the box level** — the `ci.yml` macOS job installs them itself
 every run (`pipx install cmake==4.3.4`, `pipx install meson==…`, `pip pyyaml`,
-`lukka/run-vcpkg` clones vcpkg into the workspace). The box only supplies brew +
+`lukka/run-vcpkg` clones vcpkg into the workspace, and a hash-pinned Erlang/OTP 28 +
+rebar3 is downloaded into `$RUNNER_TEMP` for the gateway; #4841; pins and bump procedure: `docs/darwin-compat.md`). The box only supplies brew +
 CLT + the shared binary cache. (The `/opt/ci/vcpkg` + `/opt/ci/src/Yuzu`
 checkout used for the initial manual cache-warm is optional scaffolding, not a
 runner dependency.)
@@ -201,7 +205,7 @@ first**, then remove:
 sudo launchctl bootout system/com.yuzu.ci-runner.r0 2>/dev/null || true
 sudo rm -f /Library/LaunchDaemons/com.yuzu.ci-runner.r0.plist
 ( cd /opt/ci/actions-runner/r0 && sudo -u yuzuci ./config.sh remove \
-    --token "$(gh api -X POST repos/Tr3kkR/Yuzu/actions/runners/remove-token --jq .token)" )
+    --token "$(gh api -X POST repos/DevNullLtd/Yuzu/actions/runners/remove-token --jq .token)" )
 ```
 
 **Bump the runner version**: deregister, then re-run

@@ -47,6 +47,8 @@
 
 namespace yuzu::agent {
 
+class KvStore;
+
 class YUZU_EXPORT LocalDispatcher {
 public:
     struct Result {
@@ -81,17 +83,22 @@ public:
 
 /// A plugin context for an in-process host that is not the agent daemon
 /// (tools/plugin-capture). Carries the configuration map every plugin reads
-/// through `yuzu_ctx_get_config`; no KV store and no trigger engine, so the
-/// storage and trigger ABI calls fail closed exactly as they do under the
-/// agent when those services are absent. Hand `get()` to `descriptor->init`
-/// before the first dispatch and to `descriptor->shutdown` after the last,
-/// in that order, so a plugin whose init is load-bearing (reads its config,
-/// opens a store, stashes the context) behaves as it does under the real
-/// host. The context must outlive every dispatch made against it.
+/// through `yuzu_ctx_get_config`; no trigger engine, and no KV store unless the
+/// KvStore* overload is used, so the storage and trigger ABI calls fail closed
+/// exactly as they do under the agent when those services are absent. Hand
+/// `get()` to `descriptor->init` before the first dispatch and to
+/// `descriptor->shutdown` after the last, in that order, so a plugin whose init
+/// is load-bearing (reads its config, opens a store, stashes the context)
+/// behaves as it does under the real host. The context must outlive every
+/// dispatch made against it.
 class YUZU_EXPORT StandalonePluginContext {
 public:
     StandalonePluginContext(std::string plugin_name,
                             std::unordered_map<std::string, std::string> config);
+    /// As above, with a non-owning KV store so the storage ABI calls
+    /// (`yuzu_ctx_storage_*`) work; `kv` must outlive this context.
+    StandalonePluginContext(std::string plugin_name,
+                            std::unordered_map<std::string, std::string> config, KvStore* kv);
     StandalonePluginContext(const StandalonePluginContext&) = delete;
     StandalonePluginContext& operator=(const StandalonePluginContext&) = delete;
 

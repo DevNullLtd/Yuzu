@@ -39,9 +39,61 @@
 /// a persistence failure, so the kernel returns `true` and sets no header —
 /// the established `AuditFn` contract (callers that fail closed must keep
 /// serving when audit is simply disabled).
+///
+/// **`result` semantics (#4858) — read this before assuming "success" means
+/// "data was shown".** The bool returned by `try_persist_audit`/
+/// `emit_behavioral_audit` is the PERSIST outcome (did the audit row make it
+/// to durable storage) — it is orthogonal to the `result` STRING passed in as
+/// an audit-row field, and it is that string's meaning which varies by site:
+///   * MOST call sites — the dashboard fragments and most fail-closed REST
+///     gates (`dex.device.view`, `dex.signal.view`), the MCP
+///     `get_dex_device_app_perf` tool's `dex.device.app_perf.view` row, AND
+///     the MCP `list_guardian_events` tool's `dex.device.view` row — audit
+///     BEFORE the read with a literal `result="success"`, asserting
+///     only that the request was authorised and the read was ATTEMPTED. It
+///     does **not** assert data was disclosed: a subsequent store-level
+///     degrade (see `yuzu_server_guardian_read_degrade_total`,
+///     `yuzu_server_app_perf_read_degrade_total`, `docs/user-manual/
+///     metrics.md`) can still leave the dashboard rendering a placeholder, or
+///     the REST/MCP caller getting a 503/retryable error, on top of an
+///     already recorded `success` audit row.
+///   * Some surfaces instead audit AFTER the read and set `result` by ACTUAL
+///     outcome — the Guardian REST/MCP twins (e.g. `guardian.device.view`
+///     on REST/MCP, which passes `rows ? "success" : "failure"`; the
+///     device-page Guardian lens fragment is a DIFFERENT posture, see below)
+///     and `dex.app_perf.devices.view` record `success`/`failure` reflecting
+///     whether the read itself succeeded, not merely whether it was
+///     authorised and attempted.
+///   * A third posture: the MCP `get_dex_device_score` tool's
+///     `dex.device.view` behavioural row audits AFTER the read (`model =
+///     dex_api_->device_score(...)` runs first) but records a CONSTANT
+///     `"success"` regardless of `model.degraded` (the set-and-proceed
+///     convention — the tool response body carries the degrade signal
+///     instead of the audit row). This is NOT the same posture as
+///     `get_dex_device_app_perf` above, despite both being MCP DEX
+///     behavioural rows — do not assume the two share an ordering. The MCP
+///     `get_dex_device_history` tool's `dex.device.view` row shares this
+///     THIRD posture exactly (audits after `dex_api_->device_history(...)`
+///     runs, with the same constant `"success"`) — two different MCP tools
+///     emitting the same verb under the same post-read-constant-success
+///     convention, not a drift between them.
+///   * A fourth, surface-specific split on the SAME verb: `guardian.device.
+///     view` is audited post-read-by-outcome on REST and MCP (bucket two
+///     above), but the device-page Guardian lens dashboard fragment
+///     (`device_lens_routes.cpp`) audits it BEFORE the read with a constant
+///     `"success"` (bucket-one shape) — the same audit verb therefore
+///     carries a DIFFERENT ordering/outcome convention depending on which
+///     surface emitted it.
+/// These postures are a known, accepted split across surfaces, not a bug in
+/// any one of them — an auditor reading raw rows must not assume one meaning
+/// fleet-wide, and must key off (verb, surface), not verb alone. Converging
+/// them onto one posture is deferred to the WS-B2 audit-relocation step
+/// (ADR-0031); this comment documents the CURRENT state, not a target one.
 
 #include <httplib.h>
 #include <spdlog/spdlog.h>
+
+#include "web_utils.hpp" // audit_token — CWE-117 neutralisation for a hostile target_id (#4665)
 
 #include <exception>
 #include <string>
@@ -54,7 +106,11 @@ namespace yuzu::server::detail {
 /// logged + metric-bumped inside `AuditStore::log` (it bumps
 /// `yuzu_server_audit_emit_failed_total`); the throw arm (`bad_alloc`-class)
 /// is otherwise SILENT, so we log it here — the catch-arm log #1647 asked for.
-/// Returns the persist outcome (true == durably audited OR audit-off).
+/// Returns the persist outcome (true == durably audited OR audit-off) — this
+/// is NOT the same thing as the caller-supplied `result` STRING argument
+/// (`"success"`/`"failure"`, written into the audit row itself); see the file
+/// banner's "`result` semantics (#4858)" section for what THAT string means,
+/// which varies by calling site (pre-read vs post-read audit posture).
 ///
 /// `AuditFn` is templated so either `RestApiV1::AuditFn`, `DexRoutes::AuditFn`,
 /// or `mcp::McpServer::AuditFn` (all `std::function<bool(req, action, result,
@@ -82,11 +138,11 @@ template <class AuditFn>
         return audit_fn(req, action, result, target_type, target_id, detail);
     } catch (const std::exception& e) {
         spdlog::warn("audit_fn threw on behavioural-data route action={} target={}: {}", action,
-                     target_id, e.what());
+                     audit_token(target_id), e.what());
     } catch (...) {
         spdlog::warn("audit_fn threw (non-std exception) on behavioural-data route action={} "
                      "target={}",
-                     action, target_id);
+                     action, audit_token(target_id));
     }
     return false;
 }
@@ -118,11 +174,11 @@ try_persist_audit_for_principal(const PrincipalAuditFn& audit_fn, const httplib:
     try {
         return audit_fn(req, action, result, principal, target_type, target_id, detail);
     } catch (const std::exception& e) {
-        spdlog::warn("principal audit_fn threw action={} target={}: {}", action, target_id,
-                     e.what());
+        spdlog::warn("principal audit_fn threw action={} target={}: {}", action,
+                     audit_token(target_id), e.what());
     } catch (...) {
         spdlog::warn("principal audit_fn threw (non-std exception) action={} target={}", action,
-                     target_id);
+                     audit_token(target_id));
     }
     return false;
 }
@@ -134,6 +190,18 @@ try_persist_audit_for_principal(const PrincipalAuditFn& audit_fn, const httplib:
 /// PII after a known audit-persist failure (#1651 review K4) — the HTML
 /// set-and-proceed callers, which legitimately ignore it (the header side effect
 /// is the point), discard it explicitly with `(void)`.
+///
+/// This wrapper is shared by BOTH audit postures the file banner describes —
+/// the `result` string a caller passes in is decided at the CALL SITE, not by
+/// this function: most callers audit BEFORE the read with a literal
+/// `"success"` (authorised-and-attempted, not disclosed — a degraded read
+/// afterwards can still render a placeholder / 503 on top of that row), while
+/// a few (e.g. `guardian.device.view`) audit AFTER the read and pass
+/// `rows ? "success" : "failure"` by actual outcome. Either way this
+/// function's OWN return value is the unrelated persist outcome (see
+/// `try_persist_audit` above) — see the file banner's "`result` semantics
+/// (#4858)" section before reading anything into a `result` value from this
+/// signature alone.
 template <class AuditFn>
 [[nodiscard]] inline bool emit_behavioral_audit(const AuditFn& audit_fn, const httplib::Request& req,
                                   httplib::Response& res, const std::string& action,

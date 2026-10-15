@@ -79,7 +79,7 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 | 8443 | TCP | Inbound | HTTPS dashboard | Admin network |
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
-| 50055 | TCP | Inbound | Gateway upstream | Gateway hosts only |
+| 50055 | TCP | Inbound | Gateway upstream (mutual TLS plus an SPKI public-key pin of the gateway's key, or an acknowledged-disabled plaintext rig) | Gateway hosts only |
 | 9568 | TCP | Inbound | Gateway Prometheus | Monitoring network |
 
 **Recommendations:**
@@ -107,26 +107,55 @@ Run each component under its own system user:
 
 ## Gateway TLS (if you deploy the Erlang gateway)
 
-> **⚠ The gateway agent listener (`:50051`) is plaintext in the *shipped* composes.**
+> **⚠ The gateway agent listener (`:50051`) is plaintext in every shipped compose except the reference gateway compose.**
 > The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
 > the agent listener (`transport_opts` with `verify => verify_none`,
 > `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
-> CA to your agents. It is not on by default in the deployed composes until PR5b.
+> CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
+> cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
 
 If you deploy the gateway, you **must** protect the agent edge — either enable the
 PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
-- **Terminate TLS in front** of the gateway (reverse proxy / L7 LB doing TLS on
-  `:50051`, forwarding only over loopback or a trusted segment), **or**
-- keep `:50051` on a **trusted network** (VPN / private subnet / service mesh) — never
+- **Front the gateway at L4 or with TLS passthrough only** (a plain TCP load balancer,
+  an L4 virtual IP or a TLS-passthrough proxy that keeps one TCP connection per agent
+  end to end), with the gateway agent listener itself running the one-way TLS above.
+  A reverse proxy or L7 load balancer that terminates TLS or HTTP/2 in front of
+  `:50051` is no longer a supported way to protect this edge: the gateway binds each
+  agent's heartbeats to the connection that opened its session, and such a proxy can
+  spread one agent's calls over several connections (see
+  [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
+- keep `:50051` on a **trusted network** (VPN / private subnet / a mesh policy that does not
+  terminate HTTP/2; see [Heartbeat admission](gateway.md#heartbeat-admission)), never
   directly internet-exposed.
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
 `{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. Direct agent→server connections (no gateway) are already full
-mTLS over any network. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
+without `verify_peer`. The server's gateway-upstream service additionally requires an
+authorized gateway peer: the gateway's client certificate must carry `serverAuth`, be inside
+its validity window and have a public key that matches a configured SPKI pin (automatic on
+the generated default certificates, explicit with `--gateway-peer-pin` /
+`--gateway-peer-pin-file` otherwise), and the server refuses to start without one unless
+`--insecure-gateway-peer` acknowledges a plaintext rig. The check wraps the service, which the
+server registers on the one gRPC server that also listens for agents and management, so it
+applies on every one of those ports; without it, a caller with no certificate could reach the
+service on the agent port of a default-certificate install, and any holder of a CA-issued
+client certificate (an agent leaf included) could reach it on the strict ports. Keep the
+gateway key readable only by the server and gateway processes: the pin authorizes exactly that
+key, so anyone who can read it can act as the gateway. See
+[Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization).
+Direct agent→server connections (no gateway) use TLS. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
+
+The agent listener authenticates the gateway to agents, not agents to the gateway.
+The gateway admits an agent `Heartbeat` only on the connection that opened the
+session's `Subscribe` stream, and only for a session that gateway node holds
+(a rejected heartbeat is answered `NOT_FOUND`, counted, and not forwarded).
+`Subscribe` admission is unchanged, and the binding relies on one connection per
+agent between the agent and the gateway (see the supported topologies above). The
+same change removes the session id from two gateway log lines, which reduces the
+disclosure of session ids in logs; some log lines still include session ids.
 
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can
@@ -156,7 +185,17 @@ chmod 600 /etc/yuzu/secrets.env
 # EnvironmentFile=/etc/yuzu/secrets.env
 ```
 
+For the database connection string and the OIDC client secret, a file is an
+alternative to the environment: `--postgres-dsn-file` and
+`--oidc-client-secret-file` (or `YUZU_POSTGRES_DSN_FILE` /
+`YUZU_OIDC_CLIENT_SECRET_FILE`) read the value from a file you protect, such as
+a Docker or Kubernetes secret mount. On Windows, prefer the file: a service's
+environment there is readable by local users. A `-file` flag cannot be combined
+with its direct option or environment variable. See the flag table in
+`server-admin.md`.
+
 Sensitive environment variables:
+- `YUZU_POSTGRES_DSN` — PostgreSQL connection string (usually includes a password)
 - `YUZU_OIDC_CLIENT_SECRET` — OIDC client secret
 - `YUZU_CLICKHOUSE_PASSWORD` — ClickHouse password
 - `YUZU_NVD_API_KEY` — NVD API key
@@ -526,6 +565,31 @@ You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarant
 releasing — the usual repair when a device has been contained without a reachable management
 address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
+### Containment from the Hardware page
+
+The dashboard shows and drives quarantine records without a separate page:
+
+- **Quarantined devices** panel on `/hardware` lists the active records you may read
+  (newest first, at most 200), with who quarantined the device, when, why, the whitelist and
+  how far containment has been shown to reach it: *Recorded* (the server holds the record),
+  *Applied, not confirmed* (a re-dispatch was accepted) or *Confirmed on device* (a status
+  read reported the quarantine active). A read that cannot be completed is a banner, never
+  "no device is quarantined".
+- A **Quarantined** pill marks rows on the Hardware list, and the record header carries a
+  banner while the device has an active record. Instructions to a quarantined device are
+  withheld until it is released; Sync now still works.
+- The record's **Containment** tab shows the same state and offers **Quarantine device**
+  (a reason is required in the dialog) and **Release from quarantine**. Both call
+  `POST /api/v1/quarantine` and `DELETE /api/v1/quarantine/{agent_id}`: they need
+  `Security:Execute` on the device and, like those routes, do **not** apply the approval step
+  the quarantine plugin's own actions require.
+- **Release ends the server record only.** It does not remove the device's firewall rules;
+  run the plugin's `unquarantine` action from the Actions tab for that. Once the record is
+  released the lens reads "No active quarantine record" and cannot say whether the rules
+  were removed, so check the plugin's `status` action.
+- An offline device can be quarantined: the record is stored now and applied when the device
+  next connects.
+
 ### Quarantine now blocks instruction dispatch (#881)
 
 A quarantined device is refused at the **server's dispatch chokepoint**, not only at its own
@@ -539,14 +603,20 @@ Two consequences worth planning for:
 - **The quarantine plugin's own actions are exempt** — `quarantine`, `unquarantine`, `status` and
   `whitelist` still reach a contained device, so release stays possible. The exemption is keyed on
   the action, not the plugin, so a future fifth action would be gated until it is deliberately
-  added.
-- **Three server-internal pushes are also exempt, and you should know they exist.** The TAR
+  added. These four actions, and the Guardian rule push `__guard__.push_rules`, are also exempt
+  from the per-plugin/action kill switch, the per-OS kill switch (and its agent-presence read),
+  the plugin-presence filter and a degraded plugin-config store, so none of them can strand a
+  contained device. A kill-switch row for one of these pairs is still accepted and displayed, but
+  it is informational only and has no dispatch effect. To stop Guardian rule delivery during an
+  incident, disable or remove the rules instead; see
+  [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
+- **Four server-internal pushes are also exempt, and you should know they exist.** The TAR
   fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
-  (`__guard__.push_rules`) and the asset-tag sync (`asset_tags.sync`) continue to reach a
-  contained device. This is deliberate — gating the Guardian push would stop a quarantined device
+  (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory
+  sync (`__sync__.now`) continue to reach a contained device. This is deliberate — gating the Guardian push would stop a quarantined device
   receiving the enforcement rules that make containment meaningful — but it means the containment
   boundary is not total, and a security review of the containment surface has to account for
-  those three channels. They are a closed set in code (`SystemReservedPush`) and are counted by
+  those four channels. They are a closed set in code (`SystemReservedPush`) and are counted by
   `yuzu_server_system_reserved_push_total{capability,result}`; a new one cannot be added without
   appearing in that set. **They are counted, not audited** — there is no per-event row saying a
   particular push reached a particular contained device, so this is a fleet-level signal rather
@@ -559,6 +629,7 @@ Two consequences worth planning for:
   |---|---|
   | `tar.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
   | `asset_tags.sync` | Writes device tags. No code execution. |
+  | `__sync__.now` | Requests an on-demand inventory sync — it arms the agent's existing sync scheduler and nothing else. No code execution beyond the plugin's existing daily-sync path. |
   | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**: the assertion vocabulary is a closed five-value set — file present/absent, file hash, registry value, service running, service stopped — and dangerous registry keys and service names are refused at the `dangerous_enforce_in_spec` chokepoint before a push is ever built. So an operator with Guardian deploy rights can still change *typed, bounded* state on a contained device while their `execute_instruction` is refused. That is deliberate — enforcing a security baseline on a compromised host is the point — but it is the one exempt channel that mutates the endpoint, so scope it accordingly. |
 - **If containment state becomes unreadable, dispatch fails closed** — the server refuses *every*
   target rather than guess who is contained. A short store outage is absorbed by a 60-second

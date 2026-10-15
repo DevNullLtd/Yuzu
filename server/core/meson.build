@@ -102,7 +102,7 @@ echarts_embed = custom_target(
   input: 'vendor/echarts.min.js',
   output: 'echarts_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -122,7 +122,7 @@ three_embed = custom_target(
   input: 'vendor/three.module.min.js',
   output: 'three_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -135,7 +135,7 @@ three_orbit_embed = custom_target(
   input: 'vendor/three-orbit-controls.js',
   output: 'three_orbit_controls_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -153,7 +153,7 @@ yuzu_viz_js_embed = custom_target(
   input: 'static/yuzu-viz.js',
   output: 'yuzu_viz_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -173,11 +173,84 @@ yuzu_viz_host_js_embed = custom_target(
   input: 'static/yuzu-viz-host.js',
   output: 'yuzu_viz_host_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
     'YuzuVizHostJs',
+  ],
+)
+
+# Shared modal dialog + request helper (window.YuzuDialog). Symbol: kYuzuDialogJs
+# (std::string). First consumer: the Operate action dialogs.
+yuzu_dialog_js_embed = custom_target(
+  'yuzu_dialog_js_bundle',
+  input: 'static/yuzu-dialog.js',
+  output: 'yuzu_dialog_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuDialogJs',
+  ],
+)
+
+# Operate O1: the Executions / Approvals page controller (read-only). Symbol:
+# kYuzuOperateJs (std::string).
+yuzu_operate_js_embed = custom_target(
+  'yuzu_operate_js_bundle',
+  input: 'static/yuzu-operate.js',
+  output: 'yuzu_operate_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuOperateJs',
+  ],
+)
+
+# Operate extras page controllers (Instructions, Dashboard, Result sets). Served at
+# /static/yuzu-operate-extras.js with no-cache, like the other operate scripts.
+yuzu_operate_extras_js_embed = custom_target(
+  'yuzu_operate_extras_js_bundle',
+  input: 'static/yuzu-operate-extras.js',
+  output: 'yuzu_operate_extras_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuOperateExtrasJs',
+  ],
+)
+
+# Device containment / estate controls (window-level delegated listener). Symbol: kYuzuEstateJs.
+yuzu_estate_js_embed = custom_target(
+  'yuzu_estate_js_bundle',
+  input: 'static/yuzu-estate.js',
+  output: 'yuzu_estate_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuEstateJs',
+  ],
+)
+
+# Hardware record "Tags and properties" lens controls. Symbol: kYuzuDeviceDataJs.
+yuzu_device_data_js_embed = custom_target(
+  'yuzu_device_data_js_bundle',
+  input: 'static/yuzu-device-data.js',
+  output: 'yuzu_device_data_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuDeviceDataJs',
   ],
 )
 
@@ -186,7 +259,7 @@ cytoscape_js_embed = custom_target(
   input: 'static/cytoscape.min.js',
   output: 'cytoscape_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -204,7 +277,7 @@ yuzu_css_embed = custom_target(
   input: 'static/yuzu.css',
   output: 'yuzu_css_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -212,21 +285,32 @@ yuzu_css_embed = custom_target(
   ],
 )
 
-# Build-time embed of vendored Inter variable webfont as a constexpr
-# byte array (woff2 binary; cannot use raw string literals). Symbol:
-# kInterVariableWoff2 — std::string_view of the bytes.
-inter_embed = custom_target(
-  'inter_woff2_bundle',
-  input: 'vendor/inter/InterVariable.woff2',
-  output: 'inter_woff2_bundle.cpp',
-  command: [
-    find_program('python3', 'python'),
-    files('scripts/embed_binary.py'),
-    '@INPUT@',
-    '@OUTPUT@',
-    'InterVariableWoff2',
-  ],
-)
+# Build-time embed of the vendored IBM Plex Latin webfonts (SIL OFL; IBM's
+# prebuilt woff2 files, never re-subset) as constexpr byte arrays (woff2
+# binary; cannot use raw string literals). One symbol per file, each a
+# std::string_view of the bytes: kIbmPlex<Family><Weight>Woff2.
+plex_fonts = {
+  'IbmPlexMono400Woff2': 'ibm-plex-mono-latin-400-normal.woff2',
+  'IbmPlexMono500Woff2': 'ibm-plex-mono-latin-500-normal.woff2',
+  'IbmPlexSans400Woff2': 'ibm-plex-sans-latin-400-normal.woff2',
+  'IbmPlexSans500Woff2': 'ibm-plex-sans-latin-500-normal.woff2',
+  'IbmPlexSans600Woff2': 'ibm-plex-sans-latin-600-normal.woff2',
+}
+plex_embeds = []
+foreach symbol, file : plex_fonts
+  plex_embeds += custom_target(
+    symbol.to_lower() + '_bundle',
+    input: 'vendor/ibm-plex/' + file,
+    output: symbol.to_lower() + '_bundle.cpp',
+    command: [
+      yuzu_python,
+      files('scripts/embed_binary.py'),
+      '@INPUT@',
+      '@OUTPUT@',
+      symbol,
+    ],
+  )
+endforeach
 
 # Build-time YAML→JSON conversion for shipped Yuzu content. The
 # server iterates kBundledDefinitions / kBundledSets on startup and
@@ -239,7 +323,7 @@ inter_embed = custom_target(
 # filesystem fallback at runtime), so a missing PyYAML used to silently
 # produce a binary with an empty Instructions tab. Probe at configure
 # time so the failure surfaces here rather than mid-compile.
-embed_python = find_program('python3', 'python')
+embed_python = yuzu_python
 _yaml_probe = run_command(embed_python, '-c', 'import yaml', check: false)
 if _yaml_probe.returncode() != 0
   error(
@@ -263,6 +347,8 @@ content_embed = custom_target(
     '@OUTPUT@',
   ],
   build_always_stale: true,  # always re-scan content/ for edits
+  # embed_content.py skips the write when bytes are unchanged, so always-stale does not
+  # relink; guarded by tests/test_embed_content_idempotent.py.
 )
 
 # Build-time embed of the curated CPE map (PR 3, ADR-0018). Lives under
@@ -362,8 +448,10 @@ yuzu_key_provider_dep = declare_dependency(
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
-   yuzu_viz_host_js_embed, cytoscape_js_embed,
-   yuzu_css_embed, inter_embed, content_embed, cpe_map_embed,
+   yuzu_viz_host_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_dialog_js_embed, yuzu_operate_extras_js_embed, yuzu_estate_js_embed,
+   yuzu_device_data_js_embed,
+   yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
     'src/runtime_config_store.cpp',
@@ -372,8 +460,13 @@ yuzu_server_core_lib = static_library(
     'src/agent_registry.cpp',
     'src/agent_service_impl.cpp',
     'src/gateway_service_impl.cpp',
+    'src/gateway_peer_cert.cpp', # gateway-upstream peer authorization: SPKI pin + EKU + validity facts
+    'src/gateway_peer_pinset.cpp', # gateway-upstream peer authorization: boot-fixed pin set + loader
+    'src/gateway_peer_guard.cpp', # gateway-upstream peer authorization: the guarded service wrapper
+    'src/gateway_peer_resolution.cpp', # gateway-upstream peer authorization: boot mode resolution + boot pin set
     'src/auth.cpp',
     'src/auth_db.cpp',
+    'src/enrollment_cfg_import.cpp', # WS-6 6.2: one-time legacy enrollment .cfg -> Postgres import
     'src/auth_routes.cpp',
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
@@ -382,8 +475,7 @@ yuzu_server_core_lib = static_library(
     'src/auto_approve.cpp',
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
-    'src/chargen_ui.cpp',
-    'src/procfetch_ui.cpp',
+    'src/app_shell.cpp',
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
@@ -398,9 +490,13 @@ yuzu_server_core_lib = static_library(
     'src/update_registry.cpp',
     'src/response_store.cpp',
     'src/response_routes.cpp',
+    'src/response_query_model.cpp', # #2146 A2-R2: shared REST v1 + MCP builder for the
+                                     # instruction/command-ID-keyed response query/aggregate/export surface
     'src/bundle_service.cpp',
     'src/bundle_orchestrator.cpp',
     'src/audit_store.cpp',
+    'src/credential_change_owner.cpp', # #5342: ADR-0012 §3 query owner — one-transaction
+                                       # local credential change (auth + session_store + audit_store)
     'src/tag_store.cpp',
     'src/tag_routes.cpp',
     'src/scope_engine.cpp',
@@ -418,22 +514,40 @@ yuzu_server_core_lib = static_library(
     'src/execution_model.cpp',
     'src/execution_routes.cpp',
     'src/health_routes.cpp',
+    'src/home_panels_render.cpp',
+    'src/home_panels_routes.cpp',
     'src/leader_elector.cpp',
+    'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
+    'src/command_delivery_finalization_owner.cpp', # #4982 round 5: ADR-0012 §3 cross-schema owner
     'src/command_outbox_delivery.cpp',
     'src/gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
     'src/execution_event_bus.cpp',
     'src/fleet_topology_store.cpp',
     'src/heartbeat_ingestion.cpp',
     'src/approval_manager.cpp',
+    'src/approval_model.cpp',
     'src/schedule_engine.cpp',
     'src/schedule_routes.cpp',
     'src/schedule_runner.cpp',
+    'src/schedule_model.cpp', # ADR-0031 WS-A4: seventh per-family seam, pure JSON row builder
+    'src/schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam
     'src/help_ui.cpp',
+    'src/home_ui.cpp',     # Home (/home): the sign-in landing page, rendered per request
+    'src/home_render.cpp', # Dashboard panels: pure value structs + renderers
+    'src/home_routes.cpp', # Dashboard: GET /fragments/dashboard/summary over injected seams
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
     'src/result_sets_ui.cpp',
+    'src/result_set_extras_render.cpp',
+    'src/approvals_page_render.cpp', # Operate O1: the Approvals page's pure list renderer
+    'src/approvals_ui.cpp',
+    'src/executions_page_render.cpp', # Operate O1: the Executions page's pure list and panel renderers
+    'src/executions_ui.cpp',
+    'src/workflows_ui.cpp',
+    'src/workflows_page_render.cpp', # Operate WF-A: the Workflows page's pure definitions and schedules renderers
     'src/rbac_store.cpp',
+    'src/rbac_admin_authority_owner.cpp',
     'src/oidc_provider.cpp',
     'src/oidc_scim_link.cpp',
     'src/saml_provider.cpp',
@@ -475,12 +589,16 @@ yuzu_server_core_lib = static_library(
     'src/guardian_schema_registry.cpp',
     'src/guardian_form_render.cpp',
     'src/guardian_model.cpp',
+    'src/guardian_api.cpp', # ADR-0031 WS-A4: the ninth per-family in-process API seam
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
     'src/custom_properties_store.cpp',
     'src/custom_properties_routes.cpp',
+    'src/device_data_render.cpp',
+    'src/device_data_routes.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
+    'src/instruction_param_schema.cpp',
     'src/mcp_orientation.cpp',
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',
@@ -494,6 +612,8 @@ yuzu_server_core_lib = static_library(
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',
     'src/dex_read_model.cpp',
+    'src/dex_types.cpp', # ADR-0031 WS-A4 PR-1 F1 fix: pure catalogue/health computation, relocated out of dex_routes.cpp
+    'src/dex_window.cpp', # ADR-0031 WS-A4 PR-1 F1 fix: pure window/OS-filter resolvers, relocated out of dex_routes.cpp
     'src/execution_statistics_model.cpp', # #2146 Batch B3 -- shared REST+MCP builder (Rule 1)
     'src/management_group_model.cpp', # #2146 Batch B4 -- shared REST+MCP builder (Rule 1)
     'src/api_token_model.cpp', # #2146 Batch B4 -- shared REST+MCP builder (Rule 1)
@@ -508,14 +628,27 @@ yuzu_server_core_lib = static_library(
     'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
     'src/network_routes.cpp',
     'src/network_ui.cpp',
+    'src/discovered_devices_model.cpp',
+    'src/discovered_devices_reader.cpp',
+    'src/device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
     'src/device_routes.cpp',
+    'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
     'src/device_ui.cpp',
     'src/group_agent_count_preview.cpp',
     'src/inventory_routes.cpp',
     'src/inventory_ui.cpp',
     'src/inventory_ci_join.cpp',
+    'src/hardware_list_model.cpp',
+    'src/device_containment_render.cpp',
+    'src/device_containment_routes.cpp',
+    'src/device_estate_render.cpp',
+    'src/device_estate_routes.cpp',
+    'src/hardware_routes.cpp',
+    'src/hardware_ui.cpp',
+    'src/hardware_actions_ui.cpp',
     'src/sle_routes.cpp',
     'src/software_catalog_rollup.cpp',
+    'src/software_catalogue_model.cpp',
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/preflight_eval.cpp',
@@ -524,8 +657,11 @@ yuzu_server_core_lib = static_library(
     'src/verify_routes.cpp',
     'src/verify_ui.cpp',
     'src/verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
+    'src/dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
+    'src/dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
+    'src/deployments_render.cpp',
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/tar_process_tree.cpp',
@@ -542,6 +678,7 @@ yuzu_server_core_lib = static_library(
     'src/diagnostics_routes.cpp', # #2542 PR-12: the 5-route Chargen + Procfetch diagnostic API, extracted onto the HttpRouteSink seam
     'src/legacy_events_routes.cpp', # #2542 PR-12: the legacy GET /events SSE stream, extracted onto the HttpRouteSink seam
     'src/instruction_fragment_routes.cpp', # #2542 PR-12: the 2-route Instructions HTMX fragment pair, extracted onto the HttpRouteSink seam
+    'src/instruction_extras_render.cpp', # Instructions extras: YAML-save merge + library fragment helpers
     'src/approvals_fragment_routes.cpp', # #2542 PR-12: the Approvals HTMX fragment, extracted onto the HttpRouteSink seam
     'src/mcp_disabled_routes.cpp', # #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
     'src/webhook_routes.cpp',
@@ -558,8 +695,11 @@ yuzu_server_core_lib = static_library(
     'src/guardian_page_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',
+    'src/list_keyset.cpp', # pure keyset cursor/int primitives (workflow-execution list)
     'src/workflow_engine.cpp',
     'src/workflow_model.cpp',
+    'src/workflow_execution_list_model.cpp', # shared REST+MCP parser/row builder for the run list
+    'src/workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/app_perf_daily_store.cpp',
@@ -569,6 +709,7 @@ yuzu_server_core_lib = static_library(
     'src/app_perf_cohort_reader.cpp',
     'src/app_perf_ingestion.cpp',
     'src/app_perf_rollup.cpp',
+    'src/dex_app_version_failures_owner.cpp',
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
     'src/data_inventory_routes.cpp',
@@ -578,6 +719,10 @@ yuzu_server_core_lib = static_library(
     'src/product_registry_store.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
+    'src/app_usage_store.cpp',           # Wave 7b PR7b.2
+    'src/app_usage_ingestion.cpp',       # Wave 7b PR7b.2
+    'src/app_usage_routes.cpp',          # Wave 7b PR7b.2
+    'src/app_usage_read_model.cpp',      # Wave 7b PR7b.2 (Rule 1 shared builder)
     'src/device_ci_ingestion.cpp',
     'src/device_inventory_store.cpp',
     'src/agent_decommission.cpp',
@@ -593,8 +738,6 @@ yuzu_server_core_lib = static_library(
     'src/device_token_store.cpp',
     'src/software_deployment_store.cpp',
     'src/license_store.cpp',
-    'src/topology_ui.cpp',
-    'src/statistics_ui.cpp',
     # css_bundle.cpp removed in favour of build-time chunked embed (Gate 4
     # cpp-B1: kYuzuCss exceeds MSVC's 16,380-byte raw-string-literal limit).
     # Source CSS lives at server/core/static/yuzu.css; embed_js.py emits
@@ -611,6 +754,7 @@ yuzu_server_core_lib = static_library(
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
     'src/pg/pg_retention_guard.cpp',
+    'src/pg/multi_host_dsn.cpp', # HA WS-8: multi-host DSN must use target_session_attrs=read-write
     # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
     # secret columns. Depends on the yuzu_key_provider leaf target above.
     'src/pg/secret_codec.cpp',
@@ -618,10 +762,12 @@ yuzu_server_core_lib = static_library(
     'src/ota_transfer_watchdog.cpp',
     'src/principal_quota.cpp',
     'src/cert_reloader.cpp',
+    'src/grpc_tls_credentials.cpp',
     'src/x509_ca.cpp',
     # key_provider.cpp lives in the yuzu_key_provider leaf target above
     # (ADR-0010 arch-S3); the dep below carries it.
     'src/ca_store.cpp',
+    'src/crl_publisher.cpp',
     'src/default_certs.cpp',
     'src/ca_routes.cpp',
     'src/kek_routes.cpp',

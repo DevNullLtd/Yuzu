@@ -61,7 +61,7 @@ inline constexpr std::chrono::seconds kOrphanDrainGrace{3};
 /// shape.
 ///
 /// EXCEPTION (test harness only, #3507 AC1): tests/unit/test_runner_main.cpp
-/// calls hard_exit(result) on Windows where a passing Catch2 run means
+/// calls hard_exit(result) on Windows and macOS where a passing Catch2 run means
 /// result == 0 - a deliberate, reviewed departure from the "never look like
 /// EXIT_SUCCESS" rule above, argued at that call site. This sentence remains
 /// binding for every F3/orphan-triggered call (main.cpp, service_win.cpp);

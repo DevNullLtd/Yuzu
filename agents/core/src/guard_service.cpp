@@ -33,6 +33,8 @@
 
 #include <yuzu/agent/guard_service.hpp>
 
+#include <yuzu/log_token.hpp>
+
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -222,8 +224,8 @@ ServiceGuard::~ServiceGuard() { stop(); }
 
 bool ServiceGuard::start() {
     if (!valid_service_name(cfg_.service_name)) {
-        spdlog::warn("Guardian ServiceGuard[{}]: invalid service name '{}'", cfg_.rule_id,
-                     cfg_.service_name);
+        spdlog::warn("Guardian ServiceGuard[{}]: invalid service name '{}'",
+                     yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(cfg_.service_name));
         return false;
     }
     HANDLE evt = CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr);
@@ -363,18 +365,21 @@ void ServiceGuard::run() try {
                         std::chrono::steady_clock::now() - r0)
                         .count());
                 if (ok)
-                    spdlog::info("Guardian ServiceGuard[{}]: {} '{}' {} -> {} ({}us)", cfg_.rule_id,
-                                 action, cfg_.service_name, d.detected_value, expected_token,
-                                 d.remediation_latency_us);
+                    spdlog::info("Guardian ServiceGuard[{}]: {} '{}' {} -> {} ({}us)",
+                                 yuzu::log_id_token(cfg_.rule_id), action,
+                                 yuzu::log_key_token(cfg_.service_name), d.detected_value,
+                                 expected_token, d.remediation_latency_us);
                 else
                     spdlog::warn("Guardian ServiceGuard[{}]: enforce {} FAILED for '{}' "
                                  "(detected={}, err={})",
-                                 cfg_.rule_id, action, cfg_.service_name, d.detected_value,
+                                 yuzu::log_id_token(cfg_.rule_id), action,
+                                 yuzu::log_key_token(cfg_.service_name), d.detected_value,
                                  GetLastError());
             } else {
                 spdlog::info("Guardian ServiceGuard[{}]: drift '{}' detected={} -- {}, not "
                              "remediating",
-                             cfg_.rule_id, cfg_.service_name, d.detected_value,
+                             yuzu::log_id_token(cfg_.rule_id),
+                             yuzu::log_key_token(cfg_.service_name), d.detected_value,
                              dec.gave_up ? "given up (alert)" : "backing off");
             }
         }
@@ -403,8 +408,8 @@ void ServiceGuard::run() try {
         svc.reset();
         scm.reset(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
         if (!scm) {
-            spdlog::warn("Guardian ServiceGuard[{}]: OpenSCManager failed (err={})", cfg_.rule_id,
-                         GetLastError());
+            spdlog::warn("Guardian ServiceGuard[{}]: OpenSCManager failed (err={})",
+                         yuzu::log_id_token(cfg_.rule_id), GetLastError());
             return false;
         }
         DWORD access = SERVICE_QUERY_STATUS;
@@ -415,7 +420,7 @@ void ServiceGuard::run() try {
         if (!h && cfg_.enforce && GetLastError() == ERROR_ACCESS_DENIED) {
             spdlog::warn("Guardian ServiceGuard[{}]: control-access open of '{}' denied — "
                          "query-only watch; enforcement will report failures",
-                         cfg_.rule_id, cfg_.service_name);
+                         yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(cfg_.service_name));
             h = OpenServiceW(scm.get(), wname.c_str(), SERVICE_QUERY_STATUS);
         }
         if (!h)
@@ -448,7 +453,8 @@ void ServiceGuard::run() try {
             // cadence rather than blocking forever.
             spdlog::warn("Guardian ServiceGuard[{}]: NotifyServiceStatusChange failed for '{}' "
                          "(rc={}) — degraded re-arm in {}ms",
-                         cfg_.rule_id, cfg_.service_name, rc, kAbsentRetryMs);
+                         yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(cfg_.service_name),
+                         rc, kAbsentRetryMs);
             svc.reset();
             next_wake_ms = kAbsentRetryMs;
             return;
@@ -457,8 +463,9 @@ void ServiceGuard::run() try {
         // as an APC at the next alertable wait. Stay fully event-driven (INFINITE).
     };
 
-    spdlog::info("Guardian ServiceGuard[{}]: watching service '{}' (expect {}){}", cfg_.rule_id,
-                 cfg_.service_name, expected_token, cfg_.enforce ? " [enforce]" : "");
+    spdlog::info("Guardian ServiceGuard[{}]: watching service '{}' (expect {}){}",
+                 yuzu::log_id_token(cfg_.rule_id), yuzu::log_key_token(cfg_.service_name),
+                 expected_token, cfg_.enforce ? " [enforce]" : "");
 
     reconcile(); // initial arm; immediate callback delivers the initial compare
 
@@ -513,10 +520,10 @@ void ServiceGuard::run() try {
     // outstanding notify registration is cancelled when its service handle closes.
 } catch (const std::exception& e) {
     spdlog::error("Guardian ServiceGuard[{}]: watch thread exception: {} — watch stopping",
-                  cfg_.rule_id, e.what());
+                  yuzu::log_id_token(cfg_.rule_id), e.what());
 } catch (...) {
     spdlog::error("Guardian ServiceGuard[{}]: watch thread unknown exception — watch stopping",
-                  cfg_.rule_id);
+                  yuzu::log_id_token(cfg_.rule_id));
 }
 
 } // namespace yuzu::agent

@@ -2,6 +2,7 @@
 
 #include <yuzu/audit_retention_rules.hpp>
 
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -136,6 +137,12 @@ constexpr const char* kStoreName = "result_set_store";
 // acquire is still bounded — none may block indefinitely on a saturated pool.
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
+
+// Shared wording for the #2437-class poisoned-payload placeholder (both
+// mark_failed's poisoned branch and heal_poisoned_payload write this same
+// "note" text) so the two heal paths can never drift apart on it.
+constexpr const char* kPoisonedPayloadNote =
+    "original source_payload exceeded the JSON nesting limit and was discarded";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
@@ -407,19 +414,17 @@ std::expected<std::optional<ResultSet>, ResultSetError> ResultSetStore::get(cons
     return std::optional<ResultSet>(read_row(res.get(), 0));
 }
 
-std::vector<ResultSet> ResultSetStore::list_by_owner(const std::string& owner,
-                                                     const std::string& cursor, int limit,
-                                                     std::string& out_next_cursor) {
-    out_next_cursor.clear();
-    std::vector<ResultSet> result;
+std::expected<ResultSetStore::ListPage, ResultSetError> ResultSetStore::list_by_owner_checked(
+    const std::string& owner, const std::string& cursor, int limit) {
     if (!open_)
-        return result;
+        return std::unexpected(ResultSetError::DbError);
     if (limit <= 0)
         limit = 50;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        spdlog::error("ResultSetStore::list_by_owner: no connection ({})", pool_.last_error());
-        return result;
+        spdlog::error("ResultSetStore::list_by_owner_checked: no connection ({})",
+                      pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
     }
 
     int64_t cur_lu = 0, cur_ca = 0;
@@ -444,79 +449,125 @@ std::vector<ResultSet> ResultSetStore::list_by_owner(const std::string& owner,
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::list_by_owner: query failed: {}",
+        spdlog::error("ResultSetStore::list_by_owner_checked: query failed: {}",
                       PQerrorMessage(lease.get()));
-        return result;
+        return std::unexpected(ResultSetError::DbError);
     }
+    ListPage page;
     const int rows = PQntuples(res.get());
-    result.reserve(static_cast<std::size_t>(rows));
+    page.sets.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
-        result.push_back(read_row(res.get(), i));
+        page.sets.push_back(read_row(res.get(), i));
 
-    if (static_cast<int>(result.size()) > limit) {
-        result.resize(limit);
-        out_next_cursor = make_cursor(result.back());
+    if (static_cast<int>(page.sets.size()) > limit) {
+        page.sets.resize(limit);
+        page.next_cursor = make_cursor(page.sets.back());
     }
-    return result;
+    return page;
+}
+
+std::vector<ResultSet> ResultSetStore::list_by_owner(const std::string& owner,
+                                                     const std::string& cursor, int limit,
+                                                     std::string& out_next_cursor) {
+    auto r = list_by_owner_checked(owner, cursor, limit);
+    if (!r) {
+        out_next_cursor.clear();
+        return {};
+    }
+    out_next_cursor = r->next_cursor;
+    return std::move(r->sets);
+}
+
+MembersPageSql build_members_page_sql(const std::string& id, const std::string& cursor,
+                                      int limit, const authz::VisibleSet& visible) {
+    MembersPageSql out;
+    out.sql = "SELECT device_id FROM result_set_store.result_set_members WHERE result_set_id = $1";
+    out.params.push_back(id);
+    int idx = 2;
+    // Visibility MUST precede ORDER BY/LIMIT: ADR-0017 INV-3 (CRITICAL). Applied after, a
+    // device the caller can no longer see would take a page slot and a confined caller would
+    // page through (and be shown a "Show more" for) ids that are not theirs.
+    if (visible) {
+        if (visible->empty()) {
+            out.sql += " AND 1=0"; // visible to nobody
+        } else {
+            std::vector<std::string_view> sv(visible->begin(), visible->end());
+            out.sql += " AND device_id = ANY($" + std::to_string(idx++) + "::text[])";
+            out.params.push_back(pg::to_text_array(sv));
+        }
+    }
+    // Keyset over device_id ASC.
+    if (!cursor.empty()) {
+        out.sql += " AND device_id > $" + std::to_string(idx++);
+        out.params.push_back(cursor);
+    }
+    out.sql += " ORDER BY device_id ASC LIMIT $" + std::to_string(idx) + "::bigint";
+    out.params.push_back(std::to_string(limit + 1)); // fetch one extra to detect next page
+    return out;
+}
+
+std::expected<ResultSetStore::MembersPage, ResultSetError> ResultSetStore::members_checked(
+    const std::string& id, const std::string& cursor, int limit,
+    const authz::VisibleSet& visible) {
+    if (!open_)
+        return std::unexpected(ResultSetError::DbError);
+    if (limit <= 0)
+        limit = 1000;
+    if (visible && visible->empty())
+        return MembersPage{}; // deny-all: nothing to read, nothing to disclose
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::members_checked: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
+    }
+
+    const auto built = build_members_page_sql(id, cursor, limit, visible);
+    pg::PgResult res = pg::exec_params(lease.get(), built.sql.c_str(), built.params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::members_checked: query failed: {}",
+                      PQerrorMessage(lease.get()));
+        return std::unexpected(ResultSetError::DbError);
+    }
+    MembersPage page;
+    const int rows = PQntuples(res.get());
+    page.device_ids.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        page.device_ids.emplace_back(PQgetvalue(res.get(), i, 0));
+
+    if (static_cast<int>(page.device_ids.size()) > limit) {
+        page.device_ids.resize(limit);
+        page.next_cursor = page.device_ids.back();
+    }
+    return page;
 }
 
 std::vector<std::string> ResultSetStore::members(const std::string& id, const std::string& cursor,
                                                  int limit, std::string& out_next_cursor) {
-    out_next_cursor.clear();
-    std::vector<std::string> result;
-    if (!open_)
-        return result;
-    if (limit <= 0)
-        limit = 1000;
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease) {
-        spdlog::error("ResultSetStore::members: no connection ({})", pool_.last_error());
-        return result;
+    auto r = members_checked(id, cursor, limit);
+    if (!r) {
+        out_next_cursor.clear();
+        return {};
     }
-
-    // Keyset over device_id ASC.
-    std::string sql =
-        "SELECT device_id FROM result_set_store.result_set_members WHERE result_set_id = $1";
-    std::vector<std::string> params{id};
-    if (!cursor.empty()) {
-        sql += " AND device_id > $2 ORDER BY device_id ASC LIMIT $3::bigint";
-        params.push_back(cursor);
-    } else {
-        sql += " ORDER BY device_id ASC LIMIT $2::bigint";
-    }
-    params.push_back(std::to_string(limit + 1));
-
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::members: query failed: {}", PQerrorMessage(lease.get()));
-        return result;
-    }
-    const int rows = PQntuples(res.get());
-    result.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
-        result.emplace_back(PQgetvalue(res.get(), i, 0));
-
-    if (static_cast<int>(result.size()) > limit) {
-        result.resize(limit);
-        out_next_cursor = result.back();
-    }
-    return result;
+    out_next_cursor = r->next_cursor;
+    return std::move(r->device_ids);
 }
 
-std::vector<LineageNode> ResultSetStore::lineage(const std::string& id, const std::string& owner) {
-    std::vector<LineageNode> chain;
+std::expected<std::vector<LineageNode>, ResultSetError> ResultSetStore::lineage_checked(
+    const std::string& id, const std::string& owner) {
     if (!open_)
-        return chain;
+        return std::unexpected(ResultSetError::DbError);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        spdlog::error("ResultSetStore::lineage: no connection ({})", pool_.last_error());
-        return chain;
+        spdlog::error("ResultSetStore::lineage_checked: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
     }
 
     // One logical operation, one lease (ADR-0012 §2(c)) — up to kLineageDepthCap
     // sequential hops on the same connection.
+    std::vector<LineageNode> chain;
     std::optional<std::string> cur = id;
     int depth = 0;
+    bool db_error = false;
     std::unordered_set<std::string> visited; // cycle guard (review finding J)
     while (cur && depth < kLineageDepthCap) {
         if (!visited.insert(*cur).second)
@@ -527,14 +578,22 @@ std::vector<LineageNode> ResultSetStore::lineage(const std::string& id, const st
             "FROM result_set_store.result_sets WHERE id = $1 LIMIT 1",
             std::vector<std::string>{*cur});
         if (res.status() != PGRES_TUPLES_OK) {
-            spdlog::error("ResultSetStore::lineage: query failed: {}", PQerrorMessage(lease.get()));
+            spdlog::error("ResultSetStore::lineage_checked: query failed: {}",
+                          PQerrorMessage(lease.get()));
+            // #4306 finding 3: a genuine mid-walk query failure is a DbError
+            // for the WHOLE call, not the partial chain accumulated so far —
+            // the pre-#4306 plain lineage() returned that partial chain,
+            // indistinguishable from a genuinely-short breadcrumb; see the
+            // header posture note on lineage()'s semantic shift.
+            db_error = true;
             break;
         }
         std::optional<std::string> next;
         if (PQntuples(res.get()) > 0) {
             // Owner-filter (review finding B2): stop at the first node not
             // owned by `owner` so a cross-operator ancestor's name/
-            // source_kind/device_count never reaches the caller.
+            // source_kind/device_count never reaches the caller. Normal
+            // termination, not a DbError — same as the cycle guard above.
             std::string node_owner = PQgetvalue(res.get(), 0, 5);
             if (node_owner != owner)
                 break;
@@ -550,9 +609,15 @@ std::vector<LineageNode> ResultSetStore::lineage(const std::string& id, const st
         cur = next;
         ++depth;
     }
+    if (db_error)
+        return std::unexpected(ResultSetError::DbError);
     // chain is leaf→root; reverse to root→leaf for breadcrumb display.
     std::reverse(chain.begin(), chain.end());
     return chain;
+}
+
+std::vector<LineageNode> ResultSetStore::lineage(const std::string& id, const std::string& owner) {
+    return lineage_checked(id, owner).value_or(std::vector<LineageNode>{});
 }
 
 std::expected<bool, ResultSetError> ResultSetStore::contains(const std::string& id,
@@ -585,31 +650,50 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         spdlog::error("ResultSetStore::member_set_owned: no connection ({})", pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
-    // The owner join is the authorization gate: a set not owned by `owner`
-    // yields zero rows, so the caller sees an empty (non-matching) membership
-    // and never learns it exists — the documented "stale members drop
-    // silently" contract extends cleanly to "not-yours members drop silently".
-    // A DB ERROR is DISTINCT from both of those (std::unexpected, never an
-    // empty set) — see the header's type-distinguishable-reads note; the
-    // caller (AgentRegistry::evaluate_scope) MUST abort on DbError rather
-    // than proceed with a partial preload (the fleet-wide fail-open under a
-    // NOT combinator this contract exists to prevent).
+    // #4981 PR-1 (Finding A/A1): a SINGLE statement, one Postgres snapshot,
+    // existence + ownership + membership together — closes the TOCTOU window
+    // the pre-#4981 plain owner-filtered JOIN left open (a set deleted
+    // between a caller's own pre-dispatch ownership gate and this read used
+    // to surface here as a SUCCESSFUL EMPTY set, not an error — see the
+    // header's file-level note). The LEFT JOIN's ON-clause carries the owner
+    // predicate (not a WHERE clause) so a row for `id` is ALWAYS returned
+    // when `id` exists regardless of who owns it — the `owned` column tells
+    // the caller which case it is — while `m.device_id` is NULL on every row
+    // when the owner predicate didn't match (or when `id` has zero members).
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT m.device_id FROM result_set_store.result_set_members m "
-        "JOIN result_set_store.result_sets r ON r.id = m.result_set_id "
-        "WHERE m.result_set_id = $1 AND r.owner_principal = $2",
+        "SELECT (r.owner_principal = $2) AS owned, m.device_id "
+        "FROM result_set_store.result_sets r "
+        "LEFT JOIN result_set_store.result_set_members m "
+        "ON m.result_set_id = r.id AND r.owner_principal = $2 "
+        "WHERE r.id = $1",
         std::vector<std::string>{id, owner});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::member_set_owned: query failed: {}",
                       PQerrorMessage(lease.get()));
         return std::unexpected(ResultSetError::DbError);
     }
-    std::unordered_set<std::string> out;
     const int rows = PQntuples(res.get());
+    if (rows == 0)
+        return std::unexpected(ResultSetError::NotFound);
+    // `owned` is identical on every returned row (it depends only on `id`'s
+    // single owner_principal, not on which member row it's paired with) — the
+    // first row's value is authoritative for the whole result. `owner_principal`
+    // is `NOT NULL` (see the `result_sets` migration), so this column can
+    // never be NULL either — `to_bool` (this file's established boolean-
+    // column idiom, reused rather than re-inlined) treats a NULL/unexpected
+    // value as false (not-owned), the fail-closed direction, as a defensive
+    // fallback that should never actually trigger here.
+    const bool owned = to_bool(PQgetvalue(res.get(), 0, 0));
+    if (!owned)
+        return std::unexpected(ResultSetError::NotOwner);
+    std::unordered_set<std::string> out;
     out.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
-        out.insert(PQgetvalue(res.get(), i, 0));
+    for (int i = 0; i < rows; ++i) {
+        if (PQgetisnull(res.get(), i, 1))
+            continue; // owned, zero members: every row's device_id is NULL
+        out.insert(PQgetvalue(res.get(), i, 1));
+    }
     return out;
 }
 
@@ -639,23 +723,39 @@ ResultSetStore::resolve_alias(const std::string& owner, const std::string& name)
     return std::optional<std::string>(std::string(PQgetvalue(res.get(), 0, 0)));
 }
 
-int ResultSetStore::count_for_owner(const std::string& owner) {
+std::expected<int, ResultSetError> ResultSetStore::count_for_owner_checked(
+    const std::string& owner) {
     if (!open_)
-        return 0;
+        return std::unexpected(ResultSetError::DbError);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
-        spdlog::error("ResultSetStore::count_for_owner: no connection ({})", pool_.last_error());
-        return 0;
+        spdlog::error("ResultSetStore::count_for_owner_checked: no connection ({})",
+                      pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
     }
+    // #4306 fold-in A: predicate aligned with insert_row_impl's authoritative
+    // in-txn recheck (Gate 4 UP-6) -- expired-but-unswept rows do NOT count
+    // against the quota there, so a pre-check without this filter
+    // OVER-counts relative to the authoritative check and could reject a
+    // dispatch the authoritative check would have allowed (a stalled GC
+    // sweep converting GC debt into a spurious operator quota failure).
+    // Keeping the two predicates identical means this pre-check predicts the
+    // authoritative check exactly.
     pg::PgResult res = pg::exec_params(
-        lease.get(), "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1",
+        lease.get(),
+        "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
+        "AND (pinned OR ttl_at >= extract(epoch from now())::bigint)",
         std::vector<std::string>{owner});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::count_for_owner: query failed: {}",
+        spdlog::error("ResultSetStore::count_for_owner_checked: query failed: {}",
                       PQerrorMessage(lease.get()));
-        return 0;
+        return std::unexpected(ResultSetError::DbError);
     }
     return to_int(PQgetvalue(res.get(), 0, 0));
+}
+
+int ResultSetStore::count_for_owner(const std::string& owner) {
+    return count_for_owner_checked(owner).value_or(0);
 }
 
 int ResultSetStore::count_pinned_for_owner(const std::string& owner) {
@@ -971,20 +1071,41 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
     if (PQntuples(sel.get()) == 0)
         return; // not pending (or gone) — nothing to mark
 
-    // Merge {"failure": reason} into the payload in C++ rather than relying on
-    // a Postgres JSON-validity cast (source_payload is a plain TEXT column,
-    // not jsonb, and an operator-supplied string is not guaranteed valid
-    // JSON) — replicates the SQLite json1 `json_set(... CASE WHEN
-    // json_valid ...)` fallback-to-'{}' behavior.
+    const std::string raw_payload(PQgetvalue(sel.get(), 0, 0));
+
+    // #2437-class guard: this function's whole job is to write an updated
+    // source_payload back, and nlohmann::json::dump() is unboundedly
+    // recursive. This has no HTTP request/response of its own to answer with
+    // a 400 (governance Gate 4/6 finding: today it has NO production caller
+    // at all, only unit tests - the store method exists ahead of a future
+    // caller, not for a currently-wired background thread), so a poisoned
+    // row reaching here (written before this guard existed, or via any other
+    // path, past or future) would otherwise SIGSEGV the whole process on the
+    // `payload.dump()` below.
+    // Check the RAW fetched text before it is ever parsed: if it nests too
+    // deeply, DISCARD the poisoned original rather than try to preserve it.
+    // The row still must transition to 'failed' (callers depend on that
+    // contract), so the replacement is a small, fixed, trivially-shallow
+    // object that is always safe to dump: the row is "healed", no longer a
+    // live grenade for a future read.
     nlohmann::json payload;
-    try {
-        payload = nlohmann::json::parse(std::string(PQgetvalue(sel.get(), 0, 0)));
-        if (!payload.is_object())
+    if (mcp::json_exceeds_depth(raw_payload, mcp::kMcpMaxJsonDepth)) {
+        payload = nlohmann::json{{"failure", reason}, {"note", kPoisonedPayloadNote}};
+    } else {
+        // Merge {"failure": reason} into the payload in C++ rather than relying on
+        // a Postgres JSON-validity cast (source_payload is a plain TEXT column,
+        // not jsonb, and an operator-supplied string is not guaranteed valid
+        // JSON): replicates the SQLite json1 `json_set(... CASE WHEN
+        // json_valid ...)` fallback-to-'{}' behavior.
+        try {
+            payload = nlohmann::json::parse(raw_payload);
+            if (!payload.is_object())
+                payload = nlohmann::json::object();
+        } catch (...) {
             payload = nlohmann::json::object();
-    } catch (...) {
-        payload = nlohmann::json::object();
+        }
+        payload["failure"] = reason;
     }
-    payload["failure"] = reason;
 
     pg::PgResult upd = pg::exec_params(
         lease.get(),
@@ -993,6 +1114,65 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
         std::vector<std::string>{payload.dump(), id});
     if (upd.status() != PGRES_COMMAND_OK)
         spdlog::error("ResultSetStore::mark_failed: update failed: {}", PQerrorMessage(lease.get()));
+}
+
+bool ResultSetStore::heal_poisoned_payload(const std::string& id) {
+    if (!open_)
+        return false;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::heal_poisoned_payload: no connection ({})",
+                      pool_.last_error());
+        return false;
+    }
+    // #4493: no status predicate, unlike mark_failed's 'pending'-only SELECT
+    // -- this is the heal path for every status mark_failed cannot reach
+    // (materialized, and failed for symmetry), and is harmless to run
+    // against a pending row too (materialisation reads execution responses,
+    // never source_payload).
+    pg::PgResult sel =
+        pg::exec_params(lease.get(),
+                         "SELECT source_payload FROM result_set_store.result_sets WHERE id = $1",
+                         std::vector<std::string>{id});
+    if (sel.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::heal_poisoned_payload: read failed: {}",
+                      PQerrorMessage(lease.get()));
+        return false;
+    }
+    if (PQntuples(sel.get()) == 0)
+        return false; // gone -- nothing to heal
+
+    const std::string raw_payload(PQgetvalue(sel.get(), 0, 0));
+
+    // Re-check the RAW text itself -- never trust a caller's earlier check --
+    // and no-op on a healthy payload so this can never overwrite a row's
+    // genuine provenance. Same #2437-class discipline as mark_failed: the
+    // guard runs on the fetched TEXT before any parse/dump ever touches it.
+    if (!mcp::json_exceeds_depth(raw_payload, mcp::kMcpMaxJsonDepth))
+        return false;
+
+    // Status is deliberately left untouched (see the header doc comment):
+    // a materialized row's members are real and still scope-walkable
+    // (member_set_owned never filters on status), so this only replaces the
+    // poisoned blob, never the row's status.
+    // #4540: RETURNING id + an affected-row check, same idiom as
+    // materialize()'s own status-guarded UPDATE above -- a concurrent delete
+    // between the SELECT above and this UPDATE (delete_set on an independent
+    // connection lease, or the TTL GC sweep, either with no shared lock) must
+    // never be reported as a successful heal for a row that no longer exists.
+    const nlohmann::json payload{{"note", kPoisonedPayloadNote}};
+    pg::PgResult upd = pg::exec_params(
+        lease.get(),
+        "UPDATE result_set_store.result_sets SET source_payload = $1 WHERE id = $2 RETURNING id",
+        std::vector<std::string>{payload.dump(), id});
+    if (upd.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::heal_poisoned_payload: update failed: {}",
+                      PQerrorMessage(lease.get()));
+        return false;
+    }
+    if (PQntuples(upd.get()) == 0)
+        return false; // gone between the SELECT above and this UPDATE
+    return true;
 }
 
 // ── GC ───────────────────────────────────────────────────────────────────────

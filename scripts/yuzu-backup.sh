@@ -98,8 +98,15 @@ for cfg_file in "$CONFIG_DIR"/*.cfg "$CONFIG_DIR"/*.conf; do
     green "  $(basename "$cfg_file") (${SIZE} bytes)"
 done
 
-# Also check for config files alongside the binary (Windows pattern)
-for cfg_file in yuzu-server.cfg enrollment-tokens.cfg pending-agents.cfg; do
+# Also check for config files alongside the binary (Windows pattern).
+# enrollment-tokens.cfg / pending-agents.cfg are HA WS-6 6.2's one-time import
+# source only — a 6.2+ server never writes them (state is Postgres-
+# authoritative, back it up via pg_dump) and renames them to `<name>.cfg.
+# imported` once consumed. This loop still finds them on a PRE-6.2 install (or
+# the renamed `.imported` copies, via the glob below) — kept deliberately, not
+# stale: a backup taken before upgrading to 6.2 is exactly the file this
+# importer reads.
+for cfg_file in yuzu-server.cfg enrollment-tokens.cfg pending-agents.cfg                 enrollment-tokens.cfg.imported pending-agents.cfg.imported; do
     if [[ -f "$DATA_DIR/$cfg_file" ]] && [[ ! -f "$OUTPUT/$cfg_file" ]]; then
         cp "$DATA_DIR/$cfg_file" "$OUTPUT/"
         FILE_COUNT=$((FILE_COUNT + 1))

@@ -60,12 +60,12 @@ assert_eq() {
 
 assert_contains() {
     local desc="$1" needle="$2" haystack="$3"
-    if echo "$haystack" | grep -q "$needle"; then pass "$desc"; else fail "$desc (expected to contain '$needle')"; fi
+    if grep -qF -- "$needle" <<< "$haystack"; then pass "$desc"; else fail "$desc (expected to contain '$needle')"; fi
 }
 
 assert_not_contains() {
     local desc="$1" needle="$2" haystack="$3"
-    if ! echo "$haystack" | grep -q "$needle"; then pass "$desc"; else fail "$desc (expected NOT to contain '$needle')"; fi
+    if ! grep -qF -- "$needle" <<< "$haystack"; then pass "$desc"; else fail "$desc (expected NOT to contain '$needle')"; fi
 }
 
 # ── JSON-RPC helper ───────────────────────────────────────────────────

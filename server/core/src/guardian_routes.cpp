@@ -15,6 +15,8 @@
                               // get_guardian_rule_status twins
 #include "guardian_push_builder.hpp"  // guardian_guard_supported_on_platform / platform_display_name / os_target_matches
 #include "guardian_rule_spec.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "rest_audit.hpp" // detail::emit_behavioral_audit — audit-before-mutate, fail closed (ADR-0033 §9)
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — mints/reuses X-Correlation-Id so
                                      // header and body always agree
 #include "secure_random.hpp"
@@ -48,48 +50,6 @@ extern const char* const kGuardianDetailPageHtml;
 namespace yuzu::server {
 
 namespace {
-
-// ── Mock fixtures ───────────────────────────────────────────────────────────
-// Contract-shaped sample data so the dashboard is self-demonstrating before the
-// backend status/baseline/schema surfaces land (docs/guardian-mvp-contract.md
-// §8, §10). Every renderer that uses these is marked TODO(guardian-backend).
-
-struct MockGuard {
-    const char* id;
-    const char* name;
-    const char* os;          // "W" | "L" | "M"
-    const char* status;      // compliant|drifted|remediation_failed|errored|exempt|stale
-    const char* severity;    // critical|high|medium|low
-    int compliant;
-    int total;
-    bool healthy;            // guard_healthy signal (startup-wiring), distinct from status
-};
-
-constexpr std::array<MockGuard, 6> kMockGuards{{
-    {"block-smb-445", "block-smb-445", "W", "compliant", "high", 148, 148, true},
-    {"edr-agent-running", "edr-agent-running", "W", "compliant", "critical", 148, 148, true},
-    {"ssh-no-root-login", "ssh-no-root-login", "L", "drifted", "high", 28, 30, true},
-    {"av-scan-7d", "av-scan-7d", "W", "remediation_failed", "high", 144, 148, true},
-    {"macos-alf-on", "macos-alf-on", "M", "compliant", "high", 20, 20, true},
-    {"reg-watch-legacy", "reg-watch-legacy", "W", "errored", "medium", 0, 148, false},
-}};
-
-struct MockEvent {
-    const char* time;
-    const char* type;        // frozen v1 taxonomy
-    const char* guard;
-    const char* agent;
-    const char* detail;
-};
-
-constexpr std::array<MockEvent, 6> kMockEvents{{
-    {"10:42:31", "drift.remediated", "block-smb-445", "DESKTOP-A3F", "Port 445 opened &rarr; blocked (2ms)"},
-    {"10:41:08", "drift.detected", "av-scan-7d", "LAPTOP-B92", "Last scan 9d ago &rarr; triggered"},
-    {"10:39:55", "remediation.failed", "av-scan-7d", "LAPTOP-B92", "Defender service start denied (attempt 3)"},
-    {"10:38:12", "guard.armed", "edr-agent-running", "SRV-DC01", "Self-test round-trip OK"},
-    {"10:36:40", "guard.unhealthy", "reg-watch-legacy", "DESKTOP-K7M", "KEY_NOTIFY denied &mdash; watch deaf"},
-    {"10:35:14", "resilience.escalated", "block-smb-445", "DESKTOP-K7M", "firewall-api &rarr; registry-write"},
-}};
 
 // ── Display helpers ─────────────────────────────────────────────────────────
 
@@ -137,32 +97,14 @@ const char* worst_badge_label(int drifted, int remediation_failed, int errored) 
     return "All compliant";
 }
 
-// Map a status taxonomy value to its badge CSS class + human label.
-std::string status_badge(const std::string& status) {
-    std::string label = status;
-    if (status == "remediation_failed") label = "remediation failed";
-    return "<span class=\"gs-badge gs-" + status + "\">" + label + "</span>";
-}
-
-// ── Honest-state helpers (M2 / #1209) ────────────────────────────────────────
-// Contract-shaped MOCK fixtures render ONLY when no Guardian backend is present
-// (store null / not open) — a pure UI-development fallback. When the store is
-// live, an empty result renders an honest empty state, never fabricated guards
-// or "148/148 compliant" rollups: on an enforcement console, inventing
-// compliance numbers is an observability-integrity hazard. Any mock that does
-// render is wrapped in an unmistakable banner so it can never be read as live
-// fleet state.
-std::string demo_banner(const std::string& what) {
-    return "<div style=\"background:rgba(255,176,32,0.12);border:1px solid var(--yellow);"
-           "color:var(--yellow);padding:0.45rem 0.7rem;border-radius:0.4rem;margin-bottom:0.6rem;"
-           "font-size:0.72rem;font-weight:600\">&#9888; DEMO DATA &mdash; " +
-           what + ". Not live fleet state.</div>";
-}
-
+// ── Honest-state helpers ─────────────────────────────────────────────────────
+// Every Guardian panel renders only what the store returned. A missing or
+// closed store, a degraded read and a genuinely empty result are three
+// different states and each gets its own text: on an enforcement console,
+// inventing compliance numbers (or showing a degraded read as "nothing here")
+// is an observability-integrity hazard.
 std::string empty_state(const std::string& title, const std::string& hint) {
-    return "<div style=\"text-align:center;color:var(--muted);padding:1.6rem 1rem;font-size:0.8rem\">"
-           "<div style=\"font-weight:600;color:var(--fg);margin-bottom:0.25rem\">" +
-           title + "</div>" + hint + "</div>";
+    return "<div class=\"empty-state\"><b>" + title + "</b>" + hint + "</div>";
 }
 
 // Normalise an event_type ("drift.detected") to a CSS-safe suffix
@@ -204,7 +146,7 @@ std::string render_assertion_values(const nlohmann::json& asrt, const std::strin
     };
     auto row = [&](const std::string& label, const std::string& val, bool highlight) {
         return "<div class=\"k\">" + html_escape(label) + "</div><div" +
-               (highlight ? (" style=\"color:" + hi + ";font-weight:700\"") : std::string{}) + ">" +
+               (highlight ? (" style=\"color:" + hi + ";font-weight:600\"") : std::string{}) + ">" +
                html_escape(val) + "</div>";
     };
     std::string out;
@@ -238,7 +180,7 @@ std::string render_assertion_values(const nlohmann::json& asrt, const std::strin
 // green/grey so it can never read as compliant or as a stale-offline "unknown" — used
 // by the fleet census, the By-Guard/By-Baseline "N not impl" tags, and the per-device
 // drill-down.
-constexpr const char* kNotImplColor = "#a78bfa";  // violet
+constexpr const char* kNotImplColor = "var(--c5)";  // violet
 
 // agent_id -> raw platform token ("windows"|"linux"|"darwin"|...) for currently-
 // connected agents, parsed from the registry JSON (registry_.to_json()). Used both to
@@ -298,12 +240,16 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
 //    exclusion, used by all 3 synthetic-notimpl fold sites in this file ──────
 
 // Composite key for one (agent, rule) pair. A real struct + hash functor, NOT a
-// delimiter-joined string: neither agent_id nor rule_id has a charset restriction
-// that would make a separator byte unambiguous. agent_id is client-supplied at
-// Register (length-checked only, agent_service_impl.cpp) and rule_id is
-// operator free text on the REST create path (no shape validation,
-// rest_api_v1.cpp) — governance Gate 2/3/6 independently confirmed a crafted
-// "\x1f"-containing agent_id or rule_id collided the prior delimited-string key
+// delimiter-joined string — and its correctness never leans on either field's
+// charset, which is why it stays correct even though only one of the two now
+// carries a guarantee: agent_id is client-supplied at Register (length-checked
+// only, agent_service_impl.cpp), still charset-unrestricted; rule_id created
+// via REST/MCP now IS charset-restricted (is_valid_rule_id, #4665), but a
+// rule_id predating that check, or one reaching this struct via any other,
+// non-charset-checked path, is not guaranteed charset-safe either — a
+// delimiter would still be ambiguous for either field. Governance Gate 2/3/6
+// independently confirmed a crafted "\x1f"-containing agent_id or rule_id
+// collided the prior delimited-string key
 // (`agentA\x1fextra` + `ruleX` == `agentA` + `extra\x1fruleX`), silently
 // dropping a real status row from every fold. A struct key has no delimiter to
 // collide on, for any byte content, by construction — this is the fix, not a
@@ -424,17 +370,21 @@ void note_platform_matrix_stale(yuzu::MetricsRegistry* metrics, std::string_view
             .increment();
     const std::uint64_t n = g_matrix_stale_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n % kMatrixStaleLogSample == 1)
-        // log_safe (web_utils.hpp): agent_id/rule_id are operator/agent-controlled with
-        // no charset restriction (the same fact that motivated PairStatusKey above) —
-        // interpolating them raw would let a crafted id forge a fake multi-line log
-        // entry (e.g. an embedded '\n'). Neutralise control bytes before they reach the
-        // format string, same as every other log/audit site in this codebase that
-        // touches untrusted identifiers.
+        // #4665 governance-external-review finding (fjarvis, PR #4979): this line is
+        // "agent={} rule={} spark_type={}" -- a k=v k=v shape, so the threat here is
+        // not just a forged extra PHYSICAL line (log_safe's control-byte-only fold
+        // closes that much) but a forged ADJACENT FIELD on this same line via a
+        // space or '=' in an operator/agent-controlled value (e.g. a crafted
+        // rule_id like "x result=success"). audit_token (web_utils.hpp, forwards to
+        // yuzu::log_token) folds space/'='/',' too -- the correct neutraliser for a
+        // k=v-shaped line, not log_safe, which this site used before this fix and
+        // which the #4665 tripwire's own allowlist of "log_safe(" as safe made
+        // invisible to the regression net. Do not revert to log_safe here.
         spdlog::info("guardian: platform support-matrix stale vs. agent-observed reality — "
                      "agent={} rule={} spark_type={} (metric_label={}) already reports real "
                      "status; suppressed a synthetic not-implemented double-count (occurrence {})",
-                     log_safe(std::string(agent_id)), log_safe(std::string(rule_id)),
-                     spark_type.empty() ? "<empty>" : log_safe(std::string(spark_type)),
+                     audit_token(agent_id), audit_token(rule_id),
+                     spark_type.empty() ? "<empty>" : audit_token(spark_type),
                      label, n);
 }
 
@@ -448,8 +398,7 @@ bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
     if (session->token_scope_service.empty())
         return false;
     // Write the 403 FIRST, audit after: the audit call is fire-and-forget
-    // (GuardianRoutes::AuditFn is void, no persist signal to route through a
-    // kernel like try_persist_audit), and a THROWING audit_fn must not be able
+    // (a denial's row is not load-bearing for the deny itself), and a THROWING audit_fn must not be able
     // to prevent the 403 from ever being written — a Gate 8 finding on an
     // earlier draft of this function had the audit call first, so an
     // uncaught throw turned the intended 403 into a bare httplib 500 with
@@ -471,10 +420,9 @@ bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
     // probing service token leaves a trace, not silence, mirroring the REST
     // fleet-wide deny's own denial audit (rest_api_v1.cpp's events route).
     // `req.path` in `detail` disambiguates which fragment was probed, since
-    // the verb itself does not. try/catch (not routed through
-    // try_persist_audit, which requires a bool-returning AuditFn): the 403
-    // above is already durably written, so this is belt-and-suspenders
-    // against a throwing sink, not a functional requirement.
+    // the verb itself does not. try/catch rather than a fail-closed audit: the 403
+    // above is already written, so this is belt-and-suspenders against a throwing
+    // sink, not a functional requirement.
     if (audit_fn_) {
         try {
             audit_fn_(req, "guaranteed_state.fragment.access_denied", "denied", "GuaranteedState",
@@ -611,15 +559,14 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     }
 
     auto sech = [](const std::string& t) {
-        return "<div style=\"font-size:0.66rem;text-transform:uppercase;letter-spacing:0.06em;"
-               "color:var(--muted);font-weight:700;margin:0.9rem 0 0.4rem\">" + t + "</div>";
+        return "<div class=\"gs-sech\">" + t + "</div>";
     };
     auto card = [](const std::string& num, const char* tone, const std::string& label,
                    const std::string& sub) {
         std::string h = "<div class=\"stat-card\"><div class=\"stat-num " + std::string(tone) +
                         "\">" + num + "</div><div class=\"stat-label\">" + label + "</div>";
         if (!sub.empty())
-            h += "<div style=\"font-size:0.62rem;color:var(--muted);margin-top:0.15rem\">" + sub + "</div>";
+            h += "<div class=\"stat-sub\">" + sub + "</div>";
         return h + "</div>";
     };
     // Clickable variant: a Fleet stat card that doubles as navigation into the
@@ -627,11 +574,11 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     // pre-applies a filter). Plain onclick — CSP-safe, see project memory on hx-on.
     auto navcard = [](const std::string& num, const char* tone, const std::string& label,
                       const std::string& sub, const std::string& onclick) {
-        std::string h = "<div class=\"stat-card stat-card-nav\" style=\"cursor:pointer\" onclick=\"" +
+        std::string h = "<div class=\"stat-card stat-card-nav\" onclick=\"" +
                         onclick + "\"><div class=\"stat-num " + std::string(tone) + "\">" + num +
                         "</div><div class=\"stat-label\">" + label + "</div>";
         if (!sub.empty())
-            h += "<div style=\"font-size:0.62rem;color:var(--muted);margin-top:0.15rem\">" + sub + "</div>";
+            h += "<div class=\"stat-sub\">" + sub + "</div>";
         return h + "</div>";
     };
 
@@ -673,19 +620,19 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
                 };
                 std::string sum;
                 if (s.err > 0)
-                    sum = "<span style=\"color:var(--red);font-weight:600\">enforcement failing on " +
+                    sum = "<span class=\"gs-bad\">enforcement failing on " +
                           std::to_string(s.err) + "</span>";
                 else if (s.drift > 0)
-                    sum = "<span style=\"color:var(--yellow);font-weight:600\">drifted on " +
+                    sum = "<span class=\"gs-warn\">drifted on " +
                           std::to_string(s.drift) + " of " + std::to_string(tot) + " agents</span>";
                 else
-                    sum = "<span style=\"color:var(--green);font-weight:600\">compliant &middot; " +
+                    sum = "<span class=\"gs-ok\">compliant &middot; " +
                           std::to_string(s.ok) + " / " + std::to_string(tot) + "</span>";
                 if (s.notimpl > 0)  // macOS/Linux agents the guard targets but can't arm (acb332a)
-                    sum += " <span style=\"color:" + std::string(kNotImplColor) + ";font-weight:600\">&middot; " +
+                    sum += " <span class=\"gs-ni\">&middot; " +
                            std::to_string(s.notimpl) + " not impl</span>";
-                mid = "<div class=\"gs-pbar\">" + seg("var(--green)", s.ok) + seg("var(--yellow)", s.drift) +
-                      seg("var(--red)", s.err) + seg("#5b6b80", s.unk) + seg(kNotImplColor, s.notimpl) +
+                mid = "<div class=\"gs-pbar\">" + seg("var(--ok)", s.ok) + seg("var(--warn)", s.drift) +
+                      seg("var(--bad)", s.err) + seg("var(--faint)", s.unk) + seg(kNotImplColor, s.notimpl) +
                       "</div><div class=\"gs-legend\">" + sum + "</div>";
             }
 
@@ -701,7 +648,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
             std::string right = "<div class=\"big\">" +
                 (enforcing ? std::to_string(a ? a->remediated : 0) : std::to_string(a ? a->detected : 0)) +
                 "</div><div>" + (enforcing ? "remediated" : "detected") + " &middot; 7d</div>"
-                "<div style=\"margin-top:0.35rem\">" +
+                "<div class=\"gs-cr-gap\">" +
                 (dep ? std::to_string(deployed_by_rule[r.rule_id].size()) + " Baseline(s)" : "not deployed") +
                 "</div><div class=\"gs-view\">View &rarr;</div>";
 
@@ -770,33 +717,31 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
                     return "<span style=\"width:" + std::to_string((n * 100) / tot) + "%;background:" + col + "\"></span>";
                 };
                 const int pct = static_cast<int>((bc.ok * 100) / tot);
-                mid = "<div class=\"gs-pbar\">" + seg("var(--green)", bc.ok) + seg("var(--yellow)", bc.drift) +
-                      seg("var(--red)", bc.err) + seg("#5b6b80", bc.unk) + seg(kNotImplColor, bc.notimpl) +
+                mid = "<div class=\"gs-pbar\">" + seg("var(--ok)", bc.ok) + seg("var(--warn)", bc.drift) +
+                      seg("var(--bad)", bc.err) + seg("var(--faint)", bc.unk) + seg(kNotImplColor, bc.notimpl) +
                       "</div><div class=\"gs-legend\">" +
-                      std::to_string(pct) + "% compliant &middot; <span style=\"color:var(--yellow)\">" +
+                      std::to_string(pct) + "% compliant &middot; <span class=\"gs-warn\">" +
                       std::to_string(guards_drifting) + " of " + std::to_string(members.size()) +
                       " guards drifting</span>" +
-                      (bc.notimpl > 0 ? " <span style=\"color:" + std::string(kNotImplColor) + "\">&middot; " +
+                      (bc.notimpl > 0 ? " <span class=\"gs-ni\">&middot; " +
                                             std::to_string(bc.notimpl) + " not impl</span>"
                                       : std::string{}) +
                       "</div>";
             }
 
             std::string right = "<div class=\"big\">" + std::to_string(members.size()) +
-                "</div><div>guards</div><div style=\"margin-top:0.35rem\">" + std::to_string(det) +
-                " drift events &middot; 7d</div><div style=\"margin-top:0.2rem\">" +
+                "</div><div>guards</div><div class=\"gs-cr-gap\">" + std::to_string(det) +
+                " drift events &middot; 7d</div><div class=\"gs-cr-gap\">" +
                 (deployed && b.deployed_at > 0
                      ? "deployed " + html_escape(format_iso_utc(b.deployed_at).substr(0, 10))
                      : "never deployed") +
                 "</div><div class=\"gs-view\">View &rarr;</div>";
 
-            const std::string life = "<span class=\"gs-cpill\" style=\"border:none;padding-left:0;color:" +
-                std::string(deployed ? "var(--green)" : "var(--muted)") + "\">" +
+            const std::string life = std::string("<span class=\"gs-cpill") + (deployed ? " on" : "") + "\">" +
                 (deployed ? "&#9679; deployed" : "&#9675; draft") + "</span>";
             const std::string pending =
                 baseline_members_drifted(b)
-                    ? "<span class=\"gs-cpill\" style=\"color:var(--yellow);border-color:rgba(255,204,0,0.45)\">"
-                      "&#9888; changes pending</span>"
+                    ? "<span class=\"gs-cpill sev-medium\">changes pending</span>"
                     : "";
 
             cards += "<a class=\"gs-card\" href=\"/guardian/baseline/" + bid +
@@ -861,11 +806,11 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     const int success_pct = (rem + fail > 0) ? static_cast<int>((rem * 100) / (rem + fail)) : 100;
 
     std::string html;
-    html += "<div style=\"display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:0.5rem\">"
+    html += "<div class=\"gs-worst\">"
             "<span class=\"worst-badge " +
             std::string(worst_badge_class(guards_drifting, static_cast<int>(fail), guards_errored)) + "\">" +
             worst_badge_label(guards_drifting, static_cast<int>(fail), guards_errored) +
-            "</span><span style=\"font-size:0.7rem;color:var(--muted)\">activity window: last 7 days</span></div>";
+            "</span><span class=\"gs-meta\">activity window: last 7 days</span></div>";
 
     // Honesty banner: guard support is per GUARD TYPE, not a blanket "Windows
     // only" (Registry/File are Windows-only; Service also runs on Linux, but not
@@ -883,9 +828,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
             if (!breakdown.empty()) breakdown += " &middot; ";
             breakdown += html_escape(name) + " " + std::to_string(n);
         }
-        html += "<div style=\"background:#241b3a;border:1px solid " + std::string(kNotImplColor) +
-                ";color:var(--fg);padding:0.5rem 0.75rem;border-radius:0.4rem;margin-bottom:0.6rem;"
-                "font-size:0.74rem;max-width:560px\">&#9888; <b>" + std::to_string(notimpl_agent_total) +
+        html += "<div class=\"gs-banner ni\"><b>" + std::to_string(notimpl_agent_total) +
                 "</b> connected agent(s) have a deployed Guard that can't arm on their platform (" +
                 breakdown + ") &mdash; those Guards are <b>no-ops</b> there, so they are "
                 "<b>not enforced</b> and never count as compliant. Registry and File Guards run on "
@@ -912,7 +855,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     // each Guard's last reported state, not a live probe.
     html += sech("Compliance &mdash; as of last check-in");
     if (cc_total == 0) {
-        html += "<div style=\"font-size:0.72rem;color:var(--muted);max-width:520px\">No device "
+        html += "<div class=\"gs-hint\">No device "
                 "check-ins recorded yet &mdash; as deployed agents report each Guard's state (on change, "
                 "piggybacked on the heartbeat) the breakdown appears here.</div>";
     } else {
@@ -920,37 +863,32 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
         // flex:N segments fill the bar exactly in proportion — no integer-% rounding gap.
         auto seg = [](int64_t n, const char* col, const std::string& inner) -> std::string {
             if (n <= 0) return std::string{};
-            return "<div style=\"flex:" + std::to_string(n) + ";background:" + col +
-                   ";display:flex;align-items:center;justify-content:center;overflow:hidden;"
-                   "white-space:nowrap;font-size:0.6rem;color:#04101f;font-weight:700\">" + inner +
+            return "<div style=\"flex:" + std::to_string(n) + ";background:" + col + "\">" + inner +
                    "</div>";
         };
-        html += "<div style=\"display:flex;height:20px;border-radius:4px;overflow:hidden;"
-                "border:1px solid rgba(255,255,255,0.1);max-width:520px\">";
-        html += seg(cc_ok, "var(--green)", std::to_string(ok_pct) + "% compliant");
-        html += seg(cc_drift, "var(--yellow)", "");
-        html += seg(cc_err, "var(--red)", "");
-        html += seg(cc_unk, "#5b6b80", "");
+        html += "<div class=\"gs-cbar\">";
+        html += seg(cc_ok, "var(--ok)", std::to_string(ok_pct) + "% compliant");
+        html += seg(cc_drift, "var(--warn)", "");
+        html += seg(cc_err, "var(--bad)", "");
+        html += seg(cc_unk, "var(--faint)", "");
         html += seg(cc_notimpl, kNotImplColor, "");
         html += "</div>";
         auto leg = [](const char* col, const char* lbl, int64_t n, const std::string& extra) {
-            return "<span><i style=\"display:inline-block;width:.55rem;height:.55rem;border-radius:2px;"
-                   "margin-right:.3rem;vertical-align:middle;background:" + std::string(col) + "\"></i>" +
-                   lbl + " <b style=\"color:var(--fg)\">" + std::to_string(n) + "</b>" + extra + "</span>";
+            return "<span><i style=\"background:" + std::string(col) + "\"></i>" +
+                   lbl + " <b>" + std::to_string(n) + "</b>" + extra + "</span>";
         };
-        html += "<div style=\"display:flex;flex-wrap:wrap;gap:1rem;margin-top:0.45rem;"
-                "font-size:0.66rem;color:var(--muted)\">";
-        html += leg("var(--green)", "Compliant", cc_ok, "");
-        html += leg("var(--yellow)", "Drifted", cc_drift, "");
-        html += leg("var(--red)", "Error", cc_err, "");
-        html += leg("#5b6b80", "Unknown", cc_unk,
-                    " <span style=\"color:var(--muted)\">(agent offline &mdash; last state stale)</span>");
+        html += "<div class=\"gs-leg\">";
+        html += leg("var(--ok)", "Compliant", cc_ok, "");
+        html += leg("var(--warn)", "Drifted", cc_drift, "");
+        html += leg("var(--bad)", "Error", cc_err, "");
+        html += leg("var(--faint)", "Unknown", cc_unk,
+                    " <span>(agent offline &mdash; last state stale)</span>");
         if (cc_notimpl > 0)
             html += leg(kNotImplColor, "Not implemented", cc_notimpl,
-                        " <span style=\"color:var(--muted)\">(macOS / Linux &mdash; guard is a no-op on the "
+                        " <span>(macOS / Linux &mdash; guard is a no-op on the "
                         "agent)</span>");
         html += "</div>";
-        html += "<div style=\"font-size:0.62rem;color:var(--muted);margin-top:0.3rem\">" +
+        html += "<div class=\"gs-hint\">" +
                 std::to_string(cc_total) + " device-guard checks across " + std::to_string(agents) +
                 " online agent(s), as of each Guard's last reported change." +
                 (cc_notimpl > 0 ? " The compliant share is of all targeted device-guard pairs, "
@@ -972,6 +910,22 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
                     "gsGoView('guard','drift')");
     html += navcard(std::to_string(guards_errored), guards_errored ? "bad" : "good", "Unhealthy Guards",
                     "errored / watch-deaf now", "gsGoView('guard','unhealthy')");
+    html += "</div>";
+
+    // Last 24 hours: one more rule_activity() call with a 24 h window (the 7-day
+    // call above is shared by every per-guard figure). "Auto-reverted" is the
+    // remediated count; both read the same drift-event log as the 7-day cards.
+    int64_t det24 = 0, rem24 = 0, fail24 = 0;
+    for (const auto& a : store_->rule_activity(format_iso_utc(now_epoch_seconds() - 86400))) {
+        det24 += a.detected;
+        rem24 += a.remediated;
+        fail24 += a.failed;
+    }
+    html += sech("Drift activity (24h)");
+    html += "<div class=\"stat-cards\">";
+    html += card(std::to_string(det24), "warn", "Drift events", "last 24 hours");
+    html += card(std::to_string(rem24), "good", "Auto-reverted", "remediated by enforce Guards");
+    html += card(std::to_string(fail24), "bad", "Enforcement failed", "last 24 hours");
     html += "</div>";
 
     html += sech("Enforcement effectiveness (7d)");
@@ -999,21 +953,18 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
         buckets.push_back({iso.substr(5, 5), r, f});  // MM-DD
     }
     html += sech("Remediations trend (7d)");
-    html += "<div style=\"display:flex;align-items:flex-end;gap:0.4rem;height:84px;margin-top:0.3rem\">";
+    html += "<div class=\"gs-trend\">";
     for (const auto& b : buckets) {
         const int h = static_cast<int>(((b.rem + b.fail) * 72) / dmax);
         const int rh = (b.rem + b.fail) ? static_cast<int>((b.rem * 100) / (b.rem + b.fail)) : 0;
-        html += "<div style=\"flex:1;display:flex;flex-direction:column;align-items:center;gap:0.2rem\">"
-                "<div style=\"width:60%;height:" + std::to_string(h) + "px;display:flex;"
-                "flex-direction:column-reverse;border-radius:2px 2px 0 0;overflow:hidden;min-height:2px\">"
-                "<div style=\"height:" + std::to_string(rh) + "%;background:var(--green)\"></div>"
-                "<div style=\"height:" + std::to_string(100 - rh) + "%;background:var(--red)\"></div></div>"
-                "<small style=\"font-size:0.56rem;color:var(--muted)\">" + b.label + "</small></div>";
+        html += "<div><div class=\"bar\" style=\"height:" + std::to_string(h) + "px\">"
+                "<div style=\"height:" + std::to_string(rh) + "%;background:var(--ok)\"></div>"
+                "<div style=\"height:" + std::to_string(100 - rh) + "%;background:var(--bad)\"></div></div>"
+                "<small>" + b.label + "</small></div>";
     }
     html += "</div>";
-    html += "<div style=\"font-size:0.62rem;color:var(--muted);margin-top:0.3rem\">"
-            "<span style=\"color:var(--green)\">&#9632;</span> enforced &nbsp; "
-            "<span style=\"color:var(--red)\">&#9632;</span> failed</div>";
+    html += "<div class=\"gs-leg\"><span><i style=\"background:var(--ok)\"></i>enforced</span>"
+            "<span><i style=\"background:var(--bad)\"></i>failed</span></div>";
 
     // Data-source honesty: compliance is the per-(agent,rule) status feed (agents
     // report a Guard's state only when it CHANGES — nothing in steady state, so it is
@@ -1026,125 +977,95 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     return html;
 }
 
-std::string GuardianRoutes::render_guards_fragment(const std::string& status_filter) const {
+std::string GuardianRoutes::render_guards_fragment() const {
+    // Three honest non-list states, each distinct: store absent/closed, read
+    // degraded (never shown as "no Guards"), and a live empty store.
+    if (!store_ || !store_->is_open())
+        return empty_state("Guardian store unavailable", "Check server /healthz.");
+    auto rules_result = store_->list_rules();
+    if (!rules_result)
+        return empty_state("Guards temporarily unavailable",
+                           "The Guardian store is degraded, so the Guard list cannot be read. "
+                           "Check server /healthz.");
+    if (rules_result->empty())
+        return empty_state("No Guards defined yet",
+                           "Create a Guard to start enforcing desired state across the fleet.");
+
     std::string html = "<div class=\"guard-list\">";
+    const auto& rules = *rules_result;
+    // Precompute, per guard rule_id, the DEPLOYED Baselines that contain it
+    // (id + name) — one pass over deployed baselines rather than a query per
+    // guard — so each row can render "Deployed: <baseline links>".
+    std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>>
+        deployed_by_rule;
+    if (baseline_store_ && baseline_store_->is_open())
+        for (const auto& b : baseline_store_->list_deployed_baselines())
+            for (const auto& mid : baseline_store_->get_members(b.baseline_id))
+                deployed_by_rule[mid].emplace_back(b.baseline_id, b.name);
 
-    // Prefer real authored rules when the store has any; otherwise mock so the
-    // page demonstrates the full taxonomy. Per-guard live status aggregation is
-    // not yet available, so status/counts remain mock either way.
-    // TODO(guardian-backend): fold in GET /api/v1/guaranteed-state/status per guard.
-    bool used_real = false;
-    if (store_ && store_->is_open()) {
-        // list_rules is now type-distinguishable (ADR-0038): a degrade (!rules_result)
-        // falls through to the mock demonstration render below — the same fallback
-        // this file already applies for `!store_`/`!is_open()` — rather than being
-        // treated as "zero authored rules" (which renders the honest empty state).
-        auto rules_result = store_->list_rules();
-        if (rules_result && !rules_result->empty()) {
-            const auto& rules = *rules_result;
-            used_real = true;
-            // Precompute, per guard rule_id, the DEPLOYED Baselines that contain it
-            // (id + name) — one pass over deployed baselines rather than a query per
-            // guard — so each row can render "Deployed: <baseline links>".
-            std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>>
-                deployed_by_rule;
-            if (baseline_store_ && baseline_store_->is_open())
-                for (const auto& b : baseline_store_->list_deployed_baselines())
-                    for (const auto& mid : baseline_store_->get_members(b.baseline_id))
-                        deployed_by_rule[mid].emplace_back(b.baseline_id, b.name);
+    for (const auto& r : rules) {
+        const std::string os = r.os_target.empty() ? "ALL"
+                               : (r.os_target == "windows" ? "W"
+                                  : r.os_target == "linux"  ? "L"
+                                  : r.os_target == "macos"  ? "M" : r.os_target);
+        const bool on = r.enabled;
+        // Mode is the guard's immutable posture: Observe (watch/audit — empty/
+        // unknown renders Observe, never a false-green Enforce; C1/B2) or
+        // Enforce. Coloured by posture (CSS .gi-mode.observe/.enforce).
+        const bool enforcing = (r.enforcement_mode == "enforce");
+        const std::string mode_label = enforcing ? "Enforce" : "Observe";
+        const char* mode_cls = enforcing ? "enforce" : "observe";
+        const std::string rid = html_escape(r.rule_id);
 
-            for (const auto& r : rules) {
-                const std::string os = r.os_target.empty() ? "ALL"
-                                       : (r.os_target == "windows" ? "W"
-                                          : r.os_target == "linux"  ? "L"
-                                          : r.os_target == "macos"  ? "M" : r.os_target);
-                const bool on = r.enabled;
-                // Mode is the guard's immutable posture: Observe (watch/audit — empty/
-                // unknown renders Observe, never a false-green Enforce; C1/B2) or
-                // Enforce. Coloured by posture (CSS .gi-mode.observe/.enforce).
-                const bool enforcing = (r.enforcement_mode == "enforce");
-                const std::string mode_label = enforcing ? "Enforce" : "Observe";
-                const char* mode_cls = enforcing ? "enforce" : "observe";
-                const std::string rid = html_escape(r.rule_id);
-
-                // Deployment line: the deployed Baselines that deliver this guard, as
-                // links to each baseline's view; otherwise an honest "not deployed".
-                std::string deploy_html;
-                if (auto dit = deployed_by_rule.find(r.rule_id);
-                    dit != deployed_by_rule.end() && !dit->second.empty()) {
-                    deploy_html = "<span class=\"gi-dep-on\">&#9679; Deployed:</span> ";
-                    bool first = true;
-                    for (const auto& [bid, bname] : dit->second) {
-                        if (!first) deploy_html += ", ";
-                        first = false;
-                        deploy_html += "<a class=\"gi-bl\" href=\"/guardian/baseline/" +
-                                       html_escape(bid) + "\">" + html_escape(bname) + "</a>";
-                    }
-                } else {
-                    deploy_html = "<span class=\"gi-dep-off\">&#9675; not deployed</span>";
-                }
-
-                // Left content column carries the detail-nav (clicking it opens the
-                // guard); the control button (gi-right) and baseline links (gi-deploy)
-                // are outside it, so they keep their own click behaviour.
-                html += "<div class=\"guard-item\">"
-                        "<div class=\"gi-main\">"
-                        "<div class=\"gi-left\" style=\"cursor:pointer\" "
-                        "onclick=\"window.location='/guardian/guard/" + rid + "'\">"
-                        "<div class=\"gi-row1\">"
-                        "<span class=\"guard-name\">" + html_escape(r.name) + "</span>"
-                        "<span class=\"gi-mode " + std::string(mode_cls) + "\">" + mode_label +
-                        "</span></div>"
-                        "<div class=\"gi-meta\">"
-                        "<span>" + html_escape(r.severity.empty() ? "medium" : r.severity) + "</span>"
-                        "<span class=\"guard-os\">" + html_escape(os) + "</span>"
-                        "</div></div>"
-                        "<div class=\"gi-right\">"
-                        "<span class=\"gi-state " + std::string(on ? "on" : "off") + "\">" +
-                        (on ? "ENABLED" : "DISABLED") + "</span>"
-                        "<button class=\"btn btn-secondary gi-act\" "
-                        "hx-post=\"/fragments/guardian/guard/" + rid + "/enabled?value=" +
-                        (on ? "0" : "1") +
-                        "\" hx-target=\"#guardian-guards\" hx-swap=\"innerHTML\">" +
-                        (on ? "Disable" : "Enable") + "</button>"
-                        "</div></div>"
-                        "<div class=\"gi-deploy\">" + deploy_html + "</div>"
-                        "</div>";
+        // Deployment line: the deployed Baselines that deliver this guard, as
+        // links to each baseline's view; otherwise an honest "not deployed".
+        std::string deploy_html;
+        if (auto dit = deployed_by_rule.find(r.rule_id);
+            dit != deployed_by_rule.end() && !dit->second.empty()) {
+            deploy_html = "<span class=\"gi-dep-on\">&#9679; Deployed:</span> ";
+            bool first = true;
+            for (const auto& [bid, bname] : dit->second) {
+                if (!first) deploy_html += ", ";
+                first = false;
+                deploy_html += "<a class=\"gi-bl\" href=\"/guardian/baseline/" +
+                               html_escape(bid) + "\">" + html_escape(bname) + "</a>";
             }
+        } else {
+            deploy_html = "<span class=\"gi-dep-off\">&#9675; not deployed</span>";
         }
+
+        // Left content column carries the detail-nav (clicking it opens the
+        // guard); the control button (gi-right) and baseline links (gi-deploy)
+        // are outside it, so they keep their own click behaviour.
+        html += "<div class=\"guard-item\">"
+                "<div class=\"gi-main\">"
+                "<div class=\"gi-left\" "
+                "onclick=\"window.location='/guardian/guard/" + rid + "'\">"
+                "<div class=\"gi-row1\">"
+                "<span class=\"guard-name\">" + html_escape(r.name) + "</span>"
+                "<span class=\"gi-mode " + std::string(mode_cls) + "\">" + mode_label +
+                "</span></div>"
+                "<div class=\"gi-meta\">"
+                "<span>" + html_escape(r.severity.empty() ? "medium" : r.severity) + "</span>"
+                "<span class=\"guard-os\">" + html_escape(os) + "</span>"
+                "</div></div>"
+                "<div class=\"gi-right\">"
+                "<span class=\"gi-state " + std::string(on ? "on" : "off") + "\">" +
+                (on ? "Enabled" : "Disabled") + "</span>"
+                "<button class=\"btn btn-secondary gi-act\" "
+                "hx-post=\"/fragments/guardian/guard/" + rid + "/enabled?value=" +
+                (on ? "0" : "1") +
+                "\" hx-target=\"#guardian-guards\" hx-swap=\"innerHTML\" hx-confirm=\"" +
+                (on ? "Disable" : "Enable") +
+                " this Guard? The setting is saved now, but it only reaches agents on the "
+                "next Baseline deploy or reconcile.\">" +
+                (on ? "Disable" : "Enable") + "</button>"
+                "</div></div>"
+                "<div class=\"gi-deploy\">" + deploy_html + "</div>"
+                "</div>";
     }
 
-    const bool live = store_ && store_->is_open();
-    if (!used_real && live) {
-        // Live store, zero authored rules → honest empty state, not fabricated
-        // example guards (M2 / #1209; also the empty-store UX wart, where the mock
-        // guards had no enable/mode controls and so made the toggle look missing).
-        html += empty_state("No Guards defined yet",
-                            "Create a Guard to start enforcing desired state across the fleet.");
-    } else if (!used_real) {
-        // No Guardian backend present (pure UI development) → contract-shaped
-        // example guards, loudly labelled below so they cannot be read as live.
-        for (const auto& g : kMockGuards) {
-            if (!status_filter.empty() && status_filter != g.status) continue;
-            const char* health_cls = g.healthy ? "health-ok" : "health-bad";
-            const char* health_lbl = g.healthy ? "&#9679; healthy" : "&#9679; unhealthy";
-            html += "<div class=\"guard-item\" style=\"cursor:pointer\" "
-                    "onclick=\"window.location='/guardian/guard/" + std::string(g.id) + "'\">"
-                    "<div class=\"guard-item-top\">"
-                    "<span class=\"guard-name\">" + std::string(g.name) + "</span>"
-                    "<span class=\"guard-os\">" + std::string(g.os) + "</span>"
-                    "<span style=\"margin-left:auto\">" + status_badge(g.status) + "</span>"
-                    "</div>"
-                    "<div class=\"guard-meta\">"
-                    "<span>" + std::string(g.severity) + "</span>"
-                    "<span>" + std::to_string(g.compliant) + "/" + std::to_string(g.total) + " agents</span>"
-                    "<span class=\"" + health_cls + "\">" + health_lbl + "</span>"
-                    "</div></div>";
-        }
-    }
     html += "</div>";
-    if (!used_real && !live)
-        html += demo_banner("example Guards, not authored rules");
     return html;
 }
 
@@ -1157,10 +1078,8 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
     // S1). 200 + banner + list keeps the list visible and shows what failed.
     auto fail = [this, &res](const std::string& msg) {
         res.status = 200;
-        res.set_content("<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
-                        "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
-                        "margin-bottom:0.5rem;font-size:0.78rem\">&#9888; " +
-                            html_escape(msg) + "</div>" + render_guards_fragment(""),
+        res.set_content("<div class=\"gs-error-banner gs-banner err\">" +
+                            html_escape(msg) + "</div>" + render_guards_fragment(),
                         "text/html; charset=utf-8");
     };
 
@@ -1174,8 +1093,20 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
         return fail("No such Guard: " + rule_id);
 
     (*rule)->enabled = enabled;
-    if (auto r = store_->update_rule(**rule); !r)
+    // ADR-0033 §9: no audit row, no mutation. Disabling an enforcing Guard is the most
+    // security-relevant change here, so it must not be the unaudited route around the
+    // fail-closed edit dialog. `fail` carries the Sec-Audit-Failed header already set.
+    const std::string audit_detail = std::string(enabled ? "enabled=true" : "enabled=false") +
+                                     " (state-only; applies on next deploy/reconcile)";
+    if (!detail::emit_behavioral_audit(audit_fn_, req, res, "guaranteed_state.rule.update",
+                                       "success", "GuaranteedState", rule_id, audit_detail))
+        return fail("The audit record could not be written, so the change was not applied. "
+                    "Try again.");
+    if (auto r = store_->update_rule(**rule); !r) {
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guaranteed_state.rule.update",
+                                            "failure", "GuaranteedState", rule_id, r.error());
         return fail("Update failed: " + r.error());
+    }
 
     // STATE-ONLY (no push). A Guard's enabled flag is global state, not an
     // individual deploy — Guards are not deployable on their own; only Baselines
@@ -1183,12 +1114,192 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
     // effect on the next Baseline deploy or heartbeat reconcile, both of which
     // re-push the union of *deployed* Baselines' enabled members. (Mode is set at
     // creation and immutable — a different posture is a different Guard — so there
-    // is no mode change here.) Audited under its own rule.update verb so "who
-    // enabled / disabled this guard" stays queryable.
-    audit_fn_(req, "guaranteed_state.rule.update", "success", "GuaranteedState", rule_id,
-              std::string(enabled ? "enabled=true" : "enabled=false") +
-                  " (state-only; applies on next deploy/reconcile)");
-    res.set_content(render_guards_fragment(""), "text/html; charset=utf-8");
+    // is no mode change here.) Audited under its own rule.update verb (written
+    // above, before the store write) so "who enabled / disabled this guard" stays
+    // queryable.
+    res.set_content(render_guards_fragment(), "text/html; charset=utf-8");
+}
+
+bool GuardianRoutes::deny_cross_origin_(const httplib::Request& req, httplib::Response& res,
+                                        const std::string& audit_action,
+                                        const std::string& target_id) const {
+    const std::string origin = req.get_header_value("Origin");
+    const std::string referer = req.get_header_value("Referer");
+    const bool same_site =
+        !(origin.empty() && referer.empty()) &&
+        origin_is_same_site(req.get_header_value("Host"), origin, referer, csrf_trusted_origins_);
+    if (same_site)
+        return false;
+    res.status = 403;
+    res.set_content(detail::a4_denial(res, 403, "cross-origin request refused"),
+                    "application/json");
+    if (audit_fn_) {
+        try {
+            audit_fn_(req, audit_action, "denied", "GuaranteedState", target_id, "csrf_denied");
+        } catch (const std::exception& e) {
+            spdlog::warn("{}: audit_fn_ threw: {}", audit_action, e.what());
+        } catch (...) {
+            spdlog::warn("{}: audit_fn_ threw (non-std)", audit_action);
+        }
+    }
+    return true;
+}
+
+namespace {
+/// The audit row could not be written, so the mutation was not applied (503 +
+/// `Sec-Audit-Failed: true`, set by emit_behavioral_audit).
+void audit_unavailable(httplib::Response& res) {
+    res.status = 503;
+    res.set_content(detail::a4_error(res,
+                                     "audit record could not be written; the change was not "
+                                     "applied",
+                                     {.retry_after_ms = 5000, .remediation = "retry the request"}),
+                    "application/json");
+}
+} // namespace
+
+void GuardianRoutes::update_guard_action(const httplib::Request& req, httplib::Response& res,
+                                         const std::string& rule_id) {
+    static constexpr const char* kVerb = "guaranteed_state.rule.update";
+    auto fail = [&](int status, const std::string& msg) {
+        res.status = status;
+        res.set_content(detail::a4_error(res, msg), "application/json");
+        audit_fn_(req, kVerb, "denied", "GuaranteedState", rule_id, msg);
+    };
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return;
+    if (step_up_fn_ && !step_up_fn_(req, res, *session, "POST /fragments/guardian/guard/{id}/update"))
+        return; // step-up wrote the 401 envelope (or the redirect)
+    if (!store_ || !store_->is_open()) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, "Guardian store unavailable"), "application/json");
+        return;
+    }
+    auto found = store_->get_rule(rule_id);
+    if (!found) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, "Guardian store degraded"), "application/json");
+        return;
+    }
+    if (!*found)
+        return fail(404, "rule not found");
+    auto updated = **found;
+
+    auto get = [&](const char* k) -> std::string {
+        return req.has_param(k) ? req.get_param_value(k) : std::string{};
+    };
+    // Mode (Watch/Enforce) is immutable: echoing the current value is fine, a
+    // different one is a 400, never a silent flip (same rule as the REST PUT).
+    if (req.has_param("mode")) {
+        std::string m = get("mode");
+        if (m == "watch")
+            m = "audit";
+        if (m != updated.enforcement_mode)
+            return fail(400, "mode is immutable — create a new Guard for a different posture "
+                             "(Watch vs Enforce)");
+    }
+    if (req.has_param("name")) {
+        updated.name = get("name");
+        if (updated.name.empty())
+            return fail(400, "Name is required.");
+    }
+    if (req.has_param("enabled")) {
+        // Closed 0/1: any other value must not silently disable an enforcing Guard.
+        const std::string ev = get("enabled");
+        if (ev != "0" && ev != "1")
+            return fail(400, "enabled must be 0 or 1");
+        updated.enabled = ev == "1";
+    }
+    if (req.has_param("severity")) {
+        const std::string sv = get("severity");
+        // Closed enum: severity renders into a CSS class (same as create).
+        if (sv != "critical" && sv != "high" && sv != "medium" && sv != "low")
+            return fail(400, "Severity must be critical, high, medium or low.");
+        updated.severity = sv;
+    }
+    updated.version = (*found)->version + 1;
+
+    // Single source with the REST PUT and the create form. A metadata-only body
+    // (no spark/assertion/remediation) returns structured=false and keeps the stored spec.
+    auto spec = guardian::derive_rule_spec(nlohmann::json::object(), updated.name,
+                                           updated.version, updated.enabled,
+                                           updated.enforcement_mode);
+    if (spec.error)
+        return fail(400, spec.error->message);
+    // derive_rule_spec did not run the assertion validator over the stored spec, so
+    // re-check an enforce Guard against the dangerous-target denylist (contract §6).
+    if (updated.enforcement_mode == "enforce")
+        if (std::string why = guardian::dangerous_enforce_in_spec(updated.spec_json); !why.empty())
+            return fail(400, "enforce mode not permitted: this guard targets " + why);
+
+    updated.updated_at = format_iso_utc(now_epoch_seconds());
+    updated.updated_by = session->username;
+    // ADR-0033 §9: a mutating capability fails closed on audit failure, so the row
+    // is written BEFORE the store write and a lost row refuses the change. The row
+    // asserts "authorised and attempted" (rest_audit.hpp, #4858); a store failure
+    // below adds a "failure" row rather than leaving a bare "success".
+    if (!detail::emit_behavioral_audit(audit_fn_, req, res, kVerb, "success", "GuaranteedState",
+                                       rule_id, updated.name))
+        return audit_unavailable(res);
+    if (auto r = store_->update_rule(updated); !r) {
+        const bool conflict = is_conflict_error(r.error());
+        res.status = conflict ? 409 : 400;
+        res.set_content(detail::a4_error(res, std::string(strip_conflict_prefix(r.error()))),
+                        "application/json");
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, kVerb, "failure", "GuaranteedState",
+                                            rule_id, r.error());
+        return;
+    }
+    // Last write wins: no concurrency check (#4303), same as the REST PUT.
+    res.set_content(nlohmann::json{{"updated", true}, {"version", updated.version}}.dump(),
+                    "application/json");
+}
+
+void GuardianRoutes::delete_guard_action(const httplib::Request& req, httplib::Response& res,
+                                         const std::string& rule_id) {
+    static constexpr const char* kVerb = "guaranteed_state.rule.delete";
+    auto fail = [&](int status, const std::string& msg) {
+        res.status = status;
+        res.set_content(detail::a4_error(res, msg), "application/json");
+        audit_fn_(req, kVerb, "denied", "GuaranteedState", rule_id, msg);
+    };
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return;
+    if (step_up_fn_ && !step_up_fn_(req, res, *session, "POST /fragments/guardian/guard/{id}/delete"))
+        return;
+    if (!store_ || !store_->is_open()) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, "Guardian store unavailable"), "application/json");
+        return;
+    }
+    auto found = store_->get_rule(rule_id);
+    if (!found) {
+        res.status = 503;
+        res.set_content(detail::a4_error(res, "Guardian store degraded"), "application/json");
+        return;
+    }
+    if (!*found)
+        return fail(404, "rule not found");
+    // Typed-name confirm, enforced here as well as in the dialog: the request must
+    // carry the Guard's exact name.
+    if (!req.has_param("confirm_name") || req.get_param_value("confirm_name") != (*found)->name)
+        return fail(400, "type the Guard's exact name to confirm the delete");
+    // ADR-0033 §9: audit BEFORE the delete, fail closed (see update_guard_action).
+    if (!detail::emit_behavioral_audit(audit_fn_, req, res, kVerb, "success", "GuaranteedState",
+                                       rule_id, (*found)->name))
+        return audit_unavailable(res);
+    if (auto r = store_->delete_rule(rule_id); !r) {
+        res.status = 404;
+        res.set_content(detail::a4_error(res, r.error()), "application/json");
+        (void)detail::emit_behavioral_audit(audit_fn_, req, res, kVerb, "failure", "GuaranteedState",
+                                            rule_id, r.error());
+        return;
+    }
+    // Does NOT unarm agents already enforcing it (#4304): they keep enforcing until
+    // the next push converges them.
+    res.set_content(nlohmann::json{{"deleted", true}}.dump(), "application/json");
 }
 
 void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib::Response& res) {
@@ -1201,9 +1312,7 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
     // is a known wart (the form re-renders blank); the banner names what to fix.
     auto fail = [&res](const std::string& msg) {
         res.status = 200;
-        const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
-                                   "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
-                                   "margin-bottom:0.6rem;font-size:0.78rem\">&#9888; " +
+        const std::string banner = "<div class=\"gs-error-banner gs-banner err\">" +
                                    html_escape(msg) + "</div>";
         res.set_content(guardian::render_guard_form(banner), "text/html; charset=utf-8");
     };
@@ -1314,7 +1423,7 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
         "<div class=\"k\">Name</div><div>" +
         html_escape(row.name) +
         "</div>"
-        "<div class=\"k\">ID</div><div style=\"font-family:var(--mono);font-size:0.75rem\">" +
+        "<div class=\"k\">ID</div><div class=\"gs-mono\">" +
         html_escape(row.rule_id) +
         "</div>"
         "<div class=\"k\">Trigger</div><div>" +
@@ -1331,7 +1440,7 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
         "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"guardianCloseModal()\">"
         "Close</button></div></div>"
         "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +
-        render_guards_fragment("") + "</div>";
+        render_guards_fragment() + "</div>";
     res.set_content(html, "text/html; charset=utf-8");
 }
 
@@ -1344,9 +1453,7 @@ void GuardianRoutes::create_baseline_from_form(const httplib::Request& req,
         if (store_ && store_->is_open())
             for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
                 names.push_back(r.name);
-        const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
-                                   "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
-                                   "margin-bottom:0.6rem;font-size:0.78rem\">&#9888; " +
+        const std::string banner = "<div class=\"gs-error-banner gs-banner err\">" +
                                    html_escape(msg) + "</div>";
         res.status = 200;
         // render_baseline_form has no error slot; prepend the banner to its body.
@@ -1549,7 +1656,7 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
     std::string html = "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
                        render_baselines_fragment() + "</div>"
                        "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +
-                       render_guards_fragment("") + "</div>";
+                       render_guards_fragment() + "</div>";
     res.set_content(html, "text/html; charset=utf-8");
 }
 
@@ -1558,9 +1665,7 @@ void GuardianRoutes::update_baseline_from_form(const httplib::Request& req, http
     // Re-render the edit form (pre-filled from the store's current state) with an
     // inline banner on error — htmx won't swap a 4xx body.
     auto fail = [this, &res, &baseline_id](const std::string& msg) {
-        const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
-                                   "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
-                                   "margin-bottom:0.6rem;font-size:0.78rem\">&#9888; " +
+        const std::string banner = "<div class=\"gs-error-banner gs-banner err\">" +
                                    html_escape(msg) + "</div>";
         res.status = 200;
         res.set_content(banner + render_baseline_edit_form_fragment(baseline_id),
@@ -1628,7 +1733,7 @@ void GuardianRoutes::update_baseline_from_form(const httplib::Request& req, http
     std::string html = "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
                        render_baselines_fragment() + "</div>"
                        "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +
-                       render_guards_fragment("") + "</div>";
+                       render_guards_fragment() + "</div>";
     res.set_content(html, "text/html; charset=utf-8");
 }
 
@@ -1686,63 +1791,48 @@ void GuardianRoutes::delete_baseline_action(const httplib::Request& req, httplib
     std::string html = "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
                        render_baselines_fragment() + "</div>"
                        "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +
-                       render_guards_fragment("") + "</div>";
+                       render_guards_fragment() + "</div>";
     res.set_content(html, "text/html; charset=utf-8");
 }
 
 std::string GuardianRoutes::render_events_fragment(const std::string& type_filter,
                                                    const std::string& severity_filter) const {
     (void)severity_filter;
+    // A missing/closed store is its own state, never "no drift events yet".
+    // query_events() returns an empty vector on a degraded read (its seam keeps
+    // the plain vector signature, #2659), so a degrade there is not separable
+    // from an empty log; the store-open check is the distinction available.
+    // Deliberately no capability probe here: this fragment is polled every 5 s.
+    if (!store_ || !store_->is_open())
+        return empty_state("Guardian store unavailable", "Check server /healthz.");
+
     std::string html = "<div class=\"event-list\">";
 
-    bool used_real = false;
-    if (store_ && store_->is_open()) {
-        // Resolve rule_id → human Guard name (events store the id) so rows read —
-        // and the client-side search filters — by the name the operator knows.
-        std::unordered_map<std::string, std::string> rule_name;
-        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
-            rule_name[r.rule_id] = r.name;
-        GuaranteedStateEventQuery q;
-        q.limit = 20;
-        auto rows = store_->query_events(q);
-        if (!rows.empty()) {
-            used_real = true;
-            for (const auto& e : rows) {
-                if (!type_filter.empty() && type_filter != e.event_type) continue;
-                auto it = rule_name.find(e.rule_id);
-                const std::string gname =
-                    (it != rule_name.end() && !it->second.empty()) ? it->second : e.rule_id;
-                html += "<div class=\"event-item\"><div class=\"event-top\">"
-                        "<span class=\"event-time\">" + html_escape(e.timestamp) + "</span>"
-                        "<span class=\"event-type " + event_type_class(e.event_type) + "\">" +
-                        html_escape(e.event_type) + "</span></div>"
-                        "<div class=\"event-detail\"><strong>" + html_escape(gname) +
-                        "</strong> on <strong>" + html_escape(e.agent_id) + "</strong></div></div>";
-            }
-        }
+    // Resolve rule_id -> human Guard name (events store the id) so rows read, and
+    // the client-side search filters, by the name the operator knows.
+    std::unordered_map<std::string, std::string> rule_name;
+    for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
+        rule_name[r.rule_id] = r.name;
+    GuaranteedStateEventQuery q;
+    q.limit = 20;
+    bool any = false;
+    for (const auto& e : store_->query_events(q)) {
+        if (!type_filter.empty() && type_filter != e.event_type) continue;
+        any = true;
+        auto it = rule_name.find(e.rule_id);
+        const std::string gname =
+            (it != rule_name.end() && !it->second.empty()) ? it->second : e.rule_id;
+        html += "<div class=\"event-item\"><div class=\"event-top\">"
+                "<span class=\"event-time\">" + html_escape(e.timestamp) + "</span>"
+                "<span class=\"event-type " + event_type_class(e.event_type) + "\">" +
+                html_escape(e.event_type) + "</span></div>"
+                "<div class=\"event-detail\"><strong>" + html_escape(gname) +
+                "</strong> on <strong>" + html_escape(e.agent_id) + "</strong></div></div>";
     }
-
-    const bool live = store_ && store_->is_open();
-    if (!used_real && live) {
-        // Live store, no drift events recorded yet → honest empty state (M2 / #1209).
+    if (!any)
         html += empty_state("No drift events yet",
                             "Drift detections and remediations from your Guards will appear here.");
-    } else if (!used_real) {
-        // No Guardian backend present (pure UI development) → example timeline.
-        for (const auto& e : kMockEvents) {
-            if (!type_filter.empty() && type_filter != e.type) continue;
-            html += "<div class=\"event-item\"><div class=\"event-top\">"
-                    "<span class=\"event-time\">" + std::string(e.time) + "</span>"
-                    "<span class=\"event-type " + event_type_class(e.type) + "\">" +
-                    std::string(e.type) + "</span></div>"
-                    "<div class=\"event-detail\"><strong>" + std::string(e.guard) +
-                    "</strong> on <strong>" + std::string(e.agent) + "</strong> &middot; " +
-                    std::string(e.detail) + "</div></div>";
-        }
-    }
     html += "</div>";
-    if (!used_real && !live)
-        html += demo_banner("example drift timeline");
     return html;
 }
 
@@ -1791,22 +1881,20 @@ std::string GuardianRoutes::render_baselines_fragment() const {
         // "changes pending" marker beside the lifecycle badge.
         const std::string pending =
             drifted ? "<span title=\"Member Guards changed since last deploy — Re-deploy to apply\" "
-                      "style=\"font-size:0.66rem;font-weight:600;color:var(--yellow);"
-                      "margin-left:0.4rem\">&#9888; changes pending</span>"
+                      "class=\"baseline-pending\">changes pending</span>"
                     : "";
         html += "<div class=\"baseline-card\">"
                 "<div class=\"baseline-top\">"
-                "<a class=\"baseline-name\" href=\"/guardian/baseline/" + rid +
-                "\" style=\"color:inherit;text-decoration:none;cursor:pointer\">" + html_escape(b.name) +
+                "<a class=\"baseline-name\" href=\"/guardian/baseline/" + rid + "\">" + html_escape(b.name) +
                 "</a>"
-                "<span class=\"lifecycle-" + std::string(deployed ? "deployed" : "draft") +
-                "\" style=\"font-size:0.72rem;font-weight:600\">" +
+                "<span class=\"baseline-state lifecycle-" + std::string(deployed ? "deployed" : "draft") +
+                "\">" +
                 (deployed ? "&#9679; deployed" : "&#9675; draft") + "</span>" + pending +
                 "</div>"
                 "<div class=\"baseline-scope\">" + target + "</div>"
                 "<div class=\"guard-meta\">"
                 "<span>" + std::to_string(members) + " Guards</span>"
-                "<span style=\"margin-left:auto;display:flex;gap:0.4rem\">"
+                "<span class=\"gs-push gs-row-acts\">"
                 // Edit opens the authoring form (a modal); Deploy posts and lets the
                 // handler's out-of-band response refresh both lists in place (hx-swap
                 // none) — no detail modal. The name links to the full Baseline page.
@@ -1814,7 +1902,10 @@ std::string GuardianRoutes::render_baselines_fragment() const {
                 "hx-get=\"/fragments/guardian/baseline/" + rid + "/edit\" "
                 "hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">Edit</button>"
                 "<button class=\"btn btn-secondary btn-sm\" "
-                "hx-post=\"/fragments/guardian/baseline/" + rid + "/deploy\" hx-swap=\"none\">" +
+                "hx-post=\"/fragments/guardian/baseline/" + rid + "/deploy\" hx-swap=\"none\" "
+                "hx-confirm=\"" + std::string(deployed ? "Re-deploy" : "Deploy") +
+                " this Baseline? This changes what every in-scope agent enforces: the fleet "
+                "enforces the union of all deployed Baselines.\">" +
                 (deployed ? "Re-deploy" : "Deploy") + "</button></span>"
                 "</div></div>";
     }
@@ -1963,16 +2054,16 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     // 'unsafe-eval' and htmx compiles hx-on handlers with new Function.
     h += "</div></div><div class=\"gp-actions\">"
          "<button class=\"gp-btn accent\" onclick=\"gpAction('POST','/fragments/guardian/baseline/" + bid +
-         "/deploy')\">" + std::string(deployed ? "Re-deploy" : "Deploy") +
+         "/deploy',{confirm:'" + std::string(deployed ? "Re-deploy" : "Deploy") +
+         " this Baseline? This changes what every in-scope agent enforces: the fleet enforces the "
+         "union of all deployed Baselines.'})\">" + std::string(deployed ? "Re-deploy" : "Deploy") +
          "</button><button class=\"gp-btn danger\" onclick=\"gpAction('POST','/fragments/guardian/baseline/" +
          bid + "/delete',{confirm:'Delete this baseline? Guards it uniquely delivers will be removed from "
          "agents on the next reconcile.',go:'/guardian'})\">Delete</button></div></div>";
 
     if (baseline_members_drifted(*b))
-        h += "<div style=\"background:rgba(255,176,32,0.12);border:1px solid var(--yellow);"
-             "color:var(--yellow);padding:0.5rem 0.7rem;border-radius:0.4rem;margin-top:0.8rem;"
-             "font-size:0.76rem;font-weight:600\">&#9888; Member Guards changed since last deploy &mdash; "
-             "<strong>Re-deploy</strong> to apply to agents.</div>";
+        h += "<div class=\"gp-banner\">Member Guards changed since last deploy &mdash; "
+             "<b>Re-deploy</b> to apply to agents.</div>";
 
     // Compliance hero.
     h += "<div class=\"gp-sech\">Compliance &mdash; as of last check-in</div>";
@@ -1988,14 +2079,14 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
         };
         h += "<div class=\"gp-hero\"><div class=\"gp-pct\">" + std::to_string(pct) +
              "%<small>compliant &middot; " + std::to_string(agents) + " agent(s)</small></div>"
-             "<div style=\"flex:1;min-width:320px\"><div class=\"gp-bar\">" +
-             seg("var(--green)", total.ok) + seg("var(--yellow)", total.drift) +
-             seg("var(--red)", total.err) + seg("#5b6b80", total.unk) + seg(kNotImplColor, total.notimpl) +
+             "<div class=\"gp-hero-bar\"><div class=\"gp-bar\">" +
+             seg("var(--ok)", total.ok) + seg("var(--warn)", total.drift) +
+             seg("var(--bad)", total.err) + seg("var(--faint)", total.unk) + seg(kNotImplColor, total.notimpl) +
              "</div><div class=\"gp-legend\">"
-             "<span><i style=\"background:var(--green)\"></i>Compliant <b>" + std::to_string(total.ok) +
-             "</b></span><span><i style=\"background:var(--yellow)\"></i>Drifted <b>" +
-             std::to_string(total.drift) + "</b></span><span><i style=\"background:var(--red)\"></i>Error <b>" +
-             std::to_string(total.err) + "</b></span><span><i style=\"background:#5b6b80\"></i>Unknown <b>" +
+             "<span><i style=\"background:var(--ok)\"></i>Compliant <b>" + std::to_string(total.ok) +
+             "</b></span><span><i style=\"background:var(--warn)\"></i>Drifted <b>" +
+             std::to_string(total.drift) + "</b></span><span><i style=\"background:var(--bad)\"></i>Error <b>" +
+             std::to_string(total.err) + "</b></span><span><i style=\"background:var(--faint)\"></i>Unknown <b>" +
              std::to_string(total.unk) + "</b></span>" +
              (total.notimpl > 0 ? "<span><i style=\"background:" + std::string(kNotImplColor) +
                                       "\"></i>Not implemented <b>" + std::to_string(total.notimpl) + "</b></span>"
@@ -2104,15 +2195,15 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     }
 
     // Assignment (deferred until management groups land).
-    h += "<div class=\"gp-sech\">Assignment <span style=\"font-weight:400;color:var(--muted);"
-         "text-transform:none;letter-spacing:0\">(management groups)</span></div>";
+    h += "<div class=\"gp-sech\">Assignment <span class=\"gp-mute gp-reg\">"
+         "(management groups)</span></div>";
     if (assign.empty()) {
         h += "<div class=\"gp-placeholder\"><b>Targeting not available yet</b>"
              "Management-group targeting (included / excluded groups) lands when the global "
              "management-group feature is ready. Deploy currently applies this Baseline's enabled "
              "Guards fleet-wide (all agents, OS-filtered per Guard).</div>";
     } else {
-        h += "<ul style=\"margin:0;padding-left:1.1rem;font-size:0.8rem\">";
+        h += "<ul class=\"gp-list\">";
         for (const auto& a : assign)
             h += "<li>" + html_escape(a.disposition) + ": <code>" + html_escape(a.group_id) + "</code></li>";
         h += "</ul>";
@@ -2120,14 +2211,16 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     return h;
 }
 
-std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_id) const {
+std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_id, bool can_write,
+                                                       bool can_delete) const {
     std::string name = guard_id, severity, os = "all", os_target_raw = "windows", yaml, spec_json;
-    bool real_rule = false, enabled = true, enforcing = false;
+    bool real_rule = false, enabled = true, enforcing = false, degraded = false;
     if (store_ && store_->is_open()) {
-        // get_rule is now three-state (ADR-0038): found / genuinely absent / degraded.
-        // Both "not found" and "degraded" fall through to the same "Guard not found"
-        // placeholder below — a degrade here is a page-render failure either way.
-        if (auto r = store_->get_rule(guard_id); r && *r) {
+        // get_rule is three-state (ADR-0038): found / genuinely absent / degraded.
+        // A degrade must not read as "Guard not found" (that says the Guard is gone).
+        auto r = store_->get_rule(guard_id);
+        degraded = !r;
+        if (r && *r) {
             const auto& rr = **r;
             real_rule = true;
             name = rr.name;
@@ -2142,14 +2235,34 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     }
     if (!real_rule)
         return "<a class=\"gp-back\" href=\"/guardian\">&larr; All guards</a>"
-               "<div class=\"gp-placeholder\"><b>Guard not found</b></div>";
+               "<div class=\"gp-placeholder\"><b>" +
+               std::string(degraded ? "Guard data temporarily unavailable (store degraded) — try "
+                                      "again shortly."
+                                    : "Guard not found") +
+               "</b></div>";
+
+    // #2437-class guard: check nesting on the RAW stored spec_json text
+    // BEFORE any parse of it below - spark_type_of's own parse, and the
+    // "what it checks" parse further down that feeds render_assertion_values'
+    // as_str(), which dump()s any non-string params value. B1/B2 close the
+    // REST write side (both create and update reject an over-deep body
+    // before derive_rule_spec), but this read path stays reachable against a
+    // row written before that fix shipped, or by direct DB manipulation - a
+    // routine page load must not crash the whole process. Treat a poisoned
+    // spec_json as unusable for rendering rather than partially parsing it;
+    // the rest of this page (fleet compliance, device census) does not
+    // depend on spec_json and still renders normally. This is a read-only
+    // display decision: it does not heal/rewrite the stored row, which this
+    // function does not own.
+    const bool spec_poisoned =
+        !spec_json.empty() && mcp::json_exceeds_depth(spec_json, mcp::kMcpMaxJsonDepth);
 
     // Parsed once, outside the per-agent loop below (#4252): the input to
     // guardian::guardian_guard_supported_on_platform's guard-type-aware check.
-    const std::string spark_type = spark_type_of(spec_json);
+    const std::string spark_type = spec_poisoned ? std::string{} : spark_type_of(spec_json);
 
     const std::string mode = enforcing ? "Enforce" : "Observe";
-    const std::string mode_color = enforcing ? "var(--yellow)" : "#a5d6ff";
+    const std::string mode_color = enforcing ? "var(--info)" : "var(--ink)";
 
     // Which DEPLOYED Baselines deliver this guard (link to their pages).
     std::string delivered = "<span class=\"gp-mute\">not in a deployed Baseline</span>";
@@ -2167,8 +2280,11 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     }
 
     // "What it checks" — parse the structured spec for the assertion values.
+    // Skipped entirely when spec_poisoned (see the guard above): values_html
+    // stays empty and the "What it checks" section below renders the
+    // explicit invalid-data state instead of attempting the parse.
     std::string values_html;
-    if (!spec_json.empty())
+    if (!spec_poisoned && !spec_json.empty())
         if (auto j = nlohmann::json::parse(spec_json, nullptr, false); j.is_object())
             values_html = render_assertion_values(j.value("assertion", nlohmann::json::object()), mode_color);
 
@@ -2283,24 +2399,44 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     if (!severity.empty())
         h += "<span class=\"gp-pill " + sevclass + "\">" + html_escape(severity) + "</span>";
     h += "<span class=\"gp-pill " + std::string(enforcing ? "enforce" : "observe") + "\">" + mode +
-         "</span><span class=\"gp-pill\" style=\"color:" +
-         std::string(enabled ? "var(--green)" : "var(--muted)") + "\">" +
+         "</span><span class=\"gp-pill" + std::string(enabled ? " dep" : "") + "\">" +
          (enabled ? "&#9679; enabled" : "&#9675; disabled") + "</span></div>"
-         "<div class=\"gp-sub\">Delivered by <b style=\"color:#a5d6ff\">" + std::to_string(baseline_count) +
+         "<div class=\"gp-sub\">Delivered by <b>" + std::to_string(baseline_count) +
          " Baseline(s)</b> &middot; " + delivered + " &middot; reports on change (heartbeat)</div></div>"
          "<div class=\"gp-actions\">"
-         "<button class=\"gp-btn accent\" onclick=\"location.reload()\">&#10227; Refresh</button>"
+         "<button class=\"gp-btn accent\" onclick=\"location.reload()\">Refresh</button>"
          "<button class=\"gp-btn\" onclick=\"gpAction('POST','/fragments/guardian/guard/" +
-         html_escape(guard_id) + "/enabled?value=" + (enabled ? "0" : "1") + "')\">" +
-         (enabled ? "Disable" : "Enable") + "</button></div></div>";
+         html_escape(guard_id) + "/enabled?value=" + (enabled ? "0" : "1") + "',{confirm:'" +
+         (enabled ? "Disable" : "Enable") +
+         " this Guard? The setting is saved now, but it only reaches agents on the next "
+         "Baseline deploy or reconcile.'})\">" +
+         (enabled ? "Disable" : "Enable") + "</button>";
+    // Edit / Delete: drawn only when the render-time probe passed. Plain data-
+    // attributes; the page shell's delegated handler opens the YuzuDialog (and
+    // hides these buttons when the module did not load).
+    const std::string gp_data = " data-gp-id=\"" + html_escape(guard_id) + "\" data-gp-name=\"" +
+                                html_escape(name) + "\"";
+    if (can_write)
+        h += "<button class=\"gp-btn\" data-gp-act=\"edit\"" + gp_data + " data-gp-severity=\"" +
+             html_escape(severity) + "\" data-gp-enabled=\"" + (enabled ? "1" : "0") +
+             "\" data-gp-mode=\"" + mode + "\">Edit</button>";
+    if (can_delete)
+        h += "<button class=\"gp-btn\" data-gp-act=\"delete\"" + gp_data + ">Delete</button>";
+    h += "</div></div>";
 
     // What it checks.
     h += "<div class=\"gp-sech\">What it checks</div>";
-    if (values_html.empty()) {
+    if (spec_poisoned) {
+        // Distinct from "not available" below: this Guard DOES have a
+        // stored structured spec, but it cannot be safely parsed/displayed
+        // (#2437-class). Must never read as "no spec" or "guard not found".
+        h += "<div class=\"gp-note\">This Guard's stored spec could not be displayed "
+             "(invalid data).</div>";
+    } else if (values_html.empty()) {
         h += "<div class=\"gp-note\">This Guard's structured spec is not available.</div>";
     } else {
         h += "<div class=\"gp-spec\"><div class=\"k\">Mode</div><div style=\"color:" + mode_color +
-             ";font-weight:700\">" + mode + "</div><div class=\"k\">OS target</div><div>" + html_escape(os) +
+             ";font-weight:600\">" + mode + "</div><div class=\"k\">OS target</div><div>" + html_escape(os) +
              "</div>" + values_html + "</div>";
     }
 
@@ -2318,13 +2454,13 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         };
         h += "<div class=\"gp-hero\"><div class=\"gp-pct\">" + std::to_string(pct) +
              "%<small>compliant &middot; " + std::to_string(d_total) + " device(s)</small></div>"
-             "<div style=\"flex:1;min-width:320px\"><div class=\"gp-bar\">" +
-             seg("var(--green)", d_ok) + seg("var(--yellow)", d_drift) + seg("var(--red)", d_err) +
-             seg("#5b6b80", d_unk) + seg(kNotImplColor, d_notimpl) + "</div><div class=\"gp-legend\">"
-             "<span><i style=\"background:var(--green)\"></i>Compliant <b>" + std::to_string(d_ok) +
-             "</b></span><span><i style=\"background:var(--yellow)\"></i>Drifted <b>" + std::to_string(d_drift) +
-             "</b></span><span><i style=\"background:var(--red)\"></i>Error <b>" + std::to_string(d_err) +
-             "</b></span><span><i style=\"background:#5b6b80\"></i>Unknown <b>" + std::to_string(d_unk) +
+             "<div class=\"gp-hero-bar\"><div class=\"gp-bar\">" +
+             seg("var(--ok)", d_ok) + seg("var(--warn)", d_drift) + seg("var(--bad)", d_err) +
+             seg("var(--faint)", d_unk) + seg(kNotImplColor, d_notimpl) + "</div><div class=\"gp-legend\">"
+             "<span><i style=\"background:var(--ok)\"></i>Compliant <b>" + std::to_string(d_ok) +
+             "</b></span><span><i style=\"background:var(--warn)\"></i>Drifted <b>" + std::to_string(d_drift) +
+             "</b></span><span><i style=\"background:var(--bad)\"></i>Error <b>" + std::to_string(d_err) +
+             "</b></span><span><i style=\"background:var(--faint)\"></i>Unknown <b>" + std::to_string(d_unk) +
              "</b></span>" +
              (d_notimpl > 0 ? "<span><i style=\"background:" + std::string(kNotImplColor) +
                                   "\"></i>Not implemented <b>" + std::to_string(d_notimpl) + "</b></span>"
@@ -2350,8 +2486,8 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
              "to Enforce and a remediation-effectiveness block appears here.</div>";
 
     // Per-device census (filterable, on-demand).
-    h += "<div class=\"gp-sech\">Per-device status <span style=\"font-weight:400;color:var(--muted);"
-         "text-transform:none;letter-spacing:0\">&mdash; on-demand census</span></div>";
+    h += "<div class=\"gp-sech\">Per-device status <span class=\"gp-mute gp-reg\">"
+         "&mdash; on-demand census</span></div>";
     if (d_total == 0) {
         h += "<div class=\"gp-note\">No device reports yet.</div>";
     } else {
@@ -2381,7 +2517,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                             : d.state == "errored"   ? "gp-err" : "gp-unk";
             const std::string statecell =
                 ni ? "<span style=\"color:" + std::string(kNotImplColor) +
-                         ";font-weight:600\">&#9679; not yet implemented</span>"
+                         ";font-weight:500\">&#9679; not yet implemented</span>"
                    : "<span class=\"" + std::string(cls) + "\">&#9679; " + html_escape(d.state) + "</span>";
             // not-impl rows carry the platform display name in `updated`, not a timestamp.
             const std::string as_of =
@@ -2391,11 +2527,11 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             h += "<tr data-gpf=\"d\" data-gpstate=\"" + rowstate + "\" data-gpname=\"" +
                  html_escape(lower(d.host)) + "\"><td class=\"" + std::string(d.online ? "" : "gp-mute") +
                  "\"><a href=\"/viz/host/" + html_escape(d.agent_id) +
-                 "\" style=\"color:inherit;text-decoration:none\" title=\"Open host detail\">" +
+                 "\" title=\"Open host detail\">" +
                  html_escape(d.host) + "</a>" +
-                 (d.online ? "" : " <span style=\"font-size:0.66rem\">(offline)</span>") +
+                 (d.online ? "" : " <span class=\"gp-mute\">(offline)</span>") +
                  "</td><td>" + statecell + "</td>"
-                 "<td class=\"gp-mute\" style=\"font-size:0.72rem\">" + as_of + "</td></tr>";
+                 "<td class=\"gp-mute\">" + as_of + "</td></tr>";
         }
         h += "</tbody></table>";
         h += "<div class=\"gp-note\">The census is a scoped, on-demand re-check &mdash; it loads when you open "
@@ -2460,7 +2596,8 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                                      BaselineStore* baseline_store,
                                      AgentsJsonFn agents_json_fn,
                                      PushFn push_fn,
-                                     yuzu::MetricsRegistry* metrics) {
+                                     yuzu::MetricsRegistry* metrics,
+                                     StepUpFn step_up_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload below (mirrors RestApiV1 / SettingsRoutes;
     // see http_route_sink.hpp). Lets the handlers be unit-tested in-process via
@@ -2468,7 +2605,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(emit_event_fn), store, baseline_store, std::move(agents_json_fn),
-                    std::move(push_fn), metrics);
+                    std::move(push_fn), metrics, std::move(step_up_fn));
 }
 
 void GuardianRoutes::register_routes(HttpRouteSink& sink,
@@ -2480,7 +2617,8 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                                      BaselineStore* baseline_store,
                                      AgentsJsonFn agents_json_fn,
                                      PushFn push_fn,
-                                     yuzu::MetricsRegistry* metrics) {
+                                     yuzu::MetricsRegistry* metrics,
+                                     StepUpFn step_up_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
@@ -2490,6 +2628,7 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     agents_json_fn_ = std::move(agents_json_fn);
     push_fn_ = std::move(push_fn);
     metrics_ = metrics;
+    step_up_fn_ = std::move(step_up_fn);
     if (metrics_) {
         // Pre-seed the closed spark_type label set (#4252), per
         // docs/observability-conventions.md: a bounded-label counter is
@@ -2577,13 +2716,12 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                 res.set_content(render_status_fragment(view), "text/html; charset=utf-8");
             });
 
-    // -- Guards list (optional ?status= filter) ----------------------------
+    // -- Guards list -------------------------------------------------------
     sink.Get("/fragments/guardian/guards",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
-                const std::string sf = req.has_param("status") ? req.get_param_value("status") : "";
-                res.set_content(render_guards_fragment(sf), "text/html; charset=utf-8");
+                res.set_content(render_guards_fragment(), "text/html; charset=utf-8");
             });
 
     // -- Event timeline (optional ?type= / ?severity= filters) — fleet-wide,
@@ -2609,11 +2747,11 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // silently corrupt a SIEM/works-council query filtering that verb by
     // target_type=Agent. `target_type="GuaranteedState"` matches every other
     // rule/guard-scoped verb in this file (guaranteed_state.rule.*,
-    // guaranteed_state.baseline.*). GuardianRoutes::AuditFn is void (no
-    // persist-failure signal, unlike RestApiV1::AuditFn), so both calls below
-    // are direct fire-and-forget — the same set-and-proceed idiom every other
-    // audit_fn_ call site in this file already uses; a transient audit hiccup
-    // must not blank this operator's lens, and a denial is not a leak.
+    // guaranteed_state.baseline.*). GuardianRoutes::AuditFn returns a persist bool,
+    // but both calls below deliberately ignore it (set-and-proceed, the idiom of
+    // this file's read fragments): a transient audit hiccup must not blank this
+    // operator's lens, and a denial is not a leak. Mutations differ: they fail
+    // closed (update/delete/enable) per ADR-0033 §9.
     sink.Get(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/page)",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (deny_service_scoped_(req, res)) return;
@@ -2623,7 +2761,14 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                     audit_fn_(req, "guaranteed_state.rule.view", "success", "GuaranteedState",
                               guard_id,
                               "per-guard fleet-wide agent status drilldown via dashboard fragment");
-                res.set_content(render_guard_page_fragment(guard_id), "text/html; charset=utf-8");
+                // Render-only capability probe, once per page load: a scratch response
+                // absorbs perm_fn_'s 403 so a denial never touches the real one.
+                httplib::Response probe;
+                const bool can_write = perm_fn_(req, probe, "GuaranteedState", "Write");
+                probe = httplib::Response{};
+                const bool can_delete = perm_fn_(req, probe, "GuaranteedState", "Delete");
+                res.set_content(render_guard_page_fragment(guard_id, can_write, can_delete),
+                                "text/html; charset=utf-8");
             });
 
     // -- Baselines list ----------------------------------------------------
@@ -2685,6 +2830,7 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                  if (deny_service_scoped_mutation_(req, res, "Write",
                                                    "guaranteed_state.rule.create", ""))
                      return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.rule.create", "")) return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  create_guard_from_form(req, res);
              });
@@ -2701,9 +2847,35 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                  if (deny_service_scoped_mutation_(req, res, "Write",
                                                    "guaranteed_state.rule.update", id))
                      return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.rule.update", id)) return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  const bool enable = req.has_param("value") && req.get_param_value("value") == "1";
                  apply_guard_change(req, res, id, enable);
+             });
+
+    // -- Guard edit / delete twins (N3) -----------------------------------
+    // Fetch-driven (YuzuDialog.request): JSON answers with real statuses so the
+    // 401 step-up envelope reaches the dialog. Gate order: service-scope deny,
+    // same-site (csrf_denied audit), RBAC, then step-up + the mutation itself.
+    sink.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/update)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.rule.update", id))
+                     return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.rule.update", id)) return;
+                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
+                 update_guard_action(req, res, id);
+             });
+    sink.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/delete)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Delete",
+                                                   "guaranteed_state.rule.delete", id))
+                     return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.rule.delete", id)) return;
+                 if (!perm_fn_(req, res, "GuaranteedState", "Delete")) return;
+                 delete_guard_action(req, res, id);
              });
 
     // -- Structured create (Baseline) -------------------------------------
@@ -2714,6 +2886,7 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                  if (deny_service_scoped_mutation_(req, res, "Write",
                                                    "guaranteed_state.baseline.create", ""))
                      return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.baseline.create", "")) return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  create_baseline_from_form(req, res);
              });
@@ -2728,6 +2901,7 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                  if (deny_service_scoped_mutation_(req, res, "Push",
                                                    "guaranteed_state.baseline.deploy", id))
                      return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.baseline.deploy", id)) return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Push")) return;
                  deploy_baseline(req, res, id);
              });
@@ -2741,6 +2915,7 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                  if (deny_service_scoped_mutation_(req, res, "Delete",
                                                    "guaranteed_state.baseline.delete", id))
                      return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.baseline.delete", id)) return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Delete")) return;
                  delete_baseline_action(req, res, id);
              });
@@ -2750,6 +2925,7 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                  if (deny_service_scoped_mutation_(req, res, "Write",
                                                    "guaranteed_state.baseline.update", id))
                      return;
+                 if (deny_cross_origin_(req, res, "guaranteed_state.baseline.update", id)) return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  update_baseline_from_form(req, res, id);
              });

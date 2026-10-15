@@ -147,7 +147,6 @@ struct McpEngineRolesHarness {
             /*response_scope_fn=*/{},
             /*software_inventory_store=*/nullptr,
             /*metrics=*/nullptr,
-            /*app_perf_providers=*/{},
             /*quarantine_store=*/nullptr,
             /*tag_push_fn=*/{},
             /*agent_registry=*/nullptr,

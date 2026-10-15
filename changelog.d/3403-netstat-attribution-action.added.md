@@ -1,1 +1,0 @@
-- **`netstat` gains a new `attribution` action.** `attribution` enumerates the same TCP/UDP connections and listening sockets as `netstat_list`, additionally resolving each socket's owning process name and executable path — the functionality the standalone `sockwho` plugin previously provided.

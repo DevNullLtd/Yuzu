@@ -121,12 +121,12 @@ std::string render_frame(const std::vector<DeviceRow>& devices) {
     // Filter bar — client-side state + anomalies + text filters (no round-trip;
     // re-applied after every tree swap via the htmx:afterSettle listener).
     h += "<div class=\"tar-tree-filterbar\">";
-    h += "<span class=\"tt-filter-label\">Show</span>";
+    h += "<span class=\"tt-filter-label\">Show</span><span class=\"tar-seg\">";
     h += "<a class=\"tar-chip on\" data-statechip=\"all\" onclick=\"tarTreeState('all',this)\">All</a>";
     h += "<a class=\"tar-chip\" data-statechip=\"running\" onclick=\"tarTreeState('running',this)\">"
          "Running</a>";
     h += "<a class=\"tar-chip\" data-statechip=\"exited\" onclick=\"tarTreeState('exited',this)\">"
-         "Exited</a>";
+         "Exited</a></span>";
     h += "<label class=\"tt-anom-toggle\"><input type=\"checkbox\" id=\"tar-tree-anom-only\" "
          "onchange=\"applyTarTreeFilters()\"> Anomalies only</label>";
     h += "<input id=\"tar-tree-filter\" class=\"tar-tree-filter\" type=\"text\" "
@@ -328,7 +328,13 @@ std::string tar_retention_paused_json(const TarRetentionPausedScan& scan) {
                {"agents_responded", scan.agents_responded},
                {"agents_with_no_paused_sources", scan.agents_with_no_paused_sources},
                {"agents_filtered_out_of_scope", scan.agents_filtered_out_of_scope},
-               {"store_degraded", scan.store_degraded},
+               // A cut scan also reports store_degraded so a client that predates
+               // result_truncated_by_cap still sees the result is not complete;
+               // result_truncated_by_cap is the discriminator between "the read failed"
+               // and "the read was cut". The dashboard page uses the two fields
+               // separately (scan.store_degraded stays "the read failed").
+               {"store_degraded", scan.store_degraded || scan.result_truncated_by_cap},
+               {"result_truncated_by_cap", scan.result_truncated_by_cap},
                {"rows", rows_json}}
         .dump();
 }

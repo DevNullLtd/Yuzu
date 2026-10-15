@@ -242,6 +242,9 @@ TEST_CASE("POST /api/inventory/query: happy path filters by agent_id",
     REQUIRE(body["results"].size() == 1);
     CHECK(body["results"][0]["agent_id"] == "agent-3");
     CHECK(body["result_truncated_by_cap"] == false);
+    // #4496: emitted unconditionally (0 when nothing was excluded), same
+    // convention as `count`/`result_truncated_by_cap` on this route.
+    CHECK(body["results_excluded_by_poison"] == 0);
 }
 
 TEST_CASE("POST /api/inventory/query: invalid JSON body is a 400",
@@ -250,6 +253,81 @@ TEST_CASE("POST /api/inventory/query: invalid JSON body is a 400",
     auto res = h.sink.Post("/api/inventory/query", "not json");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+// ── #2437-class depth guard (C7/C8) ─────────────────────────────────────────
+//
+// data_json is a generic ADR-0016 sync-framework blob written verbatim off
+// the wire (see the write-side guard, gateway_service_impl.cpp's
+// ProxyInventory) with no depth check until that fix shipped - a row seeded
+// directly (as here, bypassing the now-guarded write path, matching this
+// branch's established pattern for proving a read-side guard independently)
+// or written before that fix, still reaches these reads. Reachability-proxy
+// depth (35 > kMcpMaxJsonDepth's 32), never the real ~100,000-level attack
+// depth.
+
+namespace {
+const std::string kPoisonedJson = std::string(35, '[') + std::string(35, ']');
+} // namespace
+
+TEST_CASE("GET /api/inventory/:agent_id/:plugin: a poisoned data_json is excluded as a clean "
+          "404, never a 200 with a poisoned dump",
+          "[server][routes][data_inventory_routes][rest][pg][security]") {
+    PgHarness h;
+    h.store->upsert("agent-poisoned", "custom_source", kPoisonedJson, 400);
+
+    // Confirm the seed actually landed with the poisoned bytes intact before
+    // exercising the route below - otherwise a skipped/failed upsert would
+    // let this test pass for the wrong reason (a genuinely-absent row is
+    // also a 404).
+    auto seeded = h.store->get("agent-poisoned", "custom_source");
+    REQUIRE(seeded.has_value());
+    REQUIRE(seeded->has_value());
+    CHECK((*seeded)->data_json == kPoisonedJson);
+
+    auto res = h.sink.Get("/api/inventory/agent-poisoned/custom_source");
+    REQUIRE(res);
+    CHECK(res->status == 404); // same shape as a genuinely-absent record, never a crash/200
+    auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["code"] == 404);
+}
+
+// #4496: this test predates the `results_excluded_by_poison` signal - it
+// originally only proved the exclusion was silent-but-safe (no crash, `count`
+// consistent). It now also proves the caller can TELL a record was excluded,
+// which #4496 exists to fix (the response otherwise looks identical to "no
+// poisoned records existed").
+TEST_CASE("POST /api/inventory/query: a poisoned record is excluded, a healthy matching "
+          "record is still returned, and count stays consistent with the exclusion",
+          "[server][routes][data_inventory_routes][rest][pg][security]") {
+    PgHarness h;
+    h.store->upsert("agent-poisoned2", "custom_source", kPoisonedJson, 500);
+    h.store->upsert("agent-healthy", "custom_source", R"({"ok":true})", 501);
+
+    // Same false-green trap as the GET test above: confirm both rows actually
+    // seeded with their intended bytes before relying on the query route's
+    // count/exclusion behavior to prove anything.
+    auto poisoned_seed = h.store->get("agent-poisoned2", "custom_source");
+    REQUIRE(poisoned_seed.has_value());
+    REQUIRE(poisoned_seed->has_value());
+    CHECK((*poisoned_seed)->data_json == kPoisonedJson);
+    auto healthy_seed = h.store->get("agent-healthy", "custom_source");
+    REQUIRE(healthy_seed.has_value());
+    REQUIRE(healthy_seed->has_value());
+    CHECK((*healthy_seed)->data_json == R"({"ok":true})");
+
+    auto res = h.sink.Post("/api/inventory/query", R"({"plugin":"custom_source"})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // no crash, no 5xx from the poisoned row
+    auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body["results"].size() == 1);
+    CHECK(body["results"][0]["agent_id"] == "agent-healthy");
+    CHECK(body["count"] == 1); // consistent with the exclusion, not silently wrong
+    // #4496: the signal this test was missing before - without it, this
+    // response is byte-for-byte identical to "no poisoned record existed".
+    CHECK(body["results_excluded_by_poison"] == 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

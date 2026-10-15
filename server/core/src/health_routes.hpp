@@ -91,8 +91,10 @@
 ///                                     load-bearing and must run identically on
 ///                                     both routes)
 ///   GET /livez                      (no gate, no deps — trivial process-alive probe)
-///   GET /readyz                     (no gate — draining_/store is_open() checks only)
+///   GET /readyz                     (no gate — draining_, runtime pg_reachable, boot-latched store checks)
 ///   GET /fragments/health/summary   (deny_service_scoped_fn THEN auth_fn)
+
+#include "authz_gates.hpp" // authz::FleetReadGate (Dashboard health panel)
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -122,6 +124,7 @@ class PgPool;
 
 // Stores checked by /health AND /readyz (also /fragments/health/summary
 // where noted).
+class PgReachabilityProbe; // HA WS-8: /readyz pg_reachable + /metrics gauges
 class ResponseStore;       // + fragment summary
 class AuditStore;          // + fragment summary
 class InstructionStore;
@@ -164,6 +167,8 @@ class CustomPropertiesStore;
 class FleetTopologyStore;
 class AccessReviewStore;
 class SoftwareLicensingStore;
+class PluginConfigStore;
+class AppUsageStore;
 class ProductRegistryStore;
 class ProductPackStore;
 class ScimStore;
@@ -201,9 +206,18 @@ struct Deps {
                            const std::string& action, const std::string& message,
                            const std::string& target_type, const std::string& target_id)>;
 
+    /// Dashboard health panel only (`/fragments/dashboard/health`): the admit-then-filter
+    /// gate for the "Executions running" row. Optional: unbound -> the row is
+    /// omitted (never shown unfiltered).
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+
     AuthFn auth_fn;                          // /fragments/health/summary
     ResolveSessionFn resolve_session_fn;      // /health, /api/health
     DenyServiceScopedFn deny_service_scoped_fn; // /fragments/health/summary
+    FleetReadFn fleet_read_fn;                  // /fragments/dashboard/health (optional)
 
     // ---- REQUIRED (registration throws std::invalid_argument if null) ----
     Config* cfg{nullptr};
@@ -225,6 +239,14 @@ struct Deps {
     // above for the ones ALSO read by /fragments/health/summary or
     // /metrics) ----
     pg::PgPool* pg_pool{nullptr};
+    /// HA WS-8 (ADR-2002 §12): the runtime Postgres-reachability probe —
+    /// `/readyz`'s gating `pg_reachable` row, and the `yuzu_server_pg_*`
+    /// reachability gauges refreshed on `/metrics` scrape. Read only through
+    /// `snapshot()`/`verdict()` — a copy under the probe's leaf mutex, never
+    /// held across I/O, so a stalled probe cannot stall a handler. Null degrades
+    /// FAIL-CLOSED (row reports not ready), matching the store-pointer idiom;
+    /// never null in production whenever `pg_pool` is set.
+    PgReachabilityProbe* pg_reachability_probe{nullptr};
     ResponseStore* response_store{nullptr};
     AuditStore* audit_store{nullptr};
     InstructionStore* instruction_store{nullptr};
@@ -267,6 +289,8 @@ struct Deps {
     FleetTopologyStore* fleet_topology_store{nullptr};
     AccessReviewStore* access_review_store{nullptr};
     SoftwareLicensingStore* software_licensing_store{nullptr};
+    PluginConfigStore* plugin_config_store{nullptr};
+    AppUsageStore* app_usage_store{nullptr}; // Wave 7 PR7.2 (gov Gate 3 sre HIGH finding)
     ProductRegistryStore* product_registry_store{nullptr};
     ProductPackStore* product_pack_store{nullptr};
     ScimStore* scim_store{nullptr};

@@ -18,8 +18,20 @@
  * set, with no per-process handles. CPU% needs two snapshots; the previous
  * one is held in plugin memory keyed by (pid, create_time) so PID reuse never
  * miscounts. Linux source — one /proc/[pid]/stat read per process per tick
- * (comm, utime+stime, rss, starttime; no ptrace, no per-process handles).
- * macOS (proc_pid_rusage) is kPlanned.
+ * (comm, utime+stime, rss, starttime, flags; no ptrace, no per-process
+ * handles). macOS (proc_pid_rusage) is kPlanned.
+ *
+ * Kernel-thread marker (`is_kthread`): Linux processes are flagged via the
+ * kernel `flags` word (/proc/[pid]/stat field 9, bit 0x00200000 = PF_KTHREAD,
+ * <linux/sched.h>) rather than a name pattern — `comm` is attacker/process-
+ * settable (prctl(PR_SET_NAME)) and TASK_COMM_LEN-truncated, so a name match
+ * is trivially spoofable in either direction. Windows marks pid 4 ("System",
+ * the kernel-process analog) the same way. This tier's own top-N sampling and
+ * storage NEVER filter on it (kernel threads are deliberately included here —
+ * parity with Windows pid 4, see read_proc_counters()); it exists so the
+ * separate DAILY app-perf-over-time rollup (agents/core/src/
+ * sync_source_app_perf.cpp) can exclude kernel/system noise from the
+ * historical "application" view without touching this live tier.
  *
  * Version (DEX app-perf-over-time): the per-app `version` is the BOUNDED,
  * deliberate exception to the handle-free posture. SystemProcessInformation
@@ -70,6 +82,11 @@ struct ProcCounter {
     std::uint64_t cpu_100ns{0};
     std::uint64_t ws_bytes{0};
     std::string name; ///< image name, UTF-8 (no path, no cmdline)
+    /// True for a Linux kernel thread (PF_KTHREAD, stat field 9) or the
+    /// Windows "System" process (pid 4). Metadata only — see the header
+    /// banner's "Kernel-thread marker" note for why this is flag-derived,
+    /// not name-matched, and what consumes it.
+    bool is_kthread{false};
 };
 
 /// One system-wide snapshot.
@@ -95,6 +112,13 @@ struct ProcPerfSample {
     /// resolution. Set by derive_proc_samples; read by resolve_proc_versions.
     std::uint32_t rep_pid{0};
     std::int64_t rep_create_time_100ns{0};
+    /// True iff ANY aggregated instance is a kernel thread / Windows System
+    /// process (ProcCounter::is_kthread, OR'd across instances — a name
+    /// group sharing an exact kernel-thread comm is, in practice, only ever
+    /// kernel threads). Recorded into procperf_live/_hourly unfiltered (this
+    /// tier keeps kernel threads, see the header banner); the daily app-perf
+    /// rollup filters on it.
+    bool is_kthread{false};
 };
 
 /// Top-N size per dimension. The recorded set is the UNION of the top N by
@@ -137,6 +161,8 @@ ProcSnapshot read_proc_counters();
 /// separators into the pipe-delimited sql/export/app_perf wire formats).
 /// cpu_100ns = (utime+stime)·1e7/clk_tck; ws_bytes = rss·page_size;
 /// create_time_100ns = starttime·1e7/clk_tck (boot-relative, identity-only).
+/// is_kthread = (flags & PF_KTHREAD) != 0, from the field-9 kernel flags word
+/// (proc(5)) — see the header banner's "Kernel-thread marker" note.
 /// nullopt on malformed content or non-positive clk_tck/page_size.
 std::optional<ProcCounter> parse_linux_pid_stat(std::uint32_t pid, std::string_view stat_content,
                                                 long clk_tck, long page_size);

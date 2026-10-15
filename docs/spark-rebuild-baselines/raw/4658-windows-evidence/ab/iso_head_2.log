@@ -1,0 +1,342 @@
+[DIAG] DLL static-init starting (before proto registration)
+Filters: "File spark (real mechanism): a shared-ancestor storm*"
+Randomness seeded to: 924448775
+[2026-09-21 22:53:33.621] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 22:53:33.621] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep0\f.txt'
+[2026-09-21 22:53:33.622] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep1\f.txt'
+[2026-09-21 22:53:33.622] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep2\f.txt'
+[2026-09-21 22:53:33.623] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep3\f.txt'
+[2026-09-21 22:53:33.623] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep4\f.txt'
+[2026-09-21 22:53:33.624] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep5\f.txt'
+[2026-09-21 22:53:33.625] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep6\f.txt'
+[2026-09-21 22:53:33.625] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep7\f.txt'
+[2026-09-21 22:53:33.625] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep8\f.txt'
+[2026-09-21 22:53:33.626] [info] SparkEngine: armed 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep9\f.txt'
+[2026-09-21 22:53:33.626] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep10\f.txt'
+[2026-09-21 22:53:33.627] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep11\f.txt'
+[2026-09-21 22:53:33.627] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep12\f.txt'
+[2026-09-21 22:53:33.627] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt'
+[2026-09-21 22:53:33.628] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt'
+[2026-09-21 22:53:33.628] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt'
+[2026-09-21 22:53:33.628] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt'
+[2026-09-21 22:53:33.629] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt'
+[2026-09-21 22:53:33.629] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt'
+[2026-09-21 22:53:33.629] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt'
+[2026-09-21 22:53:33.629] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt'
+[2026-09-21 22:53:33.630] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep21\f.txt'
+[2026-09-21 22:53:33.630] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt'
+[2026-09-21 22:53:33.630] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt'
+[2026-09-21 22:53:33.631] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt'
+[2026-09-21 22:53:33.631] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt'
+[2026-09-21 22:53:33.631] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt'
+[2026-09-21 22:53:33.632] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt'
+[2026-09-21 22:53:33.632] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt'
+[2026-09-21 22:53:33.632] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep29\f.txt'
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.690] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.691] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' recovered
+[2026-09-21 22:53:33.691] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' recovered
+[2026-09-21 22:53:33.691] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' recovered
+[2026-09-21 22:53:33.740] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.755] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' recovered
+[2026-09-21 22:53:33.756] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' recovered
+[2026-09-21 22:53:33.756] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' recovered
+[2026-09-21 22:53:33.756] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' recovered
+[2026-09-21 22:53:33.756] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep21\f.txt' recovered
+[2026-09-21 22:53:33.756] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' recovered
+[2026-09-21 22:53:33.756] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' recovered
+[2026-09-21 22:53:33.756] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:33.791] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.791] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.791] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.805] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.852] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' recovered
+[2026-09-21 22:53:33.853] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' recovered
+[2026-09-21 22:53:33.853] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' recovered
+[2026-09-21 22:53:33.868] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' recovered
+[2026-09-21 22:53:33.881] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' recovered
+[2026-09-21 22:53:33.905] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.905] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.905] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.905] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.905] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.932] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' recovered
+[2026-09-21 22:53:33.934] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep6\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.934] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:33.935] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep9\f.txt' recovered
+[2026-09-21 22:53:33.945] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep6\f.txt' recovered
+[2026-09-21 22:53:33.965] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' recovered
+[2026-09-21 22:53:33.966] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' recovered
+[2026-09-21 22:53:33.966] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' recovered
+[2026-09-21 22:53:33.967] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep21\f.txt' recovered
+[2026-09-21 22:53:33.967] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' recovered
+[2026-09-21 22:53:33.998] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep2\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.014] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.014] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.016] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep8\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.016] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.045] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.045] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.046] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.046] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' recovered
+[2026-09-21 22:53:34.047] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' recovered
+[2026-09-21 22:53:34.047] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:34.060] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep2\f.txt' recovered
+[2026-09-21 22:53:34.076] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep8\f.txt' recovered
+[2026-09-21 22:53:34.076] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' recovered
+[2026-09-21 22:53:34.078] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' recovered
+[2026-09-21 22:53:34.078] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' recovered
+[2026-09-21 22:53:34.109] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.109] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.109] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.110] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' recovered
+[2026-09-21 22:53:34.142] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.142] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.172] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' recovered
+[2026-09-21 22:53:34.172] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:34.174] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep3\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.174] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep4\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.174] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep6\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.174] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep7\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.174] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.174] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.205] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' recovered
+[2026-09-21 22:53:34.205] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' recovered
+[2026-09-21 22:53:34.235] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep6\f.txt' recovered
+[2026-09-21 22:53:34.237] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep3\f.txt' recovered
+[2026-09-21 22:53:34.237] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep4\f.txt' recovered
+[2026-09-21 22:53:34.237] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep7\f.txt' recovered
+[2026-09-21 22:53:34.237] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' recovered
+[2026-09-21 22:53:34.237] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' recovered
+[2026-09-21 22:53:34.238] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.238] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.254] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.254] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.255] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.255] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.286] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.286] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.286] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.286] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.286] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.286] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.286] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.300] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' recovered
+[2026-09-21 22:53:34.301] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:34.317] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' recovered
+[2026-09-21 22:53:34.317] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' recovered
+[2026-09-21 22:53:34.317] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' recovered
+[2026-09-21 22:53:34.317] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' recovered
+[2026-09-21 22:53:34.318] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.318] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep29\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.318] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep12\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.318] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.318] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.348] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' recovered
+[2026-09-21 22:53:34.348] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' recovered
+[2026-09-21 22:53:34.349] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' recovered
+[2026-09-21 22:53:34.349] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' recovered
+[2026-09-21 22:53:34.349] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' recovered
+[2026-09-21 22:53:34.349] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' recovered
+[2026-09-21 22:53:34.349] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep21\f.txt' recovered
+[2026-09-21 22:53:34.382] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep10\f.txt' recovered
+[2026-09-21 22:53:34.383] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep29\f.txt' recovered
+[2026-09-21 22:53:34.383] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep12\f.txt' recovered
+[2026-09-21 22:53:34.383] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' recovered
+[2026-09-21 22:53:34.383] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' recovered
+[2026-09-21 22:53:34.383] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.398] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep2\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.398] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep3\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.398] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep4\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.398] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep5\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.398] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep8\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.399] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep11\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.399] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.445] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' recovered
+[2026-09-21 22:53:34.445] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.445] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.445] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.446] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.446] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.446] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.446] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.462] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep2\f.txt' recovered
+[2026-09-21 22:53:34.462] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep3\f.txt' recovered
+[2026-09-21 22:53:34.462] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep4\f.txt' recovered
+[2026-09-21 22:53:34.462] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep5\f.txt' recovered
+[2026-09-21 22:53:34.462] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep8\f.txt' recovered
+[2026-09-21 22:53:34.462] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep11\f.txt' recovered
+[2026-09-21 22:53:34.462] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' recovered
+[2026-09-21 22:53:34.464] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.464] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.464] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.464] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.494] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.495] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:34.508] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' recovered
+[2026-09-21 22:53:34.509] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' recovered
+[2026-09-21 22:53:34.509] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' recovered
+[2026-09-21 22:53:34.509] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' recovered
+[2026-09-21 22:53:34.509] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' recovered
+[2026-09-21 22:53:34.509] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' recovered
+[2026-09-21 22:53:34.510] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' recovered
+[2026-09-21 22:53:34.558] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep2\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.558] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep3\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.558] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep4\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.559] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep5\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.559] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep6\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.559] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep7\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.559] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.559] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.606] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep11\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.606] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.606] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.607] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep11\f.txt' recovered
+[2026-09-21 22:53:34.622] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep4\f.txt' recovered
+[2026-09-21 22:53:34.622] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:34.623] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep2\f.txt' recovered
+[2026-09-21 22:53:34.623] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep3\f.txt' recovered
+[2026-09-21 22:53:34.623] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep5\f.txt' recovered
+[2026-09-21 22:53:34.623] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep6\f.txt' recovered
+[2026-09-21 22:53:34.623] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep7\f.txt' recovered
+[2026-09-21 22:53:34.623] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' recovered
+[2026-09-21 22:53:34.653] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' recovered
+[2026-09-21 22:53:34.653] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' recovered
+[2026-09-21 22:53:34.653] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' recovered
+[2026-09-21 22:53:34.655] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' recovered
+[2026-09-21 22:53:34.657] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.657] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.657] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.657] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.658] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.658] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.658] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.660] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' recovered
+[2026-09-21 22:53:34.660] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' recovered
+[2026-09-21 22:53:34.660] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' recovered
+[2026-09-21 22:53:34.660] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' recovered
+[2026-09-21 22:53:34.666] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' recovered
+[2026-09-21 22:53:34.666] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' recovered
+[2026-09-21 22:53:34.687] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep8\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.687] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.687] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.687] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.687] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.717] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep12\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.718] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.718] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.718] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.718] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.718] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.718] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.718] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.718] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.718] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.747] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep8\f.txt' recovered
+[2026-09-21 22:53:34.747] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep9\f.txt' recovered
+[2026-09-21 22:53:34.747] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep10\f.txt' recovered
+[2026-09-21 22:53:34.747] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' recovered
+[2026-09-21 22:53:34.747] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:34.749] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.779] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep12\f.txt' recovered
+[2026-09-21 22:53:34.779] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' recovered
+[2026-09-21 22:53:34.779] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep13\f.txt' recovered
+[2026-09-21 22:53:34.779] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' recovered
+[2026-09-21 22:53:34.781] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' recovered
+[2026-09-21 22:53:34.781] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' recovered
+[2026-09-21 22:53:34.781] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' recovered
+[2026-09-21 22:53:34.810] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' recovered
+[2026-09-21 22:53:34.825] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep1\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.825] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep2\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.825] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.825] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.825] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.842] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' recovered
+[2026-09-21 22:53:34.842] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' recovered
+[2026-09-21 22:53:34.845] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.875] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep2\f.txt' recovered
+[2026-09-21 22:53:34.876] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep1\f.txt' recovered
+[2026-09-21 22:53:34.876] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep10\f.txt' recovered
+[2026-09-21 22:53:34.876] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' recovered
+[2026-09-21 22:53:34.876] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:34.907] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' recovered
+[2026-09-21 22:53:34.907] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' recovered
+[2026-09-21 22:53:34.907] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' recovered
+[2026-09-21 22:53:34.908] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' recovered
+[2026-09-21 22:53:34.909] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.910] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.910] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.910] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.910] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.925] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep12\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.941] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.957] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.957] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.957] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.958] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' recovered
+[2026-09-21 22:53:34.958] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep25\f.txt' recovered
+[2026-09-21 22:53:34.958] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:34.972] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.972] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.985] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep12\f.txt' recovered
+[2026-09-21 22:53:34.988] [warning] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.988] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep11\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:34.988] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep29\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:35.002] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep16\f.txt' recovered
+[2026-09-21 22:53:35.004] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:35.033] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep19\f.txt' recovered
+[2026-09-21 22:53:35.034] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep20\f.txt' recovered
+[2026-09-21 22:53:35.035] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:35.035] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:35.035] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:35.035] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 22:53:35.037] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep14\f.txt' recovered
+[2026-09-21 22:53:35.037] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep15\f.txt' recovered
+[2026-09-21 22:53:35.037] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep26\f.txt' recovered
+[2026-09-21 22:53:35.037] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep27\f.txt' recovered
+[2026-09-21 22:53:35.049] [info] SparkEngine: watch 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep9\f.txt' recovered
+[2026-09-21 22:53:35.049] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep11\f.txt' recovered
+[2026-09-21 22:53:35.050] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep29\f.txt' recovered
+[2026-09-21 22:53:35.065] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep24\f.txt' recovered
+[2026-09-21 22:53:35.083] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep21\f.txt' recovered
+[2026-09-21 22:53:35.098] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep28\f.txt' recovered
+[2026-09-21 22:53:35.098] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep17\f.txt' recovered
+[2026-09-21 22:53:35.098] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep23\f.txt' recovered
+[2026-09-21 22:53:35.098] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep18\f.txt' recovered
+[2026-09-21 22:53:35.098] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_6032592465085344657_0\dep22\f.txt' recovered
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+yuzu_agent_tests.exe is a Catch2 v3.13.0 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+File spark (real mechanism): a shared-ancestor storm keeps concurrent discovery
+probes bounded by the lane cap and converges once the storm stops (#2012 PR-B2,
+criterion #15, bounded-growth half)
+-------------------------------------------------------------------------------
+../tests/unit/test_spark_mechanism.cpp(8022)
+...............................................................................
+
+../tests/unit/test_spark_mechanism.cpp(8065): FAILED:
+  CHECK( max_active <= kTestLaneCap )
+with expansion:
+  9 <= 8
+with message:
+  max observed probe_workers_active=9 (test cap=8)
+
+[2026-09-21 22:53:35.151] [info] SparkEngine stopped
+===============================================================================
+test cases:  1 |  0 passed | 1 failed
+assertions: 36 | 35 passed | 1 failed
+
+[DIAG] Catch2 Session::run() returned 42 (main about to return)

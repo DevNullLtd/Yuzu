@@ -45,8 +45,11 @@ using yuzu::server::DispatchArm;
 using yuzu::server::DispatchResolvers;
 using yuzu::server::resolve_and_dispatch_confined;
 using yuzu::server::resolve_scope_targets;
+using yuzu::server::ScopeAbortReason;    // #4981 PR-1
+using yuzu::server::ScopeEvalError;      // #4981 PR-1
 using yuzu::server::ScopeLadderAudit;
 using yuzu::server::ScopeLadderResult;
+using yuzu::server::to_abort_reason;     // #4981 PR-1
 using yuzu::server::authz::VisibleSet;
 
 namespace {
@@ -59,6 +62,17 @@ struct RecordingSink {
     std::vector<std::string> reached;
     bool unfiltered_broadcast_used = false;
     std::vector<std::string> fleet{"dev-A", "dev-B", "dev-C"};
+    // HA WS-5 (governance hardening, 2026-09-22): override point for a test
+    // that simulates presence widening known_agent_ids() beyond the local
+    // registry — nullopt (the default) means "no presence", i.e. every id in
+    // `fleet` is locally known, exactly as it was before this field existed.
+    // When set, names the LOCAL-ONLY subset of `fleet`; any candidate not in
+    // it is treated as presence-only (mirrors AgentRegistry::
+    // has_remote_presence's direct-membership-check semantics, not a size
+    // comparison — a size-based mock would reintroduce the exact race class
+    // that method was written to close).
+    std::optional<std::vector<std::string>> local_only_override;
+    std::optional<std::vector<std::string>> route_fallback_candidates;
 
     ConfinedDispatchSink make() {
         return ConfinedDispatchSink{
@@ -70,7 +84,17 @@ struct RecordingSink {
                 unfiltered_broadcast_used = true;
                 return static_cast<int>(fleet.size());
             },
-            [this] { return fleet; }};
+            [this] { return fleet; },
+            [this](const std::vector<std::string>& candidates) {
+                route_fallback_candidates = candidates;
+                return false; // never degraded, in this mock
+            },
+            [this](const std::vector<std::string>& candidates) {
+                const auto& local = local_only_override ? *local_only_override : fleet;
+                return std::any_of(candidates.begin(), candidates.end(), [&](const auto& id) {
+                    return std::find(local.begin(), local.end(), id) == local.end();
+                });
+            }};
     }
 
     bool reached_exactly(std::vector<std::string> expected) {
@@ -242,6 +266,65 @@ TEST_CASE("Broadcast arm: present-EMPTY reaches nobody and never falls back to s
     CHECK(sent == 0);
     CHECK(sink.reached.empty());
     CHECK_FALSE(sink.unfiltered_broadcast_used);
+}
+
+// HA WS-5 (ADR-2002 §7a): once known_agent_ids() can include presence-only
+// (remote) ids, an unfiltered Broadcast is no longer safe to answer with the
+// local-only fast path — it must fall through to the per-id walk so a
+// remote id gets a directory-fallback consult via prepare_route_fallback
+// before send_to. This is the exact bug class WS-4 hit twice (a
+// wired-but-behaviorally-dead reader) — see ConfinedDispatchSink::
+// presence_widens's doc comment.
+TEST_CASE("Broadcast arm: presence widening known_agent_ids skips the unfiltered fast path "
+          "and consults the route fallback",
+          "[server][dispatch][scope][security][ha]") {
+    RecordingSink sink;
+    sink.fleet = {"dev-A", "dev-B", "dev-C", "remote-only"}; // presence added "remote-only"
+    sink.local_only_override = {"dev-A", "dev-B", "dev-C"};  // local registry still has 3
+    const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, unfiltered(), false,
+                                            kNoContainment, sink.make())
+                         .sent;
+    CHECK_FALSE(sink.unfiltered_broadcast_used); // fast path correctly skipped
+    REQUIRE(sink.route_fallback_candidates.has_value());
+    CHECK(sink.reached_exactly(*sink.route_fallback_candidates));
+    CHECK(sent == 4);
+    CHECK(sink.reached_exactly({"dev-A", "dev-B", "dev-C", "remote-only"}));
+}
+
+TEST_CASE("Broadcast arm: presence adding nothing beyond local keeps the unfiltered fast path",
+          "[server][dispatch][scope][security][ha]") {
+    RecordingSink sink;
+    sink.local_only_override = sink.fleet; // presence configured, adds nothing this call
+    const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, unfiltered(), false,
+                                            kNoContainment, sink.make())
+                         .sent;
+    CHECK(sink.unfiltered_broadcast_used);
+    CHECK_FALSE(sink.route_fallback_candidates.has_value()); // fast path never calls it
+    CHECK(sent == 3);
+}
+
+// HA WS-5 governance hardening (Gate 4 unhappy-path finding, 2026-09-22):
+// regression test for the race the size-comparison design had — a
+// COINCIDENTAL size match between known_agent_ids() and a separately-queried
+// local count must NOT fool the gate when the SETS genuinely differ. This
+// mock can't reproduce the original two-call race directly (RecordingSink's
+// presence_widens closure and known_agent_ids share one `fleet`/
+// `local_only_override` snapshot with no window between them), but it does
+// assert the CURRENT single-call membership-check semantics hold even when
+// sizes happen to be equal by construction: replacing one local id with a
+// same-count remote-only id must still force the slow path.
+TEST_CASE("Broadcast arm: a same-size but different-membership candidate set still "
+          "skips the fast path (regression: size comparison is not membership)",
+          "[server][dispatch][scope][security][ha]") {
+    RecordingSink sink;
+    sink.fleet = {"dev-A", "dev-B", "remote-only"}; // 3 candidates
+    sink.local_only_override = {"dev-A", "dev-B", "dev-C"}; // ALSO 3 — sizes match, sets don't
+    const int sent = dispatch_confined_arms(DispatchArm::Broadcast, {}, unfiltered(), false,
+                                            kNoContainment, sink.make())
+                         .sent;
+    CHECK_FALSE(sink.unfiltered_broadcast_used);
+    REQUIRE(sink.route_fallback_candidates.has_value());
+    CHECK(sent == 3);
 }
 
 // --------------------------------------------------------------- None arm ---
@@ -466,7 +549,7 @@ TEST_CASE("resolve_scope_targets: a matching expression with no from_result_set 
     audit.resolution_failed = [&](const std::string&) { audit_fired = true; };
     const auto result = resolve_scope_targets(
         "ostype == \"Windows\"", "alice", /*result_set_store=*/nullptr,
-        [](const yuzu::scope::Expression&) -> std::optional<std::vector<std::string>> {
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
             return std::vector<std::string>{"dev-A", "dev-B"};
         },
         audit);
@@ -483,7 +566,7 @@ TEST_CASE("resolve_scope_targets: invalid scope syntax surfaces a parse_error an
     ScopeLadderAudit audit;
     const auto result = resolve_scope_targets(
         "(ostype == \"Windows\"", "alice", nullptr,
-        [&](const yuzu::scope::Expression&) -> std::optional<std::vector<std::string>> {
+        [&](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
             evaluate_called = true;
             return std::vector<std::string>{};
         },
@@ -501,28 +584,108 @@ TEST_CASE("resolve_scope_targets: a degraded registry evaluation aborts as db_de
     audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
     const auto result = resolve_scope_targets(
         "ostype == \"Windows\"", "alice", nullptr,
-        [](const yuzu::scope::Expression&) -> std::optional<std::vector<std::string>> {
-            return std::nullopt; // registry membership preload failed
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            // registry membership preload failed
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
         },
         audit);
     CHECK_FALSE(result.matched.has_value());
     CHECK(aborted_reason == "db_degraded");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::DbDegraded);
 }
 
-TEST_CASE("resolve_scope_targets: a degraded registry evaluation with no principal aborts as "
+TEST_CASE("resolve_scope_targets: a PrincipalUnresolved registry evaluation aborts as "
           "principal_unresolved",
           "[server][dispatch][scope]") {
+    // #4981 PR-1: the ladder no longer INFERS this reason from an empty
+    // `principal` argument (that heuristic is gone) — it directly relays
+    // whatever Kind evaluate_scope_fn returns. AgentRegistry::evaluate_scope's
+    // OWN empty-principal-with-a-from_result_set:-atom logic is pinned
+    // separately in test_scope_walking_authz.cpp; this test pins the ladder's
+    // relay of that Kind.
     std::string aborted_reason;
     ScopeLadderAudit audit;
     audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
     const auto result = resolve_scope_targets(
         "ostype == \"Windows\"", /*principal=*/"", nullptr,
-        [](const yuzu::scope::Expression&) -> std::optional<std::vector<std::string>> {
-            return std::nullopt;
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::PrincipalUnresolved, {}});
         },
         audit);
     CHECK_FALSE(result.matched.has_value());
     CHECK(aborted_reason == "principal_unresolved");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::PrincipalUnresolved);
+}
+
+TEST_CASE("resolve_scope_targets: a PresenceDegraded registry evaluation aborts as "
+          "presence_degraded, matched absent",
+          "[server][dispatch][scope]") {
+    // #4981 PR-1 Finding B: ladder-level confirmation that a PresenceDegraded
+    // evaluator error produces evaluation_aborted("presence_degraded") with
+    // abort_reason set correctly and matched empty/absent.
+    std::string aborted_reason;
+    ScopeLadderAudit audit;
+    audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+    const auto result = resolve_scope_targets(
+        "ostype == \"Windows\"", "alice", nullptr,
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::PresenceDegraded, {}});
+        },
+        audit);
+    CHECK_FALSE(result.matched.has_value());
+    CHECK(aborted_reason == "presence_degraded");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::PresenceDegraded);
+}
+
+TEST_CASE("resolve_scope_targets: an Unresolvable registry evaluation aborts as "
+          "unresolvable, matched absent",
+          "[server][dispatch][scope]") {
+    // #4981 PR-1 adversarial-review LOW fix (independently found by both
+    // Kimi and Codex): the other four evaluator error Kinds each get a
+    // dedicated ladder-level test proving resolve_scope_targets relays them
+    // correctly; Unresolvable had only the pairwise vocabulary-agreement
+    // test below, which pins the STRING COMPOSITION (to_string(Kind) vs
+    // to_string(to_abort_reason(Kind))), not the MAPPING's correctness — a
+    // mapping bug that preserved the composition (e.g. swapping two Kinds
+    // and their strings together) would slip past it silently. This test
+    // closes that gap the same way the sibling cases do.
+    std::string aborted_reason;
+    ScopeLadderAudit audit;
+    audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+    const auto result = resolve_scope_targets(
+        "ostype == \"Windows\"", "alice", nullptr,
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::Unresolvable, {}});
+        },
+        audit);
+    CHECK_FALSE(result.matched.has_value());
+    CHECK(aborted_reason == "unresolvable");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::Unresolvable);
+}
+
+TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwise",
+          "[server][dispatch][scope]") {
+    // #4981 PR-1: scope_eval_error.hpp's to_string(ScopeEvalError::Kind) and
+    // dispatch_scope_ladder.hpp's to_string(ScopeAbortReason) are
+    // near-duplicate enums (kept separate so a caller bypassing the ladder,
+    // e.g. PolicyEvaluator::resolve_targets, can use the former without
+    // pulling in the latter's much heavier header) — pin that they can never
+    // silently drift apart.
+    using Kind = ScopeEvalError::Kind;
+    CHECK(std::string(to_string(Kind::Unresolvable)) ==
+          to_string(to_abort_reason(Kind::Unresolvable)));
+    CHECK(std::string(to_string(Kind::PrincipalUnresolved)) ==
+          to_string(to_abort_reason(Kind::PrincipalUnresolved)));
+    CHECK(std::string(to_string(Kind::StoreDegraded)) ==
+          to_string(to_abort_reason(Kind::StoreDegraded)));
+    CHECK(std::string(to_string(Kind::OwnerCheckFailed)) ==
+          to_string(to_abort_reason(Kind::OwnerCheckFailed)));
+    CHECK(std::string(to_string(Kind::PresenceDegraded)) ==
+          to_string(to_abort_reason(Kind::PresenceDegraded)));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -572,9 +735,9 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
         // command_dispatch_tag_v1 — irrelevant to what THIS test binds (the
         // exec_visible intersection), so advertise it for every fixture agent
         // exactly as a real gateway's CONNECTED notification would.
-        registry.set_gateway_route(
-            id, "test-gateway",
-            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        REQUIRE(registry.set_gateway_route(
+            id, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     }
 
     yuzu::agent::v1::CommandRequest cmd;
@@ -640,9 +803,9 @@ TEST_CASE("wire_and_dispatch_confined: concurrency_mode=\"per-device\" with a li
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_wiring_test_info("dev-A"));
-    registry.set_gateway_route(
-        "dev-A", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("wiring-concurrency-cmd");
@@ -685,9 +848,9 @@ TEST_CASE("wire_and_dispatch_confined: a non-\"per-device\" concurrency_mode lea
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_wiring_test_info("dev-A"));
-    registry.set_gateway_route(
-        "dev-A", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("wiring-unlimited-cmd");
@@ -766,9 +929,9 @@ TEST_CASE("wire_and_dispatch_confined: a per-device claim is released when the s
     // Fix the transport and dispatch again. If the fix works, the released claim
     // lets this second dispatch through; if the claim had leaked, this would also
     // report sent == 0, indistinguishable from a stale open claim.
-    registry.set_gateway_route(
-        "dev-A", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     const auto second = yuzu::server::wire_and_dispatch_confined(
         registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
         /*command_id=*/"wiring-leak-cmd-2", /*execution_id=*/"exec-leak-2",
@@ -820,9 +983,9 @@ TEST_CASE("the shared confined-dispatch seam does not refuse a Destructive fan-o
     AgentRegistry registry(bus, metrics);
     for (const auto& id : {"dev-A", "dev-B", "dev-C"}) {
         (void)registry.register_agent(make_wiring_test_info(id));
-        registry.set_gateway_route(
-            id, "test-gateway",
-            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        REQUIRE(registry.set_gateway_route(
+            id, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     }
 
     // A REAL Destructive row (tar.purge_source, DispatchClass::Destructive in
@@ -908,9 +1071,9 @@ TEST_CASE("wire_and_dispatch_confined: a locally-known agent routes via the EXIS
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_wiring_test_info("dev-local"));
-    registry.set_gateway_route(
-        "dev-local", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-local", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     // A directory row for the SAME agent id — deliberately present AND
     // routable even though the agent has a local session. If the local path
@@ -1075,9 +1238,9 @@ TEST_CASE("wire_and_dispatch_confined: a narrowed exec_visible excludes a local-
     // "dev-in-scope" has a real local session -- the caller's OWN visible set
     // admits it, so it is reached via the existing local path.
     (void)registry.register_agent(make_wiring_test_info("dev-in-scope"));
-    registry.set_gateway_route(
-        "dev-in-scope", "test-gateway",
-        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route(
+        "dev-in-scope", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     // "dev-excluded" is a local MISS (no session on this replica) but DOES
     // have a routable directory row -- the exact precondition for
@@ -1123,4 +1286,96 @@ TEST_CASE("wire_and_dispatch_confined: a narrowed exec_visible excludes a local-
     // ever reached the send step.
     for (const auto& p : pending)
         CHECK(p.agent_id != "dev-excluded");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4981 PR-1 Finding A regression test: the TOCTOU race between
+// gate_scope_dispatch's early forensic owner-check pass and
+// AgentRegistry::evaluate_scope's own (later) member_set_owned preload. A
+// result set that passes the gate can still be deleted before evaluate_scope
+// runs -- pre-#4981, member_set_owned's plain owner-filtered JOIN returned a
+// SUCCESSFUL EMPTY set once the row was gone, which a `NOT from_result_set:`
+// combinator inverted to a fleet-wide match. This exercises the REAL ladder
+// (resolve_scope_targets) against a REAL AgentRegistry + a REAL
+// PG-backed ResultSetStore, deleting the set from inside the injected
+// evaluator closure -- i.e. strictly AFTER gate_scope_dispatch's own check
+// already ran and returned Proceed, and strictly BEFORE the real
+// registry.evaluate_scope call the closure then makes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+yuzu::test::PgTestTemplate dispatch_toctou_tpl{"dispatchtoctou", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::ResultSetStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("dispatchtoctou template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("resolve_scope_targets: a result set deleted between gate_scope_dispatch and "
+          "evaluate_scope's own read aborts OwnerCheckFailed, NEVER a fleet-wide match "
+          "(#4981 PR-1 Finding A TOCTOU regression)",
+          "[pg][server][dispatch][scope][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_toctou_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-A"));
+    (void)registry.register_agent(make_wiring_test_info("dev-B"));
+
+    yuzu::server::CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(yuzu::server::source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto owned = store.create_materialized(cr, {"dev-A"});
+    REQUIRE(owned.has_value());
+    const std::string rsid = owned->id;
+
+    auto run_case = [&](std::string_view scope_expr) {
+        std::vector<std::string> resolution_failed_refs;
+        std::string aborted_reason;
+        ScopeLadderAudit audit;
+        audit.resolution_failed = [&](const std::string& ref) {
+            resolution_failed_refs.push_back(ref);
+        };
+        audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+        const auto result = resolve_scope_targets(
+            scope_expr, "alice", &store,
+            [&](const yuzu::scope::Expression& parsed)
+                -> std::expected<std::vector<std::string>, ScopeEvalError> {
+                // Simulates a concurrent delete_set/gc_sweep landing in the
+                // window between gate_scope_dispatch (already run, above,
+                // inside resolve_scope_targets, and already returned
+                // Proceed) and this evaluator's own real registry read.
+                REQUIRE(store.delete_set(rsid).has_value());
+                return registry.evaluate_scope(parsed, nullptr, nullptr, &store, "alice");
+            },
+            audit);
+        CHECK_FALSE(result.matched.has_value());
+        REQUIRE(result.abort_reason.has_value());
+        CHECK(*result.abort_reason == ScopeAbortReason::OwnerCheckFailed);
+        CHECK(aborted_reason == "owner_check_failed");
+        // The forensic per-ref row fires for the TOCTOU abort too (not only
+        // the gate-path AbortOwnerCheck case) -- see resolve_scope_targets's
+        // own comment on this.
+        REQUIRE(resolution_failed_refs.size() == 1);
+        CHECK(resolution_failed_refs[0] == rsid);
+        // dev-B (never a member) proves this never widened to a fleet-wide
+        // match; dev-A (the deleted set's only member) proves it, more
+        // strongly, never matched ANYONE -- an abort, not a match.
+        CHECK_FALSE(result.matched.has_value());
+    };
+
+    SECTION("bare form") { run_case("from_result_set:" + rsid); }
+    SECTION("NOT-combinator form -- the concrete fleet-wide-fail-open shape") {
+        run_case("NOT from_result_set:" + rsid);
+    }
+
+    // Re-create under the SAME id is astronomically unlikely (random suffix,
+    // see ResultSetStore::generate_id) so no re-fetch/cleanup is needed here.
 }

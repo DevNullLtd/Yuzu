@@ -1,0 +1,1 @@
+shared/Microsoft.NETCore.App/8.0.31

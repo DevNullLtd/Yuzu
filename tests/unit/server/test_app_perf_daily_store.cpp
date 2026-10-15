@@ -216,3 +216,118 @@ TEST_CASE("AppPerfDailyStore apply + read", "[pg][app_perf]") {
         CHECK(got->empty());
     }
 }
+
+TEST_CASE("AppPerfDailyStore::list_devices_for_version", "[pg][app_perf][version_devices]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, apperf_daily_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore store{pool};
+    REQUIRE(store.is_open());
+    const std::int64_t day = today_utc() - 86400;
+
+    // Three devices all reporting the SAME (app,version) with distinct cpu_avg
+    // so ordering is unambiguous; a fourth device reports a DIFFERENT version of
+    // the same app (must never be returned) and a fifth reports the SAME
+    // version of a DIFFERENT app (must never be returned either).
+    auto row = [&](double cpu) {
+        return std::vector<AppPerfDailyRow>{
+            {.app_name = "chrome.exe", .version = "119.0.0.0", .day = day, .samples = 10,
+             .instances_max = 1, .cpu_avg = cpu, .cpu_max = cpu, .ws_avg_bytes = 100,
+             .ws_max_bytes = 100}};
+    };
+    CHECK(store.apply_daily("agent-lo", row(5.0)));
+    CHECK(store.apply_daily("agent-mid", row(50.0)));
+    CHECK(store.apply_daily("agent-hi", row(90.0)));
+    CHECK(store.apply_daily(
+        "agent-other-version",
+        {{.app_name = "chrome.exe", .version = "118.0.0.0", .day = day, .samples = 10,
+          .instances_max = 1, .cpu_avg = 99.0, .cpu_max = 99.0, .ws_avg_bytes = 1,
+          .ws_max_bytes = 1}}));
+    CHECK(store.apply_daily(
+        "agent-other-app",
+        {{.app_name = "code.exe", .version = "119.0.0.0", .day = day, .samples = 10,
+          .instances_max = 1, .cpu_avg = 99.0, .cpu_max = 99.0, .ws_avg_bytes = 1,
+          .ws_max_bytes = 1}}));
+
+    SECTION("nullopt visible_agent_ids = unfiltered, ordered by descending cpu_avg") {
+        bool truncated = false;
+        auto got = store.list_devices_for_version("chrome.exe", "119.0.0.0", std::nullopt,
+                                                   truncated);
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == 3); // never the other-version/other-app rows
+        CHECK((*got)[0].agent_id == "agent-hi");
+        CHECK((*got)[1].agent_id == "agent-mid");
+        CHECK((*got)[2].agent_id == "agent-lo");
+        CHECK((*got)[0].last_day == day);
+        CHECK(std::abs((*got)[0].cpu_avg - 90.0) < 1e-9);
+        CHECK((*got)[0].ws_avg_bytes == 100);
+        CHECK_FALSE(truncated);
+    }
+
+    SECTION("engaged, non-empty visible_agent_ids restricts to exactly that set (ADR-0017)") {
+        // Pushed into the WHERE clause, never a post-fetch filter: only
+        // "agent-lo" is admitted even though it is the LOWEST-cpu (not the
+        // rank-1 row) — proves the filter is not merely "take the top of an
+        // unfiltered read".
+        std::optional<std::vector<std::string>> visible{std::vector<std::string>{"agent-lo"}};
+        bool truncated = false;
+        auto got = store.list_devices_for_version("chrome.exe", "119.0.0.0", visible, truncated);
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == 1);
+        CHECK((*got)[0].agent_id == "agent-lo");
+    }
+
+    SECTION("present-but-EMPTY visible_agent_ids yields ZERO rows (deny-all, not unfiltered)") {
+        // ADR-0033 §1 / ADR-0017: present-empty must NEVER read as "no filter".
+        std::optional<std::vector<std::string>> deny_all{std::vector<std::string>{}};
+        bool truncated = false;
+        auto got = store.list_devices_for_version("chrome.exe", "119.0.0.0", deny_all, truncated);
+        REQUIRE(got.has_value()); // NOT a degrade — a genuine, correctly-filtered empty
+        CHECK(got->empty());
+    }
+
+    SECTION("a version with no matching rows returns empty, not a degrade (retention-mismatch case)") {
+        bool truncated = false;
+        auto got = store.list_devices_for_version("chrome.exe", "999.0.0.0", std::nullopt,
+                                                   truncated);
+        REQUIRE(got.has_value());
+        CHECK(got->empty());
+    }
+
+    SECTION("empty app_name is a precondition miss, not a degrade; empty version is a valid key") {
+        bool truncated = false;
+        auto got = store.list_devices_for_version("", "119.0.0.0", std::nullopt, truncated);
+        REQUIRE(got.has_value());
+        CHECK(got->empty());
+
+        // "" is the valid unknown-version bucket, matched exactly like any other
+        // version string — not a precondition miss and not "all versions".
+        CHECK(store.apply_daily(
+            "agent-unknown-version",
+            {{.app_name = "linuxapp", .version = "", .day = day, .samples = 5, .instances_max = 1,
+              .cpu_avg = 42.0, .cpu_max = 42.0, .ws_avg_bytes = 1, .ws_max_bytes = 1}}));
+        auto unknown = store.list_devices_for_version("linuxapp", "", std::nullopt, truncated);
+        REQUIRE(unknown.has_value());
+        REQUIRE(unknown->size() == 1);
+        CHECK((*unknown)[0].agent_id == "agent-unknown-version");
+    }
+
+    SECTION("reports the device's MOST RECENT day for this version, not an older one") {
+        const std::int64_t older_day = day - 86400;
+        CHECK(store.apply_daily(
+            "agent-two-days",
+            {{.app_name = "twoday.exe", .version = "1.0.0.0", .day = older_day, .samples = 1,
+              .instances_max = 1, .cpu_avg = 1.0, .cpu_max = 1.0, .ws_avg_bytes = 1,
+              .ws_max_bytes = 1},
+             {.app_name = "twoday.exe", .version = "1.0.0.0", .day = day, .samples = 1,
+              .instances_max = 1, .cpu_avg = 77.0, .cpu_max = 77.0, .ws_avg_bytes = 1,
+              .ws_max_bytes = 1}}));
+        bool truncated = false;
+        auto got =
+            store.list_devices_for_version("twoday.exe", "1.0.0.0", std::nullopt, truncated);
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == 1);
+        CHECK((*got)[0].last_day == day); // the newer of the two days, not older_day
+        CHECK(std::abs((*got)[0].cpu_avg - 77.0) < 1e-9);
+    }
+}

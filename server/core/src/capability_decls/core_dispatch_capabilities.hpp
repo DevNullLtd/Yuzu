@@ -8,15 +8,16 @@
 
 /// @file core_dispatch_capabilities.hpp
 /// The ONE fragment of the command capability catalogue this package owns:
-/// the three dispatches the SERVER issues to itself rather than on a
+/// the four dispatches the SERVER issues to itself rather than on a
 /// caller's behalf. Every other `capability_decls/*.hpp` fragment (the five
 /// per-group plugin.action catalogues) belongs to a different package and is
 /// composed alongside this one only at the `CommandCapabilityRegistry`
 /// construction site — never merged into this array.
 ///
-/// The three rows, each `system_reserved = true` because none of them is
+/// The four rows, each `system_reserved = true` because none of them is
 /// reachable via an operator-attributable RBAC decision — they run on the
-/// server's own schedule/reconcile loops:
+/// server's own schedule/reconcile loops (or, for `__sync__.now`, behind a
+/// route that gates the operator itself and then dispatches as the system):
 ///
 ///   - `tar.fleet_snapshot` (`server.cpp:2427`) — the periodic fleet-wide
 ///     snapshot pull. Read-only: it asks agents to report, it does not
@@ -28,11 +29,14 @@
 ///   - `asset_tags.sync` (`server.cpp:6586`) — structured tag-category sync
 ///     to an agent. Mutating-but-reversible for the same reason: a later
 ///     sync simply supersedes the prior one.
+///   - `__sync__.now` (hardware_routes.cpp `POST /api/v1/hardware/{id}/sync`)
+///     — operator-requested inventory sync-on-demand (ADR-0016 update).
+///     Read-only: the agent re-runs a daily-sync source and reports.
 namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 3> kCoreDispatchCapabilities{{
+inline constexpr std::array<CommandCapability, 4> kCoreDispatchCapabilities{{
     {
         .plugin = "tar",
         .action = "fleet_snapshot",
@@ -63,6 +67,23 @@ inline constexpr std::array<CommandCapability, 3> kCoreDispatchCapabilities{{
         .securable = "Tag",
         .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::Medium,
+        .system_reserved = true,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        // Operator-REQUESTED but system-DISPATCHED (POST /api/v1/hardware/{id}/sync
+        // RBAC-gates the operator, then dispatches as the system caller): asks the
+        // agent to run its daily-sync source(s) now and report — the same thing it
+        // does unprompted every 24h. Read-only like tar.fleet_snapshot: nothing on
+        // the endpoint changes. The securable/operation here never admit anyone
+        // (system_reserved); they name the data the report lands under.
+        .plugin = "__sync__",
+        .action = "now",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
         .system_reserved = true,
         .execute_gate = ExecuteGate::None,
     },

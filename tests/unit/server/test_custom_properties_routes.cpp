@@ -373,6 +373,36 @@ TEST_CASE("custom_properties_routes: PUT body-shape 400s (missing 'value', inval
     CHECK(h.audits.empty());
 }
 
+// json-dump-depth-guard fix (#2437-class): nlohmann::json::dump() is
+// unboundedly recursive. This body is an otherwise-VALID request ("value" is
+// present) nested past the depth limit - the exact field this handler calls
+// .dump() on when it is not a string - so on unguarded code the request
+// proceeds to the store write, and only the new depth check tells fixed and
+// unfixed code apart. depth 40 is trivially safe to build/dump directly in
+// this test process; the real attack depth this guard exists for is many
+// orders of magnitude higher (~100,000 levels).
+TEST_CASE("custom_properties_routes: PUT a value nested past the depth limit is a 400 "
+          "with no audit and no store write",
+          "[pg][server][routes][custom_properties_routes][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_props_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::string deep_array = std::string(40, '[') + std::string(40, ']');
+    const std::string put_body = R"({"value":)" + deep_array + "}";
+    auto res = h.sink.Put("/api/agents/agent-1/properties/role", put_body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.audits.empty());
+
+    auto get = h.sink.Get("/api/agents/agent-1/properties");
+    REQUIRE(get);
+    CHECK(get->status == 200);
+    CHECK(body(get->body)["properties"].empty());
+}
+
 TEST_CASE("custom_properties_routes: PUT with a value failing store-side validation is a "
           "400 with a 'failure' audit row (not the db-error 503 branch)",
           "[pg][server][routes][custom_properties_routes]") {

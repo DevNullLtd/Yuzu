@@ -365,6 +365,42 @@ TEST_CASE("config_routes: PUT an invalid JSON body is a 400 with no audit",
     CHECK(h.audits.empty());
 }
 
+// json-dump-depth-guard fix (#2437-class): nlohmann::json::dump() is
+// unboundedly recursive. This body is an otherwise-VALID request ("value" is
+// present) nested past the depth limit - the exact field this handler calls
+// .dump() on when it is not a string - so on unguarded code the request
+// proceeds to the store write. Uses "oidc_issuer" (a plain string key with
+// no downstream value-shape validation of its own) rather than "log_level"
+// (whose enumerated-value check would also 400 a dumped array, masking
+// whether THIS guard fired); the message assertion additionally proves it
+// was this guard that fired, not some other 400. depth 40 is trivially safe
+// to build/dump directly in this test process; the real attack depth this
+// guard exists for is many orders of magnitude higher (~100,000 levels).
+TEST_CASE("config_routes: PUT a value nested past the depth limit is a 400 with no "
+          "audit and no store write",
+          "[pg][server][routes][config_routes][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    PgWired w{db.dsn()};
+    MockHarness h;
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    const std::string deep_array = std::string(40, '[') + std::string(40, ']');
+    const std::string put_body = R"({"value":)" + deep_array + "}";
+    auto res = h.sink.Put("/api/config/oidc_issuer", put_body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto res_b = body(res->body);
+    CHECK(res_b["error"]["message"].get<std::string>().find("nests too deeply") !=
+          std::string::npos);
+    CHECK(h.audits.empty());
+
+    auto get_res = h.sink.Get("/api/config");
+    REQUIRE(get_res);
+    auto get_b = body(get_res->body);
+    CHECK_FALSE(get_b["overrides"].contains("oidc_issuer"));
+}
+
 TEST_CASE("config_routes: PUT a secret key never leaks the raw value into the audit detail "
           "or the response body",
           "[pg][server][routes][config_routes]") {

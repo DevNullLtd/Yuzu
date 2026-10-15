@@ -41,6 +41,7 @@
 #include "../test_helpers.hpp"
 
 #include <chrono>
+#include <ctime>
 #include <optional>
 #include <string>
 #include <vector>
@@ -444,38 +445,69 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: an operator-tier session CAN ro
     CHECK(res->status == 200);
 }
 
-// De-escalating direction (governance Gate 8 follow-up — see
+// De-escalating direction — DECIDED by #2963 (see
 // docs/user-manual/authentication.md "Rotating a Token" and
-// docs/auth-architecture.md "Human API-token rotation" for the documented
-// consequence): the harness's session tier/scope default to `""`/`""` —
-// the cookie/JIT-elevated interactive shape — so this pins the guard's
-// OTHER direction from the two tests above: an untiered session can never
-// rotate a TIERED predecessor either, even though it is the token's own
-// owner and holds no lesser authority than the token itself grants nobody
-// else. This is the documented capability loss, not a defect — the owner
-// of an MCP-tiered or service-scoped token can only rotate it by
-// presenting that token's own credential (or an equally-tiered one), never
-// from the dashboard/cookie session. Nothing in this suite exercised this
-// direction before this test — the REST harness's tier/scope default IS
-// untiered, so a route that silently passed empty strings for
-// caller_mcp_tier/caller_scope_service (rather than the real session
-// authority) would have stayed green on every OTHER test in this file.
-TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: an UNTIERED (cookie-shaped) session is "
-          "refused rotating its own TIERED token — the de-escalating direction is blocked too",
+// docs/auth-architecture.md "Human API-token rotation" for the design
+// record): the harness's session tier/scope default to `""`/`""` — the
+// cookie/JIT-elevated interactive shape. Before #2963 this direction was
+// refused (the guard was bare equality, so an untiered caller could not
+// touch a tiered predecessor either, even though it holds a strict
+// superset of that token's own authority). The decision: a caller
+// presenting NO standing tier/scope at all may now rotate/confirm ANY of
+// its own tokens regardless of that token's own tier/scope — a single
+// special case, not a general "no broader than" ordering — because the
+// successor still inherits the TOKEN's own narrower tier/scope verbatim,
+// never the caller's, so nothing is escalated. This is what makes it
+// possible to rotate a possibly-compromised MCP-tiered token from the
+// dashboard, which could not reach it before. Nothing in this suite
+// exercised this direction before the sibling test that preceded this one
+// existed — the REST harness's tier/scope default IS untiered, so a route
+// that silently passed empty strings for caller_mcp_tier/caller_scope_service
+// (rather than the real session authority) would have stayed green on
+// every OTHER test in this file.
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: an UNTIERED (cookie-shaped) session CAN "
+          "rotate its own TIERED token — the #2963 full-authority exception, and the "
+          "successor inherits the TOKEN's own tier, never the caller's",
           "[pg][rest][token][rotation][security]") {
     RestTokenRotationHarness h;
     auto token_id = h.create_token_for("alice", "alices-tiered-key", now_epoch() + 86400 * 30,
                                        /*scope_service=*/"", /*mcp_tier=*/"operator");
     h.session_user = "alice";
     // h.session_mcp_tier left at its default "" — an untiered/cookie
-    // session, distinct from the token's own "operator" tier.
+    // session, distinct from the token's own "operator" tier. This is
+    // exactly the #2963 exception's precondition.
 
     auto res = h.rotate(token_id);
     REQUIRE(res);
-    // Same store-reached "no such token to rotate" wording/status as the
-    // operator-vs-untiered direction above — the guard is symmetric
-    // equality, not an ordering, so "caller has LESS authority than the
-    // token" refuses exactly like "caller has MORE".
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    auto successor_id = body["data"]["token_id"].get<std::string>();
+    auto successor = h.token_store->get_token(successor_id).value();
+    REQUIRE(successor.has_value());
+    // Inherits the PREDECESSOR's own tier — the caller's (empty) authority
+    // never leaks into the successor.
+    CHECK(successor->mcp_tier == "operator");
+
+    auto predecessor = h.token_store->get_token(token_id).value();
+    REQUIRE(predecessor.has_value());
+    CHECK(predecessor->rotation_group == successor->rotation_group);
+    CHECK_FALSE(predecessor->rotation_group.empty()); // successor WAS minted
+}
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: a caller holding SOME non-empty tier is "
+          "still refused rotating a DIFFERENT tier — the #2963 exception is narrow, never "
+          "a lattice",
+          "[pg][rest][token][rotation][security]") {
+    RestTokenRotationHarness h;
+    auto token_id = h.create_token_for("alice", "alices-supervised-key",
+                                       now_epoch() + 86400 * 30,
+                                       /*scope_service=*/"", /*mcp_tier=*/"supervised");
+    h.session_user = "alice";
+    h.session_mcp_tier = "operator"; // non-empty, but NOT "supervised"
+
+    auto res = h.rotate(token_id);
+    REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(res->body.find("no such token to rotate") != std::string::npos);
 
@@ -699,7 +731,12 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: overlap_expires_at describes th
     auto token_id = h.create_token_for("alice", "alice-key");
     h.session_user = "alice";
 
-    const int64_t before = now_epoch();
+    // The handler stamps now = std::time(nullptr). On MSVC that is the coarse system
+    // time, which reads up to ~15 ms (measured on a real host) behind system_clock
+    // after each second boundary. Take the lower reference from the same source so
+    // the bound below cannot fail by one second; the upper bound stays on the newer
+    // clock.
+    const int64_t before = static_cast<int64_t>(std::time(nullptr));
     auto res = h.rotate(token_id, /*overlap_secs=*/86400);
     REQUIRE(res);
     REQUIRE(res->status == 200);

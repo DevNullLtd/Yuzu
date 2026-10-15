@@ -64,7 +64,7 @@ You perform a targeted review when a change:
 
 The UAT stack runs server, gateway, and observability in Docker containers while the agent runs natively on the host. The canonical deployment is:
 
-- **`docker-compose.uat.yml`** — Release artifact (uploaded to GitHub Releases). Uses `ghcr.io/tr3kkr/yuzu-*` images. Remote UAT testers download this single file. This is the product.
+- **`docker-compose.uat.yml`** — Release artifact (uploaded to GitHub Releases). Uses `ghcr.io/devnullltd/yuzu-*` images. Remote UAT testers download this single file. This is the product.
 
 A `docker-compose.local.yml` (gitignored) may exist temporarily during development when the release images don't yet contain fixes being tested. The goal is to eliminate the need for it — every fix should flow through the release pipeline so `docker-compose.uat.yml` works out of the box.
 
@@ -81,6 +81,7 @@ Host :50052  →  server container  :50052  (management gRPC)
 
 The server runs in gateway mode with three flags:
 - `--gateway-upstream 0.0.0.0:50055` — gateway connects here to proxy registrations/heartbeats
+  (the server refuses to start with it unless gateway peer authorization resolves: a pin, `--gateway-peer-pin` / `--gateway-peer-pin-file`, automatic on the generated default certificates, or on a plaintext rig only `--insecure-gateway-peer` / `YUZU_INSECURE_GATEWAY_PEER=1`; `--no-tls` alone is not an acknowledgement; see `docs/user-manual/server-admin.md` "Gateway upstream peer authorization")
 - `--gateway-mode` — relaxes Subscribe peer validation for gateway-proxied agents
 - `--gateway-command-addr gateway:50063` — server forwards commands to gateway for fanout
 

@@ -74,10 +74,27 @@ DexPerfFleetNow dex_perf_fleet_now(const DexPerfSnapshot& snap) {
     DexPerfFleetNow out;
     std::vector<double> cpu, commit, disk;
     for (const auto& d : snap.devices) {
-        if (d.is_windows)
+        // *_online: every online device of that OS, regardless of whether it
+        // reported anything this cycle. perf_capable_online (below) is the
+        // coverage-honest denominator: only OSes that collect perf.
+        if (d.os == "windows")
             ++out.windows_online;
-        if (reports_any(d))
+        else if (d.os == "linux")
+            ++out.linux_online;
+        else if (d.os == "macos")
+            ++out.macos_online;
+        if (detail::dex_perf_os_collects(d.os))
+            ++out.perf_capable_online;
+        const bool reported = reports_any(d);
+        if (reported) {
             ++out.reporting;
+            if (d.os == "windows")
+                ++out.reporting_windows;
+            else if (d.os == "linux")
+                ++out.reporting_linux;
+            else if (d.os == "macos")
+                ++out.reporting_macos;
+        }
         if (d.cpu_pct)
             cpu.push_back(*d.cpu_pct);
         if (d.commit_pct)
@@ -306,9 +323,9 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
         if (cohort_filter && d.cohort != *cohort_filter)
             continue;
         if (not_reporting) {
-            // The complement list: Windows devices (the only OS expected to
-            // report today) that contributed nothing this cycle.
-            if (!d.is_windows || reports_any(d))
+            // The complement list: devices whose OS has a real perf collector
+            // (dex_perf_os_collects) but contributed nothing this cycle.
+            if (!detail::dex_perf_os_collects(d.os) || reports_any(d))
                 continue;
         } else {
             if (!metric_value(d, metric))
@@ -320,6 +337,7 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
         r.cpu_pct = d.cpu_pct;
         r.commit_pct = d.commit_pct;
         r.disk_lat_ms = d.disk_lat_ms;
+        r.os = d.os;
         if (auto v = metric_value(d, metric))
             r.fleet_pctile = detail::percentile_rank(fleet_vals, *v);
         rows.push_back(std::move(r));

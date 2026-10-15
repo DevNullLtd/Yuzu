@@ -386,7 +386,7 @@ TEST_CASE("ca_routes: GET /ca/crl serves latest-or-503, never builds on the publ
     rec.der = {0x30, 0x01, 0x00};
     rec.this_update = 1;
     rec.next_update = 2;
-    REQUIRE(h.store->record_crl(rec));
+    REQUIRE(h.store->record_crl_for_test(rec));
     auto served = h.sink.Get("/api/v1/ca/crl");
     REQUIRE(served);
     REQUIRE(served->status == 200);
@@ -533,6 +533,40 @@ TEST_CASE("ca_routes: dashboard fragment renders, gated, and HTML-escapes (PR4b)
     auto denied = h.sink.Get("/fragments/settings/ca");
     REQUIRE(denied);
     REQUIRE(denied->status == 403);
+}
+
+// An unrevoked certificate past not_after reads Expired, in the neutral colour a revoked one
+// wears, never Active and never the green OK colour (role-ok). A certificate still in date
+// stays Active, and a revoked one reads Revoked even once it has also lapsed.
+TEST_CASE("ca_routes: an expired certificate is listed as Expired and never as Active",
+          "[ca_routes][pki][pg]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    IssuedCertRecord lapsed = sample_issued("E0D1");
+    lapsed.not_after = 1; // long past
+    REQUIRE(h.store->record_issued(lapsed));
+    REQUIRE(h.store->record_issued(sample_issued("F00D"))); // in date (not_after 9999999999)
+    IssuedCertRecord both = sample_issued("B07A");
+    both.not_after = 1;
+    REQUIRE(h.store->record_issued(both));
+    REQUIRE(h.store->revoke("B07A", "test").value());
+    h.wire();
+
+    auto frag = h.sink.Get("/fragments/settings/ca");
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200);
+    // The pill that follows a row's serial cell.
+    const auto pill_of = [&](const std::string& serial) {
+        const auto row = frag->body.find("title=\"" + serial + "\"");
+        REQUIRE(row != std::string::npos);
+        const auto pill = frag->body.find("role-badge ", row);
+        REQUIRE(pill != std::string::npos);
+        return frag->body.substr(pill, frag->body.find("</span>", pill) - pill);
+    };
+    CHECK(pill_of("E0D1") == "role-badge role-user\">Expired");
+    CHECK(pill_of("F00D") == "role-badge role-admin\">Active");
+    CHECK(pill_of("B07A") == "role-badge role-user\">Revoked");
+    CHECK(frag->body.find("role-ok") == std::string::npos);
 }
 
 TEST_CASE("ca_routes: dashboard revoke wrapper revokes + re-renders (PR4b)",
@@ -691,10 +725,18 @@ TEST_CASE("ca_routes: POST /ca/import-chain validates body + maps outcomes + aud
     REQUIRE(j["crl_republished"] == true); // CRL refreshed under the new issuer
     REQUIRE(h.crl_calls == 1);
     bool saw_import = false;
-    for (const auto& a : h.audits)
+    bool saw_crl_published = false;
+    for (const auto& a : h.audits) {
         if (a.action == "ca.subordinate.imported" && a.result == "success")
             saw_import = true;
+        // #4829: the import-chain path previously wrote NO ca.crl.published row at all —
+        // symmetric with revoke's own pair, and carries reason=import_chain to distinguish it.
+        if (a.action == "ca.crl.published" && a.result == "success" &&
+            a.detail.find("reason=import_chain") != std::string::npos)
+            saw_crl_published = true;
+    }
     REQUIRE(saw_import);
+    REQUIRE(saw_crl_published);
 
     // Body validation: invalid JSON → 400; missing fields → 400.
     auto badjson = h.sink.Post("/api/v1/ca/import-chain", "{not json");
@@ -778,9 +820,20 @@ TEST_CASE("ca_routes: dashboard import wrapper enforces CSRF + Security:Write (P
     REQUIRE(ok->get_header_value("Content-Type").find("text/html") != std::string::npos);
     REQUIRE(h.last_import_intermediate == "INT");
     REQUIRE(h.last_import_chain == "PAR");
+    // #4829: the dashboard import-chain path previously wrote NO ca.crl.published row.
+    {
+        bool saw = false;
+        for (const auto& a : h.audits)
+            if (a.action == "ca.crl.published" && a.result == "success" &&
+                a.detail.find("reason=import_chain") != std::string::npos &&
+                a.detail.find("via=dashboard") != std::string::npos)
+                saw = true;
+        REQUIRE(saw);
+    }
 
     // Hermes 6c LOW: a CRL-republish failure on a successful dashboard import is
     // SURFACED (the import stands, but the panel warns the CRL is stale).
+    h.audits.clear();
     h.crl_succeeds = false;
     auto crlfail = h.sink.dispatch("POST",
                                    "/api/settings/ca/import-chain?intermediate_pem=INT&chain_pem=PAR",
@@ -788,6 +841,14 @@ TEST_CASE("ca_routes: dashboard import wrapper enforces CSRF + Security:Write (P
     REQUIRE(crlfail);
     REQUIRE(crlfail->status == 200);                            // import still succeeded
     REQUIRE(crlfail->body.find("CRL could not be republished") != std::string::npos);
+    {
+        bool saw = false;
+        for (const auto& a : h.audits)
+            if (a.action == "ca.crl.published" && a.result == "failure" &&
+                a.detail.find("reason=import_chain") != std::string::npos)
+                saw = true;
+        REQUIRE(saw);
+    }
     h.crl_succeeds = true;
 
     // Cross-origin → 403 + csrf.denied, and import_chain_fn must NOT be called.

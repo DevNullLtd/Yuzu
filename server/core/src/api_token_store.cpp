@@ -545,13 +545,42 @@ bool constant_time_hex_equal(const std::string& a, const std::string& b) {
 // already-scrubbed/empty string is a no-op) — so the theoretical
 // double-fire hazard has no live path, and there is no defect this
 // guard needs deleted copy/move to close. Same reasoning applies to the
-// byte-identical sibling in `agents/core/src/agent.cpp`; keep both
+// byte-identical siblings in `agents/core/src/agent.cpp` and
+// `agents/core/src/spark_engine.cpp` (#2050) — keep all three
 // aggregate, not just this one.
 template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }
 };
 template <typename F> ScopeExit(F) -> ScopeExit<F>;
+
+// #2963: the authority-inheritance guard used by rotate_token/
+// confirm_token_rotation (three call sites — the pre-txn mirror and the
+// authoritative check in rotate_token, plus confirm_token_rotation's own
+// defense-in-depth copy) originally required caller_mcp_tier/
+// caller_scope_service to match the token's OWN tier/scope exactly, which
+// makes a full-authority interactive session (a plain cookie session,
+// tier="" scope="") structurally unable to rotate/confirm its OWN
+// MCP-tiered or service-scoped token — backwards precisely when the
+// reason to rotate is that the secret may be compromised.
+//
+// The fix is a SINGLE special case, not a tier lattice: a caller holding
+// NO standing tier/scope authority at all already holds a strict superset
+// of what ANY tiered/scoped token can do, so admitting it here grants
+// nothing new — the successor still inherits the TOKEN's own (narrower)
+// tier/scope verbatim, copied from the predecessor, never from the
+// caller. A caller that itself holds SOME non-empty tier/scope must still
+// match the token's exactly (no ordering/"no-broader-than" comparison —
+// that requires a lattice assumption this guard deliberately does not
+// make, per its original design).
+[[nodiscard]] bool caller_may_act_on_tiered_token(std::string_view token_mcp_tier,
+                                                   std::string_view token_scope_service,
+                                                   std::string_view caller_mcp_tier,
+                                                   std::string_view caller_scope_service) {
+    if (caller_mcp_tier.empty() && caller_scope_service.empty())
+        return true; // full-authority caller — the #2963 exception
+    return token_mcp_tier == caller_mcp_tier && token_scope_service == caller_scope_service;
+}
 
 } // namespace
 
@@ -1034,24 +1063,37 @@ ApiTokenStore::get_token(const std::string& token_id) const {
 
 std::vector<ApiToken>
 ApiTokenStore::list_active_for_principal(const std::string& principal_id) const {
+    // Both failure arms of the checked twin collapse to an empty vector here:
+    // this accessor's positive-read contract (rotation_confirm_state.hpp) is
+    // that an empty vector is indistinguishable from a genuine
+    // zero-active-credentials read by ANY caller. That is fine for a
+    // destructive in-transaction consumer (stays retryable), but #2443's
+    // precondition caller has no other signal to notice a persistent fault
+    // here — the warn line the checked twin writes is that signal for
+    // on-call, since the caller itself denies-without-consuming either way
+    // and cannot distinguish the causes from the return value alone. A caller
+    // that must tell "none" from "could not read" uses
+    // list_active_for_principal_checked directly (#5342 Gate 7).
+    auto checked = list_active_for_principal_checked(principal_id);
+    if (!checked)
+        return {};
+    return std::move(*checked);
+}
+
+std::expected<std::vector<ApiToken>, std::string>
+ApiTokenStore::list_active_for_principal_checked(const std::string& principal_id) const {
     std::vector<ApiToken> result;
-    if (!open_ || principal_id.empty())
+    if (!open_)
+        return std::unexpected(std::string("token store is not open"));
+    if (principal_id.empty())
         return result;
 
-    // Both early returns below share rotation_confirm_state.hpp's positive-read
-    // contract: an empty vector here is indistinguishable from a genuine
-    // zero-active-credentials read by ANY caller of this public accessor. That
-    // is fine for a destructive in-transaction consumer (stays retryable), but
-    // #2443's precondition caller has no other signal to notice a persistent
-    // fault here — the warn line is that signal for on-call, since the caller
-    // itself denies-without-consuming either way and cannot distinguish the
-    // causes from the return value alone.
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::warn("ApiTokenStore::list_active_for_principal: pool lease timed out for "
                      "principal_id={}",
                      principal_id);
-        return result;
+        return std::unexpected(std::string("pool lease timed out"));
     }
 
     const auto now = now_epoch();
@@ -1066,7 +1108,7 @@ ApiTokenStore::list_active_for_principal(const std::string& principal_id) const 
         spdlog::warn("ApiTokenStore::list_active_for_principal: query failed for "
                      "principal_id={}: {}",
                      principal_id, PQerrorMessage(lease.get()));
-        return result;
+        return std::unexpected(std::string("query failed"));
     }
 
     const int rows = PQntuples(res.get());
@@ -1911,11 +1953,13 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
         // Authority-inheritance guard (governance Gate 7 CRITICAL fix) —
         // early-rejection MIRROR only, against this pre-lock snapshot; the
         // fresh re-read under the advisory lock below is authoritative. See
-        // the header doc comment for the full rationale. Folded into the
-        // SAME "no such token to rotate" wording so this is not an
-        // authority-probing oracle.
-        if (lookup.token->mcp_tier != caller_mcp_tier ||
-            lookup.token->scope_service != caller_scope_service)
+        // the header doc comment for the full rationale, and
+        // caller_may_act_on_tiered_token's doc comment for the #2963
+        // full-authority-caller exception. Folded into the SAME "no such
+        // token to rotate" wording so this is not an authority-probing
+        // oracle.
+        if (!caller_may_act_on_tiered_token(lookup.token->mcp_tier, lookup.token->scope_service,
+                                            caller_mcp_tier, caller_scope_service))
             return std::unexpected("no such token to rotate");
         if (lookup.token->principal_kind != "human")
             return std::unexpected("token is not a human-owned credential");
@@ -2053,11 +2097,16 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
         // caller could rotate their own untiered sibling token into a
         // fresh untiered/perpetual credential. Equality against the FRESH
         // under-lock read, never a "no-broader-than" ordering (deliberate
-        // — needs no tier-lattice assumption). Folded into the SAME
-        // "no such token to rotate" wording as the absence/ownership
+        // — needs no tier-lattice assumption), EXCEPT the single #2963
+        // full-authority-caller case caller_may_act_on_tiered_token
+        // carves out (a caller with NO standing tier/scope authority
+        // already holds a superset of any tiered/scoped token, so it may
+        // rotate one it owns — the successor still inherits the token's
+        // OWN narrower tier/scope, never the caller's). Folded into the
+        // SAME "no such token to rotate" wording as the absence/ownership
         // checks above so this is not an authority-probing oracle.
-        if (lookup.token->mcp_tier != caller_mcp_tier ||
-            lookup.token->scope_service != caller_scope_service) {
+        if (!caller_may_act_on_tiered_token(lookup.token->mcp_tier, lookup.token->scope_service,
+                                            caller_mcp_tier, caller_scope_service)) {
             error_msg = "no such token to rotate";
             return false;
         }
@@ -2315,9 +2364,14 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
         // diverge from what the caller who initiated the rotation already
         // held, so rotate_token's own guard is the load-bearing one; this
         // catches only a hypothetical future bypass of it, never a live
-        // path today. Same "no such token" wording for the same reason.
-        if (lookup.token->mcp_tier != caller_mcp_tier ||
-            lookup.token->scope_service != caller_scope_service) {
+        // path today. Uses the SAME caller_may_act_on_tiered_token
+        // exception as rotate_token (#2963) — a full-authority caller that
+        // successfully rotated a tiered token must also be able to
+        // confirm it, or the two calls would disagree on the identical
+        // caller/token pair. Same "no such token" wording for the same
+        // reason.
+        if (!caller_may_act_on_tiered_token(lookup.token->mcp_tier, lookup.token->scope_service,
+                                            caller_mcp_tier, caller_scope_service)) {
             error_msg = "no such token to confirm";
             return false;
         }

@@ -54,6 +54,12 @@
 /// EXTEND this set, never fork it — a second copy of a floor set is exactly
 /// the kind of drift the repo's other chokepoints (`dispatch_confined_arms.hpp`,
 /// `principal_quota_gate.hpp`) exist to prevent.
+///
+/// `legacy_self_service_allow.hpp` is this file's counterpart in the SAME two
+/// legacy branches (#2963) — checked in the same order, at the same two call
+/// sites — but widening rather than flooring: a narrow, self-targeted
+/// exception from the "non-Read needs admin" rule, never overriding this
+/// floor (a floored pair can never also be self-service-exempt).
 namespace yuzu::server {
 
 /// One (securable, operation) pair in the topology floor.
@@ -95,6 +101,17 @@ inline constexpr TopologyFloorEntry kTopologyFloor[] = {
     // this set, never fork it" rule.
     {"Enrollment", "Read"},
     {"OidcConfig", "Read"},
+    // Wave 7 PR7.2 (app_usage): docs/authz-model.md §4 documents every
+    // Forensics read as Administrator-only, and Forensics is absent from the
+    // Viewer read-list. Without this entry, an RBAC-off default install
+    // (rbac_enabled_ false) would serve the app-usage REST route and its MCP
+    // twin to any authenticated cookie session via the legacy Read-allow at
+    // auth_routes.cpp:1145 — the same defect class every other entry in this
+    // set closes. The floor lives only in the legacy branch, so a live RBAC
+    // grant (e.g. a seeded Administrator) still admits; plugin dispatch is
+    // unaffected (it authorizes via has_permission + the AdminOrApproval
+    // switch in agent_registry.hpp:243-285, not this branch).
+    {"Forensics", "Read"},
 };
 
 /// True when `(securable, operation)` is in the topology floor, i.e. the

@@ -26,16 +26,23 @@
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
 #include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
+#include "guardian_legacy_sink_executor.hpp" // LegacySendOutcome (EventSink's return type, #4783)
 
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <set>
 #include <string>
+#include <system_error>
+#include <vector>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -540,17 +547,224 @@ TEST_CASE("GuardianEngine: delta merge keeps prior rules and updates overlap",
     CHECK(raw->find("\"name\":\"first-renamed\"") != std::string::npos);
 }
 
-TEST_CASE("GuardianEngine: rules with empty rule_id are skipped, not persisted",
+// ── #4665: an invalid rule_id anywhere in a push rejects the WHOLE push ────
+//
+// Pre-#4665, a push containing one rule with an empty (or otherwise invalid)
+// rule_id among otherwise-valid rules would skip just that one rule and
+// still apply/arm the rest - and, on a full_sync push, still advance
+// policy_generation_ to the pushed value even though the skipped rule's
+// prior enforcement (torn down by full_sync's own teardown) was never
+// re-armed. That silently drops a rule's enforcement while reporting the
+// agent as caught-up on the generation. The fix pre-validates every rule_id
+// BEFORE any teardown/mutation and rejects the whole push on the first
+// invalid one - these tests assert no rule mutation and no generation
+// advance happen on rejection, for both full_sync and incremental pushes.
+
+TEST_CASE("GuardianEngine: a push with an empty rule_id is rejected whole, not skipped",
           "[guardian][engine][apply][validation]") {
     GuardianFixture f;
     gpb::GuaranteedStatePush p;
     p.set_full_sync(true);
+    p.set_policy_generation(5);
     *p.add_rules() = GuardianFixture::make_rule("", "no-id");
     *p.add_rules() = GuardianFixture::make_rule("r-keep", "valid");
     auto applied = f.engine->apply_rules(p);
-    REQUIRE(applied.has_value());
-    CHECK(*applied == 1);
+    CHECK_FALSE(applied.has_value());
+    // Nothing was persisted - not even the otherwise-valid "r-keep" rule -
+    // and the generation did not advance off its fresh-KV default of 0.
+    CHECK(f.engine->rule_count() == 0);
+    CHECK(f.engine->policy_generation() == 0);
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-keep"));
+}
+
+TEST_CASE("GuardianEngine: a push with a charset-violating rule_id is rejected whole",
+          "[guardian][engine][apply][validation]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_rule("bad id\nwith control bytes", "bad");
+    *p.add_rules() = GuardianFixture::make_rule("r-keep", "valid");
+    auto applied = f.engine->apply_rules(p);
+    CHECK_FALSE(applied.has_value());
+    CHECK(f.engine->rule_count() == 0);
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-keep"));
+}
+
+TEST_CASE("GuardianEngine: a push with an over-length rule_id is rejected whole",
+          "[guardian][engine][apply][validation]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_rule(std::string(257, 'a'), "too-long");
+    *p.add_rules() = GuardianFixture::make_rule("r-keep", "valid");
+    auto applied = f.engine->apply_rules(p);
+    CHECK_FALSE(applied.has_value());
+    CHECK(f.engine->rule_count() == 0);
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-keep"));
+}
+
+TEST_CASE("GuardianEngine: a full_sync push with a mixed valid/invalid rule_id set "
+          "does not tear down the prior rule set",
+          "[guardian][engine][apply][validation][full_sync]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(1);
+        *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    REQUIRE(f.engine->rule_count() == 1);
+    REQUIRE(f.engine->policy_generation() == 1);
+
+    // A later full_sync push at a HIGHER generation, with a genuinely new
+    // valid rule alongside one with a bad id - if this silently tore down
+    // r-1 (full_sync's own teardown, ~line 1091 at the time this test was
+    // written) before validating, r-1 would be gone even though the whole
+    // push is rejected.
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(2);
+        *p.add_rules() = GuardianFixture::make_rule("r-2", "second");
+        *p.add_rules() = GuardianFixture::make_rule("", "bad");
+        auto applied = f.engine->apply_rules(p);
+        CHECK_FALSE(applied.has_value());
+    }
+
+    // r-1 survives, unarmed generation 2 rule never landed, generation held at 1.
     CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->policy_generation() == 1);
+    CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-1"));
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-2"));
+}
+
+TEST_CASE("GuardianEngine: an incremental push with a mixed valid/invalid rule_id set "
+          "leaves the prior rule set untouched",
+          "[guardian][engine][apply][validation]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(1);
+        *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(false);
+        p.set_policy_generation(2);
+        *p.add_rules() = GuardianFixture::make_rule("r-2", "second");
+        *p.add_rules() = GuardianFixture::make_rule("bad id", "bad");
+        auto applied = f.engine->apply_rules(p);
+        CHECK_FALSE(applied.has_value());
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->policy_generation() == 1);
+    CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-1"));
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-2"));
+}
+
+TEST_CASE("GuardianEngine: a push where every rule_id is valid is unaffected by the "
+          "#4665 pre-validation pass",
+          "[guardian][engine][apply][validation]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(3);
+    *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+    *p.add_rules() = GuardianFixture::make_rule("r-2", "second");
+    auto applied = f.engine->apply_rules(p);
+    REQUIRE(applied.has_value());
+    CHECK(*applied == 2);
+    CHECK(f.engine->rule_count() == 2);
+    CHECK(f.engine->policy_generation() == 3);
+}
+
+TEST_CASE("GuardianEngine: a full_sync push clears a pre-#4665 legacy rule's PERSISTED "
+          "state when the server excludes it for a non-conforming rule_id (hard cutover, "
+          "not preserved)",
+          "[guardian][engine][apply][validation][full_sync]") {
+    // Governance-external-review finding (fjarvis, PR #4979): apply_rules()'s own
+    // pre-validation now rejects any push CONTAINING a non-conforming rule_id, and
+    // guardian_push_builder.cpp's server-side filter (#4665) excludes such a row
+    // from every push it builds -- so the only way this state exists in a real
+    // fleet is a row that predates #4665 entirely, now silently ABSENT from every
+    // push. Seeded directly into KV here (the only way to reach it, since
+    // apply_rules() can no longer be used to create it) to prove the
+    // full_sync/exclusion interaction actually clears its persisted state cleanly
+    // -- Dave's explicit call: this is a hard cutover, not a migration, so
+    // "cleanly cleared" is the CORRECT outcome to pin, not a bug to route around.
+    //
+    // What this pins vs. what it doesn't (Gate-8 re-verification finding, LOW,
+    // 2026-09-25): it proves the KV row is genuinely deleted -- the crux of the
+    // hard-cutover behaviour, and what apply_rules() itself controls. It does NOT
+    // prove a previously-RUNNING legacy guard gets torn down, because this
+    // codebase's own Windows-only-for-MVP legacy backends (make_registry_rule's
+    // and make_file_hash_rule's own doc comments, above) mean armed_guard_count()
+    // cannot observe a real arm on this test's Linux CI host regardless of what
+    // this fix touches -- that teardown path (stop_all_guards_locked(), already
+    // unconditional and unchanged by this fix) is proven separately by this
+    // file's other full_sync TEST_CASEs, not re-proven here.
+    GuardianFixture f;
+    nlohmann::json legacy;
+    legacy["rule_id"] = "bad id";
+    legacy["name"] = "bad id";
+    legacy["yaml_source"] = "name: bad id\n";
+    legacy["version"] = 1;
+    legacy["enabled"] = true;
+    legacy["enforcement_mode"] = "enforce";
+    legacy["spark"] = nlohmann::json::object();
+    legacy["assertion"] = nlohmann::json::object();
+    legacy["remediation"] = nlohmann::json::object();
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "rule:bad id", legacy.dump()));
+    REQUIRE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:bad id"));
+
+    // The push the agent actually receives in production: fully valid, simply
+    // omitting the excluded legacy rule_id -- exactly what
+    // guardian_push_builder.cpp's filter produces.
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(2);
+    *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+    auto applied = f.engine->apply_rules(p);
+    REQUIRE(applied.has_value());
+
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:bad id"));
+    CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-1"));
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->policy_generation() == 2);
+}
+
+TEST_CASE("GuardianEngine: a rejected push does not latch the ack ledger against a "
+          "later valid push",
+          "[guardian][engine][apply][validation]") {
+    // The #4665 pre-validation pass deliberately does NOT call
+    // ack_ledger_->latch_failure() on rejection (it runs before
+    // begin_application(), so there is no current application to latch a
+    // failure against). This proves that choice leaves nothing "stuck" -
+    // a rejected push followed by a genuinely valid push at a higher
+    // generation must apply and advance normally.
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(1);
+        *p.add_rules() = GuardianFixture::make_rule("", "bad");
+        CHECK_FALSE(f.engine->apply_rules(p).has_value());
+    }
+    CHECK(f.engine->policy_generation() == 0);
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(2);
+        *p.add_rules() = GuardianFixture::make_rule("r-1", "first");
+        auto applied = f.engine->apply_rules(p);
+        REQUIRE(applied.has_value());
+        CHECK(*applied == 1);
+    }
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.engine->policy_generation() == 2);
 }
 
 TEST_CASE("GuardianEngine: dispatch routes push_rules through SerializeAsString",
@@ -886,10 +1100,17 @@ TEST_CASE("GuardianEngine: drift event_id embeds agent_id (#1307)",
           "[guardian][engine][event][event_id]") {
     GuardianFixture f;  // agent_id == "agent-test"
 
-    std::string captured_id;
-    f.engine->set_event_sink([&captured_id](const gpb::GuaranteedStateEvent& ev) {
-        captured_id = ev.event_id();
+    // #4783: EventSink delivery is now asynchronous (a detached executor worker,
+    // not the calling thread) — own the captured data via shared_ptr rather than
+    // reference-capturing a local declared after the fixture, so destruction
+    // order can never race the worker's own access to it.
+    auto captured_id = std::make_shared<std::string>();
+    f.engine->set_event_sink([captured_id](const gpb::GuaranteedStateEvent& ev) {
+        *captured_id = ev.event_id();
+        return yuzu::agent::LegacySendOutcome::Sent;
     });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "registry";
@@ -897,11 +1118,12 @@ TEST_CASE("GuardianEngine: drift event_id embeds agent_id (#1307)",
     d.rule_name = "rule-A";
     yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
 
-    REQUIRE_FALSE(captured_id.empty());
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE_FALSE(captured_id->empty());
     // Layout is "<rule_id>-<agent_id>-<ms>-<seq>"; assert agent_id is present and
     // sits immediately after the rule_id prefix (the slot the crash path uses).
-    CHECK(captured_id.find("agent-test") != std::string::npos);
-    CHECK(captured_id.rfind("rule-A-agent-test-", 0) == 0);
+    CHECK(captured_id->find("agent-test") != std::string::npos);
+    CHECK(captured_id->rfind("rule-A-agent-test-", 0) == 0);
 }
 
 TEST_CASE("GuardianEngine: same rule + same seq on two agents → distinct event_ids (#1307)",
@@ -928,9 +1150,23 @@ TEST_CASE("GuardianEngine: same rule + same seq on two agents → distinct event
     REQUIRE(eng_a.start_local().has_value());
     REQUIRE(eng_b.start_local().has_value());
 
-    std::string id_a, id_b;
-    eng_a.set_event_sink([&id_a](const gpb::GuaranteedStateEvent& ev) { id_a = ev.event_id(); });
-    eng_b.set_event_sink([&id_b](const gpb::GuaranteedStateEvent& ev) { id_b = ev.event_id(); });
+    // #4783: own the captures via shared_ptr — see the sibling event_id test's
+    // comment above for why a reference capture of a local declared after the
+    // engines is no longer safe now that delivery is asynchronous.
+    auto id_a = std::make_shared<std::string>();
+    auto id_b = std::make_shared<std::string>();
+    eng_a.set_event_sink([id_a](const gpb::GuaranteedStateEvent& ev) {
+        *id_a = ev.event_id();
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    eng_b.set_event_sink([id_b](const gpb::GuaranteedStateEvent& ev) {
+        *id_b = ev.event_id();
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire_a(
+        [&] { CHECK(eng_a.retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
+    yuzu::test::ScopeExit retire_b(
+        [&] { CHECK(eng_b.retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "registry";
@@ -940,15 +1176,17 @@ TEST_CASE("GuardianEngine: same rule + same seq on two agents → distinct event
     yuzu::agent::guardian_emit_drift_for_test(eng_a, d);
     yuzu::agent::guardian_emit_drift_for_test(eng_b, d);
 
-    REQUIRE_FALSE(id_a.empty());
-    REQUIRE_FALSE(id_b.empty());
-    CHECK(id_a != id_b);  // no PK collision
+    REQUIRE(eng_a.flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE(eng_b.flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE_FALSE(id_a->empty());
+    REQUIRE_FALSE(id_b->empty());
+    CHECK(*id_a != *id_b);  // no PK collision
     // Prefix-anchor each id independently (not just containment): this pins the
     // "{rule_id}-{agent_id}-..." layout so the test fails against the pre-fix
     // "{rule_id}-{ms}-{seq}" shape on its own, without depending on a timing
     // difference between the two emits or on the sibling test having run.
-    CHECK(id_a.rfind("shared-rule-agent-alpha-", 0) == 0);
-    CHECK(id_b.rfind("shared-rule-agent-bravo-", 0) == 0);
+    CHECK(id_a->rfind("shared-rule-agent-alpha-", 0) == 0);
+    CHECK(id_b->rfind("shared-rule-agent-bravo-", 0) == 0);
 }
 
 TEST_CASE("GuardianEngine: empty agent_id still yields a well-formed (if ambiguous) event_id",
@@ -966,10 +1204,13 @@ TEST_CASE("GuardianEngine: empty agent_id still yields a well-formed (if ambiguo
     GuardianEngine eng{&kv, ""};
     REQUIRE(eng.start_local().has_value());
 
-    std::string captured_id;
-    eng.set_event_sink([&captured_id](const gpb::GuaranteedStateEvent& ev) {
-        captured_id = ev.event_id();
+    auto captured_id = std::make_shared<std::string>();
+    eng.set_event_sink([captured_id](const gpb::GuaranteedStateEvent& ev) {
+        *captured_id = ev.event_id();
+        return yuzu::agent::LegacySendOutcome::Sent;
     });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(eng.retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
 
     yuzu::agent::GuardDrift d;
     d.guard_type = "registry";
@@ -977,8 +1218,9 @@ TEST_CASE("GuardianEngine: empty agent_id still yields a well-formed (if ambiguo
     d.rule_name = "rule-Z";
     yuzu::agent::guardian_emit_drift_for_test(eng, d);
 
-    REQUIRE_FALSE(captured_id.empty());
-    CHECK(captured_id.rfind("rule-Z--", 0) == 0);  // empty agent_id segment, not a crash
+    REQUIRE(eng.flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE_FALSE(captured_id->empty());
+    CHECK(captured_id->rfind("rule-Z--", 0) == 0);  // empty agent_id segment, not a crash
 }
 
 TEST_CASE("GuardianEngine: stop() makes subsequent apply_rules fail",
@@ -1046,4 +1288,482 @@ TEST_CASE("GuardianEngine::arm_stats(): default prefer_spark_=false stays "
     // The io-ceiling counter is unaffected by this trap (see its own doc
     // comment for why) and reads a plain 0 either way.
     CHECK(f.engine->io_ceiling_rejections() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// guard.hpp's GuardDrift::Health / emit_guard_event's health arm (PR #4748 blocking fix):
+// a health report must go out as "guard.unhealthy" via the health branch, never through
+// apply_drift_to_event's default-arm 4-way event_type cascade, and every compliance field
+// on the same report must be ignored outright — a health report never mints drift.detected
+// or guard.compliant, even when the caller (a bug in some future producer) also sets them.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("GuardianEngine: a health report emits guard.unhealthy with its detail, never "
+          "through the drift/compliance cascade",
+          "[guardian][engine][event][health]") {
+    GuardianFixture f;
+
+    // #4783: shared_ptr-owned capture — see the event_id test's comment near the
+    // top of this file for why a reference to a local declared after the fixture
+    // is no longer safe now that delivery is asynchronous.
+    auto captured = std::make_shared<gpb::GuaranteedStateEvent>();
+    f.engine->set_event_sink([captured](const gpb::GuaranteedStateEvent& ev) {
+        *captured = ev;
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "rule-health";
+    d.rule_name = "rule-health-name";
+    d.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    d.health_detail = "parent-directory watch permanently disabled";
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    CHECK(captured->event_type() == "guard.unhealthy");
+    CHECK(captured->guard_type() == "file");
+    CHECK(captured->rule_name() == "rule-health-name");
+    CHECK(captured->detail_json() == R"({"detail":"parent-directory watch permanently disabled"})");
+    // event_id/rule_id/guard_category/timestamp/platform are stamped outside the
+    // health/drift branch — unaffected by which arm ran.
+    CHECK(captured->rule_id() == "rule-health");
+    CHECK(captured->guard_category() == "event");
+    CHECK_FALSE(captured->event_id().empty());
+}
+
+TEST_CASE("GuardianEngine: a health report with an empty detail omits detail_json",
+          "[guardian][engine][event][health]") {
+    GuardianFixture f;
+
+    auto captured = std::make_shared<gpb::GuaranteedStateEvent>();
+    f.engine->set_event_sink([captured](const gpb::GuaranteedStateEvent& ev) {
+        *captured = ev;
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "rule-health-empty";
+    d.rule_name = "rule-health-empty";
+    d.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    // health_detail left empty.
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    CHECK(captured->event_type() == "guard.unhealthy");
+    CHECK(captured->detail_json().empty());
+}
+
+TEST_CASE("GuardianEngine: a health report with non-UTF-8 detail bytes still serializes "
+          "(U+FFFD replacement, matches the spark health stream's convention)",
+          "[guardian][engine][event][health]") {
+    GuardianFixture f;
+
+    auto captured = std::make_shared<gpb::GuaranteedStateEvent>();
+    f.engine->set_event_sink([captured](const gpb::GuaranteedStateEvent& ev) {
+        *captured = ev;
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "rule-health-badutf8";
+    d.rule_name = "rule-health-badutf8";
+    d.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    d.health_detail = "bad-byte-\xFF-here";
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    CHECK(captured->event_type() == "guard.unhealthy");
+    CHECK_FALSE(captured->detail_json().empty()); // must serialize, never throw/drop the event
+    CHECK(captured->detail_json().find("bad-byte-") != std::string::npos);
+}
+
+TEST_CASE("GuardianEngine: a health report with contradictory compliance fields set still "
+          "emits guard.unhealthy and ignores every compliance field",
+          "[guardian][engine][event][health]") {
+    GuardianFixture f;
+
+    auto captured = std::make_shared<gpb::GuaranteedStateEvent>();
+    f.engine->set_event_sink([captured](const gpb::GuaranteedStateEvent& ev) {
+        *captured = ev;
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    yuzu::test::ScopeExit retire(
+        [&] { CHECK(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5})); });
+
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "rule-health-contradictory";
+    d.rule_name = "rule-health-contradictory";
+    d.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    d.health_detail = "contradictory-fields-test";
+    // Deliberately contradictory: a real producer never sets these alongside health, but
+    // the health arm must ignore them unconditionally regardless of caller behavior.
+    d.compliant = true;
+    d.detected_value = "should-be-ignored";
+    d.expected_value = "should-be-ignored";
+    d.remediation_attempted = true;
+    d.remediation_success = true;
+    d.remediation_action = "should-be-ignored";
+    d.collapsed_count = 3;
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    CHECK(captured->event_type() == "guard.unhealthy");
+    CHECK(captured->remediation_action().empty());
+    CHECK_FALSE(captured->remediation_success());
+    CHECK(captured->detected_value().empty());
+    CHECK(captured->expected_value().empty());
+    CHECK(captured->drift_rate() == 0);
+}
+
+// ===========================================================================
+// #5513 boot re-arm catch-up (LEGACY path: prefer_spark=false, no Spark wiring)
+//
+// A cached rule whose boot re-arm fails (a legacy guard's std::thread ctor
+// throwing on thread-creation failure is the production-reachable case) used
+// to leave the agent reporting its persisted, already-acknowledged generation, so
+// the server's "agent behind current" reconcile never fired and the rule stayed
+// unenforced until the next restart. start_local() now reports generation 0 while
+// a boot re-arm is unresolved (boot_rearm_unresolved()), which makes the server
+// re-push at the current generation; the first CLEAN application (every rule
+// reconciled without failure) clears it. The INTERNAL generation
+// (policy_generation_) and its persisted value are never touched: only the
+// REPORTED value moves, so a second restart still reads the real generation from
+// disk. Tests below drive the throw through set_rearm_fault_hook_for_test (armed
+// BEFORE start_local(), fires with mtx_ held, so it throws or observes only).
+//
+// Rules: a registry-change rule is Inert on Linux/macOS (the legacy guard stub
+// returns false), so a push of it applies and persists on every host with no
+// platform dependency; the hook fires before reconcile_rule_locked, so the rule's
+// arm outcome never matters to what the tests assert. Every registry rule here is
+// "audit" mode, never "enforce": on Windows the seed phase really arms a
+// RegistryGuard against the fixed, unsalted HKCU\SOFTWARE\YuzuTest\GuardStatusTest
+// key, and enforce mode would create and write that key (a cross-job shared
+// resource on the shared CI runners); audit mode only watches. The Spark-wired
+// cases for this issue live in test_guardian_engine_spark_reconcile.cpp.
+// ===========================================================================
+
+namespace {
+
+// One engine lifetime over a (possibly pre-existing) KV file. The hook, if any, is
+// armed in start() strictly before start_local(), as the setter's contract requires.
+// Declaration order matters: engine is destroyed before kv.
+struct BootedEngine {
+    std::unique_ptr<KvStore> kv;
+    std::unique_ptr<GuardianEngine> engine;
+
+    explicit BootedEngine(const fs::path& path) {
+        auto opened = KvStore::open(path);
+        REQUIRE(opened.has_value());
+        kv = std::make_unique<KvStore>(std::move(*opened));
+        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test");
+    }
+
+    void start(std::function<void(const std::string&)> hook = nullptr) {
+        if (hook)
+            engine->set_rearm_fault_hook_for_test(std::move(hook));
+        REQUIRE(engine->start_local().has_value());
+    }
+};
+
+// Models a legacy guard's thread ctor throwing on thread-creation failure, aimed at one rule.
+std::function<void(const std::string&)> exhaust_on(std::string target) {
+    return [target = std::move(target)](const std::string& rule_id) {
+        if (rule_id == target)
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                    "injected thread exhaustion");
+    };
+}
+
+gpb::GuaranteedStatePush push_at(std::uint64_t gen, std::vector<gpb::GuaranteedStateRule> rules,
+                                 bool full_sync) {
+    auto p = GuardianFixture::make_push(std::move(rules), full_sync);
+    p.set_policy_generation(gen);
+    return p;
+}
+
+// r1 + r2: registry rules, Inert on Linux/macOS (see the banner above). "audit" so a
+// Windows run never creates the fixed shared HKCU test key (enforce mode would).
+std::vector<gpb::GuaranteedStateRule> two_registry_rules() {
+    return {GuardianFixture::make_registry_rule("r1", "audit"),
+            GuardianFixture::make_registry_rule("r2", "audit")};
+}
+
+// Phase 1: a first engine on `path` applies a push at `gen` and goes away, leaving the
+// rules and the generation persisted for a later engine to boot from.
+void seed_persisted_generation(const fs::path& path, std::uint64_t gen,
+                               std::vector<gpb::GuaranteedStateRule> rules, bool full_sync = true) {
+    BootedEngine seed{path};
+    seed.start();
+    REQUIRE(seed.engine->apply_rules(push_at(gen, std::move(rules), full_sync)).has_value());
+    REQUIRE(seed.engine->policy_generation() == gen);
+}
+
+} // namespace
+
+TEST_CASE("GuardianEngine #5513: a re-arm that throws at boot reports generation 0 until a "
+          "clean same-generation catch-up push",
+          "[guardian][engine][boot_rearm]") {
+    constexpr std::uint64_t kG = 5;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG, two_registry_rules());
+
+    BootedEngine b{db.path};
+    CHECK_FALSE(b.engine->boot_rearm_unresolved()); // nothing has booted yet
+    const auto failures_before = b.engine->arm_failure_count();
+    b.start(exhaust_on("r1"));
+
+    // The persisted generation (kG) was loaded, yet the REPORTED value is 0: the
+    // server sees an agent behind its current generation and re-pushes.
+    CHECK(b.engine->policy_generation() == 0);
+    CHECK(b.engine->boot_rearm_unresolved());
+    CHECK(b.engine->arm_failure_count() == failures_before + 1);
+    CHECK(b.engine->rule_count() == 2); // the cache is intact, including the failed rule
+    // The heartbeat reads both values from ONE snapshot.
+    const auto report = b.engine->generation_report();
+    CHECK(report.reported == 0);
+    CHECK(report.boot_rearm_unresolved);
+
+    // The catch-up: the SAME generation, so the tail's `push > policy_generation_`
+    // advance gate is false. The flag must clear on a clean application regardless of
+    // that gate (it sits beside the gate, not inside it).
+    REQUIRE(b.engine->apply_rules(push_at(kG, two_registry_rules(), /*full_sync=*/true))
+                .has_value());
+    CHECK_FALSE(b.engine->boot_rearm_unresolved());
+    CHECK(b.engine->policy_generation() == kG);
+    CHECK(b.engine->arm_failure_count() == failures_before + 1); // the clean push added none
+    const auto cleared = b.engine->generation_report();
+    CHECK(cleared.reported == kG);
+    CHECK_FALSE(cleared.boot_rearm_unresolved);
+}
+
+TEST_CASE("GuardianEngine #5513: get_status keeps the internal persisted generation while the "
+          "reported one reads 0",
+          "[guardian][engine][boot_rearm]") {
+    // get_status() is the census view and reads the INTERNAL generation (policy_generation_),
+    // deliberately not policy_generation()'s reported value; only the heartbeat-facing accessors
+    // move. Mutation: get_status() switched to the reported value reports 0 here.
+    constexpr std::uint64_t kG = 8;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG, two_registry_rules());
+
+    BootedEngine b{db.path};
+    b.start(exhaust_on("r1"));
+    REQUIRE(b.engine->boot_rearm_unresolved());
+    CHECK(b.engine->policy_generation() == 0);
+    CHECK(b.engine->get_status().policy_generation() == kG);
+
+    REQUIRE(b.engine->apply_rules(push_at(kG, two_registry_rules(), /*full_sync=*/true))
+                .has_value());
+    CHECK_FALSE(b.engine->boot_rearm_unresolved());
+    CHECK(b.engine->policy_generation() == kG);
+    CHECK(b.engine->get_status().policy_generation() == kG);
+}
+
+TEST_CASE("GuardianEngine #5513: the push_rules reply text reports the persisted generation "
+          "once the catch-up clears the flag",
+          "[guardian][engine][boot_rearm][dispatch]") {
+    // The reply is built from the REPORTED generation. A push that returns success is not
+    // always a clean application: apply_rules counts a rule whose reconcile_rule_locked throws
+    // into reconcile_failures, still returns success, leaves the flag set, and the reply can
+    // then read generation=0 on the legacy path too. No deterministic legacy seam makes that
+    // throw at apply time (the re-arm fault hook fires only in start_local()), so that case is
+    // not pinned here; the Spark Accepted path is asserted in
+    // test_guardian_engine_spark_reconcile.cpp. Here: the catch-up applies cleanly, so its
+    // reply names kG, not 0. Space-anchored like the dispatch test above.
+    constexpr std::uint64_t kG = 42;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG, two_registry_rules());
+
+    BootedEngine b{db.path};
+    b.start(exhaust_on("r1"));
+    REQUIRE(b.engine->boot_rearm_unresolved());
+
+    auto p = push_at(kG, two_registry_rules(), /*full_sync=*/true);
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*b.engine, p.SerializeAsString());
+    CHECK(dr.exit_code == 0);
+    CHECK(dr.output.find(" generation=42 ") != std::string::npos);
+    CHECK(dr.output.find(" generation=0 ") == std::string::npos);
+    CHECK_FALSE(b.engine->boot_rearm_unresolved());
+}
+
+TEST_CASE("GuardianEngine #5513: a second restart while unresolved re-derives the state from "
+          "the walk, never from disk",
+          "[guardian][engine][boot_rearm]") {
+    // Nothing about the unresolved state is persisted: the disk keeps the real
+    // generation throughout, so a restart WITHOUT the fault reports it at once, and a
+    // restart WITH the fault reports 0 again.
+    constexpr std::uint64_t kG = 9;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG, two_registry_rules());
+
+    {
+        BootedEngine failing{db.path};
+        failing.start(exhaust_on("r1"));
+        REQUIRE(failing.engine->boot_rearm_unresolved());
+        CHECK(failing.engine->policy_generation() == 0);
+        failing.engine->stop();
+    }
+    {
+        BootedEngine healthy{db.path};
+        healthy.start(); // no hook: the rule re-arms (or is Inert) without incident
+        CHECK_FALSE(healthy.engine->boot_rearm_unresolved());
+        CHECK(healthy.engine->policy_generation() == kG);
+    }
+    {
+        BootedEngine failing_again{db.path};
+        failing_again.start(exhaust_on("r1"));
+        CHECK(failing_again.engine->boot_rearm_unresolved());
+        CHECK(failing_again.engine->policy_generation() == 0);
+    }
+}
+
+TEST_CASE("GuardianEngine #5513: generation 0 and a never-pushed boot never confuse the "
+          "report",
+          "[guardian][engine][boot_rearm]") {
+    // A push at generation 0 with full_sync=false persists the rule but never writes
+    // the generation key (the tail's `0 > 0` advance gate is false), so a later boot
+    // loads 0 either way. This proves the CLEARING path at 0 (no `gen - 1` or
+    // "reported != 0" arithmetic anywhere): it does NOT prove the server ever pushes
+    // to an agent whose current generation is 0, which it does not.
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, 0, two_registry_rules(), /*full_sync=*/false);
+
+    SECTION("no fault: reports 0 and no flag") {
+        BootedEngine b{db.path};
+        b.start();
+        CHECK(b.engine->policy_generation() == 0);
+        CHECK_FALSE(b.engine->boot_rearm_unresolved());
+    }
+    SECTION("fault: flag set, a gen-0 push clears it, still reports 0") {
+        BootedEngine b{db.path};
+        b.start(exhaust_on("r1"));
+        CHECK(b.engine->policy_generation() == 0);
+        REQUIRE(b.engine->boot_rearm_unresolved());
+        REQUIRE(b.engine->apply_rules(push_at(0, two_registry_rules(), /*full_sync=*/true))
+                    .has_value());
+        CHECK_FALSE(b.engine->boot_rearm_unresolved());
+        CHECK(b.engine->policy_generation() == 0);
+    }
+}
+
+TEST_CASE("GuardianEngine #5513: a catch-up that removes or disables the failed rule still "
+          "clears the flag",
+          "[guardian][engine][boot_rearm]") {
+    // The flag clears on a clean APPLICATION, not on "the failed rule re-armed": a rule
+    // the server no longer wants (removed, or authored disabled) is no longer an open
+    // enforcement gap.
+    constexpr std::uint64_t kG = 4;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    // "audit": see the banner above (no enforce-mode write to the fixed Windows test key).
+    seed_persisted_generation(db.path, kG, {GuardianFixture::make_registry_rule("r1", "audit")});
+
+    BootedEngine b{db.path};
+    b.start(exhaust_on("r1"));
+    REQUIRE(b.engine->boot_rearm_unresolved());
+    REQUIRE(b.engine->policy_generation() == 0);
+
+    SECTION("the full_sync push omits the rule") {
+        // r9 carries no spark/assertion: it is validation-rejected and Inert on every OS,
+        // so nothing is armed and the push is clean.
+        REQUIRE(b.engine
+                    ->apply_rules(push_at(kG, {GuardianFixture::make_rule("r9", "plain")},
+                                          /*full_sync=*/true))
+                    .has_value());
+        CHECK(b.engine->rule_count() == 1);
+        // Trivially true on every host: the boot hook threw before arming, so r1 was never
+        // armed to begin with. What the section proves is the flag/generation pair below.
+        CHECK(b.engine->armed_guard_count() == 0);
+        CHECK_FALSE(b.engine->boot_rearm_unresolved());
+        CHECK(b.engine->policy_generation() == kG);
+    }
+    SECTION("the full_sync push carries the rule disabled") {
+        // A disabled r1 is withdrawn from both backends and never armed.
+        REQUIRE(b.engine
+                    ->apply_rules(push_at(
+                        kG, {GuardianFixture::make_rule("r1", "r1", /*enabled=*/false)},
+                        /*full_sync=*/true))
+                    .has_value());
+        CHECK(b.engine->rule_count() == 1);
+        CHECK(b.engine->armed_guard_count() == 0); // trivially true, as in the section above
+        CHECK_FALSE(b.engine->boot_rearm_unresolved());
+        CHECK(b.engine->policy_generation() == kG);
+    }
+}
+
+TEST_CASE("GuardianEngine #5513: stop() is sticky - a start_local() after stop() never walks, "
+          "so never sets the flag",
+          "[guardian][engine][boot_rearm][lifecycle]") {
+    // CONTROL case: the sticky-stop invariant is untouched by the catch-up work. The hook
+    // is armed (legal: start_local() has not run) yet must never fire.
+    constexpr std::uint64_t kG = 3;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG, two_registry_rules());
+
+    std::size_t hook_calls = 0; // declared before the engine that holds the hook
+    BootedEngine b{db.path};
+    b.engine->stop();
+    b.engine->set_rearm_fault_hook_for_test([&hook_calls](const std::string&) { ++hook_calls; });
+    REQUIRE(b.engine->start_local().has_value()); // returns cleanly, a no-op
+
+    CHECK(hook_calls == 0);          // no walk
+    CHECK(b.engine->rule_count() == 0); // the cache was never loaded
+    CHECK(b.engine->arm_failure_count() == 0);
+    CHECK_FALSE(b.engine->boot_rearm_unresolved());
+    // 0 here is the construction default (start_local() returned before loading kKeyGen),
+    // not an unresolved report: the flag above is the discriminator.
+    CHECK(b.engine->policy_generation() == 0);
+}
+
+TEST_CASE("GuardianEngine #5513: a non-std::exception throw at boot is contained, counted and "
+          "reported like any other re-arm failure",
+          "[guardian][engine][boot_rearm]") {
+    // start_local()'s caller does not catch, so a throw that is not a std::exception used
+    // to escape run() and end the agent. A third-party or ABI-boundary type is the
+    // realistic shape.
+    constexpr std::uint64_t kG = 6;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG,
+                              {GuardianFixture::make_service_rule("r1", "audit"),
+                               GuardianFixture::make_service_rule("r2", "audit"),
+                               GuardianFixture::make_service_rule("r3", "audit")});
+
+    std::set<std::string> visited; // declared before the engine that holds the hook
+    BootedEngine b{db.path};
+    const auto failures_before = b.engine->arm_failure_count();
+    b.engine->set_rearm_fault_hook_for_test([&visited](const std::string& rule_id) {
+        visited.insert(rule_id);
+        if (rule_id == "r2")
+            throw 42; // NOT derived from std::exception
+    });
+    REQUIRE(b.engine->start_local().has_value()); // the non-standard throw is contained
+
+    // The walk visits keys in sorted order, so r3 was reached AFTER the throw.
+    const std::set<std::string> expected_visited{"r1", "r2", "r3"};
+    CHECK(visited == expected_visited);
+    CHECK(b.engine->boot_rearm_unresolved());
+    CHECK(b.engine->policy_generation() == 0);
+    CHECK(b.engine->arm_failure_count() == failures_before + 1);
+    CHECK(b.engine->rule_count() == 3);
+    // The degrade message names the throwing rule, like the std::exception arm's.
+    const std::string degrade_msg = b.engine->last_rearm_degrade_message_for_test();
+    CHECK(degrade_msg.find("r2") != std::string::npos);
+    CHECK(degrade_msg.find("non-standard exception") != std::string::npos);
+    // Legacy service guards arm only where a system bus is reachable (the existing
+    // service-rule tests SKIP otherwise). Where they do, exactly the two rules whose
+    // re-arm did not throw are armed and the poisoned one is not. On a host without a
+    // system bus (macOS, a bus-less Linux container) `armed` is 0 and this check is
+    // skipped; the continued walk is then carried by the `visited` set above (r3 was
+    // reached after r2 threw), which holds on every host.
+    if (const auto armed = b.engine->armed_guard_count(); armed != 0)
+        CHECK(armed == 2);
 }

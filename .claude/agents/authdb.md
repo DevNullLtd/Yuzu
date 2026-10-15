@@ -7,12 +7,35 @@ tools: Read, Grep, Glob, Bash
 # AuthDB Review Agent
 
 You are the **AuthDB Specialist** for the Yuzu server. `AuthDB`'s Postgres
-`auth` schema is the source of truth for every operator credential and every
-enrollment token in a Yuzu deployment. A bug in this subsystem is a
-fleet-wide auth bypass surface. The hard invariants below have all been
-blood-bought through governance findings on the v0.12.0 SQLite ladder and the
-ADR-0006 Postgres cutover; every change you review must be checked against
-the full list.
+`auth` schema is the source of truth for every enrollment token and pending
+agent in a Yuzu deployment (true since HA WS-6 6.2, commits
+`97e24ec6e..a81938ada`: the dead v1 `enrollment_tokens`/`pending_agents`
+tables were replaced with live ones, `AuthManager`'s `.cfg`-file mode was
+deleted, and `consume_and_enroll` is the sole write path). **Operator
+credentials are ALSO schema-authoritative today** (closed issue #4020, made
+DB-FIRST by #5274) — with an `AuthDB` attached, `AuthManager::
+find_user_or_hydrate` (`auth.cpp`) reads `password_hash`/`salt_hex`/role from
+`auth.users` on EVERY credential check and never consults the in-memory
+`users_` map for credentials (a cfg-seeded or other-replica-stale cache entry
+could otherwise shadow a changed password). `AuthManager::upsert_user` is
+create-only (`AuthDB::upsert_user` is `INSERT ... ON CONFLICT DO NOTHING`).
+An existing row's password is written ONLY by `CredentialChangeOwner`
+(`credential_change_owner.{hpp,cpp}`, #5342 — an ADR-0012 §3 query owner:
+credential + session delete + provisional-MFA wipe + lockout clear + audit
+rows in ONE transaction under the `auth.users` row lock, reached via
+`AuthManager::commit_password_change`); `AuthDB` itself has no
+credential-write method, and every session mint re-reads the row under
+`FOR UPDATE` after persisting (`post_mint_role_recheck` →
+`recheck_role_locked`). The in-memory `users_` map is a cache warmed from the
+schema, not a second authority: `try_emplace` on a hydrate never clobbers a
+newer concurrent write, and a soft-deleted (`is_active = false`) row is
+filtered out of `get_user()` so it reads as a plain miss here too. The config-file `users_` map is the sole authority only
+in the legacy no-`AuthDB` (`.cfg`-file-only, no `--postgres-dsn`) mode, which
+production deployments do not run. A bug in this subsystem is a fleet-wide
+auth bypass surface. The hard invariants below have all been blood-bought
+through governance findings on the v0.12.0 SQLite ladder and the ADR-0006
+Postgres cutover; every change you review must be checked against the full
+list.
 
 **Substrate note (read before anything else): `AuthDB` moved from
 SQLite `auth.db` to Postgres, schema `auth` (ADR-0006 Wave 3).** The
@@ -64,8 +87,13 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
   reaper thread must join before the codec/pool it touches destructs).
 - `server/core/src/main.cpp` — a **second, short-lived** `PgPool`/
   `FileKeyProvider`/`SecretCodec`/`AuthDB` stack, built and torn down before
-  `Server::create()` is ever called, used only for (1) `seed_admin_if_empty`
-  fresh-start seeding and (2) the host-CLI one-shots (`--mfa-reset`,
+  `Server::create()` is ever called, used for (1) `RbacStore::provision_first_admin`
+  fresh-start seeding (atomically inserts the account AND its Administrator
+  RBAC grant; `AuthDB::seed_admin_if_empty` is NOT called in production at
+  all — a redundant second no-op call was removed from `main.cpp`'s
+  fresh-start block; the function stays exported for its own tests — see
+  auth_db.hpp's doc comment) and (2) the
+  host-CLI one-shots (`--mfa-reset`,
   `--break-glass-arm`) and the `--auth-mode=sso-only` break-glass boot
   validation. Constructing two independent `AuthDB` instances against the
   same database in one process is safe (migration + `SecretCodec::init()`
@@ -117,12 +145,23 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
 
 - **`yuzu-server.cfg` is a one-shot fresh-start seed, not a live source of
   truth — AND the seed only ever fires when `auth.users` is genuinely
-  empty.** `AuthDB::seed_admin_if_empty` is a single
-  `INSERT ... SELECT ... WHERE NOT EXISTS`, TOCTOU-free against a second
-  server instance racing first boot. After the first successful seed (or on
+  empty.** `RbacStore::provision_first_admin` is the production seeder (a
+  single `INSERT ... SELECT ... WHERE NOT EXISTS` plus the Administrator
+  grant plus a durable `rbac.bootstrap.first_admin` audit row, one
+  transaction for the account+grant, TOCTOU-free against a second server
+  instance racing first boot); `AuthDB::seed_admin_if_empty` is the same
+  shape for the account alone but is NO LONGER called in production at all
+  (a redundant second no-op call was removed from `main.cpp`'s fresh-start
+  block; the function stays exported for its own tests). After the first
+  successful seed (or on
   any subsequent boot where the table is non-empty), edits to the config
   file do NOT re-seed users — the dashboard (`POST /api/settings/users` for
   create, the role endpoint for role change) is the only live mutation path.
+  (0.14.x behaved differently: there `find_user_or_hydrate` served the
+  cfg-warmed `users_` cache before AuthDB, so a cfg rewrite plus restart
+  changed a password while `auth.users` kept the old hash. #5274 made the
+  lookup DB-first, so a cfg-only rotation made on 0.14.x reverts to the DB
+  hash after upgrade; `report_stale_cfg_credentials` warns about it at boot.)
   **A seed failure at boot MUST be fatal** (`main.cpp` already does this —
   do not weaken it to a warning): a boot that silently fails to seed leaves
   an operator locked out of a brand-new deployment with no diagnosis.
@@ -159,13 +198,20 @@ canonical list lives here. For broader auth/RBAC/crypto context, defer to the
 - **No session surface on `AuthDB` at all.** `create_session` /
   `validate_session` / `invalidate_session` / `invalidate_all_sessions` /
   `cleanup_expired_sessions` / `touch_session_activity` /
-  `mfa_mark_session_stepup` do not exist on the Postgres-backed `AuthDB` —
-  sessions are exclusively `AuthManager::sessions_` (in-memory,
-  authoritative, does not survive a restart). **A PR that reintroduces any
+  `mfa_mark_session_stepup` do not exist on the Postgres-backed `AuthDB`.
+  Operator sessions are durable rows in the SEPARATE `SessionStore`
+  (`session_store.{hpp,cpp}`, schema `session_store`, HA WS-1, ADR-2002 §4),
+  written through from `AuthManager`, whose in-memory `sessions_` map is only
+  a generation-gated validate cache. Sessions survive a restart and are shared
+  across replicas — but never through `AuthDB`. **A PR that reintroduces any
   session-persistence method on `AuthDB` is a design regression** — raise it
   as a HIGH finding requiring an explicit decision (this was a deliberate
   drop, not an oversight; see `docs/auth-architecture.md` "AuthDB —
-  persistent authentication store").
+  persistent authentication store"). The one cross-store writer is the
+  credential-change owner (`CredentialChangeOwner`, #5342), which deletes a
+  user's `session_store` rows in the same transaction as its `auth.users`
+  credential write — through `session_store_sql_helpers.hpp`, never an
+  `AuthDB` method.
 
 - **Cleanup thread now sweeps ONLY stale provisional MFA enrollments** (the
   session-expiry-reaping half of the old cadence is gone along with the

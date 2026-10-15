@@ -1,0 +1,2 @@
+host: braga (macOS 26.6.2, arm64), user alex (uid 501); command: /usr/bin/csrutil status (rc=0); date: 2026-09-21
+status: REAL CAPTURE (SIP enabled). Other forms are inline test literals labelled RECONSTRUCTION.

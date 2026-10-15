@@ -528,9 +528,10 @@ void nstat_advance_snapshot_baseline(FlowState& flow) noexcept;
 
 /// PURE. True when a stream that is nominally alive should be presumed dead:
 /// it has delivered nothing for longer than `threshold_seconds`. Same shape
-/// as tar_proc_es.hpp's es_stream_is_stalled (kept as its own named function,
-/// not a cross-collector call, since the two streams' health semantics are
-/// conceptually independent even though the arithmetic is identical).
+/// as yuzu/agent/es_client.hpp's es_stream_is_stalled (kept as its own named
+/// function, not a cross-collector call, since the two streams' health
+/// semantics are conceptually independent even though the arithmetic is
+/// identical).
 bool nstat_stream_is_stalled(std::int64_t last_event_ts, std::int64_t started_ts, std::int64_t now,
                              std::int64_t threshold_seconds) noexcept;
 

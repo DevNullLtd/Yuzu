@@ -33,7 +33,7 @@ SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 def parse_changelog(path: Path) -> list[tuple[int, str, date | None]]:
     """Return [(line_no, raw_version, date_or_None), ...] in file order."""
     sections: list[tuple[int, str, date | None]] = []
-    for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         m = HEADER_RE.match(raw)
         if not m:
             continue

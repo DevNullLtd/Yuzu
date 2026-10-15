@@ -1,5 +1,6 @@
 #include "offload_target_store.hpp"
 
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -702,9 +703,38 @@ bool OffloadTargetStore::record_delivery(int64_t target_id, const std::string& e
 
 // ── Single delivery (runs on a worker pool thread) ──────────────────────────
 
-std::string OffloadTargetStore::build_batch_body(const std::vector<BufferedEvent>& events) {
+std::string OffloadTargetStore::build_batch_body(const std::vector<BufferedEvent>& events,
+                                                 int64_t target_id) {
     nlohmann::json arr = nlohmann::json::array();
     for (const auto& e : events) {
+        // #2437-class guard: depth-check the raw BUFFERED payload_json
+        // BEFORE nlohmann::json::parse ever sees it. Every current caller of
+        // fire_event() (agent enrollment, execution.completed, DEX blast-
+        // radius/signal alerts) builds a small flat scalar-field object and
+        // dumps it immediately, so no live path hands this a too-deep
+        // payload today - but fire_event() itself performs no validation on
+        // the string it buffers, so a future caller (or a change to one of
+        // today's) could reintroduce exactly this crash with no signal.
+        // Parsing this into a real tree and then `.dump()`-ing the wrapping
+        // `{"events":[…]}` below is unboundedly recursive on `.dump()` (see
+        // json_exceeds_depth's doc comment, mcp_jsonrpc.hpp - measured, not
+        // assumed), so reject on the raw text before parse ever runs.
+        //
+        // Routed through the SAME "can't be safely handled, preserve as raw
+        // text" fallback the catch(...) below already uses for genuinely
+        // malformed JSON - the event is never silently dropped, so an
+        // operator inspecting /deliveries can still see and investigate it.
+        // This store has no retry/backoff mechanism (delivery is one-shot
+        // per flush), so a poisoned event cannot be retried forever either -
+        // it is attempted exactly once, like every other buffered event.
+        if (mcp::json_exceeds_depth(e.payload_json, mcp::kMcpMaxJsonDepth)) {
+            spdlog::warn("OffloadTargetStore::build_batch_body: target {} event '{}' payload "
+                         "nested past the depth guard (max {}), preserving as raw text - cannot "
+                         "be safely parsed",
+                         target_id, e.event_type, mcp::kMcpMaxJsonDepth);
+            arr.push_back(e.payload_json);
+            continue;
+        }
         try {
             arr.push_back(nlohmann::json::parse(e.payload_json));
         } catch (...) {
@@ -960,7 +990,7 @@ void OffloadTargetStore::fire_event(const std::string& event_type,
         }
 
         if (!to_flush.empty()) {
-            auto body = build_batch_body(to_flush);
+            auto body = build_batch_body(to_flush, tgt.id);
             int count = static_cast<int>(to_flush.size());
             const bool queued = delivery_pool_.submit([this, tgt, event_type, count, body]() {
                 deliver_single(tgt, event_type, count, body);
@@ -1017,7 +1047,7 @@ void OffloadTargetStore::flush_all() {
         }
 
         auto event_type = events.front().event_type; // representative
-        auto body = build_batch_body(events);
+        auto body = build_batch_body(events, target_id);
         int count = static_cast<int>(events.size());
         const bool queued = delivery_pool_.submit([this, tgt, event_type, count, body]() {
             deliver_single(tgt, event_type, count, body);

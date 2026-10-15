@@ -50,7 +50,7 @@ CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
 # case-name specs still never match (no leading '['), so a case name is never
 # mistaken for a strippable spec — the invariant _cmd_without_test_specs and
 # the isolated retry rely on (a recognised spec is always stripped, so it can
-# never OR with the retried case name).
+# never be combined with the retried case name).
 CATCH2_TAG_SPEC = re.compile(r"^(~?\[[^\[\]]+\])+(,(~?\[[^\[\]]+\])+)*$")
 VALID_PLATFORMS = {"windows", "linux", "macos", "all"}
 
@@ -248,8 +248,9 @@ def introspect_tests(builddir):
 
 def match_suite(failed_name, tests):
     """Map a meson-junit failed-suite name to its introspected test (cmd/env)."""
-    # meson junit names look like "agent - yuzu:agent unit tests"; the
-    # introspect `name` ("agent unit tests") is a substring. Longest match wins.
+    # meson junit names look like "agent - yuzu:agent unit tests shard A"; the
+    # introspect `name` ("agent unit tests shard A") is a substring. Longest match
+    # wins (so an entry name must never be a substring of another entry's name).
     best = None
     for t in tests:
         n = t.get("name", "")
@@ -263,8 +264,10 @@ def _cmd_without_test_specs(cmd):
     """cmd minus positional Catch2 tag-filter specs.
 
     Sharded meson entries (#2092) carry a tag spec ('~[pg]' / '[pg]') in their
-    args, and Catch2 ORs positional test specs — appending a case name to the
-    introspected cmd would re-run the whole shard ∪ case. The isolated retry
+    args, and Catch2 ANDs positional test specs (verified: `'[spark]' '[guardian]'`
+    lists only the cases carrying BOTH). Appending a case name to the introspected
+    cmd would run only the cases matching both the shard filter and the name, so a
+    retried case outside the shard's filter would zero-match. The isolated retry
     must REPLACE the shard filter with the case name. argv[0] and option args
     are never touched."""
     if not cmd:
@@ -292,23 +295,126 @@ def _cmd_for_case_retry(cmd):
     return [stripped[0]] + [a for a in stripped[1:] if a != "--allow-running-no-tests"]
 
 
-def _run(cmd, env, workdir, extra=None, timeout=None):
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+
+def _meson_test_env(builddir):
+    """Env additions replicating `meson test`'s own launch contract for a
+    test() binary (#4580 root cause). `meson test` always sets
+    MESON_BUILD_ROOT/MESON_SOURCE_ROOT and runs with CWD at the build root
+    (never introspectable — meson injects these at launch time, not part of
+    a test() entry's own declared `env`/`cmd`); a large fraction of this
+    suite locates its build-output plugin .so/.dylib via exactly these two
+    vars (grep tests/unit/*.cpp for MESON_BUILD_ROOT — dozens of call sites,
+    several with an explicit "under meson test, this is always set" comment,
+    e.g. test_disk_actions_local_dispatcher.cpp). A caller re-invoking the
+    test BINARY directly, bypassing `meson test` itself, must replicate this
+    contract or every such test fails deterministically on its
+    plugin-not-found fallback, indistinguishable from a real regression —
+    this was the actual mechanism behind #4580's ~20-case cascade, not CI
+    concurrency: every case in the cascade shared this exact fallback path,
+    at time=0.000 (never touched real logic), across three independent
+    occurrences with unrelated original failures (PRs #4532/#4566/#4583)."""
+    return {
+        "MESON_BUILD_ROOT": os.path.abspath(builddir),
+        "MESON_SOURCE_ROOT": _REPO_ROOT,
+    }
+
+
+def _run(cmd, env, workdir, builddir=None, extra=None, timeout=None):
     e = dict(os.environ)
+    if builddir:
+        e.update(_meson_test_env(builddir))
     e.update(env or {})
+    cwd = workdir or (os.path.abspath(builddir) if builddir else None)
     return subprocess.run(
-        cmd + (extra or []), env=e, cwd=workdir or None,
+        cmd + (extra or []), env=e, cwd=cwd,
         capture_output=True, text=True, timeout=timeout,
     )
 
 
-def catch2_failed_cases(test, this_os):
+def _suite_slug(test):
+    """Filesystem-safe slug for a test() entry, for the preserved-junit path."""
+    name = test.get("name") or os.path.basename((test.get("cmd") or ["unknown"])[0])
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "unknown"
+
+
+def _clear_stale_enum_junit(builddir):
+    """Best-effort: remove any flake-retry-enum-*.catch2.xml left over from a
+    PRIOR invocation before this one writes its own (#4580 review finding).
+    `build-linux-*`/`build-windows-*` dirs are NOT wiped between ordinary CI
+    runs (`clean:false` in ci.yml, persisted for ccache/vcpkg reuse) — without
+    this, a suite that failed on run N but not on run N+1 leaves run N's file
+    sitting in meson-logs/, where a same-directory failure on run N+1 (for a
+    DIFFERENT suite) sweeps it into that run's own "on failure" artifact
+    upload alongside genuinely-fresh evidence, with nothing in the filename
+    distinguishing old from new. Called once per invocation, before any suite
+    runs, so at most this run's own entries can ever be present when the
+    artifact upload happens. Never raises: diagnostic bookkeeping only, must
+    not affect retry semantics.
+
+    KNOWN LIMITATION (build-ci review, 2026-09-18): ci.yml's "Test (non-pg
+    suites)" step invokes flake-retry.py TWICE against the same --builddir.
+    If the first invocation preserves evidence for a case that then recovers
+    via known-flaky retry (rc 0, bash -e does not abort), the second
+    invocation's own sweep deletes that same-run, still-legitimate file too —
+    this function cannot distinguish "written earlier this run" from
+    "leftover from three runs ago" by filename alone. Fail-SAFE, not
+    fail-misleading (evidence silently absent, never wrong-run evidence
+    silently present as current), so left as a documented follow-up rather
+    than blocking this fix: stamping the preserved filename with
+    GITHUB_RUN_ID would close it."""
+    if not builddir:
+        return
+    import glob
+
+    for stale in glob.glob(os.path.join(builddir, "meson-logs", "flake-retry-enum-*.catch2.xml")):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+
+def _preserve_enum_junit(builddir, test, xml_path):
+    """Best-effort: copy a failed suite's enumeration re-run junit XML into
+    meson-logs/ instead of letting it be deleted (#4580) — it rides the
+    existing meson-logs CI artifact upload, so a future occurrence is
+    diagnosable (real assertion text/file:line for every enumerated case)
+    without re-downloading and manually inspecting raw run artifacts. Purely
+    diagnostic: never raises, never affects retry semantics. `builddir` is
+    optional (omitted in the selftest / a caller with no build) — a no-op
+    then, not an error."""
+    if not builddir:
+        return
+    try:
+        logs = os.path.join(builddir, "meson-logs")
+        os.makedirs(logs, exist_ok=True)
+        dest = os.path.join(logs, f"flake-retry-enum-{_suite_slug(test)}.catch2.xml")
+        with open(xml_path, "rb") as src, open(dest, "wb") as dst:
+            dst.write(src.read())
+    except OSError:
+        pass
+
+
+def catch2_failed_cases(test, this_os, builddir=None):
     """Re-run a failed Catch2 suite with the junit reporter; return failed case
     names, or None if it isn't a classifiable Catch2 run (non-Catch2 / crash /
     hang). `timeout` mirrors the suite's own meson-configured timeout (falsy ->
     None, meson's own "no timeout" convention) so a genuine hang degrades to a
     clean unclassifiable result instead of blocking the job indefinitely — the
     observed failure mode this guards is a fast abnormal exit, not a hang, so
-    this is a robustness net rather than a fix for that specific pattern."""
+    this is a robustness net rather than a fix for that specific pattern.
+
+    This is a SEPARATE re-run of the whole suite, not a replay of the exact
+    failure meson's own invocation hit (#4580) — on a suite with real-
+    subprocess/environment-sensitive cases, the set returned here can differ
+    from, or omit entirely, whatever case(s) actually failed the original
+    invocation (meson's own junit is suite-granularity only, so there is no
+    structured record of the original run's specific case to compare
+    against). Every name this function returns is still a genuine failure
+    from an actual run just now, so blocking on it is never a false report
+    — but do not read the returned set as authoritative for *why* the
+    original invocation failed."""
     # Deliberately keeps any shard tag-filter in cmd: the enumeration re-run
     # must only surface failures from THIS shard (#2092). Only the isolated
     # retry_case() strips it.
@@ -318,12 +424,14 @@ def catch2_failed_cases(test, this_os):
     fd, xml_path = tempfile.mkstemp(suffix=".catch2.xml")
     os.close(fd)
     try:
-        _run(cmd, test.get("env"), test.get("workdir"),
+        _run(cmd, test.get("env"), test.get("workdir"), builddir,
              extra=["--reporter", "junit", "--out", xml_path],
              timeout=test.get("timeout") or None)
         if not os.path.getsize(xml_path):
             return None  # crash/timeout before any reporter output -> unclassifiable
-        return _failed_testcase_names(xml_path)
+        cases = _failed_testcase_names(xml_path)
+        _preserve_enum_junit(builddir, test, xml_path)
+        return cases
     except (ET.ParseError, OSError, subprocess.TimeoutExpired):
         return None
     finally:
@@ -333,12 +441,12 @@ def catch2_failed_cases(test, this_os):
             pass
 
 
-def retry_case(test, case, retries):
+def retry_case(test, case, retries, builddir=None):
     """Return the 1-based retry attempt that passed, or 0 if none passed."""
     cmd = _cmd_for_case_retry(test.get("cmd") or [])
     for attempt in range(1, retries + 1):
         try:
-            result = _run(cmd, test.get("env"), test.get("workdir"), extra=[case],
+            result = _run(cmd, test.get("env"), test.get("workdir"), builddir, extra=[case],
                           timeout=test.get("timeout") or None)
         except subprocess.TimeoutExpired:
             continue
@@ -410,6 +518,11 @@ def main(argv=None):
         gh("error", f"known-flaky list invalid: {ex}")
         return 2
 
+    # 0. Clear any stale enumeration-junit evidence from a prior invocation in
+    #    this same (persisted) build dir, before this run gets a chance to
+    #    write its own (#4580) — see _clear_stale_enum_junit's docstring.
+    _clear_stale_enum_junit(args.builddir)
+
     # 1. Run meson test normally.
     rc = subprocess.run(["meson", "test", "-C", args.builddir] + args.meson_args).returncode
 
@@ -450,7 +563,7 @@ def main(argv=None):
         if test is None:
             blocked.append(f"{suite_name} (could not map to a binary)")
             continue
-        cases = catch2_failed_cases(test, this_os)
+        cases = catch2_failed_cases(test, this_os, args.builddir)
         if cases is None:
             blocked.append(f"{suite_name} (not a classifiable Catch2 run — crash/non-Catch2)")
             continue
@@ -463,12 +576,30 @@ def main(argv=None):
             blocked.append(f"{suite_name} (suite failed but enumeration re-run "
                            f"reproduced no failing case — unclassifiable, no masking)")
             continue
+        if len(cases) > 1:
+            # #4580: a solo re-run of the WHOLE suite surfacing multiple
+            # failing cases for what meson reported as a single suite
+            # failure is not a replay of the original invocation — do not
+            # read the names below as "what failed originally". The same
+            # caveat technically applies at len(cases) == 1 too (a single
+            # enumerated case can still be a DIFFERENT case than whatever
+            # failed originally — meson's own junit is suite-granularity
+            # only, so there is nothing to compare against either way), but
+            # >1 is the shape that visibly LOOKS suspicious to a human
+            # reader; a lone case reads as an unremarkable, expected
+            # reproduction and isn't worth a notice on every ordinary flake.
+            gh("notice",
+               f"{suite_name}: the enumeration re-run found {len(cases)} failing "
+               "cases in a separate solo run of the whole suite, not a replay of "
+               "the original invocation — the original failure may not be among "
+               "these names (#4580). Assertion detail preserved at "
+               f"meson-logs/flake-retry-enum-{_suite_slug(test)}.catch2.xml")
         for case in sorted(cases):
             entry = flaky.get(case)
             if entry is None:
                 blocked.append(case)
                 continue
-            passed_attempt = retry_case(test, case, args.retries)
+            passed_attempt = retry_case(test, case, args.retries, args.builddir)
             if passed_attempt:
                 cross = "all" in entry.get("platforms", [])
                 recovered.append((case, cross, passed_attempt))
@@ -597,6 +728,57 @@ def _selftest():
             f.write('<testsuites><testsuite><testcase name="A"/>'
                     '<testcase name="B"><failure>x</failure></testcase></testsuite></testsuites>')
         check(_failed_testcase_names(x) == {"B"}, "junit picks only failed cases")
+
+    # enumeration-junit preservation (#4580).
+    check(_suite_slug({"name": "agent unit tests"}) == "agent-unit-tests",
+          "suite slug: spaces become dashes")
+    check(_suite_slug({"name": "a/b [pg]"}) == "a-b-pg",
+          "suite slug: non-filename-safe chars collapse to dashes")
+    check(_suite_slug({"cmd": ["/build/yuzu_agent_tests"]}) == "yuzu_agent_tests",
+          "suite slug: falls back to cmd[0] basename when name is absent")
+    with tempfile.TemporaryDirectory() as d:
+        builddir = os.path.join(d, "build")
+        os.makedirs(builddir)
+        src = os.path.join(d, "src.xml")
+        with open(src, "w") as f:
+            f.write("<testsuites/>")
+        test = {"name": "agent unit tests"}
+        _preserve_enum_junit(builddir, test, src)
+        dest = os.path.join(builddir, "meson-logs", "flake-retry-enum-agent-unit-tests.catch2.xml")
+        check(os.path.exists(dest), "preserve: copies junit into meson-logs/ under the slug name")
+        with open(dest, encoding="utf-8") as f:
+            check(f.read() == "<testsuites/>", "preserve: content copied verbatim")
+        check(os.path.exists(src), "preserve: source temp file is untouched (caller still deletes it)")
+        # builddir=None (e.g. a caller with no build) is a documented no-op,
+        # never an error — must not raise or fabricate a path.
+        _preserve_enum_junit(None, test, src)
+        # An unwritable destination degrades silently — diagnostic-only,
+        # must never propagate and break the actual retry flow.
+        unwritable_parent = os.path.join(d, "not-a-dir")
+        with open(unwritable_parent, "w") as f:
+            f.write("")
+        try:
+            _preserve_enum_junit(unwritable_parent, test, src)
+        except OSError:
+            check(False, "preserve: must swallow OSError from an unwritable builddir")
+
+        # Stale-file sweep (#4580 review finding): build dirs are NOT wiped
+        # between ordinary CI runs, so a prior run's leftover
+        # flake-retry-enum-*.catch2.xml must not survive into this run's own
+        # artifact upload looking like fresh evidence.
+        logs = os.path.join(builddir, "meson-logs")
+        stale_other = os.path.join(logs, "flake-retry-enum-some-other-suite.catch2.xml")
+        with open(stale_other, "w") as f:
+            f.write("<testsuites/>")
+        _clear_stale_enum_junit(builddir)
+        check(not os.path.exists(dest) and not os.path.exists(stale_other),
+              "clear-stale: removes every prior flake-retry-enum-*.catch2.xml")
+        # A directory with no meson-logs/ yet (first invocation ever) or no
+        # matching files must be a silent no-op, not an error.
+        empty_builddir = os.path.join(d, "empty-build")
+        os.makedirs(empty_builddir)
+        _clear_stale_enum_junit(empty_builddir)  # must not raise
+        _clear_stale_enum_junit(None)  # must not raise
 
     # duration extraction + budget rows (#2093).
     with tempfile.TemporaryDirectory() as d:
@@ -744,15 +926,17 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    # Windows CI test-phase restructuring (#3443, 2026-08-28): 12 pg shards
-    # (10 + shard K + shard L, ADR-0065's instruction-cluster carve,
-    # 2026-08-31) + 4 non-pg shards (A/B + shard C, then a later
-    # measured-by-time follow-up added shard D, carved from B's [body_cap]
-    # tests) + the smoke entry (also server_test_exe) = 17. The floor stays
-    # a loose ">=", same spirit as the original "twelve" (itself a floor,
-    # not an exact pin) -- exactness is check-pg-shard-partition.py's job,
-    # against the real binary.
-    check(len(_entries) >= 17, "meson.build: all seventeen server shard entries located")
+    # Counted from tests/meson.build 2026-10-11 (regex over the test()
+    # entries, cross-checked against check-pg-shard-partition.py): 14 pg
+    # shards (A-O without J or P: the original ten minus J, then K, L, M, N
+    # and O from the pg-shard rebalance; J and P were merged into I and M on
+    # 2026-10-11 to stay at 14 pg shards) + 4 non-pg shards (A/B + shard C,
+    # then shard D carved from B's [body_cap] tests) + the smoke entry (also
+    # server_test_exe) = 19. The floor stays a loose ">=" (not an exact pin):
+    # exactness is check-pg-shard-partition.py's job, against the real
+    # binary. Lowered from 21 in the same change that merged the pg suite
+    # from 16 shards back to 14.
+    check(len(_entries) >= 19, "meson.build: all nineteen server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -813,9 +997,9 @@ def _selftest():
     # 2026-08-28) -- comparatively stable, unlike the pg shards, which get
     # rebalanced -- so a small verbatim pin is proportionate for them
     # specifically. Plus a COUNT-based (not exact-string) sanity check that
-    # extraction still finds a real pg-shard population (now 12: 10 + shard
-    # K + shard L, plus the smoke entry makes 13 total non-excluded specs --
-    # see the comment on the >= 13 floor below), as a second, independent signal
+    # extraction still finds a real pg-shard population (now 14, plus the
+    # smoke entry makes 15 total non-excluded specs -- see the comment on the
+    # >= 15 floor below), as a second, independent signal
     # alongside check-pg-shard-partition.py's own hollow-discovery guard, in
     # case the two checks are ever run without each other.
     _NONPG_SPECS = (
@@ -828,16 +1012,15 @@ def _selftest():
     _pg_specs = [s for s in _shard_specs if s not in _NONPG_SPECS]
     check(all(spec in _shard_specs for spec in _NONPG_SPECS),
           "meson.build: all four non-pg shard tag filters extracted verbatim")
-    # _pg_specs = 12 real pg shards (10 + K + L, ADR-0065's instruction-
-    # cluster carve, 2026-08-31) + the smoke entry (also server_test_exe,
-    # also not one of the three excluded non-pg tuples) = 13. The smoke
-    # entry's own spec ('[pg-smoke]',) has always been counted here; this is
-    # a pre-existing property of the extraction, not new to any split
-    # (verified against the pre-split source: smoke was already included,
-    # making the OLD floor's true value 11 before K, not the "10 pg-shard
-    # entries" an even older message claimed).
-    check(len(_pg_specs) >= 13,
-          f"meson.build: at least 13 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
+    # _pg_specs = 14 real pg shards (A-O without J or P; counted 2026-10-11)
+    # + the smoke entry (also server_test_exe, also not one of the four
+    # excluded non-pg tuples) = 15. The smoke entry's own spec ('[pg-smoke]',)
+    # has always been counted here; this is a pre-existing property of the
+    # extraction, not new to any split. Lowered from 17 in the same change that
+    # merged the pg suite from 16 shards back to 14 (it had been raised from 13
+    # when the suite grew from 12 to 16).
+    check(len(_pg_specs) >= 15,
+          f"meson.build: at least 15 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
           "-- exact partition identity is proven separately, against the real "
           "binary, by check-pg-shard-partition.py")
 

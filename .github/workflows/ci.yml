@@ -20,24 +20,19 @@ on:
   push:
     branches: [main, dev]
     tags-ignore: ['v*']
-    # BR-010: expressed as a `paths` ALLOW-list (not `paths-ignore`) precisely
-    # so docs/os-capability-matrix.md can be re-included after the docs
-    # exclusion. GitHub honours a trailing `!`-negation only in `paths`
-    # (last-match-wins); the same trick in `paths-ignore` is a silent no-op,
-    # which is why the earlier carve-out did nothing. `**` matches everything,
-    # the negations then re-exclude the ignore set, and the final positive
-    # pattern re-includes ONLY the generated matrix (whose drift gate must run
-    # on a push that touches just that file). Its generator/plugins/scripts are
-    # not in the ignore set, so they already trigger.
-    paths:
-      - '**'
-      - '!docs/**'
-      - '!*.md'
-      - '!LICENSE'
-      - '!.gitignore'
-      - '!.github/runner-inventory.json'
-      - '!.github/workflows/runner-inventory-sentinel.yml'
-      - 'docs/os-capability-matrix.md'
+    # No `paths` filter here either (#5320), for the same reason as
+    # pull_request below (#1978). The push trigger used to carry a docs `paths`
+    # allow-list on the reasoning that "post-merge docs pushes need no build and
+    # gate nothing" — but a release commit is often changelog-only, and with no
+    # run on it the six required contexts never appeared on the commit the
+    # release tags (v0.14.0's 50a81af91). Now every push runs, and preflight's
+    # `code_changed` output skips the heavy build jobs when the push changed
+    # only the docs set, exactly as on a PR; the build legs' required names then
+    # come from the `docs-required-checks` stub. That skip is fail-closed and
+    # additionally requires the previous commit's push run to have succeeded,
+    # so a docs push never stands in for an unbuilt or red code commit (see the
+    # codegate step). A push touching docs/os-capability-matrix.md still builds
+    # and runs its drift gate (BR-010): the classifier carves it out of docs.
   pull_request:
     branches: [main, dev]
     # No paths-ignore here (issue #1978). Filtering this whole workflow out
@@ -47,8 +42,8 @@ on:
     # (they had to be admin-bypassed). Instead the workflow always runs and
     # the `preflight` job's `code_changed` output gates the heavy build jobs:
     # a docs-only PR skips them, and a *skipped* required check is satisfied
-    # whereas an *absent* one is not. The `push:` trigger above keeps its
-    # paths-ignore — post-merge docs pushes need no build and gate nothing.
+    # whereas an *absent* one is not. The `push:` trigger above now does the
+    # same (#5320).
   workflow_call:
     inputs:
       pr_number:
@@ -93,13 +88,15 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
-  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # meson pin for the Linux and macOS jobs lives in requirements-ci.txt (pip
+  # ecosystem tracked by Dependabot); the Windows job uses the runner's
+  # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
+  # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
   # Bumped 500M → 30G after measuring 94-97% direct-hit rate on the
-  # self-hosted runners (yuzu-wsl2-linux + yuzu-local-windows). Yuzu has
+  # self-hosted runners (originally yuzu-wsl2-linux + yuzu-local-windows, since retired). Yuzu has
   # ~700 TUs × multiple build_type/compiler matrix legs; 500M was
   # thrashing the cache between configs. This is a self-hosted-only budget:
   # the macOS leg moved to the BigMags pool (#3217) and no longer uploads
@@ -220,6 +217,23 @@ jobs:
             exit 1
           }
 
+          # CWE-349 (#4471): the caller's ref is this run's GitHub Actions
+          # cache scope, and every job below executes the approved fork
+          # revision. Dispatched on main/dev, that code could write cache
+          # entries every later trusted run restores (main is readable from
+          # every ref; dev is every PR's base). The #3543 save gates in the
+          # canary only cover this workflow's OWN save steps. So: confine
+          # the run to a throwaway per-PR trusted-fork/pr-<N>[-<sha>] branch
+          # whose scope nothing trusted ever reads (a run restores only from
+          # its own ref, the default branch, and a PR's base), and let the
+          # wrapper purge that scope afterwards. docs/ci-troubleshooting.md
+          # 1.2 is the runbook. Checked BEFORE the API calls so the hermetic
+          # test (tests/shell/test_trusted_inputs_validate.sh) reaches it.
+          [[ "$GITHUB_REF" =~ ^refs/heads/trusted-fork/pr-${PR_NUMBER}(-[0-9a-fA-F]{7,40})?$ ]] || {
+            echo "::error::trusted-fork-ci must be dispatched on refs/heads/trusted-fork/pr-${PR_NUMBER}[-<sha>] (got $GITHUB_REF); see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
+
           pr_json=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")
           state=$(jq -r '.state' <<<"$pr_json")
           head_sha=$(jq -r '.head.sha' <<<"$pr_json")
@@ -255,12 +269,9 @@ jobs:
   # `== 'true'` (fail-closed: an unhealthy or unknown runner skips the
   # job in <30s rather than queuing 30 min into a stalled runner).
   #
-  # Output names are slugified runner names from .github/runner-inventory.json:
-  #   yuzu-wsl2-linux  → yuzu_wsl2_linux_healthy
-  #   yuzu-local-windows → yuzu_local_windows_healthy
-  # Plus a pool gate:
+  # Pool gates:
   #   linux_pool_healthy → true iff >=1 [self-hosted, Linux, X64] runner is online
-  #     (any yuzu-bigtam-* OR the yuzu-wsl2-linux Shulgi fallback). The Linux jobs
+  #     (the yuzu-bigtam-* runners, the only Linux runners in the inventory). The Linux jobs
   #     gate on the pool, not a single named runner, so a free pool member keeps
   #     them running and a fully-offline pool still skips them fast.
   #
@@ -275,16 +286,18 @@ jobs:
     # Job-level permissions REPLACE the workflow default (contents: read), so
     # both are listed. pull-requests: read is required by the code-vs-docs gate
     # below, which lists the PR's changed files via the REST API (issue #1978).
+    # actions: read is for the same gate's push arm (#5320), which reads the
+    # previous commit's ci.yml push run before it may skip the build.
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     outputs:
       # Pool gate for the [self-hosted, Linux, X64] jobs (proto-compat, linux):
-      # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
-      # Shulgi fallback) is online. Replaces the old single-named yuzu_wsl2_linux gate.
+      # true iff >=1 eligible Linux runner (the yuzu-bigtam-* runners) is online.
       linux_pool_healthy: ${{ steps.health.outputs.linux_pool_healthy }}
       # Big Tam sub-pool (yuzu-bigtam-linux) — gates the gcc-15/clang-21 compile
-      # job, whose 26.04-only toolchain cannot run on the Shulgi 24.04 fallback.
+      # job, whose toolchain is 26.04-only.
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
       # Exact Wee Tam pool gate matching the Windows job's runs-on labels.
       # Shulgi is an operator testbed, not a production scheduling fallback.
@@ -292,14 +305,14 @@ jobs:
       # Exact BigMags pool gate matching the macOS job's runs-on labels.
       # No GitHub-hosted or Shulgi fallback can satisfy the Apple-Silicon job.
       bigmags_pool_healthy: ${{ steps.health.outputs.bigmags_pool_healthy }}
-      yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
-      yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
-      # code_changed (issue #1978): false iff every changed file in a PR is in
-      # the docs/ignore set the pull_request trigger used to carry. Gates the
-      # heavy build jobs (proto-compat, linux, windows, macos) so a docs-only
-      # PR skips them instead of blocking forever on absent required checks.
-      # Always true for non-PR events (push / workflow_dispatch build always).
+      # code_changed (issue #1978): false iff every changed file in a PR, or
+      # in a push to main/dev (#5320), is in the docs-only set
+      # (scripts/ci/detect-code-change.sh). Gates the heavy build jobs
+      # (proto-compat, linux, windows, macos) so a docs-only change skips them
+      # instead of leaving required checks absent. A push additionally needs
+      # the previous commit's push run to have succeeded. Always true for any
+      # other event (workflow_call / trusted-fork builds always).
       code_changed: ${{ steps.codegate.outputs.code_changed }}
       checkout_repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
       checkout_ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
@@ -315,37 +328,117 @@ jobs:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
-      # ── Docs-only vs code gate (issue #1978) ───────────────────────────
-      # Decide whether the heavy build matrix runs for this PR. The
+      # ── Docs-only vs code gate (issue #1978, push arm #5320) ────────────
+      # Decide whether the heavy build matrix runs for this PR or push. The
       # classification (which paths count as docs-only, the 3000-file API-cap
       # truncation guard) lives in scripts/ci/detect-code-change.sh and is
-      # covered by tests/shell/test_detect_code_change.sh. Fail-closed
-      # throughout: a non-PR event, an API/permission failure, an empty list,
-      # or a truncated list all build rather than silently skip.
+      # covered by tests/shell/test_detect_code_change.sh; this step's own
+      # branches are executed by tests/shell/test_codegate_push.sh. Fail-closed
+      # throughout: an API/permission failure, an empty list, or a truncated
+      # list all build rather than silently skip.
       - name: Determine code-vs-docs change set (docs-only gate)
         id: codegate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
+          build() {
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+            echo "$1"
+            exit 0
+          }
+          # ── Push to main/dev (#5320) ──────────────────────────────────────
+          # A docs-only push skips the build like a docs-only PR, so the
+          # required contexts still appear on the commit (the release tag gate
+          # needs them). Two conditions, both fail-closed:
+          #  1. The previous tip's ci.yml push run on this branch SUCCEEDED.
+          #     Without this, a docs push could stand in for an unbuilt code
+          #     commit: a newer pending run in this workflow's concurrency group
+          #     cancels an older pending one, so a code push still waiting
+          #     behind a running build is cancelled by a docs push arriving
+          #     next, and the code would never be built. Likewise a red code
+          #     commit followed by a docs commit must not turn green. By
+          #     induction a docs-only skip only ever follows a green build.
+          #  2. Every path between the previous tip and this commit is in the
+          #     docs-only set. Renames contribute both names, so moving a file
+          #     out of code into docs/ still builds.
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            if [[ ! "$PUSH_BEFORE_SHA" =~ ^[0-9a-f]{40}$ || "$PUSH_BEFORE_SHA" =~ ^0{40}$ ]]; then
+              build "Push with no usable previous tip ('$PUSH_BEFORE_SHA') — building (fail-closed)."
+            fi
+            if ! prev=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+                  -f head_sha="$PUSH_BEFORE_SHA" -f event=push -f branch="$GITHUB_REF_NAME" -f per_page=100 \
+                  --jq '[.workflow_runs[]] | max_by(.run_number) | .conclusion // "none"'); then
+              build "Workflow-runs API failed — building to be safe (fail-closed)."
+            fi
+            if [[ "$prev" != "success" ]]; then
+              build "Previous tip $PUSH_BEFORE_SHA has no successful ci.yml push run on $GITHUB_REF_NAME (latest: '$prev') — building."
+            fi
+            cmp_json="$RUNNER_TEMP/codegate-compare.json"
+            if ! gh api -X GET "repos/$GITHUB_REPOSITORY/compare/${PUSH_BEFORE_SHA}...${GITHUB_SHA}" \
+                  -f per_page=1 > "$cmp_json"; then
+              build "Compare API failed — building to be safe (fail-closed)."
+            fi
+            # ahead = the previous tip is an ancestor, so the three-dot compare
+            # is exactly previous-tip..this-commit. Anything else (a force push)
+            # builds.
+            if [[ "$(jq -r '.status' "$cmp_json")" != "ahead" ]]; then
+              build "Push is not a fast-forward of $PUSH_BEFORE_SHA — building."
+            fi
+            # The compare API lists at most 300 files; at the cap the list may be
+            # truncated, so build. An empty list is missing evidence (and an
+            # empty commit is the usual way to re-trigger CI), so build too.
+            if ! nfiles=$(jq '.files // [] | length' "$cmp_json") || (( nfiles == 0 || nfiles >= 300 )); then
+              build "Compare lists ${nfiles:-?} files (empty, or the 300-file API cap) — building (fail-closed)."
+            fi
+            # A path with a control character (a newline, say) would be split
+            # into several lines below and could pass as docs; build instead.
+            # A jq error here builds too.
+            if ! ncntrl=$(jq '[.files[] | .filename, (.previous_filename // empty) | select(test("[[:cntrl:]]"))] | length' "$cmp_json") \
+                || [[ ! "$ncntrl" =~ ^[0-9]+$ ]] || (( ncntrl > 0 )); then
+              build "A changed path contains a control character, or the path list could not be read — building (fail-closed)."
+            fi
+            if ! files=$(jq -r '.files[] | .filename, (.previous_filename // empty)' "$cmp_json"); then
+              build "Could not read the compare file list — building (fail-closed)."
+            fi
+            echo "Changed paths since $PUSH_BEFORE_SHA (previous run: success):"
+            printf '%s\n' "$files"
+            if ! code_changed=$(printf '%s\n' "$files" | bash scripts/ci/detect-code-change.sh); then
+              build "Classifier errored — building to be safe (fail-closed)."
+            fi
+            echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
+            echo "Result: code_changed=$code_changed"
+            if [[ "$code_changed" == "false" ]]; then
+              echo "Docs-only push (#5320): build skipped. Predecessor $PUSH_BEFORE_SHA push run: success. 'Linux gcc-15 debug' / 'Windows MSVC debug' / 'macOS debug' on $GITHUB_SHA are stubs, not builds." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            fi
+            exit 0
+          fi
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "code_changed=true" >> "$GITHUB_OUTPUT"
             echo "Non-PR event (${{ github.event_name }}) — building unconditionally."
             exit 0
           fi
           # Fail-closed on any API/permission failure: build rather than block.
-          if ! files=$(gh api --paginate \
-                "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-                --jq '.[].filename'); then
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "PR files API failed — building to be safe (fail-closed)."
-            exit 0
+          # The JSON is captured once and read twice: the file names (one line
+          # per file, so the changed_files total check below stays exact) and
+          # the renames' previous names.
+          pr_json="$RUNNER_TEMP/codegate-pr-files.json"
+          if ! gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" > "$pr_json"; then
+            build "PR files API failed — building to be safe (fail-closed)."
           fi
+          # jq reads the concatenated per-page arrays --paginate emits as a stream.
+          # A path with a control character (a newline, say) would be split into
+          # several lines and could pass as docs; build instead (a jq error too).
+          if ! ncntrl=$(jq -n '[inputs[] | .filename, (.previous_filename // empty) | select(test("[[:cntrl:]]"))] | length' "$pr_json") \
+              || [[ ! "$ncntrl" =~ ^[0-9]+$ ]] || (( ncntrl > 0 )); then
+            build "A changed path contains a control character, or the PR file list could not be read — building (fail-closed)."
+          fi
+          files=$(jq -r '.[].filename' "$pr_json") || build "Could not read the PR file list — building (fail-closed)."
+          prev=$(jq -r '.[] | .previous_filename // empty' "$pr_json") || build "Could not read the PR rename list — building (fail-closed)."
           echo "Changed files in PR #${{ github.event.pull_request.number }}:"
           printf '%s\n' "$files"
           if [[ -z "$files" ]]; then
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Empty changed-file list — building to be safe (fail-closed)."
-            exit 0
+            build "Empty changed-file list — building to be safe (fail-closed)."
           fi
           # changed_files is the authoritative total; the script fails closed if
           # the API list is shorter (truncated past the 3000-file cap). Wrap the
@@ -353,9 +446,18 @@ jobs:
           # PR), independent of the runner's default shell error mode.
           if ! code_changed=$(printf '%s\n' "$files" \
                 | bash scripts/ci/detect-code-change.sh "${{ github.event.pull_request.changed_files }}"); then
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Classifier errored — building to be safe (fail-closed)."
-            exit 0
+            build "Classifier errored — building to be safe (fail-closed)."
+          fi
+          if [[ "$code_changed" == "false" && -n "$prev" ]]; then
+            # A rename's previous path counts too (moving server/x.cpp to docs/ must still build).
+            # No TOTAL here: the total check above already covered the file list.
+            if ! prev_changed=$(printf '%s\n' "$prev" | bash scripts/ci/detect-code-change.sh); then
+              build "Classifier errored on rename sources — building (fail-closed)."
+            fi
+            if [[ "$prev_changed" == "true" ]]; then
+              echo "A rename's previous path is code-side — building."
+              code_changed=true
+            fi
           fi
           echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
           echo "Result: code_changed=$code_changed"
@@ -400,16 +502,48 @@ jobs:
             exit 1
           }
 
+      # Portable-path gate (ws91 P91-7, Architect ruling 2026-09-08). Pure
+      # `git ls-files` scan -- no build deps -- so it belongs here beside the
+      # other preflight gates. Fails on any tracked path Windows/NTFS cannot
+      # represent (a ':' -- the recurring offender for sysfs/PCI/MAC-
+      # address-shaped fixture data -- or `* ? " < > |` or a trailing '.'/' '
+      # on any path component): P91-5's Linux sysfs fixture tree shipped 35
+      # such paths and broke `git checkout` on every Windows host, the-rig
+      # and the "Windows MSVC ${{ matrix.build_type }}" self-hosted CI
+      # checkout job (this file's build matrix, below) included. Selftest
+      # first (fixture-level proof the predicate still discriminates
+      # clean/seeded paths), then the real scan over the tree.
+      - name: Portable path gate (ws91 P91-7)
+        run: |
+          bash scripts/ci/check-portable-paths.sh --selftest
+          bash scripts/ci/check-portable-paths.sh
+
+      # test_check_elf_floor.sh parses the workflows with PyYAML (its tripwire);
+      # the hosted image may lack it, so install it hash-pinned like docs-lint.yml.
+      - name: Install PyYAML (hash-pinned)
+        run: |
+          python3 -c "import yaml" 2>/dev/null || \
+            python3 -m pip install --user --break-system-packages \
+              --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
       # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
       # otherwise only runs at release time, so a regex regression would surface
-      # too late (after the full build matrix). No build deps — just bash.
+      # too late (after the full build matrix). No build deps — just bash (and
+      # python3; test_check_elf_floor.sh also needs gcc + binutils, all on the
+      # hosted ubuntu runner).
       - name: Shell gate tests
         run: |
           bash tests/shell/test_check_compose_versions.sh
           bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
+          bash tests/shell/test_codegate_push.sh        # docs-only gate's push + PR arms (#5320)
+          bash tests/shell/test_release_guard.sh        # release.yml re-publish guard (#5282)
+          bash tests/shell/test_release_tag_sha.sh      # release.yml per-push tag recheck (#5282)
           python3 scripts/ci/test_runner_health_check.py
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
+          bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
+          bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
+          bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
 
       # Prometheus HELP-text ASCII gate (#2128). Source-only, no build deps,
       # so it belongs on the PR fast path beside the shell gate above rather
@@ -498,11 +632,11 @@ jobs:
     name: "Proto backward-compat"
     needs: [preflight]
     # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
-    # (yuzu-bigtam-* or the Shulgi fallback). Fail-closed `== 'true'`.
+    # (yuzu-bigtam-*). Fail-closed `== 'true'`.
     # `&& code_changed` (issue #1978): a docs-only PR skips this required job
     # (skipped == satisfied), so it no longer blocks the merge on an absent check.
     if: needs.preflight.outputs.linux_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -533,7 +667,7 @@ jobs:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
     needs: [preflight]
     # Pinned to the Big Tam sub-pool: the GCC 15 / Clang 21 toolchain is
-    # 26.04-only and cannot build on the Shulgi 24.04 fallback, so gate on
+    # 26.04-only (the retired Shulgi runners were 24.04), so gate on
     # bigtam_pool_healthy (>=1 yuzu-bigtam-linux runner online) rather than the
     # broader linux_pool. Fail-closed `== 'true'` (NOT `!= 'false'`) — an offline
     # Big Tam skips this job fast instead of queueing against an empty pool.
@@ -560,6 +694,11 @@ jobs:
       # ERL_EPMD_PORT isolation (each runner's .env) removes the cross-runner
       # EPMD collision that triggers the transient distribution in the first place.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
+      # The gateway TLS test legs mint certificates with the openssl CLI. With
+      # this set, an unavailable or failing openssl FAILS those tests instead of
+      # silently skipping them. Linux (Big Tam) only: the Windows and macOS legs
+      # are deliberately not covered (docs/erlang-gateway-build.md).
+      YUZU_REQUIRE_TLS_TESTS: "1"
     strategy:
       fail-fast: false
       # max-parallel: 3, not 4 — Big Tam has exactly 4 yuzu-bigtam-linux runner
@@ -577,8 +716,8 @@ jobs:
       # since push-triggered runs aren't PR-fast-path latency sensitive.
       # NOT a guarantee the freed runner reaches the intended PR job: this
       # matrix isn't the only claimant on the pool. `proto-compat` below
-      # targets the bare `[self-hosted, Linux, X64]` label, which every
-      # Big Tam Linux runner also carries, and runs on the same push trigger
+      # is pinned to the same `yuzu-bigtam-linux` label, so it draws on
+      # the same runners, and runs on the same push trigger
       # this cap targets — it can claim the freed runner itself (its own
       # `timeout-minutes: 5` means it self-frees quickly, but it is a real
       # same-push competitor, not just the already-named nightly-overlap
@@ -713,6 +852,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
               bison flex libsystemd-dev libblkid-dev autoconf automake libtool \
+              postgresql-client \
               ${{ matrix.compiler == 'gcc-15' && 'gcc-15 g++-15' || 'clang-21' }}
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
@@ -734,10 +874,18 @@ jobs:
       # build runs fine on 26.04 (same libcrypto.so.3 soname). Do NOT change to
       # ubuntu26 until setup-beam ships a 26.04 build — it would fail to resolve
       # the asset. Verified by gateway eunit on the Big Tam leg.
+      # RUNNER_TOOL_CACHE is re-pointed for this step only, as on the macOS leg
+      # (see its step for the full reasoning, #4852): a trusted-fork run must not
+      # write a persistent erl into a cache later normal jobs on this agent
+      # execute (the "Do not read or write runner.tool_cache" rule above), so it
+      # gets a per-run temp dir; normal runs keep a per-agent subdir of the tool
+      # cache (Big Tam's tool cache is already per agent, so that costs one cold
+      # install per agent and no new sharing).
       - name: Install Erlang/OTP and rebar3
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         env:
           ImageOS: ubuntu24
+          RUNNER_TOOL_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-beam-{1}', runner.temp, github.run_id) || format('{0}/setup-beam/{1}', runner.tool_cache, runner.name) }}
         with:
           otp-version: '28'
           rebar3-version: '3.24'
@@ -835,6 +983,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-15' && '-Db_lto=true' || '' }}
+          python3 scripts/ci/assert-gateway-tests.py "$BUILDDIR"
 
       - name: Build
         # Cross-OS capture certification guard (PR #4112 review, blocker),
@@ -986,10 +1135,49 @@ jobs:
         # added shard D, carved from B's [body_cap] tests — + the mcp bridge
         # teardown budget test + the pg shard partition invariant, #3443
         # Phase 1 — needs no Postgres DSN,
-        # --list-tests only enumerates TEST_CASE macros). Both UNCAPPED (no
-        # --num-processes) since neither touches Postgres. Only the pg-tagged
-        # invocations (full shards or smoke, #3443 Phase 2) go through their
-        # own dedicated steps below.
+        # --list-tests only enumerates TEST_CASE macros). Both now pass
+        # --num-processes 2 (2026-09-18, extends #3443). The old reasoning
+        # here ("UNCAPPED since neither touches Postgres") conflated
+        # Postgres contention with the WITHIN-job meson fan-out #3443 already
+        # proved on the pg shards below: uncapped `meson test` spawns every
+        # registered test() entry through its own cpu_count()-based worker
+        # pool, blind to this box's cgroup-confined CPU count, regardless of
+        # whether any of those entries touch Postgres. Evidence this actually
+        # fires here: on two independently-diagnosed CI runs (PR #4532 run
+        # 35307458479, PR #4566 run 35361987460, no diff in common), THIS
+        # invocation's own testlog.txt shows exactly ONE Catch2 case failing
+        # each time, both async/timing assertions in the spark/guardian
+        # suite (a 10s spin_until that never resolved; an ArmOutcomeKind/
+        # ReceiptStatus mismatch in an async wedge test) - consistent with
+        # CPU steal flipping a real-time assertion, not a Postgres-specific
+        # mechanism. --num-processes 2 matches the value already established
+        # for this box's pg-shard step below rather than inventing a new
+        # one.
+        #
+        # CORRECTION (build-ci review, 2026-09-18): the much larger ~20-case
+        # "blocked" list CI actually reports for those same two runs
+        # (content_dist/script_exec/event_logs/wifi/windows_updates/
+        # software_actions/license_scan) is NOT produced by this meson
+        # invocation and this flag does not touch it - it comes from
+        # flake-retry.py's catch2_failed_cases() classifier, which re-runs
+        # the WHOLE failed binary a second time, SOLO, as a bare subprocess
+        # outside meson's own test orchestrator, to enumerate failing case
+        # names for the retry pass. Why that solo re-run fails ~20 different
+        # cases than the original invocation above is NOT diagnosed (see
+        # #4580) - candidates include cross-job box contention during the
+        # solo re-run, shared-fixture/test-order pollution, or resource
+        # pressure from running the 3300+-case suite twice back to back;
+        # none confirmed. This cap is shipped on the single-case evidence
+        # above; do not read it as a fix for the classifier cascade.
+        #
+        # Cross-job with-test-slot.sh gating is deliberately NOT added here
+        # yet: this step's aggregate duration is
+        # still short, so the within-job cap is the single-axis fix shipped
+        # first, per this file's own "ship and measure one axis at a time"
+        # practice - watch ci-suite-stats for this leg before adding the
+        # cross-job gate too. The pg-tagged invocations (full shards or
+        # smoke, #3443 Phase 2) still separately go through with-test-slot.sh
+        # below; this step does not.
         # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): previously only
         # enabled on the nightly windows-asan leg, so a hang in this leg's agent
         # suite - the exact class #2345/#4018 recurred as - had no per-test
@@ -1005,8 +1193,8 @@ jobs:
           export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/progress.log"
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --suite agent --suite docs --suite proto --suite tar --suite gateway
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "server pg shard partition invariant"
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite agent --suite docs --suite proto --suite tar --suite gateway
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "server pg shard partition invariant" "dex link no presentation symbols"
 
       - name: Test (pg shards, full)
         if: matrix.pg_mode == 'full'
@@ -1022,7 +1210,8 @@ jobs:
         # cpu_count() (this runner's job is genuinely confined to execute on 16
         # logical CPUs via cgroup, "Self-hosted runner topology" in
         # docs/ci-architecture.md, but meson's own pool sizing ignores that) — so
-        # the ~10 server pg shards ran CONCURRENTLY inside this one job, sharing
+        # the server pg shards (~10 when this was diagnosed; 14 now) ran
+        # CONCURRENTLY inside this one job, sharing
         # those 16 CPUs AND the one ensure-postgres.sh container this job got.
         # Proved via back-computed shard start times (printed-timestamp minus
         # elapsed) landing within ~0.01s of each other across every pg shard in a
@@ -1261,7 +1450,7 @@ jobs:
             python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
 
       # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
-      # this small tagged subset INSTEAD of the 12-shard server-pg suite
+      # this small tagged subset INSTEAD of the 14-shard server-pg suite
       # above — see tests/meson.build's 'server pg smoke' entry for the full
       # rationale (tag membership, why --allow-running-no-tests is REQUIRED
       # here unlike Correction 1's original "no flag" wording, why it's a
@@ -1282,6 +1471,46 @@ jobs:
         env:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
         run: bash tests/shell/test_mfa_reset.sh
+
+      # --generate-tokens CLI contract (WS-6 6.2) — same rationale as the
+      # break-glass CLI test above: exit codes + the stdout JSON scripting
+      # contract of `yuzu-server --generate-tokens` are not exercisable by the
+      # Catch2 suite (which does not drive main()).
+      - name: Generate-tokens CLI test
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+        run: bash tests/shell/test_generate_tokens.sh
+
+      # Fresh-install Administrator bootstrap: the fatal refusal when the config
+      # lists local users but none has role=admin, and the durable
+      # rbac.bootstrap.first_admin audit row on a successful bootstrap — neither
+      # is exercisable by the Catch2 suite (which never drives main()).
+      - name: First-admin bootstrap CLI test
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+        run: bash tests/shell/test_first_admin_bootstrap_refusal.sh
+
+      # Gateway-upstream peer authorization boot decision: with --gateway-upstream enabled the
+      # server must exit non-zero before binding any listener for the refused configurations
+      # (--no-tls without --insecure-gateway-peer, acknowledgement plus a pin, operator certs
+      # with no pin, no client CA, a broken explicit pin source, HTTPS-only defaults) and must
+      # boot for the permitted ones. It also makes an ANONYMOUS gateway-upstream call (curl, no
+      # client certificate) to the real binary: refused (grpc-status 16, denial counter on
+      # /metrics) when enforcing, answered when acknowledged-off. With a client certificate it
+      # calls the agent, the dedicated gateway-upstream and the management listeners (the guarded
+      # service answers on all three): the pinned default gateway leaf is admitted, the unpinned
+      # default server leaf is refused as not_pinned with its denial audit row in Postgres, and
+      # no certificate at all fails the handshake on the two strict listeners. Not exercisable by
+      # the Catch2 suite (which never constructs ServerImpl); needs the binary and Postgres, like the step
+      # above. YUZU_REQUIRE_PSQL makes a missing `psql` a failure, never a skip: the test creates
+      # one database per row through it, and a skipped step would be a green job that never ran
+      # (the sibling CLI steps above skip when psql is absent; this one must not).
+      - name: Gateway peer boot-decision CLI test
+        timeout-minutes: 10
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+          YUZU_REQUIRE_PSQL: "1"
+        run: bash tests/shell/test_gateway_peer_boot_refusal.sh
 
       # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so
       # never installs a signal handler). Nothing in unit, integration or CI failed if it broke
@@ -1503,15 +1732,17 @@ jobs:
           done
           meson --version
           ccache --version | head -1
-          # Governance UAT 2026-05-06 build-ci B-2: PyYAML must be
-          # importable for `meson setup` to pass — embed_content.py
-          # hard-fails without it. The runner image should provision
-          # python-yaml via MSYS2 pacman, but ensure idempotently here
-          # so a re-baked runner doesn't silently break release. Use
-          # the hash-pinned requirements file so a compromised PyPI
-          # cannot inject a malicious wheel (Gate 7 re-review LOW).
-          python -c "import yaml" >/dev/null 2>&1 || \
-            python -m pip install --user --require-hashes -r requirements-ci.txt
+          # PyYAML must be importable for `meson setup` (embed_content.py
+          # hard-fails without it; governance UAT 2026-05-06 build-ci B-2).
+          # It is provisioned by deploy/windows/Provision-Windows-Runner.ps1.
+          # Never install it here: all runner slots share one OS identity,
+          # and a --user install of requirements-ci.txt also puts its newer
+          # meson in the user site, which C:\Python314's meson then imports,
+          # failing the toolchain contract for every job on the box.
+          if ! python -c "import yaml" >/dev/null 2>&1; then
+            echo "::error::PyYAML is not importable by the runner's Python (C:\Python314). This job does not install packages into the shared host Python: drain every runner slot on this host, then re-run deploy/windows/Provision-Windows-Runner.ps1 from an elevated pwsh session (do not pass -AllowActiveRunners)."
+            exit 1
+          fi
 
       - name: Assert toolchain manifest (self-hosted)
         shell: pwsh
@@ -1606,6 +1837,7 @@ jobs:
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
+          python scripts/ci/assert-gateway-tests.py "$BUILDDIR"
 
       - name: Build
         # Affinity controls placement, not Ninja's processor-count discovery;
@@ -1735,6 +1967,10 @@ jobs:
           export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-windows-${{ matrix.build_type }}/meson-logs/progress.log"
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
+          # #4666/#5025: clear any pid-suffixed MI-1b topology report left over from a
+          # prior run in this reused (clean:false) build dir, so the "Surface MI-1b..."
+          # step below can't present a stale previous run's verdict as this run's own.
+          rm -f "build-windows-${{ matrix.build_type }}/log_handoff_multi_image_topology."*.txt
           # Single-sourced: the guard and the real invocation must select the
           # SAME suites, or the guard certifies a list the real run doesn't
           # actually use (sre Gate 6 finding, governance 2026-08-28) — a
@@ -1835,6 +2071,42 @@ jobs:
           path: build-windows-${{ matrix.build_type }}/meson-logs/
           if-no-files-found: warn
           retention-days: 14
+
+      # #4666/#5025: tests/unit/test_log_handoff_multi_image.cpp's MI-1b case measures
+      # the Windows spdlog-registry topology and writes its verdict as a Catch2 WARN
+      # (already captured by testlog.txt above on failure) plus a per-PID report file
+      # in the build root — nobody had ever read that file from a CI run before this.
+      # always(): the verdict is produced on every green run too, not only failures,
+      # and this is the leg that only ever uploads on failure/cancel. Cheap (step-
+      # summary text, no artifact storage), purely informational — continue-on-error
+      # so a transient read/write glitch on this reporting step never reddens the
+      # required Windows job over something that gates nothing.
+      #
+      # The "Test (non-pg suites)" step above clears any same-build-dir leftover
+      # report before running, which closes the common stale-previous-run case. Wee
+      # Tam's 4 runner agents share one per-repo workspace with this job (see
+      # cache-prune.yml's own comment on why `clean: false` is load-bearing there), so
+      # two truly concurrent same-build-type Windows runs could in principle still
+      # collide on this namespace between one run's clear and its own report write;
+      # `ls -t` then picks whichever file is newest, which could be the OTHER run's.
+      # Accepted residual risk (display-only, nothing downstream gates on this
+      # summary) — see docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md
+      # for the measured verdict this step exists to surface.
+      - name: Surface MI-1b Windows spdlog-registry verdict
+        if: always()
+        continue-on-error: true
+        run: |
+          shopt -s nullglob
+          files=(build-windows-${{ matrix.build_type }}/log_handoff_multi_image_topology.*.txt)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "MI-1b: no topology report found (the test case may not have run)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            newest="$(ls -t "${files[@]}" | head -1)"
+            echo "### MI-1b Windows spdlog-registry verdict ($(basename "$newest"))" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$newest" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: ccache stats + build observability
         if: always()
@@ -1996,6 +2268,92 @@ jobs:
           # at meson configure time for the content embed.
           pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
+      # OTP + rebar3 for the gateway build and its eunit/ct tests, on the same OTP 28 /
+      # rebar3 3.24 line as the Linux leg. Until #4841 this job had NO Erlang: meson's
+      # find_program('rebar3', required: false) silently skipped the gateway, so macOS
+      # stayed green without ever compiling or testing it. The Configure step below runs
+      # scripts/ci/assert-gateway-tests.py, which fails the leg when the gateway tests
+      # were not registered.
+      # NOT erlef/setup-beam on this leg. Both BigMags agents share /opt/ci/tool_cache and
+      # setup-beam rmRF's and re-copies /opt/ci/tool_cache/otp/macOS-26/... on every run,
+      # so two macOS jobs running at once on the two agents (typically a push's debug +
+      # release pair) raced on it (EEXIST on the epmd symlink, ENOENT mid-copy,
+      # "Unable to locate executable file: erl"). A step-level
+      # RUNNER_TOOL_CACHE did not isolate it: the failing logs showed the per-agent value
+      # in the step env while the EEXIST path was under the shared tool cache. See
+      # docs/darwin-compat.md, "Erlang gateway in macOS CI".
+      # Instead the pinned prebuilt OTP (the same bytes setup-beam fetched: its
+      # OTP-<ver>-macos-arm64.tar.gz alias has the same sha256) and the rebar3 escript go
+      # into RUNNER_TEMP (per agent) after a SHA-256 check; nothing touches
+      # runner.tool_cache (see the rule above). The check catches a bad download or a
+      # re-published asset, not a compromised step in the same job (same user).
+      # Pins are EXACT here (the other legs float on 28 / 3.24) and Dependabot does not
+      # bump env values: edit all four together. OTP_SHA256 is the sha256 of the otp_builds
+      # asset (builds/aarch64-apple-darwin.csv in erlef/otp_builds); re-check its provenance
+      #   gh attestation verify otp-aarch64-apple-darwin.tar.gz --repo erlef/otp_builds \
+      #     --bundle <the release's .sigstore file, saved with a .json name> \
+      #     --signer-workflow erlef/otp_builds/.github/workflows/build.yaml
+      # rebar3 has no attestation: its hash pins the 3.24.0 bytes first seen 2026-10-14.
+      # On a "sha256 mismatch", compare against the upstream release before touching a hash.
+      - name: Install Erlang/OTP and rebar3
+        timeout-minutes: 15
+        env:
+          OTP_VERSION: 28.5.0.7
+          OTP_SHA256: bab4cdc47104e2c6fae4b4b1cf9fe0444b23c19f127ba4345796e1e06ff58a6e
+          REBAR3_VERSION: 3.24.0
+          REBAR3_SHA256: d2d31cfb98904b8e4917300a75f870de12cb5167cd6214d1043e973a56668a54
+        run: |
+          set -euo pipefail
+          # Validate every input BEFORE the EXIT trap exists: on bash 3.2 an "unbound
+          # variable" abort exits 0 once an EXIT trap is installed, which would show this
+          # step green with no Erlang installed.
+          check_pin() { printf '%s' "$2" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::$1 is not a 64-hex sha256 pin"; exit 1; }; }
+          check_pin OTP_SHA256 "$OTP_SHA256"
+          check_pin REBAR3_SHA256 "$REBAR3_SHA256"
+          : "$OTP_VERSION" "$REBAR3_VERSION" "$GITHUB_PATH"
+          root="$RUNNER_TEMP/erlang"
+          rm -rf "$root"
+          mkdir -p "$root/otp" "$root/bin"
+          # Leave nothing behind on failure: a full disk would otherwise stay full for
+          # the other agent until the next job's rm -rf.
+          ok=0
+          trap 'test "$ok" = 1 || rm -rf "$root"' EXIT
+          # fetch <url> <out> <max-seconds-per-attempt>
+          fetch() {
+            curl -fsSL --proto '=https' --proto-redir '=https' --retry 8 --retry-all-errors \
+              --connect-timeout 20 --max-time "$3" --speed-limit 51200 --speed-time 30 \
+              -o "$2" "$1" || { echo "::error::download failed: $1"; exit 1; }
+          }
+          # verify <sha256> <file>. /usr/bin/openssl (LibreSSL) rather than shasum, which is
+          # a Perl script.
+          verify() {
+            got="$(/usr/bin/openssl dgst -sha256 "$2" | awk '{print $NF}')" ||
+              { echo "::error::could not hash ${2##*/}"; exit 1; }
+            test "$got" = "$1" || {
+              echo "::error::sha256 mismatch for ${2##*/}: expected $1, got $got (upstream re-published the asset, or a CDN/proxy error page was saved)"
+              exit 1
+            }
+          }
+          fetch "https://github.com/erlef/otp_builds/releases/download/OTP-${OTP_VERSION}/otp-aarch64-apple-darwin.tar.gz" "$root/otp.tar.gz" 600
+          verify "$OTP_SHA256" "$root/otp.tar.gz"
+          tar -xzf "$root/otp.tar.gz" -C "$root/otp"
+          rm -f "$root/otp.tar.gz"
+          fetch "https://github.com/erlang/rebar3/releases/download/${REBAR3_VERSION}/rebar3" "$root/bin/rebar3" 120
+          verify "$REBAR3_SHA256" "$root/bin/rebar3"
+          chmod 755 "$root/bin/rebar3"
+          otp_major="${OTP_VERSION%%.*}"
+          vfile="$root/otp/releases/$otp_major/OTP_VERSION"
+          test -f "$vfile" || { echo "::error::unpacked OTP has no releases/$otp_major/OTP_VERSION"; exit 1; }
+          got="$(cat "$vfile")"
+          test "$got" = "$OTP_VERSION" || { echo "::error::unpacked OTP is '$got', expected $OTP_VERSION"; exit 1; }
+          # GITHUB_PATH only takes effect from the next step, and rebar3's shebang is
+          # `#!/usr/bin/env escript`, so run both checks through absolute paths.
+          "$root/otp/bin/erl" -version
+          "$root/otp/bin/escript" "$root/bin/rebar3" version
+          echo "$root/bin" >> "$GITHUB_PATH"
+          echo "$root/otp/bin" >> "$GITHUB_PATH"
+          ok=1
+
       # ccache cache lives at ~/Library/Caches/ccache on the self-hosted
       # BigMags runner, which persists in the runner user's home between
       # jobs by definition. No actions/cache round-trip needed — paying the
@@ -2054,6 +2412,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
+          python3 scripts/ci/assert-gateway-tests.py build-macos
 
       - name: Build
         # Bound ninja fan-out by YUZU_BUILD_JOBS (from the runner .env), like the
@@ -2193,8 +2552,14 @@ jobs:
   # proto-compat is a NON-matrix job: its skipped run reports "Proto
   # backward-compat: skipped", which already satisfies the required check, so
   # it needs no stub. preflight always runs; "CHANGELOG order" (docs-lint.yml)
-  # runs on every PR. Together that satisfies all six required contexts on a
-  # docs-only PR without a build.
+  # runs on every PR and every push to main/dev. Together that satisfies all
+  # six required contexts on a docs-only PR without a build.
+  #
+  # Since #5320 the same holds for a docs-only PUSH to main/dev, so the commit a
+  # release tags carries every required context even when it changed only
+  # CHANGELOG.md. On a push the real matrix has more legs (release builds,
+  # clang-21); only the three required names are stubbed, because only they
+  # gate anything.
   docs-required-checks:
     name: ${{ matrix.check }}
     needs: [preflight]
@@ -2212,12 +2577,20 @@ jobs:
           - "Windows MSVC debug"
           - "macOS debug"
     steps:
-      - name: Satisfy required check (docs-only PR — no build)
+      - name: Satisfy required check (docs-only change — no build)
         run: |
-          echo "Docs-only PR (#1978): '${{ matrix.check }}' is not built."
-          echo "This stub emits the required check name as success so the PR is"
-          echo "not blocked on an absent matrix context. Any PR that touches"
+          echo "Docs-only ${GITHUB_EVENT_NAME} (#1978/#5320): '${{ matrix.check }}' is not built."
+          echo "This stub emits the required check name as success so the change is"
+          echo "not blocked on an absent matrix context. Any PR or push that touches"
           echo "code runs the real '${{ matrix.check }}' build instead."
+          # Say so on the run page too: `success` on this name means "inherited",
+          # not "built".
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            why="docs-only push (#1978/#5320). This context is a stub: the result is inherited from the predecessor commit, whose push run succeeded."
+          else
+            why="docs-only ${GITHUB_EVENT_NAME}: the change touches only docs (#1978/#5320). This context is a stub, not a build."
+          fi
+          echo "**${{ matrix.check }}: not built** — $why" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
   # ── CI canary (PR-8 of overhaul plan) ─────────────────────────────────
   # Detects whether a PR (or a push to main) touches CI infrastructure
@@ -2653,14 +3026,16 @@ jobs:
       # Contrast the ccache save below, which stays on bare `always()` because a
       # partial ccache is simply a smaller ccache.
       - name: Save vcpkg installed packages (canary)
-        # CWE-349 (GHSA cache-poisoning query, #3543): a trusted-fork-ci
-        # dispatch runs untrusted fork content through this same job, but its
-        # workflow_call is invoked in the DEFAULT BRANCH's cache scope (the
-        # dispatch always targets dev/main), unlike a plain pull_request run,
+        # CWE-349 (GHSA cache-poisoning query, #3543/#4471): a trusted-fork-ci
+        # dispatch runs approved fork content through this same job. Its
+        # workflow_call runs in the CALLER's cache scope, which trusted_inputs
+        # confines to a throwaway trusted-fork/pr-<N> branch (#4471) that no
+        # dev/main/PR run can restore from — unlike a plain pull_request run,
         # which the docs' "Cache access for low-trust workflow triggers"
-        # section confines to its own PR-scoped cache namespace. A save here
-        # would let a fork's build output be restored by a later, genuinely
-        # trusted push to dev/main. RESTORE above stays unconditional — reading
+        # section confines to its own PR-scoped cache namespace. This gate is
+        # therefore defence in depth: a mis-scoped dispatch is refused before
+        # this job runs, and even inside the quarantine a fork's build output
+        # is never worth keeping. RESTORE above stays unconditional — reading
         # a pre-existing entry cannot inject anything — only SAVE is gated.
         # Mirrors the existing run-id-scoped `trusted_execution` ternary the
         # self-hosted legs use for VCPKG_DEFAULT_BINARY_CACHE (this job has no

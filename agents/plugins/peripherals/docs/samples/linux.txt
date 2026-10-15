@@ -1,0 +1,27 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-14 · euid 0 · leg-hash 25220299bc79
+== action=usb
+usb|usb1|1d6b|0002|09|00|Linux 7.0.12-linuxkit vhci_hcd|USB/IP Virtual Host Controller|vhci_hcd.0|480|1
+usb|usb2|1d6b|0003|09|00|Linux 7.0.12-linuxkit vhci_hcd|USB/IP Virtual Host Controller|vhci_hcd.0|10000|1
+[result_status] OK / FULL / 
+
+== action=pci
+pci|0000:00:08.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:0d.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:10.0|1af4|1045|058000|1af4|0045|virtio-pci|-
+pci|0000:00:01.0|1af4|1041|020000|1af4|0041|virtio-pci|-
+pci|0000:00:07.0|1af4|1042|018000|1af4|0042|virtio-pci|-
+pci|0000:00:0c.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:0f.0|1af4|1044|100000|1af4|0044|virtio-pci|-
+pci|0000:00:00.0|106b|1a05|060000|0000|0000|-|-
+pci|0000:00:06.0|1af4|1042|018000|1af4|0042|virtio-pci|-
+pci|0000:00:0b.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:09.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:0e.0|1af4|1053|078000|1af4|0053|virtio-pci|-
+pci|0000:00:05.0|1af4|1043|078000|1af4|0043|virtio-pci|-
+pci|0000:00:0a.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+[result_status] OK / FULL / 
+
+== action=thunderbolt
+thunderbolt|none
+[result_status] OK / FULL / 
+

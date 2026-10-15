@@ -1,0 +1,7 @@
+host: braga (braga.local)
+os: macOS 26.6.2 (Darwin 25.6.0), Xcode CLT clang
+identity: alex (unprivileged, uid 501)
+command: ioreg -a -r -c IOUSBHostDevice -d 1
+date: 2026-09-08
+status: REAL CAPTURE
+lines: 236 (budget 236)

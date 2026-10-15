@@ -17,7 +17,8 @@
  *
  * Three things are bound, matching the #881 spec's own layering:
  *   1. `is_quarantine_control_plugin` — the pure, case-insensitive
- *      whole-plugin exemption predicate. No store, no ServerImpl.
+ *      closed four-action exemption predicate (now in
+ *      common/include/yuzu/protective_actions.hpp). No store, no ServerImpl.
  *   2. `evaluate_quarantine_degradation` — the pure bounded-staleness
  *      degradation policy, driven with a fake reader. No store, no
  *      ServerImpl, no Postgres — the VERIFICATION VERDICT for this spec
@@ -86,7 +87,14 @@ struct RecordingSink {
                 unfiltered_broadcast_used = true;
                 return static_cast<int>(fleet.size());
             },
-            [this] { return fleet; }};
+            [this] { return fleet; },
+            /*prepare_route_fallback=*/nullptr,
+            // HA WS-5 (governance hardening, 2026-09-22): see
+            // test_dispatch_confined_arms.cpp's RecordingSink — this mock
+            // has no presence concept, so every candidate is always locally
+            // known (never widens) for the fast-path eligibility check to
+            // hold.
+            [](const std::vector<std::string>&) { return false; }};
     }
 
     bool reached_exactly(std::vector<std::string> expected) {
@@ -527,9 +535,9 @@ TEST_CASE("wire_and_dispatch_confined: denied_quarantined survives out through "
     AgentRegistry registry(bus, metrics);
     for (const auto& id : {"dev-A", "dev-B", "dev-C"}) {
         registry.register_agent(make_wiring_test_info(id));
-        registry.set_gateway_route(
-            id, "test-gateway",
-            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        REQUIRE(registry.set_gateway_route(
+            id, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     }
 
     yuzu::agent::v1::CommandRequest cmd;

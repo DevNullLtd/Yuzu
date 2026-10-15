@@ -297,11 +297,17 @@ constexpr std::size_t kMaxServiceRows = 512;
 // dropped. list_res/disabled_res (out) receive the raw runner results of the
 // two `launchctl` calls below so the caller (do_list) can detect a degraded
 // enumeration and forward an honest non-success status instead of reporting
-// an empty/partial list as a clean success.
+// an empty/partial list as a clean success. malformed (out) receives
+// services_parsers.hpp's structural verdict on the `launchctl list` capture
+// (CA-1, governance A0 round-4): a truncated/zero-line/garbled-header
+// capture must never be reported as a genuine "0 services" answer, so the
+// caller must check this the same way it already checks list_res/disabled_res.
 std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t& total_seen,
                                                   yuzu::agent::SubprocessResult& list_res,
-                                                  yuzu::agent::SubprocessResult& disabled_res) {
+                                                  yuzu::agent::SubprocessResult& disabled_res,
+                                                  bool& malformed) {
     total_seen = 0;
+    malformed = false;
     std::vector<ServiceInfo> services;
 
     // services/enumerate_services_macos#1 (docs/agent-spawn-sink-manifest.md)
@@ -323,6 +329,7 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
 
     auto parsed = yuzu::services::parse_launchctl_list(list_outcome.output, running_only);
     total_seen = parsed.total_seen;
+    malformed = parsed.malformed;
     services.reserve(parsed.services.size());
     for (auto& entry : parsed.services) {
         services.push_back(ServiceInfo{std::move(entry.label), std::move(entry.pid),
@@ -735,12 +742,24 @@ private:
             return 1;
 #elif defined(__APPLE__)
         std::size_t total_seen = 0;
+        bool malformed = false;
         yuzu::agent::SubprocessResult list_res, disabled_res;
-        auto services = enumerate_services_macos(running_only, total_seen, list_res, disabled_res);
+        auto services =
+            enumerate_services_macos(running_only, total_seen, list_res, disabled_res, malformed);
         // Same honest-degrade discipline as Linux above, across BOTH
         // launchctl calls (list + print-disabled) -- never let the second
         // check overwrite an earlier degrade (status_forwarded discipline).
+        // A structurally malformed capture (CA-1, governance A0 round-4) is
+        // checked right after the list_res degrade check, before
+        // disabled_res: `launchctl list` itself ran and exited cleanly in
+        // this case (list_res carries no runner-level failure), so only the
+        // parser's own malformed verdict can catch it.
         bool degraded = forward_list_degrade(ctx, list_res);
+        if (!degraded && malformed) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "services:malformed_launchctl_capture");
+            degraded = true;
+        }
         if (!degraded)
             degraded = forward_list_degrade(ctx, disabled_res);
         for (const auto& s : services) {

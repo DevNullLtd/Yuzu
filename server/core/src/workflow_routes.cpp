@@ -5,9 +5,15 @@
 #include "dispatch_destructive_gate.hpp" // BR-001: evaluate_destructive_targeting / requires_explicit_targets
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
+#include "executions_page_render.hpp" // Operate O1: view=page renderers
+#include "workflows_page_render.hpp" // Operate WF-A: workflows + schedules page renderers
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
+#include "execution_scope_rules.hpp" // execution_visible / confined_projection (shared with GET /api/v1/executions)
 #include "http_route_sink.hpp"
+#include "instruction_param_schema.hpp" // ParamValidatorCache: stored parameter_schema enforcement
+#include "name_lookup_memo.hpp"  // Operate O1: one render's definition-name lookups
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
@@ -16,12 +22,15 @@
 #include "scope_engine.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
-#include "workflow_model.hpp" // #4030: shared workflow/workflow-execution/schedule row builders
+#include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
+#include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
+#include "workflow_model.hpp" // #4030: shared workflow/workflow-execution row builders
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <expected>
@@ -29,10 +38,93 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
+
+namespace {
+constexpr const char* kParamRejectRoute = "instruction_execute";
+constexpr const char* kParamRejectReasons[] = {"shape", "violation", "schema_invalid"};
+
+// The Workflows page fragments answer every refusal and degrade as a 200 note (htmx drops
+// 4xx/5xx bodies); nothing from the gate's own body reaches the fragment.
+void fragment_note(httplib::Response& res, const char* attr, std::string_view text) {
+    res.status = 200;
+    res.headers.erase("Retry-After");
+    res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
+                        html_escape(std::string(text)) + "</div>",
+                    "text/html; charset=utf-8");
+}
+
+// Operate Executions page (`detail?view=page`): the collapsed responses list of the devices
+// slot. The drawer keeps its own inline copy of this lookup in the detail route; the two
+// must stay in step (primary query by execution id, legacy window fallback for rows
+// without one, then the caller's scope filter once over the merged set). Returns at most
+// `kDeviceResponsesCap` rows plus the pre-cap total, so a large run does not re-send every
+// output on each live refresh.
+struct PageResponses {
+    std::vector<operate_pages::DeviceResponse> rows;
+    std::size_t total{0};
+    operate_pages::ResponsesState state{operate_pages::ResponsesState::kOk};
+};
+
+PageResponses collect_page_responses(ResponseStore* store, const Execution& exec,
+                                     const std::vector<AgentExecStatus>& visible_agents,
+                                     const authz::VisibleSet& scope) {
+    PageResponses out;
+    if (!store || !store->is_open()) {
+        out.state = operate_pages::ResponsesState::kUnavailable;
+        return out;
+    }
+    ResponseQuery rq;
+    rq.since = exec.dispatched_at;
+    rq.until = exec.completed_at > 0 ? exec.completed_at : now_epoch_seconds();
+    rq.limit = 500;
+    auto primary = store->query_by_execution(exec.id, rq);
+    bool degraded = !primary.has_value();
+    auto responses = primary.value_or(std::vector<StoredResponse>{});
+    if (responses.empty()) {
+        auto legacy = store->query(exec.definition_id, rq);
+        degraded = degraded || !legacy.has_value();
+        std::unordered_map<std::string, bool> in_set;
+        for (const auto& a : visible_agents)
+            in_set[a.agent_id] = true;
+        for (auto& r : legacy.value_or(std::vector<StoredResponse>{})) {
+            if (r.execution_id.empty() && in_set.count(r.agent_id))
+                responses.push_back(std::move(r));
+        }
+    }
+    if (degraded)
+        out.state = operate_pages::ResponsesState::kDegraded;
+    std::vector<operate_pages::DeviceResponse> rows;
+    for (auto& r : responses) {
+        if (scope && !authz::in_scope(scope, r.agent_id))
+            continue;
+        ++out.total;
+        if (out.rows.size() < operate_pages::kDeviceResponsesCap)
+            out.rows.push_back({std::move(r.agent_id), std::move(r.output),
+                                std::move(r.error_detail), static_cast<int>(r.status), r.timestamp,
+                                r.received_at_ms});
+    }
+    return out;
+}
+} // namespace
+
+void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_server_instruction_param_rejected_total",
+                     "Instruction execute calls refused before any approval ticket or dispatch "
+                     "because of the definition's stored parameter schema. reason=shape: params "
+                     "is not a JSON object. reason=violation: the params do not match the schema "
+                     "(HTTP 400). reason=schema_invalid: the stored schema cannot be prepared, so "
+                     "the call fails closed (HTTP 500).",
+                     "counter");
+    for (const char* reason : kParamRejectReasons)
+        metrics.counter("yuzu_server_instruction_param_rejected_total",
+                        {{"route", kParamRejectRoute}, {"reason", reason}});
+}
 
 // #4029: `product_pack_error_status`/`product_pack_client_message` moved to
 // product_pack_model.hpp — the new GET /api/v1/product-packs* routes and the
@@ -112,11 +204,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // #1712 / #3290 Phase 2 — see WorkflowRoutes::FleetReadFn's doc comment.
     auto fleet_read_fn = std::move(deps.fleet_read_fn);
     auto audit_fn = std::move(deps.audit_fn);
+    auto probe_perm_fn = std::move(deps.probe_perm_fn);
     auto emit_fn = std::move(deps.emit_fn);
     auto scope_fn = std::move(deps.scope_fn);
     auto* workflow_engine = deps.workflow_engine;
     auto* execution_tracker = deps.execution_tracker;
-    auto* schedule_engine = deps.schedule_engine;
+    auto schedule_api = deps.schedule_api; // ADR-0031 WS-A4 (seventh family)
+    auto workflow_api = deps.workflow_api; // ADR-0031 WS-A4 (eighth family)
     auto* product_pack_store = deps.product_pack_store;
     auto* instruction_store = deps.instruction_store;
     auto* policy_store = deps.policy_store;
@@ -155,19 +249,67 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // The optional `definition_id` query param filters the list to one
     // definition. Click-handling on the trend sparkline (PR 4) and the
     // dashboard's per-instruction detail page (future) pass it through.
-    sink.Get("/fragments/executions", [auth_fn, perm_fn, execution_tracker, instruction_store](
-                                          const httplib::Request& req, httplib::Response& res) {
-        auto session = auth_fn(req, res);
-        if (!session)
+    //
+    // Confinement (ADR-0017): the SOLE gate is `fleet_read_fn`
+    // (require_fleet_read) -- never stacked with perm_fn on the same
+    // (Execution, Read) pair. A confined caller gets the SAME owner-or-visible
+    // view as the v1 twin GET /api/v1/executions, except service-scoped
+    // sessions, which get visible-only (the owner rule would expose the
+    // minter's identity; #5557): the admission predicate is pushed into SQL
+    // BEFORE the LIMIT (a page of 50 invisible rows must not starve the
+    // visible ones), each surviving row's counters and error preview are
+    // recomputed from the in-scope agent rows only (so neither the preview
+    // text nor the `title=` attribute can carry an out-of-scope agent's
+    // error), and a store degrade renders an honest 200 degrade note (data-degraded),
+    // never "No executions yet" (the htmx config drops 4xx/5xx bodies).
+    // An unconfined caller's output is unchanged.
+    sink.Get("/fragments/executions", [auth_fn, fleet_read_fn, execution_tracker,
+                                        instruction_store](const httplib::Request& req,
+                                                           httplib::Response& res) {
+        // Fragment-local degrade note. Rendered at HTTP 200, NOT 503: the dashboard htmx
+        // config (responseHandling `[45]..` swap:false) drops 4xx/5xx bodies, so a 503 here
+        // left the panel on "Loading..." forever. Only the HTTP-200-for-a-degrade part
+        // follows dex_routes.cpp /fragments/dex/perf/apps and verify_routes.hpp; the
+        // data-degraded attribute itself is new here. The note is honest (never "No
+        // executions yet") and carries data-degraded for machine detection. The gate's own
+        // A4 JSON 403/503 are rewritten to a 200 note below for the same htmx reason (the
+        // gate's audit row is written before the rewrite and is unaffected); a 401 is left
+        // untouched so an unauthenticated caller still gets the gate's response.
+        auto degraded = [&res](const char* kind, const char* text) {
+            res.status = 200;
+            res.set_content(std::string("<div class=\"empty-state\" data-degraded=\"") + kind +
+                                "\">" + text + "</div>",
+                            "text/html; charset=utf-8");
+        };
+        if (!fleet_read_fn) {
+            spdlog::error("/fragments/executions: fleet_read_fn unwired -- "
+                          "misconfigured call site; failing closed");
+            degraded("unavailable", "Executions unavailable (service not available). Contact "
+                                    "an administrator if this persists.");
             return;
-        // sec-M1: Execution:Read gate. The LIST exposes definition_name
-        // and last_error_detail (per-agent error preview) — same data
-        // class as the DETAIL handler, so it earns the same RBAC gate.
-        // Mirrors MCP list_executions and REST /api/v1/execution-statistics.
-        if (!perm_fn(req, res, "Execution", "Read"))
+        }
+        auto gate = fleet_read_fn(req, res, "Execution", "Read");
+        if (!gate.admitted) {
+            // The gate already wrote its A4 error body + status AND its audit row. htmx
+            // drops 4xx/5xx bodies, so a 503/403 would leave the panel on "Loading..."
+            // forever: replace those two with a 200 note. Any other status (401 etc.) is
+            // left exactly as the gate wrote it.
+            if (res.status == 503) {
+                res.headers.erase("Retry-After");
+                degraded("gate", "Executions unavailable (the authorization service could not "
+                                 "be reached). Retry shortly.");
+            } else if (res.status == 403) {
+                // Deliberately generic: nothing from the gate's body (reason, role or
+                // permission names) may reach the fragment.
+                res.status = 200;
+                res.set_content("<div class=\"empty-state\" data-denied=\"true\">You do not "
+                                "have permission to view executions.</div>",
+                                "text/html; charset=utf-8");
+            }
             return;
+        }
         if (!execution_tracker) {
-            res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
+            degraded("unavailable", "Not available");
             return;
         }
 
@@ -178,18 +320,175 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // probes, metrics ticks at server.cpp:1727) leave the default
         // false and pay zero subquery cost (arch-B2 / perf-B1).
         q.include_error_detail = true;
-        if (req.has_param("definition_id")) {
-            q.definition_id = req.get_param_value("definition_id");
+        // `view=page` (Operate Executions page) renders the same rows through
+        // operate_pages::render_exec_list, after the same gate/scope/projection below.
+        const bool view_page = req.get_param_value("view") == "page";
+        // Filters are checked BEFORE any store read: a typo must read as an unknown filter,
+        // never as "no results". An empty value is no filter (the page's All options).
+        auto invalid_filter = [&res](const char* which) {
+            res.status = 200;
+            res.set_content(std::string("<div class=\"empty-state\" data-invalid=\"") + which +
+                                "\">" +
+                                std::string(operate_pages::kExecutionsUnknownFilterNote) + "</div>",
+                            "text/html; charset=utf-8");
+        };
+        const std::string def_param = req.get_param_value("definition_id");
+        if (!def_param.empty()) {
+            const bool ok = def_param.size() <= 128 &&
+                            std::all_of(def_param.begin(), def_param.end(), [](unsigned char c) {
+                                return std::isalnum(c) || c == '.' || c == '_' || c == '-';
+                            });
+            if (!ok) {
+                invalid_filter("definition_id");
+                return;
+            }
+            q.definition_id = def_param;
         }
-        auto execs = execution_tracker->query_executions(q);
+        const std::string status_param = req.get_param_value("status");
+        if (!status_param.empty()) {
+            // The statuses the tracker writes (execution_tracker.cpp: running at dispatch,
+            // succeeded / completed at the terminal transition, cancelled, pending re-runs).
+            static constexpr std::string_view kStatuses[] = {"running", "succeeded", "completed",
+                                                             "cancelled", "pending"};
+            if (std::find(std::begin(kStatuses), std::end(kStatuses), status_param) ==
+                std::end(kStatuses)) {
+                invalid_filter("status");
+                return;
+            }
+            q.status = status_param;
+        }
+        // The page asks for one row past its 50 so "older rows exist" is known, not guessed.
+        if (view_page)
+            q.limit = 51;
+
+        ExecutionScope scope_arg; // nullopt = unrestricted
+        std::string username;
+        if (gate.scope) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            username = session->username;
+            // #1634/#3789 precedent: an empty username under an engaged scope
+            // must never silently widen the owner disjunct to "no owner
+            // filter" for a confined caller.
+            if (username.empty()) {
+                spdlog::error("/fragments/executions: empty principal under a confined "
+                              "read -- failing closed");
+                degraded("unavailable", "Executions unavailable (service not available). "
+                                        "Contact an administrator if this persists.");
+                return;
+            }
+            // A service-scoped token's session username is its MINTER's identity, so the
+            // owner disjunct (dispatched_by == username) would list every execution the
+            // minter dispatched, outside the token's service tag scope (ADR-1006: the
+            // token must never see more than its tag scope). Suppress the owner disjunct
+            // for such a session, in SQL and in the per-row check below: it sees only
+            // executions that touched an in-scope agent. The other execution surfaces
+            // still carry the minter-keyed disjunct for service tokens (tracked in #5557).
+            if (!session->token_scope_service.empty())
+                username.clear();
+            ExecutionListScope s;
+            s.owner = username;
+            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+            scope_arg = std::move(s);
+        }
+
+        auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
+        if (!execs_opt) {
+            degraded("tracker", "Execution tracker degraded, retry shortly.");
+            return;
+        }
+        std::vector<Execution> execs = std::move(*execs_opt);
+        if (gate.scope) {
+            std::vector<std::string> ids;
+            ids.reserve(execs.size());
+            for (const auto& e : execs)
+                ids.push_back(e.id);
+            // Scope the read in SQL: a confined caller must not pull every agent row of
+            // every listed execution (a fleet-wide execution has one row per agent).
+            // execution_visible/confined_projection ignore out-of-scope rows, so the
+            // served result is identical to the unfiltered read.
+            auto statuses_opt = execution_tracker->get_agent_statuses_for_executions_checked(
+                ids, scope_arg->visible_agents);
+            if (!statuses_opt) {
+                degraded("tracker", "Execution tracker degraded, retry shortly.");
+                return;
+            }
+            static const std::vector<AgentExecStatus> kEmptyStatuses;
+            std::vector<Execution> projected;
+            projected.reserve(execs.size());
+            for (const auto& e : execs) {
+                auto it = statuses_opt->find(e.id);
+                const auto& statuses = it != statuses_opt->end() ? it->second : kEmptyStatuses;
+                if (!execution_visible(e, statuses, gate.scope, username))
+                    continue;
+                auto counts = confined_projection(statuses, gate.scope);
+                Execution row = e;
+                row.agents_targeted = counts.agents_targeted;
+                row.agents_responded = counts.agents_responded;
+                row.agents_success = counts.agents_success;
+                row.agents_failure = counts.agents_failure;
+                // BOTH the inline preview and the title= attribute read this
+                // field below: the confined value, never the unscoped
+                // correlated-subquery text.
+                row.last_error_detail = counts.last_error_detail;
+                projected.push_back(std::move(row));
+            }
+            execs = std::move(projected);
+        }
+        if (view_page) {
+            operate_pages::ExecListView view;
+            view.confined = gate.scope.has_value();
+            view.filtered = !def_param.empty() || !status_param.empty();
+            if (execs.size() > 50) {
+                view.truncated = true;
+                execs.resize(50);
+            }
+            operate_pages::NameLookupMemo names(
+                operate_pages::instruction_name_resolver(instruction_store));
+            view.rows.reserve(execs.size());
+            for (const auto& e : execs) {
+                operate_pages::ExecRow row;
+                row.id = e.id;
+                row.definition_id = e.definition_id;
+                row.definition_name = names.label(e.definition_id);
+                row.status = e.status;
+                row.dispatched_by = e.dispatched_by;
+                row.last_error_detail = e.last_error_detail;
+                row.rerun_of = e.rerun_of;
+                row.agents_targeted = e.agents_targeted;
+                row.agents_responded = e.agents_responded;
+                row.agents_success = e.agents_success;
+                row.agents_failure = e.agents_failure;
+                row.dispatched_at = e.dispatched_at;
+                view.rows.push_back(std::move(row));
+            }
+            // Fleet-wide figures never reach a confined view; a store failure omits the strip
+            // rather than printing zeros. The list route does not audit, so neither does this.
+            std::string strip;
+            if (!gate.scope && execution_tracker) {
+                if (auto fs = execution_tracker->get_fleet_summary_checked(0, false)) {
+                    strip = operate_pages::render_stats_strip(
+                        {fs->executions_today, fs->total_executions, fs->overall_success_rate,
+                         fs->avg_duration_seconds});
+                }
+            }
+            res.set_content(strip + operate_pages::render_exec_list(view),
+                            "text/html; charset=utf-8");
+            return;
+        }
         std::string html;
         if (execs.empty()) {
-            html = "<div class=\"empty-state\">No executions yet.</div>";
+            // A confined caller's empty page does NOT mean the fleet has no executions
+            // (out-of-scope ones may exist), so it gets its own, truthful wording.
+            html = gate.scope
+                       ? "<div class=\"empty-state\">No executions visible in your scope.</div>"
+                       : "<div class=\"empty-state\">No executions yet.</div>";
             res.set_content(html, "text/html; charset=utf-8");
             return;
         }
 
-        html = "<table class=\"exec-table\"><thead><tr>"
+        html = "<div class=\"tw\"><table class=\"exec-table\"><thead><tr>"
                "<th>Status</th>"
                "<th>Definition</th>"
                "<th>Fan-out</th>"
@@ -198,6 +497,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                "<th>Dispatched by</th>"
                "<th>Time</th>"
                "</tr></thead><tbody>";
+
+        // Per-request memo of the resolved (label, title) per definition_id: a page lists up
+        // to 50 rows but typically few distinct definitions, and each get_definition is a
+        // pool lease bounded at 2 s. The outcome is cached whatever it was (including the
+        // id-truncated fallback after a DB error), so a failing id is attempted once per
+        // request, not once per row.
+        std::unordered_map<std::string, std::pair<std::string, std::string>> def_labels;
 
         for (const auto& e : execs) {
             // Status hue + row stripe.
@@ -216,24 +522,33 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             int pending = targeted > responded ? (targeted - responded) : 0;
             int running = 0; // distinguishable only in the detail drawer
 
-            // Definition name (or fallback to truncated id).
-            std::string def_label;
-            std::string def_title;
-            if (instruction_store && instruction_store->is_open() && !e.definition_id.empty()) {
-                // ADR-0058: a DB-error outer result falls through to the id-truncated
-                // fallback below, same as a not-found inner optional did pre-migration
-                // — this is a best-effort display label, not a security/dispatch path.
-                auto def_result = instruction_store->get_definition(e.definition_id);
-                if (def_result && *def_result && !(*def_result)->name.empty()) {
-                    def_label = (*def_result)->name;
-                    def_title = e.definition_id;
+            // Definition name (or fallback to truncated id), memoized per request.
+            auto memo = def_labels.find(e.definition_id);
+            if (memo == def_labels.end()) {
+                std::string label;
+                std::string title;
+                if (instruction_store && instruction_store->is_open() && !e.definition_id.empty()) {
+                    // ADR-0058: a DB-error outer result falls through to the id-truncated
+                    // fallback below, same as a not-found inner optional did pre-migration
+                    // - this is a best-effort display label, not a security/dispatch path.
+                    auto def_result = instruction_store->get_definition(e.definition_id);
+                    if (def_result && *def_result && !(*def_result)->name.empty()) {
+                        label = (*def_result)->name;
+                        title = e.definition_id;
+                    }
                 }
-            }
-            if (def_label.empty()) {
-                def_label = e.definition_id.empty() ? std::string{"<unknown>"}
+                if (label.empty()) {
+                    label = e.definition_id.empty() ? std::string{"<unknown>"}
                                                     : e.definition_id.substr(0, 12);
-                def_title = e.definition_id;
+                    title = e.definition_id;
+                }
+                memo = def_labels
+                           .emplace(e.definition_id,
+                                    std::pair{std::move(label), std::move(title)})
+                           .first;
             }
+            const std::string& def_label = memo->second.first;
+            const std::string& def_title = memo->second.second;
 
             std::string first_error;
             if (failed > 0 && !e.last_error_detail.empty()) {
@@ -295,7 +610,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     "<div class=\"empty-state\">Loading…</div>"
                     "</div></td></tr>";
         }
-        html += "</tbody></table>";
+        html += "</tbody></table></div>";
         res.set_content(html, "text/html; charset=utf-8");
     });
 
@@ -321,7 +636,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // to exact `execution_id` correlation transparently).
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
-        [auth_fn, fleet_read_fn, audit_fn, execution_tracker, instruction_store,
+        [auth_fn, fleet_read_fn, audit_fn, probe_perm_fn, execution_tracker, instruction_store,
          response_store](const httplib::Request& req, httplib::Response& res) {
             // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
             // (fleet_read_fn), mirroring query_installed_software / the REST
@@ -359,7 +674,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             auto exec_id = req.matches[1].str();
-            auto exec_opt = execution_tracker->get_execution(exec_id);
+            // Governance fix (#2146 A2-R1 Gate 8 re-review): was the plain
+            // get_execution(), which collapses "row genuinely absent" and
+            // "read degraded" (pool/query failure) to the same nullopt -- a
+            // transient degrade here fell through to the not-found +
+            // denial-audit branch below, producing a FALSE 404 for a
+            // legitimate owner and a permanently wrong CC7.2 audit trail for
+            // a non-owner. get_execution_checked's outer std::expected
+            // distinguishes the two; the degrade branch below matches this
+            // same route's own agents_opt degrade handling just underneath.
+            auto exec_r = execution_tracker->get_execution_checked(exec_id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    "<div class=\"empty-state\">Execution tracker degraded, retry "
+                    "shortly.</div>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
             // #1634 (Doomgoose review finding, important): fail closed on a
             // transient tracker degrade rather than silently treat it as
             // "zero agents" — see get_agent_statuses_checked's doc comment.
@@ -437,6 +770,67 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     def_result && *def_result && !(*def_result)->name.empty()) {
                     def_name = (*def_result)->name;
                 }
+            }
+
+            // -- Operate Executions page: the "Selected execution" panel -----
+            // Same gate, scope filter, 404 and degrade branches above; only the rendering
+            // differs. A confined caller's counters are recomputed from the in-scope
+            // agent rows (`agents` was filtered above) and scope/parameters are the same
+            // redaction constant the drawer sidebar uses below.
+            if (req.get_param_value("view") == "page") {
+                operate_pages::ExecSelectedView view;
+                view.confined = gate.scope.has_value();
+                operate_pages::ExecRow& row = view.row;
+                row.id = exec.id;
+                row.definition_id = exec.definition_id;
+                row.definition_name = def_name;
+                row.status = exec.status;
+                row.dispatched_by = exec.dispatched_by;
+                row.rerun_of = exec.rerun_of;
+                row.dispatched_at = exec.dispatched_at;
+                row.agents_targeted = exec.agents_targeted;
+                row.agents_responded = exec.agents_responded;
+                row.agents_success = exec.agents_success;
+                row.agents_failure = exec.agents_failure;
+                if (gate.scope) {
+                    const auto c = confined_projection(agents, gate.scope);
+                    row.agents_targeted = c.agents_targeted;
+                    row.agents_responded = c.agents_responded;
+                    row.agents_success = c.agents_success;
+                    row.agents_failure = c.agents_failure;
+                }
+                view.scope_expression =
+                    gate.scope ? "(redacted - confined view)" : exec.scope_expression;
+                view.parameter_values =
+                    gate.scope ? "(redacted - confined view)" : exec.parameter_values;
+                view.completed_at = exec.completed_at;
+                // Render hint for the Cancel button only (the cancel route re-gates on
+                // Execution:Execute + Execution:Read). One probe, only for a live row;
+                // unwired probe = not probed = attribute omitted.
+                if (probe_perm_fn && (exec.status == "running" || exec.status == "pending"))
+                    view.can_cancel = probe_perm_fn(req, "Execution", "Execute") ? 1 : 0;
+                // The "Device results" slot rides in the same response (one fetch, one audit
+                // row). `agents` is already scope-filtered above; a confined caller gets no
+                // dispatched-device count (it would subtract to an out-of-scope number).
+                operate_pages::ExecDevicesView devs;
+                devs.execution_id = exec.id;
+                devs.definition_name = def_name;
+                if (!gate.scope)
+                    devs.targeted = exec.agents_targeted;
+                devs.rows.reserve(agents.size());
+                for (const auto& a : agents)
+                    devs.rows.push_back({a.agent_id, a.status, a.error_detail, a.exit_code,
+                                         a.dispatched_at, a.completed_at});
+                auto pr = collect_page_responses(response_store, exec, agents, gate.scope);
+                devs.responses = std::move(pr.rows);
+                devs.responses_total = pr.total;
+                devs.responses_state = pr.state;
+                res.set_content(operate_pages::render_exec_selected(view) +
+                                    operate_pages::render_exec_devices(devs),
+                                "text/html; charset=utf-8");
+                // Same forensic-read audit row as the drawer below: one per selection.
+                audit_fn(req, "execution.detail.view", "success", "Execution", exec.id, "");
+                return;
             }
 
             // -- Per-agent metrics: bucket counts + duration vector ----------
@@ -908,7 +1302,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
                  auto exec_id = req.matches[1].str();
-                 auto exec_opt = execution_tracker->get_execution(exec_id);
+                 // Governance fix (#2146 A2-R1 Gate 8 re-review): was the
+                 // plain get_execution(), which collapses "row genuinely
+                 // absent" and "read degraded" (pool/query failure) to the
+                 // same nullopt -- a transient degrade here fell through to
+                 // the not-found + denial-audit branch below, producing a
+                 // FALSE 404 for a legitimate owner and a permanently wrong
+                 // CC7.2 audit trail for a non-owner. get_execution_checked's
+                 // outer std::expected distinguishes the two; the degrade
+                 // branch below matches this same route's own agents_opt
+                 // degrade handling a few lines down.
+                 auto exec_r = execution_tracker->get_execution_checked(exec_id);
+                 if (!exec_r) {
+                     res.status = 503;
+                     res.set_content("live updates unavailable, tracker degraded, retry "
+                                    "shortly",
+                                    "text/plain; charset=utf-8");
+                     return;
+                 }
+                 const auto& exec_opt = *exec_r;
                  // #1634 perf (governance Gate 3 finding): only fetch/scan agent
                  // statuses when confined — an unrestricted subscriber is always
                  // visible regardless, so this indexed lookup would be pure
@@ -1179,34 +1591,144 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     };
 
     // GET /fragments/schedules -- schedule list HTMX fragment
-    sink.Get("/fragments/schedules", [perm_fn, schedule_engine,
+    sink.Get("/fragments/schedules", [auth_fn, perm_fn, probe_perm_fn, schedule_api,
                                       deny_service_scoped_schedule_list](
                                          const httplib::Request& req, httplib::Response& res) {
+        // `view=page` (Operate Workflows page) serves the same rows through
+        // operate_pages::render_schedules_page behind the SAME two-stage gate and the same
+        // seam call; only the output differs. The default view below is the Schedules tab on
+        // /instructions and stays byte-identical (pinned by test_workflows_page_routes.cpp).
+        // htmx drops 4xx/5xx bodies, so in the page view a 403 becomes a 200 note.
+        const bool view_page = req.get_param_value("view") == "page";
+        auto page_note = [&res](const char* attr, std::string_view text) {
+            fragment_note(res, attr, text);
+        };
         // deny_service_scoped_schedule_list already resolved (and validated)
         // the session via auth_fn — a second auth_fn call here would be
         // redundant, matching the original handler's only use of `session`
         // (the existence check; the body never read the session itself).
-        if (deny_service_scoped_schedule_list(req, res))
+        if (deny_service_scoped_schedule_list(req, res)) {
+            if (view_page && res.status == 403)
+                page_note("denied", operate_pages::kSchedulesDeniedNote);
             return;
+        }
         // sec-M1-style gate (mirrors /fragments/executions immediately above):
         // the LIST exposes every schedule's name/frequency/enabled state/
         // execution count fleet-wide — previously reachable by ANY
         // authenticated session with no RBAC check at all (guardian-
         // confinement-2298 hardening sweep).
-        if (!perm_fn(req, res, "Schedule", "Read"))
+        if (!perm_fn(req, res, "Schedule", "Read")) {
+            if (view_page && res.status == 403)
+                page_note("denied", operate_pages::kSchedulesDeniedNote);
             return;
-        if (!schedule_engine) {
+        }
+        if (!schedule_api) {
+            if (view_page) {
+                page_note("degraded", operate_pages::kSchedulesDegradedNote);
+                return;
+            }
             res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
             return;
         }
 
-        auto scheds = schedule_engine->query_schedules();
+        // ADR-0031 WS-A4 (seventh family): routed through the SAME
+        // `ScheduleApi::list_schedules` seam call the REST v1/MCP twins use
+        // — the pre-seam unchecked `ScheduleEngine::query_schedules()` read
+        // could not tell "the store failed" from "there are no schedules"
+        // (see `schedule_types.hpp`'s `ScheduleListResult` doc comment); this
+        // is a deliberate, disclosed behaviour delta, not a silent
+        // byte-identical rewire. `result.error()` is an internal store
+        // diagnostic and is NEVER rendered — a distinct degraded state
+        // instead.
+        auto result = schedule_api->list_schedules(ScheduleQuery{});
+        if (!result) {
+            // sre Gate 6 hardening (governance, feat/split-a4-schedule-seam):
+            // REST v1/MCP both route their equivalent failure through
+            // genericize_db_error(), which spdlog::errors the raw diagnostic
+            // before returning a sanitized message -- this fragment used to
+            // discard result.error() with no log call at all, leaving zero
+            // server-side signal correlating the degraded banner with
+            // backend health for an operator watching only the dashboard.
+            // Called here PURELY for its logging side effect -- the return
+            // value is intentionally discarded, never rendered (the fixed
+            // banner text below is the only thing sent to the client).
+            (void)yuzu::server::genericize_db_error("list_schedules", result.error());
+            if (view_page) {
+                page_note("degraded", operate_pages::kSchedulesDegradedNote);
+                return;
+            }
+            res.set_content(
+                "<div class=\"empty-state\">Schedule list temporarily unavailable &mdash; "
+                "retry shortly.</div>",
+                "text/html");
+            return;
+        }
+        const auto& scheds = result->schedules;
+        if (view_page) {
+            // The owner flag is computed HERE from the session and only that boolean reaches
+            // the page. The expression, interval, approval flag and parameter count are in no
+            // read that carries a non-owner's schedule (REST v1, MCP), so they are filled in
+            // for a row the caller created and left at their defaults for every other row;
+            // created_by is never copied. An empty created_by is nobody's (the #4131 gap).
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            operate_pages::ScheduleListView view;
+            view.truncated = result->truncated;
+            // Render hints, probed once per render and never a gate (an unwired probe offers
+            // no control). Each refused grant writes one auth.permission_required audit row.
+            auto probe = [&](const char* type, const char* op) {
+                return probe_perm_fn && probe_perm_fn(req, type, op);
+            };
+            view.can_write = probe("Schedule", "Write");
+            view.can_enable = probe("Execution", "Execute");
+            view.can_delete = probe("Schedule", "Delete");
+            view.rows.reserve(scheds.size());
+            for (const auto& sc : scheds) {
+                operate_pages::ScheduleRowView row;
+                row.id = sc.id;
+                row.name = sc.name;
+                row.definition_id = sc.definition_id;
+                row.frequency_type = sc.frequency_type;
+                row.enabled = sc.enabled;
+                row.next_execution_at = sc.next_execution_at;
+                row.last_executed_at = sc.last_executed_at;
+                row.execution_count = sc.execution_count;
+                row.targeted = !sc.scope_expression.empty();
+                row.owner = !sc.created_by.empty() && sc.created_by == session->username;
+                if (row.owner) {
+                    row.interval_minutes = sc.interval_minutes;
+                    row.scope_expression = sc.scope_expression;
+                    row.requires_approval = sc.requires_approval;
+                    const auto params = nlohmann::json::parse(sc.parameter_values, nullptr, false);
+                    row.parameter_count =
+                        params.is_object() ? static_cast<int>(params.size()) : 0;
+                }
+                view.rows.push_back(std::move(row));
+            }
+            res.set_content(operate_pages::render_schedules_page(view),
+                            "text/html; charset=utf-8");
+            return;
+        }
         std::string html;
+        // adversarial-review-kimi round (Codex C1 / Kimi K1, both independently):
+        // schedule_api.hpp's own contract says "every caller (REST, MCP, and the
+        // fragment) must surface this, never present the capped count as the
+        // fleet's true total" — REST v1/MCP already did; this fragment did not
+        // until this fix, silently rendering a capped list as complete for an
+        // operator with more schedules than the store's hard cap.
+        if (result->truncated) {
+            html += "<div class=\"note warn\">"
+                   "Showing a partial list &mdash; more schedules exist than can be "
+                   "displayed.</div>";
+        }
+        html += "<section class=\"panel\"><div class=\"hd\"><h2>Schedules</h2></div>";
         if (scheds.empty()) {
-            html = "<div class=\"empty-state\">No schedules configured.</div>";
+            html += "<div class=\"empty-state\">No schedules configured.</div>";
         } else {
-            html = "<table><thead><tr><th>Name</th><th>Frequency</th><th>Enabled</th><th>Next "
-                   "Run</th><th>Count</th><th></th></tr></thead><tbody>";
+            html += "<div class=\"tw\"><table><thead><tr><th>Name</th><th>Frequency</th>"
+                   "<th>Enabled</th><th>Next Run</th><th>Count</th><th></th></tr></thead>"
+                   "<tbody>";
             for (const auto& s : scheds) {
                 html += "<tr><td>" + html_escape(s.name) +
                         "</td>"
@@ -1216,22 +1738,279 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         "<td>" +
                         std::string(s.enabled ? "Yes" : "No") +
                         "</td>"
-                        "<td style=\"font-size:0.7rem\">" +
+                        "<td>" +
                         (s.next_execution_at > 0 ? std::to_string(s.next_execution_at) : "-") +
                         "</td>"
                         "<td>" +
                         std::to_string(s.execution_count) +
                         "</td>"
-                        "<td><button class=\"btn btn-danger\" "
-                        "style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
+                        "<td class=\"act\"><button class=\"btn btn-danger btn-sm\" "
                         "hx-delete=\"/api/schedules/" +
                         s.id +
                         "\" hx-target=\"#tab-schedules\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Delete schedule?\">Delete</button></td></tr>";
             }
-            html += "</tbody></table>";
+            html += "</tbody></table></div>";
         }
+        html += "</section>";
         res.set_content(html, "text/html; charset=utf-8");
+    });
+
+    // GET /fragments/workflows -- the Workflows page's definitions list (Operate WF-A).
+    //
+    // SINGLE gate: perm_fn(Workflow, Read), exactly the one GET /api/v1/workflows uses. It is
+    // never stacked with fleet_read_fn (a definition carries no agent axis, and a stacked
+    // pair on one tuple is the BLOCKING defect FleetReadFn's doc comment names). Step labels
+    // and instruction ids come from the workflow's own definition: there is NO instruction
+    // name lookup, because that read needs InstructionDefinition:Read, which Workflow:Read
+    // does not imply. Reads one past the 100 shown so truncation is known, not guessed.
+    // list_workflows loads every row's yaml_source and steps (one query per row under one
+    // lease), so the page limit stays at 101 and the YAML is never rendered.
+    sink.Get("/fragments/workflows", [perm_fn, probe_perm_fn, instruction_store, workflow_api](
+                                         const httplib::Request& req, httplib::Response& res) {
+        // htmx drops 4xx/5xx bodies: every refusal and degrade is a 200 note, and nothing from
+        // the gate's own body (reason, role or permission names) reaches the fragment.
+        auto note = [&res](const char* attr, std::string_view text) {
+            fragment_note(res, attr, text);
+        };
+        if (!perm_fn(req, res, "Workflow", "Read")) {
+            if (res.status == 403)
+                note("denied", operate_pages::kWorkflowsDeniedNote);
+            return;
+        }
+        if (!workflow_api) {
+            note("degraded", operate_pages::kWorkflowsDegradedNote);
+            return;
+        }
+        operate_pages::WorkflowListView view;
+        WorkflowQuery q;
+        q.limit = view.page_cap + 1;
+        auto result = workflow_api->list_workflows(q);
+        if (!result) {
+            // Called for its logging side effect only; the fixed note is all that is sent.
+            (void)yuzu::server::genericize_db_error("list_workflows", result.error());
+            note("degraded", operate_pages::kWorkflowsDegradedNote);
+            return;
+        }
+        const auto shown = std::min<std::size_t>(result->size(),
+                                                 static_cast<std::size_t>(view.page_cap));
+        view.truncated = result->size() > shown;
+        // Render hints, probed once per render and never a gate (every write route keeps its
+        // own perm_fn). An unwired probe cannot decide, so no control is offered. The probe
+        // writes one auth.permission_required audit row per refused grant (disclosed).
+        auto probe = [&](const char* type, const char* op) {
+            return probe_perm_fn && probe_perm_fn(req, type, op);
+        };
+        view.can_run = probe("Workflow", "Execute");
+        view.can_write = probe("Workflow", "Write");
+        view.can_delete = probe("Workflow", "Delete");
+        // Instruction names are a second securable: Workflow:Read does not imply
+        // InstructionDefinition:Read, so the lookup runs only behind its own probe.
+        const bool may_name = shown > 0 && probe("InstructionDefinition", "Read");
+        operate_pages::NameLookupMemo names(
+            may_name ? operate_pages::instruction_name_resolver(instruction_store)
+                     : operate_pages::NameLookupMemo::Resolver{});
+        view.rows.reserve(shown);
+        for (std::size_t i = 0; i < shown; ++i) {
+            const auto& w = (*result)[i];
+            operate_pages::WorkflowRowView row;
+            row.id = w.id;
+            row.name = w.name;
+            row.description = w.description;
+            row.steps.reserve(w.steps.size());
+            for (const auto& st : w.steps) {
+                operate_pages::WorkflowStepView sv;
+                sv.index = st.index;
+                sv.instruction_id = st.instruction_id;
+                if (may_name) {
+                    // label() answers the id itself when unresolved: that is no name.
+                    auto n = names.label(st.instruction_id);
+                    if (n != st.instruction_id)
+                        sv.instruction_name = std::move(n);
+                }
+                sv.label = st.label;
+                sv.condition = st.condition;
+                sv.foreach_source = st.foreach_source;
+                sv.on_failure = st.on_failure;
+                sv.retry_count = st.retry_count;
+                sv.retry_delay_seconds = st.retry_delay_seconds;
+                row.steps.push_back(std::move(sv));
+            }
+            view.rows.push_back(std::move(row));
+        }
+        res.set_content(operate_pages::render_workflows_list(view), "text/html; charset=utf-8");
+    });
+
+    // The two run fragments answer every refusal and degrade as a 200 note (htmx drops 4xx
+    // bodies) and never forward text from the gate's own body.
+    auto run_note = fragment_note;
+
+    // GET /fragments/workflow-runs -- run rows for the Workflows page (Operate WF-A, WF-2):
+    // each workflow's newest run (`latest_per_workflow=true`) and one workflow's recent runs.
+    //
+    // SOLE gate: fleet_read_fn(Workflow, Read), the gate GET /api/v1/workflow-executions uses;
+    // never stacked with perm_fn on the same tuple. Its scope goes to the store, which applies
+    // it before ORDER BY/LIMIT, so a confined caller's rows are exactly the runs it may see.
+    // Parameters are forwarded only if they are one of workflow_id, status, limit,
+    // latest_per_workflow, and the shared strict parser then refuses repeats and bad values;
+    // a refusal is a fixed 200 note that never echoes the caller's text. No audit row on a
+    // list, as the v1 route.
+    sink.Get("/fragments/workflow-runs", [fleet_read_fn, workflow_api, run_note](
+                                             const httplib::Request& req,
+                                             httplib::Response& res) {
+        if (!fleet_read_fn) {
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+        if (!gate.admitted) {
+            if (res.status == 403)
+                run_note(res, "denied", operate_pages::kRunsDeniedNote);
+            return;
+        }
+        static constexpr std::string_view kKnown[] = {"workflow_id", "status", "limit",
+                                                      "latest_per_workflow"};
+        std::vector<RawParam> raw;
+        raw.reserve(req.params.size());
+        for (const auto& kv : req.params) {
+            if (std::find(std::begin(kKnown), std::end(kKnown), kv.first) == std::end(kKnown)) {
+                run_note(res, "invalid", operate_pages::kRunsInvalidNote);
+                return;
+            }
+            raw.emplace_back(kv.first, kv.second);
+        }
+        auto query = parse_workflow_execution_list_params(raw);
+        if (!query) {
+            run_note(res, "invalid", operate_pages::kRunsInvalidNote);
+            return;
+        }
+        if (!workflow_api) {
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        auto page = workflow_api->list_workflow_executions(*query, gate.scope);
+        if (!page) {
+            (void)yuzu::server::genericize_db_error("list_workflow_executions", page.error());
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        operate_pages::RunListView view;
+        view.confined = gate.scope.has_value();
+        view.truncated = page->truncated_by_cap;
+        view.rows.reserve(page->rows.size());
+        for (const auto& r : page->rows) {
+            operate_pages::RunRowView row;
+            row.id = r.id;
+            row.workflow_id = r.workflow_id;
+            row.workflow_name = r.workflow_name;
+            row.workflow_deleted = r.workflow_deleted;
+            row.status = r.status;
+            row.started_at = r.started_at;
+            row.completed_at = r.completed_at;
+            view.rows.push_back(std::move(row));
+        }
+        res.set_content(operate_pages::render_runs_list(view), "text/html; charset=utf-8");
+    });
+
+    // GET /fragments/workflow-runs/{id} -- one run's step table (Operate WF-A, WF-2).
+    //
+    // The twin of GET /api/v1/workflow-executions/{id}: the same sole fleet_read_fn gate, the
+    // same record-level visibility check, the same confined projections of the step results and
+    // agent ids, and the same audit rows (success and denied). A run the caller may not see and
+    // an id that does not exist answer with the SAME status and body (the fixed-empty-
+    // correlation body of the legacy route; the per-request id rides the header only), so the
+    // route is no existence oracle. Step titles come from the workflow's own definition (label,
+    // else the step's instruction id); no instruction-name lookup, as the definitions fragment.
+    sink.Get(R"(/fragments/workflow-runs/([^/]+))",
+             [fleet_read_fn, audit_fn, probe_perm_fn, instruction_store, workflow_api,
+              run_note](const httplib::Request& req, httplib::Response& res) {
+        if (!fleet_read_fn) {
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+        if (!gate.admitted) {
+            if (res.status == 403)
+                run_note(res, "denied", operate_pages::kRunsDeniedNote);
+            return;
+        }
+        if (!workflow_api) {
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        auto not_found = [&res]() {
+            res.status = 404;
+            detail::ensure_correlation_id(res);
+            res.set_content(detail::error_json_a4(404, "execution not found", ""),
+                            "application/json");
+        };
+        const std::string id = req.matches[1].str();
+        auto exec_result = workflow_api->get_workflow_execution(id);
+        if (!exec_result) {
+            (void)yuzu::server::genericize_db_error("get_execution", exec_result.error());
+            run_note(res, "degraded", operate_pages::kRunsDegradedNote);
+            return;
+        }
+        if (!*exec_result) {
+            not_found();
+            return;
+        }
+        const auto& exec = **exec_result;
+        if (!workflow_execution_visible(exec, gate.scope)) {
+            if (audit_fn)
+                audit_fn(req, "workflow_execution.detail.fetch", "denied", "WorkflowExecution",
+                         exec.id,
+                         "not found or outside caller's fleet-read scope "
+                         "(management-group confinement)");
+            not_found();
+            return;
+        }
+        if (audit_fn)
+            audit_fn(req, "workflow_execution.detail.fetch", "success", "WorkflowExecution",
+                     exec.id, "");
+
+        const bool confined = gate.scope.has_value();
+        operate_pages::RunDetailView view;
+        view.id = exec.id;
+        view.workflow_id = exec.workflow_id;
+        view.status = exec.status;
+        view.started_at = exec.started_at;
+        view.completed_at = exec.completed_at;
+        view.confined = confined;
+        auto agents = confined_workflow_agent_ids_json(exec.agent_ids_json, gate.scope);
+        if (agents.is_array())
+            view.device_count = static_cast<int>(agents.size());
+
+        // The definition supplies step labels and the workflow name; a deleted or unreadable
+        // definition just leaves the instruction ids.
+        std::map<int, std::string> labels;
+        if (auto wf = workflow_api->get_workflow(exec.workflow_id); wf && *wf) {
+            view.workflow_name = (*wf)->name;
+            for (const auto& st : (*wf)->steps)
+                if (!st.label.empty())
+                    labels[st.index] = st.label;
+        }
+        // The instruction's name is a second securable (InstructionDefinition:Read): looked up
+        // only behind its own probe, else the instruction id stays the fallback title.
+        const bool may_name = !exec.step_results.empty() && probe_perm_fn &&
+                              probe_perm_fn(req, "InstructionDefinition", "Read");
+        operate_pages::NameLookupMemo names(
+            may_name ? operate_pages::instruction_name_resolver(instruction_store)
+                     : operate_pages::NameLookupMemo::Resolver{});
+        view.steps.reserve(exec.step_results.size());
+        for (const auto& sr : exec.step_results) {
+            operate_pages::RunStepView sv;
+            sv.index = sr.step_index;
+            auto it = labels.find(sr.step_index);
+            sv.title = it != labels.end() ? it->second : names.label(sr.instruction_id);
+            sv.status = sr.status;
+            sv.started_at = sr.started_at;
+            sv.completed_at = sr.completed_at;
+            sv.result_json = confined_workflow_step_result_json(sr.result_json, confined).dump();
+            view.steps.push_back(std::move(sv));
+        }
+        detail::ensure_correlation_id(res);
+        res.set_content(operate_pages::render_run_detail(view), "text/html; charset=utf-8");
     });
 
     // -- Scope estimate API ----------------------------------------------------
@@ -2088,11 +2867,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // scope for this twin PR).
 
     // GET /api/v1/workflows -- v1 twin of GET /api/workflows above.
-    sink.Get("/api/v1/workflows", [perm_fn, workflow_engine](const httplib::Request& req,
-                                                             httplib::Response& res) {
+    // ADR-0031 WS-A4 (eighth family): routed through the WorkflowApi seam —
+    // list_workflows() already returned a checked std::expected to this
+    // route pre-seam, so dropping the separate `!is_open()` pre-check and
+    // relying on the seam call's own result introduces no new
+    // honest-empty-vs-failure distinction (see workflow_api.cpp's doc
+    // comment); it only removes the direct presentation -> store reach.
+    sink.Get("/api/v1/workflows", [perm_fn, workflow_api](const httplib::Request& req,
+                                                          httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Read"))
             return;
-        if (!workflow_engine || !workflow_engine->is_open()) {
+        if (!workflow_api) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "workflow engine not available"),
                             "application/json");
@@ -2121,7 +2906,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // (clamped to 500) and the sibling GET /api/v1/executions (also
         // capped 500).
         q.limit = std::min(q.limit, 500);
-        auto workflows_result = workflow_engine->list_workflows(q);
+        auto workflows_result = workflow_api->list_workflows(q);
         if (!workflows_result) {
             res.status = 503;
             res.set_content(detail::a4_error(res,
@@ -2148,18 +2933,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     });
 
     // GET /api/v1/workflows/:id -- v1 twin of GET /api/workflows/:id above.
+    // ADR-0031 WS-A4 (eighth family): routed through the WorkflowApi seam.
     sink.Get(R"(/api/v1/workflows/([^/]+))",
-            [perm_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
+            [perm_fn, workflow_api](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Workflow", "Read"))
                     return;
-                if (!workflow_engine) {
+                if (!workflow_api) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "service unavailable"),
                                     "application/json");
                     return;
                 }
                 auto id = req.matches[1].str();
-                auto workflow_result = workflow_engine->get_workflow(id);
+                auto workflow_result = workflow_api->get_workflow(id);
                 if (!workflow_result) {
                     res.status = 503;
                     res.set_content(
@@ -2185,15 +2971,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                 "application/json");
             });
 
-    // GET /api/v1/workflow-executions/:id -- v1 twin of
-    // GET /api/workflow-executions/:id above. #4030 confinement decision:
-    // WorkflowExecution.agent_ids_json names agents directly, so this route
-    // gates on fleet_read_fn (not the legacy route's plain perm_fn) and
-    // confines the emitted agent_ids array to the caller's visible scope --
-    // reviewer-flagged scope point in the issue, resolved here.
-    sink.Get(R"(/api/v1/workflow-executions/([^/]+))",
-            [fleet_read_fn, audit_fn, workflow_engine](const httplib::Request& req,
-                                                        httplib::Response& res) {
+    // GET /api/v1/workflow-executions -- the workflow-execution LIST (no legacy twin: the legacy
+    // surface never listed runs). Newest first, keyset-paged, or `latest_per_workflow=true` for each
+    // workflow's newest run. Rows are metadata only (workflow_execution_summary_json): no agent ids,
+    // no step results, no fleet-size count.
+    //
+    // AUTHORIZATION: fleet_read_fn is the SOLE gate -- never stacked with perm_fn on the same
+    // (Workflow, Read) tuple (authz_gates.hpp) -- and its scope is handed to the seam, where the
+    // store applies it BEFORE ORDER BY/LIMIT (ADR-0017 INV-3). Visibility is therefore decided once,
+    // in SQL: a confined caller's page, next_cursor and page length depend only on runs it may see.
+    // No audit row on a successful list: run metadata, not operator-supplied step parameters (the
+    // detail route audits because results carry those); a denial is audited by the gate itself.
+    // Input is STRICT (workflow_execution_list_model.hpp): unknown/repeated parameters are 400.
+    sink.Get("/api/v1/workflow-executions",
+            [fleet_read_fn, workflow_api](const httplib::Request& req, httplib::Response& res) {
                 if (!fleet_read_fn) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "service unavailable"),
@@ -2203,14 +2994,73 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 auto gate = fleet_read_fn(req, res, "Workflow", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the response.
-                if (!workflow_engine) {
+                std::vector<RawParam> raw(req.params.begin(), req.params.end());
+                auto query = parse_workflow_execution_list_params(raw);
+                if (!query) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, query.error()), "application/json");
+                    return;
+                }
+                if (!workflow_api) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto page = workflow_api->list_workflow_executions(*query, gate.scope);
+                if (!page) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         yuzu::server::genericize_db_error(
+                                             "list_workflow_executions", page.error()),
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                // `total` is the rows in THIS page, never a fleet-wide count: a count of all
+                // matching runs would disclose out-of-scope existence to a confined caller.
+                nlohmann::json pagination{{"total", page->rows.size()},
+                                          {"start", 0},
+                                          {"page_size", query->limit},
+                                          {"next_cursor", workflow_execution_next_cursor_json(*page)}};
+                if (page->truncated_by_cap)
+                    pagination["result_truncated_by_cap"] = true;
+                detail::ensure_correlation_id(res);
+                res.set_content(nlohmann::json({{"data", workflow_execution_rows_json(*page)},
+                                                {"pagination", pagination},
+                                                {"meta", {{"api_version", "v1"}}}})
+                                    .dump(),
+                                "application/json");
+            });
+
+    // GET /api/v1/workflow-executions/:id -- v1 twin of
+    // GET /api/workflow-executions/:id above. #4030 confinement decision:
+    // WorkflowExecution.agent_ids_json names agents directly, so this route
+    // gates on fleet_read_fn (not the legacy route's plain perm_fn) and
+    // confines the emitted agent_ids array to the caller's visible scope --
+    // reviewer-flagged scope point in the issue, resolved here.
+    // ADR-0031 WS-A4 (eighth family): routed through the WorkflowApi seam.
+    sink.Get(R"(/api/v1/workflow-executions/([^/]+))",
+            [fleet_read_fn, audit_fn, workflow_api](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                if (!fleet_read_fn) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                if (!workflow_api) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "service unavailable"),
                                     "application/json");
                     return;
                 }
                 auto id = req.matches[1].str();
-                auto exec_result = workflow_engine->get_execution(id);
+                auto exec_result = workflow_api->get_workflow_execution(id);
                 if (!exec_result) {
                     res.status = 503;
                     res.set_content(
@@ -2284,24 +3134,55 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // fleet_read_fn does not apply here (matches the fragment's own gate
     // shape, not a per-agent list).
     sink.Get("/api/v1/schedules",
-            [perm_fn, schedule_engine, deny_service_scoped_schedule_list](
+            [perm_fn, schedule_api, deny_service_scoped_schedule_list](
                 const httplib::Request& req, httplib::Response& res) {
                 if (deny_service_scoped_schedule_list(req, res))
                     return;
                 if (!perm_fn(req, res, "Schedule", "Read"))
                     return;
-                if (!schedule_engine) {
+                if (!schedule_api) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res, "schedule engine not available"),
                                     "application/json");
                     return;
+                }
+                // #2146 A2-R1 (gov docs-writer/cpp-expert fix round): definition_id/
+                // enabled_only query params. The legacy GET /api/schedules route
+                // treats ANY presence of enabled_only as true, regardless of value
+                // -- this v1 twin does NOT reproduce that quirk. It follows the
+                // #4034 precedent already set on this same REST v1 surface
+                // (compliance_routes.cpp's PolicyQuery enabled_only fix) and
+                // matches the MCP twin list_schedules, which already honors the
+                // boolean value: presence alone must not decide it, or
+                // enabled_only=false would silently behave like enabled_only=true
+                // (the caller asked to see disabled/all schedules and got the
+                // opposite). An unrecognized value 400s.
+                ScheduleQuery q;
+                if (req.has_param("definition_id"))
+                    q.definition_id = req.get_param_value("definition_id");
+                if (req.has_param("enabled_only")) {
+                    auto v = req.get_param_value("enabled_only");
+                    if (v == "true" || v == "1") {
+                        q.enabled_only = true;
+                    } else if (v == "false" || v == "0") {
+                        q.enabled_only = false;
+                    } else {
+                        res.status = 400;
+                        res.set_content(
+                            detail::a4_error(res, "invalid boolean query parameter: enabled_only"),
+                            "application/json");
+                        return;
+                    }
                 }
                 // #4030 review finding (blocking): was the unchecked
                 // query_schedules(), which collapsed a pool-exhaustion or
                 // query failure into the same empty vector a genuinely
                 // empty table returns -- matches GET /api/v1/workflows
                 // above, which already has this checked/503 shape.
-                auto scheds_result = schedule_engine->query_schedules_checked();
+                // ADR-0031 WS-A4 (seventh family): now routed through the
+                // ScheduleApi seam (schedule_api.hpp) — the SAME checked call
+                // the dashboard fragment and MCP list_schedules also make.
+                auto scheds_result = schedule_api->list_schedules(q);
                 if (!scheds_result) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res,
@@ -2338,14 +3219,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
             });
 
+    // Prepared `parameter_schema` validators for the execute handler below: the shared cache
+    // from Deps, or a private one when the caller wired none.
+    auto param_validators = deps.param_validators ? deps.param_validators
+                                                  : std::make_shared<instr::ParamValidatorCache>();
+
     // -- Single Instruction Execution API --------------------------------------
 
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
     sink.Post(R"(/api/instructions/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
+                                                       csrf_trusted = deps.csrf_trusted_origins,
                                                        instruction_store, cmd_dispatch,
                                                        cmd_dispatch_concurrency, caller_fn,
                                                        execution_tracker, approval_manager,
-                                                       metrics,
+                                                       metrics, param_validators,
                                                        capability_registry](const httplib::Request& req,
                                                                 httplib::Response& res) {
         if (!perm_fn(req, res, "Execution", "Execute"))
@@ -2375,6 +3262,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto& def = **def_result;
+
+        // #2437-class guard: raw-text depth check before parse - a
+        // parsed-then-dumped "params" value below (`v.dump()`, non-string
+        // coercion) still crashes on the dump, so this has to run on the raw
+        // text before any allocation.
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "request body nests too deeply"),
+                            "application/json");
+            return;
+        }
 
         // Parse request body
         nlohmann::json j;
@@ -2462,6 +3360,86 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
+        // A dispatch authorised by a session cookie must come from this site (token callers
+        // are exempt): the dashboard is the only cookie caller, and it always sends Origin.
+        if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"), csrf_trusted)) {
+            (void)audit_fn(req, "csrf.denied", "denied", "Endpoint", "instruction.execute",
+                           "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"),
+                            "application/json");
+            return;
+        }
+
+        // -- Stored parameter_schema enforcement (strict) ---------------------------
+        // Validates the RAW typed `params` against the definition's stored schema
+        // (instruction_param_schema.hpp) BEFORE the approval gate, so a refused call never
+        // queues an approval (a ticket does not bind the params), creates an execution row or
+        // dispatches. An empty or `{}` schema is not validated. `params` below is untouched:
+        // no default is injected. The audit row carries only the validator's path. The response
+        // also carries its reason, which can quote text the schema author wrote (enum members,
+        // bounds) but never a caller-supplied value.
+        {
+            const auto count_reject = [&](const char* reason) {
+                if (metrics)
+                    metrics->counter("yuzu_server_instruction_param_rejected_total",
+                                     {{"route", kParamRejectRoute}, {"reason", reason}})
+                        .increment();
+            };
+            auto validator = param_validators->get(def_id, def.parameter_schema);
+            if (!validator) {
+                // A stored schema that cannot be prepared: FAIL CLOSED, never "no validation".
+                spdlog::warn("instruction '{}' has an invalid stored parameter_schema; execute "
+                             "refused until it is replaced: {}",
+                             audit_token(def_id),
+                             validator.error().empty() ? std::string("(no detail)")
+                                                       : validator.error().front());
+                count_reject("schema_invalid");
+                if (audit_fn)
+                    audit_fn(req, "instruction.execute", "failure", "instruction", def_id,
+                             "reason=param_schema_invalid");
+                res.status = 500;
+                res.set_content(
+                    detail::a4_error(res, "stored parameter schema for this instruction is invalid",
+                                     {.remediation =
+                                          "An administrator must export the definition, delete "
+                                          "it and import it again with a corrected "
+                                          "parameter_schema (signed, unless the server allows "
+                                          "unsigned definitions); see \"Replacing a stored "
+                                          "parameter schema\" in the Instructions "
+                                          "documentation."}),
+                    "application/json");
+                return;
+            }
+            if (!(*validator)->absent()) {
+                // `params` omitted and `params: null` both mean no params.
+                static const nlohmann::json kNoParams = nullptr;
+                const nlohmann::json& raw_params = j.contains("params") ? j["params"] : kNoParams;
+                if (auto violation = (*validator)->check(raw_params)) {
+                    const bool root = violation->path.empty();
+                    count_reject(!raw_params.is_null() && !raw_params.is_object() ? "shape"
+                                                                                  : "violation");
+                    if (audit_fn)
+                        audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                                 "reason=param_schema path=" +
+                                     (root ? std::string("(root)") : audit_token(violation->path)));
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         "invalid params: " +
+                                             (root ? std::string("(root)") : violation->path) +
+                                             ": " + violation->reason,
+                                         {.remediation = "Correct params to match the "
+                                                         "instruction's parameter schema and "
+                                                         "re-call; nothing was dispatched and no "
+                                                         "approval ticket was created."}),
+                        "application/json");
+                    return;
+                }
+            }
+        }
 
         // --- Approval gate ---------------------------------------------------
         // If the definition requires approval and the approval manager is
@@ -2694,6 +3672,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         bool route_unreadable = false;
         std::size_t denied_quarantined_count = 0;
         std::size_t unknown_plugin_count = 0;
+        // #5294: mirrors unknown_plugin_count for the per-OS kill-switch filter.
+        std::size_t kill_switched_os_count = 0;
+        bool os_gate_unreadable = false;
         std::optional<std::string> scope_parse_error;
         try {
             // #2500: NAME the broadcast rather than expressing it as "both
@@ -2727,6 +3708,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             route_unreadable = dispatch_outcome.route_unreadable;
             denied_quarantined_count = dispatch_outcome.denied_quarantined_count;
             unknown_plugin_count = dispatch_outcome.unknown_plugin_count;
+            kill_switched_os_count = dispatch_outcome.kill_switched_os_count;
+            os_gate_unreadable = dispatch_outcome.os_gate_unreadable;
             scope_parse_error = dispatch_outcome.scope_parse_error;
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
@@ -2739,6 +3722,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 !execution_tracker->mark_cancelled(execution_id, session->username)) {
                 spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
                               execution_id);
+                // #4982 fix round 2 (Fix 5): log-only swallowed the failure with
+                // no observable signal — count it alongside the log line,
+                // matching Part A's REST/MCP instrumentation pattern.
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                  {{"op", "mark_cancelled"}, {"surface", "workflow"}})
+                        .increment();
             }
             res.status = 500;
             res.set_content(detail::a4_error(res, "dispatch failed"), "application/json");
@@ -2750,6 +3741,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 !execution_tracker->mark_cancelled(execution_id, session->username)) {
                 spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
                               execution_id);
+                // #4982 fix round 2 (Fix 5)
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                  {{"op", "mark_cancelled"}, {"surface", "workflow"}})
+                        .increment();
             }
             // #881/#3424/#3511: "no agents reached" covers several distinct
             // causes this route did not used to discriminate — every target
@@ -2831,6 +3828,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          {"meta", {{"api_version", "v1"}}}})
                         .dump(),
                     "application/json");
+            } else if (os_gate_unreadable) {
+                // #5294: agent presence could not be read while a per-OS kill
+                // switch is OFF -- a transient fail-closed refusal.
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "agent presence could not be read while a "
+                                               "per-OS kill switch is set — dispatch is "
+                                               "failing closed and reaching no agent"},
+                                   {"reason", "os_gate_unreadable"},
+                                   {"retry_after_ms", 5000},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
             } else if (denied_quarantined_count > 0) {
                 res.set_content(
                     nlohmann::json(
@@ -2856,6 +3868,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          {"meta", {{"api_version", "v1"}}}})
                         .dump(),
                     "application/json");
+            } else if (kill_switched_os_count > 0) {
+                // #5294: every reachable target runs an OS whose per-OS kill
+                // switch is OFF -- withheld, not an empty fleet.
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "every target runs an OS for which this plugin "
+                                               "action is switched off — dispatch was withheld, "
+                                               "not attempted"},
+                                   {"reason", "kill_switched_os"},
+                                   {"retry_after_ms", nullptr},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
             } else {
                 res.set_content(
                     detail::a4_error(
@@ -2875,6 +3902,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (!execution_tracker->set_agents_targeted(execution_id, sent)) {
                 spdlog::error("workflow_routes: set_agents_targeted failed for execution_id={}",
                               execution_id);
+                // #4982 fix round 2 (Fix 5)
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                  {{"op", "set_agents_targeted"}, {"surface", "workflow"}})
+                        .increment();
             }
         }
 

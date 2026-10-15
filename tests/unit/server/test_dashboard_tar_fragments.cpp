@@ -48,6 +48,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -125,7 +126,11 @@ struct FragmentHarness {
     std::vector<PermCall> perms;
     bool perm_allow{true}; ///< perm_fn verdict (false → handler's 403 path)
     bool auth_ok{true};    ///< auth_fn verdict (false → handler returns early)
+    std::string auth_source{"local"}; ///< resolved session source; "local" = a cookie session
     int dispatch_sent{1};  ///< agents reached per dispatch (0 → offline 404)
+    /// #5294: ConfinedDispatchOutcome fields the zero-reach messages key on.
+    bool dispatch_os_gate_unreadable{false};
+    std::size_t dispatch_kill_switched_os_count{0};
 
     /// CDX-R7-02 / PLAN-006: the per-request DispatchCaller derivation the
     /// handlers consult for /api/dashboard/execute + tar-execute. Default
@@ -162,6 +167,7 @@ struct FragmentHarness {
             auth::Session s;
             s.username = kUser;
             s.role = auth::Role::admin;
+            s.auth_source = auth_source;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -183,7 +189,10 @@ struct FragmentHarness {
                    const yuzu::server::DispatchCaller& caller)
             -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back({plugin, action, scope, ids, params, caller.exec_visible, caller});
-            return {.sent = dispatch_sent, .command_id = "cmd-" + std::to_string(calls.size())};
+            return {.sent = dispatch_sent,
+                    .command_id = "cmd-" + std::to_string(calls.size()),
+                    .kill_switched_os_count = dispatch_kill_switched_os_count,
+                    .os_gate_unreadable = dispatch_os_gate_unreadable};
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -654,6 +663,32 @@ TEST_CASE("dashboard execute broadcast still carries the caller's exec_visible (
     CHECK(h.calls[0].exec_visible->count("dev-A") == 1);
 }
 
+// #5294: a zero-reach caused by the per-OS kill switch must not be reported as
+// "No agents connected" -- the operator would chase connectivity, not policy.
+TEST_CASE("dashboard execute: a per-OS kill-switch zero-reach names the switch, not connectivity",
+          "[server][dashboard][execute][5294]") {
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0;
+    h.dispatch_kill_switched_os_count = 2;
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-A");
+    REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "switched off"));
+    CHECK_FALSE(contains(res->body, "No agents connected"));
+}
+
+TEST_CASE("dashboard execute: an unreadable-presence zero-reach fails closed with its own message",
+          "[server][dashboard][execute][5294]") {
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0;
+    h.dispatch_os_gate_unreadable = true;
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-A");
+    REQUIRE(res->status == 200);
+    CHECK(contains(res->body, "presence could not be read"));
+    CHECK_FALSE(contains(res->body, "No agents connected"));
+}
+
 TEST_CASE("dashboard execute REFUSES a supplied-but-empty scope (CDX-R8-01)",
           "[server][dashboard][execute][scope][security]") {
     // The defect: `extract_form_value` returns "" for an absent `scope` AND for
@@ -782,6 +817,33 @@ TEST_CASE("tar-execute REFUSES a supplied-but-empty scope (CDX-R8-01)",
     REQUIRE(res->status == 200); // HTMX fragment, not a status-code surface
     CHECK(h.calls.empty());      // the security property: nothing was dispatched
     CHECK(res->body.find("No target selected") != std::string::npos);
+}
+
+// Same-site gate (browser_write_is_cross_site) on the "Run on TAR history" form post.
+TEST_CASE("tar-execute: a cookie-session write without a same-site Origin is refused",
+          "[server][dashboard][tar-execute][csrf][security]") {
+    FragmentHarness h;
+    SECTION("no Origin and no Referer") {
+        auto res = h.post("/api/dashboard/tar-execute", "sql=SELECT+1", {{"Host", kHost}});
+        CHECK(res->status == 403);
+    }
+    SECTION("a foreign Origin") {
+        auto res = h.post("/api/dashboard/tar-execute", "sql=SELECT+1",
+                          {{"Host", kHost}, {"Origin", "https://evil.example"}});
+        CHECK(res->status == 403);
+    }
+    CHECK(h.calls.empty());
+    CHECK(h.audits_for("csrf.denied", "denied") == 1);
+}
+
+TEST_CASE("tar-execute: a token session is not gated by Origin",
+          "[server][dashboard][tar-execute][csrf]") {
+    FragmentHarness h;
+    h.auth_source = "mcp_token";
+    auto res = h.post("/api/dashboard/tar-execute", "sql=SELECT+1", {{"Host", kHost}});
+    CHECK(res->status == 200);
+    CHECK(h.calls.size() == 1);
+    CHECK(h.audits_for("csrf.denied", "denied") == 0);
 }
 
 TEST_CASE("tar-execute still broadcasts when scope is OMITTED entirely (CDX-R8-01)",

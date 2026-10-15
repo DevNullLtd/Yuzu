@@ -1,1 +1,0 @@
-- Guardian: edge-trigger `guard.unhealthy` emission so a rule stuck Unknown (unreadable file, unqueryable service) no longer re-mints a fresh health event on every ~5s convergence re-eval; suppressed repeats are counted and surfaced sparsely as the `yuzu.guardian_unhealthy_suppressed` heartbeat tag. Inert until the `prefer_spark` cutover.

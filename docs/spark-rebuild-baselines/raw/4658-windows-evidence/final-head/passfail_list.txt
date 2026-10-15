@@ -1,0 +1,54 @@
+[DIAG] DLL static-init starting (before proto registration)
+Matching test cases:
+  File worker (direct): a backoff deadline already expired when the failed
+  pass's off-lock tail ends still retries at once and clears inert, nothing
+  else due (#4658 PF-11)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): a single transient failure with nothing else due still
+  retries at the deadline and recovers (#4658 PF-7)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): a worker that never fails keeps every pass-failure
+  counter at zero and inert false through ordinary traffic (#4658 PF-14)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): a throw after dispatched == true is counted and the
+  episode closes with no external wake (#4658 PF-15)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): the retry backoff is capped at 30 s and stop() does not
+  wait for it (#4658 PF-13)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): a persistently throwing pass does not spin - the pass
+  count is log-bounded by the backoff (#4658 PF-1)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): inert flips after exactly 3 consecutive failures and
+  clears on the first success with no external wake (#4658 PF-3)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): the retry after a failed pass runs at the backoff
+  deadline even when the only other obligation is much later (#4658 PF-10)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): a real completion recovering a pass mid-backoff resets
+  the deadline, so the next nudge is served promptly (#4658 PF-4)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): watch() of a second directory returns within budget
+  while the worker is in a failure episode (#4658 PF-8)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): a real completion during a failure episode keeps the
+  watch armed and the pass rate stays bounded (#4658 PF-9)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): the k-th consecutive failure waits doubled
+  (sweep_cadence, k, cap) (#4658 PF-2)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): control wakes during a backoff are absorbed - nudges do
+  not run passes (#4658 PF-5)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): stop() during a backoff returns promptly (#4658 PF-6)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): a backoff deadline already expired when the failed
+  pass's off-lock tail ends still retries at once, not at a later obligation
+  (#4658 PF-12)
+      [mechanism][passfail][spark][windows]
+  File worker (direct): a throw after dispatched == true in a timer-driven pass
+  is counted and the episode closes with no external wake (#4658 PF-15b)
+      [mechanism][passfail][spark][windows]
+16 matching test cases
+
+[DIAG] Catch2 Session::run() returned 0 (main about to return)

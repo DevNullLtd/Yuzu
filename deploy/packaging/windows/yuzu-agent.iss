@@ -1,6 +1,6 @@
 ; Yuzu Agent — Windows Installer (InnoSetup 6)
 ; Build: ISCC.exe yuzu-agent.iss
-; Silent: YuzuAgentSetup-0.7.0.exe /VERYSILENT /SERVER=myserver:50051 /TOKEN=abc123
+; Silent: YuzuAgentSetup-0.7.0.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=myserver:50051 /TOKEN=abc123
 
 #ifndef AppVersion
   #define AppVersion "0.7.0"
@@ -51,7 +51,7 @@ Name: "core"; Description: "Yuzu Agent core"; Types: full minimal custom; Flags:
 Name: "plugins"; Description: "Agent plugins"; Types: full custom
 Name: "plugins\system"; Description: "System info (OS, hardware, storage, users)"; Types: full custom
 Name: "plugins\network"; Description: "Network (config, diagnostics, actions, WiFi, WoL)"; Types: full custom
-Name: "plugins\security"; Description: "Security (antivirus, BitLocker, certificates, firewall)"; Types: full custom
+Name: "plugins\security"; Description: "Security (antivirus, BitLocker, certificates, firewall, exploit-mitigation posture)"; Types: full custom
 Name: "plugins\windows"; Description: "Windows (event logs, registry, WMI, updates, SCCM)"; Types: full custom
 Name: "plugins\management"; Description: "Management (processes, services, software, scripts)"; Types: full custom
 Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, vuln scan, quarantine)"; Types: full custom
@@ -84,7 +84,19 @@ Source: "{#BuildDir}\agents\plugins\msi_packages\msi_packages.dll"; DestDir: "{a
 Source: "{#BuildDir}\agents\plugins\asset_tags\asset_tags.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\power_health\power_health.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\autoruns\autoruns.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+; app_usage's only data source is tar.dll (reads tar.db directly), which is
+; itself gated on plugins\advanced alone (see that Source line below) --
+; app_usage.dll must be gated on the SAME single component, not a narrower
+; "and" of two: a custom install selecting Advanced without System has a
+; working tar.dll but would otherwise silently skip app_usage.dll despite
+; its dependency being present (governance Gate 7, cross-platform finding).
+Source: "{#BuildDir}\agents\plugins\app_usage\app_usage.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\execution_artifacts\execution_artifacts.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\runtimes\runtimes.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\windows_optional_features\windows_optional_features.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\peripherals\peripherals.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\browser_policy\browser_policy.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\pkg_inventory\pkg_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 
 ; --- Plugins: network ---
 Source: "{#BuildDir}\agents\plugins\network_config\network_config.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
@@ -101,6 +113,13 @@ Source: "{#BuildDir}\agents\plugins\bitlocker\bitlocker.dll"; DestDir: "{app}\pl
 Source: "{#BuildDir}\agents\plugins\certificates\certificates.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\firewall\firewall.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\quarantine\quarantine.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\update_source_trust\update_source_trust.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\mgmt_posture\mgmt_posture.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\app_control\app_control.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\firmware_posture\firmware_posture.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\platform_security\platform_security.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\system_hardening\system_hardening.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\local_security_policy\local_security_policy.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\ioc\ioc.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\vuln_scan\vuln_scan.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 
@@ -138,10 +157,11 @@ Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
 ; remove anything, so on its own it does NOT keep unprivileged users out:
 ; ProgramData grants Users inheritable create rights, which would let a local
 ; user plant update-trust-bundle.pem here before an operator provisions it.
-; SecureTrustAnchorDir (called from PrepareToInstall, in [Code]) rebuilds the
-; DACL outright and is what actually enforces this — it also runs FIRST, so by
-; the time this entry is processed the directory already exists and is locked
-; down, and all this adds is the two ACEs it already has.
+; SecureTrustAnchorDir (called from PrepareToInstall, in [Code]) is what
+; actually enforces this: it creates and locks the directory, or refuses one that
+; already exists without being secured — it never takes one over. It also runs
+; FIRST, so by the time this entry is processed the directory already exists and
+; is locked down, and all this adds is the two ACEs it already has.
 ;
 ; The agent service runs as LocalSystem, so it is covered by system-full and CAN
 ; write here - this keeps unprivileged local users out, not the agent itself.
@@ -200,7 +220,10 @@ Filename: "{sys}\sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yu
 ; scripts/install-agent-user.ps1 New-ProcBootAutologger — keep in sync (LogFileMode
 ; 0x2 = circular, 16 MB cap, System clock for FILETIME decode, FlushTimer 1 so the
 ; boot window reaches disk before the agent replays, keyword 0x10 = start/stop).
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; New-AutologgerConfig -Name YuzuProcBoot -LogFileMode 0x2 -LocalFilePath '{commonappdata}\Yuzu\procboot.etl' -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction SilentlyContinue | Out-Null; Add-EtwTraceProvider -AutologgerName YuzuProcBoot -Guid '{{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}' -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction SilentlyContinue | Out-Null; exit 0"""; StatusMsg: "Configuring boot process-capture AutoLogger..."; Flags: runhidden waituntilterminated; Components: plugins\advanced
+; PSModulePath reset: same as SecureTrustAnchorDir (#5176) -- $PSHOME\Modules only, no .NET call, so it
+; also runs under Constrained Language Mode (#5196). The AutoLogger cmdlets load fine without it; it is
+; here so every powershell.exe the installer starts sees Windows PowerShell's own modules.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$env:PSModulePath=$PSHOME+'\Modules'; Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; New-AutologgerConfig -Name YuzuProcBoot -LogFileMode 0x2 -LocalFilePath '{commonappdata}\Yuzu\procboot.etl' -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction SilentlyContinue | Out-Null; Add-EtwTraceProvider -AutologgerName YuzuProcBoot -Guid '{{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}' -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction SilentlyContinue | Out-Null; exit 0"""; StatusMsg: "Configuring boot process-capture AutoLogger..."; Flags: runhidden waituntilterminated; Components: plugins\advanced
 
 [UninstallRun]
 ; #1822 fix means `sc stop` now genuinely stops a running process holding open
@@ -228,7 +251,10 @@ Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--remove-service"; Flags: run
 ; session slot and still writing the 16 MB circular .etl. Unconditional (harmless
 ; no-op if never configured). Mirror of
 ; scripts/install-agent-user.ps1 Remove-ProcBootAutologger — keep in sync.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Stop-EtwTraceSession -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
+; PSModulePath reset: same as SecureTrustAnchorDir (#5176) -- $PSHOME\Modules only, no .NET call, so it
+; also runs under Constrained Language Mode (#5196). The AutoLogger cmdlets load fine without it; it is
+; here so every powershell.exe the installer starts sees Windows PowerShell's own modules.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$env:PSModulePath=$PSHOME+'\Modules'; Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Stop-EtwTraceSession -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
 
 ; gate-3 sre remediation (#3403 sockwho retirement): Inno Setup does not
 ; delete a file merely dropped from [Files] on an in-place upgrade, and
@@ -251,6 +277,14 @@ var
   EnrollmentToken: string;
   NoTLS: Boolean;
   StartService: Boolean;
+  // Set when PrepareToInstall took down a YuzuAgent service that was RUNNING
+  // or START_PENDING, so DeinitializeSetup can start it again if the
+  // installation then fails (#5250). Only ever set, never cleared: a second
+  // PrepareToInstall pass finds the service already stopped.
+  StoppedRunningService: Boolean;
+  // Set at ssPostInstall, which Inno reaches only after every file was
+  // installed and the [Run] entries -- including the service start -- ran.
+  InstallCompleted: Boolean;
 
 function GetCommandlineParam(const ParamName: string): string;
 var
@@ -368,8 +402,10 @@ begin
 end;
 
 { Embed S as a PowerShell single-quoted literal. Inside single quotes PowerShell
-  expands nothing -- no $variable, no subexpression -- so the quote itself is the
-  only character needing care, and it is escaped by doubling.
+  expands nothing -- no $variable, no subexpression -- so the only characters
+  needing care are the ones that END the literal: the ASCII quote and the
+  typographic single quotes U+2018..U+201B, which PowerShell's tokenizer treats
+  as the same delimiter. Each is escaped by doubling it.
 
   Note for anyone editing the comments in this file: a Pascal comment does NOT
   nest, so a closing brace written inside one ends it there and the prose after
@@ -380,15 +416,250 @@ var
   I: Integer;
 begin
   Result := '';
+  // A {tmp} path under a profile whose name contains U+2019 would otherwise
+  // end the literal early, and the check would fail to parse.
   for I := 1 to Length(S) do
-    if S[I] = '''' then
-      Result := Result + ''''''
+    if (S[I] = '''') or (S[I] = #$2018) or (S[I] = #$2019) or (S[I] = #$201A) or (S[I] = #$201B) then
+      Result := Result + S[I] + S[I]
     else
       Result := Result + S[I];
   Result := '''' + Result + '''';
 end;
 
-{ Harden the OTA trust-anchor directory, then PROVE it worked.
+const
+  FileAttrDirectory = $10;
+  FileAttrReparsePoint = $400;
+
+{ True when Path itself (not what it may point to) is a junction or symbolic
+  link. FindFirst on a path with no wildcard returns that entry's own
+  attributes from its parent directory, so it never follows the link. Sets
+  Found to False when the entry could not be read at all. }
+function IsReparsePoint(const Path: string; var Found: Boolean): Boolean;
+var
+  R: TFindRec;
+begin
+  Result := False;
+  Found := FindFirst(Path, R);
+  if Found then
+  begin
+    Result := (R.Attributes and FileAttrReparsePoint) <> 0;
+    FindClose(R);
+  end;
+end;
+
+{ '' when Dir holds only plain files (and, with MustBeEmpty, nothing at all);
+  otherwise why not. Lists Dir's direct entries only. A failure to list is a
+  refusal: "." always exists, so FindFirst returning False is not emptiness. }
+function NotFilesOnly(const Dir: string; MustBeEmpty: Boolean): string;
+var
+  R: TFindRec;
+  More: Boolean;
+begin
+  Result := '';
+  if not FindFirst(Dir + '\*', R) then
+  begin
+    Result := 'its contents could not be listed';
+    Exit;
+  end;
+  try
+    More := True;
+    while More and (Result = '') do
+    begin
+      if (R.Name <> '.') and (R.Name <> '..') then
+      begin
+        if (R.Attributes and FileAttrReparsePoint) <> 0 then
+        begin
+          if (R.Attributes and FileAttrDirectory) <> 0 then
+            Result := 'it contains a junction or directory link, which must be removed with ' +
+                      'cmd /c rmdir (never Remove-Item -Recurse): ' + Dir + '\' + R.Name
+          else
+            Result := 'it contains a file link, which must be removed with cmd /c del: ' +
+                      Dir + '\' + R.Name;
+        end
+        else if (R.Attributes and FileAttrDirectory) <> 0 then
+          Result := 'it contains a subdirectory, and it may hold only files: ' +
+                    Dir + '\' + R.Name
+        else if MustBeEmpty then
+          Result := 'a file appeared in it while it was being created, so it may not be ' +
+                    'the installer''s; remove the directory and run the installer again: ' +
+                    Dir + '\' + R.Name;
+      end;
+      if Result = '' then
+        More := FindNext(R);
+    end;
+  finally
+    FindClose(R);
+  end;
+end;
+
+{ The operator-facing refusal, shared by every way the directory can fail.
+  Attempted says whether the installer had tried to secure it. When it had,
+  Outcome says what that attempt left at CertDir, so the message never claims
+  more, or less, than happened (#5250); when it had not, nothing was changed. }
+function NotSecuredMessage(const CertDir, Reason: string; Attempted: Boolean;
+  const Outcome: string): string;
+begin
+  Result := 'The update trust-anchor directory is not secured:' + #13#10 +
+            CertDir + #13#10#13#10 + Reason + #13#10#13#10 +
+            'Only Administrators and SYSTEM may have access to it, both need full ' +
+            'control, and it may hold only files. While anyone else can write there, ' +
+            'they can install their own trust bundle and authorise their own agent ' +
+            'updates; while SYSTEM cannot read it, the agent cannot verify updates at ' +
+            'all. ';
+  if Attempted then
+    Result := Result + 'Securing it did not take effect -- security software may have ' +
+              'blocked it. ' + Outcome + ' '
+  else
+    Result := Result + 'Nothing was changed. ';
+  { StoppedRunningService is set here only on a second pass (Back from the
+    Restart Manager page, then Next): the first pass stopped the service, and
+    DeinitializeSetup starts it again when Setup exits. }
+  if StoppedRunningService then
+    Result := Result + 'The installation has been stopped. The Yuzu Agent service, which ' +
+              'Setup had already stopped, is started again when Setup exits; the Setup ' +
+              'log says whether that worked.'
+  else
+    Result := Result + 'The installation has been stopped; the Yuzu Agent service, if ' +
+              'installed, has not been touched.';
+end;
+
+{ Run the PowerShell permission check on CertDir. '' on PASS, otherwise the
+  reason. Mode is 'root' (the directory itself), 'files' (before an existing
+  directory's files are reset: each must be a plain file, not a hard link, and
+  already owned by Administrators or SYSTEM -- the installer never takes
+  ownership of a file, so it only ever repairs files an administrator placed;
+  the DACL is not compared, since rc1..rc5 left such files with an empty one,
+  which the reset repairs), or 'full' (the directory and every file, exactly).
+
+  THE CHECK MUST COMPARE THE EXACT OWNER AND ACE SET, not a marker within the
+  ACL text -- and the set must be exactly "Administrators and SYSTEM, each
+  allowed full control". "Nobody else has access" is also true of an empty
+  DACL, which is what the rc1..rc5 /T bug produced and what the rc1..rc5 check
+  passed; a Deny entry or an inherit-only entry for either account is also not
+  access. The earliest check tested for the inherited-ACE marker "(I)", which
+  an explicit ACE does not carry -- so it passed a directory the attacker could
+  still write to. Verified on Windows 11 26100: the install completed, reported
+  the directory secured, and the attacker retained (OI)(CI)(F) plus ownership.
+
+  It tests the reparse (1024) and directory (16) attributes BEFORE any Get-Acl,
+  because Get-Acl through a link reads the link's target, and it never
+  recurses. The comparison is on the SDDL string (owner BA or SY; the root
+  exactly (A;OICI;FA;;;BA)(A;OICI;FA;;;SY), protected; every file exactly the
+  inherited (A;ID;FA;;;..) pair). SDDL names accounts by SID alias, never by
+  localised name -- icacls prints localised names, so matching
+  "BUILTIN\Administrators" would silently fail open off an English build. It
+  uses NO .NET method or static call: under WDAC script enforcement, or
+  AppLocker script rules for a non-SYSTEM install, PowerShell runs in
+  Constrained Language Mode, which refuses method calls on non-core types. The
+  rc1..rc5 check called GetOwner()/Translate(), so there it could not run and
+  the install aborted. Verified on Windows Server 2022 with AppLocker script
+  rules enforced, installing as an elevated administrator: rc5 exit 7, this
+  check exit 0 (#5196). Property reads, -match, -band and cmdlets are allowed.
+
+  IT MUST NOT PIPE icacls INTO find. An earlier form did:
+
+      /C icacls "<dir>" | find "(I)" >nul && exit 1 || exit 0
+
+  and it FAILED OPEN in exactly the case the check exists for. cmd.exe binds
+  && / || to the PIPELINE's exit code -- that is `find`'s, the last command --
+  not icacls's, and only icacls's stdout is piped, not its errors. So when
+  icacls could not run at all it produced no "(I)"-bearing output, `find`
+  failed to match exactly as it does for a genuinely secured directory, and the
+  script reported SUCCESS.
+
+  So: no pipe, and no inference from absence of output. The check writes its
+  verdict to a file and exits 0 ONLY on a clean result; it passes only when the
+  exit code is 0 AND the file says PASS. Every way of NOT getting an answer --
+  PowerShell would not launch, it exited non-zero, the ACL could not be read,
+  the verdict could not be read back -- FAILS CLOSED, because an unverifiable
+  ACL here is indistinguishable from a bad one.
+
+  The script is passed with -Command, not -File: execution policy governs script
+  FILES, so an AllSigned policy pushed by GPO would block a .ps1 here but does
+  not affect -Command. It is built from plain literals so any braces stay
+  literal -- Inno expands a brace-delimited constant only inside ExpandConstant,
+  which is applied to the paths separately.
+
+  Windows PowerShell 5.1 inherits PSModulePath from whatever started the
+  installer. Started (via any intermediate process) from PowerShell 7, that
+  path points it at PowerShell 7's copies of modules it loads on first use,
+  such as Microsoft.PowerShell.Security, which 5.1 cannot load: Get-Acl failed,
+  the check could not run, and the install aborted (#5176). So it resets it to
+  Windows PowerShell's own modules first, using no cmdlet to build it. }
+function RunAclCheck(const CertDir, Mode: string): string;
+var
+  ResultCode: Integer;
+  ReasonFile, PsExe, Script, Reason: string;
+  ReasonText: AnsiString;
+begin
+  Result := '';
+  ReasonFile := ExpandConstant('{tmp}\yuzu-agent-certs-acl.txt');
+  PsExe := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  DeleteFile(ReasonFile);
+  Script :=
+    '$env:PSModulePath=$PSHOME+''\Modules'';' +
+    '$ErrorActionPreference=''Stop'';' +
+    '$d=' + PsLit(CertDir) + ';' +
+    '$out=' + PsLit(ReasonFile) + ';' +
+    '$m=' + PsLit(Mode) + ';' +
+    'function Fail($m){Set-Content -LiteralPath $out -Value $m -Encoding ASCII;exit 3};' +
+    'try{$r=Get-Item -LiteralPath $d -Force}catch{Fail ''it could not be opened''};' +
+    'if(($r.Attributes -band 1024) -ne 0){Fail ''it is a junction or symbolic link, not a directory''};' +
+    '$c=@();' +
+    'if($m -ne ''root''){' +
+      'try{$c=@(Get-ChildItem -LiteralPath $d -Force)}catch{Fail ''its contents could not be listed''};' +
+      'foreach($i in $c){' +
+        'if(($i.Attributes -band 1024) -ne 0){Fail (''it contains a junction or symbolic link: '' + $i.FullName)};' +
+        'if(($i.Attributes -band 16) -ne 0){Fail (''it contains a subdirectory, and it may hold only files: '' + $i.FullName)};' +
+        'if($i.LinkType -eq ''HardLink''){Fail (''it contains a hard link: '' + $i.FullName)}' +
+      '};' +
+      'if($m -eq ''files''){' +
+        'foreach($i in $c){' +
+          'try{$s=[string](Get-Acl -LiteralPath $i.FullName).Sddl}catch{Fail (''the permissions could not be read on '' + $i.FullName)};' +
+          'if($s -notmatch ''^O:(BA|SY)G:''){Fail (''it contains a file not owned by Administrators or SYSTEM, so it cannot be confirmed that an administrator placed it (inspect it; if it is yours, make Administrators its owner with icacls <file> /setowner *S-1-5-32-544 /L): '' + $i.FullName + '' '' + $s)}' +
+        '};' +
+        'Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;exit 0' +
+      '}' +
+    '};' +
+    '$t=@($d)+@($c|ForEach-Object{$_.FullName});' +
+    'foreach($p in $t){' +
+      'try{$s=[string](Get-Acl -LiteralPath $p).Sddl}catch{Fail (''the permissions could not be read on '' + $p)};' +
+      'if($s -notmatch ''^O:(BA|SY)G:''){Fail (''it is owned by an account other than Administrators or SYSTEM: '' + $p + '' '' + $s)};' +
+      'if($s -notmatch ''D:([A-Z]*)(\(.*)?$''){Fail (''its permission list could not be read: '' + $p + '' '' + $s)};' +
+      '$f=$Matches[1];$l=[string]$Matches[2];' +
+      'if($p -eq $d){' +
+        'if($f -notmatch ''P''){Fail ''it still inherits permissions from ProgramData''};' +
+        '$e=''^\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$''' +
+      '}else{$e=''^\(A;(?:OICI)?ID;FA;;;(SY|BA)\)\(A;(?:OICI)?ID;FA;;;(SY|BA)\)$''};' +
+      'if(($l -notmatch $e) -or ($Matches[1] -eq $Matches[2])){Fail (''its permission list is not exactly Administrators and SYSTEM, each with full control: '' + $p + '' '' + $s)}' +
+    '};' +
+    'Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;' +
+    'exit 0';
+
+  if not Exec(PsExe,
+              '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Script + '"',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := 'the permission check could not be run, so it could not be verified';
+    Exit;
+  end;
+  if LoadStringFromFile(ReasonFile, ReasonText) then
+    Reason := Trim(String(ReasonText))
+  else
+    Reason := '';
+  DeleteFile(ReasonFile);
+  { Both conditions are required. A non-zero exit means the check ran and
+    rejected the directory; a zero exit without the PASS verdict means it did
+    not get far enough to reach one, which is not evidence of anything. }
+  if (ResultCode <> 0) or (Reason <> 'PASS') then
+  begin
+    if Reason = '' then
+      Reason := 'the check did not produce a result (exit code ' + IntToStr(ResultCode) + ')';
+    Result := Reason;
+  end;
+end;
+
+{ Establish the OTA trust-anchor directory, then PROVE it is secured.
 
   RUNS BEFORE ANYTHING IS INSTALLED, and that placement is the point. An earlier
   version hardened from [Run] and verified from CurStepChanged(ssPostInstall),
@@ -399,161 +670,275 @@ end;
   message from PrepareToInstall instead aborts with a non-zero exit code and
   leaves nothing installed.
 
-  WHY THE DIRECTORY IS REBUILT RATHER THAN ADDED TO. %ProgramData% grants Users
-  inheritable create rights, so an unprivileged local user can create
-  agent-certs before the installer runs and set an explicit ACE for themselves
-  on it -- and they own it, which carries WRITE_DAC permanently, so removing
-  their ACE without taking ownership lets them put it straight back. Hence
-  takeown (which also enables the privilege needed to recover a directory whose
-  DACL grants Administrators nothing at all), then /reset to drop every explicit
-  ACE, then /inheritance:r /grant:r to drop the inherited ones and grant exactly
-  Administrators and SYSTEM. /T because a file the attacker planted carries its
-  own ACL and its own owner.
+  IT NEVER TAKES OVER ANYTHING IT DID NOT CREATE OR AN ADMINISTRATOR DID NOT
+  PLACE (#5255 review). %ProgramData% grants Users inheritable create rights, so
+  a local user can create agent-certs, or a file in it, before or while the
+  installer runs. Earlier versions took ownership and re-secured whatever was
+  there, adopting it as trusted. So:
+    - a junction or symbolic link at the path -> refuse, before anything runs.
+      The installer never deletes anything here.
+    - the directory already exists -> it must already be exactly secured, or
+      the install is refused for the operator to inspect. rc1..rc5 left the
+      directory itself secured (only its files were broken), and an endpoint
+      that upgraded by OTA has no directory, so every legitimate state passes.
+      It is not re-locked; its contents must be plain files already owned by
+      Administrators or SYSTEM before their permissions are reset. Nothing ever
+      takes ownership of a file, so a file someone else placed is refused on
+      every run, never adopted on a retry.
+    - it does not exist -> it is built and locked in the installer's private
+      temporary folder, checked there, and moved into place, so it never exists
+      unlocked; then it is checked again in place.
+  Not covered: an already-open handle keeps its access (#5258), and the parent
+  %ProgramData%\Yuzu is not locked down (#5257).
 
-  `icacls /grant:r` ALONE IS NOT ENOUGH and this is the bug that shipped: it
-  replaces grants only for the SIDs it NAMES, so a third SID's explicit entry
-  survives it untouched.
+  NOTHING RECURSES, AND THE DIRECTORY MAY HOLD ONLY FILES. Nothing legitimate
+  creates a subdirectory here (the agent's own credentials live in
+  <data-dir>\certs; only the trust-bundle files are read from agent-certs).
+  Every icacls carries /L so it acts on the path itself, never a link's target;
+  takeown is not used, having no such switch. Attributes are read with
+  FindFirst and Get-Item, which report a link's own attributes.
 
-  THE CHECK MUST COMPARE THE EXACT OWNER AND ACE SET, not a marker within the
-  ACL text. The previous check tested for the inherited-ACE marker "(I)", which
-  an explicit ACE does not carry -- so it passed a directory the attacker could
-  still write to. Verified on Windows 11 26100: the install completed, reported
-  the directory secured, and the attacker retained (OI)(CI)(F) plus ownership.
-  "No inherited ACEs" is a far weaker statement than "only Administrators and
-  SYSTEM can write here", and only the latter is what this directory needs.
+  WHY /setowner, /reset AND /inheritance:r /grant:r. /setowner makes
+  Administrators the owner; /reset drops every explicit ACE; /inheritance:r
+  /grant:r drops the inherited ones and grants exactly Administrators and
+  SYSTEM. `icacls /grant:r` ALONE IS NOT ENOUGH and that is a bug that shipped:
+  it replaces grants only for the SIDs it NAMES, so a third SID's explicit
+  entry survives. The grant must never reach a file: (OI)(CI) is invalid on a
+  file, and the rc1..rc5 `icacls ... /grant:r ... /T` left every existing file
+  -- the operator's update-trust-bundle.pem on every reinstall -- with an empty
+  protected DACL that locks SYSTEM out too, while reporting success. The
+  file-level /reset ("<dir>\*") repairs exactly that.
 
-  Identities are compared as SIDs, never as names: icacls prints localised
-  account names, so matching "BUILTIN\Administrators" would silently fail open
-  off an English build.
+  AN ABORT NEVER LEAVES agent-certs LESS PROTECTED THAN IT WAS FOUND (#5250).
+  The directory-level /reset and grant run ONLY on the private stage, never
+  on agent-certs in place, so there is no moment at which agent-certs exists
+  and inherits ProgramData's permissions:
+    - a new directory: a blocked or ineffective lock fails the stage check and
+      nothing is created at the path (it stays absent, as it was found); the
+      stage is deleted with the rest of the temporary folder.
+    - an existing directory: its own permissions are never changed. Only its
+      files are reset, to inherit from a directory that has just passed the
+      exact check, which can only leave Administrators and SYSTEM with access
+      to them; a file whose reset is blocked keeps the permissions it had.
+  The issue's "file created between the reset and the grant" window was an
+  in-place window and no longer exists. The stage's own window is inside
+  Inno's temporary folder, which Setup creates protected when it runs elevated
+  (Administrators and SYSTEM full control, the installing user read-only), so
+  no standard user can create anything in it; an entry an administrator or
+  SYSTEM puts there is still refused, never adopted. The issue's suggested
+  takeown /R + icacls /reset /T would break the never-recurse rule above and
+  is deliberately not used. The abort messages say which of these happened.
 
-  IT MUST NOT PIPE icacls INTO find. An earlier form did:
-
-      /C icacls "<dir>" | find "(I)" >nul && exit 1 || exit 0
-
-  and it FAILED OPEN in exactly the case the check exists for. cmd.exe binds
-  && / || to the PIPELINE's exit code -- that is `find`'s, the last command --
-  not icacls's, and only icacls's stdout is piped, not its errors. So when
-  icacls could not run at all (blocked by AV/EDR, or unable to read the ACL) it
-  produced no "(I)"-bearing output, `find` failed to match exactly as it does
-  for a genuinely secured directory, and the script reported SUCCESS.
-
-  So: no pipe, and no inference from absence of output. The check writes its
-  verdict to a file and exits 0 ONLY on a clean result; the install proceeds
-  only when the exit code is 0 AND the file says PASS. Every way of NOT getting
-  an answer -- PowerShell would not launch, it exited non-zero, the ACL could
-  not be read, the verdict could not be read back -- FAILS CLOSED, because an
-  unverifiable ACL here is indistinguishable from a bad one and a wrong
-  "secured" is worse than a refusal.
-
-  The script is passed with -Command, not -File: execution policy governs script
-  FILES, so an AllSigned policy pushed by GPO would block a .ps1 here but does
-  not affect -Command.
-
-  Returns '' on success, or the operator-facing reason to abort with. }
+  Verified on Windows Server 2022 (#5255), the outside target untouched in each
+  refusal case. Returns '' on success, or the operator-facing reason to abort. }
 function SecureTrustAnchorDir(): string;
 var
   ResultCode: Integer;
-  Ok: Boolean;
-  CertDir, ReasonFile, PsExe, Script, Reason: string;
-  ReasonText: AnsiString;
+  Ok, Found, Existed: Boolean;
+  CertDir, Stage, Reason, NotCreated, MovedIn, KeptOwn: string;
 begin
   Result := '';
   CertDir := ExpandConstant('{commonappdata}\Yuzu\agent-certs');
-  ReasonFile := ExpandConstant('{tmp}\yuzu-agent-certs-acl.txt');
-  PsExe := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  { What a failed attempt left at CertDir, for the abort message (#5250). }
+  NotCreated := 'The installer created nothing at that path.';
+  MovedIn := 'The installer had already moved its prepared directory into place there -- ' +
+             'it had passed the check, locked to Administrators and SYSTEM, before the move -- ' +
+             'when this check failed. Inspect it, delete it, and run the installer again.';
+  KeptOwn := 'The directory''s own permissions were not changed. Its files'' permissions were ' +
+             'reset to inherit from it, which leaves only Administrators and SYSTEM with access ' +
+             'to them; a file that could not be reset keeps the permissions it had.';
 
-  { [Dirs] creates this later, which is too late to be the thing we lock down.
-    On a reinstall -- or an attacker pre-creation -- it already exists. }
-  if not ForceDirectories(CertDir) then
+  { 1. A link at the path is refused before anything else, creation included. }
+  if IsReparsePoint(CertDir, Found) then
   begin
-    Result := 'Could not create the update trust-anchor directory:' + #13#10 +
-              CertDir + #13#10#13#10 +
-              'The installation has been stopped rather than continue without it.';
+    Result := NotSecuredMessage(CertDir,
+      'it is a junction or symbolic link, not a directory. Remove the link -- ' +
+      'cmd /c rmdir for a junction or directory link, cmd /c del for a file link; ' +
+      'either removes the link, never its target (never use Remove-Item -Recurse) ' +
+      '-- then run the installer again', False, '');
+    Exit;
+  end;
+  if not Found and (DirExists(CertDir) or FileExists(CertDir)) then
+  begin
+    Result := NotSecuredMessage(CertDir, 'it could not be inspected', False, '');
     Exit;
   end;
 
-  { Best-effort by design: each is VERIFIED below rather than trusted, so a
-    blocked step surfaces as a specific verification failure, which tells the
-    operator more than this step's own exit code would. }
-  Ok := Exec(ExpandConstant('{sys}\takeown.exe'),
-             '/F "' + CertDir + '" /A /R /D Y',
-             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
-             '"' + CertDir + '" /reset /T /C /Q',
-             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
-             '"' + CertDir + '" /inheritance:r /grant:r ' +
-             '"*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /T /C /Q',
-             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  { Built from plain literals so any braces stay literal -- Inno expands a
-    brace-delimited constant only inside ExpandConstant, which is applied to the
-    paths separately above. }
-  Script :=
-    '$ErrorActionPreference=''Stop'';' +
-    '$d=' + PsLit(CertDir) + ';' +
-    '$out=' + PsLit(ReasonFile) + ';' +
-    '$ok=@(''S-1-5-32-544'',''S-1-5-18'');' +
-    'function Fail($m){Set-Content -LiteralPath $out -Value $m -Encoding ASCII;exit 3};' +
-    'try{$a=Get-Acl -LiteralPath $d}catch{Fail (''the permissions could not be read: '' + $_.Exception.Message)};' +
-    'if(-not $a.AreAccessRulesProtected){Fail ''it still inherits permissions from ProgramData''};' +
-    '$t=@($d);' +
-    'try{$t+=@(Get-ChildItem -LiteralPath $d -Recurse -Force|ForEach-Object{$_.FullName})}catch{Fail ''its contents could not be listed''};' +
-    'foreach($p in $t){' +
-      'try{$x=Get-Acl -LiteralPath $p}catch{Fail (''the permissions could not be read on '' + $p)};' +
-      '$o=$x.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;' +
-      'if($ok -notcontains $o){Fail (''it is owned by '' + $o + '': '' + $p)};' +
-      'foreach($r in $x.Access){' +
-        'try{$s=$r.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value}' +
-        'catch{Fail (''an account on its permission list could not be resolved: '' + $p)};' +
-        'if($ok -notcontains $s){Fail (''access is granted to '' + $s + '': '' + $p)}' +
-      '}' +
-    '};' +
-    'Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;' +
-    'exit 0';
-
-  if not Exec(PsExe,
-              '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Script + '"',
-              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  Existed := Found;
+  if Existed then
   begin
-    Result := 'Could not run the permission check on:' + #13#10 + CertDir + #13#10#13#10 +
-              'The update trust-anchor directory could not be verified, so the ' +
-              'installation has been stopped rather than report it secured without ' +
-              'having checked. Confirm manually that only Administrators and SYSTEM ' +
-              'have access to it, then re-run the installer.';
-    Exit;
+    { 2. It existed before this installation: it must already be secured. }
+    if not DirExists(CertDir) then
+      Reason := 'it is a file, not a directory'
+    else
+      Reason := RunAclCheck(CertDir, 'root');
+    if Reason <> '' then
+    begin
+      Result := NotSecuredMessage(CertDir,
+        'it already existed and is not secured (' + Reason + '). This installer ' +
+        'does not take over a directory it did not secure: whatever is in it already ' +
+        'decides which agent updates are trusted. Check what it contains. Move any ' +
+        'update-trust-bundle.pem you placed there yourself to a safe place, delete the ' +
+        'directory (remove any junction or link in it first with cmd /c rmdir or ' +
+        'cmd /c del; never Remove-Item -Recurse), run the installer again, then copy ' +
+        'the bundle back in', False, '');
+      Exit;
+    end;
   end;
 
-  if LoadStringFromFile(ReasonFile, ReasonText) then
-    Reason := Trim(String(ReasonText))
-  else
-    Reason := '';
-
-  DeleteFile(ReasonFile);
-
-  { Both conditions are required. A non-zero exit means the check ran and
-    rejected the directory; a zero exit without the PASS verdict means it did
-    not get far enough to reach one, which is not evidence of anything. }
-  if (ResultCode <> 0) or (Reason <> 'PASS') then
+  if Existed then
   begin
+    { 3. An existing, secured directory is NOT re-locked: it has just passed the
+      exact check, and re-applying the lock would re-propagate inheritance to its
+      entries before they are checked. Its contents must be plain files (no
+      link, subdirectory or hard link), each already owned by Administrators or
+      SYSTEM -- nothing here takes ownership of a file -- and only then are the
+      files reset to inherit exactly BA and SYSTEM, which repairs the rc1..rc5
+      lock-out. Direct entries only. }
+    Reason := NotFilesOnly(CertDir, False);
     if Reason = '' then
-      Reason := 'the check did not produce a result (exit code ' + IntToStr(ResultCode) + ')';
-    Result := 'The update trust-anchor directory is not secured:' + #13#10 +
-              CertDir + #13#10#13#10 + Reason + #13#10#13#10 +
-              'Only Administrators and SYSTEM may have access to it. While anyone ' +
-              'else can write there, they can install their own trust bundle and ' +
-              'authorise their own agent updates. Securing it did not take effect -- ' +
-              'security software may have blocked it. The installation has been stopped.';
+      Reason := RunAclCheck(CertDir, 'files');
+    if Reason <> '' then
+    begin
+      Result := NotSecuredMessage(CertDir, Reason, False, '');
+      Exit;
+    end;
+    Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
+               '"' + CertDir + '\*" /reset /L /C /Q',
+               '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end
+  else
+  begin
+    { 4. A new directory is built and locked where only this installer can
+      reach it -- its private temporary folder -- checked there, and only then moved into
+      place, so agent-certs never exists unlocked. [Dirs] creates the path
+      later, which is too late. The move keeps the protected DACL; it fails if
+      anything already holds the name, or across volumes, and either refuses.
+      No /R, no /T, and /L on each icacls so it acts on the path itself (takeown
+      has no such switch and is not used). Exit codes are not trusted; the
+      checks after them are. }
+    Stage := ExpandConstant('{tmp}\agent-certs.stage');
+    if not ForceDirectories(Stage) or
+       not ForceDirectories(ExpandConstant('{commonappdata}\Yuzu')) then
+    begin
+      Result := 'Could not create the update trust-anchor directory:' + #13#10 +
+                CertDir + #13#10#13#10 +
+                'The installation has been stopped rather than continue without it; the ' +
+                'Yuzu Agent service, if installed, has not been touched.';
+      Exit;
+    end;
+    Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
+               '"' + Stage + '" /setowner *S-1-5-32-544 /L /C /Q',
+               '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
+               '"' + Stage + '" /reset /L /C /Q',
+               '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
+               '"' + Stage + '" /inheritance:r /grant:r ' +
+               '"*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /L /C /Q',
+               '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Reason := RunAclCheck(Stage, 'root');
+    if Reason = '' then
+      Reason := NotFilesOnly(Stage, True);
+    if Reason <> '' then
+    begin
+      Result := NotSecuredMessage(CertDir, 'it could not be prepared: ' + Reason, True, NotCreated);
+      Exit;
+    end;
+    if not RenameFile(Stage, CertDir) then
+    begin
+      Result := NotSecuredMessage(CertDir,
+        'the prepared directory could not be moved into place (something else ' +
+        'already holds the name, or the temporary folder is on another drive). If ' +
+        'TEMP is on another drive, set TEMP and TMP to a folder on the system drive, ' +
+        'or run the installer as SYSTEM, then run it again', True, NotCreated);
+      Exit;
+    end;
+    { 5. In place: still not a link, still exactly locked, still empty. }
+    Reason := RunAclCheck(CertDir, 'root');
+    if Reason = '' then
+      Reason := NotFilesOnly(CertDir, True);
+    if Reason <> '' then
+    begin
+      Result := NotSecuredMessage(CertDir, Reason, True, MovedIn);
+      Exit;
+    end;
   end;
+
+  { 6. The full check: the directory and every file in it. }
+  Reason := RunAclCheck(CertDir, 'full');
+  if Reason <> '' then
+  begin
+    if Existed then
+      Result := NotSecuredMessage(CertDir, Reason, True, KeptOwn)
+    else
+      Result := NotSecuredMessage(CertDir, Reason, True, MovedIn);
+  end;
+end;
+
+{ True when sc.exe query reports the YuzuAgent service in State (STOPPED,
+  STOP_PENDING, START_PENDING or RUNNING). Each program is named by its path
+  in the system directory, never looked up on the search path, which includes
+  Setup's own directory (#5250). The outer pair of quotes is cmd.exe's: /c
+  strips the first and the last quote and runs the rest as written. False when
+  the service does not exist, is in another state, or the query could not run:
+  callers treat that as "not in this state", never as proof of anything. }
+function AgentStateIs(const State: string): Boolean;
+var
+  Ran: Boolean;
+  ResultCode: Integer;
+begin
+  Ran := Exec(ExpandConstant('{sys}\cmd.exe'), '/c ""' + ExpandConstant('{sys}\sc.exe') +
+              '" query YuzuAgent | "' + ExpandConstant('{sys}\find.exe') + '" "' + State +
+              '" >nul"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := Ran and (ResultCode = 0);
+end;
+
+{ The YuzuAgent service's state as sc.exe query reports it: STOPPED,
+  STOP_PENDING, START_PENDING, RUNNING, or UNKNOWN (no such service, another
+  state, or the query could not run). }
+function AgentServiceState(): string;
+begin
+  if AgentStateIs('STOPPED') then
+    Result := 'STOPPED'
+  else if AgentStateIs('STOP_PENDING') then
+    Result := 'STOP_PENDING'
+  else if AgentStateIs('START_PENDING') then
+    Result := 'START_PENDING'
+  else if AgentStateIs('RUNNING') then
+    Result := 'RUNNING'
+  else
+    Result := 'UNKNOWN';
+end;
+
+{ How an Exec of sc.exe ended, for the log. Exec reports two different things
+  in the same ResultCode: the program's exit code when it ran, and the Windows
+  error from starting it when it did not -- so the two are never labelled the
+  same way (#5250). }
+function ScOutcome(const Ran: Boolean; const Code: Integer): string;
+begin
+  if Ran then
+    Result := 'sc.exe exit code ' + IntToStr(Code)
+  else
+    Result := 'sc.exe could not be run: ' + SysErrorMessage(Code) + ' (error ' +
+              IntToStr(Code) + ')';
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): string;
 var
   StopResultCode: Integer;
-  ResultCode: Integer;
+  StopRan: Boolean;
+  PriorState: string;
+  Stopped: Boolean;
   i: Integer;
 begin
-  Result := '';
+  { Establish the OTA trust-anchor directory and prove it, BEFORE any file is
+    copied -- and before the service is stopped, so a refusal leaves a running
+    agent running. A non-empty return aborts the install with this message and
+    a non-zero exit code, so an unattended deployment records the failure. }
+  Result := SecureTrustAnchorDir();
+  if Result <> '' then
+    Exit;
   { Stop existing service before upgrade. #1822: sc stop now actually completes
     (the agent reports SERVICE_STOP_PENDING then SERVICE_STOPPED instead of
     never responding), so poll for STOPPED instead of a blind delay -- bounded
@@ -570,15 +955,48 @@ begin
     eventually reach STOPPED, so it must still poll -- treating every non-zero
     code like "doesn't exist" would silently reproduce the old blind-race
     behavior for exactly the case this fix targets (Gate 3 release-deploy
-    finding, governance re-run). }
-  Exec('sc.exe', 'stop YuzuAgent', '', SW_HIDE, ewWaitUntilTerminated, StopResultCode);
-  if StopResultCode <> 1060 then
+    finding, governance re-run).
+
+    The state is read BEFORE the stop (#5250). A service that is RUNNING or
+    still START_PENDING is one this run takes down, whatever sc.exe stop then
+    returns: it refuses a START_PENDING service with 1061, and a stop control
+    the service does not answer in time gives 1053, so the exit code alone
+    would not count either, and a failed installation would leave the agent
+    stopped. A START_PENDING service is given up to 15s to finish starting and
+    then stopped again, so the file copy does not race a starting agent. }
+  PriorState := AgentServiceState();
+  StopRan := Exec(ExpandConstant('{sys}\sc.exe'), 'stop YuzuAgent', '', SW_HIDE,
+                  ewWaitUntilTerminated, StopResultCode);
+  if (PriorState = 'START_PENDING') and (StopResultCode = 1061) then
   begin
     for i := 1 to 15 do
     begin
-      Exec('cmd.exe', '/c sc query YuzuAgent | find "STOPPED" >nul', '', SW_HIDE,
-           ewWaitUntilTerminated, ResultCode);
-      if ResultCode = 0 then
+      if AgentServiceState() <> 'START_PENDING' then
+        Break;
+      Sleep(1000);
+    end;
+    StopRan := Exec(ExpandConstant('{sys}\sc.exe'), 'stop YuzuAgent', '', SW_HIDE,
+                    ewWaitUntilTerminated, StopResultCode);
+  end;
+  { If the installation fails from here on, DeinitializeSetup starts a service
+    this run took down again (#5250). The flag is only ever SET: Inno runs
+    PrepareToInstall again when the user goes Back from the Restart Manager
+    page and then Next, and by then the service this run stopped answers 1062 (not
+    running) -- clearing the flag there would leave it stopped after a later
+    failure. 1060 (no such service) and 1062 against a service that was
+    already stopped are not counted. }
+  if (StopRan and (StopResultCode = 0)) or (PriorState = 'RUNNING') or
+     (PriorState = 'START_PENDING') then
+    StoppedRunningService := True;
+  Log('PrepareToInstall: YuzuAgent service state before the stop: ' + PriorState + '; ' +
+      ScOutcome(StopRan, StopResultCode) + '.');
+  if StopResultCode <> 1060 then
+  begin
+    Stopped := False;
+    for i := 1 to 15 do
+    begin
+      Stopped := AgentStateIs('STOPPED');
+      if Stopped then
         Break;
       Sleep(1000);
     end;
@@ -591,29 +1009,118 @@ begin
       machine looked identical to a clean upgrade in aggregate reporting. Log it
       so a fleet log-aggregation pipeline (via /LOG=) can flag it (Gate 6 sre
       finding, governance re-run). }
-    if ResultCode <> 0 then
+    if not Stopped then
       Log('PrepareToInstall: prior YuzuAgent service did not reach STOPPED ' +
           'within the 15s poll window; proceeding with install regardless ' +
           '(CloseApplications=force will handle a still-locked executable).');
   end;
 
-  { Lock the OTA trust-anchor directory down and prove it, BEFORE any file is
-    copied. A non-empty return aborts the install with this message and a
-    non-zero exit code, so an unattended deployment records the failure. }
-  Result := SecureTrustAnchorDir();
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  { Inno reaches ssPostInstall only after every file was installed and each
+    entry of the Run section -- including the service start -- has run. Before it, a
+    failure (a file that cannot be replaced, a cancel, a fatal error) rolls
+    the installation back without running [Run]. }
+  if CurStep = ssPostInstall then
+    InstallCompleted := True;
+end;
+
+{ An installation that stopped a running agent and then did not complete
+  starts it again, so a failed upgrade does not leave the endpoint offline
+  until someone runs sc.exe start YuzuAgent or reboots (#5250). DeinitializeSetup
+  runs on every exit Setup itself controls, including after a rollback (not
+  when the Setup process is killed from outside).
+
+  The trust-anchor refusal on the first pass never gets here with
+  StoppedRunningService set: it runs, and aborts, before the service is
+  stopped. What does is a failure during the file copy -- for example a file
+  that cannot be replaced; with /SUPPRESSMSGBOXES Inno answers that error with
+  Abort (exit code 5). Inno's rollback removes only files this run created: a
+  file it had already replaced keeps the new version, so the agent restarted
+  here may run with a mix of old and new files. Restarting is still better
+  than leaving it stopped -- every file was placed by this or the previous
+  installation in an admin-only directory -- and the log says to run the
+  installer again. It is started whatever /NOSTART said: /NOSTART governs a
+  completed installation, and this one did not complete.
+
+  The log reports only the state sc.exe query OBSERVED, never what sc.exe start
+  returned. sc.exe start against a service that is still STOP_PENDING can
+  return 1056 (already running) while the service goes on to stop, and a start
+  that returns 0 can still fail while the agent starts up. So it first waits
+  (up to 45s) for the stop to finish, then starts the service and waits (up to
+  10s) to see RUNNING; "started again" is logged only when RUNNING was seen. }
+procedure DeinitializeSetup();
+var
+  State: string;
+  StartRan: Boolean;
+  StartCode: Integer;
+  I: Integer;
+begin
+  if StoppedRunningService and not InstallCompleted then
+  begin
+    State := AgentServiceState();
+    I := 0;
+    while ((State = 'STOP_PENDING') or (State = 'START_PENDING')) and (I < 45) do
+    begin
+      Sleep(1000);
+      I := I + 1;
+      State := AgentServiceState();
+    end;
+    Log('DeinitializeSetup: YuzuAgent service state before the restart: ' + State +
+        ' (waited ' + IntToStr(I) + 's for a pending stop or start to finish).');
+    StartRan := False;
+    StartCode := 0;
+    if State <> 'RUNNING' then
+    begin
+      StartRan := Exec(ExpandConstant('{sys}\sc.exe'), 'start YuzuAgent', '', SW_HIDE,
+                       ewWaitUntilTerminated, StartCode);
+      Log('DeinitializeSetup: sc.exe start YuzuAgent: ' + ScOutcome(StartRan, StartCode) + '.');
+      for I := 1 to 10 do
+      begin
+        State := AgentServiceState();
+        if State = 'RUNNING' then
+          Break;
+        Sleep(1000);
+      end;
+    end;
+    if State = 'RUNNING' then
+    begin
+      if StartRan then
+        Log('DeinitializeSetup: the installation did not complete. The YuzuAgent service, ' +
+            'which was running before it, has been started again and is RUNNING. Files the ' +
+            'installation had already replaced were not put back: run the installer again.')
+      else
+        Log('DeinitializeSetup: the installation did not complete. The YuzuAgent service, ' +
+            'which was running before it, is RUNNING again; Setup did not have to start it. ' +
+            'Files the installation had already replaced were not put back: run the ' +
+            'installer again.');
+    end
+    else
+      Log('DeinitializeSetup: the installation did not complete, and the YuzuAgent ' +
+          'service, which was running before it, could NOT be started again: its state ' +
+          'is ' + State + ' after the start (' + ScOutcome(StartRan, StartCode) + '). ' +
+          'Start it with: sc.exe start YuzuAgent, or run the installer again.');
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    { Ask about data directory }
-    if MsgBox('Remove agent data directory?' + #13#10 +
-              ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 +
-              'This includes agent identity, local storage, and cached state.',
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-    begin
-      DelTree(ExpandConstant('{commonappdata}\Yuzu'), True, True, True);
-    end;
+    { Ask about the data directory only when someone can answer. A plain MsgBox
+      is NOT suppressed by /SUPPRESSMSGBOXES (only SuppressibleMsgBox is), so a
+      silent uninstall (SCCM/Intune/GPO, /VERYSILENT) used to wait forever on an
+      invisible dialog (#5147). Silent uninstalls keep the data directory, the
+      same answer as the prompt's default button. }
+    if not UninstallSilent then
+      if MsgBox('Remove agent data directory?' + #13#10 +
+                ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 +
+                'This includes agent identity, local storage, and cached state.',
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+      begin
+        DelTree(ExpandConstant('{commonappdata}\Yuzu'), True, True, True);
+      end;
   end;
 end;

@@ -33,7 +33,7 @@ def check(cond, label, failures):
 
 def test_clean_coverage(failures):
     tests = [
-        _entry("agent unit tests", ["agent"]),
+        _entry("agent unit tests shard A", ["agent", "agent-shard"]),
         _entry("tar unit tests", ["tar"]),
         _entry("server pg unit tests shard C", ["server", "server-pg"]),
     ]
@@ -49,7 +49,7 @@ def test_missing_entry_neither_selected_nor_excluded(failures):
     # The core property: an entry in neither bucket must be caught, not
     # silently dropped (the exact Windows hazard this script exists for).
     tests = [
-        _entry("agent unit tests", ["agent"]),
+        _entry("agent unit tests shard A", ["agent", "agent-shard"]),
         _entry("orphan test", ["docs"]),  # neither --suite'd nor excluded
     ]
     ok, fail_msgs, _ = _mod.compute_coverage(tests, {"agent"}, {"server-pg"})
@@ -62,7 +62,7 @@ def test_project_namespace_stripped(failures):
     # meson introspection ALWAYS project-prefixes suite strings
     # ('yuzu:agent', not 'agent') — a naive bare-string comparison would
     # treat every entry as uncovered. This proves the prefix is stripped.
-    tests = [_entry("agent unit tests", ["agent"])]
+    tests = [_entry("agent unit tests shard A", ["agent", "agent-shard"])]
     ok, fail_msgs, stats = _mod.compute_coverage(tests, {"agent"}, set())
     check(ok, "namespace: prefixed suite matches the bare --suite name", failures)
     check(stats["selected"] == 1, "namespace: entry counted as selected", failures)
@@ -71,7 +71,7 @@ def test_project_namespace_stripped(failures):
 def test_suite_flag_matches_zero_entries(failures):
     # A real --suite typo looks EXACTLY like this — must fail loud, the
     # opposite of meson's own silent-zero-match --suite semantics.
-    tests = [_entry("agent unit tests", ["agent"])]
+    tests = [_entry("agent unit tests shard A", ["agent", "agent-shard"])]
     ok, fail_msgs, _ = _mod.compute_coverage(tests, {"agent", "aegnt"}, set())
     check(not ok, "zero-hit suite: reports not-ok", failures)
     check(any("aegnt" in m and "ZERO" in m for m in fail_msgs),

@@ -1,0 +1,38 @@
+# jdk_layouts.manifest -- JVM home layouts of four distro packages, each under its own root
+# directory (roots/<distro>/...), for the release-less-home and extra-root walk tests in
+# tests/unit/test_runtimes_linux_parsers.cpp. Same line grammar as tree.manifest; provenance.txt
+# holds the images, package versions and capture commands.
+#
+# REAL CAPTURE structure, trimmed to the paths the walk reads (home directories, `release`, the
+# bin/java and jre/bin/java probes, the alias entries next to the homes). RECONSTRUCTION: every
+# regular file other than the SUSE `release` is an EMPTY placeholder (the capture recorded names,
+# not contents), and the Ubuntu .jinfo file is empty.
+#
+# -- ubuntu:22.04 + openjdk-8-jre-headless: NO `release` file anywhere in the home ---------------
+roots/ubuntu2204-openjdk8/usr/lib/jvm/.java-1.8.0-openjdk-arm64.jinfo	T:
+roots/ubuntu2204-openjdk8/usr/lib/jvm/java-1.8.0-openjdk-arm64	L:java-8-openjdk-arm64
+roots/ubuntu2204-openjdk8/usr/lib/jvm/java-8-openjdk-arm64/bin/java	L:../jre/bin/java
+roots/ubuntu2204-openjdk8/usr/lib/jvm/java-8-openjdk-arm64/jre/bin/java	T:
+#
+# -- rockylinux:9 + java-1.8.0-openjdk-headless: only jre/bin/java, NO `release` file -------------
+roots/rocky9-openjdk8/usr/lib/jvm/java-1.8.0-openjdk-1.8.0.504.b01-1.2.el9_8.aarch64/jre/bin/java	T:
+roots/rocky9-openjdk8/usr/lib/jvm/jre	L:/etc/alternatives/jre
+roots/rocky9-openjdk8/usr/lib/jvm/jre-1.8.0	L:/etc/alternatives/jre_1.8.0
+roots/rocky9-openjdk8/usr/lib/jvm/jre-1.8.0-openjdk	L:/etc/alternatives/jre_1.8.0_openjdk
+roots/rocky9-openjdk8/usr/lib/jvm/jre-1.8.0-openjdk-1.8.0.504.b01-1.2.el9_8.aarch64	L:java-1.8.0-openjdk-1.8.0.504.b01-1.2.el9_8.aarch64/jre
+roots/rocky9-openjdk8/usr/lib/jvm/jre-openjdk	L:/etc/alternatives/jre_openjdk
+#
+# -- alpine:3.20 + openjdk8-jre-base: NO `release` file -------------------------------------------
+roots/alpine320-openjdk8/usr/lib/jvm/default-jvm	L:java-8-openjdk
+roots/alpine320-openjdk8/usr/lib/jvm/java-8-openjdk	L:java-1.8-openjdk
+roots/alpine320-openjdk8/usr/lib/jvm/java-1.8-openjdk/bin/java	T:
+roots/alpine320-openjdk8/usr/lib/jvm/java-1.8-openjdk/jre/bin/java	T:
+#
+# -- opensuse/leap:15.6 + java-17-openjdk-headless: JVMs live under /usr/lib64/jvm, there is no
+# /usr/lib/jvm; the `release` payload below is the verbatim file --------------------------------
+roots/opensuse156-openjdk17/usr/lib64/jvm/java-17-openjdk-17/release	T:IMPLEMENTOR="N/A"\nJAVA_RUNTIME_VERSION="17.0.18+8-suse-1500-aarch64"\nJAVA_VERSION="17.0.18"\nJAVA_VERSION_DATE="2026-01-20"\nLIBC="gnu"\nMODULES="java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.jvmstat jdk.attach jdk.charsets jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.incubator.foreign jdk.incubator.vector jdk.internal.le jdk.internal.opt jdk.internal.vm.ci jdk.internal.vm.compiler jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jpackage jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.rmi jdk.net jdk.nio.mapmode jdk.random jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported jdk.unsupported.desktop jdk.xml.dom jdk.zipfs"\nOS_ARCH="aarch64"\nOS_NAME="Linux"\nSOURCE=""\n
+roots/opensuse156-openjdk17/usr/lib64/jvm/java-17-openjdk-17/bin/java	T:
+roots/opensuse156-openjdk17/usr/lib64/jvm/jre	L:/etc/alternatives/jre
+roots/opensuse156-openjdk17/usr/lib64/jvm/jre-17	L:/etc/alternatives/jre_17
+roots/opensuse156-openjdk17/usr/lib64/jvm/jre-17-openjdk	L:java-17-openjdk-17
+roots/opensuse156-openjdk17/usr/lib64/jvm/jre-openjdk	L:/etc/alternatives/jre_openjdk

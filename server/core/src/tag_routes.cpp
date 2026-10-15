@@ -133,8 +133,11 @@ void register_tag_routes(HttpRouteSink& sink, Deps deps) {
 
         // Surface the write result (#3097 classification): db_error →
         // 503, caller/validation error → 400 — a swallowed failed write
-        // used to report "Tag updated" over nothing written.
-        if (auto set_res = deps.store->set_tag(agent_id, key, value, "api"); !set_res) {
+        // used to report "Tag updated" over nothing written. Uses the
+        // checked setter, like the REST v1 and MCP twins, so a category
+        // with a closed value set (environment: Dev, UAT, Production) is
+        // refused here too instead of being stored verbatim.
+        if (auto set_res = deps.store->set_tag_checked(agent_id, key, value, "api"); !set_res) {
             const bool db_error = set_res.error().starts_with(kTagDbErrorPrefix);
             (void)deps.audit_fn(req, "tag.set", "failure", "tag", agent_id + ":" + key,
                                 set_res.error());

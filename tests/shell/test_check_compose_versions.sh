@@ -33,17 +33,17 @@ expect() {
 
 mkf() { printf '%s\n' "$2" > "$TMP/$1"; printf '%s' "$TMP/$1"; }
 
-f_ok_plain="$(mkf ok_plain.yml      '    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.12.0}')"
-f_ok_chisel="$(mkf ok_chisel.yml    '    image: ghcr.io/tr3kkr/yuzu-gateway-chisel:${YUZU_VERSION:-0.12.0}')"
-f_ok_regvar="$(mkf ok_regvar.yml    '    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-agent-chisel:${YUZU_VERSION:-0.12.0}')"
-f_drift_chisel="$(mkf drift.yml     '    image: ghcr.io/tr3kkr/yuzu-server-chisel:${YUZU_VERSION:-0.11.0}')"
-f_hardcoded="$(mkf hardcoded.yml    '    image: ghcr.io/tr3kkr/yuzu-server:0.12.0')"
-f_floating="$(mkf floating.yml      '    image: ghcr.io/tr3kkr/yuzu-server:latest')"
+f_ok_plain="$(mkf ok_plain.yml      '    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.12.0}')"
+f_ok_chisel="$(mkf ok_chisel.yml    '    image: ghcr.io/devnullltd/yuzu-gateway-chisel:${YUZU_VERSION:-0.12.0}')"
+f_ok_regvar="$(mkf ok_regvar.yml    '    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-agent-chisel:${YUZU_VERSION:-0.12.0}')"
+f_drift_chisel="$(mkf drift.yml     '    image: ghcr.io/devnullltd/yuzu-server-chisel:${YUZU_VERSION:-0.11.0}')"
+f_hardcoded="$(mkf hardcoded.yml    '    image: ghcr.io/devnullltd/yuzu-server:0.12.0')"
+f_floating="$(mkf floating.yml      '    image: ghcr.io/devnullltd/yuzu-server:latest')"
 # yuzu-postgres joined the pin discipline in #1318 (F4/F5 of the Postgres
 # substrate program) — exercise all three behaviours for the new repo name.
-f_ok_pg="$(mkf ok_pg.yml            '    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.12.0}')"
-f_drift_pg="$(mkf drift_pg.yml      '    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.11.0}')"
-f_hard_pg="$(mkf hard_pg.yml        '    image: ghcr.io/tr3kkr/yuzu-postgres:0.12.0')"
+f_ok_pg="$(mkf ok_pg.yml            '    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.12.0}')"
+f_drift_pg="$(mkf drift_pg.yml      '    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.11.0}')"
+f_hard_pg="$(mkf hard_pg.yml        '    image: ghcr.io/devnullltd/yuzu-postgres:0.12.0')"
 f_floating_pg="$(mkf float_pg.yml   '    image: yuzu-postgres:local')"
 
 echo "check-compose-versions.sh fixture tests:"

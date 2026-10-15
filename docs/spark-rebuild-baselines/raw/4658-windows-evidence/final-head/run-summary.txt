@@ -1,0 +1,30 @@
+HEAD=9a3b7abb9f313e73029682d33e8b1b67612517c0
+build head ok
+pf_1 exit=0 All tests passed (176 assertions in 16 test cases)
+pf_2 exit=0 All tests passed (176 assertions in 16 test cases)
+pf_3 exit=0 All tests passed (176 assertions in 16 test cases)
+sw_1 exit=42 test cases:  145 |  144 passed | 1 failed
+sw_2 exit=0 All tests passed (1830 assertions in 145 test cases)
+build M_old_floor ok
+mut_M_old_floor exit=42 test cases:  16 |  14 passed | 2 failed
+build restore_M_old_floor ok
+restore_M_old_floor exit=0 All tests passed (176 assertions in 16 test cases)
+build M_min ok
+mut_M_min exit=42 test cases:  16 |  14 passed | 2 failed
+build restore_M_min ok
+restore_M_min exit=0 All tests passed (176 assertions in 16 test cases)
+build M_dispatch ok
+mut_M_dispatch exit=42 test cases:  16 |  14 passed | 2 failed
+build restore_M_dispatch ok
+restore_M_dispatch exit=0 All tests passed (176 assertions in 16 test cases)
+build M_first ok
+mut_M_first exit=42 test cases:  16 |  15 passed | 1 failed
+build restore_M_first ok
+restore_M_first exit=0 All tests passed (176 assertions in 16 test cases)
+build M_second ok
+mut_M_second exit=42 test cases:  16 |  15 passed | 1 failed
+build restore_M_second ok
+restore_M_second exit=0 All tests passed (176 assertions in 16 test cases)
+full_1 exit=1
+full_2 exit=1
+DONE

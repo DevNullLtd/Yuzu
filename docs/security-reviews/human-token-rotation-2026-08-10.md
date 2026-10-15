@@ -640,7 +640,13 @@ of them break its "no defect in this feature's own new code" premise.
   wrong) for this case, are now recorded in
   `docs/auth-architecture.md` "Human API-token rotation",
   `docs/user-manual/authentication.md` "Rotating a Token", and the error
-  matrices in `docs/user-manual/rest-api.md`. Pinned by a new REST-level
+  matrices in `docs/user-manual/rest-api.md`. **Addendum (2026-09-17, #2963):**
+  the de-escalating-direction gap this paragraph flags as an undocumented
+  capability loss was subsequently DECIDED and FIXED — a caller holding no
+  standing tier/scope may now act on any of its own tokens; see
+  `docs/auth-architecture.md` "Human API-token rotation" for the current
+  state. This review's own text below is left as the point-in-time record
+  of what the pass found, not updated in place. Pinned by a new REST-level
   test: an untiered (cookie-shaped) caller refused rotating its own tiered
   token (`test_rest_api_tokens_rotation.cpp`, `[pg][rest][token][rotation]
   [security]`) — the REST harness's session tier/scope default to

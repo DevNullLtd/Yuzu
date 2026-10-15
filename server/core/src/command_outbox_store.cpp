@@ -1,5 +1,6 @@
 #include "command_outbox_store.hpp"
 
+#include "command_delivery_finalization_owner.hpp" // #4982 round 5: ADR-0012 §3 cross-schema owner
 #include "leader_elector.hpp" // LeaderElector::epoch_fence_sql — the embeddable epoch predicate
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -23,13 +24,15 @@ namespace {
 // CommandOutboxStore -> command_outbox_store. One schema, one table (`outbox`).
 constexpr const char* kStoreName = "command_outbox_store";
 
-// Lease-acquire deadlines (ADR-0012 §2). This store is a leader-driven
-// background surface (a scheduler tick, a delivery loop) with no operator
-// waiting on a request, so the deadlines are modest and the caller always has
-// its own next tick to retry — a degrade is logged at `warn` + counted, never
-// silently swallowed (posture is authoritative, but the CALLER, not this
-// store, decides fail-closed on the typed error it returns).
-constexpr std::chrono::milliseconds kWriteTimeout{2000};
+// Read lease-acquire deadline (ADR-0012 §2) — see
+// `CommandOutboxStore::kWriteTimeout`'s doc comment (command_outbox_store.hpp)
+// for the write-side deadline and the shared-symbol rationale (#4982 round 6,
+// Kimi K3): this store is a leader-driven background surface (a scheduler
+// tick, a delivery loop) with no operator waiting on a request, so the
+// deadlines are modest and the caller always has its own next tick to retry —
+// a degrade is logged at `warn` + counted, never silently swallowed (posture
+// is authoritative, but the CALLER, not this store, decides fail-closed on
+// the typed error it returns).
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 
 // Interpret the result of the fenced idempotent INSERT ... RETURNING plus its
@@ -309,6 +312,35 @@ CommandOutboxStore::mark_sent(const std::string& occurrence_id, const std::strin
         "UPDATE command_outbox_store.outbox SET state='sent', updated_at=now() "
         "WHERE occurrence_id=$1 AND state='pending' AND " + fence + " RETURNING occurrence_id";
     return fenced_transition(sql.c_str(), std::vector<std::string>{occurrence_id}, "mark_sent");
+}
+
+// #4982 round 5: the guarded transaction lives in
+// `CommandDeliveryFinalizationOwner::mark_sent_with_target`
+// (command_delivery_finalization_owner.cpp) — the ADR-0012 §3 cross-schema
+// query owner, so this single-schema store no longer issues SQL against
+// `execution_tracker.executions` itself. Thin delegation, mirroring
+// `RbacStore::unassign_role`'s own delegation to `RbacAdminAuthorityOwner`:
+// construct the owner per call (never cache one), translate its typed
+// outcome back into this store's own `std::expected`/`count_degrade` shape.
+// The SQL/fencing/rollback/error-handling are byte-identical to round 3 —
+// only the location moved.
+std::expected<bool, CommandOutboxError>
+CommandOutboxStore::mark_sent_with_target(const std::string& occurrence_id,
+                                          const std::string& leader_lock_name,
+                                          std::int64_t leader_epoch,
+                                          const std::string& execution_id, int agents_targeted) {
+    if (!open_) {
+        count_degrade("mark_sent_with_target", "not_open");
+        return std::unexpected(CommandOutboxError::store_unavailable);
+    }
+    const CommandDeliveryFinalizationOwner::MarkSentWithTargetOutcome outcome =
+        CommandDeliveryFinalizationOwner{pool_}.mark_sent_with_target(
+            occurrence_id, leader_lock_name, leader_epoch, execution_id, agents_targeted);
+    if (!outcome.committed) {
+        count_degrade("mark_sent_with_target", outcome.db_error ? "db_error" : "commit_failed");
+        return std::unexpected(CommandOutboxError::db_error);
+    }
+    return outcome.matched;
 }
 
 std::expected<bool, CommandOutboxError>

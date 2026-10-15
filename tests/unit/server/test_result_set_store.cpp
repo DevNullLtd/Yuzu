@@ -16,6 +16,7 @@
 
 #include "result_set_store.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
@@ -24,8 +25,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <format>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -142,6 +146,187 @@ TEST_CASE("ResultSetStore: synchronous create, get, members", "[pg][result_set][
     CHECK_FALSE(contains_ok(store, rs->id, "dev-z"));
 }
 
+TEST_CASE("ResultSetStore: members_checked matches the plain wrapper on the healthy path, "
+          "and fails closed (DbError) rather than silently truncating on a degraded read "
+          "(#4306 finding 3)",
+          "[pg][result_set][crud][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    auto rs = store.create_materialized(req("alice", "win-fleet"), {"dev-a", "dev-b", "dev-c"});
+    REQUIRE(rs.has_value());
+
+    // Healthy path: members_checked() reports the exact same page as the
+    // plain wrapper.
+    auto checked = store.members_checked(rs->id, "", 100);
+    REQUIRE(checked.has_value());
+    CHECK(checked->device_ids.size() == 3);
+    CHECK(checked->next_cursor.empty());
+
+    // Same lock-timeout technique as test_approval_manager.cpp's
+    // lock_timeout_ms precedent (#2786/#2456): a second raw connection holds
+    // an ACCESS EXCLUSIVE table lock, and the store under test is built
+    // against a short-lock_timeout_ms pool so its blocked read fails with a
+    // real, deterministic SQLSTATE 55P03 rather than hanging or being
+    // retried away.
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_set_members IN ACCESS "
+                            "EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.members_checked(rs->id, "", 100);
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    // The plain wrapper's fallback shape is unchanged: empty vector, cleared
+    // cursor — never a partial/truncated-but-nonempty page.
+    std::string next = "sentinel";
+    auto plain = degraded_store.members(rs->id, "", 100, next);
+    CHECK(plain.empty());
+    CHECK(next.empty());
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    // And the fault clears: the same store reads correctly once the lock
+    // releases.
+    auto recovered = degraded_store.members_checked(rs->id, "", 100);
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->device_ids.size() == 3);
+}
+
+// ── Members visibility (PR #5846 review blocker) ───────────────────────────
+// The members page is a display read of per-device data: the caller's CURRENT list-read scope
+// must reach the SQL before ORDER BY/LIMIT (ADR-0017 INV-3), or ids they can no longer see take
+// page slots and are paged through.
+
+TEST_CASE("build_members_page_sql: the visibility predicate precedes the keyset predicate, "
+          "ORDER BY and LIMIT, and an engaged-empty scope matches nothing",
+          "[result_set][members][security]") {
+    SECTION("no scope: the statement is the unrestricted keyset page") {
+        auto b = build_members_page_sql("rs_a", "", 10, std::nullopt);
+        CHECK(b.sql == "SELECT device_id FROM result_set_store.result_set_members "
+                       "WHERE result_set_id = $1 ORDER BY device_id ASC LIMIT $2::bigint");
+        CHECK(b.params == std::vector<std::string>{"rs_a", "11"});
+        auto c = build_members_page_sql("rs_a", "dev-5", 10, std::nullopt);
+        CHECK(c.sql == "SELECT device_id FROM result_set_store.result_set_members "
+                       "WHERE result_set_id = $1 AND device_id > $2 ORDER BY device_id ASC "
+                       "LIMIT $3::bigint");
+        CHECK(c.params == std::vector<std::string>{"rs_a", "dev-5", "11"});
+    }
+    SECTION("a scope is bound as one array and sits before the cursor, ORDER BY and LIMIT") {
+        auto b = build_members_page_sql("rs_a", "dev-5", 10,
+                                        authz::VisibleSet{std::unordered_set<std::string>{"dev-7"}});
+        const auto any_at = b.sql.find("device_id = ANY($2::text[])");
+        const auto cursor_at = b.sql.find("device_id > $3");
+        const auto order_at = b.sql.find("ORDER BY");
+        const auto limit_at = b.sql.find("LIMIT");
+        REQUIRE(any_at != std::string::npos);
+        REQUIRE(cursor_at != std::string::npos);
+        CHECK(any_at < cursor_at);
+        CHECK(cursor_at < order_at);
+        CHECK(order_at < limit_at);
+        // Declared outside the macro: a quoted literal inside CHECK is an MSVC preprocessor trap.
+        const std::string one_id_array = "{\"dev-7\"}";
+        REQUIRE(b.params.size() == 4);
+        CHECK(b.params[0] == "rs_a");
+        CHECK(b.params[1] == one_id_array);
+        CHECK(b.params[2] == "dev-5");
+        CHECK(b.params[3] == "11");
+    }
+    SECTION("an engaged but empty scope is 1=0, never the unrestricted read") {
+        auto b = build_members_page_sql("rs_a", "", 10, authz::deny_all());
+        CHECK(b.sql.find("AND 1=0") != std::string::npos);
+        CHECK(b.sql.find("AND 1=0") < b.sql.find("ORDER BY"));
+        CHECK(b.sql.find("ANY(") == std::string::npos);
+    }
+}
+
+TEST_CASE("ResultSetStore: members_checked pushes the visible set into the SQL, so hidden ids "
+          "neither appear nor consume page slots, at 1/9/10/11 visible members and page size 10 "
+          "(mutation: drop the predicate and hidden ids lead the first page)",
+          "[pg][result_set][members][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    for (const int visible_n : {1, 9, 10, 11}) {
+        INFO("visible members: " << visible_n);
+        // 15 hidden ids sort BEFORE every visible one ("aaa-..."), and a hidden id sits between
+        // each pair of visible ones ("dev-NN-h"): a post-filter would hand back a first page of
+        // only hidden ids, and an interleaved one would short every page.
+        std::vector<std::string> all;
+        std::unordered_set<std::string> visible;
+        std::vector<std::string> expected;
+        for (int i = 0; i < 15; ++i)
+            all.push_back(std::format("aaa-{:02d}", i));
+        for (int i = 0; i < visible_n; ++i) {
+            const auto v = std::format("dev-{:02d}", i);
+            all.push_back(v);
+            all.push_back(v + "-h");
+            visible.insert(v);
+            expected.push_back(v);
+        }
+        auto rs = store.create_materialized(req("alice", std::format("set-{}", visible_n)), all);
+        REQUIRE(rs.has_value());
+
+        std::vector<std::string> seen;
+        std::vector<std::size_t> page_sizes;
+        std::string cursor;
+        for (int guard = 0; guard < 10; ++guard) {
+            auto page = store.members_checked(rs->id, cursor, 10, authz::VisibleSet{visible});
+            REQUIRE(page.has_value());
+            page_sizes.push_back(page->device_ids.size());
+            for (const auto& id : page->device_ids)
+                seen.push_back(id);
+            if (page->next_cursor.empty())
+                break;
+            // The cursor is the last VISIBLE id of the page, so the next page resumes after it.
+            CHECK(page->next_cursor == page->device_ids.back());
+            cursor = page->next_cursor;
+        }
+        CHECK(seen == expected); // every visible id, in order, no hidden id, no duplicate
+        // The first page is full whenever 10+ are visible: hidden ids took no slot.
+        CHECK(page_sizes.front() == static_cast<std::size_t>(std::min(visible_n, 10)));
+        CHECK(page_sizes.size() == (visible_n > 10 ? 2u : 1u)); // exactly 10 visible = one page
+    }
+
+    SECTION("an engaged-empty scope is an empty page with no cursor, not the unrestricted read") {
+        auto rs = store.create_materialized(req("alice", "all-hidden"), {"d1", "d2", "d3"});
+        REQUIRE(rs.has_value());
+        auto none = store.members_checked(rs->id, "", 10, authz::deny_all());
+        REQUIRE(none.has_value());
+        CHECK(none->device_ids.empty());
+        CHECK(none->next_cursor.empty());
+        // Control: the default (unrestricted) read of the same set sees all three.
+        auto all = store.members_checked(rs->id, "", 10);
+        REQUIRE(all.has_value());
+        CHECK(all->device_ids.size() == 3);
+    }
+    SECTION("a scope naming ids that are not members changes nothing about the members") {
+        auto rs = store.create_materialized(req("alice", "partial"), {"d1", "d2", "d3"});
+        REQUIRE(rs.has_value());
+        auto page = store.members_checked(
+            rs->id, "", 10,
+            authz::VisibleSet{std::unordered_set<std::string>{"d2", "not-a-member"}});
+        REQUIRE(page.has_value());
+        CHECK(page->device_ids == std::vector<std::string>{"d2"});
+    }
+}
+
 TEST_CASE("ResultSetStore: lineage walks parent chain root-first", "[pg][result_set][lineage]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -160,6 +345,83 @@ TEST_CASE("ResultSetStore: lineage walks parent chain root-first", "[pg][result_
     CHECK(chain.front().name == "all");     // root first
     CHECK(chain.back().name == "suspects"); // leaf last
     CHECK(chain.front().device_count == 4);
+}
+
+TEST_CASE("ResultSetStore: lineage_checked matches the plain wrapper on the healthy path, "
+          "and fails closed (DbError) on a FIRST-hop query failure rather than returning the "
+          "partial chain the pre-#4306 plain lineage() used to (#4306 finding 3) -- gov-4306-S2: "
+          "renamed from a prior title that claimed 'mid-walk' coverage; a table-wide lock (the "
+          "fault-injection technique below) necessarily faults every hop including the first, "
+          "so old and new lineage_checked() code behave IDENTICALLY here (both return empty on "
+          "a first-hop failure) and this test cannot by itself distinguish them. The actual "
+          "shipped semantic shift -- a failure AFTER >=1 successful hop now discards the whole "
+          "accumulated chain instead of returning it partial -- has no test coverage; a genuine "
+          "2nd-hop fault would need a per-row injection (e.g. Postgres row-level security), "
+          "which was attempted and dropped: the shared test DSN's role is a superuser with "
+          "rolbypassrls=true, so RLS policies are unconditionally bypassed on every connection "
+          "these tests can construct from it, and provisioning a dedicated non-superuser role "
+          "with its own credentials/pool is materially more than a contained fix-round diff",
+          "[pg][result_set][lineage][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    auto g = store.create_materialized(req("alice", "all"), {"a", "b", "c", "d"});
+    REQUIRE(g.has_value());
+    auto mid = store.create_materialized(req("alice", "windows", g->id), {"a", "b"});
+    REQUIRE(mid.has_value());
+    auto leaf = store.create_materialized(req("alice", "suspects", mid->id), {"a"});
+    REQUIRE(leaf.has_value());
+
+    // Healthy path: lineage_checked() reports the exact same chain as the
+    // plain wrapper.
+    auto checked = store.lineage_checked(leaf->id, "alice");
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->size() == 3);
+    CHECK(checked->front().name == "all");
+    CHECK(checked->back().name == "suspects");
+
+    // Same lock-timeout technique as above: lock result_sets (lineage_checked
+    // walks that table on every hop, including the FIRST — the leaf row
+    // itself) so the very first hop of the walk fails deterministically with
+    // 55P03.
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.lineage_checked(leaf->id, "alice");
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    // The plain wrapper's fallback shape is unchanged in KIND (empty) at
+    // THIS (first-hop) fault point specifically, since a first hop always
+    // accumulates zero prior nodes either way. The documented semantic shift
+    // (#4306) this general contract describes -- the pre-existing plain
+    // lineage() returned whatever partial chain it had accumulated before a
+    // mid-walk (2nd+ hop) failure, whereas the wrapper built on
+    // lineage_checked discards it and returns EMPTY instead -- is real and
+    // shipped but not distinguishable from old behavior by this particular
+    // fault injection; see the TEST_CASE name for why.
+    auto plain = degraded_store.lineage(leaf->id, "alice");
+    CHECK(plain.empty());
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    auto recovered = degraded_store.lineage_checked(leaf->id, "alice");
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->size() == 3);
 }
 
 TEST_CASE("ResultSetStore: alias resolution is owner-scoped", "[pg][result_set][alias]") {
@@ -317,6 +579,138 @@ TEST_CASE("ResultSetStore: per-owner quota enforced", "[pg][result_set][quota]")
     CHECK(store.count_for_owner("bob") == 0);
 }
 
+TEST_CASE("ResultSetStore: count_for_owner_checked fails closed (DbError) rather than "
+          "reading a degraded backend as a genuinely-empty owner (#4306 finding 1)",
+          "[pg][result_set][quota][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    for (int i = 0; i < 5; ++i)
+        REQUIRE(store.create_materialized(req("alice"), {"a"}).has_value());
+
+    auto checked = store.count_for_owner_checked("alice");
+    REQUIRE(checked.has_value());
+    CHECK(*checked == 5);
+
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.count_for_owner_checked("alice");
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    // The plain wrapper's fallback shape is unchanged: 0, indistinguishable
+    // in KIND from a genuinely-empty owner by design (deny-or-benign wrapper)
+    // — this is exactly why the two async-producer pre-dispatch call sites
+    // moved to the checked method instead of relying on this fallback.
+    CHECK(degraded_store.count_for_owner("alice") == 0);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    auto recovered = degraded_store.count_for_owner_checked("alice");
+    REQUIRE(recovered.has_value());
+    CHECK(*recovered == 5);
+}
+
+TEST_CASE("ResultSetStore: count_for_owner_checked's predicate matches insert_row_impl's "
+          "authoritative in-txn recheck exactly -- an expired-but-unswept, unpinned row does "
+          "NOT count against the quota (#4306 fold-in A, Gate 4 UP-6 parity)",
+          "[pg][result_set][quota][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    auto live = store.create_materialized(req("alice", "live"), {"a"});
+    REQUIRE(live.has_value());
+    auto stale = store.create_materialized(req("alice", "stale"), {"b"});
+    REQUIRE(stale.has_value());
+    auto pinned = store.create_materialized(req("alice", "pinned-but-expired"), {"c"});
+    REQUIRE(pinned.has_value());
+    REQUIRE(store.pin(pinned->id).has_value());
+
+    // Age `stale` past its TTL (unpinned -- must NOT count) and `pinned`'s
+    // ttl_at too, even though it's pinned (pinned rows count regardless of
+    // ttl_at, same as the authoritative check's `pinned OR ...` predicate).
+    // Both created_at and ttl_at move together (same idiom as this file's
+    // other TTL-expiry tests) -- the table's own CHECK (ttl_at >= created_at)
+    // rejects a ttl_at-only update against a real, recent created_at.
+    exec_sql(db.dsn(),
+             "UPDATE result_set_store.result_sets SET created_at = 1, ttl_at = 2 WHERE id IN ('" +
+                 stale->id + "', '" + pinned->id + "')");
+
+    // Before this fix, the pre-check counted all 3 (no ttl/pinned filter);
+    // the authoritative in-txn check in insert_row_impl would only ever have
+    // counted 2 (live + pinned) -- a discrepancy that could reject a
+    // dispatch the authoritative check would have allowed. Now they agree.
+    auto checked = store.count_for_owner_checked("alice");
+    REQUIRE(checked.has_value());
+    CHECK(*checked == 2); // live + pinned-but-expired; stale excluded
+}
+
+TEST_CASE("ResultSetStore: list_by_owner_checked matches the plain wrapper on the healthy "
+          "path, and fails closed (DbError) rather than reading a degraded backend as an "
+          "empty list (#4306 finding 3 / #4307 finding 2)",
+          "[pg][result_set][crud][4306]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    REQUIRE(store.create_materialized(req("alice", "a1"), {"a"}).has_value());
+    REQUIRE(store.create_materialized(req("alice", "a2"), {"b"}).has_value());
+
+    std::string next;
+    auto checked = store.list_by_owner_checked("alice", "", 50);
+    REQUIRE(checked.has_value());
+    CHECK(checked->sets.size() == 2);
+    CHECK(checked->next_cursor.empty());
+
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.list_by_owner_checked("alice", "", 50);
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    std::string plain_next = "sentinel";
+    auto plain = degraded_store.list_by_owner("alice", "", 50, plain_next);
+    CHECK(plain.empty());
+    CHECK(plain_next.empty());
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    auto recovered = degraded_store.list_by_owner_checked("alice", "", 50);
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->sets.size() == 2);
+}
+
 TEST_CASE("ResultSetStore: GC sweep deletes expired unpinned rows and returns the count",
           "[pg][result_set][gc]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
@@ -389,8 +783,96 @@ TEST_CASE("ResultSetStore: member_set_owned is owner-scoped", "[pg][result_set][
     auto owned = member_set_owned_ok(store, rs->id, "alice");
     CHECK(owned.size() == 3);
     CHECK(owned.contains("b"));
-    // A non-owner sees an empty membership — the authorization gate for B1.
-    CHECK(member_set_owned_ok(store, rs->id, "bob").empty());
+    // #4981 PR-1 (Finding A/A1): a non-owner now gets a typed NotOwner error —
+    // NOT a successful empty membership (the pre-#4981 authorization gate for
+    // B1 collapsed "not owned" into "empty", which is exactly the shape the
+    // Finding A TOCTOU bug exploited).
+    auto bob_result = store.member_set_owned(rs->id, "bob");
+    REQUIRE_FALSE(bob_result.has_value());
+    CHECK(bob_result.error() == ResultSetError::NotOwner);
+}
+
+TEST_CASE("ResultSetStore: member_set_owned's four outcomes (#4981 PR-1 A1 rewrite)",
+          "[pg][result_set][owner]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    SECTION("absent id -> NotFound") {
+        auto r = store.member_set_owned("rs_does_not_exist", "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotFound);
+    }
+    SECTION("owned, EMPTY membership -> a REAL SUCCESS (the case the pre-#4981 "
+            "contract could not express)") {
+        auto rs = store.create_materialized(req("alice", "empty-set"), {});
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->empty());
+    }
+    SECTION("owned, non-empty membership -> the correct set") {
+        auto rs = store.create_materialized(req("alice", "full-set"), {"x", "y"});
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 2);
+        CHECK(r->contains("x"));
+        CHECK(r->contains("y"));
+    }
+    SECTION("exists but not owned -> NotOwner, indistinguishable from NotFound by design "
+            "(the caller-facing collapse is at ScopeEvalError::Kind::OwnerCheckFailed, not "
+            "here — but this method itself must still be the correct SOURCE distinction)") {
+        auto rs = store.create_materialized(req("alice", "foreign"), {"z"});
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "bob");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotOwner);
+    }
+}
+
+TEST_CASE("ResultSetStore: member_set_owned reports DbError on a genuine store failure, "
+          "not a silent empty set (#4981 PR-1 A1 rewrite)",
+          "[pg][result_set][dberror]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto rs = store.create_materialized(req("alice", "will-degrade"), {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    // Same lock-timeout fault-injection idiom as the lineage_checked DbError
+    // test above: lock result_sets (the rewritten member_set_owned query
+    // reads it in the FROM clause on every call) so the statement fails
+    // deterministically with 55P03.
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ResultSetStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE result_set_store.result_sets IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    auto degraded = degraded_store.member_set_owned(rs->id, "alice");
+    REQUIRE_FALSE(degraded.has_value());
+    CHECK(degraded.error() == ResultSetError::DbError);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    auto recovered = degraded_store.member_set_owned(rs->id, "alice");
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->size() == 1);
 }
 
 TEST_CASE("ResultSetStore: lineage stops at a cross-owner ancestor", "[pg][result_set][lineage]") {
@@ -748,4 +1230,249 @@ TEST_CASE("ResultSetStore: pin enforces kMaxPinsPerOwner, per owner", "[pg][resu
     auto bob_pin = store.pin(bobs->id);
     REQUIRE(bob_pin.has_value());
     CHECK(bob_pin->pinned);
+}
+
+// json-dump-depth-guard fix (#2437-class): mark_failed's whole job is to
+// merge a failure reason into source_payload and write it back, and
+// nlohmann::json::dump() is unboundedly recursive. It has no HTTP
+// request/response of its own to answer with a 400 (today it has no
+// production caller at all - a store method ahead of a future caller, not a
+// currently-wired background thread, per governance Gate 4/6), so it cannot
+// simply reject: it must still transition the row to `failed` while never
+// re-dumping a payload that could crash the process.
+TEST_CASE("ResultSetStore: mark_failed merges a failure reason into a healthy "
+          "pending row",
+          "[pg][result_set][mark_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "healthy-pending");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_pending(r, "exec-ok");
+    REQUIRE(rs.has_value());
+
+    store.mark_failed(rs->id, "no agents reached");
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Failed);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    REQUIRE(payload.is_object());
+    CHECK(payload["failure"] == "no agents reached");
+    // The original payload is PRESERVED (merged into), not discarded, when it
+    // is safely shallow: only a nesting-limit violation triggers discard.
+    CHECK(payload["sql"] == "SELECT 1");
+}
+
+TEST_CASE("ResultSetStore: mark_failed heals a source_payload nested past the "
+          "depth limit instead of re-dumping it",
+          "[pg][result_set][mark_failed][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "poisoned-pending");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    // A raw string, never materialised as a live nlohmann::json object at
+    // this depth. kMcpMaxJsonDepth is 32; 40 is comfortably past it and still
+    // trivially safe to construct/dump directly in this test process,
+    // orders of magnitude short of the ~100,000-level depth that actually
+    // SIGSEGVs the real dump() call this guard exists to prevent.
+    r.source_payload =
+        std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') + std::string(40, ']') + "}";
+    auto rs = store.create_pending(r, "exec-poisoned");
+    REQUIRE(rs.has_value());
+
+    // This call must not crash (obviously, since we get to make the
+    // assertions below) AND must not leave the poisoned tree in place.
+    store.mark_failed(rs->id, "dispatch error");
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Failed);
+    // Healed: the row is now safely shallow, not the original poisoned tree.
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    REQUIRE(payload.is_object());
+    CHECK(payload["failure"] == "dispatch error");
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
+}
+
+// #4493: mark_failed's SELECT/UPDATE are both gated on status = 'pending' by
+// design (heal_poisoned_payload below is the dedicated path for everything
+// else) -- this pins that scope down so it can't silently widen while other
+// work touches this file.
+TEST_CASE("ResultSetStore: mark_failed is a no-op on a materialized row",
+          "[pg][result_set][mark_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    auto rs = store.create_materialized(req("alice", "already-materialized"), {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    store.mark_failed(rs->id, "should not apply");
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Materialized);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK_FALSE(payload.contains("failure"));
+}
+
+// #4493: a Materialized row has NO path through mark_failed, so a poisoned
+// source_payload on one was stuck forever (issue #4493). heal_poisoned_payload
+// is the dedicated, status-agnostic fix: it discards the poisoned blob the
+// same way mark_failed does for a pending row, but -- unlike mark_failed --
+// never rewrites status, since the row's members are real and still
+// scope-walkable regardless of what its provenance blob says.
+TEST_CASE("ResultSetStore: heal_poisoned_payload heals a materialized row's "
+          "poisoned source_payload without touching status or members",
+          "[pg][result_set][heal_poisoned_payload][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "poisoned-materialized");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    // Same idiom as the poisoned-pending test above: 40 levels, comfortably
+    // past kMcpMaxJsonDepth (32) and orders of magnitude short of the real
+    // attack depth, safe to construct/dump directly in this test process.
+    r.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') +
+                        std::string(40, ']') + "}";
+    auto rs = store.create_materialized(r, {"dev-a", "dev-b"});
+    REQUIRE(rs.has_value());
+    REQUIRE(rs->status == ResultSetStatus::Materialized);
+
+    // Must not crash, and must report that it actually healed something.
+    CHECK(store.heal_poisoned_payload(rs->id));
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    // Status is UNCHANGED -- this is the whole point of the dedicated path.
+    CHECK(got->status == ResultSetStatus::Materialized);
+    CHECK(got->device_count == 2);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    REQUIRE(payload.is_object());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("failure"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
+
+    // The row's real members are untouched and still scope-walkable --
+    // healing the provenance blob must never touch result_set_members.
+    auto members = member_set_owned_ok(store, rs->id, "alice");
+    CHECK(members == std::unordered_set<std::string>{"dev-a", "dev-b"});
+}
+
+TEST_CASE("ResultSetStore: heal_poisoned_payload is a no-op on a healthy payload",
+          "[pg][result_set][heal_poisoned_payload]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "healthy-materialized");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_materialized(r, {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    CHECK_FALSE(store.heal_poisoned_payload(rs->id));
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Materialized);
+    // Byte-identical -- a no-op never rewrites a healthy row's payload.
+    CHECK(got->source_payload == r.source_payload);
+}
+
+// Acceptance criteria "for symmetry": a Failed row can be poisoned by the
+// same class of path (pre-guard write, direct DB manipulation) and had no
+// heal path either, since mark_failed's own predicate never matches a row
+// that is already 'failed'.
+TEST_CASE("ResultSetStore: heal_poisoned_payload also heals an already-failed row",
+          "[pg][result_set][heal_poisoned_payload][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "poisoned-failed");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_pending(r, "exec-poisoned-failed");
+    REQUIRE(rs.has_value());
+
+    const std::string poisoned = std::string(R"({"failure":"no agents reached","junk":)") +
+                                  std::string(40, '[') + std::string(40, ']') + "}";
+    exec_sql(db.dsn(), "UPDATE result_set_store.result_sets SET status = 'failed', "
+                        "source_payload = '" +
+                            poisoned + "' WHERE id = '" + rs->id + "'");
+
+    CHECK(store.heal_poisoned_payload(rs->id));
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Failed);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("failure"));
+    CHECK_FALSE(payload.contains("junk"));
+}
+
+// #4540 (BLOCKING finding 2): heal_poisoned_payload SELECTs the row, then
+// UPDATEs it -- if a concurrent delete_set / GC sweep removes the row in
+// between (both are independent connection leases with no shared lock), the
+// UPDATE must affect zero rows and the method must report that as a failure,
+// never as the success it used to report unconditionally once
+// PGRES_COMMAND_OK was seen. Simulated deterministically with a BEFORE
+// UPDATE trigger that deletes the row instead of letting the update apply --
+// installed only after the row is safely seeded, so from heal's own SELECT
+// the row looks present and poisoned, and by the time its UPDATE statement
+// runs the row is already gone, the same window a real concurrent delete
+// opens.
+TEST_CASE("ResultSetStore: heal_poisoned_payload reports failure (not success) "
+          "when the row is deleted out from under its own UPDATE",
+          "[pg][result_set][heal_poisoned_payload][security][heal_race_4540]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "vanishes-mid-heal");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') +
+                        std::string(40, ']') + "}";
+    auto rs = store.create_materialized(r, {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    exec_sql(db.dsn(),
+             "CREATE OR REPLACE FUNCTION test_4540_vanish_mid_heal() RETURNS trigger AS $$ "
+             "BEGIN DELETE FROM result_set_store.result_sets WHERE id = OLD.id; RETURN NULL; "
+             "END; $$ LANGUAGE plpgsql");
+    exec_sql(db.dsn(), "CREATE TRIGGER test_4540_vanish_mid_heal BEFORE UPDATE ON "
+                        "result_set_store.result_sets FOR EACH ROW EXECUTE FUNCTION "
+                        "test_4540_vanish_mid_heal()");
+
+    CHECK_FALSE(store.heal_poisoned_payload(rs->id));
+
+    exec_sql(db.dsn(), "DROP TRIGGER test_4540_vanish_mid_heal ON result_set_store.result_sets");
+    exec_sql(db.dsn(), "DROP FUNCTION test_4540_vanish_mid_heal()");
+
+    // The trigger's own DELETE really ran -- the row is genuinely gone, not
+    // merely reporting a mismatched status while still present.
+    CHECK_FALSE(get_ok(store, rs->id).has_value());
 }

@@ -18,12 +18,13 @@ rule). Loaded by `security-guardian` + `docs-writer` during governance.
 
 `get_fleet_topology`/`get_host_topology` (`mcp_server.cpp`) are the MCP twins
 of the REST endpoints below, wired via `McpServer::set_viz_deps()` (passes the
-SAME `fleet_topology_store_`/`offline_endpoint_store_`/`viz_disabled_`
-instances REST's `VizRoutes` registration uses, so the two surfaces cannot
-disagree about cache state). Every invariant in this doc (kill-switch
-ordering, the DoS cap, the offline-merge rule) applies identically to both
-surfaces - a change to one that doesn't preserve parity with the other is a
-regression, not a stylistic difference. That equal treatment does not extend
+SAME `fleet_topology_store_`/`viz_disabled_` instances and the same
+`OfflineEndpointStore` (via an `OfflineRosterFn` closure) REST's `VizRoutes`
+registration uses, so the two surfaces cannot disagree about cache state).
+Every invariant in this doc (kill-switch ordering, the DoS cap, the
+offline-merge rule) applies identically to both surfaces - a change to one
+that doesn't preserve parity with the other is a regression, not a stylistic
+difference. That equal treatment does not extend
 to confinement: **neither surface confines results to the caller's
 management-group scope** - a caller with `Response:Read` sees every connected
 agent's process/connection/listener data fleet-wide on both REST and MCP
@@ -51,6 +52,18 @@ execution/fleet-statistics tools).
 - **Route ordering.** No future `/viz/<param>` regex may be registered
   *before* `/viz/fleet` in the route table — the more-specific literal must
   win the match (arch-S1).
+- **Host page `{{AGENT_ID}}` substitution.** The `/viz/host/<id>` handler
+  (`page_routes.cpp`) rejects any id containing a character outside
+  `[A-Za-z0-9._-]` with a 400, then replaces every `{{AGENT_ID}}` token in
+  `kVizHostPageHtml` with the raw id. That allow-list is the *only*
+  escaping: it contains no HTML, attribute-quote or URL metacharacter, so the
+  id is inert in exactly the contexts the page uses it — a text node, a
+  double-quoted attribute value (`data-agent-id`), and the query value of the
+  double-quoted `hx-get` URL. There are five tokens in
+  `viz_host_page_ui.cpp` (four live, one inside an HTML comment). Never place
+  the token in a `<script>` or `<style>` body, an unquoted attribute, an event
+  handler, or a URL path or host position, and never widen the allow-list,
+  without adding real escaping for the new context.
 
 ## Kill switch and DoS cap
 
@@ -128,6 +141,24 @@ Standing rules:
   and 503 explicitly — not collapse them to a generic error toast.
 - **Schema gate.** Reject the response unless `schema === 'fleet_topology.v1'`
   before any render call.
+- **Transparent canvas, page-painted backdrop.** The scene has no
+  `scene.background`, and the `WebGLRenderer` is created with `alpha: true`
+  (pinned in `test_static_js_bundle.cpp`). The stage backdrop comes from the
+  page CSS (`.viz-stage` in `viz_page_ui.cpp`) behind `#viz-root`, so it
+  follows the theme without a JS read. The two halves are coupled across
+  files: dropping `alpha: true` renders an opaque black canvas over the
+  backdrop, and removing the CSS backdrop leaves the transparent canvas on
+  whatever the page body is. Change both together.
+- **Token-mirrored palette.** `static/yuzu.css` owns the colour tokens
+  (`--c1`..`--c5`, `--mut`, `--faint`, `--ink`, `--primary-h`, and the rest).
+  `static/yuzu-viz.js` mirrors them as hard-coded hex values because the
+  WebGL materials cannot read CSS variables; each mirrored literal carries a
+  `// --token` comment. A token retune therefore needs a matching edit in
+  `yuzu-viz.js`, in the pinned tests, in the Fleet legend (which uses
+  `var(--c1..c3)` directly, so it follows the token while the cubes do not),
+  and in the colour sentences of `rest-api.md` and `server-admin.md`.
+  `static/yuzu-viz-host.js` does not mirror: it reads the tokens at render
+  time through `getComputedStyle`, so the Host map follows the sheet.
 
 ## Edge invariants — PR 8 (intra-cube localhost edges)
 
@@ -153,7 +184,7 @@ Standing rules:
   `dst_agent_id`-when-non-empty pattern from PR 2).
 - **Renderer line construction.** For each Local edge with both `src_pid`
   and `dst_pid` set, build `THREE.LineSegments(BufferGeometry from points,
-  LineBasicMaterial({color: 0xffffff, transparent: true, opacity: 0.3}))`
+  LineBasicMaterial({color: 0xe9ecf0, transparent: true, opacity: 0.3}))`
   and add to the per-cube `processGroup`. Per-cube parenting reuses
   `clearFleet`'s `traverse(disposeNode)` walk for free disposal — no
   separate edge index needed.
@@ -170,16 +201,17 @@ Standing rules:
   LOD for free, and reuse `clearFleet`'s `traverse(disposeNode)` walk for
   free disposal.
 - **`CATEGORY_PALETTE`** is six colours matching the agent's
-  `category_to_string()` enum exactly:
+  `category_to_string()` enum exactly. The hexes mirror the named `yuzu.css`
+  tokens (see "Token-mirrored palette" under the renderer invariants):
 
-  | Category | Hex |
-  |---|---|
-  | `system` | `#6e7681` |
-  | `browser` | `#58a6ff` |
-  | `database` | `#d29922` |
-  | `web` | `#56d364` |
-  | `runtime` | `#bc8cff` |
-  | `other` | `#8b949e` |
+  | Category | Hex | Token |
+  |---|---|---|
+  | `system` | `#9aa2ae` | `--mut` |
+  | `browser` | `#4c9aff` | `--c1` |
+  | `database` | `#f5c542` | `--c3` |
+  | `web` | `#2dd4bf` | `--c2` |
+  | `runtime` | `#a78bfa` | `--c5` |
+  | `other` | `#9199a6` | `--faint` |
 
 - **Interior layout.** Deterministic `hash32(pid|ppid)`-mod-bucket placement
   with `hash32('j|pid')` jitter, inside `cubeSize * 0.78` interior fraction
@@ -226,9 +258,10 @@ Standing rules:
   decision (2026-05-12); do not revert without UAT sign-off.
 - **Socket primitives.** `SphereGeometry(SOCKET_DOT_RADIUS, 10, 8)` on a
   ring of radius `CUBE_SIZE * 0.32` on the cube top face; port label
-  Sprite floats `0.55` units above each sphere. Listener sphere colour
-  is cream (`0xfff2cc`) — distinct from the cooler process-dot
-  palette so operators see them as "ports" not "processes".
+  Sprite floats `0.55` units above each sphere. Listener sphere and
+  `:port` label colour is coral (`0xff6b7a`, the `--c4` chart token) —
+  the one chart colour no process category or OS cube uses, so
+  operators see them as "ports" not "processes" or "machines".
 - **Cross-machine edges.** ESTABLISHED-state `connections` outbound
   from one cube's `local_ips` resolve to the destination's
   `listeners[]` socket position when `(dst_addr, dst_port)` matches.
@@ -289,8 +322,8 @@ Standing rules:
   cube's `local_ips`. Loopback destinations are dropped (intra-host
   loopback edges live INSIDE the cube as PR 8 `LineSegments`, not
   on the surface).
-- **Distinct colour.** `TALKING_SOCKET_COLOR = 0x7ec4f8` (cool blue)
-  — visually distinct from the listener-cream `0xfff2cc`. Operators
+- **Distinct colour.** `TALKING_SOCKET_COLOR = 0x7ab6ff` (light blue,
+  `--primary-h`) — visually distinct from the listener-coral `0xff6b7a`. Operators
   read incoming on the roof and outgoing through the floor.
 - **Position.** Ring radius `CUBE_SIZE * 0.32` (same as listeners),
   Y position `-CUBE_SIZE * 0.5 - 0.30` (bottom face, slightly below).
@@ -425,17 +458,25 @@ rules for the `viz_routes.cpp::handle_topology` merge:
 - **The DoS cap counts merged nodes.** `machines_max` is enforced on the
   merged total (`live + offline`), so the offline merge can never smuggle the
   response past the cap.
-- **Fail-soft, and currently silent.** A PG error on the offline query returns
-  an empty set → the page renders live-only with no stale cubes and **no
-  operator-visible signal** (the known UP-13 gap; a degraded-marker/metric is a
-  tracked follow-up). Do not "fix" this by hard-failing the request.
+- **Typed read, live-only on failure (UP-13, closed by #5531 for
+  REST/MCP/audit/metric consumers; the 3D page itself shows no indicator,
+  deliberately out of scope).** The offline read is typed; a failure still
+  renders live-only (do not "fix" this by hard-failing the request) but sets
+  `offline_roster_degraded: true` in the `fleet_topology.v1` envelope on REST
+  and MCP, appends `offline_roster_degraded=1` to the `viz.fleet_topology` audit
+  detail, and increments
+  `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`.
 - **`yuzu_viz_offline_hosts_total`** counts offline nodes merged (described in
   the `server.cpp` viz metric block — keep it described, `promtool`-clean).
-- **`/readyz` brief-200 caveat.** The substrate `pg_pool` readyz check reads
-  the connect-breaker, which can momentarily read closed between backoff
-  windows during a sustained outage — a deliberate tradeoff (don't evict a
-  busy-but-healthy server); operators should page on `YuzuPgConnectFailing`,
-  not solely on `/readyz`.
+  Since #5678 a gracefully departed host keeps its roster row, so it is merged
+  as a stale-flagged offline node for the 7-day viz stale window
+  (`kOfflineStaleWindowSecs`) and this counter rises accordingly.
+- **`/readyz` and a Postgres outage.** The substrate `pg_pool` readyz row
+  reads the connect-breaker, which can momentarily read closed between backoff
+  windows during a sustained outage (a deliberate tradeoff: don't evict a
+  busy-but-healthy server). Since HA WS-8 the `pg_reachable` row carries the
+  steady signal instead — a dedicated-connection probe, red within seconds of
+  an outage — and pages go out on `YuzuServerPostgresUnreachable`.
 
 ## Cross-references
 

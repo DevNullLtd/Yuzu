@@ -10,14 +10,40 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "bounded_wait.hpp"
+#include "test_helpers.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
 using namespace std::chrono_literals;
 using yuzu::shared::bounded_call;
+
+namespace {
+// A callable's park point. Each test releases it as soon as its assertions are made, so no
+// detached thread outlives its test case (the wait's own timeout is only a safety net).
+struct ParkGate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool open = false;
+    void wait() {
+        std::unique_lock lk{m};
+        cv.wait_for(lk, std::chrono::seconds(120), [&] { return open; }); // above the scaled spin_until deadlines (10 s * kSpinScale = 60 s under sanitizers)
+    }
+    void release() {
+        {
+            std::lock_guard lk{m};
+            open = true;
+        }
+        cv.notify_all();
+    }
+};
+} // namespace
 
 TEST_CASE("bounded_call: a fast function returns its result well before the timeout",
           "[agent][bounded_wait]") {
@@ -30,17 +56,31 @@ TEST_CASE("bounded_call: a function that never returns in time yields nullopt, n
           "[agent][bounded_wait]") {
     // Simulates the black-holing-resolver scenario: the callable blocks far
     // longer than the caller is willing to wait.
+    //
+    // The callable parks on a gate (rather than sleeping a fixed 3s) so the test can end it
+    // the moment the caller has returned: a fixed sleep left a detached thread alive for ~3s
+    // after this case, which a later case's process-quiescence wait (fork()-based death
+    // tests) could then have to sit out. The gate's own safety-net timeout (120 s, above the
+    // scaled spin deadlines) is far longer than any bound asserted here, so the callable still
+    // blocks "far longer than the caller is willing to wait".
+    using yuzu::shared::detail::g_outstanding_bounded_calls;
+    const int baseline = g_outstanding_bounded_calls.load();
+    auto gate = std::make_shared<ParkGate>();
     const auto start = std::chrono::steady_clock::now();
-    const auto result = bounded_call(100ms, [] {
-        std::this_thread::sleep_for(3s);
+    const auto result = bounded_call(100ms, [gate] {
+        gate->wait();
         return 1;
     });
     const auto elapsed = std::chrono::steady_clock::now() - start;
+    gate->release();
+    // Drain: the detached thread releases its ceiling slot once it exits.
+    CHECK(yuzu::test::spin_until([&] { return g_outstanding_bounded_calls.load() <= baseline; },
+                                 10s));
 
     CHECK_FALSE(result.has_value());
     // The whole point of the fix: the CALLER returns promptly, not after the
-    // callable finishes. Generous CI-safe ceiling, still far under the 3s the
-    // callable itself sleeps for.
+    // callable finishes. Generous CI-safe ceiling, still far under the gate's safety net
+    // (120 s) that the callable would otherwise block for.
     CHECK(elapsed < 1500ms);
 }
 
@@ -56,9 +96,23 @@ TEST_CASE("bounded_call: an exception inside fn() does not crash the process",
     // firewall -- an uncaught throw here would std::terminate() the whole
     // process (governance Gate 5 chaos-injector finding). Reaching this
     // CHECK at all is the proof: the process is still running.
-    const auto result = bounded_call(
-        300ms, []() -> int { throw std::runtime_error("simulated detached-thread failure"); });
+    //
+    // The waiting side only times out (a throw never sets `done`), so a long timeout
+    // buys nothing. What matters is that fn() really ran and threw, and that the
+    // detached thread unwound past it - both observed as events, not slept for: fn()
+    // flags that it entered, and the thread's OutstandingCallGuard releases its slot
+    // only when the thread body has exited normally after the throw was contained.
+    using yuzu::shared::detail::g_outstanding_bounded_calls;
+    const int baseline = g_outstanding_bounded_calls.load();
+    auto entered = std::make_shared<std::atomic<bool>>(false);
+    const auto result = bounded_call(50ms, [entered]() -> int {
+        entered->store(true);
+        throw std::runtime_error("simulated detached-thread failure");
+    });
     CHECK_FALSE(result.has_value());
+    CHECK(yuzu::test::spin_until([&] { return entered->load(); }, 10s));
+    CHECK(yuzu::test::spin_until([&] { return g_outstanding_bounded_calls.load() <= baseline; },
+                                 10s));
 }
 
 TEST_CASE("bounded_call: caps concurrently-outstanding detached threads, degrading excess "
@@ -69,44 +123,74 @@ TEST_CASE("bounded_call: caps concurrently-outstanding detached threads, degradi
     // of detached threads (verified by execution during the review to reach
     // dozens under simulation). kTotal comfortably exceeds bounded_wait.hpp's
     // internal ceiling so some callers MUST be degraded.
+    //
+    // Event-driven, no sleeps. Every callable parks on `gate` until the test opens it, and
+    // each caller waits for up to kCallerTimeout (far longer than this test ever runs), so:
+    //  - a caller that gets a slot holds it (its detached thread is parked on the gate) and
+    //    cannot return before the test opens the gate - it is genuinely blocked in its own
+    //    wait, exactly like a caller facing a black-holed resolver;
+    //  - a caller degraded by the ceiling never spawns a thread and returns at once, while
+    //    the gate is still closed.
+    // So "a caller returned while the gate was closed" can ONLY mean the ceiling degraded it,
+    // and the test waits for that event instead of comparing elapsed times against a
+    // scheduler-jitter margin. If the ceiling did nothing, all 100 callers stay parked and the
+    // spin below fails after its (generous) bound rather than the test passing vacuously.
     constexpr int kTotal = 100;
+    constexpr auto kCallerTimeout = std::chrono::seconds(60);
+    using yuzu::shared::detail::g_outstanding_bounded_calls;
+
+    // shared_ptr: the parked detached threads outlive this test case's stack frame
+    // (they exit as soon as the gate opens, but not necessarily before we return).
+    auto gate = std::make_shared<ParkGate>();
+
+    // The outstanding-call counter is process-wide, shared with every other test case in
+    // this binary (an earlier case can leave a detached thread holding a slot). Drain to
+    // this baseline, not to zero: a stray that releases mid-test only makes it sooner.
+    const int baseline = g_outstanding_bounded_calls.load();
+
+    std::atomic<int> returned_while_gated{0};
+    std::atomic<bool> gate_open{false};
     std::vector<std::thread> callers;
-    std::vector<std::chrono::steady_clock::duration> elapsed(kTotal);
+    callers.reserve(kTotal);
+    // Declared AFTER everything the callers touch, so it runs FIRST on any exit path
+    // (including a failed REQUIRE below): open the gate and join, so no caller or parked
+    // detached thread is left running against a destroyed frame or a saturated ceiling.
+    yuzu::test::ScopeExit cleanup{[&] {
+        gate_open.store(true);
+        gate->release();
+        for (auto& t : callers)
+            if (t.joinable())
+                t.join();
+    }};
 
     for (int i = 0; i < kTotal; ++i) {
-        callers.emplace_back([&, i] {
-            const auto start = std::chrono::steady_clock::now();
-            bounded_call(2000ms, [] {
-                std::this_thread::sleep_for(4s);
+        callers.emplace_back([&, gate] {
+            bounded_call(kCallerTimeout, [gate] {
+                gate->wait();
                 return 1;
             });
-            elapsed[i] = std::chrono::steady_clock::now() - start;
+            if (!gate_open.load())
+                returned_while_gated.fetch_add(1);
         });
     }
+
+    // Callers beyond the ceiling degrade immediately. A generous lower bound (not the exact
+    // 100-minus-ceiling count) keeps this robust to any stray slot-holder left running by an
+    // earlier test case in this same process (which only makes MORE callers degrade).
+    REQUIRE(yuzu::test::spin_until([&] { return returned_while_gated.load() >= 20; }, 10s));
+
+    // Open the gate: the slot-holders' callables return, their callers complete, and the
+    // detached threads release their slots.
+    gate_open.store(true);
+    gate->release();
     for (auto& t : callers)
         t.join();
 
-    // A real (slot-acquiring) attempt waits up to ~2s before its own timeout;
-    // a call degraded by the ceiling returns near-instantly. If the ceiling
-    // did nothing, every one of the 100 calls would wait out the full ~2s.
-    // A generous lower bound (not the exact 100-minus-ceiling count) keeps
-    // this robust to scheduling jitter and any stray thread left running
-    // from an earlier test case in this same process.
-    int fast_returns = 0;
-    for (const auto& e : elapsed) {
-        if (e < 500ms)
-            ++fast_returns;
-    }
-    CHECK(fast_returns >= 20);
-
-    // Drain: the outstanding-call counter is process-wide, shared with every
-    // other test case in this binary. Wait for the slot-acquiring callers'
-    // detached threads to finish (they were sleeping 4s) and decrement it,
-    // so a later test case doesn't start against a still-saturated ceiling.
-    for (int i = 0; i < 100 && yuzu::shared::detail::g_outstanding_bounded_calls.load() > 0;
-        ++i) {
-        std::this_thread::sleep_for(100ms);
-    }
+    // Drain: the slot-acquiring callers' detached threads decrement the counter just after
+    // their caller is notified; wait for that so a later test case doesn't start against a
+    // still-saturated ceiling.
+    CHECK(yuzu::test::spin_until([&] { return g_outstanding_bounded_calls.load() <= baseline; },
+                                 10s));
 }
 
 TEST_CASE("OutstandingCallGuard: releases the ceiling slot when an exception unwinds the stack "

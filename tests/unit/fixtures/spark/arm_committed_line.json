@@ -1,0 +1,20 @@
+{
+  "_comment": "#4665/#4606 shared golden fixture for format_arm_committed_line's PLAIN (non-hostile) shape. Read by BOTH sides of the C++/driver lockstep: tests/unit/test_guardian_spark_runtime.cpp's '#4606 criterion-10' TEST_CASE (via YUZU_TEST_FIXTURE_DIR) and tests/test_spark_evidence_format_lockstep.py (via a repo-relative path). A one-sided edit to either consumer without updating this file is the drift this fixture exists to remove -- see docs/spark-rebuild-baselines/fullsync_blackout_diag.py's T2_RE for the pattern the 'expected_line' must satisfy, and agents/core/src/guardian_spark_timing.cpp's format_arm_committed_line for the formatter under test. The hostile/adversarial assertions in test_guardian_spark_runtime.cpp (newline forgery, non-ASCII, over-long id, null type/via) stay hardcoded inline literals -- this fixture covers the plain case only.",
+  "input": {
+    "rule_id": "blackout-reg-01",
+    "epoch": 3,
+    "incarnation": 101,
+    "type": "file",
+    "via": "inline-shared",
+    "attach_to_commit_ms": 7
+  },
+  "expected_line": "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=3, incarnation=101, type=file, via=inline-shared, attach_to_commit_ms=7)",
+  "expected_parsed": {
+    "rule_id": "blackout-reg-01",
+    "epoch": "3",
+    "incarnation": "101",
+    "type": "file",
+    "via": "inline-shared",
+    "attach_to_commit_ms": "7"
+  }
+}

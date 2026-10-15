@@ -1,5 +1,7 @@
 #include "bundle_service.hpp"
 
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+
 #include <nlohmann/json.hpp>
 
 #include <string>
@@ -51,6 +53,16 @@ const char* state_token(BundleStepState st) {
 
 std::expected<std::vector<BundleStepSpec>, std::string>
 validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
+    // #2437-class guard: raw-text depth check before this function's own
+    // parse. The REST /api/v1/bundles caller already checks the whole
+    // request body before this is reached, but this function has no
+    // httplib::Request/Response of its own and is a free function any
+    // OTHER caller can reach directly - the check belongs here too, so a
+    // future caller that skips the REST-level guard cannot reintroduce the
+    // unbounded-recursion-on-dump() crash this branch's own `v.dump()`
+    // (below, per-param-value coercion) would otherwise be exposed to.
+    if (mcp::json_exceeds_depth(steps_json, mcp::kMcpMaxJsonDepth))
+        return std::unexpected("steps nests too deeply");
     nlohmann::json doc;
     try {
         doc = nlohmann::json::parse(steps_json.begin(), steps_json.end());

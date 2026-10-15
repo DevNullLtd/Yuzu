@@ -84,7 +84,9 @@ struct DefaultCertSet {
 /// short life would be a guaranteed future outage, and the operator is loudly
 /// told to replace defaults. NOTE: adding/removing `extra_sans` does NOT
 /// regenerate an existing set — the marker fast path returns the prior certs
-/// unchanged; rotate (clear the dir or replace certs) for new SANs to take.
+/// unchanged. For new SANs, rename default-marker.json aside (moving it back
+/// undoes this) and restart: the leaves are re-minted under the SAME root. Never
+/// clear the whole directory: it holds the CA key and the secrets KEK (#5370).
 ///
 /// `cert_group` (PKI #1289): when non-empty (a group name or numeric gid that the
 /// server, gateway, and agent users all belong to), the shared cert volume is made

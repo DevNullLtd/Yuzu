@@ -1,10 +1,12 @@
-# Pre-flight readiness checks (`/auto`)
+# Deployments and pre-flight readiness checks (`/auto`)
 
-The **Pre-flight** page is an operator surface for a **go/no-go check across a
-device cohort before a fleet change** (a rollout, a patch, an upgrade). You pick a
-scope and a set of thresholds, run it, and get a result grouped by device. It is
-reached at **`/auto`** by URL — it is deliberately not a navigation tab yet, and
-the same checks are intended to be driven headless by an orchestrator later.
+The **Deployments** page (formerly called **Pre-flight**) checks software
+rollouts first, deploys them, then verifies the result. Its first stage is an
+operator surface for a **go/no-go check across a device cohort before a fleet
+change** (a rollout, a patch, an upgrade). You pick a scope and a set of
+thresholds, run it, and get a result grouped by device. It is reached from
+**Software > Deployments** in the sidebar, or at **`/auto`** by URL, and the
+same checks are intended to be driven headless by an orchestrator later.
 
 ## The checks
 
@@ -144,8 +146,9 @@ Deploy** (the cohort is frozen then). On those devices it:
 The progress view is **aggregate-first**: a count strip (targeted / succeeded /
 executing / in-flight / failed / skipped) and a progress bar are the headline, with
 the per-device list below, problem-first. A device is **Succeeded** on exit 0,
-**Failed** on a stage error, a non-zero exit, being quarantined, or the dispatched
-plugin being absent from its reported inventory (the last two are permanent — a
+**Failed** on a stage error, a non-zero exit, being quarantined, the dispatched
+plugin being absent from its reported inventory, or a per-OS kill switch
+withholding the plugin from that device's OS (the last three are permanent — a
 retry will not help), and **Skipped** if you no longer have scope to it when the
 step is dispatched — it is never run. A device is **not** shown as Failed for a
 device that was offline or unreachable at dispatch time, or for a transient
@@ -184,14 +187,15 @@ after roughly ten minutes — **pauses** the deployment: its state is durably sa
 but it does not advance while no page is polling it. To **resume**, re-open the
 deploy panel for the same pre-flight run and click **Deploy go-cohort** again — the
 server detects the in-flight deployment and re-attaches to it rather than starting
-a second one. A device that is offline (or a fail-closed containment-gate read) when
+a second one. A device that is offline (or a fail-closed containment-gate or per-OS gate read) when
 its stage or execute step is dispatched is retried automatically on a later tick,
 while the page keeps polling — no need to delete and re-deploy; the device is
 released back to in-flight (not Failed) so a later tick reclaims and redispatches
 it, until it either reaches the agent or you close the page. A device that is
-quarantined or is missing the `content_dist` plugin is a permanent condition and
-fails immediately instead — those need an operator action (release the
-quarantine, install the plugin) before a re-deploy will help. The same engine is
+quarantined, is missing the `content_dist` plugin, or is on an OS the plugin's
+per-OS kill switch withholds is a permanent condition and fails immediately
+instead — those need an operator action (release the quarantine, install the
+plugin, turn the per-OS switch back on) before a re-deploy will help. The same engine is
 designed to be driven headless by an automation worker later.
 
 ## Permissions
@@ -251,9 +255,19 @@ they never create a run or a deployment.
   for one pre-flight run, gated `SoftwareDeployment:Read`. Reuses the existing `deployment.config.view`
   verb (already distinct from `deployment.create`).
 
-Both REST routes are unaudited on a successful read (the response is run scope/lifecycle metadata,
+- `GET /api/v1/deployments` and `GET /api/v1/deployments/{id}` / MCP `list_deployments` and
+  `get_deployment` — your deployments and one deployment's device grid, gated
+  `SoftwareDeployment:Read`. These are the read-only way to see a rollout: unlike the page's
+  result poll (`/fragments/auto/deploy/result`) they never advance the engine and write no per-poll audit row
+  (the REST reads are unaudited; an MCP call records the generic `mcp.<tool>` success row). A deployment shows **Running** or **Complete**; a finished one says how many devices
+  failed or were skipped ("Complete, 2 failed"). There is no staged, cancelled or rolled-back state
+  in this pipeline. The installer URL and arguments are never shown, only whether arguments are set.
+  A service-scoped token is denied under `deployment.list.view` / `deployment.detail.view`.
+
+The REST routes above are unaudited on a successful read (the response is run scope/lifecycle metadata,
 not per-agent behavioural PII, matching the fragments' own posture) but audit a service-scoped-token
 denial under their own verb. Their MCP twins instead call the generic
-`mcp.list_preflight_runs`/`mcp.get_deployment_preview` success audit, matching the majority
+`mcp.list_preflight_runs`/`mcp.get_deployment_preview` (and, for the two deployment reads above,
+`mcp.list_deployments`/`mcp.get_deployment`) success audit, matching the majority
 convention for MCP read tools in this codebase — the two transports deliberately diverge here; see
 `docs/api-twin-recipe.md` §4 for why REST/MCP/dashboard audit postures are not required to agree.

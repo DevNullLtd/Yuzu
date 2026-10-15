@@ -269,7 +269,7 @@ use-after-free guard any shutdown refactor must preserve.
 > than `fixing_stale_seconds` (default 1800s) — not immediately, and not tied
 > to any restart.
 >
-> **High Availability (HA): manual remediation is now safe on multi-replica servers.** Each target
+> **High Availability (HA): manual remediation is safe on multi-replica servers once the safe-to-scale gate lifts (ADR-2002 §7c); exactly one server replica is supported today.** Each target
 > is claimed durably before the fix is dispatched, so two replicas cannot independently remediate
 > the same agent. If a target has already exhausted its fix-retry cap for the policy, the
 > remediation request is refused with HTTP 409 and the message "remediation already in flight or
@@ -318,6 +318,21 @@ displays:
 - Per-policy compliance percentage with drill-down to agent-level detail
 - Per-agent status with last check time and check result
 
+### Managing policies from the Compliance page
+
+The page carries the same actions as the REST API; each control appears only
+when the signed-in role holds the permission (the server re-checks every call).
+
+| Control | Permission | What it does |
+|---|---|---|
+| **On** switch | `Policy:Write` | Enables or disables the policy. Both directions ask for confirmation: a disabled policy stops being re-checked and its last results go stale. |
+| **Evaluate** | `Policy:Execute` | Dispatches a read-only check now. The toast shows the execution id, not a device count. |
+| **Invalidate all** | `Policy:Execute` | Resets every result to unknown; fleet compliance reads 0% until devices check in. Confirmation required. |
+| **New policy** / **New fragment** | `Policy:Write` | Paste YAML (up to 1 MiB); a refused document shows the server's message. Not available in this build: the controls appear only once the shared dialog script (`/static/yuzu-dialog.js`) is shipped, so create policies and fragments with `POST /api/policies` and `POST /api/policy-fragments` until then. |
+| **Remediate** | `Policy:Execute` | Shown only when the policy's fragment has a fix. Runs the fix on whichever devices are non-compliant when you confirm; there is no approval step. |
+| **Invalidate cache** | `Policy:Execute` | Resets one policy's results and its fix attempt counts. Confirmation required. |
+| **Delete** (policy, fragment) | `Policy:Delete` | Confirmation required. A fragment still used by a policy cannot be deleted. |
+
 ---
 
 ## Cache Invalidation
@@ -356,16 +371,19 @@ result.signature_age < duration('24h')
 
 ## REST API Endpoints
 
-All policy engine endpoints are under `/api/` (legacy prefix). They require
-the `Policy:Read` or `Policy:Write` RBAC permission.
+All policy engine endpoints are under `/api/` (legacy prefix). They require a
+**route-specific** `Policy:*` RBAC permission — `Read`, `Write`, `Delete` and
+`Execute` are granted independently, so the per-row `Permission:` annotations
+below are the authority, not a blanket Read/Write pair. The REST reference
+(`rest-api.md`) carries the same values.
 
 ### Policy Fragments
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/policy-fragments` | List all fragments. Query params: `name`, `limit`. |
-| `POST` | `/api/policy-fragments` | Create a fragment from YAML. Body must be a complete YAML document or a JSON envelope `{"yaml_source": "<full YAML>"}` — see worked example below. |
-| `DELETE` | `/api/policy-fragments/{id}` | Delete a fragment by ID. |
+| `GET` | `/api/policy-fragments` | List all fragments. Query params: `name`, `limit`. Permission: `Policy:Read`. |
+| `POST` | `/api/policy-fragments` | Create a fragment from YAML. Permission: `Policy:Write`. Body must be a complete YAML document or a JSON envelope `{"yaml_source": "<full YAML>"}` — see worked example below. |
+| `DELETE` | `/api/policy-fragments/{id}` | Delete a fragment by ID. Permission: `Policy:Delete`. |
 
 #### Worked example — `POST /api/policy-fragments`
 
@@ -411,30 +429,41 @@ Both forms produce a 201 with `{"id": "<fragment-id>", "status": "created"}`.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/policies` | List all policies. Query params: `name`, `fragment_id`, `enabled_only`, `limit`. |
-| `POST` | `/api/policies` | Create a policy from YAML. Body: same shape as `POST /api/policy-fragments` — full YAML in `yaml_source`, with `kind: Policy`. |
-| `GET` | `/api/policies/{id}` | Get policy detail including compliance summary and `remediation_available` (true when the bound fragment defines a `fix` instruction). |
-| `DELETE` | `/api/policies/{id}` | Delete a policy and its compliance data. |
-| `POST` | `/api/policies/{id}/enable` | Enable a disabled policy. |
-| `POST` | `/api/policies/{id}/disable` | Disable an active policy. |
-| `POST` | `/api/policies/{id}/evaluate` | Force an immediate compliance check, ignoring the interval. Permission: `Policy:Execute`. Returns `202` with `execution_id`; `409` if the policy has no check instruction or matches no agents. |
-| `POST` | `/api/policies/{id}/remediate` | Manually remediate non-compliant agents. Permission: `Policy:Execute`. Only valid when `remediation_available` is true (else `409`). Optional body `{"agent_ids":[...]}` scopes the fix to a subset (intersected with the policy's own scope); absent ⇒ all currently `non_compliant` agents. Never automatic. |
-| `POST` | `/api/policies/{id}/invalidate` | Invalidate agent-side cache for this policy. |
-| `POST` | `/api/policies/invalidate-all` | Invalidate cache for all policies (fleet-wide). |
+| `GET` | `/api/policies` | List all policies. Query params: `name`, `fragment_id`, `enabled_only`, `limit`. Permission: `Policy:Read`. |
+| `POST` | `/api/policies` | Create a policy from YAML. Permission: `Policy:Write`. Body: same shape as `POST /api/policy-fragments` — full YAML in `yaml_source`, with `kind: Policy`. |
+| `GET` | `/api/policies/{id}` | Get policy detail including compliance summary and `remediation_available` (true when the bound fragment defines a `fix` instruction). Permission: `Policy:Read`. |
+| `DELETE` | `/api/policies/{id}` | Delete a policy and its compliance data. Permission: `Policy:Delete`. |
+| `POST` | `/api/policies/{id}/enable` | Enable a disabled policy. Permission: `Policy:Write`. |
+| `POST` | `/api/policies/{id}/disable` | Disable an active policy. Permission: `Policy:Write`. |
+| `POST` | `/api/policies/{id}/evaluate` | Force an immediate compliance check, ignoring the interval. Permission: `Policy:Execute`. Returns `202` with `execution_id`; `409` if the policy has no check instruction or matches no agents; `503` on a genuine store/InstructionStore degrade or (#4981 PR-1) if the policy's scope expression itself could not be evaluated — never reported as the `409` "matches no agents" case. |
+| `POST` | `/api/policies/{id}/remediate` | Manually remediate non-compliant agents. Permission: `Policy:Execute`. Only valid when `remediation_available` is true (else `409`). Optional body `{"agent_ids":[...]}` scopes the fix to a subset (intersected with the policy's own scope); absent ⇒ all currently `non_compliant` agents. Never automatic. `503` on a genuine store degrade or, when `agent_ids` is supplied, a scope-evaluation abort (#4981 PR-1) — never reported as the `409` "no in-scope agents" case. |
+| `POST` | `/api/policies/{id}/invalidate` | Invalidate agent-side cache for this policy. Permission: `Policy:Execute`. |
+| `POST` | `/api/policies/invalidate-all` | Invalidate cache for all policies (fleet-wide). Permission: `Policy:Execute`. |
 
 ### Compliance
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/compliance` | Fleet compliance summary (total, compliant, non_compliant, etc.). |
-| `GET` | `/api/compliance/{policy_id}` | Per-policy compliance detail with per-agent statuses. |
+| `GET` | `/api/compliance` | Fleet compliance summary (total, compliant, non_compliant, etc.). Permission: `Policy:Read`. |
+| `GET` | `/api/compliance/{policy_id}` | Per-policy compliance detail with per-agent statuses. Permission: `Policy:Read`. |
 
 ### HTMX Fragments
 
-| Route | Description |
-|---|---|
-| `/fragments/compliance/summary` | Compliance dashboard summary fragment |
-| `/fragments/compliance/{policy_id}` | Per-policy compliance detail fragment |
+> These fragments carry the same gate as their REST v1 twins. After a
+> service-scoped-token deny, the summary requires `Policy:Read` (a global grant: a holder
+> whose grant arrives only through a management group is refused with 403). The
+> per-policy detail uses the fleet-read gate as its only gate, lists only the devices in
+> the caller's scope, and writes a `compliance.agent_statuses.view` audit row per open. If
+> that row cannot be persisted the page still renders and the response carries
+> `Sec-Audit-Failed: true` (the REST twin refuses with 503 instead). A caller whose grant
+> arrives only through a management group sees the device rows and no policy definition
+> (name, scope, check), the same as `GET /api/v1/compliance/{id}`.
+
+| Route | Gate | Description |
+|---|---|---|
+| `/fragments/compliance/summary` | `Policy:Read` | Compliance dashboard summary fragment |
+| `/fragments/compliance/{policy_id}` | fleet-read `Policy:Read`, confined, audited | Per-policy compliance detail fragment |
+| `/fragments/policy-fragments` | `Policy:Read` | Policy fragments list with used-by counts |
 
 ---
 

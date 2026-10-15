@@ -35,7 +35,11 @@ namespace yuzu::server {
 /// nullopt = the device did not report that metric this cycle.
 struct DexPerfDevice {
     std::string agent_id;
-    bool is_windows{false}; ///< denominator scoping (perf collectors are Windows-only today)
+    /// Normalized OS token from dex_perf_rules.hpp's dex_perf_os_from_session:
+    /// "windows" | "linux" | "macos" | "" (unrecognized/session-less). Denominator
+    /// scoping — see dex_perf_os_collects for which of these have a real
+    /// heartbeat perf collector today.
+    std::string os;
     std::optional<double> cpu_pct;
     std::optional<double> commit_pct;
     std::optional<double> disk_lat_ms;
@@ -82,7 +86,21 @@ struct DexPerfFleetNow {
     std::optional<DexPerfStat> commit;
     std::optional<DexPerfStat> disk_lat;
     int64_t reporting{0};      ///< devices contributing at least one metric
-    int64_t windows_online{0}; ///< the coverage-honest denominator
+    int64_t windows_online{0}; ///< online Windows devices (unchanged wire field; keep first)
+    // Trailing per-OS breakdown (C1, additive — REST/MCP responses only ever
+    // APPEND fields; windows_online/reporting above stay byte-identical).
+    // *_online counts every online device of that OS (collector or not);
+    // reporting_* counts only those that ALSO reported ≥1 metric this cycle
+    // (dex_perf_os_collects gates which OSes can appear here at all today).
+    int64_t linux_online{0};
+    int64_t macos_online{0};
+    int64_t reporting_windows{0};
+    int64_t reporting_linux{0};
+    int64_t reporting_macos{0};
+    /// Online devices whose OS has a real perf collector per
+    /// detail::dex_perf_os_collects -- the OS-aware "of N" denominator for
+    /// `reporting`. windows_online stays as-is for wire compatibility. Trailing.
+    int64_t perf_capable_online{0};
 };
 
 DexPerfFleetNow dex_perf_fleet_now(const DexPerfSnapshot& snap);
@@ -146,6 +164,7 @@ struct DexPerfDeviceRow {
     std::optional<double> commit_pct;
     std::optional<double> disk_lat_ms;
     int fleet_pctile{-1};
+    std::string os; ///< normalized OS token (dex_perf_os_from_session); trailing, additive (C1)
 };
 
 /// Sort metrics for the devices drill. Anything else resolves to kCpu.
@@ -204,7 +223,7 @@ DexPerfDeviceContext dex_perf_device_context(const DexPerfSnapshot& snap,
 /// The ONE device list that serves every drill (grill decision: metric card →
 /// worst devices; Reporting card → not-reporting; cohort/untagged row → that
 /// cohort's devices):
-///  - `not_reporting=true`  → Windows devices with NO metric this cycle
+///  - `not_reporting=true`  → devices of an OS with a perf collector with NO metric this cycle
 ///    (sorted by agent_id; metric/cohort filters still apply if given).
 ///  - `cohort_filter` set   → only devices whose resolved cohort equals it
 ///    ("" = the untagged residual). nullopt = no cohort filtering.
@@ -214,5 +233,22 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
                                                    bool not_reporting,
                                                    const std::optional<std::string>& cohort_filter,
                                                    int limit);
+
+// ── F2a PR2: device drill perf extensions (relocated from dex_routes.hpp,
+//    #4626 Concern B — dex_perf_ui.cpp needs this pure struct without pulling
+//    in the httplib-coupled route header) ──────────────────────────────────
+
+/// One per-application row out of the device's `$ProcPerf_Hourly` edge tier
+/// (A2 — names only, NEVER command lines; opt-in `procperf_enabled`).
+struct DexProcPerfRow {
+    std::string name; ///< image name — agent bytes, HTML-escape at render
+    std::int64_t samples{0};
+    std::int64_t instances_max{0};
+    double cpu_avg{0.0}; ///< % share of total capacity, clamped 0..100
+    double cpu_max{0.0};
+    double ws_avg_bytes{0.0};
+    double ws_max_bytes{0.0};
+    std::int64_t hours{0}; ///< distinct hourly rollups the app appeared in
+};
 
 } // namespace yuzu::server

@@ -44,7 +44,7 @@ namespace yuzu::win {
 /// A process-unique HKEY_USERS mount name for `sid`, of the shape
 /// `YUZU_HIVE_<sid>_<16 hex>_<n>`.
 ///
-/// Salt scheme mirrors agents/core/src/agent_csr.cpp's random_suffix(): a
+/// Salt scheme mirrors agents/shared/atomic_file_write.hpp's detail::temp_suffix(): a
 /// one-time random_device base (seeded once, no per-call fd churn) XORed with
 /// a monotonic atomic counter — unique within the process, unpredictable
 /// across processes, and not solely dependent on random_device entropy, which

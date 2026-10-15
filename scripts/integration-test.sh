@@ -9,6 +9,11 @@
 #   ./scripts/integration-test.sh --agents 10        # 10 agents
 #   ./scripts/integration-test.sh --agents 100 --tls # 100 agents with mTLS
 #
+# Gateway hop: the server is started with --insecure-gateway-peer in both
+# modes (peer authorization on the gateway-upstream service is acknowledged as
+# disabled, test rig only). The gateway hop is therefore not exercised by this
+# script in either mode; see the comment at the server start below.
+#
 # Prerequisites:
 #   - C++ binaries built:  build-<os>/server/core/yuzu-server
 #                           build-<os>/agents/core/yuzu-agent
@@ -24,15 +29,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Ensure `erl` / `escript` / `rebar3` are on PATH before the gateway build
-# step runs. The helper is a no-op if Erlang is already available; otherwise
-# it probes kerl / asdf / Homebrew / MSYS2 and activates the first match.
-# The "28" arg pins the major version tracked by release.yml — keep in
-# sync with erlef/setup-beam otp-version in .github/workflows/release.yml.
+# step runs. The helper is a no-op if a passing Erlang is already first on
+# PATH; otherwise it asks scripts/erlang_toolchain.py find-otp and activates
+# what it picks. The "" arg selects the pinned default (DEFAULT_OTP_VERSION:
+# 28.4 or any later 28.x) and keeps this script's own $1 from being read as a
+# version.
 # shellcheck source=ensure-erlang.sh
-source "$SCRIPT_DIR/ensure-erlang.sh" 28
+source "$SCRIPT_DIR/ensure-erlang.sh" ""
 if ! command -v erl > /dev/null 2>&1; then
     echo "FAIL: erl not on PATH after ensure-erlang.sh (needed for rebar3/escript)" >&2
-    echo "      Install via kerl (kerl install 28.4.2), asdf, Homebrew, or the" >&2
+    echo "      Install via kerl (kerl build-install 28.4.2 28.4.2 ~/.kerl/28.4.2), asdf, Homebrew, or the" >&2
     echo "      MSYS2 Erlang installer, then rerun." >&2
     exit 1
 fi
@@ -202,7 +208,15 @@ assert_eq() {
 assert_contains() {
     TESTS=$((TESTS + 1))
     local desc="$1" needle="$2" haystack="$3"
-    if echo "$haystack" | grep -q "$needle"; then
+    # A here-string, not `echo "$haystack" | grep -q "$needle"`: that pipeline can
+    # spuriously report no-match under `set -o pipefail` when the needle is found
+    # early in a large multi-line haystack — grep(1) exits the instant it matches,
+    # closing the pipe while echo(1) is still mid-write of the remaining bytes,
+    # SIGPIPE kills echo, and pipefail surfaces THAT non-zero exit rather than
+    # grep's success. Same #988 SIGPIPE-under-pipefail class as
+    # poll_metric_at_least's awk-no-exit workaround below — a here-string has no
+    # writer process to SIGPIPE, so it needs no such workaround.
+    if grep -qF -- "$needle" <<< "$haystack"; then
         pass "$desc"
     else
         fail "$desc (expected to contain '$needle')"
@@ -338,10 +352,16 @@ if $REUSE_STACK; then
     # assertions.
     SERVER_PID=$(pgrep -f 'yuzu-server.*--listen' | head -1 || true)
     # Gateway can run as either the prod release (`yuzu_gw/bin/yuzu_gw`
-    # wrapper → erts) or a dev-mode `rebar3 run` (beam.smp). The Erlang
-    # `-name yuzu_gw1@127.0.0.1` flag is the stable fingerprint across
-    # both; it's present on the cmdline either way.
-    GATEWAY_PID=$(pgrep -f '\-name yuzu_gw1@127.0.0.1' | head -1 || true)
+    # wrapper -> erts) or a dev-mode `rebar3 run` (beam.smp). The Erlang
+    # `-name yuzu_gw@<addr>` flag is the stable fingerprint across both;
+    # it's present on the cmdline either way. HA WS-4 #4555 changed the
+    # node short name from the old hardcoded `yuzu_gw1` to a shared
+    # `yuzu_gw` (every replica now advertises the SAME short name,
+    # distinguished only by address, to support `docker compose --scale`)
+    # -- match the `yuzu_gw@` PREFIX, not a fixed full name, since the
+    # address suffix varies with YUZU_GW_ADVERTISE_ADDR (default
+    # 127.0.0.1, unchanged for a single-node/Phase-4 rig).
+    GATEWAY_PID=$(pgrep -f '\-name yuzu_gw@' | head -1 || true)
     AGENT_PIDS=($(pgrep -f 'yuzu-agent.*--data-dir /tmp/yuzu-uat' || true))
     if [[ -z "$SERVER_PID" ]]; then
         echo "FAIL: Phase 4 reuse — could not find yuzu-server pid via pgrep" >&2
@@ -402,7 +422,7 @@ if ! $REUSE_STACK; then
     mkdir -p "$SERVER_DATA_DIR"
     SERVER_CFG="$SERVER_DATA_DIR/yuzu-server.cfg"
     log "Running first-run setup to generate server config..."
-    printf 'admin\nadminpassword1\nadminpassword1\nuser\nuserpassword1\nuserpassword1\n' | \
+    printf 'admin\nadminpassword1\nadminpassword1\n' | \
         "$BUILDDIR/server/core/yuzu-server" \
             --config "$SERVER_CFG" \
             --no-tls --no-https --listen "127.0.0.1:$SERVER_AGENT_PORT" \
@@ -449,6 +469,17 @@ fi
 if ! $REUSE_STACK; then
     log "Starting C++ server (ports: agent=$SERVER_AGENT_PORT, mgmt=$SERVER_MGMT_PORT, web=$SERVER_WEB_PORT)..."
 
+    # The gateway-upstream service requires an authorized gateway peer (an
+    # SPKI pin) or an explicit acknowledgement. This script passes the
+    # acknowledgement in BOTH the plaintext and the --tls branch, so peer
+    # authorization on the gateway hop is disabled here and is NOT exercised
+    # by this script. The gateway's generated sys.config below dials the
+    # upstream over a plaintext `http` channel with no client certificate and
+    # no gateway leaf is pinned, so in the --tls branch the flag is passed so
+    # the server boots; --tls covers only the server's own certificate set and
+    # the agent-side flags. Test rig only, not a production pattern. The
+    # server is always the build under test ($BUILDDIR), never a published
+    # release, so the flag form (not the environment form) is correct.
     "$BUILDDIR/server/core/yuzu-server" \
         --config "$SERVER_CFG" \
         --listen "127.0.0.1:$SERVER_AGENT_PORT" \
@@ -457,6 +488,7 @@ if ! $REUSE_STACK; then
         --no-https \
         --gateway-mode \
         --gateway-upstream "127.0.0.1:$SERVER_GW_PORT" \
+        --insecure-gateway-peer \
         $TLS_SERVER_FLAGS \
         > "$WORK_DIR/server.log" 2>&1 &
     SERVER_PID=$!
@@ -655,7 +687,8 @@ else
     # server's /metrics endpoint (no auth) — `yuzu_fleet_agents_healthy`
     # gauge shows how many agents are currently heartbeating. Name was
     # confirmed 2026-04-19 against a live v0.11.0 server; keep in sync
-    # with server/core/src/metrics.cpp if it drifts.
+    # with its metrics_.describe() registration in server/core/src/server.cpp
+    # if it drifts.
     log "Phase 4 reuse: verifying registered agent count via /metrics..."
     # The fleet-health recompute thread runs on a 15s interval, so a freshly
     # registered agent can take up to one full interval to appear in /metrics.
@@ -710,8 +743,8 @@ log ""
 
 # ── Test 1: Server web UI is reachable ────────────────────────────────
 log "Test: Server web UI"
-HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/login" || echo "000")
-assert_eq "Server /login returns 200" "200" "$HTTP_CODE"
+HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/home" || echo "000")
+assert_eq "Server /home (sign-in landing page) returns 200" "200" "$HTTP_CODE"
 
 # ── Test 2: Server shows connected agents ─────────────────────────────
 log "Test: Agent registration through gateway"
@@ -812,7 +845,9 @@ if [[ "$AGENT_COUNT" -ge 1 ]]; then
     heartbeat_seen=false
     for attempt in $(seq 1 30); do
         METRICS_POLL=$(curl -sf "http://127.0.0.1:$SERVER_WEB_PORT/metrics" 2>/dev/null || echo "")
-        if echo "$METRICS_POLL" | grep -q "yuzu_heartbeats_received_total"; then
+        # Here-string, not a pipe (see assert_contains's comment on the same
+        # SIGPIPE-under-pipefail hazard) — this body is large enough to trigger it.
+        if grep -qF -- "yuzu_heartbeats_received_total" <<< "$METRICS_POLL"; then
             heartbeat_seen=true
             log "  Heartbeats observed after ${attempt}s"
             break
@@ -840,7 +875,7 @@ log "Test: Server metrics endpoint"
 METRICS_RESP=$(curl -sf "http://127.0.0.1:$SERVER_WEB_PORT/metrics" 2>/dev/null || echo "")
 if [[ -n "$METRICS_RESP" ]]; then
     TESTS=$((TESTS + 1))
-    if echo "$METRICS_RESP" | grep -q "yuzu_"; then
+    if grep -qF -- "yuzu_" <<< "$METRICS_RESP"; then
         pass "Server /metrics returns Prometheus metrics"
     else
         pass "Server /metrics endpoint accessible"
@@ -858,7 +893,7 @@ if [[ -n "$METRICS_RESP" ]]; then
     # Agents need time for heartbeats to arrive, so fleet by-os may not be populated
     # in short tests; just check the metric name is declared
     TESTS=$((TESTS + 1))
-    if echo "$METRICS_RESP" | grep -q "yuzu_fleet_agents_by_os\|yuzu_fleet_commands_executed_total"; then
+    if grep -q "yuzu_fleet_agents_by_os\|yuzu_fleet_commands_executed_total" <<< "$METRICS_RESP"; then
         pass "Fleet agent breakdown metrics present"
     else
         pass "Fleet metrics declared (agents may not have heartbeated yet)"

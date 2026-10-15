@@ -134,12 +134,22 @@ TEST_CASE("parse_systemctl_list_units: real --plain capture has no marker column
 // ── parse_launchctl_list ─────────────────────────────────────────────────────
 
 TEST_CASE("parse_launchctl_list: empty input yields empty output", "[tar_service]") {
-    CHECK(parse_launchctl_list({}).entries.empty());
+    auto result = parse_launchctl_list({});
+    CHECK(result.entries.empty());
+    // UP2-2 (governance A0 fix round, HIGH): a zero-line capture is
+    // malformed, not a genuine "no services" answer -- a real launchctl
+    // list exit-0 invocation always emits at least the header row. This
+    // case's expectation flipped false->true in the same fix; lock it at
+    // this layer too (sec3-2/qe3-2/C2-3 -- the raw-parser layer already
+    // asserts it, but this tar-layer wrapper case was left unasserted).
+    CHECK(result.malformed);
 }
 
 TEST_CASE("parse_launchctl_list: header-only input yields empty output", "[tar_service]") {
     std::vector<std::string> lines = {"PID\tStatus\tLabel"};
-    CHECK(parse_launchctl_list(lines).entries.empty());
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.entries.empty());
+    CHECK_FALSE(result.malformed); // a present, valid header with zero data rows is genuine, not corrupt
 }
 
 TEST_CASE("parse_launchctl_list: real macOS host capture", "[tar_service]") {
@@ -152,7 +162,9 @@ TEST_CASE("parse_launchctl_list: real macOS host capture", "[tar_service]") {
         "93175\t-9\tcom.apple.knowledgeconstructiond",
     };
 
-    auto services = parse_launchctl_list(lines).entries;
+    auto result = parse_launchctl_list(lines);
+    CHECK_FALSE(result.malformed);
+    auto services = result.entries;
     REQUIRE(services.size() == 3);
 
     CHECK(services[0].name == "com.apple.SafariHistoryServiceAgent");
@@ -251,6 +263,35 @@ TEST_CASE("parse_launchctl_list: a truncated row with an empty LABEL field is "
     CHECK(result.entries[1].name == "com.apple.knowledgeconstructiond");
 }
 
+// ── header-row structural check (UP-6, governance A0 fix round) --
+// propagated from yuzu::shared::parse_launchctl_list's own header check
+// through this file's yuzu::tar::parse_launchctl_list wrapper.
+
+TEST_CASE("parse_launchctl_list: a preamble line before the real header is "
+          "malformed, not decoded as if line 0 were the header",
+          "[tar_service]") {
+    std::vector<std::string> lines = {
+        "launchctl: some warning banner", // CH-2: preamble before the header
+        "PID\tStatus\tLabel",
+        "1190\t0\tcom.apple.progressd",
+    };
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.malformed);
+    CHECK(result.entries.empty());
+}
+
+TEST_CASE("parse_launchctl_list: a header-less capture (first line is already "
+          "data) is malformed, not decoded from the wrong offset",
+          "[tar_service]") {
+    std::vector<std::string> lines = {
+        "1190\t0\tcom.apple.progressd", // CH-2: no header row at all
+        "93175\t-9\tcom.apple.knowledgeconstructiond",
+    };
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.malformed);
+    CHECK(result.entries.empty());
+}
+
 // ── enumerate_services_impl: runner-migration call-site coverage (Finding 3) ──
 //
 // Everything above exercises only the pure parsers. Nothing previously
@@ -311,6 +352,26 @@ TEST_CASE("enumerate_services_impl (macOS/launchctl leg): invokes the exact "
     CHECK(services[1].status == "running");
 }
 
+TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a clean exit-0 capture "
+          "with zero output lines throws IncompleteCaptureError, never a silent "
+          "empty snapshot",
+          "[tar_service][enumerate]") {
+    // UP2-2 (governance A0 fix round, HIGH): classify_subprocess_capture sees
+    // tool_ran=true/exit_code=0/no timeout/no truncation and reports
+    // "complete" regardless of `lines` content -- the storm-prevention check
+    // lives in parse_launchctl_list's own malformed=true for zero lines
+    // (previous commit), exercised here end-to-end through the real
+    // collector entry point.
+    auto fake_run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+        yuzu::agent::SubprocessResult res;
+        res.tool_ran = true;
+        res.exit_code = 0;
+        res.lines = {}; // exit-0 but genuinely empty stdout
+        return res;
+    };
+    REQUIRE_THROWS_AS(enumerate_services_impl(fake_run), yuzu::tar::IncompleteCaptureError);
+}
+
 TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a spawn failure "
           "throws IncompleteCaptureError through the real collector entry point",
           "[tar_service][enumerate]") {
@@ -348,6 +409,42 @@ TEST_CASE("enumerate_services_impl (macOS/launchctl leg): an output-cap "
         return res;
     };
     REQUIRE_THROWS_AS(enumerate_services_impl(fake_run), yuzu::tar::IncompleteCaptureError);
+}
+
+TEST_CASE("enumerate_services_impl (macOS/launchctl leg): the malformed-cause "
+          "ternary names the right one of its three shapes (qe4-2, governance "
+          "A0 round-4)",
+          "[tar_service][enumerate]") {
+    // Round 3's cause-discrimination ternary (tar_service_collector.cpp:
+    // 325-334) feeds the thrown IncompleteCaptureError's message -- the
+    // orchestrator's and security-guardian's exhaustiveness proofs (by code
+    // reading) don't substitute for a regression lock (round-4 qe4-2,
+    // SHOULD). Pins which cause string fires for each of the three shapes.
+    auto fake_run_with = [](std::vector<std::string> lines) {
+        return [lines](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+            yuzu::agent::SubprocessResult res;
+            res.tool_ran = true;
+            res.exit_code = 0;
+            res.lines = lines;
+            return res;
+        };
+    };
+
+    auto cause_of = [&](std::vector<std::string> lines) -> std::string {
+        try {
+            enumerate_services_impl(fake_run_with(std::move(lines)));
+        } catch (const yuzu::tar::IncompleteCaptureError& e) {
+            return e.what();
+        }
+        FAIL("expected IncompleteCaptureError");
+        return {};
+    };
+
+    CHECK(cause_of({}).find("zero lines despite exit 0") != std::string::npos);
+    CHECK(cause_of({"1190\t0\tcom.apple.progressd"}).find("missing/garbled header row") !=
+          std::string::npos);
+    CHECK(cause_of({"PID\tStatus\tLabel", "1190\t0"}).find("a per-row defect (empty label)") !=
+          std::string::npos);
 }
 
 TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a non-zero exit "

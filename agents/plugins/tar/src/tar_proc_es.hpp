@@ -85,22 +85,6 @@ std::string resolve_uid_cached(std::unordered_map<std::uint32_t, std::string>& c
                                std::uint32_t uid,
                                const std::function<std::string(std::uint32_t)>& lookup);
 
-/// Kernel-side drop count implied by a per-event-type `seq_num` jump: the number of
-/// messages Endpoint Security dropped between `last_seq` and `seq`. Returns 0 when
-/// there is no gap (`seq == last_seq + 1`) or when `seq` did not advance past
-/// `last_seq` (a client re-create can reset the per-type counter backwards — treated
-/// as no-drop rather than underflowing into a huge bogus count). Pure + testable.
-std::uint64_t es_seq_gap(std::uint64_t last_seq, std::uint64_t seq) noexcept;
-
-/// True when an ES stream that is nominally running should be presumed dead and the
-/// poll re-armed: it has delivered nothing for longer than `threshold_seconds`.
-/// `last_event_ts` is the unix-seconds of the last successfully decoded event (0 if
-/// none yet), `started_ts` the start() instant; idle is measured from whichever is
-/// later. Returns false if neither is set (`since <= 0`) so a clock that never
-/// initialised cannot trigger a spurious fallback. Pure + testable.
-bool es_stream_is_stalled(std::int64_t last_event_ts, std::int64_t started_ts,
-                          std::int64_t now, std::int64_t threshold_seconds) noexcept;
-
 /// Owns an Endpoint Security client subscribed to process exec/exit and decodes
 /// each message into a ProcEventRing on the ES-managed handler queue. Single-owner
 /// (non-copyable). macOS-only; every method is a no-op on other platforms and

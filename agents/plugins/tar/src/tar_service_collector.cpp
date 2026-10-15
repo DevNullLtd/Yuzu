@@ -317,10 +317,26 @@ std::vector<ServiceInfo> enumerate_services_impl(const RunSubprocessFn& run) {
 
     auto parsed = parse_launchctl_list(res.lines);
     if (parsed.malformed) {
-        // BR-service-001: same policy as the systemctl leg above.
-        spdlog::error("TAR: service snapshot incomplete (launchctl produced a malformed row) -- "
-                      "skipping diff, retaining previous baseline");
-        throw yuzu::tar::IncompleteCaptureError("TAR: launchctl produced a malformed row");
+        // `malformed` covers THREE distinct causes -- a missing/garbled
+        // header (UP-6), zero lines at all despite exit 0 (UP2-2), and a
+        // per-row BR-service-001 defect -- none of which is specifically
+        // "a malformed row", so the message names the capture as a whole
+        // (governance A0 fix round, UP2-5). UP3-2 (governance A0 fix round,
+        // NICE): this refusal is the sole human-readable signal on this
+        // path, so name WHICH of the three shapes triggered it -- cheap to
+        // discriminate here from `res.lines` directly (the header-check
+        // logic is duplicated rather than threading a cause enum back
+        // through ServiceParseResult, out of proportion for a NICE finding);
+        // the per-row BR-service-001 case is the only one left unnamed
+        // since ServiceParseResult doesn't carry which row failed.
+        const char* cause = res.lines.empty()                     ? "zero lines despite exit 0"
+                            : res.lines[0] != "PID\tStatus\tLabel" ? "missing/garbled header row"
+                                                                    : "a per-row defect (empty label)";
+        spdlog::error("TAR: service snapshot incomplete (launchctl produced a malformed "
+                      "capture: {}) -- skipping diff, retaining previous baseline",
+                      cause);
+        throw yuzu::tar::IncompleteCaptureError(std::string("TAR: launchctl produced a malformed "
+                                                              "capture: ") + cause);
     }
     return std::move(parsed.entries);
 }

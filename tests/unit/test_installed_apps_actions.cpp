@@ -9,17 +9,24 @@
  * host, end to end, not just that the pure parsers in
  * installed_apps_parsers.hpp accept a fixture string.
  *
- * `list` is the fast, local, always-available action (no params, no
- * per-app enrichment loop) -- assertions are on rc and output SHAPE
- * (every emitted line matches the `app|` wire prefix), never on specific
- * app names/counts, which are entirely host-dependent.
+ * `list` is the fast, local, always-available action (no params; on macOS one
+ * bounded in-process CFBundle pass for all listed apps for bundle_id, inside the noise
+ * of the single system_profiler call on this Mac, 2026-09-21) -- assertions are on
+ * rc and output SHAPE (every emitted line matches the `app|` wire prefix), never
+ * on specific app names/counts, which are host-dependent, with ONE deliberate
+ * exception: the `list` case asserts value-level facts every Mac guarantees
+ * (`*.app` rows under `/System/Applications/` with `com.apple.*` bundle ids,
+ * absolute locations), because shape-only checks survive reverting either half of the
+ * ADR-0028 wiring (see that case's own comment).
  *
  * TEST-EFFICIENCY JUSTIFICATION (CLAUDE.md unit-suite discipline requires one
  * whenever a test's runtime depends on process creation):
  *   - What it costs, measured on this host (macOS 26, arm64, 2026-08-24):
- *     `list` 4.5 s wall, `list_inventory` a few seconds more. Both are
- *     dominated by one `system_profiler` call, not by fan-out; the pkgutil
- *     receipt leg is a bounded per-id loop under kMaxPkgutilPackages.
+ *     `list` 1.4-2.3 s wall (2026-09-21; the 2026-08-24 base figure was 4.5 s),
+ *     `list_inventory` a few seconds more. `list` is
+ *     dominated by one `system_profiler` call plus that in-process pass (no
+ *     process fan-out); the pkgutil receipt leg is a bounded per-id loop under
+ *     kMaxPkgutilPackages.
  *   - Why a pure-function test cannot replace it: the pure parsers in
  *     installed_apps_parsers.hpp are already exhaustively covered by
  *     test_installed_apps_parsers.cpp. What is NOT reachable that way is the
@@ -28,7 +35,11 @@
  *     emitted rows. A fixture string re-asserts the parser and proves nothing
  *     about the migration; external functional review specifically found that
  *     the parser-only tests survive reverting every changed call site.
- *   - Bound: these two cases are the ONLY process-spawning tests added here,
+ *   - A third macOS case (one more system_profiler run, ~2 s) is the only way to
+ *     reach do_list's degraded bundle-id wiring: the reader is agent-core-resident
+ *     and the process-wide in-flight flag the plugin image shares with this
+ *     executable is the seam that forces Busy without a production test hook.
+ *   - Bound: the cases above are the ONLY process-spawning tests added here,
  *     and both are macOS/POSIX-gated. Everything else added by this PR is a
  *     pure-function case. If the cost ever becomes a problem, the right move
  *     is an integration tag, not weaker assertions.
@@ -41,11 +52,13 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+#include "test_helpers.hpp" // yuzu::test::unique_temp_path -- cache-invalidation marker filename
 
 #include <cstdlib>
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -101,9 +114,9 @@ std::optional<LoadedPlugin> load_installed_apps_plugin() {
 }
 
 // Every line of `list`'s output is either a real `app|name|version|publisher|
-// install_date` row or the plugin's own honest-empty sentinel
-// ("app|No applications found|-|-|-") -- both share the `app|` prefix, so a
-// single prefix check covers both shapes.
+// install_date|install_location|bundle_id` row or the plugin's own honest-empty
+// sentinel ("app|No applications found|-|-|-|-|-") -- both share the `app|`
+// prefix, so a single prefix check covers both shapes.
 std::size_t count_non_matching_lines(const std::string& captured, std::string_view prefix) {
     std::istringstream iss(captured);
     std::string line;
@@ -115,6 +128,26 @@ std::size_t count_non_matching_lines(const std::string& captured, std::string_vi
             ++bad;
     }
     return bad;
+}
+
+/// Escape-aware field split (shape of test_peripherals_local_dispatcher.cpp's
+/// helper): a backslash-escaped '|' does not start a new field.
+std::vector<std::string> split_fields_escape_aware(const std::string& row) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (row[i] == '|') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += row[i];
+        }
+    }
+    out.push_back(cur);
+    return out;
 }
 
 } // namespace
@@ -145,10 +178,89 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
     // Shape invariant: every emitted line is an `app|...` row, whether a
     // real app/package or the plugin's own "No applications found" sentinel
     // -- never a stray error string or fragment from a reverted parser.
+#if defined(__APPLE__)
+    // Healthy host: the bounded bundle-id pass completes untruncated, so no
+    // `warning|bundle_id_*` row precedes the app rows (that row is the only
+    // absent-vs-not-read signal; the 7-field row shape is frozen).
+    CHECK(result.captured.find("warning|bundle_id_") == std::string::npos);
+#endif
     CHECK(count_non_matching_lines(result.captured, "app|") == 0);
+
+    // Wire contract (ADR-0028 binding condition): every row is
+    // app|name|version|publisher|install_date|install_location|bundle_id --
+    // exactly 7 escape-aware tokens on every host, the sentinel included, because
+    // format_app_row escapes every field; a `|` in a real name is escaped, not a
+    // delimiter.
+    std::istringstream iss(result.captured);
+    std::string line;
+    std::size_t rows = 0, bad_field_count = 0, empty_field = 0;
+    [[maybe_unused]] std::size_t abs_location_rows = 0, system_app_rows = 0,
+                                 non_dash_trailing = 0;
+    while (std::getline(iss, line)) {
+        if (line.empty())
+            continue;
+        ++rows;
+        const auto fields = split_fields_escape_aware(line);
+        if (fields.size() != 7) {
+            ++bad_field_count;
+            continue;
+        }
+        // Empty optional columns render "-", never an empty string (a
+        // shifted column would surface here as an empty field).
+        for (std::size_t i = 1; i < fields.size(); ++i)
+            if (fields[i].empty())
+                ++empty_field;
+#if defined(__APPLE__)
+        if (!fields[5].empty() && fields[5].front() == '/')
+            ++abs_location_rows;
+        if (fields[5].starts_with("/System/Applications/") && fields[6].starts_with("com.apple."))
+            ++system_app_rows;
+#elif defined(__linux__)
+        if (fields[5] != "-" || fields[6] != "-")
+            ++non_dash_trailing;
+#endif
+    }
+    CHECK(rows > 0);
+    CHECK(bad_field_count == 0);
+    CHECK(empty_field == 0);
+
+    // The shape checks above are satisfied by "-" in both trailing columns, so on
+    // their own they survive reverting either half of the feature: (A) dropping
+    // with_bundle_ids leaves every bundle_id "-"; (B) returning {} for the location
+    // leaves every install_location "-". These value-level checks fail both.
+    // Every Mac lists /System/Applications/*.app with a com.apple.* bundle id.
+#if defined(__APPLE__)
+    CHECK(abs_location_rows > 0);
+    CHECK(system_app_rows > 0); // bundle ids come from agent-core's CoreFoundation reader, Security or not
+#elif defined(__linux__)
+    // Linux has no install location or bundle id concept: both columns are "-" by design.
+    CHECK(non_dash_trailing == 0);
+#endif
 }
 
 #if defined(__APPLE__)
+
+// Round-3 sync-speed fix coverage: the profiler memo cache
+// (installed_apps_plugin.cpp's ProfilerCache/get_inventory_macos, anonymous-
+// namespace so not directly includable) and the receipt-read/pkgutil-fallback
+// parity it sits in front of. `installed_apps_parsers.hpp` and
+// `installed_apps_macos_receipts.hpp` are both public, OS-scoped headers this
+// plugin's own .cpp includes -- reused verbatim here, not re-implemented, so
+// a parity test is never checking its own re-derivation of the contract.
+#include "installed_apps_macos_receipts.hpp"
+#include "installed_apps_parsers.hpp"
+
+#include <yuzu/agent/bundle_id_read.hpp>
+#include <yuzu/agent/subprocess_runner.hpp>
+
+#include <chrono>
+#include <cstdio>
+#include <fstream>
+#include <future>
+#include <thread>
+
+namespace parsers = yuzu::installed_apps::parsers;
+namespace macos_receipts = yuzu::installed_apps::macos_receipts;
 
 // Gate-1 remediation (external functional review): NOTHING dispatched
 // `list_inventory`, so the whole point of this PR on macOS -- the #2273
@@ -289,6 +401,268 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     // collection, so the run returns rc=1 and never reaches this branch. The
     // degraded contract is asserted in the rc!=0 branch above; asserting a
     // bound here would be asserting something unreachable by construction.
+}
+
+// Round-3 sync-speed fix: the profiler memo cache (ProfilerCache/
+// apps_root_signature/get_inventory_macos, installed_apps_plugin.cpp) lives
+// in that .cpp's anonymous namespace, so it is not directly includable from a
+// test. The least invasive way to observe its behaviour from outside is
+// exactly what it exists to do: dispatch `list_inventory` twice in one
+// process and show the second call is a fast, byte-identical repeat of the
+// first -- never touching the cache's internals.
+//
+// TEST-EFFICIENCY JUSTIFICATION: this necessarily spawns real
+// system_profiler/pkgutil argv (same cost class as the sibling dispatch test
+// above -- "a few seconds" on this host per that test's own header comment).
+// It is the ONLY way to observe the cache's hit/miss behaviour at all: the
+// cache sits between the collector and the wire format, with no seam a pure
+// unit test could reach.
+TEST_CASE("installed_apps plugin: list_inventory memo cache serves an identical, faster repeat",
+          "[installed_apps][posix_actions][macos_inventory][cache]") {
+    auto plugin = load_installed_apps_plugin();
+    if (!plugin)
+        SKIP("installed_apps plugin library not found -- cannot drive LocalDispatcher");
+
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto first = dispatcher.run(plugin->descriptor, "list_inventory");
+    const auto t1 = std::chrono::steady_clock::now();
+
+    if (first.rc != 0) {
+        // Same degraded contract as the sibling test above: get_inventory_macos
+        // NEVER memoizes a degraded outcome (installed_apps_plugin.cpp resets
+        // cache.result rather than storing it), so there is nothing cached to
+        // prove a hit against on this run.
+        CHECK(first.captured.empty());
+        SKIP("system_profiler/pkgutil degraded on this host -- the memo cache was "
+             "never populated, so its hit behaviour is NOT exercised here");
+    }
+    REQUIRE_FALSE(first.captured.empty());
+
+    const auto first_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+    const auto t2 = std::chrono::steady_clock::now();
+    auto second = dispatcher.run(plugin->descriptor, "list_inventory");
+    const auto t3 = std::chrono::steady_clock::now();
+    const auto second_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+
+    INFO("first=" << first_ms << "ms second=" << second_ms << "ms");
+
+    // The cached result must be the EXACT same bytes, not merely fast -- this
+    // is what catches a cache bug that serves stale/wrong/truncated data.
+    CHECK(second.rc == first.rc);
+    CHECK(second.captured == first.captured);
+
+    // Absolute ceiling: a real cache hit is a mutex lock + a struct copy, not
+    // a fresh system_profiler+pkgutil collection. The sibling dispatch test's
+    // own header comment puts an UNCACHED list_inventory at "a few seconds"
+    // on this host -- 2s is generous headroom above a genuine cache hit while
+    // staying far below any plausible uncached run, even under CI load.
+    CHECK(second_ms < 2000);
+
+    // Relative check, guarded: only meaningful when the first call was itself
+    // slow enough that a ratio isn't noise -- an unusually quiet host could
+    // make the FIRST call fast too, which would make ANY ratio flaky; the
+    // absolute ceiling above is the real proof in that case.
+    if (first_ms >= 500) {
+        CHECK(second_ms * 3 <= first_ms);
+    }
+
+    SECTION("touching a per-user Applications root invalidates the cache") {
+        // apps_root_signature() lstat()s every local user's own
+        // ~/Applications (installed_apps_plugin.cpp). Creating then removing
+        // one throwaway file inside an EXISTING such directory changes its
+        // mtime -- and so the signature -- without changing anything the
+        // collection itself reports (the file is not a .app bundle and
+        // pkgutil never looks at it), so this is safe to run on a shared dev
+        // host and leaves it exactly as found.
+        const char* home = std::getenv("HOME");
+        std::error_code ec;
+        const auto apps_dir = home ? (fs::path(home) / "Applications") : fs::path{};
+        if (apps_dir.empty() || !fs::is_directory(apps_dir, ec)) {
+            SKIP("no ~/Applications directory on this host -- cache-invalidation "
+                 "signature path cannot be exercised without creating a new root "
+                 "the signature scan doesn't already cover");
+        }
+
+        // yuzu_test_ prefix (Defender-exclusion convention) + the shared
+        // process-salted unique-name generator -- never a thread-id hash or a
+        // clock read (#473/#482) -- even though this filename never leaves
+        // this host.
+        const auto marker =
+            apps_dir / yuzu::test::unique_temp_path("yuzu_test_cache_invalidate_").filename();
+        {
+            std::ofstream touch(marker);
+            REQUIRE(touch.is_open());
+        }
+        struct Cleanup {
+            fs::path p;
+            ~Cleanup() {
+                std::error_code rm_ec;
+                fs::remove(p, rm_ec);
+            }
+        } cleanup{marker};
+
+        const auto t4 = std::chrono::steady_clock::now();
+        auto third = dispatcher.run(plugin->descriptor, "list_inventory");
+        const auto t5 = std::chrono::steady_clock::now();
+        const auto third_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t5 - t4).count();
+
+        if (third.rc != 0)
+            SKIP("system_profiler/pkgutil degraded on the invalidated re-collection -- "
+                 "invalidation itself cannot be distinguished from a transient tool "
+                 "hiccup here");
+
+        INFO("second=" << second_ms << "ms third=" << third_ms << "ms");
+        // Mirror image of the cache-hit check above: a signature match would
+        // return in the same fast window `second` did; a genuine invalidation
+        // re-runs the full collection, which is not fast by the same margin.
+        CHECK(third_ms > second_ms * 2);
+    }
+}
+
+// Receipt-read / pkgutil-fallback parity (round-3 sync-speed fix, item 4).
+// installed_apps_plugin.cpp's get_inventory_macos_uncached tries
+// macos_receipts::read_receipt_plist(id) FIRST and falls back to spawning
+// `pkgutil --pkg-info <id>` (parsed by parsers::parse_pkgutil_pkg_info) only
+// on a miss -- so proving the two AGREE on a real package, independently,
+// proves the fallback is a pure speed optimisation and never a second source
+// of truth, without needing to force the plugin down one path artificially.
+//
+// TEST-EFFICIENCY JUSTIFICATION: one bounded pkgutil spawn (the same shape
+// the plugin's own fallback call makes) plus a handful of small file reads --
+// no different in cost class from the parser/receipts unit tests already in
+// this suite.
+TEST_CASE("installed_apps plugin: receipt-plist read and pkgutil --pkg-info fallback agree",
+          "[installed_apps][macos][receipts][parity]") {
+    // Command Line Tools' Executables package is present on essentially every
+    // macOS host that can build this repo, but never assumed -- checked here,
+    // SKIPped loudly (never silently reported as a pass) if absent, matching
+    // this suite's false-green policy floor.
+    static constexpr const char* kPkgId = "com.apple.pkg.CLTools_Executables";
+
+    const auto pkgutil_path = yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"});
+    if (pkgutil_path.empty())
+        SKIP("pkgutil not found at /usr/sbin/pkgutil on this host");
+
+    const auto probe = yuzu::agent::run_bounded_subprocess(
+        {pkgutil_path, "--pkg-info", kPkgId},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    if (probe.termination_reason != yuzu::agent::TerminationReason::exited ||
+        probe.exit_code != 0) {
+        SKIP(std::string(kPkgId) +
+             " is not installed on this host (pkgutil --pkg-info exited " +
+             std::to_string(probe.exit_code) +
+             ") -- receipt/pkgutil parity cannot be exercised here");
+    }
+
+    // The SAME parser the plugin's own fallback branch calls -- this
+    // comparison is against exactly what the fallback path produces, not a
+    // re-implementation of it.
+    const auto via_pkgutil = parsers::parse_pkgutil_pkg_info(probe.output);
+    REQUIRE_FALSE(via_pkgutil.version.empty());
+    REQUIRE_FALSE(via_pkgutil.install_time.empty());
+
+    const auto via_receipt = macos_receipts::read_receipt_plist(kPkgId);
+    if (!via_receipt) {
+        SKIP(std::string(kPkgId) +
+             "'s receipt plist was not readable on this host (missing/permissions) -- "
+             "the in-process read path can't be compared here; the plugin would itself "
+             "fall back to pkgutil in this exact case");
+    }
+
+    CHECK(via_receipt->version == via_pkgutil.version);
+    CHECK(via_receipt->install_time == via_pkgutil.install_time);
+}
+
+// The bounded bundle-id pass's degraded wiring in do_list (warning row + typed
+// status) is unreachable from the pure tests, which only pin the mapping helpers.
+// agent-core is a shared library, so this executable and the loaded plugin bind
+// ONE in-flight flag: parking a blocked reader through the _for_test seam (1 ms
+// deadline -> TimedOut, worker left holding the flag) makes the plugin's own
+// `list` pass report Busy -- no production seam involved.
+TEST_CASE("installed_apps plugin: list reports a busy bundle-id pass as a leading warning row "
+          "and CONSTRAINED/PARTIAL",
+          "[installed_apps][posix_actions]") {
+    using namespace std::chrono_literals;
+    using yuzu::agent::BundleIdPassStatus;
+    using yuzu::agent::read_bundle_ids_bounded_for_test;
+
+    auto plugin = load_installed_apps_plugin();
+    if (!plugin)
+        SKIP("installed_apps plugin library not found -- cannot drive LocalDispatcher");
+
+    // Opens the gate on scope exit: a failing REQUIRE must not leave a worker
+    // wedged forever holding the process-wide flag (it would turn every later
+    // `list` case into Busy).
+    std::promise<void> gate;
+    bool gate_open = false;
+    const auto release = [&] {
+        if (!gate_open) {
+            gate_open = true;
+            gate.set_value();
+        }
+    };
+    yuzu::test::ScopeExit opener{release};
+    auto gate_f = gate.get_future().share();
+    const auto blocked = [gate_f](const std::string&) -> std::string {
+        gate_f.wait();
+        return {};
+    };
+
+    // A sibling test's abandoned worker may still hold the flag (Busy): poll until
+    // this call is the one that times out and so owns the wedge.
+    auto st = BundleIdPassStatus::Busy;
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            st = read_bundle_ids_bounded_for_test({"/x"}, 1ms, blocked).status;
+            CHECK((st == BundleIdPassStatus::TimedOut || st == BundleIdPassStatus::Busy));
+            return st == BundleIdPassStatus::TimedOut;
+        },
+        10s));
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor, "list");
+    release();
+
+    if (result.rc != 0)
+        SKIP("system_profiler degraded on this host -- the bundle-id pass was not reached");
+
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "installed_apps:bundle_id_busy");
+
+    std::istringstream iss(result.captured);
+    std::string line;
+    std::size_t row_count = 0;
+    bool first = true;
+    while (std::getline(iss, line)) {
+        if (line.empty())
+            continue;
+        if (first) {
+            CHECK(line.starts_with("warning|bundle_id_busy:"));
+            first = false;
+            continue;
+        }
+        ++row_count;
+        REQUIRE(line.starts_with("app|"));
+        const auto fields = split_fields_escape_aware(line);
+        REQUIRE(fields.size() == 7);
+        CHECK(fields[6] == "-"); // the pass never ran: every bundle_id is "not read"
+    }
+    CHECK(row_count > 0);
+
+    // Leave the flag free so the healthy `list` case is not poisoned under --order rand.
+    auto after = BundleIdPassStatus::Busy;
+    CHECK(yuzu::test::spin_until(
+        [&] {
+            after = read_bundle_ids_bounded_for_test(
+                        {"/x"}, 5000ms, [](const std::string&) { return std::string{"z"}; })
+                        .status;
+            return after == BundleIdPassStatus::Completed;
+        },
+        10s));
 }
 
 #endif // __APPLE__

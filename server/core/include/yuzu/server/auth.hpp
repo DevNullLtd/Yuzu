@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -18,10 +19,38 @@ namespace yuzu {
 class MetricsRegistry;
 }
 namespace yuzu::server {
+
+/// Typed failure of the enrollment-token / pending-agent store surface
+/// (WS-6 slice 6.2), shared by `AuthDB` (the store) and `auth::AuthManager`
+/// (which routes every enrollment call to it). Defined here, not in
+/// auth_db.hpp, so this header stays free of store headers. Deliberately
+/// three-valued and distinct from "not found"/"rejected"/"absent", which are
+/// SUCCESSFUL outcomes carried in the value channel: a caller can never read a
+/// store outage as an empty result.
+enum class StoreError : std::uint8_t {
+    /// The store could not be reached: pool lease not acquired, OR no AuthDB is
+    /// attached to the AuthManager (shutdown / never wired) — fail CLOSED.
+    Unavailable,
+    /// A statement or transaction ran (or the connection broke) and failed.
+    QueryFailed,
+    /// A caller-supplied value violated a bound (empty/oversize/embedded NUL/
+    /// out-of-range). Not a store outage — maps to INVALID_ARGUMENT / 400.
+    InvalidInput,
+};
+
+/// True iff `e` is a store outage (fail-closed UNAVAILABLE/503), not bad input.
+[[nodiscard]] inline bool is_store_unavailable(StoreError e) noexcept {
+    return e != StoreError::InvalidInput;
+}
+
 class AuthDB;
 class SessionStore;       // HA WS-1/1a — durable operator sessions (Postgres, ADR-2002 §4)
 struct SessionRow;        // session_store.hpp — the durable row shape
 struct SessionWriteParams; // session_store.hpp — duration-based create params (DB-clock authoring)
+class CredentialChangeOwner;    // credential_change_owner.hpp — #5342 one-transaction credential change
+class RbacStore;                // rbac_store.hpp, #4966 last-Administrator guard for account lifecycle
+struct CredentialChangeRequest; // credential_change_owner.hpp
+struct CredentialChangeOutcome; // credential_change_owner.hpp
 } // namespace yuzu::server
 
 namespace yuzu::server::auth {
@@ -343,12 +372,14 @@ struct EnrollmentToken {
     /// every successful consume so the lost-race audit detail can name the
     /// winner ("already_consumed_by=<agent_id>"). Empty on a freshly-created
     /// token or on a multi-use token before its first consume. Never the
-    /// raw token — only the agent_id presented to consume_enrollment_token.
+    /// raw token — only the agent_id presented to `consume_and_enroll`.
     std::string last_consumed_by_agent_id;
 };
 
-/// Typed rejection reason for `AuthManager::consume_enrollment_token`
-/// (W1.4 / #827). Naming style matches W1.2's `DeviceTokenValidateError`
+/// Typed rejection reason for `AuthManager::consume_and_enroll` (the token-half
+/// of its outcome; W1.4 / #827, folded into the atomic consume-and-enroll by
+/// WS-6 6.2 — see `ConsumeEnrollResult` below). Naming style matches W1.2's
+/// `DeviceTokenValidateError`
 /// (snake_case variants) so SIEM filters can grep across both. Variants
 /// are operator-facing — they surface in audit `detail` rows and as
 /// Prometheus label values; the public wire shape is uniform ("invalid,
@@ -375,8 +406,9 @@ enum class EnrollmentTokenError {
     internal_error,
 };
 
-/// Successful claim returned from `AuthManager::consume_enrollment_token`.
-/// Carries enough context for the success-path audit row and for telling
+/// Successful claim, carried in `ConsumeEnrollResult::claim` on the `enrolled`
+/// outcome of `AuthManager::consume_and_enroll`. Carries enough context for
+/// the success-path audit row and for telling
 /// "this consume won an actual race" from "this consume was uncontested".
 /// `prior_use_count` is the use_count BEFORE this consume — when it's > 0
 /// for a max_uses > 1 token, this consume shared the token with prior
@@ -387,6 +419,33 @@ struct EnrollmentClaim {
     int max_uses{0};        // 0 = unlimited
     int use_count_after{0}; // After this consume
     bool single_use{false}; // max_uses == 1 → token is now exhausted
+};
+
+/// Result of a successful `create_enrollment_token`. `raw_token` is shown once;
+/// `token_id` (8 hex chars of the hash) is the admin-facing handle.
+struct CreatedEnrollmentToken {
+    std::string raw_token;
+    std::string token_id;
+};
+
+/// Outcome of the atomic `consume_and_enroll` (WS-6 6.2). Exactly one of:
+///  - `enrolled`       : the token use was counted AND the agent row approved,
+///                       in one store transaction. `claim` is populated.
+///  - `token_rejected` : the token did not admit; `token_error` is the
+///                       audit/metric reason (the WIRE message stays uniform)
+///                       and `already_consumed_by` names the last consumer when
+///                       `token_error == already_consumed`.
+///  - `admin_denied`   : the token was valid but an administrator has denied
+///                       this agent_id. The whole txn rolled back — the token's
+///                       use_count is unchanged (closes #1135).
+/// A store outage is NOT a value here — it is the `StoreError` on the outer
+/// `std::expected`.
+struct ConsumeEnrollResult {
+    enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied };
+    Kind kind{Kind::token_rejected};
+    EnrollmentClaim claim{};                                        ///< enrolled only
+    EnrollmentTokenError token_error{EnrollmentTokenError::not_found}; ///< token_rejected only
+    std::string already_consumed_by;                                ///< token_rejected only
 };
 
 /// Maximum raw enrollment token length accepted at handler entry. Raw
@@ -410,6 +469,13 @@ inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 /// hostname-derived or UUID-derived agent_id fits in well under 100 chars.
 inline constexpr std::size_t kMaxAgentIdLength = 256;
 
+/// Maximum length of any free-text field the enrollment/pending store accepts
+/// (label, hostname, os, arch, agent_version, acting principal). The store
+/// REJECTS longer values (`StoreError::InvalidInput`); the Register/ProxyRegister
+/// handlers TRUNCATE agent-supplied descriptive fields to this cap first
+/// (`sanitize_enrollment_text`), so an over-long hostname never strands an agent.
+inline constexpr std::size_t kMaxEnrollmentTextLength = 256;
+
 // ── Pending agents (Tier 1) ─────────────────────────────────────────────────
 
 enum class PendingStatus { pending, approved, denied };
@@ -422,6 +488,94 @@ struct PendingAgent {
     std::string agent_version;
     std::chrono::system_clock::time_point requested_at;
     PendingStatus status;
+};
+
+/// Outcome of `AuthDB::remove_pending`/`AuthManager::remove_pending_agent` (a hard
+/// delete). A plain bool cannot distinguish "no such row" from "a row exists but
+/// isn't `pending`" — and that distinction is load-bearing: the store only ever
+/// hard-deletes a row whose status is `pending`, so a caller (and the audit row)
+/// must be able to tell a refused reversal of an admin decision apart from a
+/// plain not-found. Removing a `denied` row would delete the very guard
+/// `kEnrollUpsertSql`'s `WHERE status <> 'denied'` depends on (the agent's
+/// still-valid token could then re-enroll it with no audit trail explaining the
+/// reversal); removing an `approved` row would silently deregister an enrolled
+/// agent with no admin decision behind it.
+enum class RemovePendingOutcome : std::uint8_t {
+    removed,      ///< The row existed, was `pending`, and was deleted.
+    not_found,    ///< No row exists for this agent_id.
+    wrong_status, ///< A row exists but is `approved`/`denied` — refused, not deleted.
+};
+
+/// Why `AuthManager::verify_password` refused (#5342 Gate 7, sec-3). The two
+/// TRANSIENT kinds (`kStoreUnavailable`, `kCredentialChanged`) are NOT a wrong
+/// password: a caller must answer them with a retryable 503 and must NEVER
+/// count them toward account lockout or write a "login failed" evidence row —
+/// a store blip or a concurrent password change is not a guess.
+enum class VerifyFailure : std::uint8_t {
+    kBadCredential,     ///< the password did not match the stored hash (or was over the max)
+    kUnknownUser,       ///< no ACTIVE account by that name (incl. one removed mid-verify)
+    kStoreUnavailable,  ///< an AuthDB read failed — transient, fail closed, retry
+    kCredentialChanged, ///< the stored hash changed between the read and the row-locked
+                        ///< recheck (a password change committed concurrently) — retry
+};
+
+/// True for the `VerifyFailure` kinds that are not a credential verdict.
+[[nodiscard]] constexpr bool is_transient(VerifyFailure f) noexcept {
+    return f == VerifyFailure::kStoreUnavailable || f == VerifyFailure::kCredentialChanged;
+}
+
+/// A successful `verify_password`: the DB-confirmed role AND the exact stored
+/// hash the password was verified against. The hash is the anchor every later
+/// step of the same login carries forward — the session mint's post-mint
+/// recheck (`create_local_session`, a row-LOCKED re-read) denies if the stored
+/// hash is no longer this one, the MFA enrolment bootstrap binds its guarded
+/// UPDATE to it, and the self-service change compares it under the
+/// `auth.users` row lock (`CredentialChangeOwner`) — so a password reset that
+/// lands mid-flow can never be "completed" with the OLD credential.
+/// Credential material: never log, audit, or serialise it.
+struct VerifiedCredential {
+    Role role{Role::user};
+    std::string hash_hex;
+};
+
+/// Outcome of `AuthManager::remove_user_checked` (#4966). A closed answer so a caller can tell a
+/// last-Administrator refusal and a store fault from "no such user", and can say truthfully what
+/// state the account is in.
+enum class RemoveUserOutcome : std::uint8_t {
+    Removed,                  ///< the account was deactivated; caches and sessions are cleaned up
+    NotFound,                 ///< unknown or already inactive: nothing was deactivated by this call
+    LastAdministratorRefused, ///< deactivating it would remove the last member of a protected
+                              ///< administrator population; NOTHING changed, the account is active
+    StoreFailure,             ///< the guarded write did not complete, OR the guard is not wired
+                              ///< while an AuthDB is (fail closed, never the unguarded path), OR
+                              ///< a retry's session wipe failed on an already-inactive row.
+                              ///< The row may or may not be deactivated (a lost COMMIT ack). On
+                              ///< a failure of the guarded write itself the target's `users_`
+                              ///< entry and sessions are evicted anyway (fail toward
+                              ///< re-authentication). A repeated call (the dashboard DELETE)
+                              ///< can complete it; an IdP retry of a SCIM request is NOT
+                              ///< promised to (#5214)
+    RemovedSessionWipeFailed, ///< the account IS deactivated (committed) but the durable session
+                              ///< wipe failed, so a live session may survive: a repeated
+                              ///< `remove_user_checked` re-runs the wipe (the dashboard DELETE
+                              ///< offers that); a SCIM retry is NOT promised to repeat it
+                              ///< (#5214)
+};
+
+/// Outcome of `AuthManager::update_role_checked` (#4966), the demotion twin of `RemoveUserOutcome`.
+enum class UpdateRoleOutcome : std::uint8_t {
+    Updated,                  ///< the role now equals the requested one (written, or already so)
+    NotFound,                 ///< no such account
+    LastAdministratorRefused, ///< demoting it would remove the last active local admin; NOTHING
+                              ///< changed
+    InactivePromotionRefused, ///< an inactive account cannot be made an admin; NOTHING changed
+    StoreFailure,             ///< as `RemoveUserOutcome::StoreFailure`
+    UpdatedSessionWipeFailed, ///< the role IS changed (committed) but the durable session wipe
+                              ///< failed, so a session at the old role may survive. A repeated
+                              ///< `update_role_checked` re-runs the wipe, but the dashboard role
+                              ///< route answers an unchanged role with a 200 no-op BEFORE calling
+                              ///< it, so that route offers no retry: the operator revokes the
+                              ///< sessions
 };
 
 class AuthManager {
@@ -441,21 +595,27 @@ public:
     /// Persist current user list to disk.
     bool save_config() const;
 
-    /// Interactive first-run: prompt for admin + user credentials, write config.
+    /// Interactive first-run: prompt for the ADMIN credentials only, write config.
+    /// (No second account: only the admin cfg entry is provisioned into the auth
+    /// store, so a cfg-only user could never sign in - #5343.)
     static bool first_run_setup(const std::filesystem::path& cfg_path);
 
     /// Authenticate; returns session token on success.
     std::optional<std::string> authenticate(const std::string& username,
                                             const std::string& password);
 
-    /// Verify a username+password without creating a session. Returns the
-    /// user's legacy role on match, nullopt on failure (unknown user /
-    /// bad password / user soft-deleted in AuthDB). Used by the MFA-aware
-    /// login flow at AuthRoutes::POST /login to decide between "mint full
-    /// session now" (no MFA enrolled) and "issue a pending token, wait
+    /// Verify a username+password without creating a session. On match returns
+    /// the DB-confirmed role and the stored hash it verified against
+    /// (`VerifiedCredential`); on failure a TYPED reason (#5342 Gate 7) — a
+    /// wrong password / unknown user is a credential verdict, an AuthDB read
+    /// failure or a concurrent credential change is TRANSIENT (`is_transient`)
+    /// and must never be counted or audited as a failed guess. Used by the
+    /// MFA-aware login flow at AuthRoutes::POST /login to decide between "mint
+    /// full session now" (no MFA enrolled) and "issue a pending token, wait
     /// for TOTP" (MFA enrolled). Histogram metrics observed on every call
     /// using the same labels as authenticate().
-    std::optional<Role> verify_password(const std::string& username, const std::string& password);
+    [[nodiscard]] std::expected<VerifiedCredential, VerifyFailure>
+    verify_password(const std::string& username, const std::string& password);
 
     /// Create a session for a user who has already cleared the password
     /// and any required MFA checks. Mirrors create_oidc_session but with
@@ -473,7 +633,29 @@ public:
     /// the row exists; calling this directly for an account with no row
     /// (e.g. a test synthesizing a session for an OIDC/SCIM-only
     /// principal) will always be denied (#4107 CI finding, 38cc33b88).
-    std::string create_local_session(const std::string& username, Role role, bool mfa_verified);
+    ///
+    /// `expected_hash_hex` (#5342 Gate 7, REQUIRED — no default): the stored
+    /// hash the caller's `verify_password` verified the password against
+    /// (`VerifiedCredential::hash_hex`, carried through any MFA round trip on
+    /// the pending entry). The post-mint recheck also requires the stored hash
+    /// to STILL be this one, constant-time compared, and revokes-and-denies
+    /// otherwise — so a pending login proven with the OLD password cannot be
+    /// completed after an admin reset or a self-change committed in between.
+    /// An empty value never matches a stored hash and so DENIES (fail closed);
+    /// it never disables the check. Ignored in cfg-file-only mode (no AuthDB,
+    /// no concurrent credential writer).
+    std::string create_local_session(const std::string& username, Role role, bool mfa_verified,
+                                     const std::string& expected_hash_hex);
+
+    /// TEST-ONLY: `create_local_session` WITHOUT the credential anchor — the
+    /// post-mint role/active recheck still runs, only the stored-hash compare
+    /// is skipped. For tests that synthesise a session for a principal whose
+    /// password they never verified (fixtures for unrelated route suites).
+    /// Production code MUST NOT call this — no caller in `server/core/src/**`
+    /// references it; every production mint follows a real password
+    /// verification and passes its hash to `create_local_session`.
+    std::string create_local_session_for_test(const std::string& username, Role role,
+                                              bool mfa_verified);
 
     /// Stamp `mfa_verified_at = system_clock::now()` on the named session.
     /// Returns true if the session existed and was updated. Used by the
@@ -686,10 +868,102 @@ public:
     /// List all configured users (password hashes omitted from caller view).
     std::vector<UserEntry> list_users() const;
 
-    /// Add or overwrite a user.
+    /// Create a user (or, in config-file-only mode, add-or-overwrite the
+    /// in-memory/cfg entry). Returns false when the password fails the length
+    /// policy (`password_policy.hpp`) OR the store write fails — the two are
+    /// indistinguishable here (historical contract; the #5342 password routes
+    /// use the typed `commit_password_change` instead).
+    ///
+    /// With AuthDB configured this NEVER changes an existing account's
+    /// password: `AuthDB::upsert_user` is INSERT-only (`ON CONFLICT DO
+    /// NOTHING` → `UserAlreadyExists` → this returns false). Password changes
+    /// go through `commit_password_change` (#5342).
     bool upsert_user(const std::string& username, const std::string& password, Role role);
 
-    /// Remove a user by name.
+    /// Wire the #5342 credential-change query owner (server.cpp, built after
+    /// the audit store on the shared pool). Null (the default, and cfg-file-only
+    /// mode) ⇒ `commit_password_change` answers `kStoreUnavailable`. The owner
+    /// must outlive every call; server.cpp nulls this at teardown before the
+    /// owner destructs (same contract as `set_auth_db`). Set during
+    /// single-threaded startup only.
+    void set_credential_change_owner(CredentialChangeOwner* owner) noexcept {
+        credential_change_owner_ = owner;
+    }
+
+    /// The ONE local-account credential write (#5342, Gate 8 class fix) —
+    /// self-service change AND administrative reset. Delegates to
+    /// `CredentialChangeOwner::commit`: the credential, every durable session,
+    /// the provisional MFA state, the lockout (admin reset) and the audit
+    /// row(s) commit or abort together in one transaction under the
+    /// `auth.users` row lock (see credential_change_owner.hpp). On `kOk` only,
+    /// AFTER the commit and outside every lock it took, refreshes this
+    /// process's caches: the `users_` entry's hash/salt (if cached) and every
+    /// in-memory `sessions_` entry of the account (other replicas drop theirs
+    /// via the bumped session write-generation). The caller computes the new
+    /// hash (PBKDF2, no lock held) and enforces the length policy before
+    /// calling. Caller must NOT hold `mu_` or any database lock.
+    [[nodiscard]] CredentialChangeOutcome
+    commit_password_change(const CredentialChangeRequest& request);
+
+    /// #5274 boot signal (#5342 Gate 7): with AuthDB wired, `yuzu-server.cfg`
+    /// is seed-only and the stored credential always wins. Compares every
+    /// cfg-seeded `users_` entry against its `auth.users` row and, for each
+    /// one whose hash DIFFERS (a dead cfg password an operator may still think
+    /// is live), logs a `spdlog::warn` naming the user. Sets the
+    /// `yuzu_auth_cfg_credentials_stale` gauge to the count and returns it.
+    /// A cfg user with no row, or whose row read fails, is not counted (the
+    /// latter is logged). Call once at boot, right after `set_auth_db`, before
+    /// any login can hydrate `users_`. 0 in cfg-file-only mode. Caller must
+    /// NOT hold `mu_`.
+    std::size_t report_stale_cfg_credentials();
+
+    /// Wire the #4966 last-Administrator guard (server.cpp, after `RbacStore` opens on the SAME
+    /// pool as `AuthDB`). `AuthManager` borrows the store and reaches the guard through
+    /// `RbacStore::deactivate_account` / `set_local_role`: the owner class is deliberately not
+    /// injected (its constructor is private to `RbacStore`). Must outlive every call; server.cpp
+    /// nulls it at teardown beside `set_credential_change_owner(nullptr)`. Single-threaded
+    /// startup only. FAIL CLOSED: with an AuthDB set and this unset, `remove_user_checked` /
+    /// `update_role_checked` answer `StoreFailure` and NEVER fall back to the unguarded
+    /// `AuthDB::remove_user` / `update_role`.
+    void set_rbac_store(RbacStore* store) noexcept { rbac_store_ = store; }
+    [[nodiscard]] bool has_rbac_store() const noexcept { return rbac_store_ != nullptr; }
+
+    /// The ONE decision "the lifecycle guard is required but not wired": an AuthDB is set and the
+    /// RbacStore is not. Shared by the runtime fail-closed arms and the boot self-check in
+    /// server.cpp (which refuses to start on it), so they cannot disagree. Config-file-only mode
+    /// (no AuthDB) never needs the guard.
+    [[nodiscard]] static constexpr bool lifecycle_guard_unwired(bool auth_db_set,
+                                                                bool rbac_store_set) noexcept {
+        return auth_db_set && !rbac_store_set;
+    }
+
+    /// Remove a user by name, guarded by the last-Administrator floors (#4966) when an AuthDB is
+    /// configured: the soft delete runs in the owner's transaction BEFORE any cache or session
+    /// change, and `mu_` is NEVER held across it (the file-wide "no mu_ across a DB call" rule,
+    /// which `recheck_role_after_credential_check`'s mu_-inside-row-lock acquisition depends on).
+    /// The `users_` erase and the session wipe (in-memory, then durable) run only AFTER a
+    /// committed deactivation, and are re-attempted on `NotFound`, so a repeat re-runs the guarded
+    /// write and the session wipe. Config-file mode (no AuthDB) keeps the in-memory path unchanged.
+    [[nodiscard]] RemoveUserOutcome remove_user_checked(const std::string& username);
+
+    /// #4966 best-effort EARLY refusal for a deactivation: true iff removing `username` would
+    /// exhaust a protected administrator population right now, so a caller can decline BEFORE it
+    /// revokes linked credentials. Read-only, takes no lock, and is NOT the authority: a
+    /// concurrent change can invalidate either answer, and `remove_user_checked` still decides.
+    /// `nullopt` = could not be answered (no AuthDB or no RbacStore wired, or a store fault):
+    /// the caller proceeds and lets the guard decide.
+    [[nodiscard]] std::optional<bool> would_strand_last_administrator(const std::string& username) const;
+
+    /// #4966 pre-create check for SCIM: does the local account name `username` already hold an
+    /// `Administrator` role grant (RBAC `principal_roles`, principal type "user")? A SCIM slug may
+    /// never become a counted administrator, so provisioning refuses a name that already holds one.
+    /// `nullopt` = could not be answered (RbacStore not wired or a store fault): callers refuse.
+    [[nodiscard]] std::optional<bool> holds_administrator_grant(const std::string& username) const;
+
+    /// Bool wrapper over `remove_user_checked` (GUARDED: it delegates). It has no production
+    /// caller (production uses the checked form); it exists for tests. True iff `Removed`. Every refusal, absence and
+    /// failure (including `RemovedSessionWipeFailed`, which was `false` before this wrapper
+    /// existed) is false; a caller that must tell them apart uses the checked form.
     bool remove_user(const std::string& username);
 
     /// Reactivate a user previously soft-deleted via `remove_user` — the
@@ -706,8 +980,18 @@ public:
     /// user (active or not).
     bool reactivate_user(const std::string& username);
 
-    /// Change a user's role. Uses AuthDB if available, otherwise updates in-memory + config.
-    /// Returns false if user not found.
+    /// Change a user's role. Uses AuthDB if available (through the #4966 guarded owner write,
+    /// same ordering and `mu_` rule as `remove_user_checked`), otherwise updates in-memory +
+    /// config. The cache entry and sessions are refreshed after the commit, also when the row
+    /// already held the requested role, so a repeated CALL of this function re-runs a failed
+    /// wipe. That does not make a route-level retry safe: the dashboard role route returns a
+    /// 200 no-op for an unchanged role before it reaches here, and a retry after a lost COMMIT
+    /// acknowledgement is not promised to converge.
+    [[nodiscard]] UpdateRoleOutcome update_role_checked(const std::string& username, Role new_role);
+
+    /// Bool wrapper over `update_role_checked` (GUARDED: it delegates). It has no production
+    /// caller (production uses the checked form); it exists for tests. True iff `Updated`.
+    /// Returns false if user not found, refused, or failed.
     bool update_role(const std::string& username, Role new_role);
 
     /// Look up a user's legacy role. Returns nullopt if user not found (or,
@@ -872,122 +1156,86 @@ public:
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 
-    /// Set an explicit data directory for runtime state files (enrollment
-    /// tokens, pending agents). If not set, defaults to cfg_path_ parent.
-    void set_data_dir(const std::filesystem::path& dir) { data_dir_ = dir; }
+    // -- Enrollment tokens + pending agents (WS-6 slice 6.2, ADR-2002 §8) --------
+    //
+    // Every method below routes to the attached `AuthDB` (Postgres, shared by
+    // every replica) and FAILS CLOSED: with no AuthDB attached (shutdown calls
+    // `set_auth_db(nullptr)`; or never wired) or on any store error the result
+    // is the typed `StoreError` — NEVER an empty list, a `0`, "absent" or
+    // "rejected". There is deliberately no in-memory or file fallback (the
+    // pre-6.2 per-replica .cfg mode was deleted): a fall-through-to-memory on a
+    // store error would let a denied agent re-enroll or a spent token replay.
+    // Each store-side failure bumps `yuzu_auth_enrollment_store_degrade_total`.
+    // `by`/`created_by`/`principal` are the acting principal recorded on the row.
 
-    /// Re-load enrollment tokens and pending agents from the current state_dir().
-    /// Call after set_data_dir() to pick up files from the new location.
-    void reload_state() {
-        load_tokens();
-        load_pending();
-    }
+    /// Create a token. `max_uses` 0 = unlimited; `ttl` 0 = never expires.
+    [[nodiscard]] std::expected<CreatedEnrollmentToken, StoreError>
+    create_enrollment_token(const std::string& label, int max_uses, std::chrono::seconds ttl,
+                            const std::string& created_by);
 
-    // -- Enrollment tokens (Tier 2) ---------------------------------------
+    /// THE atomic enrollment claim (one store transaction): count a token use,
+    /// then approve the agent unless an admin denied it (a denial rolls the use
+    /// back). See `ConsumeEnrollResult`.
+    [[nodiscard]] std::expected<ConsumeEnrollResult, StoreError>
+    consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
+                       const std::string& hostname, const std::string& os,
+                       const std::string& arch, const std::string& agent_version);
 
-    /// Create a new enrollment token. Returns the raw token string (show once).
-    std::string create_enrollment_token(const std::string& label, int max_uses,
-                                        std::chrono::seconds ttl);
+    /// All enrollment tokens, newest first (admin UI).
+    [[nodiscard]] std::expected<std::vector<EnrollmentToken>, StoreError>
+    list_enrollment_tokens();
 
-    /// Create multiple enrollment tokens at once for batch deployment.
-    /// Returns a vector of raw token strings (each shown once).
-    std::vector<std::string> create_enrollment_tokens_batch(const std::string& label_prefix,
-                                                            int count, int max_uses_each,
-                                                            std::chrono::seconds ttl);
-
-    /// Read-only validity check for a raw enrollment token. Returns true
-    /// iff the token exists, is not revoked, is not expired, and still has
-    /// at least one use remaining. Does NOT mutate `use_count` and does
-    /// NOT update `last_consumed_by_agent_id` — call
-    /// `consume_enrollment_token` for the atomic check-and-consume.
-    ///
-    /// W1.4 R2 / UP-H2 semantic restoration: pre-W1.4 R2 this wrapper
-    /// silently delegated to `consume_enrollment_token`, meaning any
-    /// "is this token usable" probe would burn a use. That broke the
-    /// caller's stated intent (name says "validate") and made
-    /// `max_uses=1` tokens unreachable to any caller that wanted to
-    /// observe-before-act. Restored to true read-only semantics. The
-    /// only callers in-tree are tests; production Register / ProxyRegister
-    /// handlers call `consume_enrollment_token` directly so they can
-    /// emit the lost-race audit row.
-    bool validate_enrollment_token(const std::string& raw_token);
-
-    /// Atomic check-and-consume of an enrollment token (W1.4 / #827).
-    ///
-    /// **The race the function closes.** The prior `validate_enrollment_
-    /// token` returned a bare bool. A second concurrent Register that
-    /// presented the same token could pass the validity check before the
-    /// first call's `++use_count` landed, allowing a single-use token to
-    /// enroll N agents in the race window. This function does the validity
-    /// check and the use-count increment under the SAME `unique_lock` so
-    /// no second consumer can interleave. The token's `last_consumed_by_
-    /// agent_id` is written under the same lock, giving the lost-race
-    /// audit row enough context to name the winner.
-    ///
-    /// **Why an `EnrollmentClaim` on success.** The handler needs the
-    /// public token_id (for audit detail), the new use_count (so a
-    /// successful multi-use consume can still emit a "M of N uses
-    /// remaining" log line), and `single_use` so the response can
-    /// summarise the token's lifecycle.
-    ///
-    /// **Why a typed error on failure.** Audit/metric variant lives in the
-    /// typed error; public wire response uniformly says "invalid, expired,
-    /// or exhausted enrollment token" so the response shape is the same
-    /// regardless of variant. This is the same wire-collapse rule that
-    /// W1.3 enforces for `DeviceTokenValidateError` — a presenter cannot
-    /// discriminate `not_found` from `already_consumed` (which would tell
-    /// them the token existed and someone beat them to it). Operator-
-    /// visible variance lives in audit rows + Prometheus counters.
-    ///
-    /// `consuming_agent_id` is the agent_id presented to Register. It is
-    /// written into the token's `last_consumed_by_agent_id` on a winning
-    /// consume so a subsequent loser can audit `already_consumed_by=<id>`.
-    [[nodiscard]] std::expected<EnrollmentClaim, EnrollmentTokenError>
-    consume_enrollment_token(std::string_view raw_token, std::string_view consuming_agent_id);
-
-    /// Look up the most-recent consumer's agent_id for a token (hash-keyed).
-    /// Used by the Register handler's lost-race audit emission so the
-    /// "already_consumed_by=<X>" detail can name the winning agent without
-    /// requiring a second locked traversal in the consume path.
-    /// Returns empty string if no record / token not found / never consumed.
-    std::string last_consumer_for_token_hash(std::string_view token_hash) const;
-
-    /// List all enrollment tokens (for admin UI).
-    std::vector<EnrollmentToken> list_enrollment_tokens() const;
-
-    /// Revoke a token by its token_id.
-    bool revoke_enrollment_token(const std::string& token_id);
+    /// Revoke a token by its token_id. `true` = the token exists (idempotent).
+    [[nodiscard]] std::expected<bool, StoreError> revoke_enrollment_token(const std::string& token_id);
 
     // -- Pending agents (Tier 1) ------------------------------------------
 
-    /// Add an agent to the pending approval queue.
-    void add_pending_agent(const std::string& agent_id, const std::string& hostname,
-                           const std::string& os, const std::string& arch,
-                           const std::string& agent_version);
+    /// Queue an unenrolled agent as pending. `true` = NEWLY added (gates the
+    /// analytics event + SSE publish); `false` = a row already existed.
+    [[nodiscard]] std::expected<bool, StoreError>
+    add_pending_agent(const std::string& agent_id, const std::string& hostname,
+                      const std::string& os, const std::string& arch,
+                      const std::string& agent_version);
 
-    /// Mark an agent as enrolled (approved). Creates the entry if it doesn't
-    /// exist, or sets an existing entry to approved. This ensures reconnecting
-    /// agents are recognized without re-enrollment.
-    /// Returns false if the agent has been explicitly denied by an admin —
-    /// tokens do not override admin denials.
-    bool ensure_enrolled(const std::string& agent_id, const std::string& hostname,
-                         const std::string& os, const std::string& arch,
-                         const std::string& agent_version);
+    /// Mark an agent as enrolled (approved), creating the row if absent.
+    /// `true` = enrolled; `false` = the agent was explicitly denied by an admin
+    /// (tokens and auto-approve never override an admin denial). `by` is
+    /// recorded as the row's `status_changed_by`.
+    [[nodiscard]] std::expected<bool, StoreError>
+    ensure_enrolled(const std::string& agent_id, const std::string& hostname,
+                    const std::string& os, const std::string& arch,
+                    const std::string& agent_version, const std::string& by);
 
-    /// Check if an agent_id is pending, approved, or denied.
-    std::optional<PendingStatus> get_pending_status(const std::string& agent_id) const;
+    /// Five-state lookup: a value = pending/approved/denied; `nullopt` = absent;
+    /// `unexpected(StoreError)` = ERROR. A caller MUST NOT treat the error as
+    /// "absent" (an unreadable denied row would fall through to add/consume).
+    [[nodiscard]] std::expected<std::optional<PendingStatus>, StoreError>
+    get_pending_status(const std::string& agent_id);
 
-    /// List all pending agents (for admin UI).
-    std::vector<PendingAgent> list_pending_agents() const;
+    /// All pending-agent rows (any status), newest first (admin UI).
+    [[nodiscard]] std::expected<std::vector<PendingAgent>, StoreError> list_pending_agents();
 
-    /// Approve a pending agent.
-    bool approve_pending_agent(const std::string& agent_id);
+    /// Approve / deny a pending agent. `true` = the row existed.
+    [[nodiscard]] std::expected<bool, StoreError>
+    approve_pending_agent(const std::string& agent_id, const std::string& principal);
+    [[nodiscard]] std::expected<bool, StoreError>
+    deny_pending_agent(const std::string& agent_id, const std::string& principal);
 
-    /// Deny a pending agent.
-    bool deny_pending_agent(const std::string& agent_id);
+    /// Bulk approve / deny: every row that is `pending` AT THE TIME OF THE
+    /// STATEMENT moves in one atomic `UPDATE .. WHERE status='pending' RETURNING`,
+    /// so a row a concurrent admin denied/approved (or another replica moved) is
+    /// never overwritten. Returns the agent_ids THIS call transitioned — the
+    /// authoritative count and audit set.
+    [[nodiscard]] std::expected<std::vector<std::string>, StoreError>
+    approve_all_pending_agents(const std::string& principal);
+    [[nodiscard]] std::expected<std::vector<std::string>, StoreError>
+    deny_all_pending_agents(const std::string& principal);
 
-    /// Remove a pending agent entry (cleanup after enrollment or denial).
-    bool remove_pending_agent(const std::string& agent_id);
+    /// Remove a pending agent entry (hard delete). Only a `pending` row is ever
+    /// deleted — see `RemovePendingOutcome`'s doc comment for why an
+    /// `approved`/`denied` row must be REFUSED, not silently reversed.
+    [[nodiscard]] std::expected<RemovePendingOutcome, StoreError>
+    remove_pending_agent(const std::string& agent_id);
 
     // -- Crypto primitives (platform-abstracted) --------------------------
 
@@ -1009,18 +1257,26 @@ private:
     /// is never logged or counted as a bad username.
     enum class UserLookupMiss { NotFound, DbError };
 
-    /// Look a user up for a credential check, hydrating `users_` from AuthDB on
-    /// a cache miss (#4020). `users_` is warmed only by load_config() and by THIS
-    /// process's own per-username writes, so a row created anywhere else (a
-    /// dashboard `POST /api/settings/users` before a restart, SCIM, another
-    /// replica) is invisible to a cache-only lookup - authenticate() and
-    /// verify_password() reported "unknown user" for a genuinely active account
-    /// until the next cfg-file boot. The AuthDB row is authoritative and the map
-    /// is a read-optimisation layered on top (the remove_user / update_role /
-    /// reactivate_user contract). PG I/O runs OUTSIDE `mu_`; the insert never
-    /// overwrites an entry an in-process write installed while that read was in
-    /// flight. Returns a COPY so callers run PBKDF2 without holding `mu_`.
-    /// Caller must NOT hold `mu_`.
+    /// Look a user up for a credential check.
+    ///
+    /// AuthDB mode (#5274): DB-FIRST on every call — the credential (hash +
+    /// salt) and role come from `AuthDB::get_user`, NEVER from `users_`
+    /// (precedent: `get_user_role`, "ALWAYS authoritative"). `users_` is seeded
+    /// at boot from `yuzu-server.cfg` by `load_config()` and is never
+    /// invalidated across replicas, so a cache-first read let (a) every restart
+    /// re-seed a pre-change cfg hash that then shadowed a password changed in
+    /// AuthDB, and (b) a second replica keep accepting the old password until
+    /// it restarted. The cfg file is therefore seed-only by construction. A
+    /// store error fails closed (`DbError`) — never a cache fallback, which
+    /// would reopen exactly that gap while the store degrades. On a miss the
+    /// row is still `try_emplace`d into `users_` (the #4020 warm-up other
+    /// readers rely on); an existing entry is left alone (the write paths own
+    /// cache refresh), since its credentials are never consulted here.
+    ///
+    /// Config-file-only mode (no AuthDB): unchanged — the map IS the truth.
+    ///
+    /// PG I/O runs OUTSIDE `mu_`. Returns a COPY so callers run PBKDF2 without
+    /// holding `mu_`. Caller must NOT hold `mu_`.
     [[nodiscard]] std::expected<UserEntry, UserLookupMiss>
     find_user_or_hydrate(const std::string& username);
 
@@ -1119,9 +1375,22 @@ private:
     /// `context` is the log-message prefix ("Auth failed" / "verify_password
     /// failed") so both callers keep their existing distinct wording. Caller
     /// must NOT hold `mu_`.
-    [[nodiscard]] std::optional<Role>
+    ///
+    /// #5274: `verified_hash_hex` is the stored hash the caller just verified
+    /// the supplied password against. The row-locked read also returns the
+    /// row's CURRENT `password_hash`; if it differs (a password change
+    /// committed between the caller's read and this lock) the check DENIES —
+    /// no re-verify against the new hash; the user simply retries. Ignored in
+    /// cfg-file mode.
+    ///
+    /// Typed (#5342 Gate 7): `kUnknownUser` when the row is no longer active
+    /// (a credential verdict, like an unknown name), `kStoreUnavailable` on a
+    /// store error, `kCredentialChanged` on the hash mismatch above — the last
+    /// two are transient and never a failed guess.
+    [[nodiscard]] std::expected<Role, VerifyFailure>
     recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
                                         std::uint64_t pre_check_version,
+                                        const std::string& verified_hash_hex,
                                         std::string_view context);
 
     /// Closes the #4107 check-then-mint gap: `recheck_role_after_credential_
@@ -1148,8 +1417,28 @@ private:
     ///
     /// Returns `true` unconditionally in cfg-file mode (`!auth_db_`) - no
     /// separate authority exists to diverge from. Caller must NOT hold `mu_`.
+    ///
+    /// `expected_hash_hex` (#5342 Gate 7): when engaged, the stored hash must
+    /// ALSO still equal it (constant-time compare) — a password change/reset
+    /// that committed after the caller verified the password revokes and
+    /// denies exactly like a role divergence. Disengaged only for
+    /// `create_local_session_for_test` (no password was ever verified).
+    ///
+    /// #5342 Gate 8 (M1): the re-read is ROW-LOCKED
+    /// (`AuthDB::recheck_role_locked`, `SELECT ... FOR UPDATE`, bounded
+    /// `lock_timeout`), never a plain autocommit read — so a credential change
+    /// whose UPDATE has executed but not yet committed makes this call WAIT for
+    /// that commit and then see the new hash (deny + revoke), instead of
+    /// reading the old hash past an uncommitted write whose session DELETE
+    /// already ran before this session existed.
     [[nodiscard]] bool post_mint_role_recheck(const std::string& username, Role minted_role,
+                                              const std::optional<std::string>& expected_hash_hex,
                                               std::string_view context);
+
+    /// Shared body of `create_local_session` / `create_local_session_for_test`.
+    [[nodiscard]] std::string
+    mint_local_session(const std::string& username, Role role, bool mfa_verified,
+                       const std::optional<std::string>& expected_hash_hex);
 
     /// Backing field for `set_role_recheck_race_hook_for_test` - see that
     /// method's doc. Invoked (if set) from inside
@@ -1172,6 +1461,13 @@ private:
     /// as `role_recheck_race_hook_for_test_` above - see that field's
     /// Resource Ledger entry, which covers this one too.
     std::function<void()> post_mint_race_hook_for_test_;
+
+    /// #5342: the credential-change query owner (`set_credential_change_owner`).
+    /// Borrowed, never owned; null ⇒ no credential writes.
+    CredentialChangeOwner* credential_change_owner_{nullptr};
+
+    /// #4966: the last-Administrator guard (`set_rbac_store`). Borrowed, never owned.
+    yuzu::server::RbacStore* rbac_store_{nullptr};
 
     /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
     /// doc for why this is process-wide, not per-username. `std::atomic` since
@@ -1241,6 +1537,17 @@ private:
     /// (true) without a store. Caller must NOT hold `mu_`.
     [[nodiscard]] bool wipe_user_sessions_durable(const std::string& username);
 
+    /// #4966: after a guarded lifecycle write answered StoreFailure (it MAY have committed: a
+    /// lost COMMIT ack), evict the TARGET's `users_` entry and in-memory sessions and attempt the
+    /// durable wipe, so a possibly-committed removal or demotion is not served stale. Fails
+    /// toward re-authentication; the caller still answers StoreFailure. Caller must NOT hold
+    /// `mu_`.
+    void evict_target_after_indeterminate_write(const std::string& username);
+
+    /// #4966: `yuzu_server_rbac_lifecycle_store_failure_total{op}` (deactivate | set_role |
+    /// would_strand | grant_read). No-op without a MetricsRegistry.
+    void note_lifecycle_store_failure(const char* op) const;
+
     /// Poll the durable write-generation on an interval; when it has advanced
     /// (a create/invalidate/elevate/mfa mutation landed, possibly on another
     /// replica), clear the process-local `sessions_` cache so the next lookup
@@ -1265,24 +1572,16 @@ private:
     /// a store. Takes `session_gen_mtx_`; caller must NOT hold it.
     [[nodiscard]] bool session_generation_view_stale() const;
 
-    /// Persist enrollment tokens to disk.
-    bool save_tokens() const;
-    /// Load enrollment tokens from disk.
-    bool load_tokens();
-
-    /// Persist pending agents to disk.
-    bool save_pending() const;
-    /// Load pending agents from disk.
-    bool load_pending();
-
-    /// Returns the directory for runtime state files.
-    std::filesystem::path state_dir() const {
-        return data_dir_.empty() ? cfg_path_.parent_path() : data_dir_;
-    }
+    /// Shared body of every enrollment/pending store call: resolves the attached
+    /// AuthDB (null => `StoreError::Unavailable`, fail closed) and counts a
+    /// degrade (`yuzu_auth_enrollment_store_degrade_total{op,reason}`) on any
+    /// store-side failure. `op` is a short literal.
+    template <typename R, typename Fn>
+    [[nodiscard]] std::expected<R, StoreError> enrollment_store_call(const char* op, Fn&& fn);
+    void note_enrollment_store_degrade(const char* op, const char* reason) const;
 
     mutable std::shared_mutex mu_;
     std::filesystem::path cfg_path_;
-    std::filesystem::path data_dir_;
     std::unordered_map<std::string, UserEntry> users_;
     // Keyed by the token HASH when a durable store is configured (it is the
     // store row key too), by the raw token in the legacy in-memory-only mode.
@@ -1319,12 +1618,6 @@ private:
 
     // Non-owning pointer to MetricsRegistry; null in tests/CLI tools.
     yuzu::MetricsRegistry* metrics_ = nullptr;
-
-    // Enrollment tokens keyed by token_id
-    std::unordered_map<std::string, EnrollmentToken> enrollment_tokens_;
-
-    // Pending agents keyed by agent_id
-    std::unordered_map<std::string, PendingAgent> pending_agents_;
 };
 
 // OS-appropriate default paths.

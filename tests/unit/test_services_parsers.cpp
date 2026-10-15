@@ -166,10 +166,38 @@ TEST_CASE("services: parse_launchctl_list defaults to kMaxServiceRows when no ca
     CHECK(result.total_seen == kMaxServiceRows + 10);
 }
 
-TEST_CASE("services: parse_launchctl_list on empty/header-only input yields no entries",
+TEST_CASE("services: parse_launchctl_list header-only input yields no entries, not malformed",
           "[services][macos]") {
-    CHECK(parse_launchctl_list("", false).services.empty());
-    CHECK(parse_launchctl_list("PID\tStatus\tLabel\n", false).services.empty());
+    // A real exit-0 `launchctl list` capture with genuinely zero services
+    // still emits the header row -- see the next test for the zero-line
+    // case, which is the opposite verdict.
+    auto result = parse_launchctl_list("PID\tStatus\tLabel\n", false);
+    CHECK(result.services.empty());
+    CHECK_FALSE(result.malformed);
+}
+
+TEST_CASE("services: parse_launchctl_list on a truncated/zero-line capture reports "
+          "malformed, never a clean \"0 services\" (CA-1, governance A0 round-4)",
+          "[services][macos]") {
+    // Before the convergence onto agents/shared/launchctl_list.hpp, this
+    // plugin's own independent parser had no header-shape check and no
+    // empty-input check at all: a truncated/zero-line capture parsed as a
+    // clean "0 services" success, the identical defect class UP2-2 fixed
+    // for TAR at HIGH in round 2.
+    auto result = parse_launchctl_list("", false);
+    CHECK(result.services.empty());
+    CHECK(result.malformed);
+}
+
+TEST_CASE("services: parse_launchctl_list on a preamble/garbled header line reports "
+          "malformed, not decoded from the wrong offset",
+          "[services][macos]") {
+    const std::string out = "launchctl: some warning banner\n"
+                             "PID\tStatus\tLabel\n"
+                             "1190\t0\tcom.apple.progressd\n";
+    auto result = parse_launchctl_list(out, false);
+    CHECK(result.services.empty());
+    CHECK(result.malformed);
 }
 
 // ── is_safe_service_name ─────────────────────────────────────────────────────

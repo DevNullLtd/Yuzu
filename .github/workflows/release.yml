@@ -25,8 +25,10 @@ permissions:
   contents: read
 
 env:
-  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
-  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # meson pin for the Linux and macOS legs lives in requirements-ci.txt (pip
+  # ecosystem tracked by Dependabot); the Windows leg uses the runner's
+  # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
+  # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
@@ -42,9 +44,88 @@ env:
   YUZU_BUILD_JOBS: "16"
 
 jobs:
+  # ── Refuse to publish over a released tag (#5282) ────────────────────
+  # Every image-publishing job (docker-publish, docker-publish-postgres,
+  # docker-publish-chisel, docker-publish-agent-bundle) and the release job
+  # list this job in `needs`, and so do the three build jobs, so a refused run
+  # stops before any build, attestation or push. Without it, a run started
+  # against an already-released tag (by mistake, or a superseded run) rebuilt
+  # everything and pushed new digests over :X.Y.Z (and :X.Y/:latest), which then
+  # no longer matched the published release's signed SHA256SUMS and SBOMs; the
+  # only existing-release check was the release job's own, after every push.
+  #
+  # There is deliberately NO override input. A published release's assets and
+  # signatures describe the images it shipped, so any re-push over it breaks
+  # verification. To redo a release, cut a new version. Deleting a PUBLISHED
+  # release is never the recovery for a failed job (that is "Re-run failed
+  # jobs" on the newest run); it is only for a release whose published content
+  # is itself wrong, an explicit, destructive step the release skill gates on
+  # operator confirmation, after which a fresh run recreates the release
+  # together with the images it pushes.
+  #
+  # Only a release tag may run: the ref must be a tag (a workflow_dispatch from
+  # a branch is refused) shaped vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N, the alphabet
+  # the release job's prerelease classifier and the `:latest` enable
+  # (!contains(ref_name, '-')) assume.
+  #
+  # Fail-closed: only an HTTP 404 status line from
+  # `gh api -i repos/.../releases/tags/<tag>` proceeds; 200 refuses; anything
+  # else — no status line, 401/403/429/5xx — fails the run. gh's exit code and
+  # stderr prose are never interpreted. contents:read sees PUBLISHED releases
+  # only, not drafts; a draft for the tag is caught later by "Create GitHub
+  # Release" (after the pushes). A re-run ("Re-run failed jobs" on the newest
+  # run, the release skill's Recovery) does not repeat this job; every push and
+  # the release creation instead re-check that the tag still points at the
+  # run's commit (scripts/ci/check-release-tag-sha.sh).
+  # Shell contract: tests/shell/test_release_guard.sh (runs this step body).
+  release-guard:
+    name: "Refuse re-publish over a released tag"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read   # gh api releases/tags/<tag> (sees published releases only)
+    steps:
+      - id: refuse-published-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          tag="${GITHUB_REF_NAME:-}"
+          # SEC-F1: only a release tag may publish. A branch ref (a workflow_dispatch
+          # without --ref vX.Y.Z) has no release, so the existence check alone passes it
+          # and docker-publish-postgres would push :latest from branch content.
+          if [[ "${GITHUB_REF_TYPE:-}" != "tag" ]]; then
+            echo "::error::release.yml must run from a release tag, not ${GITHUB_REF_TYPE:-<unset>} '${tag}' (dispatch with --ref vX.Y.Z). Refusing (#5282)."
+            exit 1
+          fi
+          re='^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)[0-9]+)?$'
+          if [[ ! "$tag" =~ $re ]]; then
+            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N). Refusing (#5282)."
+            exit 1
+          fi
+          out="$(mktemp)"; err="$(mktemp)"; rc=0
+          gh api -i "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$out" 2>"$err" || rc=$?
+          # The HTTP status line is the ONLY evidence accepted: 200 = a published
+          # release exists; 404 = none visible to this token (REST returns 404 for a
+          # draft too). gh's exit code and stderr prose are never interpreted.
+          status="$(head -n1 "$out" | tr -d '\r' | awk '$1 ~ /^HTTP\// { print $2 }')"
+          case "$status" in
+            200)
+              body="$(sed '1,/^\r\{0,1\}$/d' "$out")"
+              echo "::error::Release $tag already exists ($(jq -c '{tag_name,published_at,html_url}' <<<"$body" 2>/dev/null || head -c 300 <<<"$body")). Refusing to rebuild and push images over it: they would no longer match its signed SHA256SUMS and SBOMs (#5282). Cut a new version; see the release skill, Recovery."
+              exit 1 ;;
+            404)
+              echo "No published release for $tag (HTTP 404); publishing may proceed."
+              exit 0 ;;
+            *)
+              echo "::error::Could not determine whether release $tag exists (gh exit $rc, HTTP status '${status:-none}'): $(tr '\r\n' '  ' <"$err"). Failing closed (#5282)."
+              exit 1 ;;
+          esac
+
   # ── Linux x64 release build ──────────────────────────────────────────
   build-linux:
     name: "Build Linux x64"
+    needs: [release-guard]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     permissions:
       contents: read
@@ -65,8 +146,9 @@ jobs:
           persist-credentials: false
 
       # Activate Erlang/OTP + rebar3 so the meson `.gateway_built` custom_target
-      # (auto-enabled whenever rebar3 is on PATH — meson.build gates the gateway
-      # purely on `find_program('rebar3')`) can run `escript` at compile time.
+      # (enabled when rebar3 is on PATH AND an OTP passing the pin in
+      # scripts/erlang_toolchain.py - 28.4 or any later 28.x - is found at
+      # configure) can run `escript` at compile time.
       # The github-runner user has rebar3 in ~/.local/bin but no OTP runtime on
       # PATH, so without this the Build step fails at `.gateway_built` with
       # "escript: No such file or directory". Pin matches ci.yml + the
@@ -212,12 +294,78 @@ jobs:
 
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
+      # Linux ELF floor gate, ADR-2003 (Proposed, PR #5631) slice S0:
+      # REPORT-ONLY. Measures the versioned-symbol requirements of everything
+      # just staged against the committed floor files (agent: glibc 2.28;
+      # server: 2.34) and records them. continue-on-error, and the script exits
+      # 0 on violations in this mode, so it cannot fail a release; the step is
+      # bounded to 10 minutes (the script has its own 240s deadline per run)
+      # so a hung binutils call cannot hold the runner for long. S2 flips it to
+      # --enforce. Contract: tests/shell/test_check_elf_floor.sh;
+      # docs/ci-architecture.md.
+      - name: ELF floor report (report-only, ADR-2003 S0)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          # The default shell is `bash -e` without pipefail: without this the
+          # `| tee || rc=$?` below would report tee's status, not the script's.
+          set -o pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
+          STAGING="yuzu-${VERSION}-linux-x64"
+          OUT="${RUNNER_TEMP}/elf-floor"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+          rc=0
+          bash scripts/ci/check-elf-floor.sh --report-only \
+            --floor deploy/packaging/linux-floor-agent.json --dir "$STAGING" \
+            --exclude 'bin/yuzu-server' --set-name agent \
+            --source "${GITHUB_REF_NAME} yuzu-linux-x64.tar.gz (agent set)" \
+            --emit-baseline "$OUT/baseline.json" --full-report "$OUT/agent-full.json" \
+            | tee "$OUT/agent-report.txt" || rc=$?
+          bash scripts/ci/check-elf-floor.sh --report-only \
+            --floor deploy/packaging/linux-floor-server.json --dir "$STAGING" \
+            --include 'bin/yuzu-server' --set-name server \
+            --source "${GITHUB_REF_NAME} yuzu-linux-x64.tar.gz (server)" \
+            --emit-baseline "$OUT/baseline.json" --full-report "$OUT/server-full.json" \
+            | tee "$OUT/server-report.txt" || rc=$?
+          exit "$rc"
+
+      # Named without the "yuzu-" prefix on purpose: the release job downloads
+      # every artifact matching 'yuzu-*' into its asset directory.
+      - name: Upload ELF floor report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: linux-elf-floor-report
+          path: ${{ runner.temp }}/elf-floor
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Build .deb packages
         run: |
+          # This job runs in a reused self-hosted workspace (clean: false). Clear
+          # packages left by an earlier release first, or the "*.deb"/"*.rpm"
+          # attest and upload globs ship them as this release's output (v0.13.0-rc6
+          # published rc4 packages with rc6 provenance). This rm is the primary
+          # control; scripts/check-release-artifacts.sh catches only leftovers
+          # from a different version.
+          rm -f -- ./*.deb ./*.rpm
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-deb.sh \
             --bin-dir build-linux --version "$DEB_VERSION" --output .
+          # Pre-release FILE names use the tag's version, not DEB_VERSION (#5141).
+          # The control Version keeps Debian's "~" so 0.14.0~rc3 sorts before
+          # 0.14.0, but GitHub rewrites "~" to "." in asset names, so a "~"
+          # file name never matched SHA256SUMS or the provenance subjects.
+          # Renaming here, before attestation and upload, keeps every
+          # downstream name (attestations, SHA256SUMS, .intoto.jsonl) equal
+          # to the stored asset name.
+          if [ "$DEB_VERSION" != "$VERSION" ]; then
+            for f in *_"${DEB_VERSION}"_*.deb; do
+              mv -v -- "$f" "${f/_${DEB_VERSION}_/_${VERSION}_}"
+            done
+          fi
 
       - name: Build .rpm packages
         run: |
@@ -238,7 +386,7 @@ jobs:
       # Output two formats because customer questionnaires ask for one
       # or the other inconsistently and both are trivial to emit.
       - name: Generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
@@ -247,7 +395,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: spdx-json
@@ -368,14 +516,11 @@ jobs:
           set +e
           rebar3 as test eunit --dir apps/yuzu_gw/test 2>&1 | tee eunit.log
           RC=${PIPESTATUS[0]}
-          # Allow exit 1 if all tests passed but meck fixtures were cancelled
-          if [ "$RC" -ne 0 ]; then
-            if grep -q "Failed: 0" eunit.log && grep -q "Passed:" eunit.log; then
-              echo "::warning::EUnit exited $RC but 0 tests failed (meck fixture cancellation)"
-            else
-              exit "$RC"
-            fi
-          fi
+          # One parser for every gateway test gate (scripts/gateway_test_summary.py,
+          # pinned by tests/test_gateway_test_summary.py): >= 1 test must have
+          # EXECUTED (#4800), and a non-zero exit is tolerated only for eunit's
+          # "Failed: 0" line with tests passed (meck fixture cancellation, #1005).
+          python3 ../scripts/gateway_test_summary.py cancel-tolerant "$RC" eunit.log --github
 
       - name: Run Dialyzer
         working-directory: gateway
@@ -396,11 +541,28 @@ jobs:
 
       - name: Build .deb package
         run: |
+          # Defensive: this job's checkout cleans the workspace, but build-linux's
+          # does not (clean: false) and there old packages were shipped as this
+          # release's output (#5141). Never let the "*.deb"/"*.rpm" attest and
+          # upload globs below see a package this step did not build.
+          rm -f -- ./*.deb ./*.rpm
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-gateway-deb.sh \
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
             --version "$DEB_VERSION" --output .
+          # Pre-release FILE names use the tag's version, not DEB_VERSION (#5141).
+          # The control Version keeps Debian's "~" so 0.14.0~rc3 sorts before
+          # 0.14.0, but GitHub rewrites "~" to "." in asset names, so a "~"
+          # file name never matched SHA256SUMS or the provenance subjects.
+          # Renaming here, before attestation and upload, keeps every
+          # downstream name (attestations, SHA256SUMS, .intoto.jsonl) equal
+          # to the stored asset name.
+          if [ "$DEB_VERSION" != "$VERSION" ]; then
+            for f in *_"${DEB_VERSION}"_*.deb; do
+              mv -v -- "$f" "${f/_${DEB_VERSION}_/_${VERSION}_}"
+            done
+          fi
 
       - name: Build .rpm package
         run: |
@@ -419,7 +581,7 @@ jobs:
       # walks _build/prod/rel/yuzu_gw/ for compiled beam files + OTP
       # runtime bundled into the release.
       - name: Generate gateway SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: gateway
           format: cyclonedx-json
@@ -428,7 +590,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate gateway SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: gateway
           format: spdx-json
@@ -479,10 +641,12 @@ jobs:
           retention-days: 3
 
   # ── Windows x64 release build ────────────────────────────────────────
-  # No needs: — runs on the Wee Tam Windows pool (a separate host from the Big
-  # Tam Linux build) so it can build in parallel with build-linux + build-gateway.
+  # Needs only release-guard (#5282) — runs on the Wee Tam Windows pool (a
+  # separate host from the Big Tam Linux build) so it can build in parallel with
+  # build-linux + build-gateway.
   build-windows:
     name: "Build Windows x64"
+    needs: [release-guard]
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     permissions:
       contents: read
@@ -507,9 +671,27 @@ jobs:
         with:
           sdk: 10.0.26100.0
 
-      - name: Install Meson and ccache
+      - name: Verify Meson, PyYAML and ccache (pre-provisioned)
+        shell: pwsh
         run: |
-          pip install --require-hashes -r requirements-ci.txt
+          # Never install Python packages here. Wee Tam's toolchain is set up
+          # by deploy/windows/Provision-Windows-Runner.ps1 and pinned by
+          # deploy/windows/toolchain-contract.json (checked by the next step).
+          # All runner slots share one OS identity, so a machine-wide OR a
+          # --user install changes what every later job's C:\Python314
+          # imports: requirements-ci.txt pins a newer meson than the contract,
+          # and installing it (machine-wide, in the v0.14.0-rc1 release run)
+          # failed the contract check for every Windows job on the box.
+          # A missing PyYAML (embed_content.py needs it at meson setup) is a
+          # provisioning fault, so fail with the fix instead of installing.
+          $PSNativeCommandUseErrorActionPreference = $false
+          python -c "import yaml" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::PyYAML is not importable by the runner's Python (C:\Python314). This job does not install packages into the shared host Python: drain every runner slot on this host, then re-run deploy/windows/Provision-Windows-Runner.ps1 from an elevated pwsh session (do not pass -AllowActiveRunners)."
+            exit 1
+          }
+          meson --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # ccache is pre-provisioned on the Wee Tam (yuzu-weetam-windows)
           # runner — C:\tools\ccache is already on PATH. Chocolatey is NOT
           # installed there, so the old `choco install ccache` aborted the
@@ -762,7 +944,7 @@ jobs:
       # binaries). Syft supports PowerShell/Windows runners via the
       # composite action, which downloads a Windows syft binary.
       - name: Generate Windows SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
@@ -771,7 +953,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate Windows SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: spdx-json
@@ -818,6 +1000,7 @@ jobs:
   # ── macOS ARM64 release build ────────────────────────────────────────
   build-macos:
     name: "Build macOS ARM64"
+    needs: [release-guard]
     # Pinned to the self-hosted BigMags macOS pool (Apple Silicon, Xcode 16 /
     # Apple Clang 16, accepts -std=c++23), matching how build-linux/build-gateway
     # pin Big Tam and build-windows pins Wee Tam. release.yml triggers only on
@@ -1139,7 +1322,7 @@ jobs:
       # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
       # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
       - name: Generate macOS SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
@@ -1148,7 +1331,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate macOS SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: spdx-json
@@ -1195,7 +1378,7 @@ jobs:
   # across releases so repeat runs with unchanged vcpkg/rebar deps are fast.
   docker-publish:
     name: "Publish ${{ matrix.image }} image"
-    needs: [build-linux, build-gateway]
+    needs: [release-guard, build-linux, build-gateway]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
     permissions:
@@ -1224,20 +1407,23 @@ jobs:
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo (e.g.
           # yuzu-agent-bundle-chisel, originally created via local
           # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
           # don't have access to the secret. Username pinned to the
-          # PAT owner ('Tr3kkR') since github.actor varies per actor.
-          username: Tr3kkR
+          # PAT owner since github.actor varies per actor. The owner is a
+          # USER, not the org, so it is carried in the `GHCR_USERNAME` repo
+          # variable rather than hardcoded — see the DevNullLtd migration
+          # note in .github/runner-inventory.json.
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
@@ -1278,7 +1464,7 @@ jobs:
       # export would be a full duplicate write of a cache that already includes
       # the vcpkg builder stage, for no benefit.
       - name: Build for healthcheck verification (no push)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -1305,9 +1491,12 @@ jobs:
           IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
         run: docker image rm -f "$IMAGE" || true
 
+      - name: Refuse to publish if the tag moved (#5282)
+        run: bash scripts/ci/check-release-tag-sha.sh
+
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -1343,7 +1532,7 @@ jobs:
       # will pull. Output goes to artifacts/ for the release job to
       # attach alongside the per-platform archive SBOMs.
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1352,23 +1541,13 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: yuzu-${{ matrix.image }}-image.spdx.json
           artifact-name: yuzu-${{ matrix.image }}-image.spdx.json
           upload-artifact: false
-
-      - name: Upload image SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        continue-on-error: true
-        with:
-          name: yuzu-${{ matrix.image }}-image-sbom
-          path: |
-            yuzu-${{ matrix.image }}-image.cdx.json
-            yuzu-${{ matrix.image }}-image.spdx.json
-          retention-days: 3
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
@@ -1399,6 +1578,27 @@ jobs:
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
 
+      - name: Upload image SBOM artifacts
+        # After attest + sign (#5242): if this upload fails, the pushed tag is
+        # already signed and attested, rather than left unsigned until a re-run.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
+        # upload must fail this job rather than leave a green leg with an
+        # earlier attempt's SBOM (or none) for the release to sign.
+        with:
+          name: yuzu-${{ matrix.image }}-image-sbom
+          path: |
+            yuzu-${{ matrix.image }}-image.cdx.json
+            yuzu-${{ matrix.image }}-image.spdx.json
+          if-no-files-found: error
+          retention-days: 3
+          # A re-run of this job ("Re-run failed jobs" on the newest run, the
+          # release skill's Recovery) pushes a new digest; replace the earlier attempt's
+          # SBOM. With no continue-on-error and
+          # if-no-files-found: error, a re-run either uploads this attempt's
+          # SBOM or fails the job (#5242).
+          overwrite: true
+
       - name: Image summary
         env:
           META_TAGS: ${{ steps.meta.outputs.tags }}
@@ -1425,13 +1625,12 @@ jobs:
   #      build failure is irrelevant to it. It IS in the release job's
   #      needs: the composes release-pin ghcr.io/.../yuzu-postgres:X.Y.Z,
   #      so a release must not publish if this image failed to.
-  #   2. Multi-arch linux/amd64,linux/arm64 (the demo/viz rigs are arm64).
-  #      The arm64 leg runs under QEMU on the amd64 self-hosted runner —
-  #      cheap here (apt install + one small C extension compile), unlike
-  #      the chisel jobs' full vcpkg-from-source builds.
+  #   2. amd64-only today: the QEMU arm64 leg was dropped (see the buildx
+  #      step); the demo/viz rigs would need it back.
   #   3. Distinct local buildcache path (postgres suffix).
   docker-publish-postgres:
     name: "Publish postgres image"
+    needs: [release-guard]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 60
     permissions:
@@ -1454,7 +1653,7 @@ jobs:
       # amd64-only: linux/arm64 (QEMU) dropped — not needed yet. See
       # docker-publish-chisel for the same rationale.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver: docker-container
 
@@ -1462,9 +1661,9 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN — see docker-publish for the full rationale.
-          username: Tr3kkR
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
@@ -1487,9 +1686,12 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
+      - name: Refuse to publish if the tag moved (#5282)
+        run: bash scripts/ci/check-release-tag-sha.sh
+
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile.postgres
@@ -1510,7 +1712,7 @@ jobs:
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1519,23 +1721,13 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: yuzu-postgres-image.spdx.json
           artifact-name: yuzu-postgres-image.spdx.json
           upload-artifact: false
-
-      - name: Upload image SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        continue-on-error: true
-        with:
-          name: yuzu-postgres-image-sbom
-          path: |
-            yuzu-postgres-image.cdx.json
-            yuzu-postgres-image.spdx.json
-          retention-days: 3
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
@@ -1561,6 +1753,27 @@ jobs:
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
 
+      - name: Upload image SBOM artifacts
+        # After attest + sign (#5242): if this upload fails, the pushed tag is
+        # already signed and attested, rather than left unsigned until a re-run.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
+        # upload must fail this job rather than leave a green leg with an
+        # earlier attempt's SBOM (or none) for the release to sign.
+        with:
+          name: yuzu-postgres-image-sbom
+          path: |
+            yuzu-postgres-image.cdx.json
+            yuzu-postgres-image.spdx.json
+          if-no-files-found: error
+          retention-days: 3
+          # A re-run of this job ("Re-run failed jobs" on the newest run, the
+          # release skill's Recovery) pushes a new digest; replace the earlier attempt's
+          # SBOM. With no continue-on-error and
+          # if-no-files-found: error, a re-run either uploads this attempt's
+          # SBOM or fails the job (#5242).
+          overwrite: true
+
       - name: Image summary
         env:
           META_TAGS: ${{ steps.meta.outputs.tags }}
@@ -1579,28 +1792,36 @@ jobs:
             echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ── Chiselled demo images — server + gateway + agent, multi-arch ─────
+  # ── Chiselled demo images — server + gateway + agent ─────────────────
   # Publishes the FROM-scratch chiselled Ubuntu 26.04 demo images to GHCR
   # under a distinct `-chisel` repo suffix (see docs/demo-environment.md).
-  # Deliberately NOT in the `release` job's needs: a slow or failed
-  # demo-image build must never block the actual GitHub release. Mirrors
-  # docker-publish (login / metadata / cosign / attestation / lowercase
-  # owner) but differs in three ways:
-  #   1. Multi-arch linux/amd64,linux/arm64 (docker-publish is amd64-only).
-  #   2. NO TRIPLET build-arg — the server/agent chisel Dockerfiles derive
-  #      the vcpkg triplet from buildx's TARGETARCH per-arch; forcing
-  #      x64-linux would bake an x64 binary into the arm64 image.
-  #   3. A distinct local buildcache path (-chisel suffix) so it never
+  # The `release` job NEEDS this job since #5242 (see the comment at its
+  # needs: below). Mirrors docker-publish (login / metadata / cosign /
+  # attestation / lowercase owner) but differs in two ways:
+  #   1. NO TRIPLET build-arg — the server/agent chisel Dockerfiles derive
+  #      the vcpkg triplet from buildx's TARGETARCH. The build is amd64-only
+  #      today (the QEMU-emulated arm64 leg was dropped; see the buildx step).
+  #   2. A distinct local buildcache path (-chisel suffix) so it never
   #      collides with docker-publish's cache.
   docker-publish-chisel:
     name: "Publish ${{ matrix.image }}-chisel image"
-    # Mirror docker-publish's needs (core builds must pass) but stay OUT
-    # of the release job's needs: so this never gates the release.
-    needs: [build-linux, build-gateway]
+    # Mirror docker-publish's needs (core builds must pass). The release job
+    # NEEDS this job (#5242): the three chisel images' SBOMs are release assets
+    # and belong inside the signed SHA256SUMS, and while this job stayed out of
+    # the release's needs they were attached only when it happened to finish
+    # first (rc2, rc4 and rc6 shipped without some of them). Cost: the release
+    # waits for these builds -- 1-16 min on rc1..rc6, all green; a cold cache
+    # (vcpkg from source) takes longer, bounded by the timeout below -- and a
+    # failed or cancelled chisel leg now skips the release (fail-closed).
+    # Recovery: "Re-run failed jobs" on the NEWEST run for the tag (digests of
+    # the succeeded legs are kept; each push re-checks the tag), never on an
+    # older run (#5242); a fresh run is the fallback. See the release skill.
+    needs: [release-guard, build-linux, build-gateway]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
-    # in-flight 6 h QEMU build instead of wedging the single self-hosted
-    # Linux runner slot behind a stale emulated arm64 compile. The
+    # in-flight build instead of wedging the single self-hosted Linux runner
+    # slot behind a stale one (a superseded run's release is then skipped,
+    # since it needs this job). The
     # workflow-level concurrency is cancel-in-progress:false (a real
     # release must run to completion); this narrower group trades that
     # for runner-slot liveness on the demo-image path specifically — SRE
@@ -1615,19 +1836,15 @@ jobs:
     concurrency:
       group: chisel-publish-${{ github.ref }}-${{ matrix.image }}
       cancel-in-progress: true
-    # Generous timeout: the server/agent chisel images compile all of
-    # vcpkg (gRPC/abseil/protobuf/openssl) from source, and the arm64 leg
-    # does it under QEMU emulation. docs/demo-environment.md flags up to a
-    # ~240 min cold-cache risk for the emulated arm64 build.
-    #
-    # INTERIM STRATEGY: arm64 is built via QEMU on the amd64 self-hosted
-    # runner. This is slow but needs no extra runner. The sustainable path
-    # is a native arm64 runner (self-hosted or GitHub-hosted
-    # ubuntu-24.04-arm) + per-arch manifest merge — a runner-topology
-    # decision tracked as the "Open decision — arm64 build strategy" note
-    # in docs/demo-environment.md ("Publishing"). Revisit before relying on
-    # the QEMU path for every release.
-    timeout-minutes: 360
+    # The server/agent chisel images compile vcpkg (gRPC/abseil/protobuf/
+    # openssl) from source on a cold cache: the same compile peaked at 26 min
+    # in docker-publish (run 36607188023), and the chisel legs took 1-16 min
+    # on rc1..rc6. The build is amd64-only now (the old 360-min budget was for
+    # the dropped QEMU arm64 leg), and since #5242 the release waits on this
+    # job, so the bound is tighter: 120 min. Re-adding
+    # arm64 is tracked as the "Open decision — arm64 build strategy" note in
+    # docs/demo-environment.md ("Publishing").
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -1660,7 +1877,7 @@ jobs:
       # arm64 runner exists. docker-container driver retained for the local
       # layer-cache export (cache-to type=local) below.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver: docker-container
 
@@ -1668,14 +1885,17 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo (e.g.
           # yuzu-agent-bundle-chisel, originally created via local
           # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
           # don't have access to the secret. Username pinned to the
-          # PAT owner ('Tr3kkR') since github.actor varies per actor.
-          username: Tr3kkR
+          # PAT owner since github.actor varies per actor. The owner is a
+          # USER, not the org, so it is carried in the `GHCR_USERNAME` repo
+          # variable rather than hardcoded — see the DevNullLtd migration
+          # note in .github/runner-inventory.json.
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
@@ -1712,7 +1932,7 @@ jobs:
       #
       # NO TRIPLET build-arg, matching "Build and push" below.
       - name: Build for healthcheck verification (no push)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -1738,9 +1958,12 @@ jobs:
           IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
         run: docker image rm -f "$IMAGE" || true
 
+      - name: Refuse to publish if the tag moved (#5282)
+        run: bash scripts/ci/check-release-tag-sha.sh
+
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -1775,10 +1998,10 @@ jobs:
       # Mirrors docker-publish's SBOM steps so the chisel demo images get
       # the same supply-chain coverage (compliance flagged that the chisel
       # images had cosign + SLSA but no SBOM). Syft scans the pushed
-      # multi-arch image by digest. Same SHA-pinned anchore/sbom-action +
+      # image by digest. Same SHA-pinned anchore/sbom-action +
       # upload-artifact versions as docker-publish.
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1787,23 +2010,13 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: yuzu-${{ matrix.image }}-chisel-image.spdx.json
           artifact-name: yuzu-${{ matrix.image }}-chisel-image.spdx.json
           upload-artifact: false
-
-      - name: Upload image SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        continue-on-error: true
-        with:
-          name: yuzu-${{ matrix.image }}-chisel-image-sbom
-          path: |
-            yuzu-${{ matrix.image }}-chisel-image.cdx.json
-            yuzu-${{ matrix.image }}-chisel-image.spdx.json
-          retention-days: 3
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
@@ -1828,6 +2041,27 @@ jobs:
           # error in v3 (see docker-publish for the #495 history).
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      - name: Upload image SBOM artifacts
+        # After attest + sign (#5242): if this upload fails, the pushed tag is
+        # already signed and attested, rather than left unsigned until a re-run.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
+        # upload must fail this job rather than leave a green leg with an
+        # earlier attempt's SBOM (or none) for the release to sign.
+        with:
+          name: yuzu-${{ matrix.image }}-chisel-image-sbom
+          path: |
+            yuzu-${{ matrix.image }}-chisel-image.cdx.json
+            yuzu-${{ matrix.image }}-chisel-image.spdx.json
+          if-no-files-found: error
+          retention-days: 3
+          # A re-run of this job ("Re-run failed jobs" on the newest run, the
+          # release skill's Recovery) pushes a new digest; replace the earlier attempt's
+          # SBOM. With no continue-on-error and
+          # if-no-files-found: error, a re-run either uploads this attempt's
+          # SBOM or fails the job (#5242).
+          overwrite: true
 
       - name: Image summary
         env:
@@ -1858,7 +2092,7 @@ jobs:
   # (it depends on release, not vice-versa), so it never gates the release.
   docker-publish-agent-bundle:
     name: "Publish agent-bundle image"
-    needs: [release]
+    needs: [release-guard, release]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     concurrency:
@@ -1888,7 +2122,7 @@ jobs:
       # amd64-only: linux/arm64 (QEMU) dropped — not needed yet. The bundle
       # script builds the host-arch (amd64) image when --multiarch is omitted.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver: docker-container
 
@@ -1896,18 +2130,24 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo (e.g.
           # yuzu-agent-bundle-chisel, originally created via local
           # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
           # don't have access to the secret. Username pinned to the
-          # PAT owner ('Tr3kkR') since github.actor varies per actor.
-          username: Tr3kkR
+          # PAT owner since github.actor varies per actor. The owner is a
+          # USER, not the org, so it is carried in the `GHCR_USERNAME` repo
+          # variable rather than hardcoded — see the DevNullLtd migration
+          # note in .github/runner-inventory.json.
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Refuse to publish if the tag moved (#5282)
+        run: bash scripts/ci/check-release-tag-sha.sh
 
       # Reuse the maintainer script (download release artifacts -> verify by
       # sha256 -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
@@ -1931,7 +2171,7 @@ jobs:
           echo "Resolved ${{ steps.ref.outputs.image }} digest: ${DIGEST}"
 
       - name: Generate bundle SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
           format: cyclonedx-json
@@ -1940,7 +2180,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate bundle SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
           format: spdx-json
@@ -1994,7 +2234,12 @@ jobs:
     # docker-publish-postgres is in the needs: the composes release-pin
     # ghcr.io/.../yuzu-postgres:X.Y.Z (#1318), so publishing a release
     # whose postgres image failed to push would ship broken composes.
-    needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish, docker-publish-postgres]
+    # docker-publish-chisel is in the needs so its SBOMs are always present and
+    # inside SHA256SUMS (#5242); check-release-artifacts.sh requires them.
+    # docker-publish-agent-bundle is NOT, by design: it builds from this
+    # release's published assets, so it can only run after it, and its SBOM is
+    # not a release asset (it stays a workflow artifact).
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos, docker-publish, docker-publish-postgres, docker-publish-chisel]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -2074,10 +2319,13 @@ jobs:
       - name: Verify release artifact completeness
         run: |
           # Gate: every expected archive must have a sibling CycloneDX +
-          # SPDX SBOM, and both image SBOMs must be present. Missing any
+          # SPDX SBOM, and every image SBOM must be present (server, gateway,
+          # postgres and the three chisel images, #5242). Missing any
           # of the above fails the release before we publish anything
           # customers will have to unwind. Tracked as #362 / #408.
-          bash scripts/check-release-artifacts.sh artifacts
+          # With the version it also checks every asset name is one GitHub
+          # stores unchanged and every package is from this release (#5141).
+          bash scripts/check-release-artifacts.sh artifacts "${GITHUB_REF_NAME#v}"
 
       - name: Generate SHA256SUMS
         run: |
@@ -2216,12 +2464,14 @@ jobs:
           ### Windows silent install (GPO / SCCM / Intune)
           \`\`\`powershell
           # Agent
-          YuzuAgentSetup-*.exe /VERYSILENT /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
+          YuzuAgentSetup-*.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
 
           # Server
-          YuzuServerSetup-*.exe /VERYSILENT /ADMIN_USER=admin /ADMIN_PASS=<password> \`
+          YuzuServerSetup-*.exe /VERYSILENT /SUPPRESSMSGBOXES /ADMIN_USER=admin /ADMIN_PASS=<password> \`
             /HTTPS_CERT=cert.pem /HTTPS_KEY=key.pem
           \`\`\`
+
+          Silent uninstall — agent: \`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\`; server: \`"C:\\Program Files\\Yuzu Server\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\` (or the path in the product's \`UninstallString\` registry value, if it was installed to another directory). Each removes the program but keeps its data directory: \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key) or \`%ProgramData%\\Yuzu Server\` (databases, configuration, TLS keys). To decommission a device, revoke its certificate on the server and delete that directory (see \`docs/agent-bundle.md\`). Uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
 
           ### macOS silent install (Jamf / MDM)
           \`\`\`bash
@@ -2292,7 +2542,8 @@ jobs:
 
           Every release ships CycloneDX + SPDX SBOMs per platform
           (\`yuzu-*-{linux-x64,windows-x64,macos-arm64}.{cdx,spdx}.json\`,
-          \`yuzu-{server,gateway}-image.{cdx,spdx}.json\`), GitHub-native
+          \`yuzu-{server,gateway,postgres}-image.{cdx,spdx}.json\` and
+          \`yuzu-{server,gateway,agent}-chisel-image.{cdx,spdx}.json\`), GitHub-native
           SLSA build provenance attestations for every binary archive
           and Docker image, and cosign keyless signatures on both the
           Docker images and the \`SHA256SUMS\` manifest. See
@@ -2304,6 +2555,9 @@ jobs:
           NOTES_EOF
           # Strip leading whitespace from heredoc indentation
           sed -i 's/^          //' release-notes.md
+
+      - name: Refuse to publish if the tag moved (#5282)
+        run: bash scripts/ci/check-release-tag-sha.sh
 
       - name: Create GitHub Release
         env:
@@ -2323,17 +2577,25 @@ jobs:
             WIZARD_ASSET+=(artifacts/yuzu-compose-wizard-*.zip)
           fi
 
-          # Idempotent on re-tag: if the release already exists (e.g.
-          # operator deleted + recreated the tag to backfill a CI bug
-          # like the chisel-publish concurrency miss in run 26413256206),
-          # skip the create+upload so the dependent docker-publish-*
-          # jobs can still run cleanly without "release already exists"
-          # blowing up Create Release. Asset re-upload would require
-          # --clobber per-file and risks signature drift on already-
-          # published artifacts; the safer behavior is leave the
-          # published release untouched.
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            echo "::notice::Release ${GITHUB_REF_NAME} already exists; skipping create+upload (assets already published, signatures preserved)"
+          # The release-guard job refused this run up front if a published
+          # release already existed (#5282), so a release found here is either
+          # a DRAFT (an interrupted `gh release create`, possibly this job's own
+          # earlier attempt, or a hand-made draft the guard's contents:read
+          # token cannot see) or one PUBLISHED after the guard ran (an earlier
+          # attempt of this job, another run of the tag, or a hand-run
+          # `gh release create`). Fail with the matching instruction rather than
+          # the old skip-with-a-notice that went green, and never re-upload over
+          # it: --clobber would replace signed assets.
+          if existing_draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$existing_draft" == "true" ]]; then
+              # gh release create makes a draft, uploads, then publishes; an
+              # interrupted upload (this job's own earlier attempt included)
+              # leaves the draft behind. Nothing was published.
+              echo "::error::A DRAFT release ${GITHUB_REF_NAME} already exists, most likely left by an interrupted 'gh release create' (an earlier attempt of this job, or a hand-made draft). Nothing has been published. Delete the draft (gh release delete ${GITHUB_REF_NAME} --yes), then Re-run failed jobs on this run (#5282)."
+            else
+              echo "::error::Release ${GITHUB_REF_NAME} is already PUBLISHED. If an earlier attempt of THIS run's release job published it and then failed, the release itself is complete (verify its assets against its SHA256SUMS), but docker-publish-agent-bundle, which needs this job, will not run on a re-run: see the release skill, Recovery, and #5479. Otherwise another run or a hand-run 'gh release create' published it after release-guard passed, and this run's pushed images may not match it: investigate before anything else. Refusing to re-upload over signed assets (#5282)."
+            fi
+            exit 1
           else
             gh release create "${GITHUB_REF_NAME}" \
               --title "Yuzu ${GITHUB_REF_NAME}" \

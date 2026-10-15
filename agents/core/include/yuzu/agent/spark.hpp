@@ -34,6 +34,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -202,6 +203,13 @@ struct DiskSparkData {
 ///            compares and remediates on it, so the raw primitive must surface it
 ///            or a consumer goes blind to paused drift); *_PENDING →
 ///            TRANSITIONAL — HELD.
+///   macOS  : `launchctl list` (see agents/shared/launchctl_list.hpp +
+///            agents/core/include/yuzu/agent/launchd_state.hpp) — listed with a
+///            pid → Running; listed without a pid, or absent from the snapshot
+///            → Stopped. Paused is NEVER produced: launchd, like systemd, has
+///            no analogue to the Windows SCM's SERVICE_PAUSED terminal state,
+///            and there is no TRANSITIONAL concept either (a launchctl list
+///            snapshot is a point-in-time terminal read, not a state machine).
 /// Transitional states are held, not emitted: a consumer can neither assert over
 /// nor enforce against a mid-transition state (the guards hold on exactly these),
 /// and emitting them would make every stop/start a multi-event flap each consumer
@@ -294,6 +302,69 @@ enum class SubscriptionHealth {
     Dead,     ///< the id is no longer tracked — its key was torn down (or never armed).
     Faulted,  ///< the id's key is armed but reported unhealthy (B1).
     Healthy,  ///< armed, not faulted.
+};
+
+// ── Establishment signal (rung 9c PR-6 item 1) ─────────────────────────────────
+
+/// Identity token for one armed watch, minted by the SparkEngine when a key
+/// transitions from "not armed" to "armed" (a fresh key, or a key re-armed
+/// after being fully torn down) — never on a dedup arm, which shares the
+/// existing key's incarnation. Monotone, drawn from the engine's shared id
+/// counter (the same source as ConsumerId/SubscriptionId); wrap is not
+/// expected within any realistic process lifetime. `kNoSparkIncarnation` (0)
+/// is never minted before wrap and marks "no incarnation" where one is
+/// optional. Compared for EQUALITY at the engine (does this report still name
+/// the CURRENT watch for this key) and for ORDER at a mechanism (is this
+/// submission newer than what I already have — the forward-only rebind a
+/// mechanism applies before adopting a new incarnation for an already-known
+/// key).
+using SparkIncarnation = std::uint64_t;
+inline constexpr SparkIncarnation kNoSparkIncarnation = 0;
+
+/// A mechanism's best current answer to "does live OS-level notification
+/// coverage exist for this watch right now" — the fact `spark.hpp`'s "armed
+/// means a watcher is running" does NOT by itself guarantee (arm() succeeding
+/// only means a watch request was accepted, not that the OS confirmed it).
+/// Tri-state, never a bool: `Poll` is a real, load-bearing middle state, not
+/// a degraded `Notification` — a mechanism that has fallen back to (or has
+/// not yet moved off) periodic polling for a key must say so rather than
+/// claim event-driven coverage it does not have.
+enum class SparkCoverage : std::uint8_t {
+    None,         ///< no coverage at all — never established, or lost (fault, teardown, error).
+    Notification, ///< live OS-level event notification is in effect for this key.
+    Poll,         ///< the mechanism is watching this key by periodic re-check, not notification.
+};
+
+/// Stable token for logs and (later) the content plane.
+[[nodiscard]] constexpr const char* spark_coverage_token(SparkCoverage c) noexcept {
+    switch (c) {
+    case SparkCoverage::None:         return "none";
+    case SparkCoverage::Notification: return "notification";
+    case SparkCoverage::Poll:         return "poll";
+    }
+    return "unknown";
+}
+
+/// Pull-query result for "has this subscription's watch achieved live coverage,
+/// and when" (rung 9c PR-6 item 1) — a THIRD timestamp alongside R5.3's
+/// accepted/resolved pair, not a correction to either: `armed_at` is when the
+/// engine committed the arm, `established_at` is when a mechanism first
+/// reported `Notification` coverage for the CURRENT incarnation (unset while
+/// still pending, or while coverage has never reached `Notification` — e.g. a
+/// mechanism that only ever offers `Poll`), and `coverage` is the mechanism's
+/// most recently reported tri-state for this key, except that the engine answers
+/// `None` while the type's mechanism reports itself inert (a conservative, not
+/// coherent, snapshot; `established_at` is unchanged). RECOVERY DOES NOT RE-STAMP:
+/// once `established_at` is set for an incarnation it stays set, even if
+/// `coverage` later drops to `None` and comes back — first-wins, not
+/// last-transition. Meaningless fields read as their defaults (`coverage`
+/// `None`, `established_at` unset) for a spark type with no event-driven
+/// mechanism (interval/startup/disk) — there is nothing wrong in that reading,
+/// it simply means nothing has ever reported the contrary.
+struct SubscriptionEstablishment {
+    std::chrono::steady_clock::time_point armed_at{};
+    std::optional<std::chrono::steady_clock::time_point> established_at;
+    SparkCoverage coverage{SparkCoverage::None};
 };
 
 // ── Subscription tiers ────────────────────────────────────────────────────────

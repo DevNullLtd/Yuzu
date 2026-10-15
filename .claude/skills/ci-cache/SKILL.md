@@ -12,7 +12,7 @@ Canonical caching patterns for Yuzu CI workflows. **CI eats more time than dev �
 | Runner kind | Cache mechanism | Snippet |
 |---|---|---|
 | GHA-hosted (`ubuntu-24.04`, `macos-15`, `windows-latest`) | `actions/cache/restore` + paired `actions/cache/save` | [GHA-hosted](#gha-hosted-ephemeral-runners) |
-| Self-hosted (`yuzu-wsl2-linux`, `yuzu-local-windows`, future macOS) | Local filesystem under `runner.tool_cache` | [Self-hosted](#self-hosted-runners) |
+| Self-hosted (`yuzu-bigtam-linux`, `yuzu-weetam-windows`, `yuzu-bigmags-macos`) | Local filesystem under `runner.tool_cache` | [Self-hosted](#self-hosted-runners) |
 
 **Hard rule (enforced by `.github/workflows/zizmor.yml`):** never use `save-always: true` on `actions/cache@`. The input is deprecated by the actions/cache maintainers as "does not work as intended and will be removed in a future release." The `Guard — no save-always on actions/cache` step in zizmor.yml fails any workflow audit if `^[[:space:]]*save-always:` reappears as a YAML key. Don't try to silence the guard — rewrite the cache step using the snippets below.
 
@@ -215,11 +215,13 @@ GHA cache scope is **branch-isolated** with PR runs scoped to `refs/pull/<N>/mer
 
 Fix: also trigger the job on `push` to the branch PRs actually base on. The canary job in `ci.yml` does this via `detect-ci-changes` firing on `pull_request` plus `push` to `refs/heads/main` **and `refs/heads/dev`**. Warming only the default branch is not enough here and silently stopped working: this repo integrates on `dev`, `main` moves only at release time, and with no `main` push for five weeks the warm scope was simply empty — every PR then saved its own private ~843 MB copy of a byte-identical tree, six of them live at once against a 10 GB repo cap (#3233). Pick the branch by scope rule (c), not by convention, and check it is actually pushed to.
 
+**Untrusted code never runs in a scope a trusted run reads (#4471).** The same rules are the security boundary. `fork-dynamic-review.yml` and `trusted-fork-ci.yml` → `ci.yml` execute fork code under `workflow_dispatch`, whose cache scope is the dispatch ref, and any code executing in a run can write that scope (the runtime token is in the runner process) — so a `save:` gate cannot close it. They refuse any ref but a throwaway `trusted-fork/pr-<N>` branch, unreadable from `main`, `dev`, or any PR by (a)–(c), and BOTH workflows carry their own `purge-quarantine-cache` job that deletes that scope right after they finish (branch deletion alone leaves entries for seven days) — the review workflow's own purge closes the window in which its pre-approval writes would otherwise be restorable by the later trusted gate on the same ref. The canary's `trusted_execution != 'true'` save gates are defence in depth behind that, not the primary control. CodeQL's `actions/cache-poisoning/poisonable-step` cannot see the confinement and is excluded in `.github/codeql/codeql-config.yml`; `scripts/ci/test_runner_health_check.py` sweeps for any new PR-derived checkout outside those two workflows.
+
 ---
 
 ## Self-hosted runners
 
-Self-hosted runners (`yuzu-wsl2-linux`, `yuzu-local-windows`, and any future self-hosted macOS) keep state across jobs. **Skip GHA's blob-storage cache entirely** — round-tripping ~1 GB of vcpkg binaries through GHA storage when the same data already lives on the runner's local disk is an unforced loss. Pin caches to `runner.tool_cache` (a stable per-runner path that survives between jobs but is owned by the runner setup, not the workspace):
+Self-hosted runners (the `yuzu-bigtam-linux`, `yuzu-weetam-windows` and `yuzu-bigmags-macos` pools) keep state across jobs. **Skip GHA's blob-storage cache entirely** — round-tripping ~1 GB of vcpkg binaries through GHA storage when the same data already lives on the runner's local disk is an unforced loss. Pin caches to `runner.tool_cache` (a stable per-runner path that survives between jobs but is owned by the runner setup, not the workspace):
 
 ```yaml
 # Self-hosted: no actions/cache step at all. Set the env var that

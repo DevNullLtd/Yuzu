@@ -13,13 +13,17 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "response_export_metrics.hpp"
 #include "rest_api_v1.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <httplib.h>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
@@ -27,10 +31,28 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
+
+namespace {
+// Fault-injection helper for the #2146 A2-R1 degrade test below: runs a raw
+// statement over a fresh side connection (never the harness's own pool, so
+// the tracker's `open_`/pool state stays otherwise healthy -- only the ONE
+// targeted query fails). Mirrors test_audit_store.cpp's identical
+// `exec_sql` idiom.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+} // namespace
 
 namespace {
 
@@ -52,6 +74,7 @@ struct AuditRecord {
 };
 
 struct ExecV1Harness {
+    yuzu::MetricsRegistry metrics; // #4644 counter, seeded like production; outlives the sink
     yuzu::server::test::TestRouteSink sink;
 
     std::unique_ptr<ExecutionTracker> execution_tracker;
@@ -66,6 +89,7 @@ struct ExecV1Harness {
     RestApiV1 api;
 
     explicit ExecV1Harness(pg::PgPool& pool) {
+        yuzu::server::seed_response_metrics(metrics);
         execution_tracker = std::make_unique<ExecutionTracker>(pool);
         REQUIRE(execution_tracker->is_open());
         instruction_store = std::make_unique<InstructionStore>(pool);
@@ -124,7 +148,7 @@ struct ExecV1Harness {
                             /*device_token_store=*/nullptr,
                             /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr,
-                            /*metrics_registry=*/nullptr,
+                            /*metrics_registry=*/&metrics,
                             /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr,
@@ -138,7 +162,6 @@ struct ExecV1Harness {
                             /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
                             /*response_scope_fn=*/{},
-                            /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr,
@@ -221,6 +244,92 @@ TEST_CASE("GET /api/v1/executions: fleet_read_fn denial → 403",
     CHECK(res->status == 403);
 }
 
+// Confined list (#3526): the handler pushes the caller's scope into the list query, reads the
+// per-agent status rows through the SAME visible set, and recomputes the counters from the
+// in-scope rows only. Exact ids and exact projected counts, so (a) a mutation that hands the
+// status read some other list (the owner, an empty set) zeroes the counters and (b) one that
+// drops the scope or the owner disjunct changes the id set. Fake gate (the harness has no real
+// chokepoint); the real-gate drive of the same decision is in
+// test_workflow_executions_list_authz.cpp.
+TEST_CASE("GET /api/v1/executions: a confined caller gets owner-or-visible rows with projected "
+          "counts",
+          "[pg][rest][executions][v1][confinement][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A", "agent-C"}};
+    h.session_username = "bob";
+
+    auto make = [&](const std::string& by, int64_t at) {
+        Execution e;
+        e.definition_id = "def-rest-confined";
+        e.dispatched_by = by;
+        e.status = "completed";
+        e.dispatched_at = at;
+        e.agents_targeted = 9; // the unconfined counter: must never reach a confined caller
+        auto id = h.execution_tracker->create_execution(e);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    auto st = [&](const std::string& exec, const std::string& agent, const std::string& status,
+                  const std::string& err, int64_t done) {
+        AgentExecStatus a;
+        a.agent_id = agent;
+        a.status = status;
+        a.completed_at = done;
+        a.error_detail = err;
+        h.execution_tracker->update_agent_status(exec, a);
+    };
+    const auto x_mixed = make("carol", 1735689601); // A ok + B failed: visible via A
+    st(x_mixed, "agent-A", "success", "", 1735689610);
+    st(x_mixed, "agent-B", "failure", "SECRET-B-ERR", 1735689690);
+    const auto x_hidden = make("carol", 1735689602); // B only: invisible
+    st(x_hidden, "agent-B", "failure", "SECRET-B-ONLY", 1735689691);
+    const auto x_own = make("bob", 1735689603); // owner row, B only: visible, counters 0
+    st(x_own, "agent-B", "failure", "SECRET-B-OWN", 1735689692);
+    const auto x_two = make("carol", 1735689604); // A failed + C ok + B ok
+    st(x_two, "agent-A", "failure", "ERR-A", 1735689700);
+    st(x_two, "agent-C", "success", "", 1735689701);
+    st(x_two, "agent-B", "success", "", 1735689702);
+
+    auto res = h.sink.Get("/api/v1/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("SECRET-B") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    std::unordered_map<std::string, nlohmann::json> rows;
+    for (const auto& row : body["data"])
+        rows[row["id"].get<std::string>()] = row;
+    CHECK(rows.size() == 3);
+    CHECK(rows.count(x_hidden) == 0);
+    REQUIRE(rows.count(x_mixed) == 1);
+    CHECK(rows[x_mixed]["agents_targeted"] == 1);
+    CHECK(rows[x_mixed]["agents_responded"] == 1);
+    CHECK(rows[x_mixed]["agents_success"] == 1);
+    CHECK(rows[x_mixed]["agents_failure"] == 0);
+    CHECK(rows[x_mixed]["error_preview"] == "");
+    REQUIRE(rows.count(x_own) == 1);
+    CHECK(rows[x_own]["agents_targeted"] == 0);
+    CHECK(rows[x_own]["agents_responded"] == 0);
+    CHECK(rows[x_own]["error_preview"] == "");
+    REQUIRE(rows.count(x_two) == 1);
+    CHECK(rows[x_two]["agents_targeted"] == 2);
+    CHECK(rows[x_two]["agents_responded"] == 2);
+    CHECK(rows[x_two]["agents_success"] == 1);
+    CHECK(rows[x_two]["agents_failure"] == 1);
+    CHECK(rows[x_two]["error_preview"] == "ERR-A");
+
+    // The same caller with an empty visible set sees ONLY the row they dispatched.
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{}};
+    auto none = h.sink.Get("/api/v1/executions");
+    REQUIRE(none);
+    CHECK(none->status == 200);
+    auto nb = nlohmann::json::parse(none->body);
+    REQUIRE(nb["data"].size() == 1);
+    CHECK(nb["data"][0]["id"] == x_own);
+    CHECK(nb["data"][0]["agents_targeted"] == 0);
+}
+
 TEST_CASE("GET /api/v1/executions/:id: bare request has no agents/kpi and is unaudited",
           "[pg][rest][executions][v1]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
@@ -234,6 +343,50 @@ TEST_CASE("GET /api/v1/executions/:id: bare request has no agents/kpi and is una
     auto body = nlohmann::json::parse(res->body);
     CHECK_FALSE(body["data"].contains("agents"));
     CHECK_FALSE(body["data"].contains("kpi"));
+    for (const auto& c : h.audit_log)
+        CHECK(c.target_id != exec_id);
+}
+
+// Governance fix (#2146 A2-R1 re-review, adjudicated): this route used the
+// plain get_execution(), which collapses "execution genuinely absent" and
+// "read degraded" (a transient pool/query failure) to the same nullopt -- a
+// degrade fell through to the SAME not-found + denial-audit branch a genuine
+// absence takes, producing a FALSE 404 for a legitimate owner and a
+// permanently wrong CC7.2 denial audit row for a confined caller whose only
+// "fault" was hitting a transient outage. get_execution_checked's outer
+// std::expected now distinguishes the two; the degrade branch returns
+// BEFORE any denial audit is recorded.
+TEST_CASE("GET /api/v1/executions/:id: a transient tracker degrade is 503, not a "
+          "false 404, and records no denial audit (#2146 A2-R1)",
+          "[pg][rest][executions][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-degrade-1");
+    // Engage a confined scope so the OLD code's denial-audit branch would
+    // have fired on the false 404 this fix closes -- an unconfined caller
+    // never reaches that branch at all, which would make assertion (b)
+    // below pass trivially even against the unfixed code.
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the harness's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault (a full outage would
+    // already hit the pre-existing tracker-unavailable/pool-exhaustion
+    // branch above and mask this specific defect).
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_2146");
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id);
+    exec_sql(db.dsn(), "ALTER TABLE execution_tracker.executions_hidden_2146 RENAME TO executions");
+
+    REQUIRE(res);
+    // (a) 503, never the old false 404.
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+
+    // (b) no denial audit row for this execution -- pre-fix, this recorded
+    // execution.detail.fetch/denied here.
     for (const auto& c : h.audit_log)
         CHECK(c.target_id != exec_id);
 }
@@ -336,6 +489,58 @@ TEST_CASE("GET /api/v1/executions/:id/responses: offset is rejected with 400, "
     CHECK(res->status == 400);
 }
 
+TEST_CASE("GET /api/v1/executions/:id/responses: a malformed numeric query parameter is a 400 "
+          "not a different valid-looking filter; -1 'any' and zero-padding still pass (#4644)",
+          "[pg][rest][executions][v1][responses]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-strict");
+
+    const std::string bad = GENERATE(as<std::string>{}, "status=0x1", "status=-5", "since=1e9",
+                                     "since=-5", "until=-5", "until=0", "until=000", "since=5&until=0",
+                                     "until=100abc", "limit=1e3", "limit=");
+    INFO(bad);
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?" + bad);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "invalid numeric query parameter");
+
+    const std::string good = GENERATE(as<std::string>{}, "status=-1", "status=007", "limit=10",
+                                      "since=0", "until=1", "since=0&until=4102444800");
+    INFO(good);
+    auto ok = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?" + good);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("GET /api/v1/executions/:id/responses: a rejected numeric parameter counts on the "
+          "rest_v1 surface and a valid request does not (#4644)",
+          "[pg][rest][executions][v1][responses]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-metric");
+    auto rejected = [&](const char* surface) {
+        return h.metrics
+            .counter(yuzu::server::kResponseParamRejectedMetric, {{"surface", surface}})
+            .value();
+    };
+    REQUIRE(rejected("rest_v1") == 0.0);
+
+    CHECK(h.sink.Get("/api/v1/executions/" + exec_id + "/responses?limit=100abc")->status == 400);
+    CHECK(rejected("rest_v1") == 1.0);
+    CHECK(h.sink.Get("/api/v1/executions/" + exec_id + "/responses?status=0x1")->status == 400);
+    CHECK(rejected("rest_v1") == 2.0);
+    // A valid request, and the offset 400 (a different refusal), do not count.
+    CHECK(h.sink.Get("/api/v1/executions/" + exec_id + "/responses?limit=10")->status == 200);
+    CHECK(h.sink.Get("/api/v1/executions/" + exec_id + "/responses?offset=1")->status == 400);
+    CHECK(rejected("rest_v1") == 2.0);
+    // The other surfaces stay untouched.
+    CHECK(rejected("rest") == 0.0);
+    CHECK(rejected("mcp") == 0.0);
+}
+
 TEST_CASE("GET /api/v1/executions/:id/responses: fleet_read_fn gates on Response:Read, "
           "independent of Execution:Read",
           "[pg][rest][executions][v1][responses][security]") {
@@ -345,6 +550,190 @@ TEST_CASE("GET /api/v1/executions/:id/responses: fleet_read_fn gates on Response
     h.perm_grant = false;
 
     auto res = h.sink.Get("/api/v1/executions/anything/responses");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// #2146 A2-R1: GET /api/v1/executions/{id}/children -- REST v1 twin of the
+// legacy GET /api/executions/{id}/children (execution_routes.cpp), same
+// gate/confinement rules, same execution_child_row_json shared builder
+// (docs/api-twin-recipe.md Rule 1).
+
+TEST_CASE("GET /api/v1/executions/:id/children: lists children via the shared builder",
+          "[pg][rest][executions][v1][children]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto parent_id = h.make_exec_with_agents("def-children-parent");
+
+    Execution child;
+    child.definition_id = "def-children-parent";
+    child.dispatched_by = "tester";
+    child.status = "completed";
+    child.dispatched_at = 1735689700;
+    child.parent_id = parent_id;
+    auto child_id = h.execution_tracker->create_execution(child);
+    REQUIRE(child_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/executions/" + parent_id + "/children");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].contains("children"));
+    REQUIRE(body["data"]["children"].is_array());
+    bool found = false;
+    for (const auto& c : body["data"]["children"]) {
+        if (c["id"] == *child_id) {
+            found = true;
+            CHECK(c["status"] == "completed");
+            CHECK(c["dispatched_at"] == 1735689700);
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("GET /api/v1/executions/:id/children: unknown parent id is 404",
+          "[pg][rest][executions][v1][children]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+
+    auto res = h.sink.Get("/api/v1/executions/does-not-exist/children");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+}
+
+TEST_CASE("GET /api/v1/executions/:id/children: each child is confined independently of the "
+          "parent's own visibility (#3789)",
+          "[pg][rest][executions][v1][children][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    // Parent has agent-A(success)/agent-B(failure) -- visible to a caller
+    // confined to agent-A.
+    auto parent_id = h.make_exec_with_agents("def-children-conf");
+
+    Execution visible_child;
+    visible_child.definition_id = "def-children-conf";
+    visible_child.dispatched_by = "someone-else";
+    visible_child.status = "completed";
+    visible_child.dispatched_at = 1735689710;
+    visible_child.parent_id = parent_id;
+    auto visible_child_id = h.execution_tracker->create_execution(visible_child);
+    REQUIRE(visible_child_id.has_value());
+    AgentExecStatus visible_status;
+    visible_status.agent_id = "agent-A";
+    visible_status.status = "success";
+    h.execution_tracker->update_agent_status(*visible_child_id, visible_status);
+
+    Execution invisible_child;
+    invisible_child.definition_id = "def-children-conf";
+    invisible_child.dispatched_by = "someone-else";
+    invisible_child.status = "completed";
+    invisible_child.dispatched_at = 1735689720;
+    invisible_child.parent_id = parent_id;
+    auto invisible_child_id = h.execution_tracker->create_execution(invisible_child);
+    REQUIRE(invisible_child_id.has_value());
+    AgentExecStatus invisible_status;
+    invisible_status.agent_id = "agent-C";
+    invisible_status.status = "success";
+    h.execution_tracker->update_agent_status(*invisible_child_id, invisible_status);
+
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+
+    auto res = h.sink.Get("/api/v1/executions/" + parent_id + "/children");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"]["children"].is_array());
+    bool found_visible = false, found_invisible = false;
+    for (const auto& c : body["data"]["children"]) {
+        if (c["id"] == *visible_child_id)
+            found_visible = true;
+        if (c["id"] == *invisible_child_id)
+            found_invisible = true;
+    }
+    CHECK(found_visible);
+    CHECK_FALSE(found_invisible);
+}
+
+// #2146 A2-R1 Gate 8 fix: the exact bug the SQL scope-fold closes -- the
+// 100-row cap used to apply to the RAW `parent_id`-matched row set BEFORE
+// the caller-side confinement filter, so an invisible sibling dispatched
+// more recently could displace this caller's own visible child entirely out
+// of the capped `dispatched_at DESC` window, with `result_truncated_by_cap`
+// absent (a false "this is your complete visible list"). This is a
+// ROUTE-level test, not just a tracker-level one: it proves the REST v1
+// handler actually threads its real confinement scope into
+// get_children_checked, not merely that the tracker's SQL fold works in
+// isolation (a caller that forgot to pass its scope would stay green here
+// too if this test only asserted at the tracker layer).
+TEST_CASE("GET /api/v1/executions/:id/children: an invisible sibling cannot displace a "
+          "visible child out of the capped window (#2146 A2-R1 Gate 8 fix)",
+          "[pg][rest][executions][v1][children][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto parent_id = h.make_exec_with_agents("def-children-displace");
+
+    Execution visible_child;
+    visible_child.definition_id = "def-children-displace";
+    visible_child.dispatched_by = "someone-else";
+    visible_child.status = "completed";
+    visible_child.dispatched_at = 1000;
+    visible_child.parent_id = parent_id;
+    auto visible_child_id = h.execution_tracker->create_execution(visible_child);
+    REQUIRE(visible_child_id.has_value());
+    AgentExecStatus visible_status;
+    visible_status.agent_id = "agent-A";
+    visible_status.status = "success";
+    h.execution_tracker->update_agent_status(*visible_child_id, visible_status);
+
+    // 105 invisible siblings, all dispatched strictly AFTER the visible
+    // child -- every one of these sorts ahead of it in the dispatched_at
+    // DESC window the pre-fix cap-before-scope defect used to apply the cap
+    // to.
+    for (int i = 0; i < 105; ++i) {
+        Execution invisible_child;
+        invisible_child.definition_id = "def-children-displace";
+        invisible_child.dispatched_by = "someone-else";
+        invisible_child.status = "completed";
+        invisible_child.dispatched_at = 2000 + i;
+        invisible_child.parent_id = parent_id;
+        auto invisible_id = h.execution_tracker->create_execution(invisible_child);
+        REQUIRE(invisible_id.has_value());
+        AgentExecStatus invisible_status;
+        invisible_status.agent_id = "agent-invisible-" + std::to_string(i);
+        invisible_status.status = "success";
+        h.execution_tracker->update_agent_status(*invisible_id, invisible_status);
+    }
+
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+
+    auto res = h.sink.Get("/api/v1/executions/" + parent_id + "/children");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"]["children"].is_array());
+    bool found_visible = false;
+    for (const auto& c : body["data"]["children"]) {
+        if (c["id"] == *visible_child_id)
+            found_visible = true;
+    }
+    CHECK(found_visible);
+    // The caller's OWN visible row set is one row -- nowhere near the cap --
+    // so this must never be reported as truncated.
+    CHECK_FALSE(body["data"].contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("GET /api/v1/executions/:id/children: fleet_read_fn denial -> 403",
+          "[pg][rest][executions][v1][children][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    h.perm_grant = false;
+
+    auto res = h.sink.Get("/api/v1/executions/anything/children");
     REQUIRE(res);
     CHECK(res->status == 403);
 }

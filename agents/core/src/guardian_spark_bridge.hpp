@@ -61,6 +61,7 @@
 #include "guaranteed_state.pb.h"
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include <charconv>
 #include <cstdint>
@@ -94,20 +95,30 @@ namespace yuzu::agent {
 /// `unsupported`, NOT an authoring fault. Only an unknown spark type is
 /// `errored`/page-worthy.
 enum class RulePlacement {
-    Arm,          ///< known event-driven type WITH a mechanism on this host: arm it
-    Unsupported,  ///< known type, NO mechanism registered here: routine, terminal-state unsupported
+    Arm,          ///< known event-driven type WITH an armable mechanism on this host: arm it
+    Unsupported,  ///< known type, NO mechanism registered here, OR registered but boot-inert
+                  ///< (#4685): either way, routine, terminal-state unsupported
     Unrecognized, ///< spark type token not understood: an authoring error (errored)
 };
 
 /// Classify a rule's spark type against the mechanisms available on this host.
 /// PURE and side-effect-free. `supported` is the set of event-driven types the
-/// SparkEngine has a registered, non-inert mechanism for - callers must filter
-/// out any mechanism the heartbeat itself treats as inert (see
-/// spark_heartbeat.hpp's inert-filtering) before passing it here, or a
-/// registered-but-inert mechanism would be misclassified as armable. CRITICAL:
-/// the discriminator is capability membership, NEVER the text of an arm()
-/// rejection message (ADR-0021 platform-rejection) - a string match would
-/// silently misfile a rejection the day the message wording changes.
+/// SparkEngine has a registered, ARMABLE mechanism for - registered AND NOT
+/// boot-inert (#4685). This is DELIBERATELY NARROWER than
+/// spark_heartbeat.hpp's own inert-filtering, which excludes the UNION of
+/// boot-inert and runtime-degraded: a mechanism mid a TRANSIENT runtime-degraded
+/// episode (Registry's sweeper / File's worker, three consecutive failed passes,
+/// cleared on the next success) still accepts watch() and serves it once a pass
+/// next succeeds, so it must stay armable here even though the heartbeat CSV
+/// stops advertising it as a capability for that same window. Filtering it here
+/// too would strand every rule of that type Unsupported for the whole episode,
+/// with nothing to proactively re-reconcile once the mechanism recovers (the bug
+/// #4685 exists to close - see guardian_engine.cpp's reconcile_rule_locked for
+/// the caller). Callers therefore pass the BOOT-INERT-filtered set, never the
+/// heartbeat's own (union) inert-filtered set. CRITICAL: the discriminator is
+/// capability membership, NEVER the text of an arm() rejection message
+/// (ADR-0021 platform-rejection) - a string match would silently misfile a
+/// rejection the day the message wording changes.
 [[nodiscard]] inline RulePlacement classify(std::string_view spark_type_token,
                                             const std::set<SparkType>& supported) noexcept {
     const std::optional<SparkType> type = spark_type_from_token(spark_type_token);
@@ -259,7 +270,8 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
         default_debounce_ms = kGuardianLegacyDebounceMs;
         spdlog::error("Guardian: rule '{}' has spark type '{}' unhandled by the debounce-"
                       "default switch - falling back to the legacy {}ms default (#3531)",
-                      out.rule_id, spark_type_token(*spark_type), *default_debounce_ms);
+                      log_id_token(out.rule_id), spark_type_token(*spark_type),
+                      *default_debounce_ms);
     }
     (void)parse_resilience_params(get, out.debounce_ms, *default_debounce_ms);
 
@@ -292,7 +304,7 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
             if (const auto clamped = clamp_max_hash_bytes(out.max_bytes); clamped != out.max_bytes) {
                 spdlog::warn("Guardian: rule '{}' authored max_bytes={} exceeds the {}-byte "
                             "ceiling - clamped (#2233 item 6)",
-                            out.rule_id, out.max_bytes, kMaxFileHashBytes);
+                            log_id_token(out.rule_id), out.max_bytes, kMaxFileHashBytes);
                 out.max_bytes = clamped;
             }
             return out;

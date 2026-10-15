@@ -40,6 +40,12 @@ constexpr std::chrono::milliseconds kQueryAcquireTimeout{3000};
 // table growth: 31 days × top-N(~20) × a few versions is ~1k; this is generous
 // headroom so the store can never allocate an unbounded result set.
 constexpr int kQueryRowCap = 100000;
+// Hard ceiling on DEVICES a single "which devices ran (app,version)" drill will
+// materialise. Backs an interactive UI table (not a bulk export), so a much
+// tighter cap than kQueryRowCap above is appropriate; ordering by descending
+// cpu_avg before the cap keeps the highest resource consumers even when a
+// wildly popular version is truncated.
+constexpr int kVersionDevicesRowCap = 2000;
 // Defensive cap on rows accepted from one apply (a legit agent sends ~tens — the
 // 2-day window × top-N). Bounds memory + the upsert batch against a misbehaving
 // agent; the ingest seam's blob cap is the primary bound, this is depth.
@@ -102,6 +108,16 @@ const std::vector<pg::PgMigration>& migrations() {
          // is safe here — this table is born-on-Pg alongside B2, so it is empty at
          // first migration (no ACCESS EXCLUSIVE stall, no CONCURRENTLY needed).
          "CREATE INDEX app_perf_daily_day_idx ON app_perf_daily (day, app_name, version);"},
+        // v3 (the version-drill index) is deliberately NOT here. list_devices_for_version
+        // below runs correctly without it — a full scan, not a wrong answer — until the
+        // non-transactional migration kind exists (ADR-0008 Update, 2026-06-22): this
+        // table is live-written (daily-sync has been shipping since v1/v2), so a plain
+        // CREATE INDEX would take an ACCESS EXCLUSIVE lock for the build's duration, and
+        // ADR-0008 requires the non-transactional kind for DDL on an already-large,
+        // live table rather than "weakening the transactional default to sneak one in".
+        // Tracked as https://github.com/Tr3kkR/Yuzu/issues/4432 — land the index via
+        // that migration kind (or a reviewed ADR-0008 exception), never a plain
+        // CREATE INDEX here.
     };
     return kMigrations;
 }
@@ -411,6 +427,94 @@ AppPerfDailyStore::get_agent_app_perf(std::string_view agent_id) {
         r.cpu_max = to_double(PQgetvalue(res.get(), i, 6));
         r.ws_avg_bytes = to_i64(PQgetvalue(res.get(), i, 7));
         r.ws_max_bytes = to_i64(PQgetvalue(res.get(), i, 8));
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<std::vector<AppPerfVersionDeviceRow>>
+AppPerfDailyStore::list_devices_for_version(
+    std::string_view app_name, std::string_view version,
+    const std::optional<std::vector<std::string>>& visible_agent_ids, bool& truncated) {
+    truncated = false;
+    // AUTHORITATIVE read: a degrade returns nullopt, never a silent empty.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("AppPerfDailyStore: list_devices_for_version degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    std::vector<AppPerfVersionDeviceRow> out;
+    if (app_name.empty())
+        return out; // precondition miss, not a degrade (version="" is the valid unknown bucket)
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("AppPerfDailyStore: list_devices_for_version degraded — no connection "
+                         "({}) (occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+
+    std::vector<std::string> params;
+    params.emplace_back(app_name);
+    params.emplace_back(version);
+    // ADR-0017: the caller's visible-agent set is pushed into the WHERE clause
+    // (never applied post-fetch) so it composes correctly with the LIMIT below —
+    // a present-but-empty set binds an empty text[] literal, and
+    // `agent_id = ANY('{}'::text[])` is false for every row, yielding zero rows
+    // (deny-all) with no special-casing needed.
+    std::string sql =
+        "SELECT agent_id, day, samples, cpu_avg, ws_avg_bytes FROM ("
+        "  SELECT DISTINCT ON (agent_id) agent_id, day, samples, cpu_avg, ws_avg_bytes "
+        "  FROM app_perf_daily_store.app_perf_daily "
+        "  WHERE app_name = $1 AND version = $2";
+    if (visible_agent_ids) {
+        std::vector<std::string_view> views(visible_agent_ids->begin(), visible_agent_ids->end());
+        params.push_back(pg::to_text_array(views));
+        sql += " AND agent_id = ANY($3::text[])";
+    }
+    sql += "  ORDER BY agent_id, day DESC"
+           ") t ORDER BY cpu_avg DESC, agent_id LIMIT " +
+           // One row PAST the cap (#4030 pattern) so a fleet of exactly
+           // kVersionDevicesRowCap devices is never misreported as truncated —
+           // the sentinel row is trimmed back off below, never returned.
+           std::to_string(kVersionDevicesRowCap + 1);
+
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("AppPerfDailyStore: list_devices_for_version degraded — query failed: "
+                         "{} (occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    const int rows = PQntuples(res.get());
+    truncated = rows > kVersionDevicesRowCap;
+    const int n = truncated ? kVersionDevicesRowCap : rows;
+    if (truncated) {
+        // The cap sits on the OUTER (cpu_avg DESC) ordering, so the dropped rows
+        // are the LOWEST-cpu devices past the ceiling — a truncated read still
+        // surfaces the highest resource consumers, never an arbitrary subset.
+        if (metrics_)
+            metrics_->counter("yuzu_app_perf_version_devices_cap_hit_total", {}).increment();
+        spdlog::warn("AppPerfDailyStore: list_devices_for_version hit the {}-row cap for "
+                     "app='{}' version='{}' — the device list is truncated to the highest-CPU "
+                     "devices",
+                     kVersionDevicesRowCap, app_name, version);
+    }
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        AppPerfVersionDeviceRow r;
+        r.agent_id = PQgetvalue(res.get(), i, 0);
+        r.last_day = to_i64(PQgetvalue(res.get(), i, 1));
+        r.samples = to_i64(PQgetvalue(res.get(), i, 2));
+        r.cpu_avg = to_double(PQgetvalue(res.get(), i, 3));
+        r.ws_avg_bytes = to_i64(PQgetvalue(res.get(), i, 4));
         out.push_back(std::move(r));
     }
     return out;

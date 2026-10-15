@@ -148,5 +148,4 @@ error|platform not supported
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/test_sccm_parsers.cpp` · `tests/unit/test_sccm_win_actions.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
-- Changelog: `changelog.d/wave3-pr33d-windows-updates-sccm-native.changed.md`
 <!-- END GENERATED -->

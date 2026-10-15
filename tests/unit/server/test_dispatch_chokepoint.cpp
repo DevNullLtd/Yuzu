@@ -46,6 +46,7 @@
 
 #include <array>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -738,8 +739,8 @@ constexpr CommandCapability kTarPurgeCap{
 TEST_CASE("finalize_classified_command: the per-action kill switch refuses AFTER classification, "
           "naming the classified securable — never a permissive default on a thrown switch",
           "[server][dispatch][chokepoint]") {
-    std::function<bool(std::string_view, std::string_view)> switch_off =
-        [](std::string_view, std::string_view) { return false; };
+    yuzu::server::detail::KillSwitchFn switch_off =
+        [](std::string_view, std::string_view) { return std::nullopt; };
 
     auto result = finalize_classified_command(kTarPurgeCap, switch_off, "tar", "purge_source",
                                                "cmd-1", {}, {}, 0, 0, {}, {});
@@ -758,10 +759,13 @@ TEST_CASE("finalize_classified_command: the kill switch is consulted on the CLAS
     // A callback that only recognizes the canonical spelling — if
     // finalize_classified_command consulted the caller's raw "TAR"/"PURGE_SOURCE"
     // instead of cap.plugin/cap.action, this would (wrongly) refuse.
-    std::function<bool(std::string_view, std::string_view)> canonical_only =
-        [](std::string_view plugin, std::string_view action) {
-            return plugin == "tar" && action == "purge_source";
-        };
+    yuzu::server::detail::KillSwitchFn canonical_only =
+        [](std::string_view plugin,
+           std::string_view action) -> std::optional<std::unordered_set<std::string>> {
+        if (plugin == "tar" && action == "purge_source")
+            return std::unordered_set<std::string>{};
+        return std::nullopt;
+    };
 
     auto result = finalize_classified_command(kTarPurgeCap, canonical_only, "TAR", "PURGE_SOURCE",
                                                "cmd-2", {}, {}, 0, 0, {}, {});
@@ -771,18 +775,35 @@ TEST_CASE("finalize_classified_command: the kill switch is consulted on the CLAS
 TEST_CASE("finalize_classified_command: an unwired kill-switch callback is legacy-open, mirroring "
           "an absent PluginConfigStore in production — never a hard refusal",
           "[server][dispatch][chokepoint]") {
-    std::function<bool(std::string_view, std::string_view)> unwired; // empty — no store wired
+    yuzu::server::detail::KillSwitchFn unwired; // empty — no store wired
 
     auto result = finalize_classified_command(kTarPurgeCap, unwired, "tar", "purge_source", "cmd-3",
                                                {}, {}, 0, 0, {}, {});
     REQUIRE(result.has_value());
+    CHECK(result->kill_switched_os().empty());
+}
+
+TEST_CASE("finalize_classified_command: a per-OS switch OFF is carried on the classified command "
+          "(#5294), and does not refuse the dispatch",
+          "[server][dispatch][chokepoint][os_kill_switch]") {
+    yuzu::server::detail::KillSwitchFn per_os =
+        [](std::string_view, std::string_view) -> std::optional<std::unordered_set<std::string>> {
+        return std::unordered_set<std::string>{"windows"};
+    };
+
+    auto result = finalize_classified_command(kTarPurgeCap, per_os, "tar", "purge_source", "cmd-os",
+                                               {}, {}, 0, 0, {}, {});
+    REQUIRE(result.has_value());
+    CHECK(result->kill_switched_os() == std::unordered_set<std::string>{"windows"});
 }
 
 TEST_CASE("finalize_classified_command: BR-009 — the wire command carries the CANONICAL "
           "plugin/action the catalogue resolved, never the caller's raw casing",
           "[server][dispatch][chokepoint]") {
-    std::function<bool(std::string_view, std::string_view)> switch_on =
-        [](std::string_view, std::string_view) { return true; };
+    yuzu::server::detail::KillSwitchFn switch_on =
+        [](std::string_view, std::string_view) {
+            return std::optional<std::unordered_set<std::string>>{std::unordered_set<std::string>{}};
+        };
 
     // Caller dispatched with a differently-cased spelling — classify() is
     // case-insensitive so this would have been authorized against kTarPurgeCap,
@@ -799,8 +820,10 @@ TEST_CASE("finalize_classified_command: parameters, payload, stagger and delay r
           "command verbatim, and the dispatch tag is composed over the CALLER's raw plugin/action "
           "(not the canonical spelling) — matching what compute_dispatch_tag always received",
           "[server][dispatch][chokepoint]") {
-    std::function<bool(std::string_view, std::string_view)> switch_on =
-        [](std::string_view, std::string_view) { return true; };
+    yuzu::server::detail::KillSwitchFn switch_on =
+        [](std::string_view, std::string_view) {
+            return std::optional<std::unordered_set<std::string>>{std::unordered_set<std::string>{}};
+        };
     const std::unordered_map<std::string, std::string> params{{"path", "/var/log"}};
 
     auto result =
@@ -900,7 +923,7 @@ TEST_CASE("AgentRegistry::send_to: a routed envelope to a gateway session that n
     (void)registry.register_agent(make_agent_info("dev-gw"));
     // Node set, capabilities deliberately EMPTY — this gateway has not
     // proven it forwards dispatch_tag untouched.
-    registry.set_gateway_route("dev-gw", "gw-node-1", {});
+    REQUIRE(registry.set_gateway_route("dev-gw", /*session_id=*/{}, "gw-node-1", {}));
 
     auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("routed-cmd"));
 
@@ -919,8 +942,8 @@ TEST_CASE("AgentRegistry::send_to: a routed envelope succeeds once the gateway h
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_agent_info("dev-gw"));
-    registry.set_gateway_route("dev-gw", "gw-node-1",
-                               {std::string(kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route("dev-gw", /*session_id=*/{}, "gw-node-1",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)}));
 
     auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("routed-cmd-ok"));
 
@@ -931,6 +954,48 @@ TEST_CASE("AgentRegistry::send_to: a routed envelope succeeds once the gateway h
     CHECK(pending[0].cmd.command_id() == "routed-cmd-ok");
 }
 
+TEST_CASE("AgentRegistry::send_to: cluster_id published via set_gateway_route is carried onto "
+          "GatewayPendingCmd — HA WS-4 4.3",
+          "[server][dispatch][chokepoint]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_agent_info("dev-gw-cluster"));
+    REQUIRE(registry.set_gateway_route("dev-gw-cluster", /*session_id=*/{}, "gw-node-1",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)},
+                                       /*stream_home_id=*/{}, "cluster-a"));
+
+    auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("routed-cmd-cluster"));
+
+    CHECK(registry.send_to("dev-gw-cluster", classified));
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].agent_id == "dev-gw-cluster");
+    REQUIRE(pending[0].cluster_id.has_value());
+    CHECK(*pending[0].cluster_id == "cluster-a");
+}
+
+TEST_CASE("AgentRegistry::send_to: an empty cluster_id (no gateway build predating 4.1/4.3, or a "
+          "direct-session path) carries nullopt, not an empty-string cluster_id",
+          "[server][dispatch][chokepoint]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_agent_info("dev-gw-nocluster"));
+    // set_gateway_route's cluster_id parameter defaults to {} (empty) — same
+    // shape every pre-4.3 call site (tests, an old gateway build) keeps.
+    REQUIRE(registry.set_gateway_route("dev-gw-nocluster", /*session_id=*/{}, "gw-node-1",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)}));
+
+    auto classified =
+        ClassifiedCommandTestAccess::make(make_well_formed_cmd("routed-cmd-nocluster"));
+
+    CHECK(registry.send_to("dev-gw-nocluster", classified));
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK_FALSE(pending[0].cluster_id.has_value());
+}
+
 TEST_CASE("AgentRegistry::send_to_all: an individual gateway recipient missing the "
           "advertisement is excluded from the count without failing the rest of the broadcast",
           "[server][dispatch][chokepoint]") {
@@ -938,11 +1003,11 @@ TEST_CASE("AgentRegistry::send_to_all: an individual gateway recipient missing t
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_agent_info("dev-ok"));
-    registry.set_gateway_route("dev-ok", "gw-node-1",
-                               {std::string(kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route("dev-ok", /*session_id=*/{}, "gw-node-1",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)}));
     (void)registry.register_agent(make_agent_info("dev-missing"));
     // dev-missing's gateway never advertised the capability.
-    registry.set_gateway_route("dev-missing", "gw-node-2", {});
+    REQUIRE(registry.set_gateway_route("dev-missing", /*session_id=*/{}, "gw-node-2", {}));
 
     auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("broadcast-cmd"));
 
@@ -950,6 +1015,35 @@ TEST_CASE("AgentRegistry::send_to_all: an individual gateway recipient missing t
     auto pending = registry.drain_gateway_pending();
     REQUIRE(pending.size() == 1);
     CHECK(pending[0].agent_id == "dev-ok");
+}
+
+TEST_CASE("AgentRegistry::send_to_all: each recipient's own cluster_id is carried onto its "
+          "GatewayPendingCmd — HA WS-4 4.3",
+          "[server][dispatch][chokepoint]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_agent_info("dev-cluster-a"));
+    REQUIRE(registry.set_gateway_route("dev-cluster-a", /*session_id=*/{}, "gw-node-1",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)},
+                                       /*stream_home_id=*/{}, "cluster-a"));
+    (void)registry.register_agent(make_agent_info("dev-cluster-b"));
+    REQUIRE(registry.set_gateway_route("dev-cluster-b", /*session_id=*/{}, "gw-node-2",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)},
+                                       /*stream_home_id=*/{}, "cluster-b"));
+
+    auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("broadcast-cluster"));
+
+    CHECK(registry.send_to_all(classified) == 2);
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 2);
+    std::unordered_map<std::string, std::optional<std::string>> by_agent;
+    for (auto& gp : pending)
+        by_agent[gp.agent_id] = gp.cluster_id;
+    REQUIRE(by_agent["dev-cluster-a"].has_value());
+    CHECK(*by_agent["dev-cluster-a"] == "cluster-a");
+    REQUIRE(by_agent["dev-cluster-b"].has_value());
+    CHECK(*by_agent["dev-cluster-b"] == "cluster-b");
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -972,7 +1066,8 @@ TEST_CASE("AgentRegistry: gateway wire capabilities are recorded and queryable",
 
     // Node value is irrelevant here — gateway_has_wire_capability never
     // reads it — so a fixed placeholder is used throughout this test.
-    registry.set_gateway_route("dev-A", "irrelevant-node", {"command_dispatch_tag_v1", "other_cap"});
+    REQUIRE(registry.set_gateway_route("dev-A", /*session_id=*/{}, "irrelevant-node",
+                                       {"command_dispatch_tag_v1", "other_cap"}));
 
     CHECK(registry.gateway_has_wire_capability("dev-A", "command_dispatch_tag_v1"));
     CHECK(registry.gateway_has_wire_capability("dev-A", "other_cap"));
@@ -988,12 +1083,13 @@ TEST_CASE("AgentRegistry: a reconnect REPLACES advertised wire capabilities, nev
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_agent_info("dev-A"));
 
-    registry.set_gateway_route("dev-A", "irrelevant-node", {"cap_a", "cap_b"});
+    REQUIRE(registry.set_gateway_route("dev-A", /*session_id=*/{}, "irrelevant-node",
+                                       {"cap_a", "cap_b"}));
     REQUIRE(registry.gateway_has_wire_capability("dev-A", "cap_a"));
     REQUIRE(registry.gateway_has_wire_capability("dev-A", "cap_b"));
 
     // A reconnect behind a DIFFERENT gateway build advertises a narrower set.
-    registry.set_gateway_route("dev-A", "irrelevant-node", {"cap_c"});
+    REQUIRE(registry.set_gateway_route("dev-A", /*session_id=*/{}, "irrelevant-node", {"cap_c"}));
 
     CHECK_FALSE(registry.gateway_has_wire_capability("dev-A", "cap_a"));
     CHECK_FALSE(registry.gateway_has_wire_capability("dev-A", "cap_b"));
@@ -1008,8 +1104,8 @@ TEST_CASE("AgentRegistry: clear_stream_if_session clears advertised wire capabil
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_agent_info("dev-A"));
     registry.map_session("sess-1", "dev-A");
-    registry.set_gateway_route("dev-A", "irrelevant-node",
-                               {std::string(kGatewayWireCapabilityDispatchTagV1)});
+    REQUIRE(registry.set_gateway_route("dev-A", "sess-1", "irrelevant-node",
+                                       {std::string(kGatewayWireCapabilityDispatchTagV1)}));
     REQUIRE(registry.gateway_has_wire_capability(
         "dev-A", kGatewayWireCapabilityDispatchTagV1));
 
@@ -1027,7 +1123,7 @@ TEST_CASE("AgentRegistry: clear_gateway_wire_capabilities drops the advertised s
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_agent_info("dev-A"));
-    registry.set_gateway_route("dev-A", "irrelevant-node", {"cap_a"});
+    REQUIRE(registry.set_gateway_route("dev-A", /*session_id=*/{}, "irrelevant-node", {"cap_a"}));
     REQUIRE(registry.gateway_has_wire_capability("dev-A", "cap_a"));
 
     registry.clear_gateway_wire_capabilities("dev-A");

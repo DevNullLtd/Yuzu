@@ -515,6 +515,35 @@ bool InventoryStore::delete_agent(const std::string& agent_id) {
     return true;
 }
 
+// ── Delete source (all agents, one plugin) ───────────────────────────────────
+
+bool InventoryStore::delete_source(std::string_view plugin_name) {
+    // Empty-name guard, mirroring delete_agent's empty-id guard: never run a
+    // `DELETE ... WHERE plugin = ''` (a footgun, never a fleet wipe).
+    if (plugin_name.empty())
+        return false;
+    if (!open_) {
+        spdlog::debug("InventoryStore: delete_source skipped for plugin={}, store not open",
+                      plugin_name);
+        return false;
+    }
+    auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("InventoryStore: delete_source skipped for plugin={}, no connection ({})",
+                      plugin_name, pool_.last_error());
+        return false;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "DELETE FROM inventory_store.inventory_data WHERE plugin = $1",
+        std::vector<std::string>{std::string(plugin_name)});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::debug("InventoryStore: delete_source failed for plugin={}: {}", plugin_name,
+                      PQerrorMessage(lease.get()));
+        return false;
+    }
+    return true;
+}
+
 // ── Count (authoritative read) ───────────────────────────────────────────────
 
 std::optional<int64_t> InventoryStore::count() const {

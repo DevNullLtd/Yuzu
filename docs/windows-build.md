@@ -6,13 +6,14 @@ Reference for the Windows build toolchain paths and prerequisites. CLAUDE.md kee
 
 ```bash
 source ./setup_msvc_env.sh           # MSVC paths
-source scripts/ensure-erlang.sh      # Erlang/OTP on PATH (gateway target)
 meson compile -C build-windows       # canonical Windows dir; coexists with build-linux from WSL2
 ```
 
 **Do NOT use `vcvars64.bat`.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.
 
-`scripts/ensure-erlang.sh` is the sibling helper for the Erlang/OTP toolchain (see "Toolchain activation (Erlang on PATH)" in `docs/erlang-gateway-build.md`). Source both before invoking meson if your build touches the gateway custom_target.
+The gateway's Erlang/OTP needs no activation step: Meson resolves the pinned release at configure time and hands it to the gateway build and tests (see "Toolchain activation (Erlang on PATH)" in `docs/erlang-gateway-build.md`). `scripts/ensure-erlang.sh` applies the same pin to an interactive shell, for running rebar3 or `erl` by hand.
+
+**Python for build scripts:** every Meson target that runs a repo script uses the interpreter running Meson itself (`yuzu_python` in the root `meson.build`), i.e. the native `C:\Python314` of the runner contract. A bare `python3` under MSYS2 bash is MSYS2's `/usr/bin/python3`, which cannot open the `C:/` paths Meson passes and made every script test fail in ~0.04s.
 
 ## Toolchain paths
 
@@ -25,7 +26,7 @@ All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Progr
 | cmake.exe | `C:\Program Files\CMake\bin\cmake.exe` (needed by Meson's cmake dep method) |
 | ninja.exe | Installed with CMake or VS BuildTools |
 | python | `C:\Python314\python.exe` (system-wide, installed via Chocolatey) |
-| meson | `C:\Python314\Scripts\meson.exe` (`pip install meson==1.11.1`) |
+| meson | `C:\Python314\Scripts\meson.exe` (`pip install meson==1.11.1` — the Windows runner contract pin in `deploy/windows/toolchain-contract.json`; Linux CI uses 1.12.0) |
 | vcpkg | `C:\vcpkg` (`VCPKG_ROOT`) |
 | protoc | `C:\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
 | grpc_cpp_plugin | `C:\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |
@@ -105,8 +106,38 @@ files correctly.
 Every shipped `.ps1` begins with a `PSVersionTable.PSVersion.Major -lt 7`
 guard that exits 1 with an actionable message. CI workflow steps use
 `shell: pwsh` rather than `shell: powershell`. The
-`yuzu-local-windows` runner has `pwsh` 7.6.1 pre-installed. See
+retired `yuzu-local-windows` runner had `pwsh` 7.6.1 pre-installed; the Wee Tam runners are provisioned per `deploy/windows/README.md`. See
 issue #517 for the migration history.
+
+**Exception: installer helpers run on end-user hosts.** Scripts the
+installers run on the customer's machine, today
+`deploy/packaging/windows/generate-config.ps1` and the inline commands in
+`yuzu-agent.iss` / `yuzu-server.iss`, target the Windows PowerShell 5.1
+(`powershell.exe`) that every Windows host has, and carry no PowerShell 7
+guard. They must stay ASCII-only outside comments (5.1 reads BOM-less files
+in the ANSI codepage), and each must first reset `PSModulePath` (#5176):
+the permission checks to `$PSHOME\Modules` alone, `generate-config.ps1` to
+that plus the machine value.
+
+**The permission checks (`RunAclCheck` in both installers) must run under
+Constrained Language Mode**, which WDAC script enforcement, or AppLocker
+script rules for an install run by an administrator, imposes on them. So
+they use no .NET method or static call: only property reads, `-match`,
+`-band` and cmdlets, comparing SDDL text by SID alias (#5196). Only
+`generate-config.ps1` needs .NET (password hashing). The server installer
+checks the language mode first and refuses with its own message; an upgrade
+that keeps the existing accounts never runs it.
+
+The installers run these helpers with `-Command`, never `-File`: a
+Group-Policy `AllSigned` execution policy blocks unsigned script *files* even
+with `-ExecutionPolicy Bypass`, but not command text. `generate-config.ps1`
+is therefore read as text and run as a script block. A helper that handles a
+secret takes it from the environment, never from its command line, and fails
+the install on any error rather than warning (#5196). The server installer's
+data-directory handling (`PrepareToInstall`, `RunAclCheck`) follows the
+agent's `SecureTrustAnchorDir` design: refuse links, never adopt what it did
+not create, build a new directory privately and move it into place, verify
+exact permissions. Change them together.
 
 ## Running server tests locally (libpq.dll on PATH)
 

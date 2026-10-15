@@ -1,1 +1,0 @@
-- **`firewall` plugin no longer misreports a disabled Linux `ufw` as active.** The Linux `state` action's ufw check used a substring search for `"active"`, which also matches inside `"inactive"` — a host with ufw explicitly disabled was reported as `active`. The check now matches the full `"Status: active"`/`"Status: inactive"` prefix.

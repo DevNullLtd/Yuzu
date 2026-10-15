@@ -5,6 +5,12 @@
 **Component:** Agent core (sync scheduler) · Server (inventory ingest + Postgres store) · Gateway (proxy)
 **Authors:** Dave Rae
 
+> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> the direction that `--inventory-disable` stops being the collection toggle: it becomes a
+> one-time starting-state input that the server adopts as a visible off-rule, and each daily-sync
+> source becomes a unit that can be switched off on its own. Nothing has changed in the product
+> yet: until the work that follows ADR-3006 lands, this ADR describes what ships.
+
 ## Context
 
 We are beginning to write endpoint-reported data to the server's **PostgreSQL**
@@ -75,6 +81,18 @@ A small, source-agnostic seam:
   offline) → one catch-up sync after a *short random startup delay* (so a
   mass-deploy or a site's Monday-morning power-on does not herd); otherwise wait
   for the next phase fire.
+
+> **Update (2026-10-04, #5327):** a source whose collect yields nothing records
+> `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
+> (`skip_backoff`; today installed_software only — device_ci dispatches many
+> actions per attempt and software_licensing's single `license_scan.list` is a
+> full scan of every detection surface, so neither retry is cheap) retries after
+> the earlier of the next phase slot and 1 h · 2^(streak-1) while the streak is
+> at most 5, then once per daily slot; the others keep one full interval. The operator-facing schedule is stated once, in
+> `docs/user-manual/inventory.md`. The skip reason reaches the server only as a
+> heartbeat tag, never a report. KV writes are ordered skip fields first
+> (`save_state`), so an interrupted save never advances `next_fire` with the skip
+> unrecorded.
 
 ### 4. Hash-skip conditional protocol
 - The agent **always** sends a per-source `content_hash`; it **omits the full
@@ -206,7 +224,9 @@ Therefore we **coexist, not replace**:
 > gate — a management-group-confined operator now gets a genuinely filtered result
 > instead of a 403, and a service-scoped token gets a filtered result instead of a
 > blanket deny. This closes ADR-0017's PR-D backlog item for these two surfaces; the
-> `/inventory` dashboard Find tab is unmigrated and stays global-gate-only for now.
+> `/inventory` dashboard Find tab is unmigrated and stays global-gate-only for now
+> (that tab's routes were since removed; the equivalent read is the `/software` page's
+> devices expansion, still global-gate-only).
 > See `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.
 
 ## Consequences
@@ -329,7 +349,8 @@ daily-sync thread).
 originally scoped the DPIA/Workstream-E entry as a "pre-correlation-PR assurance
 item" — written when this data was store-only (central Postgres, no operator
 surface). That framing is now stale: the `/inventory` Devices tab CI columns +
-per-device CI panel (PR2 of this ladder) make serial/system_uuid/primary_mac
+per-device CI panel (PR2 of this ladder; now the Hardware CI list/record — the
+`/inventory` Devices-tab fragments were removed) make serial/system_uuid/primary_mac
 **operator-visible** for the first time, which is a co-determination trigger
 point distinct from mere central storage (works-council review is about
 monitoring *capability becoming exercised*, not just data existing in a DB).
@@ -344,8 +365,8 @@ leaving it as prose here.
 
 **Binding requirement for a future CMDB-correlation PR (unscheduled) — do NOT
 correlate on `"unknown"`.** (Note: the ladder's actual "PR2" — the `/inventory`
-Devices tab CI columns + per-device CI panel — is dashboard-**read**-only; it joins
-purely on `agent_id` and does not implement CMDB correlation/merge, so this
+Devices tab CI columns + per-device CI panel, now the Hardware CI list/record — is
+dashboard-**read**-only; it joins purely on `agent_id` and does not implement CMDB correlation/merge, so this
 requirement does not apply to it and remains open for whichever future PR adds
 cross-device correlation.) When the platform identity subsystem is unavailable, or
 a host genuinely has no SMBIOS serial (many VMs; Linux without the capability),
@@ -399,13 +420,51 @@ ecosystem value, not collected). `version` is now the upstream version with the
 release/revision split into its own field, and rpm `publisher` switches
 VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 
+> **Update (2026-10-04, #5328):** `homebrew` was never emitted as an ecosystem
+> value and is retired. Homebrew (ecosystem `brew`; kind `pkg` for formulae, `app`
+> for casks) and Windows optional features (ecosystem `optional_feature`, kind
+> `feat`) are collected since #5335.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no
   proto change, no gateway pb regen (§6 applies only to outer-envelope fields).
 - Collection is a new `installed_apps` action **`list_inventory`** (13-token
   `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
-  stable contract and is byte-unchanged (rpm `list` keeps VENDOR).
+  stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
+  VENDOR). On Windows, `get_installed_apps_windows()` feeds `list` and `query`, and
+  the hashed `inv|` rows come from the registry walk
+  (`reg_walk::collect_uninstall_apps`), so a change to either must be checked
+  against the hashed rows. *Amended 2026-10-06:* the hashed rows moved off
+  `get_installed_apps_windows()` onto the registry walk. *Amended 2026-09-21:* `list` gained two trailing columns
+  (`install_location`, `bundle_id`) under ADR-0028's binding condition. Its
+  `app` tag, `name`, `version`, `publisher` and `install_date` keep their
+  position and value for every real value; every `list` field is now
+  escape-aware (`\`→`/`, `|`→`\|`, CR/LF→space, 4 KiB cut) — `list` rows are
+  never hashed. On macOS, the collector `list`/`query`/`list_per_user` share now
+  sorts same-named apps by (name, `install_location`) instead of an arbitrary
+  order; their row shape is otherwise unchanged. The `inv|` rows are unchanged
+  for real Location values (a relative or control-byte Location, which only a
+  hostile bundle produces, is now ignored rather than feeding the #2273
+  enrichment): the Windows name+version dedupe (`dedupe_uninstall_records`)
+  keeps the same survivor as before and sets that survivor's `install_location`
+  to the lexicographically smallest populated location in its run. Data
+  classification: `install_location` is
+  operator-tier — an ordinary stored Response (90-day default retention, no
+  per-subject erasure, not covered by `--inventory-disable`), never in this
+  blob — and can name an account's home directory
+  (`/Users/<account>/...`, `C:/Users/<name>/...`). §8's finding — that the
+  sync neither crawls a logged-in user's hive nor `~/Applications` — is about
+  the sync and the Windows `HKCU` path specifically; it does not extend to
+  `list`: on macOS the shared `system_profiler` scan `list`/`list_inventory`
+  both run CAN list entries under `/Users/<account>/Applications` (4 of the
+  323 rows in the committed macOS sample), so `list` may name a home
+  directory. Any change that puts `install_location` into a hashed or synced
+  blob (the component-inventory collection's blob v3, ADR-0028) must re-open
+  §8's classification first. `list`/`list_inventory` keep their
+  `Inventory:Read`/`ExecuteGate::None` tier; `list_per_user`'s AdminOrApproval
+  gate exists for profile enumeration, which `list` does not do (CC6.3
+  decision recorded here).
 - Store: migration v5 adds the 8 columns as `TEXT NOT NULL DEFAULT ''`
   (metadata-only on PG11+). REST/MCP rows carry all 12 fields.
 - Caps: unchanged (`kMaxEntries` 20k, `kMaxFieldLen` 1024, `kMaxBlobBytes`
@@ -436,4 +495,35 @@ Mechanics:
   (common on community/COPR-built packages) — that is third-party data-subject
   data, not the monitored end-user's, and is out of scope for the
   co-determination analysis above. `distro_id`/`distro_version` add no new
+
+### 2026-09-17 — source `app_usage` (machine-scope usage evidence) CATASTROPHIC clauses
+
+A new sync source, **`app_usage`**, ships the agent-side `app_usage` plugin's
+`last_used` projection to the server once a day. Its own plugin README and the
+header banner in `agents/plugins/app_usage/src/app_usage_parsers.hpp` are the
+per-file contracts; this entry is the routed-concerns.md pointer's full text
+(kept here, not duplicated inline in that file, to stay under its per-file
+character budget — see `docs/instruction-file-standard.md`'s placement
+ladder). The plugin reads TAR's `usage` fold read-only (`PRAGMA query_only`,
+`SQLITE_OPEN_READONLY`) — it never writes `tar.db`. Four clauses, all
+CATASTROPHIC-IF-VIOLATED:
+
+1. **No pid, command line or user name is ever emitted.** `usage_daily_user`
+   contributes only a distinct-user COUNT, never a name. A negative test greps
+   the plugin source for the raw process-event table name and `cmdline` and
+   must find zero hits.
+2. **`exe_key` pipe-escaping is a byte-for-byte contract.** Every emitted row
+   pipe-escapes `exe_key` via `yuzu::util::safe_output_field`, and this
+   source's `split_pipe` parser only splits on UNESCAPED pipes and unescapes
+   the producer's backslash-pipe escape sequence — changing one side without
+   the other silently corrupts or drops rows whose executable name contains a
+   delimiter character.
+3. **A `tar_config` read failure must map to `Errored`, never `Enabled`.**
+   `source_state_from_config`'s tri-state (Enabled/Disabled/Errored) mirrors
+   TAR's own `canonical_source_enabled` #560 fix; defaulting a read failure to
+   `Enabled` is the opposite of fail-closed.
+4. **Never send an empty blob for a constrained capture.** Skip the sync cycle
+   instead — an empty blob reads server-side as "genuinely zero usage" on a
+   host that is actually constrained or disabled, which is a false negative a
+   downstream consumer cannot distinguish from real data.
   exposure (already derivable from the existing `os_info` source).

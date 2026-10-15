@@ -424,9 +424,9 @@ std::string read_proc(const char* path) {
 
 PerfCounters read_perf_counters() {
     // A transient /proc read failure surfaces as valid=false, which
-    // do_collect_perf reports as `unsupported_platform` — on Linux that status
-    // token also covers "momentarily unreadable" (renaming it is an
-    // operator-facing contract change, out of scope). The caller advances
+    // do_collect_perf reports as `counters_unavailable` on a supported OS
+    // (read_failure_token, #1846) and `unsupported_platform` only where the
+    // registry says the OS has no perf collector. The caller advances
     // prev_perf_ only on valid readings and the counters are cumulative, so
     // the next successful tick derives correctly over the longer interval.
     return parse_linux_perf_counters(read_proc("/proc/stat"), read_proc("/proc/meminfo"),

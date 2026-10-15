@@ -1,1 +1,0 @@
-- Fixed several exception-safety and targeting-validation defects in `POST /api/command`'s dispatch path, and made the route testable via the in-process route-sink harness.

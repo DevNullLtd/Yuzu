@@ -318,7 +318,11 @@ spec:
           took effect. "login" and "all" are also not supported for
           delete and are rejected with an error rather than silently
           deleting from an unintended store, as is any other unrecognized
-          value. Ignored on Linux.
+          value. Ignored on Linux. On Windows the named store is opened
+          under the LocalMachine hive only; if it cannot be opened there
+          the action reports error|<store> store could not be opened;
+          nothing removed (non-zero exit) and never falls back to the
+          CurrentUser hive.
         default: "MY"
 
   result:

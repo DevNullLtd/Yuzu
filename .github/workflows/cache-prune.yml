@@ -38,7 +38,7 @@ concurrency:
 jobs:
   prune-linux:
     name: "Prune Linux runner cache"
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 15  # headroom for the #1367 sweep's worst-case per-instance psql timeouts
     steps:
       - name: Prune vcpkg binary cache zips older than 30 days

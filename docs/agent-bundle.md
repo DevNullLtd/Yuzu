@@ -128,6 +128,10 @@ LD_LIBRARY_PATH="$PWD/bin" ./bin/yuzu-agent \
 Persistent: `sudo apt-get install ./installers/<deb>` (or `dnf install ./installers/<rpm>`),
 then `sudo systemctl edit yuzu-agent` to set `--server`/`--enrollment-token`
 (+ `--no-tls` for the demo) and `sudo systemctl enable --now yuzu-agent`.
+Two known limits: the RPM installs but its service does not start yet (the
+unit expects `/usr/local/bin`, the RPM installs to `/usr/bin`, #4916), and the
+Linux binaries need glibc 2.38 or newer, so neither package nor the payload
+runs on RHEL/Rocky 9, Ubuntu 22.04 or Debian 12 yet (#5143).
 
 **macOS** — foreground (demo):
 ```bash
@@ -149,9 +153,81 @@ cd yuzu-agents\windows-x64\payload
 ```
 Persistent: run `installers\YuzuAgentSetup-<v>.exe` (enter gateway + token on the
 config page), or fully unattended —
-`installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN>`
+`installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN> /LOG=<path>`
 (the installer takes the gateway address as `/SERVER=`, not only the GUI page).
+Keep `/LOG=`: without it Setup writes no log, and the log is the only record of
+why an unattended install failed and what it did about the service. The log also
+records the enrollment token: Setup writes its whole command line, including the
+`/TOKEN=` value, and the service command line it registers. Tokens can be reused,
+so write the log where only Administrators and SYSTEM can read it, and restrict or
+delete it after the deployment; deployment tools (SCCM's AppEnforce.log, Intune)
+record the command line too.
 Service name `YuzuAgent`.
+If a silent install exits with code **7** and its `/LOG=` log says "The update
+trust-anchor directory is not secured", the installer refused to continue
+because it could not confirm that only Administrators and SYSTEM can write
+`%ProgramData%\Yuzu\agent-certs`, and that both have full control of it and of
+everything in it. The lines after it give the directory and then the reason.
+The installer refuses when the directory, or anything in it, is a junction,
+symbolic link, subdirectory or hard link; when the directory already existed but
+was not secured; or when a file in it is not owned by Administrators or SYSTEM.
+It never takes such a directory or file over. Remove a junction or directory link
+with `cmd /c rmdir "<path>"` and a file link with `cmd /c del "<path>"` (each
+removes the link, never its target; not `Remove-Item -Recurse`, which in Windows
+PowerShell 5.1 deletes a junction target's contents). For an unsecured directory,
+move any bundle you placed there yourself somewhere safe, delete the directory,
+run the installer again, then copy the bundle back in as an administrator. For a
+file refused because of its owner: inspect it, and if it is yours, run
+`icacls "<file>" /setowner *S-1-5-32-544 /L`. A fresh install also refuses if
+the installing account's TEMP folder is on another drive: set TEMP and TMP to a
+folder on the system drive, or install as SYSTEM. The
+check runs before the agent service is stopped, so the service is left as it was.
+A refusal never leaves `agent-certs` less protected than it was: a new directory
+is locked in the installer's private temporary folder and moved into place only
+once it passes the check, so if security software blocks the lock nothing is
+created at the path; an existing directory's own permissions are never changed,
+and the abort message says which happened.
+
+Installers from 0.14.0-rc1 to rc5 also refuse with code 7 wherever PowerShell
+is restricted to Constrained Language Mode -- WDAC script enforcement, or
+AppLocker script rules for an install run by an administrator rather than as
+SYSTEM (#5196): use a later installer. Installers from 0.14.0-rc1 to rc3 also hit this when started from
+PowerShell 7 through another process (#5176): run them from a new
+`powershell.exe` or `cmd.exe` window that was not itself started from
+PowerShell 7, or use a later installer.
+
+If an upgrade fails after the installer has stopped the agent service -- for
+example a file in the program directory cannot be replaced, which a
+`/SUPPRESSMSGBOXES` install answers with Abort -- Setup exits with code **5**.
+If the `YuzuAgent` service was running, or still starting, when the upgrade
+began, Setup starts it again before it exits. It does so even when `/NOSTART`
+was given: `/NOSTART` applies only to an installation that completed. The log
+records the outcome on its `DeinitializeSetup:` lines. "has been started again
+and is RUNNING" (or "is RUNNING again; Setup did not have to start it") means the
+agent is back up. "could NOT be started again" gives the state Setup saw and
+sc.exe's exit code: start the service with `sc.exe start YuzuAgent` (in
+PowerShell, plain `sc` is Set-Content), check
+`C:\Program Files\Yuzu\logs\yuzu-agent.log` if that fails too, or run the
+installer again. Setup reports only a state it observed: it waits up to 45
+seconds for a slow stop to finish and up to 10 seconds to see the service
+running. Either way, the files the failed installation had already replaced are
+not put back, so the agent may be running a mix of old and new files until you
+run the installer again. A service that was already stopped before the upgrade
+stays stopped. Installers up to 0.14.0 left the service stopped after a failed
+upgrade (#5250).
+
+Uninstall: `"C:\Program Files\Yuzu\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES`
+(add `/LOG=<path>` to keep a log; if the agent was installed to another
+directory, use the path in its `UninstallString` registry value). A silent
+uninstall removes the program but **keeps `%ProgramData%\Yuzu`**, which holds
+the agent's identity and its mTLS private key; an interactive uninstall asks. To
+decommission a device, revoke its certificate on the server (find its serial in
+`GET /api/v1/ca/issued`, then `POST /api/v1/ca/revoke`; see
+`docs/user-manual/device-management.md`) and delete that directory. Revocation
+alone does not disconnect an agent that reaches the server through a gateway;
+see "Gateway-proxied agents: revocation scope" in `docs/auth-architecture.md`.
+Uninstallers from releases up to 0.14.0-rc2 hang on a silent uninstall (#5147) —
+upgrade first.
 
 ## Verify integrity
 

@@ -69,6 +69,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -265,7 +266,11 @@ public:
     void disarm(SubscriptionId id);
 
     /// Start the mechanism threads. Interval/poll deadlines are (re)based on
-    /// the start instant; startup sparks fire immediately. Single-shot.
+    /// the start instant; startup sparks fire immediately. Single-shot. On a
+    /// failure (#2050), an internal rollback guard tears the partial startup
+    /// back down and the original exception propagates — the engine is left
+    /// TERMINALLY stopped (mirrors stop()'s own sticky-stop invariant), never
+    /// restartable, not restored to a pre-start state.
     void start();
 
     /// Stop watchers (wheel + mechanisms), then consumer dispatch threads.
@@ -297,6 +302,27 @@ public:
     /// a periodic backstop sweep (GuardianSparkRuntime::revalidate_subscriptions). See
     /// SubscriptionHealth's own doc comment for why this needs no incarnation counter.
     [[nodiscard]] SubscriptionHealth subscription_health(SubscriptionId id) const;
+
+    /// Pull query for the establishment signal (rung 9c PR-6 item 1) — see
+    /// spark.hpp's SubscriptionEstablishment doc comment for the field
+    /// semantics. nullopt for an unknown/dead subscription id, mirroring
+    /// subscription_health()'s Dead case (same sub_keys_/armed_ lookup).
+    /// Cheap, lock-only (mu_), no I/O.
+    ///
+    /// `coverage` is overlaid to None while the type's mechanism reports itself
+    /// inert - either reason, boot-inert OR runtime-degraded (whatever it last
+    /// reported); `established_at` is never touched. The result is a conservative
+    /// snapshot, not a coherent one: inert is an atomic read beside the mu_-guarded
+    /// cache, so it can disagree with a newer report.
+    ///
+    /// R4: after stop(), this returns the LAST-KNOWN values (stop() never
+    /// erases armed_ — the same precedent subscription_health() already sets,
+    /// and emit_spark_heartbeat_tags()'s ABSENT posture on !running takes the
+    /// same "consumer gates on liveness" shape). A caller that cares whether
+    /// the engine is still live checks is_running() itself; this query does
+    /// not do it for them.
+    [[nodiscard]] std::optional<SubscriptionEstablishment>
+    subscription_establishment(SubscriptionId id) const;
 
     /// Per-mechanism-type snapshot of the mechanism-owned counters (#2011 rung 1).
     /// Keyed by the registered SparkType — the KEY that stats() sums away — so the
@@ -355,6 +381,32 @@ public:
     /// a real std::bad_alloc cannot be aimed at one statement. Same set-then-use
     /// contract as the other seams.
     void set_arm_fault_hook_for_test(std::function<void(int phase)> hook);
+    /// Test seam (rung 9c PR-6 item 1, E13): if set, invoked exactly once inside
+    /// start(), after every mechanism's start() has returned (and the
+    /// establishment sink has been installed on each) but BEFORE the pre-start
+    /// replay loop runs. No locks held. Lets a test land a disarm+re-arm of a
+    /// pre-start subscription INSIDE this exact window, deterministically
+    /// reproducing the race the replay's incarnation gate (not a bare
+    /// armed_.contains() check) exists to close — the replay must skip a key
+    /// whose incarnation has moved on, not merely a key that is still present.
+    /// Same set-then-use contract as the other test seams: set before start().
+    void set_on_start_hook_for_test(std::function<void()> hook);
+    /// Test seam (#2050): if set, invoked at each labelled phase inside start()'s
+    /// in-mu_ startup sequence (Replay collection, mechanism-pointer collection,
+    /// wheel-thread spawn). None of these three sites is reachable through a
+    /// mechanism fake — they run before/around the per-mechanism loop — so this is
+    /// the only way to deterministically exercise start()'s rollback guard for them.
+    /// CONTRACT: fires with the non-recursive mu_ HELD (all three phases run inside
+    /// start()'s `{ lock_guard lk(mu_); ... }` block) — throw or observe only;
+    /// re-entering the engine self-deadlocks. Same set-then-use contract as the
+    /// other test seams: set before start().
+    void set_start_fault_hook_for_test(std::function<void(int phase)> hook);
+    /// Reached immediately before the Replay-collection loop iterates armed_.
+    static constexpr int kStartFaultPhaseReplayCollection = 1;
+    /// Reached immediately before the mechanism-pointer collection loop.
+    static constexpr int kStartFaultPhaseMechCollection = 2;
+    /// Reached immediately before wheel_thread_ is constructed.
+    static constexpr int kStartFaultPhaseWheelSpawn = 3;
     /// Reached after arm_impl's armed_ entry is committed and before the sub_keys_
     /// node is allocated: a throw here must leave armed_/sub_keys_ exactly as on
     /// entry (the in-lock layer).
@@ -410,6 +462,24 @@ private:
         /// firing. Cleared when the mechanism reports recovery.
         bool faulted{false};
         std::vector<Subscriber> subs;
+        /// Identity token (rung 9c PR-6 item 1), minted from the SAME shared
+        /// next_id_ counter as ConsumerId/SubscriptionId, ONLY on a fresh key
+        /// (never on a dedup arm, which shares the existing key's token). Lets
+        /// a mechanism's asynchronous establishment report be checked against
+        /// "is this still the CURRENT watch for this key" before it is trusted
+        /// (H1) — see report_established().
+        SparkIncarnation incarnation{kNoSparkIncarnation};
+        /// When this key's CURRENT incarnation was minted (H14: even a
+        /// pre-start arm gets this at arm time, not at start()).
+        std::chrono::steady_clock::time_point armed_at{};
+        /// First time a mechanism reported Notification coverage for the
+        /// CURRENT incarnation — first-wins, never re-stamped by a later
+        /// recovery (spark.hpp's SubscriptionEstablishment doc comment).
+        std::optional<std::chrono::steady_clock::time_point> established_at;
+        /// The mechanism's most recently reported tri-state coverage for this
+        /// key — unlike established_at, this DOES track the current state
+        /// (can drop back to None or Poll and this field follows it).
+        SparkCoverage coverage{SparkCoverage::None};
     };
 
     // #2270 tripwires. arm_impl's publishing tail runs AFTER its first shared-state
@@ -517,6 +587,38 @@ private:
     /// edge into Armed::faulted + the fault counter under mu_. Never blocks
     /// firing — health only. Called with the engine lock released.
     void report_fault(const std::string& key, bool faulted, std::string_view reason);
+    /// Establishment-signal entry point (rung 9c PR-6 item 1): a mechanism
+    /// reports a coverage transition for `key`. mu_ ONLY — allocation-free, no
+    /// deliver() (this is a pull-query field, not a delivered event). Identity
+    /// check first (drops a report whose incarnation no longer names the
+    /// key's CURRENT watch — H1), then an UNCONDITIONAL coverage assignment
+    /// (the cache always reflects the mechanism's last-reported value), then
+    /// first-wins established_at stamping (set only once per incarnation, only
+    /// on a Notification transition). Called with the engine lock released,
+    /// like report_fault().
+    void report_established(const std::string& key, SparkIncarnation incarnation,
+                            std::chrono::steady_clock::time_point at, SparkCoverage coverage);
+    /// #2050: stop()'s teardown body, factored out so start()'s own rollback guard can
+    /// drive the identical teardown on a startup failure. REQUIRES lifecycle_mu_
+    /// ALREADY HELD by the caller — stop() holds it via its own `life` lock_guard;
+    /// start()'s rollback guard runs while start()'s `life` lock_guard is still live
+    /// (the guard is declared after `life` and destructs before it unwinds — see
+    /// start()'s definition for why that ordering is deadlock-load-bearing, not
+    /// cosmetic). Never call this without lifecycle_mu_ held, and never re-enter it on
+    /// the same thread — lifecycle_mu_ is non-recursive.
+    ///
+    /// MAY THROW, exactly as stop()'s body always could (joins, map ops, spdlog can
+    /// all raise). Each of the two callers contains that itself: stop()'s own outer
+    /// `noexcept try { } catch (...) { }` (unchanged by this refactor), and the
+    /// rollback guard's own inline try/catch (a destructor must never let an
+    /// exception escape mid-unwind).
+    ///
+    /// Mechanism teardown is per-iteration-isolated: one mechanism's stop() throwing
+    /// does not skip the rest, and `teardown_complete_` is set ONLY when every phase
+    /// — including every mechanism this pass — completed without throwing, so a
+    /// partial pass is retried (idempotently) by the next caller instead of being
+    /// latched away as done.
+    void teardown_locked();
     void wheel_loop();
     void deliver(const SparkEvent& ev, const std::vector<Subscriber>& subs);
     /// Signal one consumer to stop (set stopping + notify). Non-blocking.
@@ -607,9 +709,12 @@ private:
     /// detached F3-counted worker, bounded on the control path by
     /// kFileCallerWaitBudget, with the same reservation-before-publication
     /// shape as Registry above - a hung probe on a dead UNC path no longer
-    /// holds File's lock for the OS network timeout. STILL OPEN for SERVICE
-    /// (PR-B3, not yet landed): its queue-push watch()/unwatch() are already
-    /// O(1) but its SCM open/notify still run head-of-line on its worker.
+    /// holds File's lock for the OS network timeout. LANDED for SERVICE, Windows
+    /// half only (PR-B3, #2012/#3840): its queue-push watch()/unwatch() were
+    /// already O(1); OpenServiceW establishment now runs on a bounded,
+    /// F3-counted probe lane instead of head-of-line on its worker. The Linux
+    /// sd-bus mechanism has no head-of-line OS call in watch()/unwatch() at
+    /// all (a queue push only), so PR-B3 did not need a Linux half.
     /// Populated in register_mechanism() under mu_, in lockstep with
     /// mechanisms_, and — like mechanisms_ — never erased thereafter, so a
     /// std::mutex& obtained via .at(type) is safe to hold across the blocking
@@ -663,6 +768,8 @@ private:
     std::function<void()> arm_precheck_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
     std::function<void(int)> arm_fault_hook_for_test_;  ///< test seam; null = no-op (set-then-use)
     std::function<void()> disarm_race_hook_for_test_;   ///< test seam; null = no-op (set-then-use)
+    std::function<void()> on_start_hook_for_test_;      ///< test seam (E13); null = no-op (set-then-use)
+    std::function<void(int)> start_fault_hook_for_test_; ///< test seam (#2050); null = no-op (set-then-use)
 
     // Delivery counters touched by consumer dispatch threads live in a shared
     // block so a detached thread can write them after ~SparkEngine (UP-1). The

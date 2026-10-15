@@ -1,0 +1,8 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash 5cadaa03e74e
+== action=dotnet
+status|dotnet|supported|-
+[result_status] OK / FULL /
+
+== action=jvm
+status|jvm|supported|-
+[result_status] OK / FULL /

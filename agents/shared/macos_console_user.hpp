@@ -58,6 +58,7 @@
 // resolve_delete_keychain_path) is certificates-plugin-specific and not
 // intended for reuse as-is.
 
+#include <cstdlib>
 #include <format>
 #include <optional>
 #include <string>
@@ -184,12 +185,36 @@ inline bool is_valid_uid(std::string_view uid) {
 
 // ── Store -> keychain mapping ────────────────────────────────────────────────
 
+// Named kDefault* (not kSystemKeychainPath) -- that identifier collides with
+// a macro of the same name in Security/cssmapple.h
+// (kSystemKeychainPath == kSystemKeychainDir kSystemKeychainName), which
+// mangles this declaration wherever both headers are visible.
+inline constexpr const char* kDefaultSystemKeychainPath = "/Library/Keychains/System.keychain";
+inline constexpr const char* kRootKeychainPath =
+    "/System/Library/Keychains/SystemRootCertificates.keychain";
+
+// Test-only overrides (#4374), mirroring the YUZU_KEYCHAIN_PROBE_PATH hidden-
+// probe precedent (tests/unit/test_keychain_read.cpp:332-336): read per call
+// by design (never cached), so a single test process can point successive
+// dispatches at different fixtures. Consulted by the READ paths only --
+// list_certs_macos and details_cert_macos -- `delete` deliberately does not
+// consult them (see resolve_delete_keychain_path below). A relative value is
+// ignored, never resolved against the daemon cwd (same rule as
+// is_valid_home_dir).
 inline std::string system_keychain_path() {
-    return "/Library/Keychains/System.keychain";
+    if (const char* override_path = std::getenv("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE");
+        override_path != nullptr && override_path[0] == '/') {
+        return override_path;
+    }
+    return kDefaultSystemKeychainPath;
 }
 
 inline std::string root_keychain_path() {
-    return "/System/Library/Keychains/SystemRootCertificates.keychain";
+    if (const char* override_path = std::getenv("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE");
+        override_path != nullptr && override_path[0] == '/') {
+        return override_path;
+    }
+    return kRootKeychainPath;
 }
 
 // Guard for a caller-resolved home directory: absolute and non-empty.
@@ -316,11 +341,17 @@ inline StorePlan resolve_store_plan(std::string_view store, bool has_console_use
 //                                silently redirected.
 //   "all", or any other/unrecognized value -- no single-keychain meaning
 //                                for a destructive op: rejected.
+// Resolves to the LITERAL paths (kRootKeychainPath / kDefaultSystemKeychainPath),
+// never the override-aware system_keychain_path()/root_keychain_path()
+// accessors above: destructive resolution stays literal so that a daemon
+// started with a test-only override set can never delete from a substituted
+// keychain -- the same fail-closed stance this comment already takes for an
+// unrecognised store name.
 inline std::optional<std::string> resolve_delete_keychain_path(std::string_view store) {
     if (store == "root")
-        return root_keychain_path();
+        return kRootKeychainPath;
     if (store == "MY" || store == "System")
-        return system_keychain_path();
+        return kDefaultSystemKeychainPath;
     return std::nullopt;
 }
 
@@ -449,6 +480,14 @@ inline std::vector<std::string> build_login_keychain_read_argv(std::string_view 
 // fabricates a value: any failure to determine a real console user, or a
 // build without SystemConfiguration, yields std::nullopt rather than a
 // guess.
+// saf3-1 (governance A0 fix round, NICE): unlike most of this header, a
+// caller missing -DYUZU_HAVE_SYSTEMCONFIGURATION for this ONE function gets
+// no build-time signal at all -- it compiles clean and console_user()
+// silently returns nullopt forever, indistinguishable at the call site from
+// "genuinely no console user right now". Latent only today (the sole
+// caller, the users plugin, does define the macro) but worth knowing before
+// adding a second caller: verify the macro reaches your TU, don't assume a
+// missing definition would be loud.
 inline std::optional<std::string> console_user() {
 #if defined(__APPLE__) && defined(YUZU_HAVE_SYSTEMCONFIGURATION)
     // Own the CFStringRef via unique_ptr from the moment it's acquired so a

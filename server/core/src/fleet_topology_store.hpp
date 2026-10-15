@@ -239,6 +239,28 @@ public:
         return pushed_.size();
     }
 
+    /// Round-3 Hardware-merge accessor (item 10, IP column): a copy of the
+    /// full agent_id -> claimed-local-ips index, taken under pushed_mu_. Only
+    /// currently-connected agents that have pushed at least one
+    /// fleet_snapshot (TAR fleet source, 60 s cache) ever appear here — this
+    /// is NOT a durable device-CI field, so an offline or TAR-disabled agent
+    /// is simply absent (caller renders "—"). O(fleet) copy; call once per
+    /// list render, never per row.
+    std::unordered_map<std::string, std::vector<std::string>> claimed_ips() const {
+        std::lock_guard plk(pushed_mu_);
+        return agent_ips_;
+    }
+
+    /// Same data as claimed_ips(), narrowed to one agent (the Hardware CI
+    /// record's identity lookup) — avoids copying the whole fleet map for a
+    /// single-device open. Empty when the agent has never pushed / isn't
+    /// currently claimed.
+    std::vector<std::string> ips_for(const std::string& agent_id) const {
+        std::lock_guard plk(pushed_mu_);
+        auto it = agent_ips_.find(agent_id);
+        return it == agent_ips_.end() ? std::vector<std::string>{} : it->second;
+    }
+
     /// Set the optional fetcher-duration observer (see
     /// FetchDurationObserver above). Pass an empty function to clear.
     ///

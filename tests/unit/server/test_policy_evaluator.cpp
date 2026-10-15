@@ -18,8 +18,11 @@
  * policy_store.hpp's header comment on why collect stays per-replica).
  */
 
+#include "agent_registry.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "offline_endpoint_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
@@ -28,6 +31,8 @@
 #include "response_store.hpp"
 
 #include "../test_helpers.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
@@ -77,6 +82,21 @@ std::string out_json2(const std::string& c1, const std::string& v1, const std::s
            v2 + R"("}]})";
 }
 
+// A structurally-valid result envelope (#2437-class depth guard regression)
+// whose single row value is a JSON array nested `depth` levels deep, e.g.
+// {"columns":[{"name":"col","type":"string"}],"rows":[{"col":[[[[...]]]]}]}.
+// Built as a flat repeated-bracket string -- NEVER anywhere near the real
+// ~100,000-level attack depth this guard exists to reject; `depth` in these
+// tests is 35, comfortably past kMcpMaxJsonDepth (32) while staying a trivial
+// allocation. Before the fix, this reaches parse_result's structured-result
+// branch, which calls nlohmann::json::dump() on the non-string "col" value --
+// the unboundedly-recursive call the guard exists to prevent ever reaching.
+std::string out_json_deep(const std::string& col, int depth) {
+    return R"({"columns":[{"name":")" + col + R"(","type":"string"}],"rows":[{")" + col + R"(":)" +
+           std::string(static_cast<size_t>(depth), '[') +
+           std::string(static_cast<size_t>(depth), ']') + R"(}]})";
+}
+
 struct Harness {
     // PolicyStore (ADR-0056) and InstructionStore (ADR-0058) are both migrated
     // Postgres stores now — share the same pool/database as ResponseStore
@@ -97,6 +117,9 @@ struct Harness {
     // denied_quarantined) rather than delivered or not_sent -- a THIRD way a
     // claimed target can fail to be delivered, distinct from both.
     std::set<std::string> quarantined;
+    // #5294: agent ids the fake dispatch_fn withholds via
+    // ConfinedDispatchOutcome::kill_switched_os (per-OS kill switch OFF).
+    std::set<std::string> kill_switched_os;
     // WS-4 4.2b Task D (#3424/#3511 under-count): when set, the fake
     // dispatch_fn returns `route_unreadable` for the WHOLE batch (mirroring
     // ArmDispatchResult::route_unreadable's systemic-directory-read-failure
@@ -104,6 +127,10 @@ struct Harness {
     // compute_delivered's `route_unreadable` branch the same way
     // `containment_unreadable` is exercised in deployment_engine.cpp.
     bool route_unreadable_outcome{false};
+    // #5294: the fake dispatch_fn returns `os_gate_unreadable` for the WHOLE
+    // batch (degraded presence read: sent == 0, no per-id data), mirroring
+    // the real ladder's early refusal.
+    bool os_gate_unreadable_outcome{false};
     // WS-4 4.2b Task D fix regression: agent ids the fake dispatch_fn marks
     // `not_sent` while ALSO stamping `outcome.route_unreadable = true`,
     // alongside genuinely-sent siblings in the SAME batch -- mirrors a real
@@ -163,6 +190,10 @@ struct Harness {
             dispatched_plugins.push_back(plugin);
             yuzu::server::ConfinedDispatchOutcome outcome;
             outcome.command_id = "cmd-" + execid;
+            if (os_gate_unreadable_outcome) {
+                outcome.os_gate_unreadable = true;
+                return outcome;
+            }
             if (route_unreadable_outcome) {
                 // Mirrors the real chokepoint: a degraded GatewayRouteStore
                 // directory read means nothing in the batch was individually
@@ -191,6 +222,11 @@ struct Harness {
                     // attempted, failed) and from a canned-absent lookup below.
                     outcome.denied_quarantined.push_back(a);
                     ++outcome.denied_quarantined_count;
+                    continue;
+                }
+                if (kill_switched_os.count(a)) {
+                    outcome.kill_switched_os.push_back(a);
+                    ++outcome.kill_switched_os_count;
                     continue;
                 }
                 auto it = canned.find(a + "|" + plugin);
@@ -427,6 +463,15 @@ TEST_CASE("policy evaluator: InstructionStore DB error on dispatch is distinct f
     auto result = ev.evaluate_now(pid);
     CHECK_FALSE(result.has_value()); // degraded, never a silent "no targets" empty string
     CHECK(h.dispatch_calls == 0); // never reached dispatch_fn — failed resolving the definition
+    // gov Gate 8 (#4981 PR-1, security-guardian): lock the genericized message
+    // itself, not just has_value() — this is the same
+    // kInstructionStoreDbErrorPrefix-tagged failure the fix for the earlier
+    // BLOCKING finding closed (kickoff_check now runs dispatch_instruction's
+    // error through genericize_db_error before wrapping it), so a future
+    // regression re-threading the raw "db_error: store not open" string
+    // through to a caller must fail this exact assertion, not just the
+    // has_value() check above.
+    CHECK(result.error() == "kickoff_check degraded for " + pid + ": service unavailable");
 }
 
 TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
@@ -467,6 +512,88 @@ TEST_CASE("policy evaluator: CEL evaluation error -> error", "[pg][policy][evalu
     ev.tick(true);
 
     CHECK(h.status_of(pid, "agentA") == "error");
+}
+
+TEST_CASE("policy evaluator: depth-exceeded r.output -> error, never compliant "
+          "(#2437-class guard, fail-closed)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    // agentA: legitimate, shallow, compliant response for the SAME policy/CEL
+    // -- the positive control proving the guard does not disturb the happy
+    // path.
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
+    // agentB: a structurally-valid result envelope whose "hostname" value
+    // nests past the depth guard -- see out_json_deep's own comment for why
+    // 35 levels is a safe reachability proxy, not the real attack depth.
+    h.canned["agentB|checkp"] = {1, out_json_deep("hostname", 35)};
+    auto pid = h.author("result.hostname != ''");
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20; // past grace
+    ev.tick(true);
+
+    // Positive control: the shallow response for the SAME policy/CEL still
+    // evaluates normally.
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+
+    // The depth-exceeded response must land on the evaluator's existing
+    // "could not evaluate" outcome ("error", the same status a failed check
+    // or a misconfigured empty-CEL policy already produces above), and must
+    // explicitly NOT be "compliant" -- an agent deliberately reporting
+    // unparseable-by-depth output must not be able to force a false
+    // compliant verdict.
+    const std::string agentB_status = h.status_of(pid, "agentB");
+    CHECK(agentB_status == "error");
+    CHECK(agentB_status != "compliant");
+}
+
+TEST_CASE("policy evaluator: a depth-poisoned response cannot ride along with a "
+          "legitimate non_compliant sibling into auto-selected remediation "
+          "(#2437-class guard, fail-closed)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    // agentA: legitimate non_compliant response.
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "")};
+    // agentB: depth-exceeded poisoned response. Must resolve to "error" --
+    // never "non_compliant" (which would make it eligible for the
+    // auto-selected remediation below, i.e. authorize a remediation action
+    // off a response this evaluator could not actually parse) and never
+    // "compliant" (which would silently suppress remediation for a
+    // genuinely-unevaluable device).
+    h.canned["agentB|checkp"] = {1, out_json_deep("hostname", 35)};
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+    h.canned["agentA|fixp"] = {1, "ok"};
+    h.canned["agentB|fixp"] = {1, "ok"}; // wired up, but must never be dispatched to
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK(h.status_of(pid, "agentA") == "non_compliant");
+    CHECK(h.status_of(pid, "agentB") == "error");
+
+    // remediate() with an empty agent list auto-selects every agent whose
+    // status is exactly "non_compliant" (get_policy_agent_statuses walk).
+    // The poisoned agentB's "error" status must be excluded from that
+    // selection entirely -- the overall remediation batch must reflect
+    // "could not fully evaluate" for agentB rather than silently folding it
+    // in as either a pass or a remediation target.
+    const int dispatch_calls_before = h.dispatch_calls;
+    auto rr = ev.remediate(pid, {});
+    REQUIRE(rr.ok);
+    CHECK(rr.agents == 1); // agentA only -- agentB was never selected
+    CHECK(h.dispatch_calls == dispatch_calls_before + 1); // one fix dispatch, agentA only
+    CHECK(h.dispatched_plugins.back() == "fixp");
+
+    // agentB was never targeted: still sitting at "error", never moved to
+    // "fixing".
+    CHECK(h.status_of(pid, "agentB") == "error");
 }
 
 TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {
@@ -762,6 +889,67 @@ TEST_CASE("policy evaluator: a mixed delivered+quarantined remediate batch marks
     auto rr2 = ev.remediate(pid, {"agentB"});
     REQUIRE(rr2.ok);
     CHECK(rr2.agents == 1);
+    CHECK(h.status_of(pid, "agentB") == "fixing");
+}
+
+TEST_CASE("policy evaluator: a mixed delivered+kill_switched_os remediate batch marks only "
+          "the delivered target 'fixing' and re-dispatches the withheld one once restored (#5294)",
+          "[pg][policy][evaluator]") {
+    // compute_delivered's `not_delivered` set must fold in
+    // outcome.kill_switched_os: in a sent>0 batch the withheld id is absent
+    // from `sent`, so without it the id reads as delivered and the
+    // per-(policy,agent) claim is never re-attempted after the switch is
+    // turned back on.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+
+    h.canned["agentA|fixp"] = {1, "ok"};
+    h.kill_switched_os.insert("agentB");
+
+    PolicyEvaluator ev(h.deps());
+    auto rr = ev.remediate(pid, {"agentA", "agentB"});
+    REQUIRE(rr.ok);
+    CHECK(rr.agents == 1);
+    CHECK(h.status_of(pid, "agentA") == "fixing");
+    CHECK(h.status_of(pid, "agentB") == "unknown");
+
+    h.kill_switched_os.erase("agentB");
+    h.canned["agentB|fixp"] = {1, "ok"};
+    auto rr2 = ev.remediate(pid, {"agentB"});
+    REQUIRE(rr2.ok);
+    CHECK(rr2.agents == 1);
+    CHECK(h.status_of(pid, "agentB") == "fixing");
+}
+
+TEST_CASE("policy evaluator: an os_gate_unreadable outcome leaves the WHOLE remediate batch "
+          "undelivered and releases the claims for retry (#5294)",
+          "[pg][policy][evaluator][claim]") {
+    // compute_delivered has no dedicated os_gate_unreadable branch: the
+    // refusal (sent == 0, no per-id data) is caught by the residual
+    // `sent == 0 && claimed > not_delivered` rule. Pin that, so a later edit
+    // to the residual cannot silently mark the batch delivered.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+
+    h.os_gate_unreadable_outcome = true;
+    PolicyEvaluator ev(h.deps());
+    auto rr = ev.remediate(pid, {"agentA", "agentB"});
+    REQUIRE(rr.ok);
+    CHECK(rr.agents == 0);
+    CHECK(h.status_of(pid, "agentA") == "unknown");
+    CHECK(h.status_of(pid, "agentB") == "unknown");
+
+    h.os_gate_unreadable_outcome = false;
+    h.canned["agentA|fixp"] = {1, "ok"};
+    h.canned["agentB|fixp"] = {1, "ok"};
+    auto rr2 = ev.remediate(pid, {"agentA", "agentB"});
+    REQUIRE(rr2.ok);
+    CHECK(rr2.agents == 2);
+    CHECK(h.status_of(pid, "agentA") == "fixing");
     CHECK(h.status_of(pid, "agentB") == "fixing");
 }
 
@@ -1152,4 +1340,105 @@ TEST_CASE("policy evaluator: an unset should_stop claims every due policy, "
     ev.tick(true);
 
     CHECK(h.dispatch_calls == 2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4981 PR-1 (Finding B, B6): a scope-expression policy's target resolution
+// bypasses the dispatch ladder entirely — PolicyEvaluator::resolve_targets is
+// the ONE place that owns its own observability for a degraded
+// AgentRegistry::evaluate_scope. Confirms a degraded-presence scenario makes
+// target resolution return empty (never crashes, never proceeds with a
+// wrong/partial target set) AND increments yuzu_scope_eval_degraded_total
+// with reason=presence_degraded.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+using yuzu::server::detail::AgentRegistry;
+using yuzu::server::detail::EventBus;
+
+yuzu::test::PgTestTemplate policy_presence_tpl{"policyevalpresence", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    OfflineEndpointStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("policyevalpresence template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("policy evaluator: a scope-expression policy's target resolution reports "
+          "presence_degraded rather than silently proceeding as empty-scope",
+          "[pg][policy][evaluator][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+
+    // A SECOND Postgres database (own template) for the degraded presence
+    // store — deliberately separate from the policy/response/mgmt-group pool
+    // above so locking its table can't interfere with PolicyStore's own
+    // reads on this same test.
+    YUZU_REQUIRE_PG_DB_TPL(presence_db, policy_presence_tpl);
+    PgPool short_lock_pool{
+        {.conninfo = presence_db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    OfflineEndpointStore degraded_store{short_lock_pool};
+    REQUIRE(degraded_store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(&degraded_store, std::chrono::hours(1));
+
+    PgConn locker{PQconnectdb(presence_db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // A scope-expression policy (no management groups) — the branch that
+    // reaches d_.registry->evaluate_scope inside resolve_targets. Defines a
+    // fix_instruction so remediate() below reaches its own resolve_targets
+    // call rather than short-circuiting on "no remediation pathway".
+    auto fid = h.ps.create_fragment("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n"
+                                    "spec:\n  check:\n    instruction: test.check\n"
+                                    "    compliance: \"result.hostname != ''\"\n"
+                                    "  fix:\n    instruction: test.fix\n");
+    REQUIRE(fid.has_value());
+    auto pid = h.ps.create_policy("apiVersion: yuzu.io/v1alpha1\nkind: Policy\n"
+                                  "spec:\n  fragment: " +
+                                  *fid + "\n  scope: ostype == \"linux\"\n");
+    REQUIRE(pid.has_value());
+
+    auto d = h.deps();
+    d.registry = &registry;
+    d.metrics = &metrics;
+
+    PolicyEvaluator ev(d);
+    auto result = ev.evaluate_now(*pid);
+    // #4981 PR-1 adversarial-review MEDIUM fix: a degraded scope evaluation
+    // is NOT a clean "no check instruction / matches no agents" empty-string
+    // result — kickoff_check now distinguishes "genuinely empty scope" from
+    // "scope evaluation aborted" and returns std::unexpected for the latter,
+    // which the REST /evaluate route maps to 503 (previously this collapsed
+    // to a false 409).
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("presence_degraded") != std::string::npos);
+    // Never proceeded with a wrong/partial target set — no dispatch fired.
+    CHECK(h.dispatch_calls == 0);
+    CHECK(metrics.counter("yuzu_scope_eval_degraded_total", {{"reason", "presence_degraded"}})
+              .value() == 1);
+
+    // remediate()'s refusal message (B6) names the actual degradation rather
+    // than claiming a genuine empty-scope result, AND (adversarial-review
+    // MEDIUM fix) sets `degraded = true` so the REST /remediate route maps
+    // this to 503/audit "error" rather than 400/audit "denied" — a degraded
+    // scope evaluation is an infrastructure fault, not an operator denial.
+    auto remediation = ev.remediate(*pid, {"some-agent"});
+    REQUIRE_FALSE(remediation.error.empty());
+    CHECK(remediation.error.find("presence_degraded") != std::string::npos);
+    CHECK(remediation.degraded);
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
 }

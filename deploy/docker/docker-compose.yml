@@ -41,6 +41,15 @@ services:
       YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
     volumes:
       - server-data:/var/lib/yuzu
+      # The internal CA, the default certs and the secrets KEK
+      # (secrets-kek-v<N>.key) live in /etc/yuzu/certs, the server's default
+      # cert dir. The KEK is registered in Postgres, so this directory must
+      # outlive the container exactly as postgres-data does: without the
+      # volume, a recreate (image upgrade, `down && up`, --force-recreate)
+      # loses the key file and the server refuses to boot (kek_unresolvable,
+      # #5370). The image pre-creates the directory owned by `yuzu`, and a new
+      # named volume copies that ownership on first mount.
+      - server-certs:/etc/yuzu/certs
     # File-descriptor headroom mirrors the systemd unit
     # (deploy/systemd/yuzu-server.service). The Docker default is 1024;
     # 65536 absorbs SSE EventSource fan-in + agent gRPC streams + SQLite
@@ -57,7 +66,10 @@ services:
     # "Sizing"): a held-open SSE response's worst-case drain is the 120s
     # response cap + 2x~3s pump ticks + the 30s socket write timeout
     # (server.cpp set_write_timeout) = ~156s. Docker's 10s default SIGKILLs
-    # it mid-drain; 210s matches the systemd unit's existing margin.
+    # it mid-drain; 210s matches the systemd unit's existing margin. Also the
+    # only external bound on the T_server async logger's exit-time worker join
+    # under a stalled sink (#4666 PR-4, no self-armed watchdog) short of a
+    # second SIGTERM — see guardian_ingest.hpp's own header banner.
     stop_grace_period: 210s
 
   # ── PostgreSQL (server storage substrate, ADR-0006) ─────────────────
@@ -120,6 +132,7 @@ services:
 
 volumes:
   server-data:
+  server-certs:
   postgres-data:
   prometheus-data:
   grafana-data:

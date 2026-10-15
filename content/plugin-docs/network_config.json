@@ -155,14 +155,40 @@
           "support": "supported"
         }
       }
+    },
+    {
+      "action": "routes",
+      "definition_ids": [
+        "device.network_config.routes"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "main and custom routing tables, IPv4 and IPv6; the local table, cloned entries and host-local route types are not reported; a multipath route reports its first nexthop only and an `ip nexthop` object route carries no resolved gateway (both flagged in the result status)",
+          "mechanism": "rtnetlink RTM_GETROUTE (AF_UNSPEC)",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "IPv4 and IPv6; macOS has no route metric or table id, so those fields are '-', and the origin is only the RTF_STATIC bit (static, which also covers connected-interface routes), else RTF_DYNAMIC/RTF_MODIFIED (dynamic), else other; entries flagged as neighbour (RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) are not reported (the limited-broadcast 255.255.255.255/32 route carries none of those flags and is); interface-scoped routes (RTF_IFSCOPE) are listed like any other",
+          "mechanism": "PF_ROUTE sysctl NET_RT_DUMP",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "IPv4 and IPv6; the host's own and broadcast addresses (Protocol Local, full-length prefix) and the multicast prefixes are not reported, connected-subnet routes are; the metric is the route metric alone, without the interface metric",
+          "mechanism": "GetIpForwardTable2",
+          "rung": "1",
+          "support": "constrained"
+        }
+      }
     }
   ],
   "caveats": [
-    "**Windows `speed_mbps` is not clamped for an unknown-speed adapter.** `TransmitLinkSpeed` is divided by 1,000,000 with no sentinel check (`network_config_plugin.cpp:761`); when the API reports its \"unknown speed\" sentinel (`ULONG64_MAX`), the row emits `18446744073709` instead of `0` — visible on four of nine adapters in the real Windows capture above (`Ethernet 2`, `WiFi`, `Local Area Connection* 1`, `Local Area Connection* 2`). Any consumer treating `speed_mbps` as a real Mbps figure must guard against this value.",
-    "**`dns_cache` has no shared row shape across platforms.** Windows emits a structured `name|type|0|` row (`network_config_plugin.cpp:1759`); Linux's `resolvectl` path emits one raw, unparsed line under the same `cache_entry|` prefix (`network_config_plugin.cpp:1787`); Linux's `systemd-resolve` fallback uses a different discriminator, `dns_stats|` (`network_config_plugin.cpp:1819`); macOS never populates the three schema columns at all. A consumer that parses `cache_entry|` as `name|record_type|ttl` on every platform will misparse Linux's output.",
-    "**Linux `proxy_type` is the raw environment-variable name, not a normalized type.** Windows and macOS emit `none`/`http`/`pac`/`auto_detect`; Linux instead emits the literal variable it read (`http_proxy`, `HTTPS_PROXY`, …) and can emit several `proxy_type`/`proxy_address` pairs in one response if more than one is set (`network_config_plugin.cpp:1210-1229`), unlike Windows/macOS which always resolve to at most one via `select_proxy()`.",
-    "**`ip_addresses.gateway` is per-adapter on Windows, host-wide on macOS/Linux.** Windows reads each adapter's own `FirstGatewayAddress` (`network_config_plugin.cpp:893-901`); macOS and Linux each resolve a single system-wide default gateway once and repeat it on every row (`network_config_plugin.cpp:920-931`, `967-976`). A multi-homed Windows host can show different gateways per adapter; macOS/Linux never do.",
-    "**The `adapters` loopback asymmetry is deliberate — do not \"align\" it.** Linux filters `lo` (matching the pre-migration `ip -o link show` parse); macOS reports `lo0` as a real adapter (matching the pre-migration `ifconfig -a` parse). The predates-this-migration asymmetry is called out explicitly in-code and verified against both legacy legs (`network_config_plugin.cpp:812-818`) — changing either side silently alters what the fleet reports."
+    "**Windows `speed_mbps` is not clamped for an unknown-speed adapter.** `TransmitLinkSpeed` is divided by 1,000,000 with no sentinel check (`network_config_plugin.cpp:762`); when the API reports its \"unknown speed\" sentinel (`ULONG64_MAX`), the row emits `18446744073709` instead of `0` — visible on four of nine adapters in the real Windows capture above (`Ethernet 2`, `WiFi`, `Local Area Connection* 1`, `Local Area Connection* 2`). Any consumer treating `speed_mbps` as a real Mbps figure must guard against this value.",
+    "**Some row shapes differ by platform and are not normalised.** `dns_cache` has no shared shape: Windows emits a structured `name|type|0|` row (`network_config_plugin.cpp:1818`); Linux's `resolvectl` path emits one raw, unparsed line under the same `cache_entry|` prefix (`network_config_plugin.cpp:1846`); Linux's `systemd-resolve` fallback uses a different discriminator, `dns_stats|` (`network_config_plugin.cpp:1878`); macOS never populates the three schema columns at all — a consumer that parses `cache_entry|` as `name|record_type|ttl` on every platform will misparse Linux's output. And Linux `proxy_type` is the raw environment-variable name, not a normalised type: Windows and macOS emit `none`/`http`/`pac`/`auto_detect`, Linux emits the literal variable it read (`http_proxy`, `HTTPS_PROXY`, …) and can emit several `proxy_type`/`proxy_address` pairs in one response if more than one is set (`network_config_plugin.cpp:1211-1230`).",
+    "**`ip_addresses.gateway` is per-adapter on Windows, host-wide on macOS/Linux.** Windows reads each adapter's own `FirstGatewayAddress` (`network_config_plugin.cpp:894-902`); macOS and Linux each resolve a single system-wide default gateway once and repeat it on every row (`network_config_plugin.cpp:921-932`, `967-976`). A multi-homed Windows host can show different gateways per adapter; macOS/Linux never do.",
+    "**The `adapters` loopback asymmetry is deliberate — do not \"align\" it.** Linux filters `lo` (matching the pre-migration `ip -o link show` parse); macOS reports `lo0` as a real adapter (matching the pre-migration `ifconfig -a` parse). The predates-this-migration asymmetry is called out explicitly in-code and verified against both legacy legs (`network_config_plugin.cpp:813-819`) — changing either side silently alters what the fleet reports.",
+    "**`routes` is the configured table, not a byte-for-byte copy of the kernel's, and it differs by OS.** Linux reports the main and custom tables; it drops the local table, cloned cache entries and the local/broadcast/anycast/multicast route types, reports only the FIRST nexthop of a multipath route, and shows an `ip nexthop`-object route's gateway as `nhid:<n>` (both are flagged in the result status, never silent). macOS has no route metric and no table id (`metric` and `table` are `-`), its `origin` is `static` when RTF_STATIC is set (the kernel sets it on connected-interface routes too, which Linux calls `kernel` and Windows `local`, so `origin == static` matches different routes per OS), `dynamic` for RTF_DYNAMIC or RTF_MODIFIED, else `other`; interface-scoped routes (RTF_IFSCOPE, such as one default per VPN tunnel) are listed like any other and cannot be told from unscoped ones, so \"the\" default route is not one row; it drops entries flagged as neighbour (RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) — the limited-broadcast `255.255.255.255/32` route carries none of those flags and is reported. Windows reports the ROUTE metric alone — Windows adds the interface metric when ranking routes and that sum is not shown — and drops the host's own and broadcast addresses (Protocol `Local` with a full-length prefix) and the multicast prefixes, but keeps connected-subnet routes (Protocol `Local` with a shorter prefix). A consumer comparing the three OSes must not assume the same filter or the same `origin` vocabulary."
   ],
   "definitions": [
     {
@@ -290,17 +316,38 @@
         "linux",
         "darwin"
       ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the host routing table, IPv4 and IPv6 together: destination prefix, gateway, interface, metric, table, type and origin, capped at 20000 rows. On Linux reads one rtnetlink RTM_GETROUTE dump covering the main table and any custom table (VPN and policy routing live there), including blackhole, unreachable, prohibit and throw routes; the local table, cloned entries and host-local route types are not reported, a multipath route reports its first nexthop only and an \"ip nexthop\" object route carries no resolved gateway (both flagged in the result status). On macOS reads the PF_ROUTE NET_RT_DUMP sysctl for every address family; macOS has no route metric or table id, so those are \"-\", and the origin is only the static bit (which also covers connected-interface routes), else the dynamic or redirect-modified bit; entries flagged as neighbour, cloned, multicast, broadcast or own-address are not reported (the limited-broadcast 255.255.255.255/32 route carries none of those flags and is), and interface-scoped routes (one default per VPN tunnel, say) are listed like any other. On Windows reads GetIpForwardTable2; the metric is the route metric alone, without the interface metric Windows adds when ranking routes, and the host's own and broadcast addresses and the multicast prefixes are not reported. A route table that cannot be read at all is reported as unavailable, never as an empty table.",
+      "display_name": "Routing Table",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "device.network_config.routes",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
     }
   ],
-  "description": "Reports network adapter configuration, IP addresses, DNS servers, and proxy settings",
-  "how_it_works": "`adapters` enumerates NICs (name, MAC, link speed, up/down). `ip_addresses` enumerates unicast\naddresses per adapter plus the default gateway. `dns_servers` reads the configured resolvers.\n`proxy` reads the system HTTP/PAC proxy and bypass list. `dns_cache` dumps the resolver cache —\nWindows and Linux only; macOS has no OS-level access to cache contents and returns an honest\n`unsupported` sentinel rather than attempting a doomed read. `arp` reads the host ARP/neighbour\ntable, capped at 20,000 rows on every OS to bound a large or forged table.\n\nEvery action is a single read with no state and no scheduled trigger; `gather.ttlSeconds` (30–120s\nper action) only caches a result for that long, it does not fire a background collection. The\nplugin deliberately does not attempt a live packet capture, does not resolve non-default routes,\nand (Linux/macOS) reports only the primary default route, not every routing table.",
+  "description": "Reports network adapter configuration, IP addresses, DNS servers, proxy settings, and the routing table",
+  "how_it_works": "`adapters` enumerates NICs (name, MAC, link speed, up/down). `ip_addresses` enumerates unicast\naddresses per adapter plus the default gateway. `dns_servers` reads the configured resolvers.\n`proxy` reads the system HTTP/PAC proxy and bypass list. `dns_cache` dumps the resolver cache —\nWindows and Linux only; macOS has no OS-level access to cache contents and returns an honest\n`unsupported` sentinel rather than attempting a doomed read. `arp` reads the host ARP/neighbour\ntable, capped at 20,000 rows on every OS to bound a large or forged table. `routes` reads the full\nrouting table — IPv4 and IPv6 together, with destination prefix, gateway, interface, metric, table,\ntype and origin — capped at 20,000 rows; it reports the configured routes, not the host's own\naddresses (see Caveats).\n\nEvery action is a single read with no state and no scheduled trigger; `gather.ttlSeconds` (30–120s\nper action) only caches a result for that long, it does not fire a background collection. The\nplugin deliberately does not attempt a live packet capture. `ip_addresses` still reports only the\nprimary default gateway on Linux/macOS (one value, repeated per row); `routes` is the action that\nreports every route.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "3b5c27bfec23",
+  "leg_hash": "440c7ee170cd",
   "manifest_version": 1,
   "name": "network_config",
   "outputs": [
@@ -579,9 +626,122 @@
         }
       ],
       "definition_id": "device.network_config.proxy"
+    },
+    {
+      "columns": [
+        {
+          "description": "Address family of the route. Values: ipv4, ipv6.",
+          "example": "ipv4",
+          "name": "family",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Destination network address; the default route is 0.0.0.0 or ::. Values: IPv4 or IPv6 literal.",
+          "example": "192.0.2.0",
+          "name": "destination",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Destination prefix length in bits; 0 is the default route, 32 or 128 a host route. Values: 0-32 (ipv4), 0-128 (ipv6).",
+          "example": "24",
+          "name": "prefix_len",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Next-hop address; '-' when the route is on-link (directly attached). Linux reports 'nhid:<n>' for a route that references an `ip nexthop` object whose gateway is not resolved, and the first nexthop's gateway for a multipath route. Values: IPv4 or IPv6 literal, 'nhid:<n>' (Linux only), or '-'.",
+          "example": "192.0.2.1",
+          "name": "gateway",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Outgoing interface name; '-' when the interface index no longer resolves on Linux and macOS (or, for a Linux blackhole/unreachable/prohibit/throw route or an `ip nexthop` object route, when the route carries none); Windows renders `if<index>` when the alias lookup fails. Values: interface name, `if<index>` (Windows), or '-'.",
+          "example": "eth0",
+          "name": "interface",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Route metric (the Linux priority; the Windows route metric, without the interface metric); '-' on macOS, which has no route metric. Values: decimal integer, or '-' (macOS, always).",
+          "example": "100",
+          "name": "metric",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Linux routing table; '-' on Windows and macOS, which have a single table. Values: main, default, or a decimal table id (Linux); '-' (Windows, macOS).",
+          "example": "main",
+          "name": "table",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Kind of route. Values: unicast, blackhole, unreachable, prohibit, throw, nat, xresolve, or type<N> for an unknown Linux rtm_type (Linux); unicast, blackhole, reject (macOS); unicast (Windows, always).",
+          "example": "unicast",
+          "name": "route_type",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Who installed the route. Linux: the rtm_protocol name (kernel, boot, static, dhcp, ra, bgp, ospf, ...) or proto<N>. Windows: the NL_ROUTE_PROTOCOL name (local, netmgmt, dhcp, ...) or proto<N>. macOS: static when the kernel set RTF_STATIC (the kernel sets it on connected-interface routes too, which Linux calls kernel and Windows calls local), dynamic for RTF_DYNAMIC or RTF_MODIFIED, else other (the routing socket carries no protocol field). Values: protocol name, or proto<N>.",
+          "example": "kernel",
+          "name": "origin",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.network_config.routes"
     }
   ],
-  "outputs_note": "Pipe-delimited rows via `write_output()`. `adapters`/`ip_addresses`/`dns_servers`/`arp` each emit one\nrow per record under a single literal-prefix discriminator. `proxy` and `dns_cache` do **not** — see\ntheir own notes below the field tables. `-` marks a value the leg could not resolve; it never means\nzero, and it is not used as a \"no rows\" sentinel (a leg that finds nothing on `adapters`/\n`ip_addresses`/`dns_servers`/`arp` simply emits zero rows, which is itself a legitimate host state\ndistinguished from failure by the typed result status).\n\n\n\n**`proxy` — not one row per record.** Each configured value is its own row: `proxy_type|<value>`,\n`proxy_address|<value>` (omitted when there is no proxy), and `bypass|<value>` (omitted when the\nlist is empty). Windows/macOS emit at most one `proxy_type`/`proxy_address` pair; Linux can emit\nseveral — see Caveats.\n\n| Field | Type | Values | Available | Example |\n|---|---|---|---|---|\n| `proxy_type` | string | `none` `http` `pac` `auto_detect` (W); `none` `http` `pac` (M); `none`, or a literal `*_proxy`/`ALL_PROXY` variable name (L) | W, M, L | `auto_detect` |\n| `proxy_address` | string | `host:port`, a PAC URL, or the raw env-var value (L) | W, M, L | not observed in the captured samples — omitted whenever `proxy_type` is `none`/`auto_detect` |\n| `bypass` | string | comma-separated free text | W, M, L | `*.local,169.254/16` |\n\n**`dns_cache` — no shared row shape across platforms.** Windows: `cache_entry|name|record_type|0|`\n(the literal `0` is a hardcoded placeholder, not a real TTL, and the trailing field is always empty\n— `network_config_plugin.cpp:1759`). Linux (`resolvectl` path): `cache_entry|<raw resolvectl line>`\n— one opaque field, not split into name/type/ttl (`network_config_plugin.cpp:1787`). Linux\n(`systemd-resolve` fallback): `dns_stats|<raw statistics line>` — a different discriminator entirely\n(`network_config_plugin.cpp:1819`). Every platform also has sentinel rows: `dns_cache|empty` (W, zero\nentries), `dns_cache|not_available|<reason>` (W/L, tool missing or query failed), `dns_cache|unsupported|<reason>`\n(M, always). The three schema-mapped fields below apply to the Windows structured row only.\n\n| Field | Type | Values | Available | Example |\n|---|---|---|---|---|\n| `name` | string | free text (FQDN or reverse-lookup name) | W only | `windowsupdate.microsoft.com` |\n| `record_type` | enum | `A` `AAAA` `CNAME` `PTR` `MX` `SRV` `unknown` | W only | `PTR` |\n| `ttl` | int | literal `0` | W only | `0` |",
+  "outputs_note": "Pipe-delimited rows via `write_output()`. `adapters`/`ip_addresses`/`dns_servers`/`arp`/`routes` each emit one\nrow per record under a single literal-prefix discriminator. `proxy` and `dns_cache` do **not** — see\ntheir own notes below the field tables. `-` marks a value the leg could not resolve; it never means\nzero, and it is not used as a \"no rows\" sentinel (a leg that finds nothing on `adapters`/\n`ip_addresses`/`dns_servers`/`arp`/`routes` simply emits zero rows, which is itself a legitimate host state\ndistinguished from failure by the typed result status).\n\n\n\n**`proxy` — not one row per record.** Each configured value is its own row: `proxy_type|<value>`,\n`proxy_address|<value>` (omitted when there is no proxy), and `bypass|<value>` (omitted when the\nlist is empty). Windows/macOS emit at most one `proxy_type`/`proxy_address` pair; Linux can emit\nseveral — see Caveats.\n\n| Field | Type | Values | Available | Example |\n|---|---|---|---|---|\n| `proxy_type` | string | `none` `http` `pac` `auto_detect` (W); `none` `http` `pac` (M); `none`, or a literal `*_proxy`/`ALL_PROXY` variable name (L) | W, M, L | `auto_detect` |\n| `proxy_address` | string | `host:port`, a PAC URL, or the raw env-var value (L) | W, M, L | not observed in the captured samples — omitted whenever `proxy_type` is `none`/`auto_detect` |\n| `bypass` | string | comma-separated free text | W, M, L | `*.local,169.254/16` |\n\n**`dns_cache` — no shared row shape across platforms.** Windows: `cache_entry|name|record_type|0|`\n(the literal `0` is a hardcoded placeholder, not a real TTL, and the trailing field is always empty\n— `network_config_plugin.cpp:1818`). Linux (`resolvectl` path): `cache_entry|<raw resolvectl line>`\n— one opaque field, not split into name/type/ttl (`network_config_plugin.cpp:1846`). Linux\n(`systemd-resolve` fallback): `dns_stats|<raw statistics line>` — a different discriminator entirely\n(`network_config_plugin.cpp:1878`). Every platform also has sentinel rows: `dns_cache|empty` (W, zero\nentries), `dns_cache|not_available|<reason>` (W/L, tool missing or query failed), `dns_cache|unsupported|<reason>`\n(M, always). The three schema-mapped fields below apply to the Windows structured row only.\n\n| Field | Type | Values | Available | Example |\n|---|---|---|---|---|\n| `name` | string | free text (FQDN or reverse-lookup name) | W only | `windowsupdate.microsoft.com` |\n| `record_type` | enum | `A` `AAAA` `CNAME` `PTR` `MX` `SRV` `unknown` | W only | `PTR` |\n| `ttl` | int | literal `0` | W only | `0` |",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -590,22 +750,22 @@
   "privileges": [
     {
       "grant": "**None.** Every leg is a native Win32 read API; none requires elevation.",
-      "if_refused": "no dedicated `PERMISSION_DENIED` path — a failed API call returns `rc=1` with an in-band error row (adapters/ip_addresses/dns_servers) or `GetIpNetTable2 failed (rc=N)` (arp)",
-      "measured": "2026-09-07 on bare metal as `SYSTEM`",
+      "if_refused": "no dedicated `PERMISSION_DENIED` path — a failed API call returns `rc=1` with an in-band error row (adapters/ip_addresses/dns_servers) or `GetIpNetTable2 failed (rc=N)` (arp); `routes` instead returns `rc=0` with `UNAVAILABLE`/`PARTIAL` `network_config:routes_table_unavailable`",
+      "measured": "2026-09-07 on bare metal as `SYSTEM`; `routes` 2026-10-03 on bare metal as `SYSTEM`",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
     {
       "grant": "**None.** `getifaddrs`/`ioctl(SIOCGIFMEDIA)`/PF_ROUTE sysctl reads and `SCDynamicStore` reads all work unprivileged.",
-      "if_refused": "`UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:getifaddrs_failed`, `network_config:pf_route_arp_sysctl_failed`)",
-      "measured": "2026-09-07 at euid 501 (`alex`) — captured **unprivileged**, below the agent's actual root runtime",
+      "if_refused": "`UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:getifaddrs_failed`, `network_config:pf_route_arp_sysctl_failed`, `network_config:pf_route_dump_failed`)",
+      "measured": "2026-09-07 at euid 501 (`alex`) — captured **unprivileged**, below the agent's actual root runtime; `routes` 2026-10-03, also at euid 501",
       "os": "macOS",
       "runs_as": "agent daemon, root (no `_yuzu` account yet, #1455)"
     },
     {
-      "grant": "**None** for adapters/ip_addresses/dns_servers/proxy/arp (native reads only). `dns_cache` shells out to `resolvectl`/`systemd-resolve` via the bounded direct-argv runner (ADR-3002 rung 2) — no elevation required, but the tool must be present.",
-      "if_refused": "`UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:resolv_conf_unreadable`, `network_config:proc_net_arp_unreadable`)",
-      "measured": "2026-09-06 in a container as `euid 0` (root) — more privileged than the agent's real unprivileged runtime",
+      "grant": "**None** for adapters/ip_addresses/dns_servers/proxy/arp/routes (native reads only). `dns_cache` shells out to `resolvectl`/`systemd-resolve` via the bounded direct-argv runner (ADR-3002 rung 2) — no elevation required, but the tool must be present.",
+      "if_refused": "`UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:resolv_conf_unreadable`, `network_config:proc_net_arp_unreadable`, `network_config:rtnetlink_routes_dump_incomplete`)",
+      "measured": "2026-09-06 in a container as `euid 0` (root) — more privileged than the agent's real unprivileged runtime; `routes` 2026-10-03, also `euid 0` (an RTM_GETROUTE dump is an unprivileged read by design, but it was not measured below root)",
       "os": "Linux",
       "runs_as": "agent's own unprivileged account (`yuzu`)"
     }
@@ -692,6 +852,60 @@
     },
     {
       "completeness": "partial",
+      "provenance": "`network_config:routes_row_cap_reached`",
+      "status": "`CONSTRAINED` / `PARTIAL`",
+      "when": "`routes` on any OS, the 20k-row cap was hit; the first 20,000 routes are reported, the table is longer"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`network_config:rtnetlink_routes_dump_incomplete`",
+      "status": "`CONSTRAINED` / `PARTIAL`",
+      "when": "Linux `routes`, the RTM_GETROUTE dump did not complete (error, truncation, foreign-datagram flood, timeout, the kernel aborting it with an errno in the closing NLMSG_DONE, or the kernel flagging that the table changed during the read — NLM_F_DUMP_INTR, so rows may repeat or be missing); the rows decoded so far are reported"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`network_config:rtnetlink_routes_dump_incomplete`",
+      "status": "`UNAVAILABLE` / `PARTIAL`",
+      "when": "Linux `routes`, the dump failed before any route was decoded — no rows, never an empty table"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`network_config:routes_multipath_first_nexthop_only` / `network_config:routes_nexthop_object_unresolved`",
+      "status": "`CONSTRAINED` / `PARTIAL`",
+      "when": "Linux `routes`, at least one multipath route reported only its first nexthop, or an `ip nexthop` object route has no resolved gateway (reported as `nhid:<n>`)"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`network_config:pf_route_dump_failed` / `network_config:pf_route_dump_too_large`",
+      "status": "`UNAVAILABLE` / `PARTIAL`",
+      "when": "macOS `routes`, the NET_RT_DUMP sysctl failed, or the table exceeded the 64 MiB read bound"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`network_config:pf_route_dump_truncated`",
+      "status": "`CONSTRAINED` / `PARTIAL`",
+      "when": "macOS `routes`, a record header was malformed (the parse stops there, later routes are not reported) or a record had a non-contiguous netmask or an undecodable address (that route is skipped, the rest are reported)"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`network_config:routes_table_unavailable`",
+      "status": "`UNAVAILABLE` / `PARTIAL`",
+      "when": "Windows `routes`, `GetIpForwardTable2` failed"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`network_config:routes_row_unformattable`",
+      "status": "`CONSTRAINED` / `PARTIAL`",
+      "when": "Windows `routes`, a route's destination could not be rendered and was left out"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`network_config:routes_internal_error`",
+      "status": "`CONSTRAINED` / `PARTIAL` (rc 1)",
+      "when": "`routes` on any OS, an exception escaped a leg (e.g. an allocation failure); an `error|routes: internal error` row is written"
+    },
+    {
+      "completeness": "partial",
       "provenance": "`subprocess_runner:spawn_error`",
       "status": "`UNAVAILABLE` / `PARTIAL`",
       "when": "Linux `dns_cache`, the `resolvectl`/`systemd-resolve` child process could not be spawned at all"
@@ -756,7 +970,7 @@
           },
           "row_count": 1,
           "rows": [
-            "ip|eth0|172.17.0.4|16|172.17.0.1"
+            "ip|eth0|172.17.0.3|16|172.17.0.1"
           ],
           "truncated": false
         },
@@ -821,12 +1035,29 @@
           "row_count": 0,
           "rows": [],
           "truncated": false
+        },
+        {
+          "action": "routes",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 2,
+          "rows": [
+            "route|ipv4|0.0.0.0|0|172.17.0.1|eth0|0|main|unicast|boot",
+            "route|ipv4|172.17.0.0|16|-|eth0|0|main|unicast|kernel"
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-06",
+        "date": "2026-10-03",
         "host_class": "container",
-        "leg_hash": "3b5c27bfec23",
+        "leg_hash": "440c7ee170cd",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -866,11 +1097,11 @@
           },
           "row_count": 12,
           "rows": [
-            "ip|en0|fe80::9e:c46b:750c:b2eb|64|203.0.113.1",
+            "ip|en0|fe80::200:5eff:fe00:5381|64|203.0.113.1",
             "ip|en0|203.0.113.66|24|203.0.113.1",
-            "ip|llw0|fe80::58a0:84ff:fe32:a9a3|64|203.0.113.1",
-            "ip|utun0|fe80::93eb:5451:9abf:3695|64|203.0.113.1",
-            "ip|utun1|fe80::313e:505c:4e40:16c8|64|203.0.113.1"
+            "ip|llw0|fe80::200:5eff:fe00:5382|64|203.0.113.1",
+            "ip|utun0|fe80::200:5eff:fe00:5383|64|203.0.113.1",
+            "ip|utun1|fe80::200:5eff:fe00:5384|64|203.0.113.1"
           ],
           "truncated": false
         },
@@ -936,24 +1167,44 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 15,
+          "row_count": 16,
           "rows": [
             "arp|-|203.0.113.1|00:00:5e:00:53:0e|-",
-            "arp|-|203.0.113.61|00:00:5e:00:53:0f|-",
-            "arp|-|203.0.113.71|00:00:5e:00:53:10|-",
-            "arp|-|203.0.113.131|00:00:5e:00:53:11|-",
-            "arp|-|203.0.113.138|00:00:5e:00:53:12|-"
+            "arp|-|203.0.113.30|00:00:5e:00:53:0f|-",
+            "arp|-|203.0.113.60|00:00:5e:00:53:10|-",
+            "arp|-|203.0.113.61|00:00:5e:00:53:11|-",
+            "arp|-|203.0.113.66|00:00:5e:00:53:04|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "routes",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 29,
+          "rows": [
+            "route|ipv4|0.0.0.0|0|203.0.113.1|en0|-|-|unicast|static",
+            "route|ipv4|0.0.0.0|0|-|utun6|-|-|unicast|static",
+            "route|ipv4|100.64.0.0|10|-|utun6|-|-|unicast|static",
+            "route|ipv4|100.100.100.100|32|-|utun6|-|-|unicast|static",
+            "route|ipv4|127.0.0.0|8|127.0.0.1|lo0|-|-|unicast|static"
           ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-10-03",
         "host_class": "bare-metal",
-        "leg_hash": "3b5c27bfec23",
+        "leg_hash": "440c7ee170cd",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
-        "privilege": "euid 501 (jsmith)"
+        "privilege": "euid 501 (addresses redacted)"
       }
     },
     "windows": {
@@ -970,11 +1221,11 @@
           },
           "row_count": 9,
           "rows": [
-            "adapter|Ethernet 2|FC:34:97:65:1E:0B|18446744073709|down",
             "adapter|Tailscale|-|100000|up",
-            "adapter|Ethernet|FC:34:97:65:1E:0A|1000|up",
-            "adapter|OpenVPN Data Channel Offload for NordVPN|-|1000|down",
-            "adapter|Local Area Connection|00:FF:C1:08:92:E3|1000|down"
+            "adapter|Ethernet|00:00:5e:00:53:01|1000|up",
+            "adapter|VPN Adapter|-|1000|down",
+            "adapter|Local Area Connection|00:00:5e:00:53:02|1000|down",
+            "adapter|WiFi|00:00:5e:00:53:03|18446744073709|down"
           ],
           "truncated": false
         },
@@ -990,11 +1241,11 @@
           },
           "row_count": 19,
           "rows": [
-            "ip|Ethernet 2|fe80::24d2:a5ae:f55b:9132|64|-",
-            "ip|Ethernet 2|169.254.54.245|16|-",
-            "ip|Tailscale|fd7a:115c:a1e0::1c32:357a|128|-",
-            "ip|Tailscale|fe80::c5b0:bd45:79bc:bd97|64|-",
-            "ip|Tailscale|198.51.100.121|32|-"
+            "ip|Tailscale|fd7a:115c:a1e0::77|128|-",
+            "ip|Tailscale|fe80::200:5eff:fe00:5381|64|-",
+            "ip|Tailscale|198.51.100.121|32|-",
+            "ip|Ethernet|fe80::200:5eff:fe00:5382|64|203.0.113.1",
+            "ip|Ethernet|203.0.113.131|24|203.0.113.1"
           ],
           "truncated": false
         },
@@ -1010,11 +1261,11 @@
           },
           "row_count": 24,
           "rows": [
-            "dns|Ethernet 2|192.0.2.100|IPv4",
-            "dns|Ethernet 2|192.0.2.101|IPv4",
             "dns|Tailscale|fec0:0:0:ffff::1|IPv6",
             "dns|Tailscale|fec0:0:0:ffff::2|IPv6",
-            "dns|Tailscale|fec0:0:0:ffff::3|IPv6"
+            "dns|Tailscale|fec0:0:0:ffff::3|IPv6",
+            "dns|Ethernet|192.0.2.100|IPv4",
+            "dns|Ethernet|192.0.2.101|IPv4"
           ],
           "truncated": false
         },
@@ -1044,13 +1295,9 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 52,
+          "row_count": 1,
           "rows": [
-            "cache_entry|66.24.104.213.in-addr.arpa|PTR|0|",
-            "cache_entry|array514.prod.do.dsp.mp.microsoft.com|A|0|",
-            "cache_entry|37.43.127.100.in-addr.arpa|PTR|0|",
-            "cache_entry|121.53.123.100.in-addr.arpa|PTR|0|",
-            "cache_entry|desktop-04dnsig.mshome.net|A|0|"
+            "dns_cache|not_available|query failed"
           ],
           "truncated": false
         },
@@ -1064,24 +1311,44 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 67,
+          "row_count": 101,
           "rows": [
             "arp|Loopback Pseudo-Interface 1|224.0.0.22|-|static",
+            "arp|Loopback Pseudo-Interface 1|224.0.0.252|-|static",
             "arp|Loopback Pseudo-Interface 1|239.255.255.250|-|static",
-            "arp|OpenVPN Data Channel Offload for NordVPN|224.0.0.22|-|static",
-            "arp|WiFi|224.0.0.22|01:00:5e:00:00:16|static",
-            "arp|Local Area Connection|224.0.0.22|01:00:5e:00:00:16|static"
+            "arp|VPN Adapter|224.0.0.22|-|static",
+            "arp|VPN Adapter|224.0.0.252|-|static"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "routes",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 17,
+          "rows": [
+            "route|ipv4|0.0.0.0|0|203.0.113.1|Ethernet|0|-|unicast|netmgmt",
+            "route|ipv4|198.51.100.98|32|-|Tailscale|0|-|unicast|netmgmt",
+            "route|ipv4|100.100.100.100|32|-|Tailscale|0|-|unicast|netmgmt",
+            "route|ipv4|198.51.100.77|32|-|Tailscale|0|-|unicast|netmgmt",
+            "route|ipv4|198.51.100.37|32|-|Tailscale|0|-|unicast|netmgmt"
           ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-10-03",
         "host_class": "bare-metal",
-        "leg_hash": "3b5c27bfec23",
+        "leg_hash": "440c7ee170cd",
         "os": "windows",
-        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
-        "privilege": "SYSTEM"
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "LocalSystem (elevated; addresses redacted)"
       }
     }
   },
@@ -1139,24 +1406,44 @@
       "operation": "Read",
       "risk_tier": "Low",
       "securable": "Infrastructure"
+    },
+    {
+      "action": "routes",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
     }
   ],
   "source": {
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/2026-10-04-network_config-routes.added.md"
+    ],
     "definitions": [
       "content/definitions/network_config.yaml"
     ],
     "plugin": [
+      "agents/plugins/network_config/src/network_config_netlink.hpp",
       "agents/plugins/network_config/src/network_config_parsers.hpp",
-      "agents/plugins/network_config/src/network_config_plugin.cpp"
+      "agents/plugins/network_config/src/network_config_plugin.cpp",
+      "agents/plugins/network_config/src/network_config_routes_ifname.hpp",
+      "agents/plugins/network_config/src/network_config_routes_legs.hpp",
+      "agents/plugins/network_config/src/network_config_routes_linux.cpp",
+      "agents/plugins/network_config/src/network_config_routes_macos.cpp",
+      "agents/plugins/network_config/src/network_config_routes_parsers.hpp",
+      "agents/plugins/network_config/src/network_config_routes_win.cpp"
     ],
     "privilege_row": true,
     "tests": [
+      "tests/test_network_config_routes_definition.py",
       "tests/unit/test_network_config_local_dispatcher.cpp",
-      "tests/unit/test_network_config_parsers.cpp"
+      "tests/unit/test_network_config_parsers.cpp",
+      "tests/unit/test_network_config_routes.cpp"
     ]
   },
   "version": "1.0.0",
@@ -1165,7 +1452,7 @@
     "**Device page \"Get live info\".** `ip_addresses`, `arp`, and `dns_cache` back three of the device page's live-snapshot cards (`device.live.netconfig` \"Adapters & IP\", `device.live.arp` \"ARP\", `device.live.dns_cache` \"DNS cache\" — `server/core/src/device_routes.cpp:84,86,88`), dispatched through the shared \"Get live info\" chokepoint. This dispatch is deliberately **untracked** (`execution_id=\"\"`, no ExecutionTracker row, not in the executions drawer) because it auto-fires one query per card on every click (`server/core/src/server.cpp:19698-19708`).",
     "**Daily-sync device_ci source (ADR-0016).** `adapters` is one of the four plugin reads (`hardware`/`device_identity`/`os_info`/`network_config`) the `device_ci` daily-sync source invokes in-process to build the device's CI (config-item) record — its MAC addresses are deduped, sorted, and the first becomes the record's primary MAC (`agents/core/src/sync_source_device_ci.hpp:7-8,76`, `agents/core/src/sync_source_device_ci.cpp:197-209`, `agents/core/src/agent.cpp:2076,2095`). MAC address is device-identifying data, so this source is GDPR-personal-data/behavioural-PII tier per the daily-sync routed concern. A failed `adapters` read aborts the whole CI sync cycle rather than syncing a partial record (`sync_source_device_ci.cpp:268-277`).",
     "**Not consumed by** TAR, DEX, or Prometheus metrics.",
-    "**Sensitivity.** `adapters` rows carry the host's own MAC addresses, and `arp` rows carry the MAC and IP address of every other device currently seen on the local subnet — device-identifying data by another route. `ip_addresses`/`dns_servers` rows carry only this host's own IP/resolver configuration. `dns_cache` entries can include hostnames of other devices actually contacted on the network (e.g. `iphone`, `the-rig` in the sample) — potentially device-identifying, not personal. `proxy` rows carry network configuration only, nothing that identifies a person or installed software.",
+    "**Sensitivity.** `adapters` rows carry the host's own MAC addresses, and `arp` rows carry the MAC and IP address of every other device currently seen on the local subnet — device-identifying data by another route. `routes` rows carry the host's routing topology — internal networks, the next-hop addresses and interface names of VPN and internal gateways — infrastructure detail, not personal data. `ip_addresses`/`dns_servers` rows carry only this host's own IP/resolver configuration. `dns_cache` entries can include hostnames of other devices actually contacted on the network (for example the names of phones or workstations on the LAN) — potentially device-identifying, not personal. `proxy` rows carry network configuration only, nothing that identifies a person or installed software.",
     "**Siblings:** `tar/status` and `tar`'s own ARP collector (`agents/plugins/tar/src/tar_arp_collector.cpp`) perform an independent Windows ARP enumeration for the TAR capture surface — it duplicates similar RAII-guard logic for `GetIpNetTable2` but is not a consumer of this plugin's `arp` action (`tar_arp_collector.cpp:130-131`). `network_diag` covers listening ports and active connections, a distinct surface from this plugin's adapter/address/DNS/ARP inventory.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.network_config.arp\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`, or the device page's \"Get live info\" snapshot for `ip_addresses`/`arp`/`dns_cache`."
   ]

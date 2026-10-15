@@ -23,12 +23,14 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -231,6 +233,27 @@ public:
         return PQntuples(r.get()) > 0;
     }
 
+    // The stored `stream_home_id` column value, or nullopt if NULL — for
+    // asserting announce_connected/register_fresh/deregister's #4324
+    // stream_home_id writes; bypasses lookup_route/RouteRow, which do not
+    // expose the column (#4324 is store-layer-only in this slice — see
+    // gateway_route_store.hpp's SLICE #4324 note).
+    std::optional<std::string> raw_get_stream_home_id(const std::string& agent_id) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const char* p1 = agent_id.c_str();
+        const char* params[1] = {p1};
+        yuzu::server::pg::PgResult r{PQexecParams(
+            conn.get(),
+            "SELECT stream_home_id FROM gateway_route_store.agent_routes WHERE agent_id=$1", 1,
+            nullptr, params, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        if (PQgetisnull(r.get(), 0, 0))
+            return std::nullopt;
+        return std::string(PQgetvalue(r.get(), 0, 0));
+    }
+
     // Bulk-insert `count` rows with lease_until well in the past, directly
     // via SQL — looping register_fresh/announce_connected `count` times would
     // make the cap test the slow part of the suite (mirrors
@@ -387,6 +410,207 @@ TEST_CASE("GatewayRouteStore[pg]: announce_connected is a no-op against a differ
     CHECK(*(*row)->cluster_id == "cluster-a");
 }
 
+// ── #4669: agent<->cluster affinity ─────────────────────────────────────────
+
+TEST_CASE("GatewayRouteStore[pg]: announce_connected BINDS home_cluster_id on first contact "
+          "(TOFU) and a matching cluster_id on a later reconnect keeps succeeding",
+          "[gateway_route][pg][store][affinity]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-affinity-1", "session-1").value().won);
+    auto ann1 =
+        fx.store().announce_connected("agent-affinity-1", "session-1", "cluster-x", "node-1", 30);
+    REQUIRE(ann1.has_value());
+    CHECK(ann1->matched);
+    CHECK_FALSE(ann1->cluster_affinity_violation);
+    // Gate 4 happy-path NICE (2026-09-21): AnnounceResult's doc comment
+    // states matched/cluster_affinity_violation are mutually exclusive but
+    // nothing asserted it — pin the invariant so a future refactor that
+    // silently breaks it fails a test, not just a code review.
+    CHECK_FALSE((ann1->matched && ann1->cluster_affinity_violation));
+
+    auto row1 = fx.store().lookup_route("agent-affinity-1");
+    REQUIRE(row1.has_value());
+    REQUIRE(row1->has_value());
+    REQUIRE((*row1)->home_cluster_id.has_value());
+    CHECK(*(*row1)->home_cluster_id == "cluster-x");
+
+    // A SECOND legitimate reconnect (fresh session, same real cluster) —
+    // single-gateway/non-multi-cluster deployments look exactly like this:
+    // the SAME stable cluster_id presented on every reconnect. Must keep
+    // succeeding, unaffected by the new affinity guard.
+    REQUIRE(fx.store().register_fresh("agent-affinity-1", "session-2").value().won);
+    auto ann2 =
+        fx.store().announce_connected("agent-affinity-1", "session-2", "cluster-x", "node-2", 30);
+    REQUIRE(ann2.has_value());
+    CHECK(ann2->matched);
+    CHECK_FALSE(ann2->cluster_affinity_violation);
+
+    auto row2 = fx.store().lookup_route("agent-affinity-1");
+    REQUIRE(row2.has_value());
+    REQUIRE(row2->has_value());
+    REQUIRE((*row2)->cluster_id.has_value());
+    CHECK(*(*row2)->cluster_id == "cluster-x");
+    REQUIRE((*row2)->home_cluster_id.has_value());
+    CHECK(*(*row2)->home_cluster_id == "cluster-x"); // unchanged
+}
+
+TEST_CASE("GatewayRouteStore[pg]: announce_connected REFUSES a same-session claim presenting a "
+          "DIFFERENT cluster_id than the bound home affinity — #4669 the rogue-gateway shape",
+          "[gateway_route][pg][store][affinity]") {
+    GatewayRoutePg fx;
+    // The REAL cluster (cluster-x) legitimately binds the agent's affinity.
+    REQUIRE(fx.store().register_fresh("agent-affinity-2", "session-real").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-affinity-2", "session-real", "cluster-x", "node-real",
+                                    30)
+                .value()
+                .matched);
+
+    // A ROGUE gateway calls ProxyRegister for the SAME already-approved
+    // agent_id (no per-agent secret required — #4669's finding) and its own
+    // register_fresh wins the epoch race unconditionally (it always mints a
+    // strictly higher epoch), installing a NEW session and NULLing
+    // cluster_id/gateway_node — but NOT home_cluster_id (sticky, file
+    // header). It then tries to CONFIRM its own cluster via
+    // announce_connected.
+    auto reg2 = fx.store().register_fresh("agent-affinity-2", "session-rogue");
+    REQUIRE(reg2.has_value());
+    CHECK(reg2->won); // register_fresh itself is NOT cluster-aware — this is the accepted,
+                       // pre-existing DoS-shaped churn #4669 does not attempt to close.
+
+    auto ann_rogue = fx.store().announce_connected("agent-affinity-2", "session-rogue",
+                                                    "cluster-rogue", "node-rogue", 30);
+    REQUIRE(ann_rogue.has_value());
+    CHECK_FALSE(ann_rogue->matched);
+    CHECK(ann_rogue->cluster_affinity_violation); // the mitigation: refused, not silently applied
+
+    // The row is COMPLETELY UNTOUCHED by the rogue's claim: cluster_id stays
+    // NULL (register_fresh's own NULLing, never confirmed by the refused
+    // announce_connected), home_cluster_id stays cluster-x, and the row is
+    // therefore NOT routable to the rogue's cluster.
+    auto row = fx.store().lookup_route("agent-affinity-2");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == "session-rogue"); // register_fresh's own unconditional win
+    CHECK_FALSE((*row)->cluster_id.has_value());   // never confirmed for the rogue
+    REQUIRE((*row)->home_cluster_id.has_value());
+    CHECK(*(*row)->home_cluster_id == "cluster-x"); // untouched
+
+    // The REAL agent's own later reconnect (its own fresh register_fresh,
+    // strictly higher epoch, always eventually wins) self-heals the row once
+    // it announces the MATCHING cluster.
+    REQUIRE(fx.store().register_fresh("agent-affinity-2", "session-real-2").value().won);
+    auto ann_real = fx.store().announce_connected("agent-affinity-2", "session-real-2",
+                                                   "cluster-x", "node-real-2", 30);
+    REQUIRE(ann_real.has_value());
+    CHECK(ann_real->matched);
+    CHECK_FALSE(ann_real->cluster_affinity_violation);
+    auto row2 = fx.store().lookup_route("agent-affinity-2");
+    REQUIRE(row2.has_value());
+    REQUIRE(row2->has_value());
+    REQUIRE((*row2)->cluster_id.has_value());
+    CHECK(*(*row2)->cluster_id == "cluster-x");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes' expired-lease sweep clears home_cluster_id "
+          "too — the 'row expired' legitimate re-home trigger (#4669)",
+          "[gateway_route][pg][store][affinity][reap]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-affinity-reap", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-affinity-reap", "session-1", "cluster-x", "node-1", 30)
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-affinity-reap", 200); // past the 180s grace
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->expired_leases_reaped == 1);
+
+    auto row = fx.store().lookup_route("agent-affinity-reap");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->home_cluster_id.has_value()); // affinity cleared, not just placement
+
+    // A DIFFERENT cluster can now legitimately bind the agent — genuine
+    // staleness is a real re-home trigger, not a hijack.
+    REQUIRE(fx.store().register_fresh("agent-affinity-reap", "session-2").value().won);
+    auto ann = fx.store().announce_connected("agent-affinity-reap", "session-2", "cluster-y",
+                                             "node-2", 30);
+    REQUIRE(ann.has_value());
+    CHECK(ann->matched);
+    CHECK_FALSE(ann->cluster_affinity_violation);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: clear_cluster_affinity is the explicit-operator-action "
+          "re-home trigger (#4669) — clears ONLY home_cluster_id, leaves current placement "
+          "untouched, and the next announce_connected can bind a new cluster",
+          "[gateway_route][pg][store][affinity]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-affinity-op", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-affinity-op", "session-1", "cluster-x", "node-1", 30)
+                .value()
+                .matched);
+
+    auto cleared = fx.store().clear_cluster_affinity("agent-affinity-op");
+    REQUIRE(cleared.has_value());
+    CHECK(*cleared);
+
+    // Current placement (cluster_id/gateway_node/session_id) is UNTOUCHED —
+    // only the sticky affinity anchor is reset.
+    auto row = fx.store().lookup_route("agent-affinity-op");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == "session-1");
+    REQUIRE((*row)->cluster_id.has_value());
+    CHECK(*(*row)->cluster_id == "cluster-x");
+    CHECK_FALSE((*row)->home_cluster_id.has_value());
+
+    // A DIFFERENT cluster's session can now legitimately (re-)bind.
+    REQUIRE(fx.store().register_fresh("agent-affinity-op", "session-2").value().won);
+    auto ann = fx.store().announce_connected("agent-affinity-op", "session-2", "cluster-z",
+                                             "node-2", 30);
+    REQUIRE(ann.has_value());
+    CHECK(ann->matched);
+    CHECK_FALSE(ann->cluster_affinity_violation);
+
+    // clear_cluster_affinity against an unknown agent is a harmless no-op
+    // (false, not an error).
+    auto cleared_missing = fx.store().clear_cluster_affinity("agent-affinity-op-never-seen");
+    REQUIRE(cleared_missing.has_value());
+    CHECK_FALSE(*cleared_missing);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: an ordinary deregister does NOT clear home_cluster_id — only "
+          "genuine staleness or an explicit operator action does (#4669)",
+          "[gateway_route][pg][store][affinity]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-affinity-dereg", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-affinity-dereg", "session-1", "cluster-x", "node-1", 30)
+                .value()
+                .matched);
+    REQUIRE(fx.store().deregister("agent-affinity-dereg", "session-1").value().removed);
+
+    auto row = fx.store().lookup_route("agent-affinity-dereg");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value()); // tombstoned, still present
+    CHECK_FALSE((*row)->session_id.has_value());
+    REQUIRE((*row)->home_cluster_id.has_value()); // affinity SURVIVES an ordinary disconnect
+    CHECK(*(*row)->home_cluster_id == "cluster-x");
+
+    // An ordinary reconnect from a DIFFERENT cluster right after a plain
+    // disconnect is STILL refused — a ProxyRegister/disconnect cycle is not,
+    // on its own, one of the two legitimate re-home triggers.
+    REQUIRE(fx.store().register_fresh("agent-affinity-dereg", "session-2").value().won);
+    auto ann = fx.store().announce_connected("agent-affinity-dereg", "session-2", "cluster-rogue",
+                                             "node-2", 30);
+    REQUIRE(ann.has_value());
+    CHECK_FALSE(ann->matched);
+    CHECK(ann->cluster_affinity_violation);
+}
+
 TEST_CASE("GatewayRouteStore[pg]: deregister tombstones only when session matches",
           "[gateway_route][pg][store]") {
     GatewayRoutePg fx;
@@ -487,6 +711,201 @@ TEST_CASE("GatewayRouteStore[pg]: register_fresh after a tombstone mints a highe
     CHECK((*row)->connection_epoch == r2->epoch);
     REQUIRE((*row)->session_id.has_value());
     CHECK(*(*row)->session_id == "session-new");
+}
+
+// --- #4324: stream_home_id per-home generation fence (store layer) --------
+
+TEST_CASE("GatewayRouteStore[pg]: announce_connected writes stream_home_id on a winning "
+          "placement (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-1", "session-1").value().won);
+    auto ann =
+        fx.store().announce_connected("agent-home-1", "session-1", "c1", "n1", 30, "home-abc");
+    REQUIRE(ann.has_value());
+    CHECK(ann->matched);
+
+    auto home_id = fx.raw_get_stream_home_id("agent-home-1");
+    REQUIRE(home_id.has_value());
+    CHECK(*home_id == "home-abc");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: register_fresh NULLs stream_home_id on a winning re-register, "
+          "same as cluster_id/gateway_node (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-2", "session-S1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-home-2", "session-S1", "c1", "n1", 30, "home-old")
+                .value()
+                .matched);
+    REQUIRE(fx.raw_get_stream_home_id("agent-home-2").has_value());
+
+    auto r2 = fx.store().register_fresh("agent-home-2", "session-S2");
+    REQUIRE(r2.has_value());
+    CHECK(r2->won);
+
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-home-2").has_value());
+    // cluster_id/gateway_node are NULLed too (4.2b, pre-existing) — assert
+    // the whole placement, not just the new column, dropped together.
+    auto row = fx.store().lookup_route("agent-home-2");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->cluster_id.has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: deregister tombstones when the incoming stream_home_id "
+          "EXACTLY matches the stored one (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-3", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-home-3", "session-1", "c1", "n1", 30, "home-match")
+                .value()
+                .matched);
+
+    auto out = fx.store().deregister("agent-home-3", "session-1", "home-match");
+    REQUIRE(out.has_value());
+    CHECK(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-3");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value());
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-home-3").has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: deregister does NOT tombstone when the incoming "
+          "stream_home_id is a STALE mismatch against the stored one — the core "
+          "asymmetric-fence case (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-4", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-home-4", "session-1", "c1", "n1", 30, "home-current")
+                .value()
+                .matched);
+
+    // A stale DISCONNECTED carrying a DIFFERENT (superseded) home id for the
+    // same session must not tear down the row's current placement.
+    auto out = fx.store().deregister("agent-home-4", "session-1", "home-stale");
+    REQUIRE(out.has_value());
+    CHECK_FALSE(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-4");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    REQUIRE((*row)->session_id.has_value());
+    CHECK(*(*row)->session_id == "session-1");
+    REQUIRE((*row)->cluster_id.has_value());
+    CHECK(*(*row)->cluster_id == "c1");
+    auto home_id = fx.raw_get_stream_home_id("agent-home-4");
+    REQUIRE(home_id.has_value());
+    CHECK(*home_id == "home-current");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: deregister tombstones a legacy row when neither side ever "
+          "carried a stream_home_id — backward compatibility (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-5", "session-1").value().won);
+    // Neither call passes stream_home_id — both default to empty ("legacy,
+    // no home id"), so the stored column stays NULL, exactly as it would for
+    // a gateway build predating #4324.
+    REQUIRE(
+        fx.store().announce_connected("agent-home-5", "session-1", "c1", "n1", 30).value().matched);
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-home-5").has_value());
+
+    auto out = fx.store().deregister("agent-home-5", "session-1");
+    REQUIRE(out.has_value());
+    CHECK(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-5");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: deregister ADMITS a STAMPED incoming stream_home_id against a "
+          "register_fresh-only row (stored NULL, announce_connected never ran) — the reorder/"
+          "lost-CONNECTED regression from PR #4492's review, HIGH",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    // register_fresh only — no announce_connected call, so stream_home_id
+    // stays NULL. This is EXACTLY the state a fresh session is in if its own
+    // paired DISCONNECTED reaches the server before its own paired CONNECTED
+    // (the gateway dispatches the two as independently spawn_monitor'd RPC
+    // workers with no ordering guarantee — see gateway_route_store.hpp's
+    // PREDICATE FIX note). It is NOT distinguishable, at the store layer,
+    // from a genuinely stale row whose home was cleared by a tombstone sweep
+    // — both are safe to admit, because a stored-NULL home never represents
+    // a live placement worth protecting.
+    REQUIRE(fx.store().register_fresh("agent-home-7", "session-1").value().won);
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-home-7").has_value());
+
+    // The ORIGINAL predicate (`stream_home_id = $3 OR (stream_home_id IS
+    // NULL AND $3 = '')`) required $3 to ALSO be empty here, so this call
+    // returned removed=false — the bug. The fixed predicate
+    // (`stream_home_id IS NULL OR stream_home_id = $3`) admits it.
+    auto out = fx.store().deregister("agent-home-7", "session-1", "home-real");
+    REQUIRE(out.has_value());
+    CHECK(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-7");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: deregister with an EMPTY (old-build gateway) stream_home_id "
+          "does NOT tombstone a row carrying a STAMPED stream_home_id — the asymmetry a naive "
+          "symmetric predicate gets wrong (#4324, rolling gateway upgrade)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-6", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-home-6", "session-1", "c1", "n1", 30, "home-newbuild")
+                .value()
+                .matched);
+
+    // An old-build gateway node's DISCONNECTED for the same session id
+    // carries NO stream_home_id (empty — the pre-#4324 wire shape). It must
+    // not be able to tear down a new-build node's stamped re-home reusing
+    // that session id. The naive symmetric predicate
+    // (`$3 = '' OR stream_home_id = $3`) would wrongly match here; the
+    // shipped asymmetric predicate must not.
+    auto out = fx.store().deregister("agent-home-6", "session-1", "");
+    REQUIRE(out.has_value());
+    CHECK_FALSE(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-6");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    REQUIRE((*row)->session_id.has_value());
+    CHECK(*(*row)->session_id == "session-1");
+    REQUIRE((*row)->cluster_id.has_value());
+    CHECK(*(*row)->cluster_id == "c1");
+    auto home_id = fx.raw_get_stream_home_id("agent-home-6");
+    REQUIRE(home_id.has_value());
+    CHECK(*home_id == "home-newbuild");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes' expired-lease tombstone sweep clears "
+          "stream_home_id too (#4324)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-reap-home-1", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-reap-home-1", "session-1", "c1", "n1", 30, "home-x")
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-reap-home-1", 200); // past the 180s grace
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->expired_leases_reaped == 1);
+
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-reap-home-1").has_value());
 }
 
 TEST_CASE("GatewayRouteStore[pg]: renew_leases bumps lease_until only for named sessions, batched",
@@ -740,6 +1159,201 @@ TEST_CASE("GatewayRouteStore[pg]: lookup_routes on an empty span returns an empt
     CHECK(routes->empty());
 }
 
+// --- lookup_by_sessions (WS-5, #4246 #3) -------------------------------------
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions on an empty span returns empty without a query",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    std::vector<std::string> sids{};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns zero rows for unknown sessions",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-bys-other", "s-bys-other").value().won);
+    std::vector<std::string> sids{"s-bys-nobody", "s-bys-nobody-2"};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions resolves one session to its owning agent",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-bys-one", "s-bys-one").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-bys-one", "s-bys-one", "c1", "n1", 3600)
+                .value()
+                .matched);
+    std::vector<std::string> sids{"s-bys-one"};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().route.agent_id == "agent-bys-one");
+    REQUIRE(rows->front().route.session_id.has_value());
+    CHECK(*rows->front().route.session_id == "s-bys-one");
+    CHECK(rows->front().routable);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns many rows in one call and "
+          "reports routable independently of resolution",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    // Live + routable.
+    REQUIRE(fx.store().register_fresh("agent-bys-a", "s-bys-a").value().won);
+    REQUIRE(fx.store().announce_connected("agent-bys-a", "s-bys-a", "c1", "n1", 3600).value().matched);
+    // Registered but never announced -> present, NOT routable.
+    REQUIRE(fx.store().register_fresh("agent-bys-b", "s-bys-b").value().won);
+    // Expired lease -> present, NOT routable.
+    REQUIRE(fx.store().register_fresh("agent-bys-c", "s-bys-c").value().won);
+    REQUIRE(fx.store().announce_connected("agent-bys-c", "s-bys-c", "c1", "n1", -3600).value().matched);
+
+    std::vector<std::string> sids{"s-bys-a", "s-bys-b", "s-bys-c", "s-bys-absent"};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 3);
+
+    auto find = [&](const std::string& sid) -> const RoutableRoute* {
+        for (const auto& rr : *rows)
+            if (rr.route.session_id && *rr.route.session_id == sid)
+                return &rr;
+        return nullptr;
+    };
+    const RoutableRoute* a = find("s-bys-a");
+    const RoutableRoute* b = find("s-bys-b");
+    const RoutableRoute* c = find("s-bys-c");
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(c != nullptr);
+    CHECK(a->route.agent_id == "agent-bys-a");
+    CHECK(a->routable);
+    CHECK(b->route.agent_id == "agent-bys-b");
+    CHECK_FALSE(b->routable);
+    CHECK(c->route.agent_id == "agent-bys-c");
+    CHECK_FALSE(c->routable);
+    CHECK(find("s-bys-absent") == nullptr);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions never matches a tombstoned row",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-bys-tomb", "s-bys-tomb").value().won);
+    REQUIRE(fx.store().announce_connected("agent-bys-tomb", "s-bys-tomb", "c1", "n1", 30).value().matched);
+    std::vector<std::string> sids{"s-bys-tomb"};
+
+    auto live = fx.store().lookup_by_sessions(sids);
+    REQUIRE(live.has_value());
+    REQUIRE(live->size() == 1);
+
+    // Tombstone: session_id -> NULL; the row still exists, but the id is gone.
+    REQUIRE(fx.store().deregister("agent-bys-tomb", "s-bys-tomb").value().removed);
+    REQUIRE(fx.store().lookup_route("agent-bys-tomb").value().has_value());
+
+    auto after = fx.store().lookup_by_sessions(sids);
+    REQUIRE(after.has_value());
+    CHECK(after->empty());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns EVERY row for a duplicated "
+          "session id so the caller can refuse it",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    // session_id is not unique (register_fresh guards only the caller's own
+    // agent row): two agents may legitimately hold the same id.
+    REQUIRE(fx.store().register_fresh("agent-bys-dup1", "s-bys-dup").value().won);
+    REQUIRE(fx.store().register_fresh("agent-bys-dup2", "s-bys-dup").value().won);
+    std::vector<std::string> sids{"s-bys-dup"};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2);
+    CHECK(rows->at(0).route.agent_id != rows->at(1).route.agent_id);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions reads every chunk and drops empty and "
+          "over-length ids",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("yuzu_test_bys_chunk_first", "s-bys-chunk-first").value().won);
+    REQUIRE(fx.store().register_fresh("yuzu_test_bys_chunk_edge", "s-bys-chunk-edge").value().won);
+    REQUIRE(
+        fx.store().register_fresh("yuzu_test_bys_chunk_second", "s-bys-chunk-second").value().won);
+    const std::string too_long(65, 'x');
+    REQUIRE(fx.store().register_fresh("yuzu_test_bys_long", "s-bys-long").value().won);
+    fx.raw_bump_epoch("yuzu_test_bys_long", 5, too_long);
+
+    // The empty and over-length ids are dropped before chunking, so the 1026th
+    // input is the 1024th looked-up id: the last of the first chunk.
+    std::vector<std::string> sids;
+    sids.push_back("s-bys-chunk-first");
+    sids.emplace_back();
+    sids.push_back(too_long);
+    for (int i = 0; sids.size() < 1025; ++i)
+        sids.push_back("s-bys-filler-" + std::to_string(i));
+    sids.push_back("s-bys-chunk-edge");
+    for (int i = 0; i < 500; ++i)
+        sids.push_back("s-bys-filler2-" + std::to_string(i));
+    sids.push_back("s-bys-chunk-second");
+
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    std::vector<std::string> agents;
+    for (const auto& rr : *rows)
+        agents.push_back(rr.route.agent_id);
+    std::sort(agents.begin(), agents.end());
+    CHECK(agents == std::vector<std::string>{"yuzu_test_bys_chunk_edge",
+                                             "yuzu_test_bys_chunk_first",
+                                             "yuzu_test_bys_chunk_second"});
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns a row once when its id repeats "
+          "across chunks",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("yuzu_test_bys_repeat", "s-bys-repeat").value().won);
+    std::vector<std::string> sids{"s-bys-repeat"};
+    for (int i = 0; i < 1100; ++i)
+        sids.push_back("s-bys-repeat-filler-" + std::to_string(i));
+    sids.push_back("s-bys-repeat");
+
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().route.agent_id == "yuzu_test_bys_repeat");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reclaim_tombstoned_session reports which guard refused it",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("yuzu_test_rcl_owner", "s-rcl-owner").value().won);
+    auto reclaim = [&](const char* agent, const char* sid) {
+        return fx.store().reclaim_tombstoned_session(agent, sid, 90).value();
+    };
+
+    SECTION("an absent row is adopted") {
+        CHECK(reclaim("yuzu_test_rcl_new", "s-rcl-new") == ReclaimOutcome::adopted);
+    }
+    SECTION("the caller's own row holding a different live session is superseded") {
+        CHECK(reclaim("yuzu_test_rcl_owner", "s-rcl-stale") == ReclaimOutcome::superseded);
+    }
+    SECTION("another agent holding the id refuses an absent caller") {
+        CHECK(reclaim("yuzu_test_rcl_thief", "s-rcl-owner") ==
+              ReclaimOutcome::held_by_other_agent);
+        CHECK_FALSE(fx.store().lookup_route("yuzu_test_rcl_thief").value().has_value());
+    }
+    SECTION("another agent holding the id refuses a tombstoned caller") {
+        REQUIRE(fx.store().register_fresh("yuzu_test_rcl_thief", "s-rcl-thief").value().won);
+        REQUIRE(fx.store().deregister("yuzu_test_rcl_thief", "s-rcl-thief").value().removed);
+        CHECK(reclaim("yuzu_test_rcl_thief", "s-rcl-owner") ==
+              ReclaimOutcome::held_by_other_agent);
+        auto row = fx.store().lookup_route("yuzu_test_rcl_thief").value();
+        REQUIRE(row.has_value());
+        CHECK_FALSE(row->session_id.has_value());
+    }
+}
+
 // --- reap_stale_routes ------------------------------------------------------
 
 TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes tombstones an expired-lease row past grace",
@@ -790,11 +1404,17 @@ TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes leaves an expired lease alon
     CHECK((*row)->is_stale); // lease_until < now() — is_stale fires independent of grace
 }
 
-TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes purges a tombstone past the purge age",
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes purges a tombstone past the purge age "
+          "(genuine tombstone — no confirmed cluster, so no affinity to protect)",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
+    // Deliberately never calls announce_connected — home_cluster_id stays
+    // NULL, so this is a genuine no-affinity tombstone and remains a
+    // sweep-(b) hard-delete candidate under the #4669 pr-rev fix (which
+    // excludes any row carrying a bound home_cluster_id from sweep (b) —
+    // see "reap_stale_routes' tombstone-purge sweep does NOT purge a row
+    // carrying a bound home_cluster_id" below for that coverage instead).
     REQUIRE(fx.store().register_fresh("agent-reap-3", "session-1").value().won);
-    REQUIRE(fx.store().announce_connected("agent-reap-3", "session-1", "c1", "n1", 30).value().matched);
     REQUIRE(fx.store().deregister("agent-reap-3", "session-1").value().removed); // tombstoned
     // kTombstonePurgeAgeSecs is 300s — push well past it.
     fx.raw_set_updated_at_ago("agent-reap-3", 400);
@@ -803,12 +1423,117 @@ TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes purges a tombstone past the 
     REQUIRE(out.has_value());
     CHECK(out->tombstones_reaped == 1);
     CHECK(out->expired_leases_reaped == 0);
+    CHECK(out->affinity_preserved_soft_tombstones == 0);
 
     // Purged means fully GONE — not merely re-tombstoned.
     CHECK_FALSE(fx.raw_row_exists("agent-reap-3"));
     auto row = fx.store().lookup_route("agent-reap-3");
     REQUIRE(row.has_value());
     CHECK_FALSE(row->has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes' tombstone-purge sweep does NOT purge a row "
+          "carrying a bound home_cluster_id — an ordinary deregister leaves the row parked, "
+          "affinity preserved, indefinitely (#4669 pr-rev Blocker 1)",
+          "[gateway_route][pg][store][reap][affinity]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-reap-affinity-parked", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-reap-affinity-parked", "session-1", "cluster-x",
+                                    "node-1", 30)
+                .value()
+                .matched);
+    REQUIRE(fx.store().deregister("agent-reap-affinity-parked", "session-1").value().removed);
+    // Well past kTombstonePurgeAgeSecs (300s) — under the PRE-fix predicate
+    // this would have been a sweep-(b) hard-delete candidate, wiping
+    // home_cluster_id along with the row and re-opening a TOFU rebind window
+    // for any cluster. Post-fix, a bound home_cluster_id excludes the row
+    // from sweep (b) UNCONDITIONALLY, regardless of how it reached
+    // session_id IS NULL (an ordinary deregister here, not just an
+    // abandoned rogue claim — see the Blocker-1 falsifier test below for
+    // that variant).
+    fx.raw_set_updated_at_ago("agent-reap-affinity-parked", 400);
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->tombstones_reaped == 0);
+    // session_id is already NULL (ordinary deregister), so sweep (b')'s
+    // `session_id IS NOT NULL` guard also does not match this row — it is
+    // parked untouched by either sweep, exactly as an already-tombstoned
+    // row with nothing left to clear should be.
+    CHECK(out->affinity_preserved_soft_tombstones == 0);
+
+    REQUIRE(fx.raw_row_exists("agent-reap-affinity-parked")); // NOT purged
+    auto row = fx.store().lookup_route("agent-reap-affinity-parked");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value());
+    REQUIRE((*row)->home_cluster_id.has_value());
+    CHECK(*(*row)->home_cluster_id == "cluster-x"); // affinity survives indefinitely
+
+    // The real agent can still reconnect and confirm the SAME cluster at any
+    // time — parked is not abandoned.
+    REQUIRE(fx.store().register_fresh("agent-reap-affinity-parked", "session-2").value().won);
+    auto ann = fx.store().announce_connected("agent-reap-affinity-parked", "session-2",
+                                             "cluster-x", "node-2", 30);
+    REQUIRE(ann.has_value());
+    CHECK(ann->matched);
+    CHECK_FALSE(ann->cluster_affinity_violation);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes' affinity-preserving soft-tombstone closes "
+          "the rogue-register-then-wait TOFU-rebind hijack (#4669 pr-rev Blocker 1, empirically "
+          "reproduced by FortitudeEtc/Codex+Kimi)",
+          "[gateway_route][pg][store][reap][affinity]") {
+    GatewayRoutePg fx;
+    // The real agent binds cluster-x first.
+    REQUIRE(fx.store().register_fresh("agent-reap-hijack", "session-real").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-reap-hijack", "session-real", "cluster-x", "node-real",
+                                    30)
+                .value()
+                .matched);
+
+    // A rogue's ProxyRegister wins the epoch race unconditionally (register_fresh
+    // is not cluster-aware) but never confirms via announce_connected — it just
+    // sits there, exactly the exploit shape pr-rev reproduced against real
+    // Postgres: claim, then wait out kTombstonePurgeAgeSecs.
+    REQUIRE(fx.store().register_fresh("agent-reap-hijack", "session-rogue").value().won);
+    fx.raw_set_updated_at_ago("agent-reap-hijack", 400); // past the 300s purge age
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    // THE DISCRIMINATING ASSERTION: pre-fix this counted as tombstones_reaped
+    // (a hard DELETE, wiping home_cluster_id) — post-fix it is soft-
+    // tombstoned instead, preserving the affinity.
+    CHECK(out->tombstones_reaped == 0);
+    CHECK(out->affinity_preserved_soft_tombstones == 1);
+
+    auto row = fx.store().lookup_route("agent-reap-hijack");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value()); // the rogue's claim is cleared
+    CHECK_FALSE((*row)->cluster_id.has_value());
+    REQUIRE((*row)->home_cluster_id.has_value());
+    CHECK(*(*row)->home_cluster_id == "cluster-x"); // affinity SURVIVES the rogue's wait-out
+
+    // A SECOND rogue attempt — fresh register_fresh, then try to confirm the
+    // rogue's own cluster — is still refused: the reap never actually cleared
+    // the affinity, so the hijack gains nothing from waiting.
+    REQUIRE(fx.store().register_fresh("agent-reap-hijack", "session-rogue-2").value().won);
+    auto ann_rogue = fx.store().announce_connected("agent-reap-hijack", "session-rogue-2",
+                                                    "cluster-rogue", "node-rogue", 30);
+    REQUIRE(ann_rogue.has_value());
+    CHECK_FALSE(ann_rogue->matched);
+    CHECK(ann_rogue->cluster_affinity_violation);
+
+    // The REAL cluster can still reconnect and confirm at any time.
+    REQUIRE(fx.store().register_fresh("agent-reap-hijack", "session-real-2").value().won);
+    auto ann_real = fx.store().announce_connected("agent-reap-hijack", "session-real-2",
+                                                   "cluster-x", "node-real-2", 30);
+    REQUIRE(ann_real.has_value());
+    CHECK(ann_real->matched);
+    CHECK_FALSE(ann_real->cluster_affinity_violation);
 }
 
 TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes leaves a live lease untouched",
@@ -1816,11 +2541,15 @@ TEST_CASE("GatewayRouteStore[pg]: reap does not purge a tombstoned row concurren
           "by a fresh register_fresh (outer-DELETE re-assert, PR #4299 review BLOCKER 2)",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
+    // Deliberately NEVER calls announce_connected — `home_cluster_id` stays
+    // NULL throughout, so this row is a genuine sweep-(b) hard-delete
+    // candidate under the #4669 pr-rev fix above (which excludes any row
+    // carrying a bound `home_cluster_id` from sweep (b) entirely — see that
+    // fix's comment). A row that HAD confirmed a cluster would instead match
+    // the new affinity-preserving sweep (b') and never take a row lock this
+    // test's race depends on; see "reap_stale_routes' affinity-preserving
+    // soft-tombstone" below for that coverage.
     REQUIRE(fx.store().register_fresh("agent-reap-epq-b", "session-b1").value().won);
-    REQUIRE(fx.store()
-                .announce_connected("agent-reap-epq-b", "session-b1", "c1", "n1", 30)
-                .value()
-                .matched);
     REQUIRE(fx.store().deregister("agent-reap-epq-b", "session-b1").value().removed);
     // Past the 300s tombstone purge age, committed — a genuine sweep-(b)
     // candidate as far as any snapshot taken before the revive below is
@@ -1858,18 +2587,21 @@ TEST_CASE("GatewayRouteStore[pg]: reap does not purge a tombstoned row concurren
     yuzu::server::pg::PgConn watcher{PQconnectdb(fx.dsn().c_str())};
     REQUIRE(PQstatus(watcher.get()) == CONNECTION_OK);
     const bool blocked = wait_for_lock_waiter(watcher.get());
+
+    // Commit (releasing the holder's row lock) and join the reaper thread
+    // UNCONDITIONALLY, before any REQUIRE that could throw — an assertion
+    // failure throws and unwinds past a still-joinable `std::thread`'s
+    // destructor, which calls std::terminate() (SIGABRT) instead of
+    // reporting a clean test failure. Only now does the revived version
+    // become visible to the blocked reaper — exactly the window BLOCKER 2's
+    // outer-WHERE re-assert defends via EvalPlanQual.
+    yuzu::server::pg::PgResult commit{PQexec(holder.get(), "COMMIT")};
+    const bool committed = commit.status() == PGRES_COMMAND_OK;
+    reaper.join();
+
+    REQUIRE(committed);
     REQUIRE(blocked); // if nothing ever blocks, the race this test exists to
                        // force never happened.
-
-    // Only now does the revived version become visible to the blocked
-    // reaper — exactly the window BLOCKER 2's outer-WHERE re-assert defends
-    // via EvalPlanQual.
-    {
-        yuzu::server::pg::PgResult commit{PQexec(holder.get(), "COMMIT")};
-        REQUIRE(commit.status() == PGRES_COMMAND_OK);
-    }
-
-    reaper.join();
 
     REQUIRE(out.has_value());
     CHECK_FALSE(out->clock_anomaly);
@@ -1933,4 +2665,25 @@ TEST_CASE("GatewayRouteStore: reap_stale_routes fails closed against a closed po
     auto out = store.reap_stale_routes();
     REQUIRE_FALSE(out.has_value());
     CHECK(out.error() == GatewayRouteStoreError::store_unavailable);
+}
+
+// WS-5: lookup_by_sessions reports the same fail-closed store_unavailable a
+// closed/unreachable pool gives every other method (distinguishable from an
+// empty result so BatchHeartbeat/ProxyInventory can take their degrade path).
+TEST_CASE("GatewayRouteStore: lookup_by_sessions fails closed against a closed pool",
+          "[gateway_route][pg]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::server::pg::PgPool pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent connect_timeout=1", .size = 1}};
+    GatewayRouteStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    std::vector<std::string> sids{"s-bys-closed"};
+    auto out = store.lookup_by_sessions(sids);
+    REQUIRE_FALSE(out.has_value());
+    CHECK(out.error() == GatewayRouteStoreError::store_unavailable);
+    // A closed store is reported as such even for an empty input (open check first).
+    auto empty_out = store.lookup_by_sessions(std::span<const std::string>{});
+    REQUIRE_FALSE(empty_out.has_value());
+    CHECK(empty_out.error() == GatewayRouteStoreError::store_unavailable);
 }

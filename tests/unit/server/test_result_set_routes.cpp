@@ -43,6 +43,9 @@
 #include "result_set_routes.hpp"
 #include "test_route_sink.hpp"
 
+#include "instruction_store.hpp"
+#include "test_real_capability_registry.hpp"
+#include "mcp_policy.hpp" // mcp::tier_allows/requires_approval — #5047 fake tier_policy_fn
 #include "result_set_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -54,10 +57,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <format>
 #include <fstream>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -88,16 +93,63 @@ struct Harness {
 
     bool session_present{true};
     std::string session_username{"alice"};
+    std::string session_mcp_tier; // empty = not an MCP token (default, matches production)
     bool auth_fn_called{false};
+
+    // #5047: a fake tier_policy_fn wired through the REAL mcp::tier_allows/
+    // requires_approval logic (mcp_policy.hpp) so these route-level tests
+    // exercise the actual tier rules, not a hand-rolled stand-in that could
+    // drift from them. `AuthRoutes::require_tier_policy` itself (the
+    // production implementation this mirrors) is unit-tested directly in
+    // test_auth_routes.cpp; this harness tests the WIRING — is it called,
+    // with the right (securable_type, operation), in the right order
+    // relative to auth_fn/the store.
+    bool tier_policy_fn_wired{true};
+    bool tier_policy_fn_called{false};
+    std::string last_tier_securable, last_tier_operation;
 
     bool audit_succeeds{true};
     std::vector<AuditRow> audits;
+
+    /// #4983 -- the create route's device_ids existence/scope gate. Mirrors
+    /// test_rest_result_sets_async.cpp's AsyncHarness fields of the same
+    /// name/purpose. `wire_fleet_read_fn`/`wire_all_agent_ids_fn` false ->
+    /// leaves that Deps field genuinely unwired (default `{}`), modelling a
+    /// misconfigured call site -- same contract as that file's own flags.
+    bool wire_fleet_read_fn{true};
+    bool wire_all_agent_ids_fn{true};
+    bool fleet_read_admit{true};
+    /// The status the gate writes when it does NOT admit (403, or 503 for a degraded read).
+    int fleet_read_deny_status{403};
+    yuzu::server::authz::VisibleSet fleet_read_scope{std::nullopt};
+    bool fleet_read_fn_reached{false};
+    std::string fleet_read_securable, fleet_read_operation;
+    std::vector<std::string> all_agent_ids_override{"dev-1", "dev-2", "dev-3"};
+
+    /// Operate extras: the producer picker and the re-evaluate verdict. `perm_ok` drives the
+    /// non-auditing RBAC probe (`Deps::probe_perm_fn`; the module has no auditing perm_fn at
+    /// all); `classify_wired` false leaves the classifier genuinely unwired.
+    InstructionStore* instruction_store{nullptr};
+    bool perm_ok{true};
+    bool wire_perm_fn{true};
+    bool classify_wired{true};
+    std::vector<std::string> perms_asked;
 
     yuzu::server::test::TestRouteSink sink;
 
     void wire() {
         result_set::Deps deps;
         deps.store = store;
+        deps.instruction_store = instruction_store;
+        if (wire_perm_fn) {
+            deps.probe_perm_fn = [this](const httplib::Request&, const std::string& type,
+                                        const std::string& op) -> bool {
+                perms_asked.push_back(type + ":" + op);
+                return perm_ok;
+            };
+        }
+        if (classify_wired)
+            deps.classify_fn = yuzu::test::real_classify_fn();
         deps.metrics = &metrics;
         deps.deny_service_scoped_fn = [this](const httplib::Request&, httplib::Response& res,
                                              const std::string& action, const std::string&,
@@ -128,20 +180,76 @@ struct Harness {
             auth::Session s;
             s.username = session_username;
             s.role = auth::Role::user;
+            s.mcp_tier = session_mcp_tier;
             return s;
         };
+        if (tier_policy_fn_wired) {
+            deps.tier_policy_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                         const auth::Session& session,
+                                         const std::string& securable_type,
+                                         const std::string& operation) -> bool {
+                tier_policy_fn_called = true;
+                last_tier_securable = securable_type;
+                last_tier_operation = operation;
+                if (session.mcp_tier.empty())
+                    return true;
+                if (!mcp::tier_allows(session.mcp_tier, securable_type, operation)) {
+                    res.status = 403;
+                    res.set_content(
+                        R"({"error":{"code":403,"message":"MCP token tier does not allow this"}})",
+                        "application/json");
+                    return false;
+                }
+                // Never /mcp/v1/ here — every route in this module is a
+                // dashboard fragment (`req.path` always starts with
+                // /fragments/), so the ticket-then-recall exemption never
+                // applies, mirroring AuthRoutes::require_tier_policy exactly.
+                if (mcp::requires_approval(session.mcp_tier, securable_type, operation)) {
+                    res.status = 403;
+                    res.set_content(
+                        R"({"error":{"code":403,"message":"operation requires approval for )"
+                        R"(this MCP tier on this transport"}})",
+                        "application/json");
+                    return false;
+                }
+                return true;
+            };
+        }
         deps.audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string& tt,
                                const std::string& ti, const std::string& d) -> bool {
             audits.push_back({a, r, tt, ti, d});
             return audit_succeeds;
         };
+        if (wire_fleet_read_fn) {
+            deps.fleet_read_fn =
+                [this](const httplib::Request&, httplib::Response& res,
+                       const std::string& securable,
+                       const std::string& operation) -> yuzu::server::authz::FleetReadGate {
+                fleet_read_fn_reached = true;
+                fleet_read_securable = securable;
+                fleet_read_operation = operation;
+                if (!fleet_read_admit) {
+                    res.status = fleet_read_deny_status;
+                    if (fleet_read_deny_status == 503)
+                        res.set_header("Retry-After", "5");
+                    return {};
+                }
+                return {.admitted = true, .scope = fleet_read_scope};
+            };
+        }
+        if (wire_all_agent_ids_fn) {
+            deps.all_agent_ids_fn = [this]() -> std::vector<std::string> {
+                return all_agent_ids_override;
+            };
+        }
         result_set::register_result_set_routes(sink, deps);
     }
 
     void reset_gate_tracking() {
         deny_scoped_fn_called = false;
         auth_fn_called = false;
+        tier_policy_fn_called = false;
     }
 };
 
@@ -153,11 +261,11 @@ const std::string kFakeId = "rs_deadbeef0123";
 
 // ── Registration shape ────────────────────────────────────────────────────
 
-TEST_CASE("result_set_routes: registers exactly 6 routes",
+TEST_CASE("result_set_routes: registers exactly 8 routes",
           "[server][routes][result_set_routes]") {
     Harness h;
     h.wire();
-    CHECK(h.sink.route_count() == 6);
+    CHECK(h.sink.route_count() == 8);
 }
 
 // ── Gate order (no Postgres needed) ─────────────────────────────────────────
@@ -182,6 +290,20 @@ TEST_CASE("result_set_routes: every route gates on deny_service_scoped_fn "
     CHECK(h.auth_fn_called);
     CHECK(h.last_deny_action == "result_set.detail.access_denied");
     CHECK(h.last_deny_target_id == kFakeId);
+
+    h.reset_gate_tracking();
+    h.sink.Get("/fragments/result-sets/" + kFakeId + "/members");
+    CHECK(h.deny_scoped_fn_called);
+    CHECK(h.auth_fn_called);
+    CHECK(h.last_deny_action == "result_set.members.access_denied");
+    CHECK(h.last_deny_target_id == kFakeId);
+
+    h.reset_gate_tracking();
+    h.sink.Get("/fragments/result-sets/producers");
+    CHECK(h.deny_scoped_fn_called);
+    CHECK(h.auth_fn_called);
+    CHECK(h.last_deny_action == "result_set.producers.access_denied");
+    CHECK(h.last_deny_target_id.empty());
 
     h.reset_gate_tracking();
     h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
@@ -212,7 +334,7 @@ TEST_CASE("result_set_routes: every route gates on deny_service_scoped_fn "
     CHECK(h.last_deny_target_id.empty());
 }
 
-TEST_CASE("result_set_routes: a service-scoped-token denial 403s on all 6 "
+TEST_CASE("result_set_routes: a service-scoped-token denial 403s on all 8 "
           "routes, before auth_fn or the store is touched",
           "[server][routes][result_set_routes]") {
     Harness h; // store stays null -- a dereference would crash; 403 must win first
@@ -222,6 +344,8 @@ TEST_CASE("result_set_routes: a service-scoped-token denial 403s on all 6 "
     for (const auto& [method, path] : std::vector<std::pair<std::string, std::string>>{
              {"GET", "/fragments/result-sets/sidebar"},
              {"GET", "/fragments/result-sets/" + kFakeId + "/detail"},
+             {"GET", "/fragments/result-sets/" + kFakeId + "/members"},
+             {"GET", "/fragments/result-sets/producers"},
              {"POST", "/fragments/result-sets/" + kFakeId + "/pin"},
              {"POST", "/fragments/result-sets/" + kFakeId + "/unpin"},
              {"POST", "/fragments/result-sets/" + kFakeId + "/delete"},
@@ -236,7 +360,7 @@ TEST_CASE("result_set_routes: a service-scoped-token denial 403s on all 6 "
     }
 }
 
-TEST_CASE("result_set_routes: an unauthenticated caller 401s on all 6 routes "
+TEST_CASE("result_set_routes: an unauthenticated caller 401s on all 8 routes "
           "(after the scoped-deny gate), before the store is touched",
           "[server][routes][result_set_routes]") {
     Harness h; // store stays null
@@ -246,6 +370,8 @@ TEST_CASE("result_set_routes: an unauthenticated caller 401s on all 6 routes "
     for (const auto& [method, path] : std::vector<std::pair<std::string, std::string>>{
              {"GET", "/fragments/result-sets/sidebar"},
              {"GET", "/fragments/result-sets/" + kFakeId + "/detail"},
+             {"GET", "/fragments/result-sets/" + kFakeId + "/members"},
+             {"GET", "/fragments/result-sets/producers"},
              {"POST", "/fragments/result-sets/" + kFakeId + "/pin"},
              {"POST", "/fragments/result-sets/" + kFakeId + "/unpin"},
              {"POST", "/fragments/result-sets/" + kFakeId + "/delete"},
@@ -260,6 +386,159 @@ TEST_CASE("result_set_routes: an unauthenticated caller 401s on all 6 routes "
         CHECK(h.auth_fn_called);
     }
     CHECK(h.audits.empty()); // every branch above is unaudited
+}
+
+// ── #5047: tier/approval belt on the 4 mutating fragments ──────────────────
+// (pin/unpin/delete/create) — closes the cross-transport gap where an
+// MCP-tiered bearer could skip C8's tier/approval check by hitting these
+// plain-HTTP fragment routes instead of /mcp/v1/. `store` stays null in
+// every case below: tier_ok runs BEFORE the store-null check (see
+// result_set_routes.cpp), so these are testable without Postgres.
+
+TEST_CASE("result_set_routes: tier_policy_fn is called on all 4 mutating "
+          "fragments, AFTER auth_fn and BEFORE the store is touched, with "
+          "the correct (securable_type, operation)",
+          "[server][routes][result_set_routes]") {
+    Harness h; // store stays null
+    h.wire();
+
+    h.reset_gate_tracking();
+    h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    CHECK(h.auth_fn_called);
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Write");
+
+    h.reset_gate_tracking();
+    h.sink.Post("/fragments/result-sets/" + kFakeId + "/unpin", "");
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Write");
+
+    h.reset_gate_tracking();
+    h.sink.Post("/fragments/result-sets/" + kFakeId + "/delete", "");
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Delete");
+
+    h.reset_gate_tracking();
+    h.sink.Post("/fragments/result-sets/create", "", "application/x-www-form-urlencoded");
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Write");
+}
+
+TEST_CASE("result_set_routes: tier_policy_fn is NOT called on the 2 read "
+          "fragments (sidebar/detail) — provable no-op there",
+          "[server][routes][result_set_routes]") {
+    Harness h;
+    h.wire();
+
+    h.reset_gate_tracking();
+    h.sink.Get("/fragments/result-sets/sidebar");
+    CHECK_FALSE(h.tier_policy_fn_called);
+
+    h.reset_gate_tracking();
+    h.sink.Get("/fragments/result-sets/" + kFakeId + "/detail");
+    CHECK_FALSE(h.tier_policy_fn_called);
+}
+
+TEST_CASE("result_set_routes: a supervised-tier session pinning/creating its "
+          "own result set is allowed (Infrastructure:Write is on "
+          "tier_allows' supervised path — this asserts the WIRING calls "
+          "through correctly, not just tier_allows in isolation); only a "
+          "false tier_policy_fn return would halt the handler before the "
+          "store is touched",
+          "[server][routes][result_set_routes]") {
+    // Sanity: supervised tier DOES allow Infrastructure:Write per
+    // tier_allows() -- so pin/create should NOT be blocked by tier_allows.
+    // What SHOULD block a supervised caller is delete (Infrastructure:Delete
+    // requires_approval() on a non-MCP transport) -- covered below. This
+    // case pins that pin/create succeed for supervised (regression net for
+    // the operator-tier-denied case immediately after).
+    Harness h;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    auto pin = h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin);
+    CHECK(pin->status == 200); // null store -> 200 empty body (degrade asymmetry), not 403
+    CHECK(h.tier_policy_fn_called);
+}
+
+TEST_CASE("result_set_routes: an operator-tier session is denied "
+          "create/pin/unpin (Infrastructure:Write is not on tier_allows' "
+          "operator allow-list) — 403 before the store is touched",
+          "[server][routes][result_set_routes]") {
+    Harness h;
+    h.session_mcp_tier = "operator";
+    h.wire();
+
+    auto pin = h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin);
+    CHECK(pin->status == 403);
+    CHECK(pin->body.find("tier") != std::string::npos);
+
+    auto create =
+        h.sink.Post("/fragments/result-sets/create", "", "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    CHECK(create->status == 403);
+}
+
+TEST_CASE("result_set_routes: a readonly-tier session is denied all 4 "
+          "mutating fragments",
+          "[server][routes][result_set_routes]") {
+    Harness h;
+    h.session_mcp_tier = "readonly";
+    h.wire();
+
+    for (const auto& [method, path] : std::vector<std::pair<std::string, std::string>>{
+             {"POST", "/fragments/result-sets/" + kFakeId + "/pin"},
+             {"POST", "/fragments/result-sets/" + kFakeId + "/unpin"},
+             {"POST", "/fragments/result-sets/" + kFakeId + "/delete"},
+             {"POST", "/fragments/result-sets/create"},
+         }) {
+        INFO("path: " << path);
+        auto r = h.sink.dispatch(method, path);
+        REQUIRE(r);
+        CHECK(r->status == 403);
+    }
+}
+
+TEST_CASE("result_set_routes: an empty (untiered) session's owner-scoped "
+          "create/pin/unpin/delete is untouched by the tier belt — no "
+          "regression",
+          "[server][routes][result_set_routes]") {
+    Harness h; // session_mcp_tier defaults to "" — matches every pre-#5047 test above
+    h.wire();
+
+    auto pin = h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin);
+    CHECK(pin->status == 200); // null-store degrade, not a tier denial
+    CHECK(h.tier_policy_fn_called);
+}
+
+TEST_CASE("result_set_routes: an unwired tier_policy_fn fails CLOSED (503) "
+          "for a TIERED session but passes through for an untiered one "
+          "(misconfiguration posture, TierPolicyFn's own contract)",
+          "[server][routes][result_set_routes]") {
+    Harness h;
+    h.tier_policy_fn_wired = false;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    auto pin = h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin);
+    CHECK(pin->status == 503);
+
+    // Untiered session, still unwired: passes through to the null-store
+    // degrade (200), not a 503 — nothing this belt enforces on it.
+    Harness h2;
+    h2.tier_policy_fn_wired = false;
+    h2.wire();
+    auto pin2 = h2.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin2);
+    CHECK(pin2->status == 200);
 }
 
 // ── Null-store degrade — THREE distinct shapes, preserved verbatim
@@ -589,7 +868,7 @@ TEST_CASE("result_set_routes: [pg] pin beyond kMaxPinsPerOwner audits "
 }
 
 TEST_CASE("result_set_routes: [pg] delete on a pinned set fails WITHOUT any "
-          "audit call or toast -- silently re-renders the existing detail",
+          "audit call, with a toast saying why, and re-renders the existing detail",
           "[pg][server][routes][result_set_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
     PgWired w{db.dsn()};
@@ -604,7 +883,10 @@ TEST_CASE("result_set_routes: [pg] delete on a pinned set fails WITHOUT any "
     auto r = h.sink.Post("/fragments/result-sets/" + rs->id + "/delete", "");
     REQUIRE(r);
     CHECK(r->status == 200);
-    CHECK(r->get_header_value("HX-Trigger").empty()); // no toast, no resultSetsChanged
+    // A toast says why (htmx drops a 4xx body); the list is NOT reloaded.
+    const auto trigger = r->get_header_value("HX-Trigger");
+    CHECK(trigger.find("Unpin this result set before deleting it.") != std::string::npos);
+    CHECK(trigger.find("resultSetsChanged") == std::string::npos);
     CHECK(r->body.find("rs-detail-empty") == std::string::npos); // NOT the empty pane
     CHECK(r->body.find("rs-badge-pinned") != std::string::npos); // the still-pinned row
     CHECK(h.audits.empty()); // delete failure is unaudited
@@ -642,6 +924,306 @@ TEST_CASE("result_set_routes: [pg] delete success round trip audits and "
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// #4983: device_ids[] existence + scope check on POST /fragments/result-sets/create
+// (Fix 2 -- the dashboard CSV-paste import had the identical gap REST/MCP
+// were fixed for; this mirrors those two files' own test shapes).
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("result_set_routes: [pg] create: a fully-valid, all-visible device_ids "
+          "list still succeeds (no regression, #4983)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h; // all_agent_ids_override defaults to {dev-1,dev-2,dev-3}
+    h.store = &w.store;
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1,dev-2",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger") == "resultSetsChanged");
+    CHECK(h.fleet_read_fn_reached);
+    std::string next;
+    auto sets = w.store.list_by_owner("alice", "", 10, next);
+    REQUIRE(sets.size() == 1);
+    CHECK(sets[0].device_count == 2);
+}
+
+TEST_CASE("result_set_routes: [pg] create: a device_ids list containing one "
+          "nonexistent id is rejected with an error toast, and no result set "
+          "is created (#4983)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1,ghost-nonexistent",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200); // this file's own idiom -- toast, not a real error status
+    CHECK(r->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("ghost-nonexistent") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger") != "resultSetsChanged");
+
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    // Gate 4 SHOULD (#4983 fix round): standardized onto REST/MCP's
+    // "reason=..." audit-detail convention for this same rejection.
+    CHECK(h.audits.back().detail == "reason=unknown_device_id");
+}
+
+TEST_CASE("result_set_routes: [pg] create: a device_ids list containing one "
+          "real but out-of-scope id is rejected identically to the "
+          "nonexistent case (oracle-safety, #4983)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    // A management-group-confined caller: "dev-2" genuinely exists (it's in
+    // all_agent_ids_override) but is outside this caller's own visible set.
+    h.fleet_read_scope = std::unordered_set<std::string>{"dev-1"};
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1,dev-2",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("dev-2") != std::string::npos);
+
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+}
+
+TEST_CASE("result_set_routes: [pg] create: fleet_read_fn is never reached when "
+          "device_ids is absent or empty (no regression, #4983)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+
+    SECTION("device_ids absent") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto r = h.sink.Post("/fragments/result-sets/create", "name=x",
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(h.fleet_read_fn_reached);
+    }
+    SECTION("device_ids empty") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto r = h.sink.Post("/fragments/result-sets/create", "name=x&device_ids=",
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(h.fleet_read_fn_reached);
+    }
+}
+
+TEST_CASE("result_set_routes: [pg] create: a non-empty device_ids with an "
+          "unwired fleet_read_fn fails closed with an error toast, and no "
+          "result set is created (#4983 Fix 10)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire_fleet_read_fn = false;
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_STORE_UNAVAILABLE") !=
+          std::string::npos);
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().result == "denied");
+    // Gate 4 SHOULD (#4983 fix round): standardized detail wording.
+    CHECK(h.audits.back().detail == "reason=fleet_read_fn_unwired");
+}
+
+TEST_CASE("result_set_routes: [pg] create: a non-empty device_ids with an "
+          "admitted fleet_read_fn but an unwired all_agent_ids_fn fails closed "
+          "with an error toast, and no result set is created (#4983 Fix 10)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire_all_agent_ids_fn = false;
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_STORE_UNAVAILABLE") !=
+          std::string::npos);
+    CHECK(h.fleet_read_fn_reached); // gate itself ran and admitted before the 2nd check tripped
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().result == "denied");
+    // Gate 4 SHOULD (#4983 fix round): standardized detail wording.
+    CHECK(h.audits.back().detail == "reason=all_agent_ids_fn_unwired");
+}
+
+// Gate 3 SHOULD (cpp-expert, #4983 fix round): unlike REST's JSON body, this
+// fragment echoes up to kMaxCitedBadIds (20) caller-supplied device_ids
+// entries into an HX-Trigger response HEADER on a rejection -- header size is
+// a real protocol/proxy ceiling a JSON body doesn't share, so every entry
+// must be bounded to MCP's own kResultSetDeviceIdMaxLen (256 bytes) at the
+// root, mirroring REST's identical fix in the same PR.
+TEST_CASE("result_set_routes: [pg] create: a device_ids entry over 256 bytes "
+          "is rejected with an error toast, and no result set is created "
+          "(#4983 Gate 3 SHOULD)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::string oversized_id(257, 'a');
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=" + oversized_id,
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200); // this file's own idiom -- toast, not a real error status
+    CHECK(r->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("256 bytes") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger") != "resultSetsChanged");
+    // Rejected before the existence/scope gate (a couple hundred lines below
+    // in result_set_routes.cpp) ever runs.
+    CHECK_FALSE(h.fleet_read_fn_reached);
+
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    // Gate 4 SHOULD (#4983 fix round): standardized onto REST/MCP's
+    // "reason=..." audit-detail convention for this same rejection.
+    CHECK(h.audits.back().detail == "reason=device_id_too_long");
+}
+
+// Fix 9 (NICE, #4983 fix round): pin the boundary the other direction --
+// exactly kResultSetDeviceIdMaxLen (256) bytes is a `>` comparator, not `>=`,
+// so this must succeed. Only the 257-byte-rejection side had a dedicated
+// test until now.
+TEST_CASE("result_set_routes: [pg] create: a device_ids entry of exactly 256 "
+          "bytes is accepted (#4983 Fix 9)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    const std::string boundary_id(256, 'a');
+    h.all_agent_ids_override = {boundary_id};
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=" + boundary_id,
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger") == "resultSetsChanged");
+    std::string next;
+    auto sets = w.store.list_by_owner("alice", "", 10, next);
+    REQUIRE(sets.size() == 1);
+    CHECK(sets[0].device_count == 1);
+}
+
+// Gate 3 SHOULD (quality-engineer + cpp-safety, both independently found,
+// #4983 fix round): REST's and MCP's twins of this create route both already
+// have a dedicated test pinning the kMaxCitedBadIds=20 "(+N more)" truncation
+// boundary; this fragment carries a byte-identical copy of that logic but had
+// no equivalent test.
+TEST_CASE("result_set_routes: [pg] create: more than kMaxCitedBadIds=20 bad "
+          "ids are truncated in the toast with a '(+N more)' suffix (#4983 "
+          "Gate 3 SHOULD)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.all_agent_ids_override = {}; // nothing exists -- every submitted id is "bad"
+    h.wire();
+
+    std::string ids;
+    for (int i = 0; i < 25; ++i) {
+        if (i)
+            ids += ",";
+        ids += "ghost-" + std::to_string(i);
+    }
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=" + ids,
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    const auto trigger = r->get_header_value("HX-Trigger");
+    CHECK(trigger.find("RESULT_SET_UNKNOWN_DEVICE_ID") != std::string::npos);
+    CHECK(trigger.find("ghost-0") != std::string::npos);
+    CHECK(trigger.find("ghost-19") != std::string::npos); // the 20th cited id (0-indexed)
+    CHECK(trigger.find("ghost-20") == std::string::npos); // the 21st is past the cap
+    CHECK(trigger.find("(+5 more)") != std::string::npos);
+
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+}
+
+// Gate 4 SHOULD (real bug, #4983 fix round): httplib's query/form decoder
+// URL-decodes %XX sequences into raw bytes with NO UTF-8 validation, unlike
+// REST's/MCP's JSON-body parsing, which structurally rejects invalid UTF-8
+// before device_ids is ever inspected -- this is the one place the three
+// surfaces genuinely diverge in robustness. A nonexistent device_ids entry
+// containing invalid raw UTF-8 bytes used to crash this handler: the
+// offending bytes flowed through the CSV tokenizer into `bad_ids`, then into
+// the RESULT_SET_UNKNOWN_DEVICE_ID toast's nlohmann::json{...}.dump() call,
+// which THREW json.exception.type_error.316 on the invalid byte -- no
+// exception_handler is installed on web_server_, so this propagated out as
+// an opaque 500 instead of this route's own documented clean-400/toast
+// contract. Empirically reproduced before this fix round's
+// error_handler_t::replace change.
+TEST_CASE("result_set_routes: [pg] create: a device_ids entry with invalid "
+          "UTF-8 bytes rejects cleanly with an error toast, not an uncaught "
+          "exception/500 (#4983 Gate 4 SHOULD)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    // "ghost..." never exists in all_agent_ids_override, so this reaches the
+    // toast-building .dump() call with the raw invalid bytes still attached.
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=ghost%FF%FE",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200); // clean toast, not an uncaught-exception 500
+    CHECK(r->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().detail == "reason=unknown_device_id");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Wiring tripwire: every case above proves register_result_set_routes' OWN
 // handlers are correct, but nothing above reads server.cpp — a future edit
 // that drops the production `register_result_set_routes(...)` call at
@@ -660,4 +1242,474 @@ TEST_CASE("result_set_routes: wiring -- server.cpp still calls "
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_result_set_routes(") != std::string::npos);
+}
+
+// ── Operate extras: members (B-5), producers (B-6), list states, re-evaluate verdict ─────
+
+namespace {
+
+yuzu::test::PgTestTemplate rs_extras_instr_tpl{
+    "rsextrasinstr", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("rs_extras_instr template: store failed to migrate");
+    }};
+
+InstructionDefinition def_for(const std::string& name, const std::string& plugin,
+                              const std::string& action, const std::string& approval,
+                              bool enabled = true) {
+    InstructionDefinition d;
+    d.name = name;
+    d.version = "1.0.0";
+    d.type = "question";
+    d.plugin = plugin;
+    d.action = action;
+    d.enabled = enabled;
+    d.approval_mode = approval;
+    return d;
+}
+
+} // namespace
+
+TEST_CASE("result_set_routes: producers answers a 200 denied note, never a 4xx, when either "
+          "permission is missing, and asks for BOTH",
+          "[server][routes][result_set_routes][extras]") {
+    Harness h;
+    h.perm_ok = false;
+    h.wire();
+    auto r = h.sink.Get("/fragments/result-sets/producers");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("data-denied=\"true\"") != std::string::npos);
+    CHECK(r->body.find("<option") == std::string::npos);
+    // The first denial short-circuits; the unwired-probe case below proves fail-closed.
+    CHECK(!h.perms_asked.empty());
+    CHECK(h.perms_asked[0] == "Execution:Execute");
+    // A render-time probe, not an attempt: the page writes no audit row for the denial.
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("result_set_routes: an unwired permission probe fails CLOSED on the producer picker",
+          "[server][routes][result_set_routes][extras][security]") {
+    Harness h;
+    h.wire_perm_fn = false;
+    h.wire();
+    auto r = h.sink.Get("/fragments/result-sets/producers");
+    REQUIRE(r);
+    CHECK(r->body.find("data-denied=\"true\"") != std::string::npos);
+}
+
+TEST_CASE("result_set_routes: producers with no instruction store says unavailable, not empty",
+          "[server][routes][result_set_routes][extras]") {
+    Harness h; // instruction_store stays null, permissions granted
+    h.wire();
+    auto r = h.sink.Get("/fragments/result-sets/producers");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("data-degraded=\"1\"") != std::string::npos);
+    CHECK(r->body.find("This is not an empty list.") != std::string::npos);
+    CHECK(r->body.find("data-empty") == std::string::npos);
+}
+
+TEST_CASE("result_set_routes: [pg] producers lists only enabled, read-only, auto-approval "
+          "definitions (mutation: drop any filter and a row below leaks)",
+          "[pg][server][routes][result_set_routes][extras][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rs_extras_instr_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
+    // os_info.os_version is ReadOnly in the real registry; tar.purge_source is Destructive.
+    REQUIRE(is.create_definition(def_for("Good read", "os_info", "os_version", "auto")));
+    REQUIRE(is.create_definition(def_for("Needs approval", "os_info", "os_name", "always")));
+    REQUIRE(is.create_definition(def_for("Destructive", "tar", "purge_source", "auto")));
+    REQUIRE(is.create_definition(def_for("Disabled", "os_info", "os_version", "auto", false)));
+
+    Harness h;
+    h.instruction_store = &is;
+    h.wire();
+    auto r = h.sink.Get("/fragments/result-sets/producers");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("Good read") != std::string::npos);
+    CHECK(r->body.find("Needs approval") == std::string::npos); // approval gate
+    CHECK(r->body.find("Destructive") == std::string::npos);    // class gate
+    CHECK(r->body.find("Disabled") == std::string::npos);       // enabled gate
+    CHECK(r->body.find("Approval rules are not applied") != std::string::npos);
+
+    SECTION("an unwired classifier lists nothing (fail closed)") {
+        Harness h2;
+        h2.instruction_store = &is;
+        h2.classify_wired = false;
+        h2.wire();
+        auto r2 = h2.sink.Get("/fragments/result-sets/producers");
+        REQUIRE(r2);
+        CHECK(r2->body.find("<option") == std::string::npos);
+        CHECK(r2->body.find("data-empty=\"1\"") != std::string::npos);
+    }
+}
+
+TEST_CASE("result_set_routes: [pg] the producers note says cut only when MORE than the limit "
+          "exists: exactly 200 definitions is a complete list "
+          "(mutation: flip > back to >= and the 200-definition case claims it is cut)",
+          "[pg][server][routes][result_set_routes][extras]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rs_extras_instr_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore is{pool};
+    REQUIRE(is.is_open());
+    auto add = [&](int from, int to) {
+        for (int i = from; i < to; ++i)
+            REQUIRE(is.create_definition(
+                def_for(std::format("Reader {:03d}", i), "os_info", "os_version", "auto")));
+    };
+    Harness h;
+    h.instruction_store = &is;
+    h.wire();
+    auto options = [](const std::string& body) {
+        std::size_t n = 0;
+        for (auto at = body.find("<option"); at != std::string::npos;
+             at = body.find("<option", at + 1))
+            ++n;
+        return n;
+    };
+
+    add(0, 200);
+    auto exactly = h.sink.Get("/fragments/result-sets/producers");
+    REQUIRE(exactly);
+    CHECK(options(exactly->body) == 200);
+    CHECK(exactly->body.find("data-truncated") == std::string::npos);
+    CHECK(exactly->body.find("Showing the first definitions only") == std::string::npos);
+
+    add(200, 201);
+    auto over = h.sink.Get("/fragments/result-sets/producers");
+    REQUIRE(over);
+    CHECK(options(over->body) == 200); // still the first 200, not 201
+    CHECK(over->body.find("data-truncated=\"1\"") != std::string::npos);
+    CHECK(over->body.find("Showing the first definitions only") != std::string::npos);
+}
+
+TEST_CASE("result_set_routes: [pg] members is owner-checked, paged, ids only; a stranger "
+          "gets the empty pane, never another owner's ids",
+          "[pg][server][routes][result_set_routes][extras][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    auto rs = w.store.create_materialized(simple_req("alice"), {"dev-1", "dev-2"});
+    REQUIRE(rs.has_value());
+
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    auto r = h.sink.Get("/fragments/result-sets/" + rs->id + "/members");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("<code>dev-1</code>") != std::string::npos);
+    CHECK(r->body.find("<code>dev-2</code>") != std::string::npos);
+    CHECK(r->body.find("data-degraded") == std::string::npos);
+    // The read is gated on the owner's current list-read scope, not on ownership alone.
+    CHECK(h.fleet_read_fn_reached);
+    CHECK(h.fleet_read_securable == "Infrastructure");
+    CHECK(h.fleet_read_operation == "Read");
+
+    Harness stranger;
+    stranger.store = &w.store;
+    stranger.session_username = "mallory";
+    stranger.wire();
+    auto s = stranger.sink.Get("/fragments/result-sets/" + rs->id + "/members");
+    REQUIRE(s);
+    CHECK(s->body.find("dev-1") == std::string::npos);
+    CHECK(s->body.find("Select a result set") != std::string::npos);
+}
+
+// A set of `n` devices named dev-001..dev-NNN, so the store's text ordering is the numeric one.
+static std::vector<std::string> numbered_devices(int n) {
+    std::vector<std::string> ids;
+    for (int i = 1; i <= n; ++i)
+        ids.push_back(std::format("dev-{:03d}", i));
+    return ids;
+}
+
+static std::size_t count_of_substr(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
+TEST_CASE("result_set_routes: [pg] members applies the owner's CURRENT scope in the SQL before "
+          "the page limit: hidden ids are not listed and take no page slot "
+          "(mutation: drop gate.scope from the members_checked call and these fail)",
+          "[pg][server][routes][result_set_routes][extras][security][members]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    // 250 devices, so the fragment's page of 100 is the real boundary.
+    auto rs = w.store.create_materialized(simple_req("alice"), numbered_devices(250));
+    REQUIRE(rs.has_value());
+    const std::string base = "/fragments/result-sets/" + rs->id + "/members";
+
+    SECTION("the first 200 ids are hidden: the page is the 50 visible ones, not an empty page "
+            "with a Show more") {
+        Harness h;
+        h.store = &w.store;
+        std::unordered_set<std::string> visible;
+        for (int i = 201; i <= 250; ++i)
+            visible.insert(std::format("dev-{:03d}", i));
+        h.fleet_read_scope = visible;
+        h.wire();
+        auto r = h.sink.Get(base);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(count_of_substr(r->body, "<code>") == 50);
+        CHECK(r->body.find("<code>dev-201</code>") != std::string::npos);
+        CHECK(r->body.find("<code>dev-250</code>") != std::string::npos);
+        CHECK(r->body.find("dev-001") == std::string::npos);
+        CHECK(r->body.find("dev-200") == std::string::npos);
+        CHECK(r->body.find("Show more") == std::string::npos);
+    }
+
+    SECTION("every other id visible: pages hold 100 visible ids, the cursor walks only visible "
+            "ids, and no hidden id appears") {
+        Harness h;
+        h.store = &w.store;
+        std::unordered_set<std::string> visible;
+        for (int i = 2; i <= 250; i += 2)
+            visible.insert(std::format("dev-{:03d}", i)); // 125 visible
+        h.fleet_read_scope = visible;
+        h.wire();
+        auto p1 = h.sink.Get(base);
+        REQUIRE(p1);
+        CHECK(count_of_substr(p1->body, "<code>") == 100);
+        CHECK(p1->body.find("<code>dev-200</code>") != std::string::npos);
+        CHECK(p1->body.find("<code>dev-001</code>") == std::string::npos);
+        CHECK(p1->body.find("<code>dev-201</code>") == std::string::npos);
+        CHECK(p1->body.find("cursor=dev-200") != std::string::npos);
+        auto p2 = h.sink.Get(base + "?cursor=dev-200");
+        REQUIRE(p2);
+        CHECK(count_of_substr(p2->body, "<code>") == 25);
+        CHECK(p2->body.find("<code>dev-202</code>") != std::string::npos);
+        CHECK(p2->body.find("<code>dev-250</code>") != std::string::npos);
+        CHECK(p2->body.find("<code>dev-201</code>") == std::string::npos);
+        CHECK(p2->body.find("Show more") == std::string::npos);
+    }
+
+    SECTION("an owner who now sees none of them is told so, not that the set is empty") {
+        Harness h;
+        h.store = &w.store;
+        h.fleet_read_scope = yuzu::server::authz::deny_all();
+        h.wire();
+        auto r = h.sink.Get(base);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("<code>") == std::string::npos);
+        CHECK(r->body.find("data-hidden=\"1\"") != std::string::npos);
+        CHECK(r->body.find("This set has no devices.") == std::string::npos);
+        CHECK(r->body.find("Show more") == std::string::npos);
+    }
+
+    SECTION("a global reader (unrestricted scope) sees the first page of the whole set") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto r = h.sink.Get(base);
+        REQUIRE(r);
+        CHECK(count_of_substr(r->body, "<code>") == 100);
+        CHECK(r->body.find("cursor=dev-100") != std::string::npos);
+    }
+}
+
+TEST_CASE("result_set_routes: [pg] members: the gate's refusal and an unwired gate are 200 notes "
+          "that disclose no id, and a stranger never reaches the gate",
+          "[pg][server][routes][result_set_routes][extras][security][members]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    auto rs = w.store.create_materialized(simple_req("alice"), {"dev-1", "dev-2"});
+    REQUIRE(rs.has_value());
+    const std::string path = "/fragments/result-sets/" + rs->id + "/members";
+
+    SECTION("403 from the gate becomes a denied note at HTTP 200") {
+        Harness h;
+        h.store = &w.store;
+        h.fleet_read_admit = false;
+        h.wire();
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("data-denied=\"true\"") != std::string::npos);
+        CHECK(r->body.find("dev-1") == std::string::npos);
+    }
+    SECTION("503 from the gate becomes a degraded note at HTTP 200, without its Retry-After") {
+        Harness h;
+        h.store = &w.store;
+        h.fleet_read_admit = false;
+        h.fleet_read_deny_status = 503;
+        h.wire();
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("data-degraded=\"1\"") != std::string::npos);
+        CHECK(r->body.find("dev-1") == std::string::npos);
+        CHECK_FALSE(r->has_header("Retry-After"));
+    }
+    SECTION("an unwired gate fails closed to the degraded note") {
+        Harness h;
+        h.store = &w.store;
+        h.wire_fleet_read_fn = false;
+        h.wire();
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("data-degraded=\"1\"") != std::string::npos);
+        CHECK(r->body.find("dev-1") == std::string::npos);
+    }
+    SECTION("a non-owner gets the empty pane and the gate is never consulted") {
+        Harness h;
+        h.store = &w.store;
+        h.session_username = "mallory";
+        h.wire();
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->body.find("dev-1") == std::string::npos);
+        CHECK_FALSE(h.fleet_read_fn_reached);
+    }
+}
+
+TEST_CASE("result_set_routes: [pg] a list read that fails renders the degraded note, never "
+          "the empty-state sentence; a healthy empty store still says so",
+          "[pg][server][routes][result_set_routes][extras]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    auto healthy = h.sink.Get("/fragments/result-sets/sidebar");
+    REQUIRE(healthy);
+    CHECK(healthy->body.find("No result sets yet") != std::string::npos);
+    CHECK(healthy->body.find("data-degraded") == std::string::npos);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "DROP TABLE result_set_store.result_sets CASCADE")};
+        REQUIRE(r.ok());
+    }
+    auto broken = h.sink.Get("/fragments/result-sets/sidebar");
+    REQUIRE(broken);
+    CHECK(broken->status == 200);
+    CHECK(broken->body.find("data-degraded=\"1\"") != std::string::npos);
+    CHECK(broken->body.find("This is not an empty list.") != std::string::npos);
+    CHECK(broken->body.find("No result sets yet") == std::string::npos);
+}
+
+TEST_CASE("result_set_routes: [pg] Re-evaluate is drawn only while the stored source is still "
+          "an enabled, auto-approval, read-only dispatch the caller may run "
+          "(mutation: drop any term of the verdict and a row below shows the button)",
+          "[pg][server][routes][result_set_routes][extras][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    yuzu::server::pg::PgPool ipool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore is{ipool};
+    REQUIRE(is.is_open());
+    auto good = is.create_definition(def_for("Good read", "os_info", "os_version", "auto"));
+    auto needs_approval = is.create_definition(def_for("Needs approval", "os_info", "os_name", "always"));
+    auto disabled = is.create_definition(def_for("Disabled", "os_info", "os_version", "auto", false));
+    auto destructive = is.create_definition(def_for("Destructive", "tar", "purge_source", "auto"));
+    REQUIRE(good);
+    REQUIRE(needs_approval);
+    REQUIRE(disabled);
+    REQUIRE(destructive);
+
+    auto make_set = [&](const std::string& payload) {
+        CreateRequest r;
+        r.owner_principal = "alice";
+        r.source_kind = std::string(source_kind::kInstructionResult);
+        r.source_payload = payload;
+        auto rs = w.store.create_materialized(r, {"dev-1"});
+        REQUIRE(rs.has_value());
+        return rs->id;
+    };
+    auto shows_button = [&](Harness& h, const std::string& id) {
+        auto r = h.sink.Get("/fragments/result-sets/" + id + "/detail");
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+        return r->body.find("data-ox-reeval=\"" + id + "\"") != std::string::npos;
+    };
+    auto payload_for = [](const std::string& def_id) {
+        return nlohmann::json{{"instruction_id", def_id}}.dump();
+    };
+
+    const auto ok_id = make_set(payload_for(*good));
+    const auto approval_id = make_set(payload_for(*needs_approval));
+    const auto disabled_id = make_set(payload_for(*disabled));
+    const auto destructive_id = make_set(payload_for(*destructive));
+    const auto gone_id = make_set(payload_for("no-such-definition"));
+    const auto bad_payload_id = make_set("{}");
+
+    Harness h;
+    h.store = &w.store;
+    h.instruction_store = &is;
+    h.wire();
+    CHECK(shows_button(h, ok_id));
+    CHECK_FALSE(shows_button(h, approval_id));    // approval_mode != auto
+    CHECK_FALSE(shows_button(h, disabled_id));    // definition disabled since
+    CHECK_FALSE(shows_button(h, destructive_id)); // not ReadOnly
+    CHECK_FALSE(shows_button(h, gone_id));        // definition deleted
+    CHECK_FALSE(shows_button(h, bad_payload_id)); // no instruction_id
+
+    SECTION("a caller without Execution:Execute never sees it, and the render writes no audit "
+            "row (the only permission path the module has is the non-auditing probe)") {
+        Harness d;
+        d.store = &w.store;
+        d.instruction_store = &is;
+        d.perm_ok = false;
+        d.wire();
+        CHECK_FALSE(shows_button(d, ok_id));
+        CHECK(d.audits.empty());
+        REQUIRE_FALSE(d.perms_asked.empty());
+        CHECK(d.perms_asked[0] == "Execution:Execute");
+    }
+    SECTION("an unwired probe or classifier fails closed") {
+        Harness np;
+        np.store = &w.store;
+        np.instruction_store = &is;
+        np.wire_perm_fn = false;
+        np.wire();
+        CHECK_FALSE(shows_button(np, ok_id));
+        Harness nc;
+        nc.store = &w.store;
+        nc.instruction_store = &is;
+        nc.classify_wired = false;
+        nc.wire();
+        CHECK_FALSE(shows_button(nc, ok_id));
+    }
+    SECTION("no instruction store: hidden") {
+        Harness ni;
+        ni.store = &w.store;
+        ni.wire();
+        CHECK_FALSE(shows_button(ni, ok_id));
+    }
+}
+
+TEST_CASE("result_set_routes: [pg] the create route's re-rendered list is also degraded, "
+          "never the empty-state sentence, when the list read fails",
+          "[pg][server][routes][result_set_routes][extras]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "DROP TABLE result_set_store.result_sets CASCADE")};
+        REQUIRE(r.ok());
+    }
+    // An empty create body is refused, and the refusal re-renders the owner's list.
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->body.find("data-degraded=\"1\"") != std::string::npos);
+    CHECK(r->body.find("No result sets yet") == std::string::npos);
 }

@@ -511,16 +511,20 @@ ThreadSanitizer: data race
         {"name": "server unit tests", "cmd": ["/b/tests/yuzu_server_tests", "~[pg]"], "env": {}},
         {"name": "server pg unit tests",
          "cmd": ["/b/tests/yuzu_server_tests", "[pg]"], "env": {"PG": "1"}},
-        {"name": "agent unit tests", "cmd": ["/b/tests/yuzu_agent_tests"], "env": {}},
+        {"name": "agent unit tests shard A",
+         "cmd": ["/b/tests/yuzu_agent_tests", "[ack]~[.]~[tsan-heavy]~[flaky-4086]",
+                 "--allow-running-no-tests"], "env": {}},
         {"name": "changelog order", "cmd": ["/usr/bin/python3", "t.py"], "env": {}},
     ]
     seeds = {name: seed_of(body) for name, body in sections.items()}
 
     # R-06: a failure in a NON-server binary must produce that binary, which is
     # the entire bug — the old step only ever gdb'd ./tests/yuzu_server_tests.
-    t = targets_for_failure(fr, {"agent - yuzu:agent unit tests"}, tests, seeds)
-    check([x[1] for x in t] == [["/b/tests/yuzu_agent_tests"]],
-          "R-06: an agent-only failure replays the AGENT binary")
+    t = targets_for_failure(fr, {"agent - yuzu:agent unit tests shard A"}, tests, seeds)
+    check([x[1] for x in t] == [["/b/tests/yuzu_agent_tests",
+                                 "[ack]~[.]~[tsan-heavy]~[flaky-4086]",
+                                 "--allow-running-no-tests"]],
+          "R-06: an agent-only failure replays the AGENT binary with its shard's own filter")
 
     # The two server shards share a binary but not a tag filter: both failing must
     # replay both filters — not one binary twice, and not the unfiltered suite.
@@ -551,14 +555,14 @@ ThreadSanitizer: data race
     # Cancelled path: the entries with no testlog.txt section are the candidates.
     # tar + server finished (they have sections); server-pg and agent did not.
     t = targets_for_cancelled(fr, tests, sections)
-    check([x[0] for x in t] == ["server pg unit tests", "agent unit tests"],
+    check([x[0] for x in t] == ["server pg unit tests", "agent unit tests shard A"],
           "cancelled: only the entries that never finished are candidates")
     # A timeout in the FIRST test leaves no completed sections at all. That is the
     # stuck-test case we most want a stack for, so it must yield every Catch2
     # entry as a candidate — not be mistaken for "nothing ran, nothing to do".
     t = targets_for_cancelled(fr, tests, {})
     check([x[0] for x in t] == ["tar unit tests", "server unit tests",
-                                "server pg unit tests", "agent unit tests"],
+                                "server pg unit tests", "agent unit tests shard A"],
           "cancelled with nothing finished: every Catch2 entry is a hang candidate")
     check(all("python3" not in c[0] for _, c, _, _ in t),
           "the python/hygiene entries are still never candidates")

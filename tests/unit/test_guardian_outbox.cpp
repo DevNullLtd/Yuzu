@@ -8,6 +8,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -329,4 +331,143 @@ TEST_CASE("stamp_provenance withholds last-in-batch unless the whole batch is wi
     auto last = whole.front_copy();
     REQUIRE(last.has_value());
     CHECK(last->journal_last_in_batch);
+}
+
+// ── #3972 C1: per-entry sequence + empty-transition epochs ───────────────────
+// The logs never stamp seq themselves (the runtime does, under outbox_mu_); they only
+// carry it. These cases pin that carrying, and the empty_epoch() contract the cross-lane
+// hold uses to tell "this lane emptied since the episode began" from "same head".
+
+namespace {
+OutboxEntry lcm(const std::string& rule, const std::string& eid, std::uint64_t seq = 0) {
+    auto e = OutboxEntry::lifecycle(rule, 1, eid, 100, "armed", "file", "n");
+    e.seq = seq;
+    return e;
+}
+OutboxEntry compq(const std::string& rule, const std::string& eid, std::uint64_t seq) {
+    auto e = comp(rule, 1, eid, 100, "x");
+    e.seq = seq;
+    return e;
+}
+} // namespace
+
+TEST_CASE("#3972: OutboxEntry::seq defaults to 0 (unstamped) on every factory", "[spark][outbox]") {
+    CHECK(comp("a", 1, "e1", 100, "x").seq == 0);
+    CHECK(OutboxEntry::health("a", 1, "h1", 101, false, "io").seq == 0);
+    CHECK(OutboxEntry::lifecycle("a", 1, "l1", 102, "armed").seq == 0);
+}
+
+TEST_CASE("#3972: front_seq reports the head's seq; a coalesce replaces it and keeps position",
+          "[spark][outbox]") {
+    GuardianOutbox ob{8};
+    CHECK_FALSE(ob.front_seq().has_value()); // empty: no head
+    REQUIRE(ob.enqueue(compq("a", "e1", 5)));
+    REQUIRE(ob.enqueue(compq("b", "e2", 6)));
+    CHECK(ob.front_seq() == std::optional<std::uint64_t>{5});
+
+    // "a" is re-observed later (runtime would stamp 9): the whole struct is replaced in
+    // place, so the SAME node (still the head) now carries the newer, higher seq.
+    REQUIRE(ob.enqueue(compq("a", "e3", 9)));
+    REQUIRE(ob.size() == 2);
+    CHECK(ob.front_seq() == std::optional<std::uint64_t>{9});
+    auto head = ob.front_copy();
+    REQUIRE(head);
+    CHECK(head->event_id == "e3"); // position kept: still first
+    CHECK(head->rule_id == "a");
+}
+
+TEST_CASE("#3972: GuardianLifecycleLog front_seq reports the head's seq", "[spark][outbox]") {
+    GuardianLifecycleLog log{8};
+    CHECK_FALSE(log.front_seq().has_value());
+    REQUIRE(log.enqueue(lcm("a", "l1", 3)));
+    REQUIRE(log.enqueue(lcm("b", "l2", 4)));
+    CHECK(log.front_seq() == std::optional<std::uint64_t>{3});
+    REQUIRE(log.pop_front_if("l1"));
+    CHECK(log.front_seq() == std::optional<std::uint64_t>{4});
+}
+
+TEST_CASE("#3972 empty_epoch: enqueue, enqueue_all and coalesce never bump it",
+          "[spark][outbox]") {
+    GuardianOutbox ob{8};
+    CHECK(ob.empty_epoch() == 0);
+    REQUIRE(ob.enqueue(compq("a", "e1", 1)));
+    REQUIRE(ob.enqueue(compq("a", "e2", 2))); // coalesce over "a"
+    std::vector<OutboxEntry> pair;
+    pair.push_back(compq("b", "e3", 3));
+    pair.push_back(compq("a", "e4", 4)); // coalesces again
+    REQUIRE(ob.enqueue_all(std::move(pair)));
+    CHECK(ob.empty_epoch() == 0);
+
+    GuardianLifecycleLog log{8};
+    REQUIRE(log.enqueue(lcm("a", "l1", 1)));
+    REQUIRE(log.enqueue(lcm("a", "l2", 2)));
+    CHECK(log.empty_epoch() == 0);
+}
+
+TEST_CASE("#3972 empty_epoch: GuardianOutbox::pop_front_if bumps only on removal-to-empty",
+          "[spark][outbox]") {
+    GuardianOutbox ob{8};
+    REQUIRE(ob.enqueue(compq("a", "e1", 1)));
+    REQUIRE(ob.enqueue(compq("b", "e2", 2)));
+    CHECK_FALSE(ob.pop_front_if("nope")); // mismatch: nothing removed
+    CHECK(ob.empty_epoch() == 0);
+    REQUIRE(ob.pop_front_if("e1")); // leaves one
+    CHECK(ob.empty_epoch() == 0);
+    REQUIRE(ob.pop_front_if("e2")); // leaves none
+    CHECK(ob.empty_epoch() == 1);
+    CHECK_FALSE(ob.pop_front_if("e2")); // already empty: no removal, no bump
+    CHECK(ob.empty_epoch() == 1);
+    REQUIRE(ob.enqueue(compq("c", "e3", 3)));
+    REQUIRE(ob.pop_front_if("e3"));
+    CHECK(ob.empty_epoch() == 2); // each emptying is its own transition
+}
+
+TEST_CASE("#3972 empty_epoch: GuardianOutbox::drop_rule bumps only when it empties the list",
+          "[spark][outbox]") {
+    GuardianOutbox ob{8};
+    ob.drop_rule("a"); // empty list, nothing to remove
+    CHECK(ob.empty_epoch() == 0);
+    REQUIRE(ob.enqueue(compq("a", "e1", 1)));
+    REQUIRE(ob.enqueue(compq("b", "e2", 2)));
+    ob.drop_rule("zzz"); // no match
+    CHECK(ob.empty_epoch() == 0);
+    ob.drop_rule("a"); // leaves "b"
+    CHECK(ob.empty_epoch() == 0);
+    ob.drop_rule("b"); // leaves none
+    CHECK(ob.empty_epoch() == 1);
+    ob.drop_rule("b"); // already empty
+    CHECK(ob.empty_epoch() == 1);
+}
+
+TEST_CASE("#3972 empty_epoch: GuardianOutbox::purge_stale bumps only when it empties the list",
+          "[spark][outbox]") {
+    GuardianOutbox ob{8};
+    ob.purge_stale("a", 5); // empty list
+    CHECK(ob.empty_epoch() == 0);
+    REQUIRE(ob.enqueue(comp("a", 1, "e1", 100, "x")));
+    REQUIRE(ob.enqueue(comp("b", 1, "e2", 101, "y")));
+    ob.purge_stale("a", 1); // generation not below the active one: kept
+    CHECK(ob.size() == 2);
+    CHECK(ob.empty_epoch() == 0);
+    ob.purge_stale("a", 2); // removes "a", leaves "b"
+    CHECK(ob.size() == 1);
+    CHECK(ob.empty_epoch() == 0);
+    ob.purge_stale("b", 2); // removes the last one
+    CHECK(ob.size() == 0);
+    CHECK(ob.empty_epoch() == 1);
+}
+
+TEST_CASE("#3972 empty_epoch: GuardianLifecycleLog::pop_front_if bumps only on removal-to-empty",
+          "[spark][outbox]") {
+    GuardianLifecycleLog log{8};
+    REQUIRE(log.enqueue(lcm("a", "l1", 1)));
+    REQUIRE(log.enqueue(lcm("b", "l2", 2)));
+    CHECK_FALSE(log.pop_front_if("nope"));
+    CHECK(log.empty_epoch() == 0);
+    REQUIRE(log.pop_front_if("l1")); // leaves one
+    CHECK(log.empty_epoch() == 0);
+    REQUIRE(log.pop_front_if("l2")); // leaves none
+    CHECK(log.empty_epoch() == 1);
+    CHECK_FALSE(log.pop_front_if("l2"));
+    CHECK(log.empty_epoch() == 1);
 }

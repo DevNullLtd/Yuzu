@@ -1,0 +1,10 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash 9cf003de2f97
+== action=secure_boot
+secure_boot|macos|secure_boot|-|unsupported
+[result_status] UNAVAILABLE / FULL / no public API; SIP reported under code_integrity
+
+== action=code_integrity
+code_integrity|macos|gatekeeper|assessments enabled|enabled
+code_integrity|macos|sip|System Integrity Protection status: enabled.|enabled
+[result_status] OK / FULL / 
+

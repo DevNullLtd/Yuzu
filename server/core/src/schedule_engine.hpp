@@ -22,67 +22,21 @@
 /// the legacy file so an environment where "no production fleet" turns out
 /// to be locally wrong gets a loud signal instead of silent loss.
 
-#include <cstdint>
 #include <expected>
 #include <string>
 #include <vector>
+
+#include "schedule_types.hpp" // InstructionSchedule / ScheduleQuery / ScheduleListResult (ADR-0031
+                              // WS-A4 seventh family) — relocated here, PODs only, see that file's
+                              // own banner. Re-included so every pre-existing includer of THIS
+                              // header keeps seeing the types transitively (ODR-safe relocation,
+                              // not a duplication).
 
 namespace yuzu::server::pg {
 class PgPool;
 } // namespace yuzu::server::pg
 
 namespace yuzu::server {
-
-struct InstructionSchedule {
-    std::string id;
-    std::string name;
-    std::string definition_id;
-    std::string frequency_type;
-    int interval_minutes{60};
-    std::string time_of_day;
-    int day_of_week{0};
-    int day_of_month{1};
-    std::string scope_expression;
-    bool requires_approval{false};
-    bool enabled{true};
-    int64_t next_execution_at{0};
-    int64_t last_executed_at{0};
-    int execution_count{0};
-    std::string created_by;
-    int64_t created_at{0};
-    // Canonical JSON object (PR1.5a, schedule_params_parsers.hpp), sorted
-    // keys, scalar values only. create_schedule() defaults an empty value to
-    // "{}" and re-canonicalizes whatever is supplied, so a row read back
-    // from storage always carries a validated canonical blob — never the raw
-    // caller-supplied text and never truly empty.
-    std::string parameter_values;
-};
-
-struct ScheduleQuery {
-    std::string definition_id;
-    bool enabled_only{false};
-};
-
-/// Honest counterpart to the older `query_schedules()` (kept as-is for the
-/// pre-existing dashboard fragment): `std::unexpected` distinguishes a real
-/// store failure (engine not open / pool exhausted / query error) from a
-/// genuinely empty table, which the older method collapses into the same
-/// empty vector either way. #4030 review finding: REST v1 `GET
-/// /api/v1/schedules` and MCP `list_schedules` were built on the older
-/// method and could not tell their caller "the store failed" from "there are
-/// no schedules" — see docs/user-manual/rest-api.md's schedules section.
-///
-/// `truncated` is a second, independent #4030 review finding: the query is
-/// hard-capped at `kScheduleListCap` rows (schedule_engine.cpp) with no
-/// caller-visible limit/cursor, so a fleet with more schedules than the cap
-/// silently loses the alphabetical tail. `truncated` tells REST/MCP callers
-/// when that happened so they can say so (precedent: MCP query_responses's
-/// `result_truncated_by_cap`) instead of presenting the capped count as the
-/// true total.
-struct ScheduleListResult {
-    std::vector<InstructionSchedule> schedules;
-    bool truncated{false};
-};
 
 class ScheduleEngine {
 public:
@@ -100,13 +54,25 @@ public:
     void create_tables() {}
     void stop();
 
+    /// ADR-0031 WS-A4 (seventh family): after the `ScheduleApi` seam rewired
+    /// the dashboard fragment onto `query_schedules_checked()` below, this
+    /// unchecked method's ONE remaining caller is the legacy, deliberately
+    /// untouched, unversioned `GET /api/schedules` route
+    /// (`schedule_routes.cpp` — a distinct capability from the seamed
+    /// `GET /api/v1/schedules`/MCP `list_schedules`/fragment triad, see
+    /// `schedule_api.hpp`). Do not add a new caller of this method — route it
+    /// through `ScheduleApi::list_schedules` instead.
     std::vector<InstructionSchedule> query_schedules(const ScheduleQuery& q = {}) const;
 
     /// #4030 review finding (blocking): the machine-facing REST v1/MCP
     /// twins need to distinguish "the store failed" from "there are no
     /// schedules" — `query_schedules()` above cannot, by design, for its
-    /// existing HTML-fragment caller (a human viewing "No schedules
+    /// then-existing HTML-fragment caller (a human viewing "No schedules
     /// configured" tolerates the ambiguity a machine consumer cannot).
+    /// ADR-0031 WS-A4 (seventh family): now the sole backing method for the
+    /// `ScheduleApi` seam (`schedule_api.cpp`), which fronts ALL THREE of the
+    /// dashboard fragment, REST v1, and MCP — the fragment's own pre-seam use
+    /// of the unchecked method above is retired.
     std::expected<ScheduleListResult, std::string>
     query_schedules_checked(const ScheduleQuery& q = {}) const;
 

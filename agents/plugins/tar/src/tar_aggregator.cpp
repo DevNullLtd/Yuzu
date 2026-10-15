@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <charconv>
@@ -19,9 +20,11 @@
 #include <ctime>
 #include <format>
 #include <limits>
+#include <memory>
 #include <tuple>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -141,6 +144,39 @@ int run_aggregation(TarDatabase& db, int64_t now_epoch) {
     return ops;
 }
 
+namespace {
+
+constexpr const char* kUpsertState =
+    "INSERT INTO tar_state (collector, state_json, updated_at) VALUES (?1, ?2, CAST(?3 AS INTEGER)) "
+    "ON CONFLICT(collector) DO UPDATE SET state_json = excluded.state_json, "
+    "updated_at = excluded.updated_at";
+constexpr const char* kUpsertConfig = "INSERT INTO tar_config (key, value) VALUES (?1, ?2) "
+                                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
+// Prepare + bind (all text) + step one UPSERT on the transaction's connection.
+// Any failure poisons the handle exactly like TransactionHandle::exec().
+bool bind_upsert(TransactionHandle& h, const char* sql, std::span<const std::string_view> params) {
+    if (h.poisoned())
+        return false;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(h.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        h.fail(sqlite3_errmsg(h.raw()));
+        return false;
+    }
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> guard{stmt, &sqlite3_finalize};
+    bool ok = true;
+    for (std::size_t i = 0; ok && i < params.size(); ++i)
+        ok = sqlite3_bind_text(stmt, static_cast<int>(i + 1), params[i].data() ? params[i].data() : "",
+                               static_cast<int>(params[i].size()), SQLITE_TRANSIENT) == SQLITE_OK;
+    if (ok)
+        ok = sqlite3_step(stmt) == SQLITE_DONE;
+    if (!ok)
+        h.fail(sqlite3_errmsg(h.raw()));
+    return ok;
+}
+
+} // namespace
+
 bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
                                      std::string_view new_value, int64_t now_epoch) {
     auto enabled_key = std::format("{}_enabled", source);
@@ -149,8 +185,8 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
     // opt-in source (module/procperf/netqual, default false) the first
     // `<src>_enabled=false` is therefore NOT an enabled→disabled transition and
     // does not write a spurious paused_at. The `_enabled` flag itself is written
-    // below (in-branch), not here, so the #538 fail-safe ordering holds: on a
-    // disable the flag flips only after the baseline clear persists.
+    // below, inside the one transaction with the baseline clear, so a failed
+    // clear leaves the flag unmoved (#538 ghost-`started` storm unreachable).
     const char* prev_def = source_default_enabled(source) ? "true" : "false";
     std::string prev = db.get_config(enabled_key, prev_def);
     // Canonicalise `prev` to the strict tri-state before BOTH transition checks
@@ -170,11 +206,10 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
     // `usage` (Wave 7 PR7.2b): every side effect of an enable/disable edge --
     // the flag write, paused_at, and the activation-generation bump that
     // forces a fresh baseline before the NEXT fold -- commits as ONE checked
-    // transaction (yuzu::tar::usage::usage_set_enabled, tar_usage.cpp). This
-    // is `usage`'s own path around the #2490 discarded-write gap every
-    // OTHER source below still has (out of scope to fix generally here): a
-    // failed persist refuses the transition outright rather than report
-    // success while the flag silently did not move. `usage` has no
+    // transaction (yuzu::tar::usage::usage_set_enabled, tar_usage.cpp). Every
+    // other source commits the same way below (#1654): a failed persist
+    // refuses the transition outright rather than report success while the
+    // flag silently did not move. `usage` has no
     // snapshot-diff baseline (diff_state_key maps nothing for it) and needs
     // no marker-clear of its own -- the generation bump on the disable leg
     // already invalidates the current activation, so a later re-enable
@@ -196,61 +231,59 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
         return true;
     }
 
-    if (new_value == "false" && prev_canon != "false") {
-        // Enable→disable. #538/UP-1: clear the diff baseline FIRST and flip the
-        // `_enabled` flag only if the clear actually persisted. `set_state` can
-        // fail silently (SQLITE_BUSY / disk full); if we flipped the flag first
-        // and the clear then failed, we'd have a DISABLED source with a STALE
-        // baseline — and a later re-enable would emit exactly the ghost "stopped"
-        // events this fix exists to prevent, while the operator saw success.
-        // Clearing first makes the disable fail-safe: a failed clear leaves the
-        // source ENABLED (its baseline still valid, collection continues) and we
-        // report failure so the operator can retry. No-op for sources without a
-        // snapshot-diff baseline (perf/procperf/netqual). The caller serialises
-        // this whole call against the collectors via collect_mu_ (see do_configure).
-        if (auto key = diff_state_key(source); !key.empty()) {
-            if (!db.set_state(std::string{key}, ""))
-                return false; // baseline NOT cleared → do not disable
-        }
-        // KNOWN GAP, deliberately not fixed here (tracked in #2490). This write's
-        // result is discarded, so a failed persist reports a successful pause
-        // while collection and retention keep running on data the operator
-        // believes is frozen -- and because the caller sees success it ALSO fires
-        // the edge-gated nstat drain, discarding live TCP lifecycle events on a
-        // source that is still enabled.
-        //
-        // Be precise about why a bare `return false` here is not the fix, because
-        // an earlier version of this comment got it backwards. The baseline has
-        // already been cleared above, so the source is left ENABLED with a WIPED
-        // baseline and the next tick emits a ghost `started` for every process --
-        // but that happens with the CURRENT code too, so it is not a reason to
-        // prefer the current code. The early return is in fact strictly better on
-        // the false-success and nstat-drain counts. What it gets wrong is the
-        // report: do_configure's failure text says "could not clear collection
-        // baseline", which would then describe the wrong failure.
-        //
-        // A real fix moves the flag and the baseline together (one transaction --
-        // execute_atomic_batch now exists), gives the flag-write failure its own
-        // operator message, and gates the nstat drain on the write having
-        // actually persisted. Out of scope for the retention clock guard; the
-        // full analysis is in #2490.
-        db.set_config(enabled_key, std::string{new_value});
-        db.set_config(paused_at_key, std::to_string(now_epoch));
-        return true;
+    // Every non-usage transition commits as ONE checked transaction: the
+    // baseline clear (disable edge), the `_enabled` flag and `_paused_at` move
+    // together or not at all, so "baseline cleared + source still enabled" (the
+    // ghost-`started` storm of #538) and "flag flipped + baseline stale" are both
+    // unreachable. A failed persist returns false and leaves the source in its
+    // previous state (the caller reports it and does not drain nstat).
+    //
+    // Every value is bound (never interpolated). The in-function guards below are
+    // the input contract: new_value is "true"/"false" (also enforced by
+    // do_configure), and the source must be a registry name. Guards mirror the
+    // usage branch above.
+    if (new_value != "true" && new_value != "false")
+        return false;
+    {
+        const auto& srcs = yuzu::tar::capture_sources();
+        if (std::none_of(srcs.begin(), srcs.end(),
+                         [&](const auto& d) { return d.name == source; }))
+            return false;
     }
 
-    // All other transitions (idempotent set, disable/errored→enable, first set):
-    // no baseline clear, so the flag write cannot leave inconsistent state.
-    db.set_config(enabled_key, std::string{new_value});
-    // Clear paused_at whenever we become enabled from a NOT-validly-enabled state
-    // — "false" (paused) OR "errored" (corrupt/tampered). `prev_canon != "true"`
-    // is the mirror of the disable leg's `prev_canon != "false"`, so an
-    // errored→true recovery no longer leaves a stale paused_at. An idempotent
-    // true→true is a no-op here (paused_at is already "0").
-    if (new_value == "true" && prev_canon != "true") {
-        db.set_config(paused_at_key, "0");
-    }
-    return true;
+    const bool disable_edge = new_value == "false" && prev_canon != "false";
+    const bool enable_edge = new_value == "true" && prev_canon != "true";
+    const std::string_view clear_key = disable_edge ? diff_state_key(source) : std::string_view{};
+
+    const std::string now_str = std::to_string(now_epoch);
+    auto result = db.checked_transaction(
+        [&](TransactionHandle& h) -> std::expected<void, std::string> {
+            if (!clear_key.empty()) {
+                const std::string_view p[] = {clear_key, std::string_view{}, now_str};
+                if (!bind_upsert(h, kUpsertState, p))
+                    return std::unexpected(h.error());
+            }
+            const auto put_config = [&](const std::string& key,
+                                        std::string_view value) -> bool {
+                const std::string_view p[] = {key, value};
+                return bind_upsert(h, kUpsertConfig, p);
+            };
+            if (!put_config(enabled_key, new_value))
+                return std::unexpected(h.error());
+            // Clear paused_at whenever we become enabled from a NOT-validly-enabled
+            // state -- "false" (paused) OR "errored" (corrupt/tampered); the mirror
+            // of the disable edge. An idempotent true->true is a no-op (paused_at
+            // is already "0").
+            if (disable_edge) {
+                if (!put_config(paused_at_key, now_str))
+                    return std::unexpected(h.error());
+            } else if (enable_edge) {
+                if (!put_config(paused_at_key, "0"))
+                    return std::unexpected(h.error());
+            }
+            return {};
+        });
+    return result.has_value();
 }
 
 std::string_view diff_state_key(std::string_view source) {

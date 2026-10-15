@@ -156,5 +156,4 @@ scan_complete|2|2
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: `tests/unit/server/test_discovery_routes.cpp` · `tests/unit/server/test_discovery_scan_route.cpp` · `tests/unit/server/test_discovery_store.cpp` · `tests/unit/test_discovery_parsers.cpp` · `tests/unit/test_discovery_scan_plan.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
-- Changelog: `changelog.d/20260817-wave2-discovery-native-arp-icmp.changed.md` · `changelog.d/3064-discovery-scan-honest-failure.changed.md` · `changelog.d/3064-discovery-store-postgres.changed.md` · `changelog.d/3253-discovery-degrade-tie-break.fixed.md`
 <!-- END GENERATED -->

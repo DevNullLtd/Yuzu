@@ -24,6 +24,29 @@
  * anywhere in this flow would reintroduce exactly the race the whole design
  * exists to close.
  *
+ * ── Recorded exception: read-only, selection-only target resolution ──────
+ * One sibling consumer of this design -- the certificates plugin's Linux
+ * store scan (agents/plugins/certificates/src/certificates_linux_store.hpp,
+ * read_cert_entry) -- deliberately performs ONE string-resolved open below
+ * its held root: a symlinked store entry is `readlinkat`-resolved and its
+ * target re-opened read-only, solely to parse certificate CONTENT for
+ * SELECTION. That is a recognised, bounded deviation from the rule above,
+ * not a licence for it, and it is safe only because the two halves of that
+ * flow carry different contracts -- exactly the "confinement absolute,
+ * selection best-effort" split confined_fs_posix.cpp documents above its
+ * capture-then-measure step. CONFINEMENT stays absolute: the only
+ * destructive syscall in that flow (`unlinkat`) is dirfd + validated-name
+ * relative and removes the entry's OWN name, never anything the resolved
+ * target handle reached. SELECTION is best-effort: the read-only open is
+ * O_RDONLY|O_NONBLOCK, its handle is never acted on destructively, and a
+ * pre-unlink identity recheck (link inode + target text + target inode)
+ * refuses (kChanged) any retarget or replacement it OBSERVES -- which
+ * narrows the residual recheck-to-unlink window to microseconds but does
+ * not close it (delete_cert_linux's own comment records why the rename
+ * step is not adopted against a live trust store). A new consumer wanting
+ * the same latitude must meet all of those conditions and record them at
+ * its own open site.
+ *
  * ── InvalidName rule (PLAN-015, adopted) ─────────────────────────────────
  * A name is refused BEFORE any syscall touches it -- never partially
  * processed -- if it is: empty; exactly "." or ".."; contains a '/' (or,

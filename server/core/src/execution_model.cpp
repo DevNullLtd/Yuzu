@@ -97,6 +97,14 @@ nlohmann::json execution_kpi_json(const ExecutionKpi& k) {
     return j;
 }
 
+nlohmann::json execution_child_row_json(const Execution& c) {
+    return nlohmann::json{
+        {"id", c.id},
+        {"status", c.status},
+        {"dispatched_at", c.dispatched_at},
+    };
+}
+
 nlohmann::json execution_response_row_json(const StoredResponse& r) {
     return nlohmann::json{
         {"agent_id", r.agent_id},

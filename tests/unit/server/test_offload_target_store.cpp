@@ -28,6 +28,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
 
@@ -383,6 +384,64 @@ TEST_CASE("OffloadTargetStore[pg]: batch_size > 1 accumulates without dispatch",
     CHECK(deliveries[0].event_count == 2);
     // Body shape: {"events":[…]}
     CHECK(deliveries[0].payload.find("\"events\"") != std::string::npos);
+}
+
+// ── Depth guard: a poisoned batched event is preserved as raw text, sibling
+//    valid event in the same batch is unaffected (#2437-class fix) ─────────
+
+TEST_CASE("OffloadTargetStore[pg]: batched event past the depth guard is preserved as raw "
+          "text, sibling event in the same batch unaffected",
+          "[offload_store][pg][batch][security]") {
+    OffloadTargetStorePg store;
+    auto result = store->create_target("poison-batch", "http://127.0.0.1:1/h",
+                                       OffloadAuthType::None, "", "*", /*batch_size=*/2);
+    REQUIRE(result.has_value());
+    auto id = *result;
+
+    // 35 levels of nesting, well past kMcpMaxJsonDepth (32) but nowhere
+    // near the ~100,000-level depth that actually crashes the process
+    // (json_exceeds_depth's own doc comment, mcp_jsonrpc.hpp: measured, not
+    // assumed; never reproduce the real attack depth in a test). Valid
+    // JSON on its own: 35 nested arrays, innermost empty.
+    const std::string poisoned = std::string(35, '[') + std::string(35, ']');
+
+    // Poisoned event fired first so its position in the resulting "events"
+    // array is deterministic. Second event reaches batch_size=2 and
+    // triggers a synchronous build_batch_body() call inside fire_event()
+    // itself, before the async HTTP dispatch is submitted.
+    store->fire_event("execution.completed", poisoned);
+    store->fire_event("execution.completed", R"({"k":2})");
+
+    // Delivery recording still runs on the worker pool; poll for the row.
+    constexpr auto kPollDeadline = std::chrono::seconds(5);
+    auto start = std::chrono::steady_clock::now();
+    std::vector<OffloadDelivery> deliveries;
+    while (std::chrono::steady_clock::now() - start < kPollDeadline) {
+        deliveries = store->get_deliveries(id);
+        if (!deliveries.empty())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE(deliveries.size() == 1);
+    CHECK(deliveries[0].event_count == 2); // neither event dropped
+
+    nlohmann::json body;
+    REQUIRE_NOTHROW(body = nlohmann::json::parse(deliveries[0].payload));
+    REQUIRE(body.contains("events"));
+    REQUIRE(body["events"].is_array());
+    REQUIRE(body["events"].size() == 2);
+
+    // Poisoned event: preserved as a raw STRING leaf (never parsed into a
+    // nested structure); proves the guard fired BEFORE
+    // nlohmann::json::parse ever ran on it. Without the guard, 35 levels
+    // parses cleanly and this would come back as a nested JSON array
+    // instead, which is exactly the discriminator the red/green proof uses.
+    REQUIRE(body["events"][0].is_string());
+    CHECK(body["events"][0].get<std::string>() == poisoned);
+
+    // Sibling valid event in the same batch: unaffected, parsed normally.
+    REQUIRE(body["events"][1].is_object());
+    CHECK(body["events"][1].value("k", 0) == 2);
 }
 
 // ── Control-byte rejection in name and url (round-3 residual finding) ─────

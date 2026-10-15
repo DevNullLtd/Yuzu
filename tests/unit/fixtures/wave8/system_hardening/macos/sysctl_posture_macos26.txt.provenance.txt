@@ -1,0 +1,7 @@
+host: braga (braga.local)
+os: macOS 26.6.2 (25G83), Darwin 25.6.0, arm64 (Apple Silicon T8132)
+identity: jsmith (unprivileged, uid 501)
+command: for k in kern.securelevel kern.coredump kern.sugid_coredump kern.bootargs kern.nx; do v=$(sysctl -n $k 2>&1) && printf "%s\tok\t%s\n" $k "$v" || printf "%s\terr\t%s\n" $k "$v"; done
+date: 2026-09-21
+status: REAL CAPTURE. kern.bootargs is an EMPTY string on this host: sysctlbyname size probe returns rc=0 len=1 (a lone NUL), so an empty value is a SUCCESSFUL read, not absent and not a failure. kern.nx (deliberately not in the allowlist) is 'unknown oid' on Apple Silicon: sysctlbyname returns -1 errno=2 (ENOENT), the real absent case.
+lines: 5 (budget 10)

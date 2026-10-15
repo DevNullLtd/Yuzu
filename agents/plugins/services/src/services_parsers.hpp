@@ -17,8 +17,21 @@
  * package (parse_print_disabled / startup_type_for): a pure parser header
  * the plugin .cpp includes and feeds captured text, kept independent of the
  * .cpp's anonymous namespace so it stays separately includable/testable.
+ *
+ * macOS's parse_launchctl_list() (governance A0 round-4, CA-1/pd-6) no
+ * longer runs its own independent tab-split/header-skip loop: it converges
+ * onto the shared raw row decoder + structural validator
+ * (agents/shared/launchctl_list.hpp, the same A0 lift TAR's
+ * tar_service_parsers.hpp already converged onto), which is the ONLY thing
+ * this file's former copy was missing -- a header-shape check and an
+ * empty-input check. Without either, a truncated/zero-line `launchctl list`
+ * capture parsed as a clean "0 services" success, the identical defect class
+ * UP2-2 (round 2) fixed for TAR at HIGH. See parse_launchctl_list's own doc
+ * comment below for the mapping details.
  */
 #pragma once
+
+#include <launchctl_list.hpp> // yuzu::shared::{LaunchctlRow,LaunchctlParseResult,parse_launchctl_list}
 
 #include <yuzu/agent/runner_status.hpp>     // yuzu::agent::classify_runner_failure
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::SubprocessResult
@@ -28,6 +41,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <utility> // std::move
 #include <vector>
 
 namespace yuzu::services {
@@ -140,81 +154,77 @@ struct LaunchdListResult {
     // filters BEFORE the row_cap, so the caller can emit an honest
     // truncation sentinel when rows were dropped.
     std::size_t total_seen = 0;
+    // True iff yuzu::shared::parse_launchctl_list judged the capture
+    // structurally untrustworthy (a missing/garbled header row, or zero
+    // lines at all despite a clean exit) -- governance A0 round-4, CA-1: a
+    // truncated/corrupted `launchctl list` capture must never be reported as
+    // a genuine "0 services" answer. `services`/`total_seen` are always 0
+    // when this is true. The CALLER (services_plugin.cpp's do_list) must
+    // check this and report a degraded status, the same discipline as the
+    // existing runner-failure path (forward_list_degrade).
+    bool malformed{false};
 };
 
-/// Parse the captured stdout of `launchctl list` (the first line -- the
-/// "PID\tStatus\tLabel" header -- is skipped automatically). `running_only`
-/// drops rows whose pid is "-" (not currently running); launchctl has no
-/// CLI flag for this, so the filter happens here, mirroring the original
-/// inline check. Every label is validated via is_safe_service_name before
-/// being trusted into the result -- an unsafe label (e.g. containing '|')
-/// would otherwise corrupt the pipe-delimited protocol the caller emits it
-/// into, or a startup_type_for() join key.
+/// Parse the captured stdout of `launchctl list`. `running_only` drops rows
+/// whose pid is "-" (not currently running); launchctl has no CLI flag for
+/// this, so the filter happens here, mirroring the original inline check.
+/// Every label is validated via is_safe_service_name before being trusted
+/// into the result -- an unsafe label (e.g. containing '|') would otherwise
+/// corrupt the pipe-delimited protocol the caller emits it into, or a
+/// startup_type_for() join key.
+///
+/// Converged onto the shared raw-row decoder + structural validator
+/// (agents/shared/launchctl_list.hpp) rather than this file's own former
+/// independent tab-split/header-skip loop (governance A0 round-4, CA-1/pd-6)
+/// -- mirrors tar_service_parsers.hpp's launchctl_rows_to_services(): a thin
+/// mapper from yuzu::shared::LaunchctlRow's raw pid/status facts onto this
+/// file's LaunchdEntry (string) vocabulary, not a second parse. pid/status
+/// round-trip through the shared decoder's std::from_chars pass -- byte-
+/// identical to the old raw-substring fields for every real capture (every
+/// fixture/sample in this tree shows status as a clean base-10 integer; "-"
+/// only ever appears in the PID column, which round-trips via
+/// nullopt -> "-" below).
 inline LaunchdListResult parse_launchctl_list(std::string_view output, bool running_only,
                                               std::size_t row_cap = kMaxServiceRows) {
     LaunchdListResult result;
 
-    std::size_t line_pos = 0;
-    bool header_skipped = false;
-    auto next_line = [&](std::string& out) -> bool {
-        if (line_pos >= output.size())
-            return false;
-        auto nl = output.find('\n', line_pos);
-        if (nl == std::string_view::npos) {
-            out = std::string(output.substr(line_pos));
-            line_pos = output.size();
-        } else {
-            out = std::string(output.substr(line_pos, nl - line_pos));
-            line_pos = nl + 1;
-        }
-        while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
-            out.pop_back();
-        return true;
-    };
+    // Split into lines matching yuzu::agent::SubprocessResult::lines' own
+    // contract (blank lines dropped, a trailing '\r' stripped) so behaviour
+    // is identical whether fed a live SubprocessResult::output blob
+    // (services_plugin.cpp's production call) or a fixture string
+    // (tests/unit/test_services_parsers.cpp).
+    std::vector<std::string> lines;
+    for (std::size_t pos = 0; pos < output.size();) {
+        auto nl = output.find('\n', pos);
+        std::string_view line =
+            (nl == std::string_view::npos) ? output.substr(pos) : output.substr(pos, nl - pos);
+        pos = (nl == std::string_view::npos) ? output.size() : nl + 1;
+        while (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        if (!line.empty())
+            lines.emplace_back(line);
+    }
 
-    std::string line;
-    while (next_line(line)) {
-        if (!header_skipped) { // first line is the "PID\tStatus\tLabel" header
-            header_skipped = true;
-            continue;
-        }
-        if (line.empty())
-            continue;
+    auto raw = yuzu::shared::parse_launchctl_list(lines);
+    result.malformed = raw.malformed;
+    if (raw.malformed)
+        return result; // caller must report a degraded status, never "0 services"
 
-        // Format: PID\tStatus\tLabel
-        LaunchdEntry entry;
-        std::size_t pos = 0;
-        auto next_field = [&]() -> std::string {
-            auto tab = line.find('\t', pos);
-            std::string field;
-            if (tab == std::string::npos) {
-                field = line.substr(pos);
-                pos = line.size();
-            } else {
-                field = line.substr(pos, tab - pos);
-                pos = tab + 1;
-            }
-            return field;
-        };
-
-        entry.pid = next_field();
-        entry.status = next_field();
-        entry.label = next_field();
-
+    for (auto& row : raw.rows) {
         // Guard the label before it is ever trusted into the pipe-delimited
         // protocol or used as a startup_type_for() join key.
-        if (!is_safe_service_name(entry.label))
+        if (!is_safe_service_name(row.label))
             continue;
-
-        if (running_only && entry.pid == "-")
+        if (running_only && !row.pid.has_value())
             continue;
 
         // Count every qualifying service BEFORE the cap so the caller can
         // tell a truncated inventory from a complete one.
         ++result.total_seen;
-
         if (result.services.size() < row_cap) {
-            result.services.push_back(std::move(entry));
+            result.services.push_back(LaunchdEntry{
+                std::move(row.label), row.pid.has_value() ? std::to_string(*row.pid) : "-",
+                std::to_string(row.status)});
         }
     }
 

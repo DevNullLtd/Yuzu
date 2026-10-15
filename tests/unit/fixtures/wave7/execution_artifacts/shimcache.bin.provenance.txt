@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache').AppCompatCache written via [System.IO.File]::WriteAllBytes (PowerShell 5.1 has no -AsByteStream)
+date: 2026-09-06
+status: REAL CAPTURE
+note: 7886 bytes total, well under the 2 MiB truncation threshold -- committed whole, no _head.bin needed. See shimcache_meta.txt for length + first-64-bytes hex.

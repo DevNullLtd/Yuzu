@@ -65,14 +65,17 @@ Maintainer: Yuzu Team <noreply@yuzu.io>
 Depends: adduser
 Section: admin
 Priority: optional
-Homepage: https://github.com/Tr3kkR/Yuzu
+Homepage: https://github.com/DevNullLtd/Yuzu
 Description: Yuzu endpoint management server
  Enterprise endpoint management platform — server component.
 EOF
 
 cp "$SCRIPT_DIR/postinst" "$PKG/DEBIAN/"
 cp "$SCRIPT_DIR/prerm" "$PKG/DEBIAN/"
-chmod 0755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm"
+# Server-only advisory upgrade pre-flight (gateway peer pin warning). The agent
+# .deb below deliberately ships no preinst.
+cp "$SCRIPT_DIR/preinst" "$PKG/DEBIAN/"
+chmod 0755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm" "$PKG/DEBIAN/preinst"
 
 dpkg-deb --build --root-owner-group "$PKG"
 echo "Built: ${PKG}.deb"
@@ -121,7 +124,7 @@ Maintainer: Yuzu Team <noreply@yuzu.io>
 Depends: adduser
 Section: admin
 Priority: optional
-Homepage: https://github.com/Tr3kkR/Yuzu
+Homepage: https://github.com/DevNullLtd/Yuzu
 Description: Yuzu endpoint management agent
  Enterprise endpoint management platform — agent component.
 EOF

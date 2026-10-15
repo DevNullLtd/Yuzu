@@ -10,18 +10,50 @@
 /// raw `CohortRead` rows, exactly as it did before this seam existed.
 ///
 /// NOT for production use — the production factory is `make_local_verify_api`
-/// (verify_api_local.hpp).
+/// (verify_api_local.hpp), which takes an `AppPerfCohortReader*` — a DIFFERENT
+/// shape from this file's own `CohortRead`/`Fn` below (see `verify_api.cpp`'s
+/// own wiring). `CohortRead`/`AppPerfCohortFn` used to live in the production
+/// `dex_app_perf_builders.hpp` alongside the (now-retired) `AppPerfProviders`
+/// bundle; they were dead in every production build (VerifyApi's real
+/// factory never took either shape) and are relocated here — their one
+/// genuine consumer, besides this file, is `test_dex_perf_api_double.hpp`'s
+/// `FnDexPerfApi::Providers::cohort` field (unused by `DexPerfApi` itself,
+/// kept only so a caller building a `Providers` for both seams' test doubles
+/// needs no field-level changes) — hence that file `#include`s this one.
 
-#include "app_perf_compare.hpp"    // build_comparison, PairedComparison
-#include "dex_app_perf_model.hpp" // AppPerfCohortFn, CohortRead
+#include "app_perf_compare.hpp" // build_comparison, PairedComparison, AppPerfCohortRow
 #include "verify_api.hpp"
 
 #include <yuzu/version_string.hpp> // canon_version
 
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
+
+namespace yuzu::server {
+
+/// What the `/auto` VERIFY cohort provider returns — the pre-ADR-0031-WS-A4
+/// shape every existing VERIFY-compare test harness builds. Left in
+/// `yuzu::server` (not `yuzu::server::test`) even though this is a test-only
+/// header — every existing test file that names these types spells them
+/// `yuzu::server::CohortRead`/`yuzu::server::AppPerfCohortFn` fully qualified,
+/// and moving the namespace too would be a needless second churn on top of
+/// the file relocation.
+struct CohortRead {
+    std::int64_t member_count{0};
+    std::vector<AppPerfCohortRow> rows;
+    bool truncated{false};
+};
+
+using AppPerfCohortFn = std::function<std::optional<CohortRead>(
+    std::string_view group_id, std::string_view app_name, std::string_view baseline_version,
+    std::string_view candidate_version, int window_days)>;
+
+} // namespace yuzu::server
 
 namespace yuzu::server::test {
 

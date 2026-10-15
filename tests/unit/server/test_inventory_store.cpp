@@ -123,8 +123,9 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
     auto g = store.get("a", "p");
     CHECK(!g.has_value());
     CHECK(g.error() == yuzu::server::InventoryReadError::kDegraded);
-    CHECK_FALSE(store.delete_agent("a")); // ingest/delete: fail-soft, false, no crash
-    store.upsert("a", "p", "{}", 1);      // fail-soft: does not throw
+    CHECK_FALSE(store.delete_agent("a"));       // ingest/delete: fail-soft, false, no crash
+    CHECK_FALSE(store.delete_source("app_usage")); // same, keyed on plugin instead of agent
+    store.upsert("a", "p", "{}", 1);            // fail-soft: does not throw
 }
 
 TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][inventory]") {
@@ -248,6 +249,31 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
         REQUIRE(bystander.has_value());
         CHECK(bystander->size() == 1);
     }
+}
+
+TEST_CASE("InventoryStore delete_source erases one plugin across all agents, leaves others intact",
+          "[pg][inventory]") {
+    INVENTORY_SHARED(store, pool);
+
+    store.upsert("agent-1", "app_usage", R"({"n":1})", 1000);
+    store.upsert("agent-2", "app_usage", R"({"n":2})", 1000);
+    store.upsert("agent-1", "installed_software", R"({"n":3})", 1000);
+
+    CHECK(store.delete_source("app_usage"));
+
+    auto agent1 = store.get_agent_inventory("agent-1");
+    REQUIRE(agent1.has_value());
+    CHECK(agent1->size() == 1);
+    CHECK((*agent1)[0].plugin == "installed_software");
+
+    auto agent2 = store.get_agent_inventory("agent-2");
+    REQUIRE(agent2.has_value());
+    CHECK(agent2->empty());
+
+    CHECK_FALSE(store.delete_source("")); // empty-name guard
+
+    // Idempotent: a 0-row delete of an already-purged source still commits.
+    CHECK(store.delete_source("app_usage"));
 }
 
 TEST_CASE("InventoryStore upsert clamps a far-future collected_at to server receipt "

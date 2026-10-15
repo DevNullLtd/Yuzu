@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 #include <spdlog/spdlog.h>
@@ -35,6 +36,7 @@ class SoftwareInventoryStore;
 class AppPerfDailyStore;
 class DeviceInventoryStore;
 class SoftwareLicensingStore;
+class AppUsageStore;
 class FleetTopologyStore;
 class HeartbeatIngestion;
 class AnalyticsEventStore;
@@ -48,6 +50,52 @@ namespace yuzu::server::detail {
 
 namespace gw = ::yuzu::gateway::v1;
 namespace pb = ::yuzu::agent::v1;
+
+// HA WS-4 4.3: `StreamStatusNotification.cluster_id` is gateway-asserted,
+// untrusted input — see gateway_service_impl.cpp's ingest-clamp comment at
+// its NotifyStreamStatus CONNECTED use for the full rationale. Declared here
+// (not TU-local) because `main.cpp`'s `--gateway-cluster-addr` CLI parser
+// (`parse_gateway_cluster_addrs`, gateway_mgmt_stub_pool.hpp) validates a
+// configured cluster_id key against this SAME bound — one constant, two
+// call sites, never a duplicated magic number.
+inline constexpr std::size_t kMaxClusterIdLen = 64;
+
+// HA WS-4 4.3 (sre Gate 3): caps GatewayUpstreamServiceImpl::
+// unmapped_clusters_warned_'s ENTRY COUNT — each entry is already
+// per-entry-bounded by kMaxClusterIdLen, but the set itself had no cap on
+// how many distinct unmapped cluster_id values it could accumulate over
+// process lifetime. 256 is generous headroom over any real deployment's
+// cluster count (a handful to low tens) while still bounding worst-case
+// memory from a session cycling through many distinct malformed/
+// misconfigured values.
+inline constexpr std::size_t kMaxUnmappedClustersWarned = 256;
+
+// #1197: BatchHeartbeatResponse.unknown_session_ids cap. Deliberately smaller
+// than the gateway heartbeat buffer's 10000-entry bound: 4096 ids x 64 B keeps
+// the response at about 260 KiB, far under gRPC's 4 MiB default message limit.
+// The listed subset under truncation is whatever the unordered set yields: do
+// NOT sort it (an omitted id is typically reported again when that agent next
+// heartbeats, so there is no fairness to preserve and a sort would only add
+// cost). Only the LISTED set is capped. The set collected inside BatchHeartbeat
+// is not, and is bounded only by the receive limit (gRPC's 4 MiB default; server
+// code sets no custom limit): capping it would saturate the
+// renew_leases/unknown_session count and make the truncation warn's total
+// inexact.
+inline constexpr int kMaxUnknownSessionIdsPerResponse = 4096;
+
+// #1197: a session_id longer than this that does NOT resolve is counted
+// malformed and never listed or echoed. Mirrors kMaxStreamHomeIdLen
+// (gateway_service_impl.cpp) and sits above the 43-byte "gw-session-" + 32 hex
+// shape this server mints. ProxyRegister now adopts only that exact 43-byte
+// shape and the directory lookup drops ids over 64 bytes (the same bound as
+// GatewayRouteStore's kMaxLookupSessionIdLen), so an over-length id resolves
+// only through a lost-race or degraded-read local hint. A legacy directory row
+// holding a longer id is no longer resolved: its heartbeats are counted
+// malformed and not listed, so its lease lapses and the reaper tombstones it.
+inline constexpr std::size_t kMaxGatewaySessionIdLen = 64;
+
+// Bound on lost_race_sessions_ (see that member's comment for what the clear costs).
+inline constexpr std::size_t kMaxLostRaceSessions = 65536;
 
 class GatewayUpstreamServiceImpl : public gw::GatewayUpstream::Service {
 public:
@@ -63,6 +111,26 @@ public:
     /// disables the writes — every write site below is fail-OPEN and tolerates
     /// a null store the same way it tolerates a degraded write.
     void set_gateway_route_store(GatewayRouteStore* store) { gateway_route_store_ = store; }
+    /// HA WS-4 4.3: the set of `cluster_id` keys `--gateway-cluster-addr`
+    /// configured (plus the auto-aliased `"default"`), for a CONNECTED-time
+    /// early warning when a session announces an unmapped cluster_id — see
+    /// the NotifyStreamStatus CONNECTED branch. nullptr (the default, and
+    /// what server.cpp wires when the flag is unset) means single-cluster
+    /// mode: skip the check entirely, since every cluster_id resolves to the
+    /// legacy stub regardless of its value in that mode. The pointee is
+    /// immutable, boot-time-built config (`GatewayMgmtStubPool`'s key set,
+    /// server.cpp) — no lifetime/mutation concerns beyond outliving this
+    /// object, same contract as every other raw store pointer here.
+    void set_known_gateway_clusters(const std::unordered_set<std::string>* clusters) {
+        known_gateway_clusters_ = clusters;
+    }
+    /// Test-only, see ProxyRegister's `proxy_register_interleave_hook_for_test_`
+    /// firing-point comment in gateway_service_impl.cpp.
+    void set_proxy_register_interleave_hook_for_test(std::function<void()> hook) {
+        proxy_register_interleave_hook_for_test_ = std::move(hook);
+    }
+    /// Test-only: lowers the lost_race_sessions_ bound. Call before any RPC.
+    void set_max_lost_race_sessions_for_test(std::size_t cap) { max_lost_race_sessions_ = cap; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
     void set_software_inventory_store(SoftwareInventoryStore* store) {
@@ -77,6 +145,9 @@ public:
     void set_software_licensing_store(SoftwareLicensingStore* store) {
         software_licensing_store_ = store;
     }
+    /// Typed per-agent last-used app-usage projection (Wave 7 PR7.2, ADR-0016
+    /// §5) — receives the app_usage daily-sync source via ProxyInventory.
+    void set_app_usage_store(AppUsageStore* store) { app_usage_store_ = store; }
     // PR 10 / UAT 2026-05-12: gateway-proxied heartbeats carry the
     // same fleet_snapshot_json field as direct heartbeats. Wire the
     // topology store so BatchHeartbeat ingests pushes from agents that
@@ -163,12 +234,21 @@ private:
     yuzu::MetricsRegistry* metrics_{nullptr};
     AgentHealthStore* health_store_{nullptr};
     GatewayRouteStore* gateway_route_store_{nullptr};
+    const std::unordered_set<std::string>* known_gateway_clusters_{nullptr};
+    // HA WS-4 4.3: which unmapped cluster_ids have already logged the
+    // CONNECTED-time warning — once per id, not once per connect, so a
+    // flapping/reconnecting agent on a permanently-misconfigured cluster
+    // doesn't spam the log. The metric counter emitted alongside it (same
+    // NotifyStreamStatus branch) increments on every occurrence regardless.
+    mutable std::mutex unmapped_clusters_warned_mu_;
+    std::unordered_set<std::string> unmapped_clusters_warned_;
     ManagementGroupStore* mgmt_group_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
     SoftwareInventoryStore* software_inventory_store_{nullptr};
     AppPerfDailyStore* app_perf_daily_store_{nullptr};
     DeviceInventoryStore* device_inventory_store_{nullptr};
     SoftwareLicensingStore* software_licensing_store_{nullptr};
+    AppUsageStore* app_usage_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     std::weak_ptr<AnalyticsEventStore> analytics_store_;
@@ -192,8 +272,102 @@ private:
     // benign, expected race loss (see record_directory_desync's header
     // comment). Same lock (sessions_mu_) as gateway_sessions_, entries added
     // at ProxyRegister time and removed together with gateway_sessions_'s
-    // entry on DISCONNECTED.
+    // entry on DISCONNECTED. HA WS-5: membership is also what lets a lost-race
+    // id (which has no directory row of its own) resolve in resolve_sessions,
+    // what exempts its CONNECTED from the stale_connected_session refusal, and
+    // what keeps it out of the renew shortfall. Bounded at
+    // max_lost_race_sessions_: an insert at the bound clears the whole set, so
+    // a lost-race session that is still LIVE then goes through one
+    // listed-unknown -> replay -> refuse cycle (or a refused CONNECTED) and its
+    // agent reconnects fresh. Bounded per session, never a loop.
     std::unordered_set<std::string> lost_race_sessions_;
+    std::size_t max_lost_race_sessions_{kMaxLostRaceSessions};
+
+    // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
+    // BLOCKER 1): a per-agent striped lock serializing ProxyRegister's own
+    // decide (renew_leases/reclaim_tombstoned_session) -> install
+    // (AgentRegistry::register_agent/GatewayRouteStore::register_fresh ->
+    // map_session -> gateway_sessions_) sequence for one agent_id at a time.
+    // Without it, two concurrent ProxyRegister calls for the SAME agent_id
+    // (an ordinary reconnect-storm timing, no partition required) can
+    // interleave: a stale replay's decide-phase confirms its presented
+    // session still owns the durable row, then — before that replay calls
+    // register_agent — an entirely separate FRESH registration for the same
+    // agent completes in full (both its own register_agent install AND its
+    // register_fresh, which unconditionally wins the row). The replay then
+    // proceeds to call register_agent: AgentRegistry::register_agent's own
+    // two-phase guard (agent_registry.cpp) only catches a second call that
+    // STARTS during THIS call's revoke window, not one that already
+    // completed entirely beforehand — so the replay's install silently
+    // overwrites the fresh registration's in-memory AgentSession, leaving
+    // the durable store correctly on the fresh session while the in-memory
+    // registry (what `send_to` actually dispatches through) points at the
+    // stale one. Striped (one mutex per agent_id, not a single global lock)
+    // so unrelated agents' registrations never contend; the map itself is
+    // never pruned, matching `AgentRegistry::agents_`'s own never-erase-the-
+    // key lifetime (bounded by the number of DISTINCT agents ever seen, not
+    // by connection churn).
+    std::mutex registration_locks_mu_;
+    std::unordered_map<std::string, std::shared_ptr<std::mutex>> registration_locks_;
+
+    /// Returns the (lazily-created) per-agent registration mutex for
+    /// `agent_id`. The returned shared_ptr keeps the mutex alive for the
+    /// caller's lock_guard even if another thread races to look up the same
+    /// agent_id concurrently (the map itself is only touched under
+    /// `registration_locks_mu_`, released before the returned mutex is ever
+    /// locked).
+    std::shared_ptr<std::mutex> registration_lock_for(const std::string& agent_id);
+
+    /// HA WS-5 (#4246 #3): the outcome of resolving gateway-presented
+    /// session ids to agent ids for the session-keyed RPCs (BatchHeartbeat,
+    /// ProxyInventory).
+    struct SessionResolution {
+        /// session_id -> agent_id for every id the caller may act on.
+        std::unordered_map<std::string, std::string> resolved;
+        /// Subset of `resolved` answered by the DIRECTORY (not the local
+        /// hint map): the only ids whose owning replica may be another one.
+        std::unordered_set<std::string> from_store;
+        /// Subset of `from_store` with NO gateway_sessions_ entry on this
+        /// replica (checked under sessions_mu_): the directory knows it but
+        /// this replica never saw its ProxyRegister (server-only restart or
+        /// another replica's session). Ingested and renewed like any resolved
+        /// id, and ALSO listed in unknown_session_ids so the gateway replays
+        /// ProxyRegister and this replica adopts it.
+        std::unordered_set<std::string> store_only;
+        /// More than one directory row carried the id (`session_id` is not
+        /// unique): refused, never guessed at. Neither acted on nor listed
+        /// as unknown (listing would trigger a gateway re-register).
+        std::unordered_set<std::string> ambiguous;
+        /// The directory read degraded: `resolved` then holds only what the
+        /// local gateway_sessions_ hint map knows, and every other id is in
+        /// `unresolved_degraded` — "cannot tell", NOT "unknown".
+        bool degraded{false};
+        std::unordered_set<std::string> unresolved_degraded;
+    };
+
+    /// Resolves `session_ids` (empty ids are skipped) with one batched
+    /// directory read (one lease, chunked statements — see
+    /// GatewayRouteStore::lookup_by_sessions) when a GatewayRouteStore is
+    /// configured — the directory GOVERNS: the
+    /// per-replica gateway_sessions_ map is consulted only for lost-race ids
+    /// (no row under their own id) and, when the read degrades, as a hint
+    /// (the 4.4 F1 rule), which is what lets a replica that did not register
+    /// a session serve its heartbeats. Resolution requires exactly one row
+    /// carrying the session id and deliberately does NOT require the row to
+    /// be `routable`: a heartbeat IS the lease-renewal path, so refusing a
+    /// stale-lease row would strand it (and, after a Postgres blip, force
+    /// every agent in the fleet through a re-register). A tombstoned row
+    /// (session_id NULL) never matches, which is what excludes a zombie
+    /// session after a DISCONNECTED. A session that lost its register_fresh
+    /// epoch race has no row under its own id; it keeps resolving through
+    /// the local map exactly as before. With no store configured the local
+    /// map alone decides (monolith, unchanged). No lock is held across the
+    /// directory call; nothing is backfilled into gateway_sessions_.
+    [[nodiscard]] SessionResolution resolve_sessions(const std::vector<std::string>& session_ids);
+
+    /// Test-only, see the setter above and ProxyRegister's firing-point
+    /// comment. nullptr (default) in production.
+    std::function<void()> proxy_register_interleave_hook_for_test_;
 };
 
 // -- ManagementServiceImpl (placeholder) --------------------------------------

@@ -19,11 +19,26 @@
  * header skipping, and PID|LABEL|NAME semantics are unchanged, so collector
  * output for identical input text stays byte-identical to before the
  * runner migration.
+ *
+ * parse_launchctl_list() (A0, macOS Spark/Reflex/DEX programme) no longer
+ * does its own tab-splitting: the raw `launchctl list` row decode is now the
+ * shared agents/shared/launchctl_list.hpp (a second consumer, the macOS
+ * Spark launchd service mechanism, needs the raw pid/status fields this file
+ * used to discard). This is DELIBERATELY still named parse_launchctl_list in
+ * THIS namespace (yuzu::tar) -- same name as yuzu::shared's raw parser, no
+ * collision (different namespace, different signature) -- so every existing
+ * caller and test in this file/tests/unit/test_tar_service.cpp is
+ * byte-unchanged; only its body becomes a two-line compose of the shared
+ * parser + launchctl_rows_to_services() below (the BR-service-001 malformed-
+ * row policy, unchanged).
  */
 
 #include "tar_collectors.hpp" // yuzu::tar::ServiceInfo
 
+#include <launchctl_list.hpp> // yuzu::shared::{LaunchctlRow,parse_launchctl_list}
+
 #include <cstddef>
+#include <span>
 #include <string>
 #include <utility> // std::move
 #include <vector>
@@ -124,57 +139,52 @@ parse_systemctl_list_units(const std::vector<std::string>& lines) {
     return out;
 }
 
-/// Parse the line-split stdout of `launchctl list`
-/// (SubprocessResult::lines -- blank lines already dropped and a trailing
-/// '\r' already stripped by the runner). The first line is always the
-/// "PID\tStatus\tLabel" header and is skipped unconditionally, matching the
-/// original fgets-based skip; an empty `lines` (no output at all) yields an
-/// empty result, same as the original no-output early return.
-inline ServiceParseResult parse_launchctl_list(const std::vector<std::string>& lines) {
+/// Map decoded `launchctl list` rows (yuzu::shared::LaunchctlRow -- the raw
+/// pid/status facts) onto this file's ServiceParseResult vocabulary: pid
+/// present -> "running", absent -> "stopped" (macOS launchctl list provides
+/// no startup type, so that field is always "unknown"). BR-service-001 (same
+/// policy as parse_systemctl_list_units above, and tar_arp_parsers.hpp's
+/// BR4-005): a row with an empty label (fewer than 3 tab-separated fields in
+/// the original text -- see yuzu::shared::parse_launchctl_list) must not be
+/// pushed as a name-less ServiceInfo. Drop it and flag `malformed` instead of
+/// silently including or dropping it.
+inline ServiceParseResult
+launchctl_rows_to_services(std::span<const yuzu::shared::LaunchctlRow> rows) {
     ServiceParseResult out;
-    if (lines.empty())
-        return out;
-    out.entries.reserve(lines.size() - 1);
+    out.entries.reserve(rows.size());
 
-    for (std::size_t i = 1; i < lines.size(); ++i) {
-        const std::string& line = lines[i];
-
-        // Format: PID\tStatus\tLabel
-        ServiceInfo si;
-        std::size_t pos = 0;
-        auto next_field = [&]() -> std::string {
-            auto tab = line.find('\t', pos);
-            std::string field;
-            if (tab == std::string::npos) {
-                field = line.substr(pos);
-                pos = line.size();
-            } else {
-                field = line.substr(pos, tab - pos);
-                pos = tab + 1;
-            }
-            return field;
-        };
-
-        auto pid_str = next_field();
-        next_field(); // status code
-        si.name = next_field();
-
-        // BR-service-001 (same policy as parse_systemctl_list_units above,
-        // and tar_arp_parsers.hpp's BR4-005): a malformed/truncated row --
-        // fewer than 3 tab-separated fields, so LABEL never got a token --
-        // must not be pushed as a name-less ServiceInfo. Drop it and flag
-        // `malformed` instead of silently including or dropping it.
-        if (si.name.empty()) {
+    for (const auto& row : rows) {
+        if (row.label.empty()) {
             out.malformed = true;
             continue;
         }
-
-        si.status = (pid_str != "-" && !pid_str.empty()) ? "running" : "stopped";
-        // macOS launchctl list does not provide startup type; 'unknown' is correct
+        ServiceInfo si;
+        si.name = row.label;
+        si.status = row.pid.has_value() ? "running" : "stopped";
         si.startup_type = "unknown";
         out.entries.push_back(std::move(si));
     }
 
+    return out;
+}
+
+/// Parse the line-split stdout of `launchctl list` (SubprocessResult::lines
+/// -- blank lines already dropped and a trailing '\r' already stripped by
+/// the runner) straight into this file's ServiceParseResult vocabulary.
+/// Composes the shared raw row parser with launchctl_rows_to_services()
+/// above; behaviourally identical to the pre-A0 inline body for a
+/// well-formed capture (governance A0 fix round, cpp3-2: this is now FALSE
+/// for a zero-line capture -- UP2-2 flipped that case's `malformed` from
+/// false to true, a deliberate behaviour change from the pre-A0 body, not a
+/// pure refactor). A structurally malformed header (UP-6 --
+/// yuzu::shared::parse_launchctl_list's own `malformed`, e.g. a missing or
+/// preamble-preceded header row, OR an empty capture, UP2-2) propagates
+/// through as `malformed` here too, on top of the per-row BR-service-001
+/// check.
+inline ServiceParseResult parse_launchctl_list(const std::vector<std::string>& lines) {
+    auto raw = yuzu::shared::parse_launchctl_list(lines);
+    auto out = launchctl_rows_to_services(raw.rows);
+    out.malformed = out.malformed || raw.malformed;
     return out;
 }
 

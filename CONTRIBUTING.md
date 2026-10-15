@@ -43,12 +43,13 @@ maintainer at nathan.dornbrook@gmail.com.
 > directly. **CMake is not an alternative build system** here — it is pulled in
 > only as a Meson dependency-resolution method, never invoked to build. Without
 > Meson + Ninja you cannot build, test, or run any of the tooling, so install
-> them first (Meson 1.11.1; a recent Ninja) before following the steps below.
+> them first (Meson 1.12.0, the pin in `requirements-ci.txt`; a recent Ninja)
+> before following the steps below.
 
-1. **Prerequisites**: Meson 1.11.1, Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
+1. **Prerequisites**: Meson 1.12.0 (`requirements-ci.txt`), Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
 2. **Clone and build**:
    ```bash
-   git clone https://github.com/Tr3kkR/Yuzu.git && cd Yuzu
+   git clone https://github.com/DevNullLtd/Yuzu.git && cd Yuzu
    ./scripts/setup.sh
    meson compile -C build-linux
    ```
@@ -83,9 +84,9 @@ on a single change.
 
 The gateway (`gateway/`) is a standalone rebar3 project using Erlang/OTP. See `docs/erlang-gateway-blueprint.md` for the architecture.
 
-- Run EUnit tests: `cd gateway && rebar3 eunit`
-- Run Common Test: `cd gateway && rebar3 ct --dir apps/yuzu_gw/test`
-- Always pass `--dir apps/yuzu_gw/test` with `--suite` flags
+- Run EUnit tests: `cd gateway && rebar3 eunit --dir apps/yuzu_gw/test` (bare `rebar3 eunit` rejects the test modules that have no `src/` counterpart, #337)
+- Run Common Test: `cd gateway && rebar3 ct --dir apps/yuzu_gw/test/ct`
+- For a single CT suite, keep `--dir apps/yuzu_gw/test/ct` and add `--suite <name>`. `ct` does not recurse, so `--dir apps/yuzu_gw/test` finds no suites and passes having run nothing (#4800)
 - Review all Erlang changes with the gateway-erlang agent (`.claude/agents/gateway-erlang.md`)
 
 ## MCP Server
@@ -111,7 +112,7 @@ Issue filing, labelling, and closing follow the repo standard:
   is a triage decision: set it if you have the context (agents and maintainers do);
   leave it off a drive-by report and triage will add it.
 - **Never file an exploitable security vulnerability as a public issue.** Use
-  [GitHub private vulnerability reporting](https://github.com/Tr3kkR/Yuzu/security/advisories/new)
+  [GitHub private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new)
   (see [SECURITY.md](SECURITY.md)). Public `security`-labelled issues are for hardening and
   defense-in-depth work only.
 - A PR that resolves an issue says `Closes #N` in its body; partial work says `Relates to #N`

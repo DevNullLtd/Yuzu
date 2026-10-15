@@ -24,6 +24,7 @@
 #include "schedule_runner.hpp"
 
 #include "../test_helpers.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
@@ -929,4 +930,75 @@ TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
     const auto sb = h.get(id_b);
     CHECK(sa.next_execution_at != 1);
     CHECK(sb.next_execution_at != 1);
+}
+
+// #4982 fix round 2 (Fix 5): the identical swallowed-mark_cancelled-failure
+// pattern this issue's own metric was built to observe (REST/MCP, Part A)
+// also existed, uninstrumented, at this file's four mark_cancelled call
+// sites. This test forces the FencedOut path's mark_cancelled to genuinely
+// FAIL (the established LOCK TABLE + short lock_timeout_ms technique against
+// execution_tracker.executions, matching test_rest_result_sets_async.cpp's
+// own #4982 tests) and asserts the new
+// yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,surface=schedule}
+// series increments. A SEPARATE ExecutionTracker/PgPool pointed at the SAME
+// already-migrated database is used (rather than Harness's own h.tracker/
+// instr_pool) purely to attach a short lock_timeout_ms without touching the
+// other 19 Harness-based tests' shared pool options.
+TEST_CASE("ScheduleRunner: mark_cancelled failing on a FencedOut fire is now "
+          "observable via yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,"
+          "surface=schedule} (#4982 fix round 2, Fix 5)",
+          "[schedule][runner][pg][4982]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval");
+
+    yuzu::server::pg::PgPool short_lock_pool{
+        {.conninfo = h.instr_db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(short_lock_pool.valid());
+    ExecutionTracker short_lock_tracker(short_lock_pool);
+    REQUIRE(short_lock_tracker.is_open());
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(h.instr_db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+
+    yuzu::MetricsRegistry metrics;
+    ScheduleRunner raw_runner(ScheduleRunner::Deps{
+        .schedule_engine = &h.engine,
+        .instruction_store = &h.is,
+        .execution_tracker = &short_lock_tracker,
+        .approval_manager = &h.approvals,
+        .metrics = &metrics,
+        // Fires AFTER create_execution has already committed the exec row,
+        // BEFORE fire_with_approval's post-outcome mark_cancelled — same
+        // timing as test_rest_result_sets_async.cpp's on_dispatch hook.
+        .enqueue_fn =
+            [&](const yuzu::server::OutboxEnqueueRequest&) -> yuzu::server::OutboxEnqueueOutcome {
+            REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+            REQUIRE(yuzu::server::pg::exec_params(
+                        locker.get(),
+                        "LOCK TABLE execution_tracker.executions IN ACCESS EXCLUSIVE MODE",
+                        std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+            return yuzu::server::OutboxEnqueueOutcome::FencedOut;
+        },
+        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+            return true;
+        },
+    });
+
+    raw_runner.tick();
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    CHECK(metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "schedule"}})
+              .value() == 1.0);
+
+    // The schedule stayed due (FencedOut never advances it) and the exec row
+    // it speculatively created is still stuck at 'running' — mark_cancelled
+    // genuinely failed, not merely was skipped.
+    const auto s = h.get(id);
+    CHECK(s.next_execution_at == 1);
 }

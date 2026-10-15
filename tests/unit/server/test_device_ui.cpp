@@ -46,6 +46,31 @@ TEST_CASE("device info lens: real fields; hardware honestly deferred", "[device]
     CHECK(html.find("inventory") != std::string::npos); // hardware/owner not fabricated
 }
 
+// #3564/WS-A4: the single-device page/info path repopulates the Tags field from
+// DeviceApi's per-device tag read (get_one). Locks the render so a future
+// refactor of DeviceRow.tags -> render_device_info_fragment cannot silently
+// regress to the "always empty" bug this seam commit fixed (happy-path Gate 8 F1).
+TEST_CASE("device info lens: tags render key=value; empty -> none", "[device][ui]") {
+    SECTION("populated tags render, escaped, comma-joined") {
+        DeviceRow d;
+        d.agent_id = "a-2";
+        d.hostname = "WS-2";
+        d.tags = {"env=prod", "role=db"};
+        const auto html = render_device_info_fragment(d);
+        CHECK(html.find("env=prod") != std::string::npos);
+        CHECK(html.find("role=db") != std::string::npos);
+        CHECK(html.find(">none<") == std::string::npos); // placeholder absent when tags present
+    }
+    SECTION("no tags -> 'none' placeholder, never a fabricated tag") {
+        DeviceRow d;
+        d.agent_id = "a-3";
+        d.hostname = "WS-3";
+        // d.tags left empty (the list path, and a device with no tags)
+        const auto html = render_device_info_fragment(d);
+        CHECK(html.find(">none<") != std::string::npos);
+    }
+}
+
 TEST_CASE("device DEX lens: score + signals + empty state", "[device][ui]") {
     std::vector<std::pair<std::string, std::int64_t>> sigs{{"process.crashed", 3}};
     const auto html = render_device_dex_lens("a-1", 71, sigs);

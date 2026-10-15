@@ -73,18 +73,83 @@ struct Collector {
 
 /// A cross-platform stand-in for the Windows watch mechanisms. Records the
 /// engine's watch/unwatch/start/stop calls and lets a test drive a fire.
+/// A one-shot park for the #2815 teardown-barrier cases (and, since rung 9c
+/// PR-6 item 1, FakeMechanism's own watch()/unwatch() park seam below): an
+/// engine test hook — or a mechanism call — enters, announces it, and blocks
+/// until the test releases it.
+///
+/// DELIBERATELY NOT OWNED BY THE ENGINE for the #2815 door-test use below.
+/// Scenario B destroys the engine while a caller is parked in here, so the
+/// gate must outlive it — it lives on the TEST's stack and the hook captures
+/// a bare pointer to it. The hook lambda's own closure storage belongs to the
+/// engine's std::function member and dies with the engine, so the capture is
+/// read ONCE at hook entry (into a stack local) and never again after the
+/// park begins; otherwise ASan reports the closure rather than the engine
+/// member the case is about. (FakeMechanism's own use owns its ParkGate as a
+/// plain member — its lifetime is the mechanism's own, no such hazard.)
+struct ParkGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool entered{false};
+    bool released{false};
+    void park() {
+        std::unique_lock lk(mu);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lk, [this] { return released; });
+    }
+    [[nodiscard]] bool wait_entered(std::chrono::milliseconds timeout = 5000ms) {
+        std::unique_lock lk(mu);
+        return cv.wait_for(lk, timeout, [this] { return entered; });
+    }
+    void release() {
+        {
+            std::lock_guard lk(mu);
+            released = true;
+        }
+        cv.notify_all();
+    }
+};
+
 class FakeMechanism final : public ISparkMechanism {
 public:
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
+        // One-way seal (rung 9c PR-6 item 1), mirroring the real mechanisms:
+        // start() being CALLED seals the establishment sink, whether or not
+        // this call does anything else.
+        sink_sealed_ = true;
         emit_ = std::move(emit);
         fault_ = std::move(fault);
         started_ = true;
         ++start_calls_;
     }
     std::expected<void, std::string> watch(const std::string& key, const SparkParams&) override {
+        // One-shot park (rung 9c PR-6 item 1, E14/E15): gate at the TOP,
+        // before any state mutation — models a mechanism whose watch() blocks
+        // on OS handle setup while the caller still holds this type's
+        // mech-ops lock. Shares one ParkGate with unwatch() below — a given
+        // test scenario parks at most one of the two at a time.
+        bool should_park = false;
+        {
+            std::lock_guard lk(mu_);
+            if (park_next_watch_) {
+                park_next_watch_ = false;
+                should_park = true;
+            }
+        }
+        if (should_park)
+            park_gate_.park(); // blocks until release_park()
         std::lock_guard lk(mu_);
         ++watch_calls_;
+        // Checked after the gate, consumed (rung 9c PR-6 item 1): a NEW
+        // one-shot failure independent of the pre-existing fail_watch_/
+        // throw_watch_* below, which stay level-triggered (set-then-use, not
+        // consumed) for the tests that already depend on that.
+        if (fail_next_watch_) {
+            fail_next_watch_ = false;
+            return std::unexpected("forced watch failure (one-shot, rung 9c PR-6 item 1)");
+        }
         if (throw_watch_nonstd_)
             throw 42; // non-std throw → exercises watch_guarded()'s catch(...) arm
         if (throw_watch_)
@@ -94,7 +159,39 @@ public:
         watched_.insert(key);
         return {};
     }
+    // The engine always calls this overload in production. Records the
+    // incarnation token BEFORE delegating to watch() above, so every existing
+    // fail/throw/park behavior on watch() (and every pre-existing test that
+    // exercises it via the engine) is unaffected — this is purely additive.
+    std::expected<void, std::string> watch_incarnation(const std::string& key,
+                                                        const SparkParams& params,
+                                                        SparkIncarnation incarnation) override {
+        {
+            std::lock_guard lk(mu_);
+            tokens_[key].push_back(incarnation);
+        }
+        return watch(key, params);
+    }
+    bool set_established_sink(SparkEstablishedFn sink) override {
+        std::lock_guard lk(mu_);
+        if (sink_sealed_)
+            return false;
+        established_sink_ = std::move(sink);
+        return true;
+    }
     void unwatch(const std::string& key) override {
+        // One-shot park (rung 9c PR-6 item 1, E14/E15) — see watch()'s own
+        // comment; same shared ParkGate.
+        bool should_park = false;
+        {
+            std::lock_guard lk(mu_);
+            if (park_next_unwatch_) {
+                park_next_unwatch_ = false;
+                should_park = true;
+            }
+        }
+        if (should_park)
+            park_gate_.park();
         std::lock_guard lk(mu_);
         ++unwatch_calls_;
         // #2815: did this unwatch arrive AFTER the engine had already torn this
@@ -117,6 +214,10 @@ public:
         started_ = false;
         ++stop_calls_;
     }
+    // Atomic-only, like every real mechanism (stats() is called under the engine's mu_).
+    [[nodiscard]] SparkMechanismStats stats() const override {
+        return {.inert = inert_for_test_.load(std::memory_order_relaxed)};
+    }
 
     // ── test drivers ──
     void fire(const std::string& key, SparkData data = SparkData{std::monostate{}}) {
@@ -137,6 +238,25 @@ public:
         }
         if (f)
             f(key, faulted, reason);
+    }
+    // Drive the establishment channel as a real mechanism would (lock released,
+    // rung 9c PR-6 item 1).
+    void fire_established(const std::string& key, SparkIncarnation inc,
+                          std::chrono::steady_clock::time_point at, SparkCoverage cov) {
+        SparkEstablishedFn f;
+        {
+            std::lock_guard lk(mu_);
+            f = established_sink_;
+        }
+        if (f)
+            f(key, inc, at, cov);
+    }
+    /// Every incarnation token watch_incarnation() has recorded for `key`, in
+    /// call order (rung 9c PR-6 item 1, H1 tests).
+    std::vector<SparkIncarnation> tokens(const std::string& key) {
+        std::lock_guard lk(mu_);
+        auto it = tokens_.find(key);
+        return it == tokens_.end() ? std::vector<SparkIncarnation>{} : it->second;
     }
     bool is_watching(const std::string& key) {
         std::lock_guard lk(mu_);
@@ -189,11 +309,43 @@ public:
         std::lock_guard lk(mu_);
         throw_unwatch_ = b;
     }
+    // ── rung 9c PR-6 item 1 test seams ──
+    void set_park_next_watch(bool b) {
+        std::lock_guard lk(mu_);
+        park_next_watch_ = b;
+    }
+    void set_park_next_unwatch(bool b) {
+        std::lock_guard lk(mu_);
+        park_next_unwatch_ = b;
+    }
+    void set_fail_next_watch(bool b) {
+        std::lock_guard lk(mu_);
+        fail_next_watch_ = b;
+    }
+    /// Drives the mechanism-reported `inert` flag (stats() is lock-free, so no mu_).
+    void set_inert(bool b) { inert_for_test_.store(b, std::memory_order_relaxed); }
+    /// True once a parked watch()/unwatch() has actually entered its park —
+    /// the observable half of the park seam (E14/E15).
+    [[nodiscard]] bool wait_parked(std::chrono::milliseconds timeout = 5000ms) {
+        return park_gate_.wait_entered(timeout);
+    }
+    void release_park() { park_gate_.release(); }
+    /// Exposes the internal ParkGate by reference so a test can hand it to
+    /// ThreadJoinGuard directly, matching the #2815 door tests' own backstop
+    /// pattern (release-then-join on early REQUIRE failure, so an unwind
+    /// never destroys a still-joinable thread parked forever with no other
+    /// caller left to release it).
+    ParkGate& park_gate_for_test() { return park_gate_; }
 
 private:
     std::mutex mu_;
     SparkEmitFn emit_;
     SparkFaultFn fault_;
+    /// Establishment-signal sink (rung 9c PR-6 item 1) — installed by
+    /// set_established_sink(), sealed at start(), read (lock released) by
+    /// fire_established().
+    SparkEstablishedFn established_sink_;
+    bool sink_sealed_{false};
     std::set<std::string> watched_;
     bool started_{false};
     bool fail_watch_{false};
@@ -207,39 +359,16 @@ private:
     int unwatch_calls_after_stop_{0};
     int stop_calls_{0};
     int start_calls_{0};
-};
-
-/// A one-shot park for the #2815 teardown-barrier cases: an engine test hook enters,
-/// announces it, and blocks until the test releases it.
-///
-/// DELIBERATELY NOT OWNED BY THE ENGINE. Scenario B destroys the engine while a caller
-/// is parked in here, so the gate must outlive it — it lives on the TEST's stack and the
-/// hook captures a bare pointer to it. The hook lambda's own closure storage belongs to
-/// the engine's std::function member and dies with the engine, so the capture is read
-/// ONCE at hook entry (into a stack local) and never again after the park begins;
-/// otherwise ASan reports the closure rather than the engine member the case is about.
-struct ParkGate {
-    std::mutex mu;
-    std::condition_variable cv;
-    bool entered{false};
-    bool released{false};
-    void park() {
-        std::unique_lock lk(mu);
-        entered = true;
-        cv.notify_all();
-        cv.wait(lk, [this] { return released; });
-    }
-    [[nodiscard]] bool wait_entered(std::chrono::milliseconds timeout = 5000ms) {
-        std::unique_lock lk(mu);
-        return cv.wait_for(lk, timeout, [this] { return entered; });
-    }
-    void release() {
-        {
-            std::lock_guard lk(mu);
-            released = true;
-        }
-        cv.notify_all();
-    }
+    /// spark key -> every incarnation token watch_incarnation() has recorded
+    /// for it, in call order (rung 9c PR-6 item 1, H1 tests).
+    std::map<std::string, std::vector<SparkIncarnation>> tokens_;
+    bool park_next_watch_{false};
+    bool park_next_unwatch_{false};
+    bool fail_next_watch_{false};
+    std::atomic<bool> inert_for_test_{false};
+    /// Shared by watch()/unwatch() — a given test scenario parks at most one
+    /// of the two calls at a time, so one gate suffices.
+    ParkGate park_gate_;
 };
 
 /// RAII safety net for the #2815/#2833/#2818 door tests below (cpp-safety Gate 3
@@ -2327,6 +2456,823 @@ TEST_CASE("platform factories honor the mechanism-or-null contract", "[spark][me
 #endif
 }
 
+// ── rung 9c PR-6 item 1: the establishment signal (SparkIncarnation /
+//    SparkCoverage / SubscriptionEstablishment), engine-level plumbing.
+//    Cross-platform (FakeMechanism); the real-mechanism M1-M6 cases live
+//    further down, alongside the existing Linux/Windows smoke sections they
+//    extend. ──────────────────────────────────────────────────────────────
+
+TEST_CASE("Establishment: a fresh arm mints a real incarnation; dedup shares it, no second "
+          "watch call (E1)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    auto est1 = engine.subscription_establishment(*sub1);
+    REQUIRE(est1.has_value());
+    CHECK(est1->coverage == SparkCoverage::None); // nothing reported yet
+    CHECK_FALSE(est1->established_at.has_value());
+    REQUIRE(fake->tokens(key).size() == 1);
+
+    // Dedup: a second subscriber to the SAME spec shares the existing
+    // watcher — no second watch_incarnation() call, same incarnation.
+    auto sub2 = engine.arm(*c2, spec);
+    REQUIRE(sub2.has_value());
+    CHECK(fake->tokens(key).size() == 1); // still just one — no second watch call
+    auto est2 = engine.subscription_establishment(*sub2);
+    REQUIRE(est2.has_value());
+    CHECK(est2->armed_at == est1->armed_at); // same Armed entry
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: report_established assigns coverage unconditionally and stamps "
+          "established_at first-wins (E2, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(fake->tokens(key).size() == 1);
+    const SparkIncarnation inc = fake->tokens(key).front();
+
+    // Poll: coverage assigned, established_at stays unset (never stamped by
+    // anything but Notification).
+    fake->fire_established(key, inc, std::chrono::steady_clock::now(), SparkCoverage::Poll);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Poll);
+    CHECK_FALSE(est->established_at.has_value());
+
+    // Notification: coverage assigned, established_at stamps for the first time.
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1);
+
+    // A second, LATER Notification does NOT move established_at (first-wins).
+    const auto t2 = t1 + std::chrono::milliseconds(50);
+    fake->fire_established(key, inc, t2, SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == t1); // unchanged
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: subscription_establishment is nullopt for an unknown or "
+          "torn-down id (E3)",
+          "[spark][established]") {
+    SparkEngine engine;
+    wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    auto sub = engine.arm(*c1, service_spec("svc1"));
+    REQUIRE(sub.has_value());
+    // Mirrors subscription_health()'s own "unknown id" pin.
+    CHECK_FALSE(engine.subscription_establishment(*sub + 1'000'000).has_value());
+    engine.disarm(*sub);
+    CHECK_FALSE(engine.subscription_establishment(*sub).has_value());
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a report against a superseded incarnation is dropped by IDENTITY, "
+          "not by timestamp ordering (E4, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(fake->tokens(key).size() == 1);
+    const SparkIncarnation old_inc = fake->tokens(key)[0];
+
+    engine.disarm(*sub1);
+    auto sub2 = engine.arm(*c1, spec); // fully torn down + re-armed -> fresh incarnation
+    REQUIRE(sub2.has_value());
+    REQUIRE(fake->tokens(key).size() == 2);
+    const SparkIncarnation new_inc = fake->tokens(key)[1];
+    CHECK(new_inc != old_inc);
+
+    // Stale report, timestamped an hour in the FUTURE — a time-ordering check
+    // would accept this over anything already recorded; an identity check
+    // must reject it regardless of its timestamp.
+    const auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    fake->fire_established(key, old_inc, future, SparkCoverage::Notification);
+
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None); // untouched by the stale report
+    CHECK_FALSE(est->established_at.has_value());
+
+    // A report against the CURRENT incarnation still works normally.
+    fake->fire_established(key, new_inc, std::chrono::steady_clock::now(),
+                           SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+    CHECK(est->established_at.has_value());
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a dedup arm shares the existing key's incarnation and armed_at "
+          "(E5)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    auto sub2 = engine.arm(*c2, spec);
+    REQUIRE(sub2.has_value());
+    REQUIRE(fake->tokens(key).size() == 1); // one watch_incarnation() call for both
+
+    const SparkIncarnation inc = fake->tokens(key).front();
+    fake->fire_established(key, inc, std::chrono::steady_clock::now(), SparkCoverage::Notification);
+    auto est1 = engine.subscription_establishment(*sub1);
+    auto est2 = engine.subscription_establishment(*sub2);
+    REQUIRE(est1.has_value());
+    REQUIRE(est2.has_value());
+    CHECK(est1->armed_at == est2->armed_at);
+    CHECK(est1->coverage == est2->coverage);
+    CHECK(est1->established_at == est2->established_at);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: armed_at is stamped at ARM time, even for a pre-start arm (E6/H14)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    // Deliberately NOT started yet.
+    const auto before = std::chrono::steady_clock::now();
+    auto sub = engine.arm(*c1, service_spec("svc1"));
+    const auto after = std::chrono::steady_clock::now();
+    REQUIRE(sub.has_value());
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->armed_at >= before);
+    CHECK(est->armed_at <= after);
+    CHECK(fake->watch_calls() == 0); // not started yet — no live watch call
+    engine.start(); // replay runs now
+    CHECK(fake->watch_calls() == 1);
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a fault-then-recovery cycle does not move established_at (E7)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1);
+
+    // Coverage drops to None (a fault/teardown) then RECOVERS to Notification
+    // — spark.hpp's SubscriptionEstablishment doc comment: established_at is
+    // a historical fact, not a live status.
+    fake->fire_established(key, inc, t1 + std::chrono::milliseconds(10), SparkCoverage::None);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK(*est->established_at == t1); // still the original stamp
+
+    const auto t2 = t1 + std::chrono::milliseconds(20);
+    fake->fire_established(key, inc, t2, SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+    CHECK(*est->established_at == t1); // STILL the original — recovery does not re-stamp
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a timer-driven spark's coverage/established_at stay at their "
+          "defaults forever — the field is inert off the event-driven path (E8)",
+          "[spark][established]") {
+    SparkEngine engine;
+    engine.set_cadence_floor_for_test(1); // ms — let the interval fire quickly
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    auto sub = engine.arm(*c1, interval_spec(5));
+    REQUIRE(sub.has_value());
+    std::this_thread::sleep_for(50ms); // let it fire a few times
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+    engine.stop();
+}
+
+TEST_CASE("Establishment: after stop(), the query returns last-known values, like "
+          "subscription_health (E9/R4)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+    {
+        auto pre = engine.subscription_establishment(*sub);
+        REQUIRE(pre.has_value());
+        REQUIRE(pre->coverage == SparkCoverage::Notification);
+    }
+
+    engine.stop();
+    CHECK_FALSE(engine.is_running());
+    // R4: stop() never erases armed_ — the query still returns the last
+    // thing any mechanism reported, exactly like subscription_health().
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1);
+}
+
+TEST_CASE("Establishment: an inert mechanism overlays coverage to None and leaves "
+          "established_at alone (O-1, red-before)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+
+    fake->set_inert(true);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1); // the overlay never touches established_at
+
+    fake->set_inert(false);
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification); // the cached value was never lost
+    CHECK(*est->established_at == t1);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a spark whose type has no registered mechanism is untouched by "
+          "another type's inert flag and never throws (O-2, regression guard for the "
+          "find()-not-at() shape; green on the pre-overlay engine)",
+          "[spark][established]") {
+    SparkEngine engine;
+    engine.set_cadence_floor_for_test(1); // ms, as E8
+    FakeMechanism* file_fake = wire_fake(engine, SparkType::File);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    auto sub = engine.arm(*c1, interval_spec(5)); // Interval has no registered mechanism
+    REQUIRE(sub.has_value());
+
+    file_fake->set_inert(true); // a DIFFERENT type's mechanism
+    std::optional<SubscriptionEstablishment> est;
+    REQUIRE_NOTHROW(est = engine.subscription_establishment(*sub));
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+    engine.stop();
+}
+
+TEST_CASE("Establishment: after stop() an inert mechanism still overlays None while "
+          "established_at keeps its last-known value (O-3, red-before)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+    fake->set_inert(true);
+
+    engine.stop();
+    CHECK_FALSE(engine.is_running());
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at == t1);
+}
+
+TEST_CASE("Establishment: [tsan] the inert overlay under concurrent inert flips and queries "
+          "(O-4, sanitizer exercise; cannot go red on the pre-overlay engine)",
+          "[spark][established][tsan]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c1, spec);
+    REQUIRE(sub.has_value());
+    const SparkIncarnation inc = fake->tokens(key).front();
+    const auto t1 = std::chrono::steady_clock::now();
+    fake->fire_established(key, inc, t1, SparkCoverage::Notification);
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> violation{false}; // set by the readers; asserted after join
+    std::thread flipper([&] {
+        bool inert = false;
+        while (!stop.load(std::memory_order_acquire)) {
+            inert = !inert;
+            fake->set_inert(inert);
+        }
+    });
+    auto reader_body = [&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            auto est = engine.subscription_establishment(*sub);
+            if (!est || !est->established_at || *est->established_at != t1 ||
+                (est->coverage != SparkCoverage::None &&
+                 est->coverage != SparkCoverage::Notification))
+                violation.store(true, std::memory_order_relaxed);
+        }
+    };
+    std::thread reader1(reader_body);
+    std::thread reader2(reader_body);
+    std::this_thread::sleep_for(200ms);
+    stop.store(true, std::memory_order_release);
+    flipper.join();
+    reader1.join();
+    reader2.join();
+    engine.stop();
+
+    CHECK_FALSE(violation.load(std::memory_order_relaxed));
+}
+
+TEST_CASE("Establishment: adoption — a disarm racing a re-arm skips the stale unwatch, and "
+          "the mechanism sees a fresh token it can report against (E10)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(fake->tokens(key).size() == 1);
+    const SparkIncarnation old_inc = fake->tokens(key)[0];
+
+    // Fires inside disarm()'s teardown, after the key is dropped from
+    // armed_/sub_keys_ under mu_ but BEFORE the (M2-staleness-rechecked)
+    // unwatch() call — a fresh equal-spec arm() lands in that exact window.
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c1, spec);
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+    // M2: the stale unwatch was skipped entirely.
+    CHECK(fake->unwatch_calls() == 0);
+    // The mechanism DID see a second watch_incarnation() call, with a
+    // different token — "adoption" from the mechanism's perspective: the
+    // same live watch object, a new engine-side identity.
+    REQUIRE(fake->tokens(key).size() == 2);
+    const SparkIncarnation new_inc = fake->tokens(key)[1];
+    CHECK(new_inc != old_inc);
+
+    // A report against the now-superseded OLD incarnation must not reach the
+    // NEW subscription.
+    fake->fire_established(key, old_inc, std::chrono::steady_clock::now(),
+                           SparkCoverage::Notification);
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+
+    // A report against the CURRENT (new) incarnation lands correctly.
+    fake->fire_established(key, new_inc, std::chrono::steady_clock::now(),
+                           SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: a disarm racing a re-arm after a positive report leaves the fresh "
+          "incarnation reading None with no established_at, drops an old-incarnation report and "
+          "accepts the new one (CH-4 engine identity, characterisation)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(fake->tokens(key).size() == 1);
+    const SparkIncarnation old_inc = fake->tokens(key)[0];
+    fake->fire_established(key, old_inc, std::chrono::steady_clock::now(),
+                           SparkCoverage::Notification);
+    {
+        auto pre = engine.subscription_establishment(*sub1);
+        REQUIRE(pre.has_value());
+        REQUIRE(pre->coverage == SparkCoverage::Notification);
+        REQUIRE(pre->established_at.has_value());
+    }
+
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c1, spec);
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+    REQUIRE(fake->tokens(key).size() == 2);
+    const SparkIncarnation new_inc = fake->tokens(key)[1];
+    CHECK(new_inc != old_inc);
+
+    CHECK_FALSE(engine.subscription_establishment(*sub1).has_value());
+    // SparkEngine::disarm() erases armed_[key] before the hook: the racing arm mints a fresh Armed.
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    fake->fire_established(key, old_inc, std::chrono::steady_clock::now(),
+                           SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    fake->fire_established(key, new_inc, std::chrono::steady_clock::now(),
+                           SparkCoverage::Notification);
+    est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::Notification);
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: [tsan] established_at is never before armed_at under concurrent "
+          "arm/report/read (locking discipline, not disarm/re-arm identity — see E4/E10 "
+          "for that) (E11)",
+          "[spark][established][tsan]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine.start();
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> violation{false}; // set by the checker; asserted after join
+    std::vector<SparkEngine::SubscriptionId> subs;
+    std::mutex subs_mu;
+
+    std::thread armer([&] {
+        int i = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            auto sub = engine.arm(*c1, service_spec("svc" + std::to_string(i++ % 8)));
+            if (sub.has_value()) {
+                std::lock_guard lk(subs_mu);
+                subs.push_back(*sub);
+                if (subs.size() > 32)
+                    subs.erase(subs.begin());
+            }
+        }
+    });
+    std::thread reporter([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            for (int i = 0; i < 8; ++i) {
+                const std::string key = spark_key(service_spec("svc" + std::to_string(i)));
+                auto toks = fake->tokens(key);
+                if (!toks.empty())
+                    fake->fire_established(key, toks.back(), std::chrono::steady_clock::now(),
+                                           SparkCoverage::Notification);
+            }
+        }
+    });
+    std::thread checker([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            std::vector<SparkEngine::SubscriptionId> snapshot;
+            {
+                std::lock_guard lk(subs_mu);
+                snapshot = subs;
+            }
+            for (auto id : snapshot) {
+                if (auto est = engine.subscription_establishment(id)) {
+                    if (est->established_at && *est->established_at < est->armed_at)
+                        violation.store(true, std::memory_order_relaxed);
+                }
+            }
+        }
+    });
+    std::this_thread::sleep_for(200ms);
+    stop.store(true, std::memory_order_release);
+    armer.join();
+    reporter.join();
+    checker.join();
+    engine.stop();
+
+    CHECK_FALSE(violation.load(std::memory_order_relaxed));
+}
+
+TEST_CASE("Establishment: set_established_sink seals at start() — a repeat call after "
+          "start() (or stop()) returns false, one-way (E12/H3)",
+          "[spark][established]") {
+    FakeMechanism fake;
+    CHECK(fake.set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    fake.start([](const std::string&, SparkData) {},
+              [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(fake.set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    fake.stop();
+    // One-way: still sealed after stop() too — never re-opens.
+    CHECK_FALSE(fake.set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+}
+
+TEST_CASE("Establishment: start()'s replay skips a key superseded during on_start_hook_ by "
+          "IDENTITY, not containment (E13, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    // I1: pre-start arm — deferred, no watch_incarnation() call yet.
+    auto sub1 = engine.arm(*c1, spec);
+    REQUIRE(sub1.has_value());
+    CHECK(fake->tokens(key).empty());
+
+    // Fires between "every mechanism started + sink installed" and "the
+    // pre-start replay loop runs" — no locks held. Disarms sub1 (I1) and
+    // re-arms the same key LIVE (running_ is already true) — I2's
+    // watch_incarnation() call happens synchronously, right here.
+    engine.set_on_start_hook_for_test([&] {
+        engine.disarm(*sub1);
+        auto sub2 = engine.arm(*c1, spec);
+        REQUIRE(sub2.has_value());
+    });
+    engine.start();
+    engine.set_on_start_hook_for_test(nullptr);
+
+    // The stale I1 replay must be skipped — only I2's live call reaches the
+    // mechanism. Mutation (replay gate reverted to bare armed_.contains())
+    // lets the stale replay through too: tokens(K) becomes [I2, I1].
+    auto toks = fake->tokens(key);
+    REQUIRE(toks.size() == 1);
+    CHECK(fake->watch_calls() == 1);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: the failed-watch cleanup only touches the entry if it's still "
+          "OURS — a successor's fresh arm survives untouched (E14, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    std::atomic<bool> c2_got_lost{false};
+    auto c2 = engine.register_consumer("c2", [&](const SparkEvent& ev) {
+        if (ev.kind == SparkEventKind::Lost)
+            c2_got_lost.store(true, std::memory_order_relaxed);
+    });
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+    const auto spec = service_spec("svc1");
+    const std::string key = spark_key(spec);
+
+    // Declared BEFORE the guard and tracked immediately (ThreadJoinGuard's
+    // own doc comment: C++ destroys locals in reverse order, so a thread
+    // must be declared before the guard protecting it, or an early REQUIRE
+    // failure below destroys a still-joinable thread -> terminate). Real
+    // bodies are move-assigned in below as each phase becomes ready.
+    std::thread t1, t2, t3;
+    ThreadJoinGuard guard{&fake->park_gate_for_test(), {}};
+    guard.track(t1);
+    guard.track(t2);
+    guard.track(t3);
+
+    // T1: arm(c1, K) — the fake parks INSIDE watch() (after recording I1's
+    // token in watch_incarnation()), holding `ops` for the whole park —
+    // arm_impl calls watch_guarded() while holding this type's mech-ops lock.
+    fake->set_park_next_watch(true);
+    t1 = std::thread([&] {
+        auto sub = engine.arm(*c1, spec);
+        (void)sub; // T1's own result is not the assertion target — T3's is
+    });
+    REQUIRE(fake->wait_parked());
+
+    // T2: unregister_consumer(c1) — erases sub1 + the Armed(I1) entry under
+    // mu_ alone (no `ops` needed for the bookkeeping), then blocks trying to
+    // take `ops` for its own (about-to-be-stale) unwatch call.
+    t2 = std::thread([&] { engine.unregister_consumer(*c1); });
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 0; }));
+
+    // T3: arm(c2, K) — commits a fresh Armed(I2) under mu_, then blocks at
+    // the live gate trying to take the SAME `ops` T1 still holds. The result
+    // is captured, NOT asserted here — a Catch2 assertion macro failing
+    // inside a spawned std::thread's own function throws across the thread
+    // boundary, which terminates the process rather than failing cleanly;
+    // every assertion on T3's outcome happens on the main thread after join.
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    t3 = std::thread([&] {
+        auto sub = engine.arm(*c2, spec);
+        if (sub.has_value())
+            sub2 = *sub;
+    });
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 1; }));
+
+    // Release T1's park with a forced watch failure queued.
+    fake->set_fail_next_watch(true);
+    fake->release_park();
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    REQUIRE(sub2.has_value());
+    // c2 never sees Lost — the cleanup found I2 != I1 and left its entry alone.
+    CHECK_FALSE(c2_got_lost.load(std::memory_order_relaxed));
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+    // Both watch_incarnation() calls reached the mechanism, in order: I1
+    // (T1, later failed) then I2 (T3, succeeded once `ops` was released).
+    auto toks = fake->tokens(key);
+    REQUIRE(toks.size() == 2);
+    CHECK(toks[0] != toks[1]);
+
+    engine.stop();
+}
+
+TEST_CASE("Establishment: the live watch gate rejects a key superseded while queued behind "
+          "`ops` — by IDENTITY, not containment (E15, mutation-verified)",
+          "[spark][established]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::Service);
+    auto c1 = engine.register_consumer("c1", [](const SparkEvent&) {});
+    auto c2 = engine.register_consumer("c2", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    REQUIRE(c2.has_value());
+    engine.start();
+
+    const auto spec0 = service_spec("svc0"); // sibling key — holds `ops` via a parked unwatch
+    const auto spec = service_spec("svc1");  // the key under test
+    const std::string key = spark_key(spec);
+
+    auto sub0 = engine.arm(*c1, spec0);
+    REQUIRE(sub0.has_value());
+
+    // Declared BEFORE the guard and tracked immediately — see E14's own
+    // comment for why.
+    std::thread t0, t1, t2, t3;
+    ThreadJoinGuard guard{&fake->park_gate_for_test(), {}};
+    guard.track(t0);
+    guard.track(t1);
+    guard.track(t2);
+    guard.track(t3);
+
+    fake->set_park_next_unwatch(true);
+    t0 = std::thread([&] { engine.disarm(*sub0); });
+    REQUIRE(fake->wait_parked());
+    // disarm()'s own mu_-held block (including armed_.erase for svc0) runs
+    // and completes BEFORE it ever calls mech->unwatch() — where the park
+    // above is — so by the time wait_parked() returns, svc0's bookkeeping
+    // is already gone: armed_sparks is 0 here, not 1 (nothing else is armed
+    // yet). Confirmed, not polled: this is a deterministic fact once T0 has
+    // provably entered its park.
+    REQUIRE(engine.stats().armed_sparks == 0);
+
+    std::atomic<bool> t1_failed_as_expected{false};
+    t1 = std::thread([&] {
+        auto sub = engine.arm(*c1, spec);
+        if (!sub.has_value() && sub.error().find("disarmed") != std::string::npos)
+            t1_failed_as_expected.store(true, std::memory_order_relaxed);
+    });
+    // K(I1) committed under mu_ (T1 then blocks trying to take the same
+    // `ops` T0 holds) — starting from the just-confirmed 0 above, this can
+    // only be the 0->1 transition, never a stale reading.
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 1; }));
+
+    t2 = std::thread([&] { engine.unregister_consumer(*c1); });
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 0; }));
+
+    // Captured, not asserted here — see E14's own comment on why a Catch2
+    // assertion macro must never fail inside a spawned thread's function.
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    t3 = std::thread([&] {
+        auto sub = engine.arm(*c2, spec);
+        if (sub.has_value())
+            sub2 = *sub;
+    });
+    REQUIRE(eventually([&] { return engine.stats().armed_sparks == 1; })); // K(I2) only
+
+    fake->release_park();
+    t0.join();
+    t1.join();
+    t2.join();
+    t3.join();
+
+    CHECK(t1_failed_as_expected.load(std::memory_order_relaxed));
+    REQUIRE(sub2.has_value());
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+    // T1's own token was NEVER recorded — the live gate rejected it before
+    // watch_incarnation() was ever called. Only T3's (I2) reaches the fake.
+    auto toks = fake->tokens(key);
+    CHECK(toks.size() == 1);
+
+    engine.stop();
+}
+
 // ── Linux-only smoke: drive the REAL sd-bus mechanism against absent units and
 //    (env-gated) a live unit transition. The cross-platform cases above prove
 //    the engine plumbing via the fake; these prove the actual Linux body fires
@@ -2398,6 +3344,25 @@ TEST_CASE("Service spark (real mechanism): an absent unit gets an initial Stoppe
     REQUIRE(eventually([&] { return got.count() >= 1; }));
     REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
     CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Stopped);
+    // M1 (rung 9c PR-6 item 1): the mechanism must reach SOME real coverage
+    // classification, never stay at the default None forever. EMPIRICALLY
+    // VERIFIED against a real system bus (a standalone sd-bus probe, not
+    // assumed from the D-Bus API docs): systemd's LoadUnit succeeds for ANY
+    // syntactically valid unit name — it lazily creates a stub unit object
+    // with LoadState=not-found rather than erroring — so an absent unit
+    // takes the SAME Resolved -> match -> read path as a present one
+    // (arm_unit's NotFound branch, mapping to Poll, is reserved for the
+    // rarer case where LoadUnit itself fails outright) and typically also
+    // reaches Notification here. Accept either — the property under test is
+    // "no coverage started at None forever, and if Notification, it stamps",
+    // not a specific tri-state value this absence path does not control.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage != SparkCoverage::None;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->established_at.has_value() == (est->coverage == SparkCoverage::Notification));
     engine.disarm(*sub);
     engine.stop();
 }
@@ -2439,6 +3404,18 @@ TEST_CASE("Service spark (real mechanism): two spark keys coalescing onto one un
     CHECK(std::get<ServiceSparkData>(got.at(1).data).state ==
           ServiceRunState::Stopped); // ...same (absent) unit, same resolved state
 
+    // M1 (rung 9c PR-6 item 1): the F4 unified branch reports establishment
+    // for the SECOND (coalescing) key unconditionally — it must NOT be
+    // gated behind the same `uw.last` check the emit above is (a key
+    // coalescing onto an already-resolved unit whose state HASN'T changed
+    // still needs its own establishment report; the emit is edge-gated, the
+    // establishment report is not). See the "absent unit" test above for why
+    // this accepts any non-None coverage rather than a specific value.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*second);
+        return est.has_value() && est->coverage != SparkCoverage::None;
+    }));
+
     engine.disarm(*first);
     engine.disarm(*second);
     engine.stop();
@@ -2466,8 +3443,93 @@ TEST_CASE("Service spark (real mechanism): a real active unit resolves to Runnin
     REQUIRE(eventually([&] { return got.count() >= 1; }));
     REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
     CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Running);
+    // M1 (rung 9c PR-6 item 1), STRICT: a real, present, resolvable unit MUST
+    // reach Notification coverage, never settle for Poll — Poll here would
+    // mean the mechanism-wide Subscribe() call failed (H7), which on a normal
+    // systemd host is a real finding (a Subscribe-denied host), not an
+    // acceptable degraded mode this test should silently tolerate.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
     engine.disarm(*sub);
     engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): a disarm racing a re-arm (adoption) still lets "
+          "the mechanism report establishment against the fresh incarnation (M1)",
+          "[spark][mechanism][linux]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub1 = engine.arm(*c, service_spec("systemd-journald.service"));
+    if (!sub1.has_value()) {
+        engine.stop();
+        SUCCEED("service mechanism reports inert (no system bus on this host) — skipping");
+        return;
+    }
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub1);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
+    // Race a re-arm of the SAME key into disarm()'s teardown window — the M2
+    // staleness recheck skips the stale unwatch, so the real mechanism's
+    // UnitWatch survives untouched ("adoption": same live sd-bus match, a
+    // new engine-side incarnation).
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, service_spec("systemd-journald.service"));
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+
+    // The adopted key still reaches Notification under its NEW incarnation
+    // — the F4 unconditional coalesce/adoption report, exercised against the
+    // real mechanism rather than the fake.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub2);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
+TEST_CASE("Service mechanism (Linux, direct): set_established_sink seals at start(), same "
+          "one-way contract as the fake (M2)",
+          "[spark][mechanism][linux]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech);
+    CHECK(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->stop();
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {})); // one-way: still sealed after stop()
 }
 
 TEST_CASE("Service spark (real mechanism): fd/thread collapse holds across N absent watches",
@@ -2577,9 +3639,13 @@ TEST_CASE("Service spark (real mechanism): live unit transition fires Running th
 
 #include <sddl.h> // ConvertSidToStringSidW / ConvertStringSecurityDescriptorToSecurityDescriptorW (UP-2 closure test)
 
+#include <cmath> // std::floor / std::log2 - the #4658 pass-count bound
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+
+#include <spdlog/sinks/base_sink.h> // PfStallLogger (#4658 PF-11/PF-12)
+#include <spdlog/spdlog.h>
 
 TEST_CASE("File spark (real mechanism): a live file write fires the spark",
           "[spark][mechanism][windows]") {
@@ -3703,14 +4769,28 @@ struct ScratchRegKey {
 };
 
 /// Parks every probe of one subkey until release(); counts what it saw.
+///
+/// The hook is a shared_ptr shared with the probe job (spark_registry.cpp), so a probe worker
+/// parked here can outlive the mechanism's destructor and would then re-lock a destroyed
+/// `mu` once released. `inside` counts the calls currently between hook entry and hook exit;
+/// it is the LAST thing a call touches (after its lock is dropped), and the destructor waits
+/// for it to reach zero - bounded, so a stuck worker can never hang the test binary.
 struct ProbeGate {
     std::mutex mu;
     std::condition_variable cv;
     bool open{false};
     std::atomic<int> parked{0};
     std::atomic<int> seen{0};
+    std::atomic<int> inside{0};
     std::function<void(std::string_view)> hook_for(std::string match) {
         return [this, match](std::string_view sub) {
+            struct Inside {
+                std::atomic<int>& n;
+                explicit Inside(std::atomic<int>& n_) : n(n_) {
+                    n.fetch_add(1, std::memory_order_acq_rel);
+                }
+                ~Inside() { n.fetch_sub(1, std::memory_order_acq_rel); }
+            } inside_scope{inside}; // declared first: destroyed last, after `lk` below
             seen.fetch_add(1, std::memory_order_relaxed);
             if (sub != match)
                 return;
@@ -3726,7 +4806,13 @@ struct ProbeGate {
         }
         cv.notify_all();
     }
-    ~ProbeGate() { release(); } // never leave a worker parked past the test
+    ~ProbeGate() {
+        release(); // never leave a worker parked past the test
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (inside.load(std::memory_order_acquire) > 0 &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(1ms);
+    }
 };
 
 std::size_t count_kind(Collector& got, const std::string& key, SparkEventKind kind) {
@@ -3738,7 +4824,1477 @@ std::size_t count_kind(Collector& got, const std::string& key, SparkEventKind ki
     return n;
 }
 
+/// Recorder for the #4340 establishment-signal cases that observe a mechanism's
+/// sinks directly: the establishment sink and the fault callback append here in
+/// dispatch order, so one log shows both the coverage sequence and where a Fault
+/// sits relative to it. Not used by the engine-level cases, which read
+/// SparkEngine::subscription_establishment() instead.
+///
+/// DECLARE IT BEFORE the mechanism or engine whose callbacks capture it. Locals
+/// unwind in reverse declaration order, so a fatal REQUIRE then destroys the
+/// mechanism (joining the thread that calls back) before this state, never after.
+struct EstLog {
+    struct Entry {
+        enum class Kind { Established, Fault } kind{Kind::Established};
+        std::string key;
+        SparkIncarnation incarnation{kNoSparkIncarnation};
+        std::chrono::steady_clock::time_point at{};
+        SparkCoverage coverage{SparkCoverage::None};
+        bool faulted{false};
+    };
+    std::mutex mu;
+    std::vector<Entry> entries;
+    std::vector<Entry> dropped; ///< reports the sink threw on instead of recording (see throw_if)
+    std::size_t calls{0};       ///< sink invocations, delivered or dropped
+
+    /// Optional fault injection, set BEFORE the mechanism starts. Called under
+    /// `mu` with the 1-based invocation number and the report; returning true
+    /// drops the report (it lands in `dropped`, not `entries`) and makes the
+    /// sink throw.
+    std::function<bool(std::size_t, const Entry&)> throw_if;
+    /// Optional stall, set BEFORE the mechanism starts: right after recording
+    /// invocation number `stall_on_call` (1-based; 0 = never) the sink blocks on
+    /// `*stall` until the test releases it. That parks the calling mechanism
+    /// thread off-lock, so a test can change mechanism state between two of its
+    /// passes.
+    std::size_t stall_on_call{0};
+    ParkGate* stall{nullptr};
+
+    SparkEstablishedFn sink() {
+        return [this](const std::string& key, SparkIncarnation inc,
+                      std::chrono::steady_clock::time_point at, SparkCoverage cov) {
+            const Entry e{Entry::Kind::Established, key, inc, at, cov, false};
+            std::size_t n = 0;
+            bool drop = false;
+            {
+                std::lock_guard lk(mu);
+                n = ++calls;
+                drop = throw_if && throw_if(n, e);
+                (drop ? dropped : entries).push_back(e);
+            }
+            if (drop)
+                throw std::runtime_error("injected establishment-sink failure");
+            if (stall && n == stall_on_call)
+                stall->park();
+        };
+    }
+    SparkFaultFn fault_sink() {
+        return [this](const std::string& key, bool faulted, std::string_view) {
+            std::lock_guard lk(mu);
+            entries.push_back({Entry::Kind::Fault, key, kNoSparkIncarnation, {},
+                               SparkCoverage::None, faulted});
+        };
+    }
+    /// Every entry, in dispatch order.
+    std::vector<Entry> all() {
+        std::lock_guard lk(mu);
+        return entries;
+    }
+    /// Only the establishment reports, in dispatch order (the coverage sequence).
+    std::vector<Entry> established() {
+        std::lock_guard lk(mu);
+        std::vector<Entry> out;
+        for (const auto& e : entries)
+            if (e.kind == Entry::Kind::Established)
+                out.push_back(e);
+        return out;
+    }
+    std::size_t established_count() { return established().size(); }
+    /// The reports for one key, in dispatch order.
+    std::vector<Entry> for_key(const std::string& key) {
+        std::vector<Entry> out;
+        for (const auto& e : established())
+            if (e.key == key)
+                out.push_back(e);
+        return out;
+    }
+    /// Delivered reports for `key`, any incarnation and coverage.
+    std::size_t count_key_reports(const std::string& key) { return for_key(key).size(); }
+    /// Delivered reports for `key` under incarnation `inc`, any coverage.
+    std::size_t count(const std::string& key, SparkIncarnation inc) {
+        std::size_t n = 0;
+        for (const auto& e : established())
+            if (e.key == key && e.incarnation == inc)
+                ++n;
+        return n;
+    }
+    /// A delivered report for `key` under `inc` carrying `cov`.
+    bool has(const std::string& key, SparkIncarnation inc, SparkCoverage cov) {
+        for (const auto& e : established())
+            if (e.key == key && e.incarnation == inc && e.coverage == cov)
+                return true;
+        return false;
+    }
+    std::size_t calls_made() {
+        std::lock_guard lk(mu);
+        return calls;
+    }
+    std::vector<Entry> dropped_entries() {
+        std::lock_guard lk(mu);
+        return dropped;
+    }
+};
+
+/// Opens a ParkGate on scope exit. Declare it AFTER the mechanism whose thread
+/// may be parked on the gate: locals unwind in reverse order, so a failed
+/// REQUIRE opens the gate first and the mechanism's stop() can then join that
+/// thread instead of waiting on it forever.
+struct OpenGateOnExit {
+    ParkGate& gate;
+    ~OpenGateOnExit() { gate.release(); }
+};
+
+/// True once `read()` has returned the same value for `quiet` straight, within
+/// `deadline` overall - a bounded "nothing else is coming" check, used where a
+/// persistent throw that were re-staged would keep the value climbing forever.
+template <typename Read>
+bool stable_for(Read read, std::chrono::milliseconds quiet, std::chrono::milliseconds deadline) {
+    auto last = read();
+    auto since = std::chrono::steady_clock::now();
+    const auto until = since + deadline;
+    while (std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(5ms);
+        auto cur = read();
+        if (cur != last) {
+            last = cur;
+            since = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - since >= quiet) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
+
+// ── #4340 (rung 9c PR-6 item 1): Registry establishment-signal ───────────────
+//
+// Mirrors spark_service.cpp's shipped M3 shape (#3840 PR-B3). Every case here
+// only runs on Windows (the real mechanism is Windows-only). RF-1..RF-17 are
+// the Registry establishment-signal cases; the FF- cases further below are the
+// File counterparts (the File section header lists which ones pair up).
+//
+// What the assertions here do and do not pin. The `established_at == stamped`
+// CHECKs in RF-4/6/8 and FF-4/6/8 restate the ENGINE's first-wins latch
+// (SparkEngine::report_established) - they cannot fail on a mechanism defect.
+// The engine side of "a loss and a recovery never re-stamp established_at" is
+// pinned by the cross-platform case "Establishment: a fault-then-recovery cycle
+// does not move established_at (E7)"; the mechanism side (which reports are
+// sent, in which order, under which incarnation) only by the direct-sink cases
+// RF-10/FF-10 and their siblings, which read the mechanism's sink rather than
+// the engine's cache.
+
+TEST_CASE("Registry mechanism (Windows, direct): set_established_sink seals at start(), still "
+          "sealed after stop() (#4340 RF-1)",
+          "[spark][established][windows]") {
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+    CHECK(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->stop();
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {})); // one-way: still sealed after stop()
+}
+
+TEST_CASE("Registry spark (real mechanism): an existing target key reaches Notification "
+          "coverage with a stamped established_at (#4340 RF-2)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_target");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): an absent target watches its ancestor with None "
+          "coverage until the key is created (#4340 RF-3)",
+          "[spark][established][windows]") {
+    ScratchRegKey parent("est_absent_parent");
+    const std::string target = parent.sub + "\\Missing"; // absent at arm time
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", target);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    // Ancestor-mode establishment settles quickly too (the parent exists),
+    // but it must NEVER report Notification for the absent target - only
+    // None, unconditionally, per the mode gate.
+    std::this_thread::sleep_for(300ms);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    // Create the target key - NO value write. The parent's NAME notification
+    // fires; the re-arm resolves to Target and must stamp established_at.
+    OwnedRegKey created(target, KEY_READ); // deleted on scope exit
+    REQUIRE(created.h != nullptr);
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): an absent target under sibling-key churn keeps "
+          "reading None with bounded probe launches and no leaked workers (CH-11, bounded "
+          "regression scenario: 50 paced then 200 unpaced create+delete pairs, not proof of no "
+          "unbounded growth)",
+          "[spark][established][windows][walkoff]") {
+    constexpr int kPacedPairs = 50;
+    constexpr int kBurstPairs = 200;
+    constexpr std::uint64_t kEventsPerPair = 2; // a name change for the create, one for the delete
+    constexpr std::uint64_t kLaunchesPerEvent = 1; // on_fire launches at most one probe per fire
+    constexpr std::uint64_t kPaced = static_cast<std::uint64_t>(kPacedPairs) * kEventsPerPair;
+    constexpr std::uint64_t kBurst = static_cast<std::uint64_t>(kBurstPairs) * kEventsPerPair;
+    ScratchRegKey parent("ch11_parent");
+    const std::string target = parent.sub + "\\Missing"; // never created: Ancestor mode on `parent`
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms; // arm() returns with the watch committed and armed
+        ctl.health_grace = 60000ms;      // keep Fault edges out of the zero-event oracle
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    auto sub = engine.arm(*c, registry_spec("HKCU", target));
+    REQUIRE(sub.has_value());
+
+    const auto snap = [&] { return *registry_debug_counters_for_test(*raw); };
+    const auto idle = [&] { return snap().probe_workers_active == 0; };
+    REQUIRE(eventually(idle, 5000ms));
+
+    bool reading_stable = true;
+    const auto observe = [&] {
+        const auto est = engine.subscription_establishment(*sub);
+        if (!est || est->coverage != SparkCoverage::None || est->established_at)
+            reading_stable = false;
+    };
+    // Pacing only shapes the load: a timed-out wait, or a spent 30 s budget, is not a failure.
+    const auto soak_until = std::chrono::steady_clock::now() + 30s;
+    const auto paced_event = [&](auto&& mutate) {
+        const auto before = snap().probe_launched;
+        mutate();
+        if (std::chrono::steady_clock::now() > soak_until)
+            return;
+        (void)eventually(
+            [&] {
+                const auto d = snap();
+                return d.probe_launched > before && d.probe_workers_active == 0;
+            },
+            2000ms);
+        observe();
+    };
+    const auto settle_and_bound = [&](std::uint64_t events) {
+        REQUIRE(stable_for([&] { return snap().probe_launched; }, 100ms, 5000ms));
+        REQUIRE(eventually(idle, 5000ms));
+        const auto d = snap();
+        const auto retries =
+            d.probe_admission_rejected + d.probe_backend_failed + d.probe_launch_failed;
+        INFO("probe_launched=" << d.probe_launched << " events=" << events
+                               << " retries=" << retries);
+        CHECK(d.probe_launched >= 2); // the noise reached the mechanism
+        CHECK(d.probe_launched <= 1 + kLaunchesPerEvent * events + retries);
+        CHECK(d.synthetic_fires == 0);
+    };
+
+    for (int i = 0; i < kPacedPairs; ++i) {
+        std::unique_ptr<OwnedRegKey> sibling;
+        paced_event([&] {
+            sibling = std::make_unique<OwnedRegKey>(parent.sub + "\\Sib" + std::to_string(i),
+                                                    KEY_READ);
+            REQUIRE(sibling->h != nullptr);
+        });
+        paced_event([&] { sibling.reset(); });
+    }
+    settle_and_bound(kPaced);
+
+    for (int i = kPacedPairs; i < kPacedPairs + kBurstPairs; ++i) {
+        OwnedRegKey sibling(parent.sub + "\\Sib" + std::to_string(i), KEY_READ);
+        REQUIRE(sibling.h != nullptr);
+    }
+    settle_and_bound(kPaced + kBurst);
+
+    CHECK(reading_stable);
+    const auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+    CHECK(got.count() == 0); // Ancestor mode never emits
+    const auto d = snap();
+    CHECK(d.live_watches == 1);
+    CHECK(d.retiring == 0);
+    CHECK(d.drain_backlog == 0);
+    CHECK(d.probe_workers_active == 0);
+    CHECK(d.sweep_pass_failed == 0);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): an ordinary fire leaves a live re-armed watch and "
+          "does not move established_at (#4340 RF-4)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_rearm");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    // RegNotifyChangeKeyValue is one-shot: the write consumes
+    // it, flapping coverage None -> Notification across the re-arm - a genuine
+    // transition the pull query below is not guaranteed to observe mid-flight
+    // (the None and the re-arm's Notification land on consecutive sweep
+    // passes), so this asserts only the settled before/after
+    // states, not the transient None.
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    a.write(1);
+    REQUIRE(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; }, 8000ms));
+    // The post-fire Notification is ALREADY true from the pre-fire cache, so
+    // waiting for it says nothing about the re-arm. What does: one consumed
+    // notify costs the immediate emit PLUS the re-arm commit's synthetic emit,
+    // so once both landed the re-arm has committed - and a SECOND write must
+    // then fire through the re-armed notify (a mechanism that lost the re-arm
+    // would never deliver it).
+    REQUIRE(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) >= before + 2; },
+        8000ms));
+    const auto settled = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    a.write(2);
+    REQUIRE(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > settled; }, 8000ms));
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    // Restates the engine's first-wins latch (see the section header above).
+    CHECK(*est->established_at == stamped);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a parked initial probe leaves coverage None until "
+          "release, then stamps established_at (#4340 RF-5)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_late");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    ProbeGate gate;
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    RegistryMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(a.sub);
+    REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value()); // success-with-pending (the call's local
+                              // discards is never dispatched - only the mark on
+                              // `w` itself, which survives, carries the report)
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    std::this_thread::sleep_for(200ms); // well past the 50 ms caller budget/sweep cadence
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    const auto t_release = std::chrono::steady_clock::now();
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= t_release);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): deleting the target loses coverage without "
+          "re-stamping, recreate restores Notification (#4340 RF-6)",
+          "[spark][established][windows]") {
+    // ScratchRegKey deletes whatever key exists at `sub` on scope exit, so a
+    // failed REQUIRE below never leaks it. Its own handle is closed up front:
+    // the mechanism's watch is then the only open handle, and deleting a key
+    // with another handle still open would leave it pending-deleted (a
+    // re-create would then fail with ERROR_KEY_DELETED).
+    ScratchRegKey key("est_delete");
+    REQUIRE(key.h != nullptr);
+    ::RegCloseKey(key.h);
+    key.h = nullptr;
+    const std::string& sub = key.sub;
+
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = registry_spec("HKCU", sub);
+    auto s = engine.arm(*c, spec);
+    REQUIRE(s.has_value());
+    engine.start();
+
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*s);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*s);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    REQUIRE(::RegDeleteKeyA(HKEY_CURRENT_USER, sub.c_str()) == ERROR_SUCCESS);
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*s);
+            return e.has_value() && e->coverage == SparkCoverage::None;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*s);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // loss of coverage never un-stamps established_at
+
+    HKEY h2 = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr,
+                              &h2, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(h2);
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*s);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        10000ms));
+    est = engine.subscription_establishment(*s);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // still first-wins - recovery never re-stamps
+
+    engine.disarm(*s);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a disarm racing a re-arm (adoption) still lets "
+          "the mechanism report establishment against the fresh incarnation (#4340 RF-7)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_adopt");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Registry, make_registry_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub1 = engine.arm(*c, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub1);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, spec); // dedup: same key -> the engine renews the
+                                           // existing armed_ entry, skipping unwatch()
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+
+    REQUIRE(eventually(
+        [&] {
+            auto est = engine.subscription_establishment(*sub2);
+            return est.has_value() && est->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at); // never predates the adopting arm
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a failed re-arm reports None until the retry "
+          "recovers, established_at unchanged (#4340 RF-8)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_backend_fail");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    // Every re-arm probe of `a` now throws inside the worker (WorkerThrew -> a
+    // backend failure), on a shortened retry schedule - the initial probe
+    // above already succeeded, so only the SECOND (re-arm) probe is affected.
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_hook = [sub_key = a.sub](std::string_view s) {
+            if (s == sub_key)
+                throw std::runtime_error("simulated re-arm failure");
+        };
+        ctl.backend_retry_base = 150ms;
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    a.write(1); // consumes the notify: on_fire marks None; the re-arm probe throws
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::None;
+        },
+        8000ms));
+    REQUIRE(eventually([&] { return engine.stats().armed_faulted == 1; }, 5000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // a fault never un-stamps established_at
+
+    // Clear the hook: the next scheduled retry recovers the watch.
+    {
+        RegistryMechanismTestControls ctl; // null hook clears it; timings unchanged
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    REQUIRE(eventually([&] { return engine.stats().armed_faulted == 0; }, 10000ms));
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // still first-wins
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a fast-committing key armed while the sweeper is idle "
+          "is reported promptly instead of waiting out the idle ceiling (#4340 RF-9)",
+          "[spark][established][windows]") {
+    ScratchRegKey warm("est_fast_warm"), a("est_fast");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    std::atomic<std::size_t> passes{0}; // sweeper passes so far (sweep_hook below)
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    {
+        // A caller budget far above any probe latency, so the key below commits INSIDE
+        // watch_incarnation's own wait - the fast-commit path this case is about - and never
+        // via the published-pending path (which nudges the sweeper separately).
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        ctl.sweep_hook = [&passes] { passes.fetch_add(1, std::memory_order_relaxed); };
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    // Warm-up: arm one key and wait for its report, so the sweeper has run a pass and gone
+    // back to its idle wait (next_wake_locked's 1 h ceiling, nothing due). A key armed
+    // straight after start() can be caught by the sweeper's very first wake computation - its
+    // probe is still Pending then, so the wake is only ~50 ms away - which would hide a
+    // missing nudge entirely.
+    const auto warm_spec = registry_spec("HKCU", warm.sub);
+    auto warm_sub = engine.arm(*c, warm_spec);
+    REQUIRE(warm_sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*warm_sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    // The sweeper is idle once no further pass has started for 300 ms (a bounded observation,
+    // not a bare sleep: a sweeper that never settles fails here instead of hiding the nudge).
+    REQUIRE(stable_for([&] { return passes.load(std::memory_order_relaxed); }, 300ms, 5000ms));
+
+    // The oracle: this key commits inside its own arm() call, marks its report due, and only
+    // the fast-commit nudge in watch_incarnation wakes the idle sweeper to stage it. Without
+    // the nudge the report would wait for the 1 h ceiling and this wait would time out.
+    // `established_at` itself is the mechanism's COMMIT time, so its distance from `armed_at`
+    // measures the probe's latency, not the report's delivery - deliberately not bounded here
+    // (a loaded runner would fail such a bound without any mechanism defect).
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually(
+        [&] {
+            auto est = engine.subscription_establishment(*sub);
+            return est.has_value() && est->coverage == SparkCoverage::Notification;
+        },
+        3000ms));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.disarm(*warm_sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): the establishment sink reports the ordered "
+          "coverage sequence [Notification, None, Notification] against a fixed incarnation, "
+          "and the fire-consumed None is dispatched strictly before the synthetic emit that "
+          "closes the gap (#4340 RF-10)",
+          "[spark][established][windows]") {
+    // Direct (no engine) so a real SparkIncarnation token can be supplied and
+    // every report's identity checked - the engine-level pull query
+    // (subscription_establishment) cannot reliably observe a transient None
+    // mid-flap, and it never exposes dispatch ORDER at
+    // all. Ordering against the SYNTHETIC (resync) emit specifically - not
+    // the immediate on_fire emit, which races the sweeper's own wake on a
+    // different thread and is not deterministically orderable - is proven by
+    // construction here: the ProbeGate below holds the re-arm probe parked,
+    // so commit_locked (the ONLY place that stages the synthetic emit) cannot
+    // have run until AFTER release(), by which point the None report has
+    // already been observed.
+    ScratchRegKey a("est_direct_seq");
+    // Everything a callback or hook below captures is declared BEFORE `mech`:
+    // locals unwind in reverse order, so a fatal REQUIRE must destroy `mech`
+    // (which joins the threads that call back) before this state.
+    ProbeGate gate;
+    EstLog log;
+    std::atomic<int> emits{0};
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+
+    // A caller budget far above any probe latency makes the initial probe
+    // commit deterministically INSIDE watch_incarnation's own wait, so the
+    // sequence below starts at Notification (never a published-pending None).
+    // Set in its own call: scalar controls persist across the later
+    // probe_hook call.
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([&](const std::string&, SparkData) { emits.fetch_add(1, std::memory_order_acq_rel); },
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = registry_spec("HKCU", a.sub);
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+
+    // Initial establishment: Notification, token 42, no emit yet ("an initial
+    // establishment never emits" - matches the existing appearance test).
+    REQUIRE(eventually([&] { return log.established_count() >= 1; }));
+    {
+        const auto seq = log.established();
+        REQUIRE(seq.size() == 1);
+        CHECK(seq[0].incarnation == kToken);
+        CHECK(seq[0].coverage == SparkCoverage::Notification);
+    }
+    CHECK(emits.load() == 0);
+
+    // Park every FUTURE probe of `a` - the re-arm only (the initial one
+    // already resolved above without this hook installed).
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.sub);
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+
+    a.write(1); // consumes the one-shot notify: on_fire marks None and
+                // fires the immediate emit; the re-arm probe launches and parks.
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    REQUIRE(eventually([&] { return log.established_count() >= 2; }, 8000ms));
+    {
+        const auto seq = log.established();
+        CHECK(seq[1].incarnation == kToken);
+        CHECK(seq[1].coverage == SparkCoverage::None);
+    }
+    // The immediate fire is emitted from the TP_WAIT callback thread,
+    // concurrently with the sweeper dispatching the None above, so wait for it
+    // rather than sampling: the baseline below must include it.
+    REQUIRE(eventually([&] { return emits.load(std::memory_order_acquire) >= 1; }, 5000ms));
+    const int emits_while_parked = emits.load(std::memory_order_acquire);
+
+    // The synthetic (resync) emit cannot land while the re-arm stays parked:
+    // established(None) above is therefore dispatched strictly before it.
+    std::this_thread::sleep_for(200ms);
+    CHECK(emits.load(std::memory_order_acquire) == emits_while_parked);
+
+    gate.release();
+    REQUIRE(eventually(
+        [&] { return emits.load(std::memory_order_acquire) > emits_while_parked; }, 5000ms));
+    REQUIRE(eventually([&] { return log.established_count() >= 3; }, 8000ms));
+    {
+        const auto seq = log.established();
+        REQUIRE(seq.size() == 3);
+        CHECK(seq[2].incarnation == kToken);
+        CHECK(seq[2].coverage == SparkCoverage::Notification);
+    }
+
+    mech->stop();
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): an establishment report and an action staged "
+          "in the SAME sweep visit dispatch in established-before-action order (#4340 RF-11)",
+          "[spark][established][windows]") {
+    // RF-10 above pins ordering ACROSS sweep passes only (it parks the re-arm
+    // probe precisely so the None report and the synthetic emit land in
+    // different passes) - a swap of run_off_lock()'s two dispatch loops would
+    // still pass it. This case forces
+    // both into ONE pass, deterministically and without any sleep:
+    //  * the initial probe is parked, so watch_incarnation() returns
+    //    success-with-pending and, in ONE mu_ hold, publishes w->call, marks
+    //    None due and nudges the sweeper;
+    //  * health_grace is 1 ms (far below the 50 ms caller budget already spent
+    //    by then), so the FIRST sweep visit that can see the published call
+    //    finds the grace already blown: within that single visit sweep_locked()
+    //    drains the None marker into work.established (before the switch) and
+    //    then, in the same visit, grace_check_locked()'s faulted_now flip
+    //    stages a Fault action into work.actions;
+    //  * an earlier visit cannot interfere: a Pending watch with no published
+    //    call is a no-op (no grace check, nothing due).
+    // Both entries therefore belong to the same run_off_lock() call, and one
+    // shared, mutex-guarded log records the real dispatch order. A Fault
+    // stands in for an Emit because an Emit is only ever
+    // staged by a commit, which re-marks Notification due strictly AFTER the
+    // drain (never the same visit) - and Fault and Emit share the one
+    // work.actions loop, so this pins the identical established-before-
+    // actions property.
+    ScratchRegKey a("est_same_pass");
+    // Everything a callback or hook below captures is declared BEFORE `mech`
+    // (see EstLog): a fatal REQUIRE must join the mechanism's threads first.
+    ProbeGate gate;
+    EstLog log;
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+
+    REQUIRE(mech->set_established_sink(log.sink()));
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.sub);
+        ctl.health_grace = 1ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {}, log.fault_sink());
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = registry_spec("HKCU", a.sub);
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    REQUIRE(eventually([&] { return log.all().size() >= 2; }, 8000ms));
+    {
+        const auto seq = log.all();
+        CHECK(seq[0].kind == EstLog::Entry::Kind::Established); // established FIRST...
+        CHECK(seq[0].incarnation == kToken);
+        CHECK(seq[0].coverage == SparkCoverage::None);
+        CHECK(seq[1].kind == EstLog::Entry::Kind::Fault); // ...then the same-visit action
+        CHECK(seq[1].faulted);
+    }
+
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            for (const auto& e : log.established())
+                if (e.coverage == SparkCoverage::Notification)
+                    return true;
+            return false;
+        },
+        8000ms));
+
+    mech->stop();
+    CHECK(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+        5000ms));
+}
+
+// ── #4340 establishment signal: failure and race coverage (Registry) ─────────
+//
+// The cases below aim faults at the establishment-report path using only
+// existing seams. Two seam traps apply to every one of them:
+//  * set_registry_test_controls_for_test REPLACES every hook on each call, so
+//    all hooks go in ONE struct (scalars persist across calls);
+//  * everything a hook, sink or stall captures is declared BEFORE `mech`, so a
+//    fatal REQUIRE joins the mechanism's threads before that state is destroyed.
+// emit_bookkeeping_hook is the one deterministic throw-or-park point between a
+// pass staging its reports and dispatching them, but it fires only on a pass
+// that staged a probe LAUNCH. RF-12 and RF-17 therefore line a report and a
+// launch up in ONE pass without any sleep-based positive: a one-slot probe lane
+// held full by a parked probe makes every later watch admission-refused and
+// Deferred, so its retries are launches the sweeper stages on a backoff, and the
+// hook parks the sweeper (off-lock) on the first of them while the test changes
+// what the NEXT pass will stage.
+
+TEST_CASE("Registry mechanism (Windows, direct): a pass that throws AFTER staging an "
+          "establishment report re-delivers it on a later pass, and a sibling's retry is not "
+          "stranded (#4340 RF-12)",
+          "[spark][established][windows]") {
+    // Recipe (see the section comment above for why):
+    //  * lane cap 1 + S's parked probe keep the lane full, so B and B2 are
+    //    admission-refused and Deferred;
+    //  * pass N (B's first retry launch) parks the sweeper in the hook;
+    //  * while it is parked the test ADOPTS A (a watch_incarnation on an existing
+    //    key marks its report due, no probe needed) and registers B2 (due ~50 ms
+    //    later); a lower-bound sleep then guarantees B2 is due, and nothing can
+    //    visit A or B2 because the sweeper is parked;
+    //  * releasing the hook lets pass N finish; the very next pass (N+1) stages A's
+    //    report AND B2's launch, and the hook's second call throws.
+    // unwind_pass_locked must re-mark A's report or it is lost: the marker was
+    // cleared when the report was staged.
+    ScratchRegKey a("est_unwind_a"), s("est_unwind_s"), b("est_unwind_b"), b2("est_unwind_b2");
+    ProbeGate occupy;
+    ParkGate hook_park;
+    std::atomic<int> hook_calls{0};
+    std::atomic<bool> threw{false};
+    EstLog log;
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+    OpenGateOnExit open_hook{hook_park}; // after `mech`: a failed REQUIRE unparks the sweeper first
+
+    // Phase 1: a caller budget far above any probe latency, so A commits inside its own
+    // watch_incarnation call; lane cap 1; health grace out of the way (no Fault noise).
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_lane_cap = 1;
+        ctl.caller_wait_budget = 5000ms;
+        ctl.health_grace = 60000ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kA = 42, kS = 51, kB = 61, kB2 = 62;
+    const auto spec_a = registry_spec("HKCU", a.sub);
+    const auto spec_s = registry_spec("HKCU", s.sub);
+    const auto spec_b = registry_spec("HKCU", b.sub);
+    const auto spec_b2 = registry_spec("HKCU", b2.sub);
+    const std::string key_a = spark_key(spec_a), key_s = spark_key(spec_s),
+                      key_b = spark_key(spec_b), key_b2 = spark_key(spec_b2);
+
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kA).has_value());
+    REQUIRE(eventually([&] { return log.has(key_a, kA, SparkCoverage::Notification); }));
+    REQUIRE(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->probe_workers_active == 0; }, 5000ms));
+
+    // Phase 2: park S's probe (it occupies the one lane slot); short caller budget; fast
+    // admission backoff; the hook parks on its first call and throws on its second.
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_hook = occupy.hook_for(s.sub);
+        ctl.emit_bookkeeping_hook = [&] {
+            const int n = hook_calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (n == 1) {
+                hook_park.park(); // pass N
+            } else if (n == 2) {
+                threw.store(true, std::memory_order_release);
+                throw std::runtime_error("injected failure after a report was staged");
+            }
+        };
+        ctl.caller_wait_budget = 40ms;
+        ctl.admission_backoff_seed = 50ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->watch_incarnation(key_s, spec_s.params, kS).has_value()); // pending: S's probe parks
+    REQUIRE(eventually([&] { return occupy.parked.load() == 1; }, 2000ms));
+    REQUIRE(mech->watch_incarnation(key_b, spec_b.params, kB).has_value()); // lane full: Deferred
+    REQUIRE(hook_park.wait_entered(8000ms)); // pass N (B's first retry launch): sweeper parked
+
+    // While the sweeper is parked: A's report becomes due, B2 becomes due ~50 ms from now.
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kA).has_value());
+    REQUIRE(mech->watch_incarnation(key_b2, spec_b2.params, kB2).has_value());
+    std::this_thread::sleep_for(200ms); // a LOWER bound only: nothing can visit B2 while parked
+    hook_park.release();
+
+    REQUIRE(eventually([&] { return threw.load(std::memory_order_acquire); }, 8000ms));
+    // The report A's adoption staged in the pass that threw must arrive on a later pass.
+    REQUIRE(eventually([&] { return log.count(key_a, kA) >= 2; }, 8000ms));
+
+    // The siblings are not stranded: once S's probe completes the lane frees and every retry
+    // establishes for real.
+    occupy.release();
+    REQUIRE(eventually(
+        [&] {
+            return log.has(key_s, kS, SparkCoverage::Notification) &&
+                   log.has(key_b, kB, SparkCoverage::Notification) &&
+                   log.has(key_b2, kB2, SparkCoverage::Notification);
+        },
+        10000ms));
+    CHECK(log.count(key_a, kA) == 2); // the initial report + exactly one re-delivery
+    CHECK(registry_debug_counters_for_test(*mech)->sweep_pass_failed >= 1);
+
+    mech->stop();
+    CHECK(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->probe_workers_active == 0; }, 5000ms));
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): a throwing establishment sink is contained - "
+          "the drop is counted, the rest of the batch is delivered, the sweeper survives and "
+          "the dropped report is not re-staged (#4340 RF-13)",
+          "[spark][established][windows]") {
+    ScratchRegKey k1("est_thr_1"), k2("est_thr_2"), k3("est_thr_3");
+    ParkGate stall;
+    EstLog log;
+    log.stall_on_call = 1; // the first delivery (k1's initial report) parks the sweeper in the sink
+    log.stall = &stall;
+    log.throw_if = [](std::size_t n, const EstLog::Entry&) { return n == 2; };
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+    OpenGateOnExit open_stall{stall}; // after `mech`: a failed REQUIRE unparks the sweeper first
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    const auto spec1 = registry_spec("HKCU", k1.sub);
+    const auto spec2 = registry_spec("HKCU", k2.sub);
+    const auto spec3 = registry_spec("HKCU", k3.sub);
+    const std::string key1 = spark_key(spec1), key2 = spark_key(spec2), key3 = spark_key(spec3);
+
+    REQUIRE(mech->watch_incarnation(key1, spec1.params, 51).has_value());
+    REQUIRE(stall.wait_entered(8000ms)); // the sweeper is parked INSIDE the sink, off-lock
+    // While it is parked k2 and k3 establish, so both reports are due before its next visit and
+    // are staged as ONE batch: the first of them is delivery #2, which throws.
+    REQUIRE(mech->watch_incarnation(key2, spec2.params, 52).has_value());
+    REQUIRE(mech->watch_incarnation(key3, spec3.params, 53).has_value());
+    stall.release();
+
+    REQUIRE(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->established_failed == 1; }, 8000ms));
+    REQUIRE(eventually([&] { return log.established_count() >= 2; }, 8000ms));
+    const auto dropped = log.dropped_entries();
+    REQUIRE(dropped.size() == 1);
+    // Exactly one of k2/k3 was dropped; the OTHER one, later in the same batch, was delivered.
+    const std::string& dropped_key = dropped[0].key;
+    const std::string& other_key = dropped_key == key2 ? key3 : key2;
+    CHECK((dropped_key == key2 || dropped_key == key3));
+    CHECK(log.count_key_reports(other_key) == 1);
+    CHECK(log.count_key_reports(dropped_key) == 0);
+
+    // The sweeper survived: a later real transition (k1's write consumes its one-shot notify)
+    // still reports - the None, then the re-arm's Notification.
+    k1.write(1);
+    REQUIRE(eventually([&] { return log.for_key(key1).size() >= 3; }, 8000ms));
+
+    // No re-stage: once everything settled nothing else is delivered or attempted, and the
+    // dropped report never shows up later.
+    REQUIRE(stable_for([&] { return log.calls_made(); }, 600ms, 8000ms));
+    CHECK(registry_debug_counters_for_test(*mech)->established_failed == 1);
+    CHECK(log.count_key_reports(dropped_key) == 0);
+    mech->stop();
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): stop() with a staged but unserved None marker "
+          "drops it undispatched and returns once the parked sweeper is released "
+          "(CH-8, characterisation)",
+          "[spark][established][windows]") {
+    struct Ch8 {
+        std::atomic<int> fires{0};
+        std::atomic<bool> stop_returned{false};
+        ParkGate gate;
+        EstLog log;
+    };
+    ScratchRegKey a("est_ch8");
+    const auto st = std::make_shared<Ch8>();
+    auto& gate = st->gate;
+    auto& log = st->log;
+    log.stall_on_call = 1; // the initial Notification report parks the sweeper inside the sink
+    log.stall = &gate;
+    std::unique_ptr<ISparkMechanism> mech = make_registry_mechanism();
+    REQUIRE(mech);
+    ISparkMechanism* const mp = mech.get();
+    std::jthread stopper; // not joinable until the stop() call below
+    OpenGateOnExit open_gate{gate}; // after `stopper`: the gate opens BEFORE the join
+    bool wedged = false;
+    struct LeakIfWedged {
+        std::unique_ptr<ISparkMechanism>& m;
+        std::jthread& t;
+        const bool& wedged;
+        ~LeakIfWedged() {
+            if (wedged) {
+                (void)m.release(); // a stop() that never returns can never be joined
+                t.detach();
+            }
+        }
+    } leak_if_wedged{mech, stopper, wedged};
+
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start(
+        [st](const std::string&, SparkData) { st->fires.fetch_add(1, std::memory_order_acq_rel); },
+        [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kInc = 71;
+    const auto spec = registry_spec("HKCU", a.sub);
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch_incarnation(key, spec.params, kInc).has_value());
+    REQUIRE(gate.wait_entered(8000ms)); // the sweeper is parked INSIDE the sink, off-lock
+    REQUIRE(log.has(key, kInc, SparkCoverage::Notification));
+
+    // on_fire stages the None marker under mu_ before it emits, so a fire that has been
+    // emitted proves the marker is staged; the parked sweeper cannot drain it.
+    a.write(1);
+    REQUIRE(eventually([&] { return st->fires.load(std::memory_order_acquire) >= 1; }, 8000ms));
+    REQUIRE(log.calls_made() == 1);
+
+    stopper = std::jthread([st, mp] {
+        mp->stop();
+        st->stop_returned.store(true, std::memory_order_release);
+    });
+    // watch_incarnation refuses once stop() has set `stopping_`, in the same critical
+    // section as the sweeper's stop flag: stop() is now blocked joining the parked sweeper.
+    REQUIRE(eventually([&] { return !mech->watch_incarnation(key, spec.params, kInc).has_value(); },
+                       5000ms));
+    std::this_thread::sleep_for(300ms);
+    CHECK_FALSE(st->stop_returned.load(std::memory_order_acquire)); // weak: a negative window
+    gate.release();
+    if (!eventually([&] { return st->stop_returned.load(std::memory_order_acquire); }, 10000ms)) {
+        wedged = true;
+        FAIL("stop() did not return within 10 s of the parked sweeper being released");
+    }
+    stopper.join();
+
+    CHECK_FALSE(log.has(key, kInc, SparkCoverage::None));
+    CHECK(log.count(key, kInc) == 1);
+    CHECK(log.calls_made() == 1);
+    CHECK(stable_for([&] { return log.calls_made(); }, 300ms, 3000ms));
+    const auto d = registry_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->live_watches == 0);
+    CHECK(d->established_failed == 0);
+    CHECK(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+        5000ms));
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): a dropped None is never re-sent - the last "
+          "delivered Notification stays (accepted residual) and the sweeper does not spin "
+          "(#4340 RF-14)",
+          "[spark][established][windows]") {
+    // CHARACTERISED, ACCEPTED RESIDUAL: a report the sink throws on is dropped, not re-staged
+    // (re-staging a persistent throw would spin the sweeper). Whatever the engine cached last
+    // therefore stays. Registry heals this on the next mark - every fire's re-arm commit marks
+    // again - so it bites only when no later mark comes: here the target is deleted, the
+    // re-arm resolves to the ancestor (a stable None) and every None is dropped, so the last
+    // delivered value stays Notification although the true coverage is None. The production
+    // engine sink takes only the engine lock and cannot realistically throw. A dropped report
+    // raises no Fault and sets no inert flag, so a consumer's health checks cannot detect it
+    // (see the design doc's consumer preconditions).
+    ScratchRegKey k("est_thr_resid");
+    EstLog log;
+    log.throw_if = [](std::size_t, const EstLog::Entry& e) {
+        return e.coverage == SparkCoverage::None;
+    };
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    const auto spec = registry_spec("HKCU", k.sub);
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch_incarnation(key, spec.params, 61).has_value());
+    REQUIRE(eventually([&] { return log.has(key, 61, SparkCoverage::Notification); }));
+
+    // Close the scratch key's own handle so the mechanism's watch is the only one open, then
+    // delete the target: its one-shot notify fires and the re-arm resolves to the ancestor.
+    ::RegCloseKey(k.h);
+    k.h = nullptr;
+    REQUIRE(::RegDeleteKeyA(HKEY_CURRENT_USER, k.sub.c_str()) == ERROR_SUCCESS);
+    REQUIRE(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->established_failed >= 1; }, 8000ms));
+    // Bounded "nothing else is coming": a re-staged persistent throw would keep this climbing.
+    REQUIRE(stable_for([&] { return log.calls_made(); }, 600ms, 8000ms));
+
+    const auto seq = log.for_key(key);
+    REQUIRE(seq.size() == 1); // only the initial Notification was ever delivered
+    CHECK(seq[0].coverage == SparkCoverage::Notification); // ...and it is stale (accepted residual)
+    const auto dropped = log.dropped_entries();
+    CHECK(registry_debug_counters_for_test(*mech)->established_failed == dropped.size());
+    for (const auto& d : dropped)
+        CHECK(d.coverage == SparkCoverage::None);
+    mech->stop();
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): unwatch() and an orderly stop() report nothing "
+          "(#4340 RF-15)",
+          "[spark][established][windows]") {
+    // Deliberate non-reports: the engine has already erased armed_[key] when unwatch() runs (so a
+    // None would be dropped by identity anyway) and stop() marks no transition. Nothing here can
+    // be waited FOR, so each check is a bounded negative window.
+    ScratchRegKey k1("est_nonrep_1"), k2("est_nonrep_2");
+    EstLog log;
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    const auto spec1 = registry_spec("HKCU", k1.sub);
+    const auto spec2 = registry_spec("HKCU", k2.sub);
+    const std::string key1 = spark_key(spec1), key2 = spark_key(spec2);
+
+    REQUIRE(mech->watch_incarnation(key1, spec1.params, 71).has_value());
+    REQUIRE(mech->watch_incarnation(key2, spec2.params, 72).has_value());
+    REQUIRE(eventually([&] { return log.established_count() >= 2; }));
+
+    mech->unwatch(key1);
+    std::this_thread::sleep_for(500ms);
+    CHECK(log.established_count() == 2); // unwatch() added no report (no None for key1)
+
+    mech->stop();
+    std::this_thread::sleep_for(300ms);
+    CHECK(log.established_count() == 2); // an orderly stop() added none either
+    CHECK(log.for_key(key2).size() == 1);
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): an incarnation rebind on an existing key is "
+          "forward-only - a lower incarnation never replaces a higher one (#4340 RF-16)",
+          "[spark][established][windows]") {
+    ScratchRegKey k("est_rebind");
+    EstLog log;
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    const auto spec = registry_spec("HKCU", k.sub);
+    const std::string key = spark_key(spec);
+
+    // 42 -> 50 (a higher incarnation rebinds), then 50 -> 42 (a lower one must NOT).
+    REQUIRE(mech->watch_incarnation(key, spec.params, 42).has_value());
+    REQUIRE(eventually([&] { return log.for_key(key).size() >= 1; }));
+    REQUIRE(mech->watch_incarnation(key, spec.params, 50).has_value());
+    REQUIRE(eventually([&] { return log.for_key(key).size() >= 2; }));
+    REQUIRE(mech->watch_incarnation(key, spec.params, 42).has_value());
+    REQUIRE(eventually([&] { return log.for_key(key).size() >= 3; }));
+    REQUIRE(stable_for([&] { return log.for_key(key).size(); }, 400ms, 5000ms));
+
+    const auto seq = log.for_key(key);
+    REQUIRE(seq.size() == 3);
+    CHECK(seq[0].incarnation == 42);
+    CHECK(seq[1].incarnation == 50); // forward rebind: the re-report carries the new incarnation
+    CHECK(seq[2].incarnation == 50); // NOT 42: a later, lower incarnation never wins
+    for (const auto& e : seq)
+        CHECK(e.coverage == SparkCoverage::Notification);
+    mech->stop();
+}
+
+
+TEST_CASE("Registry mechanism (Windows, direct): a fire, an unwatch and a re-watch landing "
+          "between a report being staged and dispatched leave the new incarnation clean, and a "
+          "sink that re-enters unwatch()/watch_incarnation() does not deadlock (#4340 RF-17)",
+          "[spark][established][windows]") {
+    // Aimed with the same one-slot-lane recipe as RF-12, but the hook's SECOND call PARKS
+    // instead of throwing: the sweeper then sits with A's incarnation-X report STAGED and not
+    // yet dispatched (off-lock), and the test does what a consumer's arm/disarm churn could:
+    // A fires, A is unwatched, A is re-watched under a fresh incarnation Y. Releasing the
+    // sweeper dispatches the now-stale X report. It reaches a sink that re-enters the
+    // mechanism on a sacrificial key (unwatch + watch_incarnation, both take mu_) - a
+    // #4181-shaped tripwire: if the sink were ever called with mu_ held this deadlocks.
+    //
+    // THE DELIBERATE LEAK. A genuinely wedged sweeper holds mu_ forever, so ~mech's join would
+    // hang the whole test binary. LeakIfWedged therefore leaks the mechanism, but ONLY on a
+    // proven wedge (the re-entry started and did not return within the bound); any other
+    // failure lets ~mech join cleanly once the gates are open. A leaked mechanism's threads may
+    // keep running, so everything they can touch is co-leaked: the sink, the emit callback and
+    // the hooks each hold the shared `Race` block by value (the mechanism owns those
+    // closures, so a leaked mechanism keeps the block alive), and the sink captures its keys
+    // and params by value and the mechanism by raw pointer (valid for as long as the leak is).
+    // Nothing they can reach lives on this test's stack.
+    ScratchRegKey a("est_race_a"), sac("est_race_sac"), s("est_race_s"), b("est_race_b"),
+        b2("est_race_b2");
+    constexpr SparkIncarnation kX = 42, kY = 43, kSac = 80, kS = 51, kB = 61, kB2 = 62;
+    const auto spec_a = registry_spec("HKCU", a.sub);
+    const auto spec_sac = registry_spec("HKCU", sac.sub);
+    const auto spec_s = registry_spec("HKCU", s.sub);
+    const auto spec_b = registry_spec("HKCU", b.sub);
+    const auto spec_b2 = registry_spec("HKCU", b2.sub);
+    const std::string key_a = spark_key(spec_a), key_sac = spark_key(spec_sac),
+                      key_s = spark_key(spec_s), key_b = spark_key(spec_b),
+                      key_b2 = spark_key(spec_b2);
+    struct Race {
+        ProbeGate occupy;
+        ParkGate hook_park1, hook_park2;
+        std::atomic<int> hook_calls{0};
+        std::atomic<int> emits{0};
+        std::atomic<bool> stale_phase{false}, reentered{false}, reentry_done{false},
+            reentry_ok{false};
+        EstLog log;
+    };
+    const auto st = std::make_shared<Race>();
+    auto& log = st->log;
+    auto& occupy = st->occupy;
+    auto& hook_park1 = st->hook_park1;
+    auto& hook_park2 = st->hook_park2;
+    bool wedged = false;
+    std::unique_ptr<ISparkMechanism> mech = make_registry_mechanism();
+    REQUIRE(mech);
+    ISparkMechanism* const mp = mech.get();
+    // Declared AFTER `mech`, so on any exit path they run before ~mech: the leak decision
+    // first, then every gate opens so a parked thread can be joined (or, when leaked, finish).
+    OpenGateOnExit open1{hook_park1}, open2{hook_park2};
+    yuzu::test::ScopeExit open_occupy{[st] { st->occupy.release(); }};
+    struct LeakIfWedged {
+        std::unique_ptr<ISparkMechanism>& m;
+        const bool& wedged;
+        ~LeakIfWedged() {
+            if (wedged)
+                (void)m.release(); // a thread deadlocked inside the sink can never be joined
+        }
+    } leak_if_wedged{mech, wedged};
+
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.probe_lane_cap = 1;
+        ctl.caller_wait_budget = 5000ms;
+        ctl.health_grace = 60000ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    auto record = log.sink();
+    REQUIRE(mech->set_established_sink(
+        [st, mp, record, key_a, key_sac, params_sac = spec_sac.params](
+            const std::string& key, SparkIncarnation inc, std::chrono::steady_clock::time_point at,
+            SparkCoverage cov) {
+            record(key, inc, at, cov);
+            // Only the STALE X report re-enters (the initial establishment must not).
+            if (st->stale_phase.load(std::memory_order_acquire) && key == key_a && inc == kX &&
+                !st->reentered.exchange(true)) {
+                mp->unwatch(key_sac);
+                st->reentry_ok.store(mp->watch_incarnation(key_sac, params_sac, 91).has_value(),
+                                     std::memory_order_release);
+                st->reentry_done.store(true, std::memory_order_release);
+            }
+        }));
+    mech->start(
+        [st](const std::string&, SparkData) { st->emits.fetch_add(1, std::memory_order_acq_rel); },
+        [](const std::string&, bool, std::string_view) {});
+
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kX).has_value());
+    REQUIRE(mech->watch_incarnation(key_sac, spec_sac.params, kSac).has_value());
+    REQUIRE(eventually([&] { return log.established_count() >= 2; }));
+    REQUIRE(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->probe_workers_active == 0; }, 5000ms));
+
+    {
+        RegistryMechanismTestControls ctl;
+        // `st` rides along only to keep the gate alive for as long as any copy of this hook
+        // (a probe worker holds one) exists.
+        ctl.probe_hook = [st, gate_hook = occupy.hook_for(s.sub)](std::string_view sub) {
+            gate_hook(sub);
+        };
+        ctl.emit_bookkeeping_hook = [st] {
+            const int n = st->hook_calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (n == 1)
+                st->hook_park1.park(); // pass N
+            else if (n == 2)
+                st->hook_park2.park(); // pass N+1: A's report staged, not yet dispatched
+        };
+        ctl.caller_wait_budget = 40ms;
+        ctl.admission_backoff_seed = 50ms;
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->watch_incarnation(key_s, spec_s.params, kS).has_value()); // S's probe parks
+    REQUIRE(eventually([&] { return occupy.parked.load() == 1; }, 2000ms));
+    REQUIRE(mech->watch_incarnation(key_b, spec_b.params, kB).has_value()); // lane full: Deferred
+    REQUIRE(hook_park1.wait_entered(8000ms)); // pass N parked
+
+    // While pass N is parked: adopt A under the SAME incarnation (its report becomes due) and
+    // register B2 (due ~50 ms from now, a launch for pass N+1).
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kX).has_value());
+    REQUIRE(mech->watch_incarnation(key_b2, spec_b2.params, kB2).has_value());
+    std::this_thread::sleep_for(200ms); // a LOWER bound only: nothing can visit B2 while parked
+    hook_park1.release();
+    REQUIRE(hook_park2.wait_entered(8000ms)); // pass N+1: [A, X, Notification] staged, undispatched
+
+    // The race: A fires (on_fire marks None - a marker that dies with the watch), A is
+    // unwatched, A is re-watched under Y (the lane is full, so Y is Deferred, not yet
+    // established).
+    const int emits_before = st->emits.load(std::memory_order_acquire);
+    a.write(1);
+    REQUIRE(eventually([&] { return st->emits.load(std::memory_order_acquire) > emits_before; },
+                       5000ms));
+    mech->unwatch(key_a);
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kY).has_value());
+
+    // Dispatch the stale X report: it reaches the re-entering sink.
+    st->stale_phase.store(true, std::memory_order_release);
+    hook_park2.release();
+    if (!eventually([&] { return st->reentry_done.load(std::memory_order_acquire); }, 10000ms)) {
+        // Only a re-entry that STARTED and never returned is a proven wedge. If it never
+        // started, the stale report simply was not dispatched: an ordinary failure, and ~mech
+        // joins cleanly once the gates open.
+        wedged = st->reentered.load(std::memory_order_acquire) &&
+                 !st->reentry_done.load(std::memory_order_acquire);
+        FAIL("the sink's re-entry into unwatch()/watch_incarnation() did not complete within "
+             "10 s ("
+             << (wedged ? "it started and never returned: the sink is being called with the "
+                          "mechanism lock held (#4181 shape)"
+                        : "it never started: the stale report was not dispatched")
+             << ")");
+    }
+    CHECK(st->reentry_ok.load(std::memory_order_acquire));
+
+    // Free the lane: Y, the sacrificial key's re-watch, B and B2 all establish for real.
+    occupy.release();
+    REQUIRE(eventually(
+        [&] {
+            return log.has(key_a, kY, SparkCoverage::Notification) &&
+                   log.has(key_sac, 91, SparkCoverage::Notification) &&
+                   log.has(key_b, kB, SparkCoverage::Notification) &&
+                   log.has(key_b2, kB2, SparkCoverage::Notification);
+        },
+        10000ms));
+
+    // The stale X report was delivered at most once beyond the initial one, and never as
+    // anything but the Notification it was staged as (A's fire-consumed None died with the old
+    // watch, so no X-incarnation None ever appears).
+    CHECK(log.count(key_a, kX) <= 2);
+    for (const auto& e : log.for_key(key_a))
+        if (e.incarnation == kX)
+            CHECK(e.coverage == SparkCoverage::Notification);
+    // Y's own log is unaffected by X: only Y-incarnation reports, ending at Notification.
+    std::vector<EstLog::Entry> y;
+    for (const auto& e : log.for_key(key_a))
+        if (e.incarnation == kY)
+            y.push_back(e);
+    REQUIRE_FALSE(y.empty());
+    CHECK(y.back().coverage == SparkCoverage::Notification);
+
+    mech->stop();
+}
 
 // ── File walkoff (#2012/#3840 PR-B2) ────────────────────────────────────────
 namespace {
@@ -3769,17 +6325,26 @@ struct ScratchDir {
 };
 
 /// Parks every probe whose base directory matches until release(); counts
-/// what it saw. Mirrors ProbeGate above but keyed on File's std::wstring
-/// probe_hook signature (spark_mechanism.hpp's FileMechanismTestControls).
+/// what it saw. Mirrors ProbeGate above (including the `inside` count its destructor waits
+/// on, bounded) but keyed on File's std::wstring probe_hook signature
+/// (spark_mechanism.hpp's FileMechanismTestControls).
 struct FileProbeGate {
     std::mutex mu;
     std::condition_variable cv;
     bool open{false};
     std::atomic<int> parked{0};
     std::atomic<int> seen{0};
+    std::atomic<int> inside{0};
     std::function<void(std::wstring_view)> hook_for(const std::filesystem::path& match_dir) {
         const std::wstring match = match_dir.wstring();
         return [this, match](std::wstring_view dir) {
+            struct Inside {
+                std::atomic<int>& n;
+                explicit Inside(std::atomic<int>& n_) : n(n_) {
+                    n.fetch_add(1, std::memory_order_acq_rel);
+                }
+                ~Inside() { n.fetch_sub(1, std::memory_order_acq_rel); }
+            } inside_scope{inside}; // declared first: destroyed last, after `lk` below
             seen.fetch_add(1, std::memory_order_relaxed);
             if (dir != match)
                 return;
@@ -3795,7 +6360,13 @@ struct FileProbeGate {
         }
         cv.notify_all();
     }
-    ~FileProbeGate() { release(); } // never leave a worker parked past the test
+    ~FileProbeGate() {
+        release(); // never leave a worker parked past the test
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (inside.load(std::memory_order_acquire) > 0 &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(1ms);
+    }
 };
 
 } // namespace
@@ -4079,6 +6650,1014 @@ TEST_CASE("File mechanism (direct): an allocation failure immediately after a co
                         << " (expected >= 1; if this is 0, see the KNOWN SUSPECT note above)");
     CHECK(a_recovered);
     mech->stop();
+}
+
+// ── File worker pass-failure backoff / counter / inert (#4658) ──────────────
+// A worker pass that throws (injected through FileMechanismTestControls::pass_fail_hook, or,
+// for PF-15/PF-15b, through emit_bookkeeping_hook, after the pass has dispatched) must back off
+// on a doubling schedule, be counted, and flip `inert` after three consecutive failures
+// instead of spinning the worker. PF-15/PF-15b pin only that a throw after dispatch is counted
+// and that the episode then closes with no external wake; the backoff schedule itself is
+// pinned by PF-2 and PF-3. Windows-only: spark_file.cpp
+// is `#ifdef _WIN32` end to end. Timing posture: LOWER bounds on elapsed time wherever
+// possible; an upper bound only where the wrong implementation differs by seconds. Where a
+// stalled runner could cross the window an assertion depends on (PF-3's exact-N read, PF-4,
+// PF-5) it degrades to SUCCEED(). The ungated bounds that remain are PF-1's and PF-9's pass
+// counts, their process CPU-time checks (skipped, with a SUCCEED, only when CPU time is
+// unreadable), PF-3's `CHECK_FALSE(inert)` right after watch(), the 2000 ms `recovered` windows
+// in PF-11/PF-12, the `took < 2000` checks in PF-6/PF-8/PF-13, and PF-15/PF-15b's 2000 ms
+// counter and recovery windows plus their 3000/5000 ms waits (throw fired, redelivery,
+// establishment). Each is wide against the correct behaviour (milliseconds to a few hundred
+// ms), so it takes a stall about as long as the window (1.5-2 s for the shortest, up to 3-5 s
+// for the PF-15/PF-15b waits) to false-red one: on the test thread for the checks that read a
+// clock, or starvation of the worker or the whole process for the windows (eventually()
+// re-evaluates at its deadline).
+// Every captured piece of state is declared BEFORE the mechanism so a fatal REQUIRE
+// destroys (and joins) the mechanism before the state its hooks capture.
+namespace {
+
+using PfClock = std::chrono::steady_clock;
+
+long long pf_ms(PfClock::duration d) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+}
+long long pf_ms_since(PfClock::time_point t0) { return pf_ms(PfClock::now() - t0); }
+
+// Local copy of spark_file.cpp's doubled() (anonymous namespace there).
+std::chrono::milliseconds pf_doubled_ms(std::chrono::milliseconds base, unsigned k,
+                                        std::chrono::milliseconds cap) {
+    auto d = base;
+    for (unsigned i = 1; i < k && d < cap; ++i)
+        d *= 2;
+    return std::min(d, cap);
+}
+
+// Upper bound on failed passes in `elapsed_ms` of a 50 ms-base doubling backoff: the passes
+// land at 0, 50, 150, 350, ... ms, so the retries after the first pass number
+// floor(log2(elapsed/50 + 1)). The ratio below drops the +1; the caller-chosen slack (which
+// also covers the first pass) absorbs the difference.
+int pf_pass_bound(long long elapsed_ms, int slack) {
+    const double ratio = std::max(static_cast<double>(elapsed_ms), 50.0) / 50.0;
+    return static_cast<int>(std::floor(std::log2(ratio))) + slack;
+}
+
+// Total CPU (user + kernel) this process has consumed, or -1 if it cannot be read. Used ONLY as
+// an UPPER bound on the worker's burn during a backoff: a worker that busy-loops (a zero-length
+// wait absorbed and re-entered) burns a core, a backed-off one burns ~nothing. Such a loop is
+// invisible to the pass-count bound, because the absorb check keeps the PASSES on schedule.
+// Machine load can only lower what a spinning worker gets, so it can hide a mutant, never cause
+// a false red.
+long long pf_process_cpu_ms() {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user))
+        return -1;
+    const auto to_ms = [](const FILETIME& ft) {
+        ULARGE_INTEGER u;
+        u.LowPart = ft.dwLowDateTime;
+        u.HighPart = ft.dwHighDateTime;
+        return static_cast<long long>(u.QuadPart / 10000ULL); // 100 ns units
+    };
+    return to_ms(kernel) + to_ms(user);
+}
+
+void pf_noop_emit(const std::string&, SparkData) {}
+void pf_noop_fault(const std::string&, bool, std::string_view) {}
+
+// Waits until `passes` (a pass_fail_hook invocation counter) has not moved for `quiet`: every
+// obligation the worker owed has been served and nothing is due but what the test arranged.
+bool pf_wait_no_passes(const std::atomic<int>& passes,
+                       std::chrono::milliseconds quiet = 400ms) {
+    int last = -1;
+    auto stable_since = PfClock::now();
+    return eventually(
+        [&] {
+            const int p = passes.load(std::memory_order_acquire);
+            if (p != last) {
+                last = p;
+                stable_since = PfClock::now();
+                return false;
+            }
+            return PfClock::now() - stable_since >= quiet;
+        },
+        5000ms);
+}
+
+// Stretches the OFF-LOCK tail of a failed worker pass without a production seam: replaces the
+// process default spdlog logger with one that keeps the previous sinks (the lines still reach
+// the console) plus a sink that sleeps `stall` when a payload contains `target`.
+// log_pass_outcome() runs after note_pass_outcome_locked() stamped the backoff deadline, so a
+// stall longer than the backoff leaves that deadline already expired when the worker re-locks.
+// This only works because spdlog is ONE shared image here (spdlog.dll); tests/unit/
+// test_log_capture.hpp warns (#3355) that a default-logger swap may not reach library code, so
+// every user MUST assert hits() > 0 or a test built on it can pass vacuously.
+// Declare it BEFORE the mechanism: the worker logs through the default logger, so the mechanism
+// has to be destroyed (its worker joined) before this restores the previous logger.
+// PRECONDITION: no thread other than the mechanism's own worker may log through spdlog's free
+// functions while an instance is alive. spdlog documents set_default_logger() as unsafe against
+// concurrent free-function calls (they read the default logger through a raw pointer), and the
+// destructor's drop() below frees the logger, so a stray logging thread would be a
+// use-after-free rather than only a data race. Nothing in the tests that use this class starts
+// one (the detached probe workers never log).
+class PfStallLogger {
+public:
+    static constexpr const char* kName = "pf_stall";
+
+    PfStallLogger(std::string target, std::chrono::milliseconds stall)
+        : sink_(std::make_shared<Sink>(std::move(target), stall)),
+          prev_(spdlog::default_logger()) {
+        std::vector<spdlog::sink_ptr> sinks = prev_->sinks();
+        sinks.push_back(sink_);
+        auto logger = std::make_shared<spdlog::logger>(kName, sinks.begin(), sinks.end());
+        logger->set_level(prev_->level());
+        spdlog::set_default_logger(std::move(logger));
+    }
+    ~PfStallLogger() {
+        spdlog::set_default_logger(prev_);
+        // set_default_logger() also REGISTERS the logger under its name; drop it so the registry
+        // does not keep it (and its sink, whose on_hit captures test locals by reference) alive.
+        // Erases by NAME: two instances alive at once would leave the default logger null, so use
+        // one at a time (the tests do).
+        spdlog::drop(kName);
+    }
+    PfStallLogger(const PfStallLogger&) = delete;
+    PfStallLogger& operator=(const PfStallLogger&) = delete;
+
+    /// Payloads that matched `target` (each one slept `stall`).
+    [[nodiscard]] int hits() const { return sink_->hits.load(std::memory_order_acquire); }
+    /// Runs on the logging thread at each match, before the sleep. Set BEFORE the mechanism starts.
+    void set_on_hit(std::function<void()> fn) { sink_->on_hit = std::move(fn); }
+
+private:
+    struct Sink final : spdlog::sinks::base_sink<std::mutex> {
+        Sink(std::string t, std::chrono::milliseconds st) : target(std::move(t)), stall(st) {}
+        void sink_it_(const spdlog::details::log_msg& msg) override {
+            const std::string_view payload(msg.payload.data(), msg.payload.size());
+            if (payload.find(target) == std::string_view::npos)
+                return;
+            // on_hit BEFORE the count: a test that polls hits() >= 1 on another thread can then
+            // always read the snapshots on_hit stored.
+            if (on_hit)
+                on_hit();
+            hits.fetch_add(1, std::memory_order_acq_rel);
+            std::this_thread::sleep_for(stall);
+        }
+        void flush_() override {}
+        std::string target;
+        std::chrono::milliseconds stall;
+        std::atomic<int> hits{0};
+        std::function<void()> on_hit;
+    };
+    std::shared_ptr<Sink> sink_;
+    std::shared_ptr<spdlog::logger> prev_;
+};
+
+// One scenario for a backoff deadline that has EXPIRED by the time the worker is back under
+// mu_ (#4658 PF-11 / PF-12): the deadline is stamped before the off-lock tail of the failed
+// pass (the log line, FilePassWork destruction), so a tail longer than the backoff leaves it in
+// the past. The retry must still run at once; with nothing else due the timeout would be
+// INFINITE, and with a later obligation (a Deferred watch's ~30 s retry) it would be that later
+// deadline. `throws` failures are injected after the watch is established and quiet; the tail
+// of the LAST one is stalled by `stall_target`.
+struct PfStaleDeadline {
+    bool deferred;                     // a Deferred retry ~30 s away is the other obligation
+    unsigned throws;                   // consecutive failed passes to inject
+    std::chrono::milliseconds cadence; // sweep_cadence: the backoffs are cadence, 2x, 4x, ...
+    const char* stall_target;          // log payload whose emission sleeps
+    std::chrono::milliseconds stall;
+    bool inert_at_stall;               // expected stats().inert while that line is being written
+};
+
+void pf_run_stale_deadline(const PfStaleDeadline& sc) {
+    ScratchDir a("pf_stale_deadline");
+    std::atomic<int> faults{0};
+    std::atomic<int> passes{0};
+    std::atomic<int> throws_left{0};
+    std::atomic<int> passes_at_stall{-1};
+    std::atomic<int> inert_at_stall{-1};
+    const std::wstring target_dir_w = a.dir.wstring();
+    PfStallLogger stall_log(sc.stall_target, sc.stall);
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    // apply_test_controls REPLACES every hook on each call, so both installs supply the same set.
+    const auto controls = [&] {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 2000ms; // the probe resolves in microseconds; be generous
+        ctl.sweep_cadence = sc.cadence;
+        if (sc.deferred)
+            ctl.attach_fail_hook = [&](std::wstring_view dir) { return dir == target_dir_w; };
+        ctl.pass_fail_hook = [&] {
+            passes.fetch_add(1, std::memory_order_acq_rel);
+            if (throws_left.load(std::memory_order_acquire) > 0 &&
+                throws_left.fetch_sub(1, std::memory_order_acq_rel) > 0)
+                throw std::bad_alloc{};
+        };
+        return ctl;
+    };
+    // stats() is lock-free, so it is safe to read from the logging (worker) thread.
+    stall_log.set_on_hit([&] {
+        passes_at_stall.store(passes.load(std::memory_order_acquire), std::memory_order_release);
+        inert_at_stall.store(mech->stats().inert ? 1 : 0, std::memory_order_release);
+    });
+    REQUIRE(set_file_test_controls_for_test(*mech, controls()));
+    mech->start(pf_noop_emit, [&](const std::string&, bool, std::string_view) {
+        faults.fetch_add(1, std::memory_order_acq_rel);
+    });
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    if (sc.deferred) {
+        // The health grace reports the deaf watch once; after that only the Deferred retry
+        // (~30 s away) remains.
+        REQUIRE(eventually([&] { return faults.load(std::memory_order_acquire) >= 1; }, 4000ms));
+    }
+    REQUIRE(pf_wait_no_passes(passes)); // established, marker drained: nothing else is due
+    if (sc.deferred)
+        REQUIRE(file_debug_counters_for_test(*mech)->probe_backend_failed >= 1);
+    const int passes_before = passes.load(std::memory_order_acquire);
+    throws_left.store(static_cast<int>(sc.throws), std::memory_order_release);
+    // apply_test_controls nudges run(): the first injected failure starts the episode.
+    REQUIRE(set_file_test_controls_for_test(*mech, controls()));
+    // The stalled line was written: the sink reached the library's logger (a FALSE-GREEN
+    // guard, #3355), and the worker is now sleeping in the off-lock tail past its deadline.
+    REQUIRE(eventually([&] { return stall_log.hits() >= 1; }, 5000ms));
+    const auto t_stall = PfClock::now();
+    CHECK(passes_at_stall.load(std::memory_order_acquire) ==
+          passes_before + static_cast<int>(sc.throws));
+    CHECK(inert_at_stall.load(std::memory_order_acquire) == (sc.inert_at_stall ? 1 : 0));
+    // The retry has to run right after the tail (~stall); a stale deadline would leave it
+    // INFINITE (idle) or on the later obligation (~30 s).
+    const bool recovered = eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return !mech->stats().inert && d->pass_failures_consecutive == 0 &&
+                   d->pass_backoff_ms == 0;
+        },
+        2000ms);
+    INFO("recovery " << pf_ms_since(t_stall) << " ms after the stalled line (stall "
+                     << sc.stall.count() << " ms)");
+    CHECK(recovered);
+    CHECK_FALSE(mech->stats().inert);
+    mech->stop(); // joins the worker: the counters below are then exact
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->pass_failed == sc.throws);
+}
+
+} // namespace
+
+TEST_CASE("File worker (direct): a persistently throwing pass does not spin - the pass count is "
+          "log-bounded by the backoff (#4658 PF-1)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_storm");
+    std::atomic<int> passes{0};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.pass_fail_hook = [&] {
+            passes.fetch_add(1, std::memory_order_relaxed);
+            throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    const auto t0 = PfClock::now();
+    const long long cpu0 = pf_process_cpu_ms();
+    // The directory exists, so the watch establishes inside watch(), marks its coverage report
+    // due and nudges run(). Every pass throws before it can drain that marker: the
+    // self-sustaining wake the backoff has to hold back.
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    std::this_thread::sleep_for(1500ms); // a LOWER bound on the window only
+    const auto elapsed_ms = pf_ms_since(t0);
+    const long long cpu_ms = pf_process_cpu_ms() - cpu0;
+    const int n = passes.load();
+    // Base 50 ms doubling: passes at ~0/50/150/350/750/1550 ms. +4 slack (the first pass, ms
+    // truncation, a tick-early timeout).
+    const int bound = pf_pass_bound(elapsed_ms, 4);
+    INFO("passes=" << n << " elapsed_ms=" << elapsed_ms << " bound=" << bound);
+    CHECK(n >= 2);     // it IS retrying
+    CHECK(n <= bound); // unbacked-off: thousands
+    CHECK(mech->stats().inert); // n >= 3 failed passes by now
+    // The worker is idle between the backed-off passes: no busy loop (a spinning one burns ~a
+    // core, i.e. ~elapsed_ms).
+    INFO("cpu_ms=" << cpu_ms << " over elapsed_ms=" << elapsed_ms);
+    if (cpu0 >= 0 && cpu_ms >= 0)
+        CHECK(cpu_ms < elapsed_ms / 3);
+    else
+        SUCCEED("cpu time unreadable");
+    mech->stop();       // joins the worker: the counters below are then exact, not a racing read
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->pass_failed == static_cast<std::uint64_t>(passes.load()));
+    CHECK(d->pass_failures_consecutive == d->pass_failed);
+}
+
+TEST_CASE("File worker (direct): the k-th consecutive failure waits doubled(sweep_cadence, k, cap) "
+          "(#4658 PF-2)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_growth");
+    std::mutex tm;
+    std::vector<PfClock::time_point> ts;
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 100ms; // a 100 ms base keeps timer-tick slack small against it
+        ctl.pass_fail_hook = [&] {
+            {
+                std::lock_guard lk(tm);
+                ts.push_back(PfClock::now());
+            }
+            throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    // 100 + 200 + 400 + 800 + 1600 ms = 3.1 s to the sixth pass.
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(tm);
+            return ts.size() >= 6;
+        },
+        15000ms));
+    std::vector<PfClock::time_point> snap;
+    {
+        std::lock_guard lk(tm);
+        snap = ts;
+    }
+    for (unsigned k = 1; k <= 5; ++k) {
+        const auto gap = snap[k] - snap[k - 1];
+        const auto want = pf_doubled_ms(100ms, k, 30000ms);
+        INFO("k=" << k << " gap_ms=" << pf_ms(gap) << " want_ms=" << want.count());
+        CHECK(gap >= want - 20ms); // LOWER bound only (timer tick slack)
+    }
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    // The computed schedule, pinned independently of timing.
+    CHECK(d->pass_backoff_ms ==
+          pf_doubled_ms(100ms, static_cast<unsigned>(d->pass_failures_consecutive), 30000ms)
+              .count());
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): inert flips after exactly 3 consecutive failures and clears on "
+          "the first success with no external wake (#4658 PF-3)",
+          "[spark][mechanism][windows][passfail]") {
+    // Template: the Registry sweeper's sre6-1 inert test.
+    ScratchDir a("pf_inert");
+    std::atomic<bool> failing{true};
+    std::atomic<int> throws{0};
+    std::atomic<int> fired{0};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        // Failures at ~0, +0.5 s, +1.5 s: wide gaps make the exact-N read robust.
+        ctl.sweep_cadence = 500ms;
+        ctl.pass_fail_hook = [&] {
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([&](const std::string&, SparkData) { fired.fetch_add(1); }, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    CHECK_FALSE(mech->stats().inert); // one failure at most: 3 need >= 1.5 s
+    REQUIRE(eventually([&] { return mech->stats().inert; }, 10000ms));
+    const auto t_inert_seen = PfClock::now();
+    {
+        const auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        INFO("pass_failed=" << d->pass_failed);
+        CHECK(d->pass_failed >= 3);
+        // Exact N: the fourth failure lands ~2 s after the flip (the backoff after the third is
+        // 2 s), so N = 4 cannot hide behind a range. Gated: a test thread stalled past that
+        // window degrades to SUCCEED.
+        if (pf_ms_since(t_inert_seen) < 1000) {
+            CHECK(d->pass_failed == 3);
+            CHECK(throws.load(std::memory_order_acquire) == 3);
+        } else {
+            SUCCEED("window missed on a loaded runner");
+        }
+        CHECK(d->pass_failures_consecutive == d->pass_failed);
+        CHECK(d->pass_backoff_ms ==
+              pf_doubled_ms(500ms, static_cast<unsigned>(d->pass_failures_consecutive), 30000ms)
+                  .count());
+    }
+    failing.store(false, std::memory_order_release);
+    // NO nudge, NO write from here: recovery has to come from the retry the open episode itself
+    // schedules for its deadline (the coverage marker is still due).
+    REQUIRE(eventually([&] { return !mech->stats().inert; }, 15000ms));
+    {
+        const auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->pass_failures_consecutive == 0);
+        CHECK(d->pass_backoff_ms == 0);
+        CHECK(d->pass_failed >= 3);
+        // The worker is idle again: every hook throw was one counted failed pass.
+        CHECK(throws.load(std::memory_order_acquire) == static_cast<int>(d->pass_failed));
+    }
+    const int before = fired.load();
+    a.write("after recovery");
+    CHECK(eventually([&] { return fired.load() > before; }, 8000ms)); // the watch is live
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): a real completion recovering a pass mid-backoff resets the "
+          "deadline, so the next nudge is served promptly (#4658 PF-4)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_reset");
+    EstLog log;
+    std::atomic<bool> failing{true};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 5000ms; // one failure => a 5 s deadline
+        ctl.pass_fail_hook = [&] {
+            if (failing.load(std::memory_order_acquire))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec_a = file_spec(a.file.string());
+    const std::string key_a = spark_key(spec_a);
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, 1).has_value());
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                       5000ms));
+    const auto t_fail = PfClock::now(); // the deadline is ~t_fail + 5 s
+    failing.store(false, std::memory_order_release);
+    a.write("real completion during backoff"); // NOT absorbed: a full pass, and it succeeds
+    REQUIRE(eventually(
+        [&] { return file_debug_counters_for_test(*mech)->pass_failures_consecutive == 0; },
+        5000ms));
+    // Now a nudge plus a report: a second key joining the same directory.
+    const auto spec_b = file_spec((a.dir / "other.txt").string());
+    const std::string key_b = spark_key(spec_b);
+    const auto t_join = PfClock::now();
+    const auto join_offset_ms = pf_ms(t_join - t_fail);
+    REQUIRE(mech->watch_incarnation(key_b, spec_b.params, 2).has_value());
+    const bool prompt =
+        eventually([&] { return log.has(key_b, 2, SparkCoverage::Notification); }, 2000ms);
+    INFO("join report after " << pf_ms_since(t_join) << " ms; join at t_fail+" << join_offset_ms
+                              << " ms, a stale deadline would be at t_fail+5000 ms");
+    if (join_offset_ms < 2500)
+        CHECK(prompt); // a stale deadline is >= 2.5 s away: it cannot be served in 2 s
+    else
+        SUCCEED("window missed on a loaded runner; the assertion cannot distinguish a stale "
+                "deadline here");
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): control wakes during a backoff are absorbed - nudges do not run "
+          "passes (#4658 PF-5)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_absorb");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 5000ms;
+        ctl.pass_fail_hook = [] { throw std::bad_alloc{}; };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec_a = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                       5000ms));
+    const auto t_fail = PfClock::now();
+    const auto before = file_debug_counters_for_test(*mech)->pass_failed;
+    for (int i = 0; i < 5; ++i) { // five joins in the same directory: five nudges
+        const auto spec_i = file_spec((a.dir / ("k" + std::to_string(i) + ".txt")).string());
+        REQUIRE(mech->watch(spark_key(spec_i), spec_i.params).has_value());
+    }
+    std::this_thread::sleep_for(200ms); // time for an un-absorbed nudge to run a pass
+    const auto after = file_debug_counters_for_test(*mech)->pass_failed;
+    INFO("pass_failed before=" << before << " after=" << after);
+    // t_fail is taken AFTER the failure was observed, so the real retry deadline (failure time +
+    // 5000 ms) can be earlier than t_fail + 5000 ms. Gate tightly so a stalled runner degrades
+    // to SUCCEED instead of comparing counters across a legitimate retry pass.
+    if (pf_ms_since(t_fail) < 2500)
+        CHECK(after == before); // no absorb: +5
+    else
+        SUCCEED("window missed on a loaded runner");
+    mech->stop(); // also exercises a prompt stop during the backoff
+}
+
+TEST_CASE("File worker (direct): stop() during a backoff returns promptly (#4658 PF-6)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_stop");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 5000ms;
+        ctl.pass_fail_hook = [] { throw std::bad_alloc{}; };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                       5000ms));
+    const auto t = PfClock::now();
+    mech->stop();
+    const auto took = pf_ms_since(t);
+    INFO("stop() took " << took << " ms during a 5 s backoff");
+    CHECK(took < 2000); // a Sleep-based backoff would take >= 4.8 s
+}
+
+TEST_CASE("File worker (direct): a single transient failure with nothing else due still retries "
+          "at the deadline and recovers (#4658 PF-7)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_idle_retry");
+    EstLog log;
+    std::atomic<int> throws_left{1};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch_incarnation(key, spec.params, 1).has_value());
+    // The establishment pass has run and reported its coverage, which drains the marker: NOTHING
+    // is due any more.
+    REQUIRE(eventually([&] { return log.has(key, 1, SparkCoverage::Notification); }, 5000ms));
+    {
+        FileMechanismTestControls ctl; // apply_test_controls nudges run(): that pass throws once
+        ctl.pass_fail_hook = [&] {
+            if (throws_left.fetch_sub(1, std::memory_order_acq_rel) > 0)
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed == 1; },
+                       5000ms));
+    // No nudge, no write, no marker: the ONLY thing that can run the recovery pass is the open
+    // episode scheduling its own retry.
+    CHECK(eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return d->pass_failures_consecutive == 0 && d->pass_backoff_ms == 0;
+        },
+        5000ms));
+    CHECK_FALSE(mech->stats().inert);
+    CHECK(file_debug_counters_for_test(*mech)->pass_failed == 1);
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): the retry after a failed pass runs at the backoff deadline even "
+          "when the only other obligation is much later (#4658 PF-10)",
+          "[spark][mechanism][windows][passfail]") {
+    // A watch whose attach fails is Deferred with next_retry_at ~30 s away (the default
+    // backend_retry_base, first attempt), and once its health fault is reported that is the ONLY
+    // obligation the worker has. A transient failed pass then owes a retry at its own ~100 ms
+    // backoff deadline. wait_timeout_locked() combines producers with min(), so a retry
+    // scheduled as max(wake, deadline) would land on that later Deferred deadline (~30 s): the
+    // log promises "retrying in 100 ms" while the retry, and with it any further failure count
+    // and the inert flip, waits for the unrelated obligation. The retry is the wake itself
+    // (the deadline). Correct ~100-200 ms, the bug ~30 s.
+    ScratchDir a("pf_later_deadline");
+    std::atomic<int> faults{0};
+    std::atomic<int> passes{0};
+    std::atomic<int> throws_left{0};
+    const std::wstring target_dir_w = a.dir.wstring();
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    // apply_test_controls REPLACES every hook on each call, so both installs supply the same set.
+    const auto controls = [&] {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 2000ms; // the probe resolves in microseconds; be generous
+        ctl.sweep_cadence = 100ms;
+        ctl.attach_fail_hook = [&](std::wstring_view dir) { return dir == target_dir_w; };
+        ctl.pass_fail_hook = [&] {
+            passes.fetch_add(1, std::memory_order_acq_rel);
+            if (throws_left.load(std::memory_order_acquire) > 0 &&
+                throws_left.fetch_sub(1, std::memory_order_acq_rel) > 0)
+                throw std::bad_alloc{};
+        };
+        return ctl;
+    };
+    REQUIRE(set_file_test_controls_for_test(*mech, controls()));
+    mech->start(pf_noop_emit, [&](const std::string&, bool, std::string_view) {
+        faults.fetch_add(1, std::memory_order_acq_rel);
+    });
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    // The health grace reports the deaf watch once; after that only the Deferred retry remains.
+    REQUIRE(eventually([&] { return faults.load(std::memory_order_acquire) >= 1; }, 4000ms));
+    {
+        int last = -1;
+        auto stable_since = PfClock::now();
+        REQUIRE(eventually(
+            [&] {
+                const int p = passes.load(std::memory_order_acquire);
+                if (p != last) {
+                    last = p;
+                    stable_since = PfClock::now();
+                    return false;
+                }
+                return PfClock::now() - stable_since >= 400ms;
+            },
+            5000ms)); // no pass for 400 ms: nothing is due but the ~30 s retry
+    }
+    REQUIRE(file_debug_counters_for_test(*mech)->probe_backend_failed >= 1);
+    throws_left.store(1, std::memory_order_release);
+    const auto t_throw = PfClock::now();
+    // apply_test_controls nudges run(): that pass throws once.
+    REQUIRE(set_file_test_controls_for_test(*mech, controls()));
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed == 1; },
+                       5000ms));
+    // Nothing else is due until ~30 s, so only the episode's own retry can run the recovery pass.
+    const bool recovered = eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return d->pass_failures_consecutive == 0 && d->pass_backoff_ms == 0;
+        },
+        10000ms);
+    INFO("recovery after " << pf_ms_since(t_throw)
+                           << " ms (retry deadline ~100 ms, Deferred deadline ~30000 ms)");
+    CHECK(recovered);
+    CHECK_FALSE(mech->stats().inert);
+    CHECK(file_debug_counters_for_test(*mech)->pass_failed == 1);
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): a backoff deadline already expired when the failed pass's "
+          "off-lock tail ends still retries at once and clears inert, nothing else due "
+          "(#4658 PF-11)",
+          "[spark][mechanism][windows][passfail]") {
+    // Three injected failures at the production 50 ms cadence (backoffs 50/100/200 ms); the
+    // flip line of the third is written 400 ms late, so its 200 ms deadline is 200 ms stale.
+    pf_run_stale_deadline({.deferred = false,
+                           .throws = 3,
+                           .cadence = 50ms,
+                           .stall_target = "failing persistently",
+                           .stall = 400ms,
+                           .inert_at_stall = true});
+}
+
+TEST_CASE("File worker (direct): a backoff deadline already expired when the failed pass's "
+          "off-lock tail ends still retries at once, not at a later obligation (#4658 PF-12)",
+          "[spark][mechanism][windows][passfail]") {
+    // PF-10's state (a Deferred watch ~30 s away is the only other obligation) with one injected
+    // failure at cadence 100 ms; its "consecutive #1" line is written 300 ms late, so the 100 ms
+    // deadline is stale and the wake would slip to the Deferred deadline.
+    pf_run_stale_deadline({.deferred = true,
+                           .throws = 1,
+                           .cadence = 100ms,
+                           .stall_target = "consecutive #1",
+                           .stall = 300ms,
+                           .inert_at_stall = false});
+}
+
+TEST_CASE("File worker (direct): watch() of a second directory returns within budget while the "
+          "worker is in a failure episode (#4658 PF-8)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_lat_a"), b("pf_lat_b");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.pass_fail_hook = [] { throw std::bad_alloc{}; };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec_a = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+    REQUIRE(eventually([&] { return mech->stats().inert; }, 10000ms)); // >= 3 failures
+    const auto spec_b = file_spec(b.file.string());
+    const auto t = PfClock::now();
+    REQUIRE(mech->watch(spark_key(spec_b), spec_b.params).has_value());
+    const auto took = pf_ms_since(t);
+    INFO("watch(B) took " << took << " ms during the failure episode");
+    CHECK(took < 2000);
+    mech->stop();
+
+    // Phase 2: a sleep (or any lock held) across the backoff is invisible at the 50 ms cadence
+    // above, where the backoff is only ~200 ms when inert is seen. A 5 s cadence makes it seconds.
+    ScratchDir c("pf_lat_c"), d("pf_lat_d");
+    auto slow = make_file_mechanism();
+    REQUIRE(slow != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 5000ms;
+        ctl.pass_fail_hook = [] { throw std::bad_alloc{}; };
+        REQUIRE(set_file_test_controls_for_test(*slow, std::move(ctl)));
+    }
+    slow->start(pf_noop_emit, pf_noop_fault);
+    const auto spec_c = file_spec(c.file.string());
+    REQUIRE(slow->watch(spark_key(spec_c), spec_c.params).has_value());
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*slow)->pass_failed >= 1; },
+                       5000ms));
+    const auto spec_d = file_spec(d.file.string());
+    const auto t_slow = PfClock::now();
+    REQUIRE(slow->watch(spark_key(spec_d), spec_d.params).has_value());
+    const auto took_slow = pf_ms_since(t_slow);
+    INFO("watch(D) took " << took_slow << " ms during a 5 s backoff");
+    CHECK(took_slow < 2000);
+    slow->stop();
+}
+
+TEST_CASE("File worker (direct): a real completion during a failure episode keeps the watch "
+          "armed and the pass rate stays bounded (#4658 PF-9)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_completion");
+    std::atomic<bool> failing{true};
+    std::atomic<int> passes{0};
+    std::atomic<int> throws{0};
+    std::atomic<int> fired{0};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.pass_fail_hook = [&] {
+            passes.fetch_add(1);
+            if (failing.load(std::memory_order_acquire)) {
+                throws.fetch_add(1);
+                throw std::bad_alloc{};
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([&](const std::string&, SparkData) { fired.fetch_add(1); }, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    REQUIRE(eventually([&] { return mech->stats().inert; }, 10000ms));
+    const auto t0 = PfClock::now();
+    const long long cpu0 = pf_process_cpu_ms();
+    const int p0 = passes.load();
+    // A real completion: a full pass that throws; the unwind reissues the read and re-marks the
+    // directory needs_resync, a due-now clause the backoff must defer to its deadline too.
+    a.write("change during the episode");
+    std::this_thread::sleep_for(1500ms);
+    const int p1 = passes.load();
+    const auto el = pf_ms_since(t0);
+    const long long cpu_ms = pf_process_cpu_ms() - cpu0;
+    // One pass for the completion plus log-bounded retries.
+    const int bound = pf_pass_bound(el, 5);
+    INFO("passes during " << el << " ms after the write: " << (p1 - p0) << " bound=" << bound);
+    CHECK(p1 - p0 <= bound);
+    // No busy loop on the needs_resync clause either (a due-now wake left ungated would spin the
+    // worker on zero-length waits without running a single extra pass).
+    INFO("cpu_ms=" << cpu_ms << " over el=" << el);
+    if (cpu0 >= 0 && cpu_ms >= 0)
+        CHECK(cpu_ms < el / 3);
+    else
+        SUCCEED("cpu time unreadable");
+    failing.store(false, std::memory_order_release);
+    // The backoff may have grown to several seconds by now.
+    REQUIRE(eventually([&] { return !mech->stats().inert; }, 40000ms));
+    std::this_thread::sleep_for(300ms); // let any recovery-time resync fire land before sampling
+    const int before = fired.load();
+    a.write("after recovery");
+    CHECK(eventually([&] { return fired.load() > before; }, 8000ms)); // the read was reissued
+    mech->stop(); // joins the worker: the counters below are then exact
+    // Every hook throw was one failed pass and the real completion's pass is one of them, so a
+    // real-completion branch that stops recording its outcome leaves pass_failed short.
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    INFO("pass_failed=" << d->pass_failed << " throws=" << throws.load());
+    CHECK(d->pass_failed == static_cast<std::uint64_t>(throws.load()));
+}
+
+TEST_CASE("File worker (direct): the retry backoff is capped at 30 s and stop() does not wait "
+          "for it (#4658 PF-13)",
+          "[spark][mechanism][windows][passfail]") {
+    // sweep_cadence 40 s: the first failure's backoff is already at the 30 s cap
+    // (kFileAdmissionBackoffCap). A cap swapped for the 300 s backend one would read 40 s.
+    ScratchDir a("pf_cap");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 40000ms;
+        ctl.pass_fail_hook = [] { throw std::bad_alloc{}; };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(pf_noop_emit, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    REQUIRE(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                       5000ms));
+    {
+        const auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->pass_backoff_ms == 30000);
+        CHECK(d->pass_failures_consecutive == 1);
+    }
+    CHECK_FALSE(mech->stats().inert); // one failure of three
+    const auto t = PfClock::now();
+    mech->stop();
+    const auto took = pf_ms_since(t);
+    INFO("stop() took " << took << " ms during a 30 s backoff");
+    CHECK(took < 2000);
+}
+
+TEST_CASE("File worker (direct): a worker that never fails keeps every pass-failure counter at "
+          "zero and inert false through ordinary traffic (#4658 PF-14)",
+          "[spark][mechanism][windows][passfail]") {
+    ScratchDir a("pf_healthy");
+    std::atomic<int> passes{0};
+    std::atomic<int> fired{0};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl; // counts passes, never throws
+        ctl.pass_fail_hook = [&] { passes.fetch_add(1, std::memory_order_acq_rel); };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([&](const std::string&, SparkData) { fired.fetch_add(1); }, pf_noop_fault);
+    const auto spec = file_spec(a.file.string());
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch(key, spec.params).has_value());
+    REQUIRE(pf_wait_no_passes(passes, 200ms)); // established, read armed
+    a.write("first");
+    REQUIRE(eventually([&] { return fired.load() >= 1; }, 5000ms));
+    const int after_first = fired.load();
+    a.write("second");
+    REQUIRE(eventually([&] { return fired.load() > after_first; }, 5000ms));
+    mech->unwatch(key);
+    REQUIRE(pf_wait_no_passes(passes, 200ms));
+    CHECK(passes.load() > 0); // the hook ran, so passes did happen
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->pass_failed == 0);
+    CHECK(d->pass_failures_consecutive == 0);
+    CHECK(d->pass_backoff_ms == 0);
+    CHECK_FALSE(mech->stats().inert);
+    mech->stop();
+}
+
+TEST_CASE("File worker (direct): a throw after dispatched == true is counted and the episode "
+          "closes with no external wake (#4658 PF-15)",
+          "[spark][mechanism][windows][passfail]") {
+    // Every other failure-injecting PF case throws from pass_fail_hook, which fires BEFORE run()
+    // sets `dispatched`. This one throws AFTER it: emit_bookkeeping_hook fires inside
+    // run_off_lock() once the pass has launched a probe, and the catch in run() must still count
+    // the pass (`ok = false` whatever `dispatched` says). A catch that only counted pre-dispatch
+    // failures would leave pass_failed at 0. Mechanics copied from the existing walkoff scenario
+    // in which an ordinary Emit notice is left Outcome::Unattempted by a same-pass run_off_lock
+    // failure: B's real write stages a notice, a forced reissue failure (real_rearm_fail_hook)
+    // stages a probe launch in the same real-completion pass, and the launch fires the
+    // bookkeeping hook. This is the real-completion catch; PF-15b is the control-wake/timeout
+    // one.
+    ScratchDir b("pf_after_dispatch");
+    EstLog log;
+    std::atomic<bool> rearm_armed{false};
+    std::atomic<int> rearm_hits{0};
+    std::atomic<bool> hook_armed{false};
+    std::atomic<int> hook_hits{0};
+    std::atomic<int> passes{0};
+    std::atomic<int> b_delivered{0};
+    const std::wstring b_dir_w = b.dir.wstring();
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.backend_retry_base = 20ms;
+        ctl.sweep_cadence = 10ms; // keeps the retry after the injected failure prompt
+        // Counts passes for the quiescence wait; never throws.
+        ctl.pass_fail_hook = [&] { passes.fetch_add(1, std::memory_order_acq_rel); };
+        ctl.real_rearm_fail_hook = [&](std::wstring_view dir) {
+            if (dir == b_dir_w && rearm_armed.exchange(false, std::memory_order_acq_rel)) {
+                rearm_hits.fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+            return false;
+        };
+        ctl.emit_bookkeeping_hook = [&] {
+            hook_hits.fetch_add(1, std::memory_order_acq_rel);
+            if (hook_armed.exchange(false, std::memory_order_acq_rel))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start(
+        [&](const std::string& key, SparkData) {
+            if (key == "B")
+                b_delivered.fetch_add(1, std::memory_order_acq_rel);
+        },
+        pf_noop_fault);
+    REQUIRE(mech->watch_incarnation("B", file_spec(b.file.string()).params, 1).has_value());
+    // Tied to B's actual establishment (its coverage was reported), so a worker starved before
+    // its first pass cannot let the arm below precede it; then nothing else is due.
+    REQUIRE(eventually([&] { return log.has("B", 1, SparkCoverage::Notification); }, 5000ms));
+    REQUIRE(pf_wait_no_passes(passes, 200ms));
+    const int hook_before = hook_hits.load(std::memory_order_acquire);
+    rearm_armed.store(true, std::memory_order_release);
+    hook_armed.store(true, std::memory_order_release);
+    b.write("change");
+    // The throw actually fired (the hook was reached AFTER the arm and consumed it), on the pass
+    // that also took the forced reissue failure.
+    REQUIRE(eventually(
+        [&] {
+            return rearm_hits.load(std::memory_order_acquire) >= 1 &&
+                   hook_hits.load(std::memory_order_acquire) > hook_before &&
+                   !hook_armed.load(std::memory_order_acquire);
+        },
+        3000ms));
+    // The failed pass is counted...
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                     2000ms));
+    // The episode closes with NO further watch()/apply_test_controls(). The predicate holds
+    // after any later successful pass (the retry at the deadline, which PF-3 and PF-7 pin, or a
+    // real completion, which is never absorbed), so it shows the episode ended, not which pass
+    // ended it.
+    CHECK(eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return d->pass_failures_consecutive == 0 && d->pass_backoff_ms == 0 &&
+                   !mech->stats().inert;
+        },
+        2000ms));
+    CHECK(eventually([&] { return b_delivered.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    mech->stop(); // joins the worker: the counters below are then exact
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    INFO("pass_failed=" << d->pass_failed << " consecutive=" << d->pass_failures_consecutive);
+    CHECK(d->pass_failed == 1); // the one injected throw, counted once
+    CHECK(d->pass_failures_consecutive == 0);
+}
+
+TEST_CASE("File worker (direct): a throw after dispatched == true in a timer-driven pass is "
+          "counted and the episode closes with no external wake (#4658 PF-15b)",
+          "[spark][mechanism][windows][passfail]") {
+    // PF-15 reaches run()'s real-completion catch; this reaches the OTHER one, in the
+    // control-wake/timeout branch, which has its own `ok = false;`. B's first attach is failed
+    // (attach_fail_hook), which leaves it Deferred on the backend retry (100 ms). The retry is
+    // due in a timer-driven pass (no completion is involved: B's read was never attached), whose
+    // sweep stages a probe launch; run_off_lock() launches it and fires emit_bookkeeping_hook,
+    // armed BEFORE the watch so that launch is the first the hook ever sees. That throw is after
+    // `dispatched = true`. The unwind keeps the launched probe, which then resolves, attaches
+    // (the hook fails only the first attach) and establishes B.
+    ScratchDir b("pf_after_dispatch_timer");
+    EstLog log;
+    std::atomic<bool> attach_armed{true};
+    std::atomic<int> attach_hits{0};
+    std::atomic<bool> hook_armed{true};
+    std::atomic<int> hook_hits{0};
+    const std::wstring b_dir_w = b.dir.wstring();
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 2000ms; // the first probe resolves inside watch(), not in a pass
+        ctl.backend_retry_base = 100ms;
+        ctl.sweep_cadence = 10ms; // keeps the retry after the injected failure prompt
+        ctl.attach_fail_hook = [&](std::wstring_view dir) {
+            if (dir == b_dir_w && attach_armed.exchange(false, std::memory_order_acq_rel)) {
+                attach_hits.fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+            return false;
+        };
+        ctl.emit_bookkeeping_hook = [&] {
+            hook_hits.fetch_add(1, std::memory_order_acq_rel);
+            if (hook_armed.exchange(false, std::memory_order_acq_rel))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start(pf_noop_emit, pf_noop_fault);
+    REQUIRE(mech->watch_incarnation("B", file_spec(b.file.string()).params, 1).has_value());
+    // The attach failed and the Deferred retry's launch then reached the hook and consumed it.
+    REQUIRE(eventually(
+        [&] {
+            return attach_hits.load(std::memory_order_acquire) >= 1 &&
+                   hook_hits.load(std::memory_order_acquire) >= 1 &&
+                   !hook_armed.load(std::memory_order_acquire);
+        },
+        5000ms));
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->pass_failed >= 1; },
+                     2000ms));
+    // No watch()/apply_test_controls() from here: the episode closes by itself (the predicate
+    // holds after any later successful pass; PF-3 and PF-7 pin the retry at the deadline).
+    CHECK(eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*mech);
+            return d->pass_failures_consecutive == 0 && d->pass_backoff_ms == 0 &&
+                   !mech->stats().inert;
+        },
+        2000ms));
+    // The probe launched by the failed pass survived its unwind and B ended up established.
+    CHECK(eventually([&] { return log.has("B", 1, SparkCoverage::Notification); }, 3000ms));
+    mech->stop(); // joins the worker: the counters below are then exact
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    INFO("pass_failed=" << d->pass_failed << " consecutive=" << d->pass_failures_consecutive);
+    CHECK(d->pass_failed == 1); // the one injected throw, counted once
+    CHECK(d->pass_failures_consecutive == 0);
 }
 
 TEST_CASE("File spark (real mechanism): a change during the INITIAL establishment window, with a "
@@ -4887,6 +8466,1484 @@ TEST_CASE("File spark (real mechanism): a shared-ancestor storm keeps concurrent
         },
         5000ms));
     engine.stop();
+}
+
+// ── #4340 (rung 9c PR-6 item 1): File establishment-signal ───────────────────
+//
+// Mirrors the Registry RF- cases above and spark_service.cpp's shipped M3
+// shape. Every case here only runs on Windows. File does NOT lose coverage on
+// an ordinary fire (the reissue is synchronous, unlike Registry's one-shot
+// RegNotifyChangeKeyValue), so FF-4/FF-10 use a parent-delete+recreate cycle /
+// a forced notify_fail_hook loss respectively, never a plain write, to
+// exercise a genuine coverage transition.
+
+TEST_CASE("File mechanism (Windows, direct): set_established_sink seals at start(), still "
+          "sealed after stop() (#4340 FF-1)",
+          "[spark][established][windows]") {
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    CHECK(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->stop();
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {})); // one-way: still sealed after stop()
+}
+
+TEST_CASE("File spark (real mechanism): an existing parent dir reaches Notification coverage "
+          "with a stamped established_at (#4340 FF-2)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_target");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = file_spec(a.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): an absent parent dir watches its ancestor with None "
+          "coverage until it is created (#4340 FF-3)",
+          "[spark][established][windows]") {
+    namespace fs = std::filesystem;
+    // TempDir removes the tree on scope exit, even when a REQUIRE below fails;
+    // declared before the engine so the engine (and its directory handles) is
+    // destroyed first.
+    yuzu::test::TempDir tmp("yuzu_test_spark_est4340_absent_");
+    const fs::path root = tmp.path;
+    const fs::path parent = root / "watched";
+    const fs::path target = parent / "file.txt";
+    fs::create_directories(root); // root exists; `parent` (the target's own dir) does not
+
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(target.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+
+    // Ancestor-mode establishment settles quickly too (root exists), but it
+    // must NEVER report Notification for the absent target - only None,
+    // unconditionally, per the mode gate.
+    std::this_thread::sleep_for(300ms);
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    // Create the parent dir + file: the ancestor's own notification fires,
+    // the re-probe resolves to Target, and establishment must stamp.
+    fs::create_directories(parent);
+    { std::ofstream(target) << "seed"; }
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        10000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): an absent parent dir under sibling churn on its ancestor "
+          "keeps reading None with bounded probe launches and no leaked workers (CH-11, bounded "
+          "regression scenario: 200 create+remove pairs, not proof of no unbounded growth)",
+          "[spark][established][windows][walkoff]") {
+    namespace fs = std::filesystem;
+    constexpr int kPairs = 200;
+    constexpr std::uint64_t kEventsPerPair = 2; // one change record per create, one per remove
+    constexpr std::uint64_t kCompletionsPerEvent = 2; // a record may surface as two completions
+    constexpr std::uint64_t kLaunchesPerCompletion = 2; // reappearance probe + one owed re-probe
+    constexpr std::uint64_t kPaced = static_cast<std::uint64_t>(kPairs) * kEventsPerPair;
+    yuzu::test::TempDir tmp("yuzu_test_spark_ch11_absent_");
+    const fs::path root = tmp.path;
+    const fs::path target = root / "watched" / "file.txt"; // `watched` is never created
+    fs::create_directories(root);
+
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms; // arm() returns with the ancestor watch committed
+        ctl.health_grace = 60000ms;      // keep Fault edges out of the run
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    auto sub = engine.arm(*c, file_spec(target.string()));
+    REQUIRE(sub.has_value());
+
+    const auto snap = [&] { return *file_debug_counters_for_test(*raw); };
+    const auto idle = [&] { return snap().probe_workers_active == 0; };
+    REQUIRE(stable_for([&] { return snap().probe_launched; }, 150ms, 5000ms));
+    REQUIRE(eventually(idle, 5000ms));
+    const auto baseline = snap().probe_launched;
+
+    bool reading_stable = true;
+    const auto observe = [&] {
+        const auto est = engine.subscription_establishment(*sub);
+        if (!est || est->coverage != SparkCoverage::None || est->established_at)
+            reading_stable = false;
+    };
+    // Pacing only shapes the load: a timed-out wait, or a spent 30 s budget, is not a failure.
+    const auto soak_until = std::chrono::steady_clock::now() + 30s;
+    const auto paced_event = [&](auto&& mutate) {
+        const auto before = snap().probe_launched;
+        mutate();
+        if (std::chrono::steady_clock::now() > soak_until)
+            return;
+        (void)eventually(
+            [&] {
+                const auto d = snap();
+                return d.probe_launched > before && d.probe_workers_active == 0;
+            },
+            2000ms);
+        observe();
+    };
+    const auto settle_and_bound = [&](std::uint64_t events) {
+        REQUIRE(stable_for([&] { return snap().probe_launched; }, 100ms, 5000ms));
+        REQUIRE(eventually(idle, 5000ms));
+        const auto d = snap();
+        const auto retries =
+            d.probe_admission_rejected + d.probe_backend_failed + d.probe_launch_failed;
+        INFO("probe_launched=" << d.probe_launched << " baseline=" << baseline
+                               << " events=" << events << " retries=" << retries);
+        CHECK(d.probe_launched > baseline); // the noise reached the mechanism
+        CHECK(d.probe_launched <=
+              baseline + kLaunchesPerCompletion * kCompletionsPerEvent * events + retries);
+        CHECK(d.synthetic_fires == 0);
+    };
+    const auto make_sibling = [&](int i) {
+        std::error_code ec;
+        fs::create_directory(root / ("sib" + std::to_string(i)), ec);
+        REQUIRE(!ec);
+    };
+    const auto remove_sibling = [&](int i) {
+        std::error_code ec;
+        fs::remove(root / ("sib" + std::to_string(i)), ec);
+    };
+
+    for (int i = 0; i < kPairs; ++i) {
+        paced_event([&] { make_sibling(i); });
+        paced_event([&] { remove_sibling(i); });
+    }
+    settle_and_bound(kPaced);
+
+    for (int i = kPairs; i < 2 * kPairs; ++i) {
+        make_sibling(i);
+        remove_sibling(i);
+    }
+    settle_and_bound(2 * kPaced);
+
+    CHECK(reading_stable);
+    const auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+    const auto d = snap();
+    CHECK(d.live_dirs == 1);
+    CHECK(d.live_ancestors == 1);
+    CHECK(d.retiring == 0);
+    CHECK(d.probe_workers_active == 0);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a parent-dir delete + recreate cycle loses and regains "
+          "coverage without ever re-stamping established_at (#4340 FF-4)",
+          "[spark][established][windows]") {
+    // An ORDINARY write never drops File's coverage (the
+    // reissue is synchronous) - only losing the parent DIRECTORY does, so
+    // this exercises the delete+recreate cycle, not a plain write.
+    namespace fs = std::filesystem;
+    yuzu::test::TempDir tmp("yuzu_test_spark_est4340_rearm_"); // removed even on a failed REQUIRE
+    const fs::path root = tmp.path;
+    const fs::path parent = root / "watched";
+    const fs::path target = parent / "file.txt";
+    std::error_code ec;
+    fs::create_directories(parent);
+    { std::ofstream(target) << "seed"; }
+
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(target.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    // Fail loudly at the setup step: a delete that did not happen would leave
+    // the wait below timing out with no hint why.
+    REQUIRE(fs::remove(target, ec));
+    REQUIRE_FALSE(ec);
+    REQUIRE(fs::remove(parent, ec));
+    REQUIRE_FALSE(ec);
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::None;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // loss of coverage never un-stamps established_at
+
+    fs::create_directories(parent);
+    { std::ofstream(target) << "recreated"; }
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        10000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // still first-wins - recovery never re-stamps
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a parked initial discovery probe leaves coverage None "
+          "until release, then stamps established_at (#4340 FF-5)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_late");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    FileProbeGate gate;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(a.dir);
+    REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = file_spec(a.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value()); // success-with-pending
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    std::this_thread::sleep_for(200ms); // well past the 50 ms caller budget/sweep cadence
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    // NB: the engine's armed-entry cache defaults to None, so this cannot tell
+    // an explicit mechanism-side None report from none at all - FF-5b below
+    // observes the mechanism's sink directly for exactly that.
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    const auto t_release = std::chrono::steady_clock::now();
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= t_release);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): a published-pending initial probe reports an "
+          "explicit None to the establishment sink before any Notification (#4340 FF-5b)",
+          "[spark][established][windows]") {
+    // FF-5 above reads only SparkEngine::subscription_establishment(), whose
+    // armed-entry cache DEFAULTS to None: it stays green if the mechanism
+    // never reports the published-pending None at all (the File branch once
+    // omitted mark_coverage_locked() where Registry's identical branch has
+    // it). Only a direct sink observer,
+    // as RF-10/FF-10 use, can tell an explicit report from an absent one.
+    ScratchDir a("est_direct_pending");
+    // Everything a callback or hook below captures is declared BEFORE `mech`
+    // (see EstLog): a fatal REQUIRE must join the mechanism's threads first.
+    FileProbeGate gate;
+    EstLog log;
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+
+    REQUIRE(mech->set_established_sink(log.sink()));
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir);
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = file_spec(a.file.string());
+    // Success-with-pending: returns after the caller budget with the probe
+    // still parked on the worker.
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    // The None must arrive while the probe is STILL parked - no Notification
+    // can exist yet, so this entry is the explicit published-pending report.
+    REQUIRE(eventually([&] { return log.established_count() >= 1; }, 5000ms));
+    {
+        const auto seq = log.established();
+        REQUIRE(seq.size() == 1);
+        CHECK(seq[0].incarnation == kToken);
+        CHECK(seq[0].coverage == SparkCoverage::None);
+    }
+
+    gate.release();
+    REQUIRE(eventually([&] { return log.established_count() >= 2; }, 5000ms));
+    {
+        const auto seq = log.established();
+        CHECK(seq[1].incarnation == kToken);
+        CHECK(seq[1].coverage == SparkCoverage::Notification);
+    }
+
+    mech->stop();
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("File spark (real mechanism): a deterministic completion failure reports None until "
+          "the recovery reissue commits Notification (#4340 FF-6)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_notify_fail");
+    // State the hooks below capture is declared BEFORE `engine`: the engine
+    // owns the mechanism, whose worker thread calls the hooks, so a fatal
+    // REQUIRE must destroy the engine (joining that thread) before this state.
+    FileProbeGate gate;
+    std::atomic<bool> armed{true};
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    const auto spec = file_spec(a.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto stamped = *est->established_at;
+
+    // Force the NEXT real completion for this dir to be reported !ok: a
+    // genuine coverage loss distinct from an ordinary fire. The recovery probe
+    // that loss stages is PARKED, so the None persists until release() instead
+    // of lasting the ~50 ms the recovery normally takes (a poll could miss a
+    // transient that short on a loaded runner). Both hooks go in ONE call:
+    // each call replaces every hook.
+    {
+        FileMechanismTestControls ctl;
+        ctl.notify_fail_hook = [&, dir = a.dir.wstring()](std::wstring_view d) {
+            if (d != dir)
+                return false;
+            return armed.exchange(false, std::memory_order_acq_rel); // one-shot
+        };
+        ctl.probe_hook = gate.hook_for(a.dir);
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    a.write("trigger a completion");
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 8000ms));
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::None;
+        },
+        8000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // a coverage loss never un-stamps established_at
+
+    // Release the parked recovery probe and clear the hooks: the mechanism's
+    // own stage_probe_locked recovery re-arms.
+    gate.release();
+    {
+        FileMechanismTestControls ctl; // null hooks clear both
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        10000ms));
+    est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(*est->established_at == stamped); // still first-wins
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a disarm racing a re-arm (adoption) still lets the "
+          "mechanism report establishment against the fresh incarnation (#4340 FF-7)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_adopt");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = file_spec(a.file.string());
+    auto sub1 = engine.arm(*c, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub1);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, spec); // dedup: same key -> the engine renews the
+                                           // existing armed_ entry, skipping unwatch()
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+
+    REQUIRE(eventually(
+        [&] {
+            auto est = engine.subscription_establishment(*sub2);
+            return est.has_value() && est->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at); // never predates the adopting arm
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a key joining an already-established directory reads "
+          "Notification promptly, the sibling's own coverage is unchanged (#4340 FF-8, coalesce)",
+          "[spark][established][windows]") {
+    namespace fs = std::filesystem;
+    ScratchDir dir("est_coalesce");
+    const fs::path file_b = dir.dir / "second.txt";
+    { std::ofstream(file_b) << "seed"; }
+
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec_a = file_spec(dir.file.string());
+    auto sub_a = engine.arm(*c, spec_a);
+    REQUIRE(sub_a.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub_a);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est_a = engine.subscription_establishment(*sub_a);
+    REQUIRE(est_a.has_value());
+    REQUIRE(est_a->established_at.has_value());
+    const auto a_stamped = *est_a->established_at;
+
+    // B joins the SAME directory (already established): it must read
+    // Notification promptly (well under one sweep cadence), and A's own
+    // stamp must be untouched by the join.
+    const auto spec_b = file_spec(file_b.string());
+    const auto t0 = std::chrono::steady_clock::now();
+    auto sub_b = engine.arm(*c, spec_b);
+    REQUIRE(sub_b.has_value());
+    REQUIRE(eventually(
+        [&] {
+            auto est = engine.subscription_establishment(*sub_b);
+            return est.has_value() && est->coverage == SparkCoverage::Notification;
+        },
+        2000ms));
+    auto est_b = engine.subscription_establishment(*sub_b);
+    REQUIRE(est_b.has_value());
+    REQUIRE(est_b->established_at.has_value());
+    CHECK(*est_b->established_at >= est_b->armed_at);
+    CHECK(*est_b->established_at >= t0);
+
+    est_a = engine.subscription_establishment(*sub_a);
+    REQUIRE(est_a.has_value());
+    CHECK(*est_a->established_at == a_stamped); // sibling's join never re-stamps A
+
+    engine.disarm(*sub_a);
+    engine.disarm(*sub_b);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a key joining during a parked probe is None until "
+          "release, then both keys reach Notification (#4340 FF-9, coalesce)",
+          "[spark][established][windows]") {
+    namespace fs = std::filesystem;
+    ScratchDir dir("est_coalesce_park");
+    const fs::path file_b = dir.dir / "second.txt";
+    { std::ofstream(file_b) << "seed"; }
+
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    FileProbeGate gate;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(dir.dir);
+    REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec_a = file_spec(dir.file.string());
+    auto sub_a = engine.arm(*c, spec_a);
+    REQUIRE(sub_a.has_value()); // success-with-pending; A's initial probe parks
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    // B joins the SAME (not-yet-established) directory while A's probe is
+    // still parked - B rides along with A's own outstanding obligation, no
+    // second probe launched.
+    const auto spec_b = file_spec(file_b.string());
+    auto sub_b = engine.arm(*c, spec_b);
+    REQUIRE(sub_b.has_value());
+
+    std::this_thread::sleep_for(200ms);
+    auto est_a = engine.subscription_establishment(*sub_a);
+    auto est_b = engine.subscription_establishment(*sub_b);
+    REQUIRE(est_a.has_value());
+    REQUIRE(est_b.has_value());
+    CHECK(est_a->coverage == SparkCoverage::None);
+    CHECK(est_b->coverage == SparkCoverage::None);
+
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            auto ea = engine.subscription_establishment(*sub_a);
+            auto eb = engine.subscription_establishment(*sub_b);
+            return ea.has_value() && ea->coverage == SparkCoverage::Notification &&
+                  eb.has_value() && eb->coverage == SparkCoverage::Notification;
+        },
+        5000ms));
+
+    engine.disarm(*sub_a);
+    engine.disarm(*sub_b);
+    engine.stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): the establishment sink reports the ordered "
+          "coverage sequence [Notification, None, Notification] against a fixed incarnation, "
+          "and an intervening ordinary write produces NO extra report (#4340 FF-10)",
+          "[spark][established][windows]") {
+    // Direct (no engine) so a real SparkIncarnation token can be supplied and
+    // every report's identity checked. Unlike Registry's RF-10 (which parks
+    // the RE-ARM probe to prove ordering), File's ordinary fire never even
+    // launches a probe (the reissue is synchronous) - the
+    // deterministic loss here comes from notify_fail_hook, mirroring FF-6.
+    ScratchDir a("est_direct_seq");
+    // Everything a callback or hook below captures is declared BEFORE `mech`
+    // (see EstLog): a fatal REQUIRE must join the mechanism's threads first.
+    EstLog log;
+    std::atomic<int> emits{0};
+    std::atomic<bool> armed{true};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+
+    // A caller budget far above any probe latency makes the initial probe
+    // commit deterministically INSIDE watch_incarnation's own wait, so the
+    // sequence below starts at Notification (never a published-pending None).
+    // Scalar controls persist across the later notify_fail_hook calls.
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([&](const std::string&, SparkData) { emits.fetch_add(1, std::memory_order_acq_rel); },
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+
+    // Initial establishment: Notification, token 42, no emit yet.
+    REQUIRE(eventually([&] { return log.established_count() >= 1; }));
+    {
+        const auto seq = log.established();
+        REQUIRE(seq.size() == 1);
+        CHECK(seq[0].incarnation == kToken);
+        CHECK(seq[0].coverage == SparkCoverage::Notification);
+    }
+    CHECK(emits.load() == 0);
+
+    // An ORDINARY write: the reissue is synchronous, so this
+    // must produce an emit but NO additional established report.
+    a.write("ordinary change");
+    REQUIRE(eventually([&] { return emits.load(std::memory_order_acquire) >= 1; }, 8000ms));
+    std::this_thread::sleep_for(200ms);
+    REQUIRE(log.established_count() == 1); // still just the initial commit
+
+    // Force the NEXT completion for this dir to be reported !ok: a
+    // genuine, deterministic coverage loss.
+    {
+        FileMechanismTestControls ctl;
+        ctl.notify_fail_hook = [&, dir = a.dir.wstring()](std::wstring_view d) {
+            if (d != dir)
+                return false;
+            return armed.exchange(false, std::memory_order_acq_rel); // one-shot
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    a.write("trigger the forced loss");
+    REQUIRE(eventually([&] { return log.established_count() >= 2; }, 8000ms));
+    {
+        const auto seq = log.established();
+        CHECK(seq[1].incarnation == kToken);
+        CHECK(seq[1].coverage == SparkCoverage::None);
+    }
+
+    // Clear the hook: the recovery reissue commits Notification again.
+    {
+        FileMechanismTestControls ctl; // null hook clears it
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(eventually([&] { return log.established_count() >= 3; }, 10000ms));
+    {
+        const auto seq = log.established();
+        REQUIRE(seq.size() == 3);
+        CHECK(seq[2].incarnation == kToken);
+        CHECK(seq[2].coverage == SparkCoverage::Notification);
+    }
+
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): an establishment report and an action staged in "
+          "the SAME sweep visit dispatch in established-before-action order (#4340 FF-11)",
+          "[spark][established][windows]") {
+    // The File twin of Registry's RF-11 (see its rationale): FF-10 above
+    // pins ordering across passes only. Here the first sweep visit that sees
+    // the published-pending call (published in the same mu_ hold that marks
+    // None due - the mark FF-5b pins) finds health_grace (1 ms) long blown,
+    // so ONE visit stages both the drained None report (stage_established_
+    // locked, ahead of the switch) and, from grace_check_locked, a Fault
+    // notice into work.notices. Fault and Emit share that one notices loop,
+    // so this pins the same established-before-notices property for an Emit
+    // (an Emit needs a commit, whose re-marked Notification is
+    // never drained in the same visit - see RF-11).
+    ScratchDir a("est_same_pass");
+    // Everything a callback or hook below captures is declared BEFORE `mech`
+    // (see EstLog): a fatal REQUIRE must join the mechanism's threads first.
+    FileProbeGate gate;
+    EstLog log;
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+
+    REQUIRE(mech->set_established_sink(log.sink()));
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir);
+        ctl.health_grace = 1ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {}, log.fault_sink());
+
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch_incarnation(spark_key(spec), spec.params, kToken).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    REQUIRE(eventually([&] { return log.all().size() >= 2; }, 8000ms));
+    {
+        const auto seq = log.all();
+        CHECK(seq[0].kind == EstLog::Entry::Kind::Established); // established FIRST...
+        CHECK(seq[0].incarnation == kToken);
+        CHECK(seq[0].coverage == SparkCoverage::None);
+        CHECK(seq[1].kind == EstLog::Entry::Kind::Fault); // ...then the same-visit action
+        CHECK(seq[1].faulted);
+    }
+
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            for (const auto& e : log.established())
+                if (e.coverage == SparkCoverage::Notification)
+                    return true;
+            return false;
+        },
+        8000ms));
+
+    mech->stop();
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+// ── #4340 establishment signal: failure and race coverage (File) ─────────────
+//
+// The File counterparts of the Registry cases above: FF-12 pairs with RF-12, FF-14
+// with RF-13, FF-15 with RF-15, FF-16 with RF-16 and FF-17 with RF-17. FF-13 (a
+// failed synchronous reissue) has no Registry twin and RF-14 (a dropped None) has
+// no File twin. The same two seam traps apply (all hooks in ONE
+// controls struct per call; captured state declared before `mech`), and the same
+// one-slot-lane recipe lines a staged report and a probe launch up in one pass
+// (see the Registry section comment). File differences: the sweeping thread is the
+// IOCP worker, so parking the hook also parks completion processing (which is why
+// FF-17 has no "fire" step), reports are staged per KEY of a directory, and the
+// worker has no pass-failure backoff or counter.
+
+TEST_CASE("File mechanism (Windows, direct): a pass that throws AFTER staging an establishment "
+          "report re-delivers it on a later pass, and a sibling's retry is not stranded "
+          "(#4340 FF-12)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_unwind_a"), s("est_unwind_s"), b("est_unwind_b"), b2("est_unwind_b2");
+    FileProbeGate occupy;
+    ParkGate hook_park;
+    std::atomic<int> hook_calls{0};
+    std::atomic<bool> threw{false};
+    EstLog log;
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    OpenGateOnExit open_hook{hook_park}; // after `mech`: a failed REQUIRE unparks the worker first
+
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_lane_cap = 1;
+        ctl.caller_wait_budget = 5000ms;
+        ctl.health_grace = 60000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kA = 42, kS = 51, kB = 61, kB2 = 62;
+    const auto spec_a = file_spec(a.file.string());
+    const auto spec_s = file_spec(s.file.string());
+    const auto spec_b = file_spec(b.file.string());
+    const auto spec_b2 = file_spec(b2.file.string());
+    const std::string key_a = spark_key(spec_a), key_s = spark_key(spec_s),
+                      key_b = spark_key(spec_b), key_b2 = spark_key(spec_b2);
+
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kA).has_value());
+    REQUIRE(eventually([&] { return log.has(key_a, kA, SparkCoverage::Notification); }));
+    REQUIRE(eventually(
+        [&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; }, 5000ms));
+
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = occupy.hook_for(s.dir);
+        ctl.emit_bookkeeping_hook = [&] {
+            const int n = hook_calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (n == 1) {
+                hook_park.park(); // pass N
+            } else if (n == 2) {
+                threw.store(true, std::memory_order_release);
+                throw std::runtime_error("injected failure after a report was staged");
+            }
+        };
+        ctl.caller_wait_budget = 40ms;
+        ctl.admission_backoff_seed = 50ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->watch_incarnation(key_s, spec_s.params, kS).has_value()); // pending: S's probe parks
+    REQUIRE(eventually([&] { return occupy.parked.load() == 1; }, 2000ms));
+    REQUIRE(mech->watch_incarnation(key_b, spec_b.params, kB).has_value()); // lane full: Deferred
+    REQUIRE(hook_park.wait_entered(8000ms)); // pass N (B's first retry launch): worker parked
+
+    // While the worker is parked: A's report becomes due (adoption), B2 becomes due ~50 ms on.
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kA).has_value());
+    REQUIRE(mech->watch_incarnation(key_b2, spec_b2.params, kB2).has_value());
+    std::this_thread::sleep_for(200ms); // a LOWER bound only: nothing can visit B2 while parked
+    hook_park.release();
+
+    REQUIRE(eventually([&] { return threw.load(std::memory_order_acquire); }, 8000ms));
+    REQUIRE(eventually([&] { return log.count(key_a, kA) >= 2; }, 8000ms));
+
+    occupy.release();
+    REQUIRE(eventually(
+        [&] {
+            return log.has(key_s, kS, SparkCoverage::Notification) &&
+                   log.has(key_b, kB, SparkCoverage::Notification) &&
+                   log.has(key_b2, kB2, SparkCoverage::Notification);
+        },
+        10000ms));
+    CHECK(log.count(key_a, kA) == 2); // the initial report + exactly one re-delivery
+
+    mech->stop();
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("File mechanism (Windows, direct): a failed synchronous reissue reports None, then the "
+          "recovery commit reports Notification, under a fixed incarnation (#4340 FF-13)",
+          "[spark][established][windows]") {
+    // The reissue-failure site (real_rearm_fail_hook) is distinct from FF-6/FF-10's failed
+    // completion (notify_fail_hook): each marks coverage lost at its own line.
+    ScratchDir a("est_reissue_fail");
+    EstLog log;
+    std::atomic<bool> fail_once{false};
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    constexpr SparkIncarnation kToken = 42;
+    const auto spec = file_spec(a.file.string());
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch_incarnation(key, spec.params, kToken).has_value());
+    REQUIRE(eventually([&] { return log.established_count() >= 1; }));
+
+    {
+        FileMechanismTestControls ctl;
+        ctl.real_rearm_fail_hook = [&, dir = a.dir.wstring()](std::wstring_view d) {
+            return d == dir && fail_once.exchange(false, std::memory_order_acq_rel); // one-shot
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    fail_once.store(true, std::memory_order_release);
+    a.write("an ordinary change whose reissue is forced to fail");
+    REQUIRE(eventually([&] { return log.established_count() >= 3; }, 10000ms));
+    {
+        const auto seq = log.established();
+        REQUIRE(seq.size() == 3);
+        CHECK(seq[0].coverage == SparkCoverage::Notification); // the initial establishment
+        CHECK(seq[1].coverage == SparkCoverage::None);         // the failed reissue
+        CHECK(seq[2].coverage == SparkCoverage::Notification); // the recovery commit
+        for (const auto& e : seq)
+            CHECK(e.incarnation == kToken);
+    }
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): a throwing establishment sink is contained - the "
+          "drop is counted, the rest of the batch is delivered, the worker survives and the "
+          "dropped report is not re-staged (#4340 FF-14)",
+          "[spark][established][windows]") {
+    namespace fs = std::filesystem;
+    ScratchDir d("est_thr");
+    const fs::path f2 = d.dir / "f2.txt", f3 = d.dir / "f3.txt";
+    { std::ofstream(f2) << "seed"; }
+    { std::ofstream(f3) << "seed"; }
+    ParkGate stall;
+    EstLog log;
+    log.stall_on_call = 1; // the first delivery (key1's initial report) parks the worker in the sink
+    log.stall = &stall;
+    log.throw_if = [](std::size_t n, const EstLog::Entry&) { return n == 2; };
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    OpenGateOnExit open_stall{stall}; // after `mech`: a failed REQUIRE unparks the worker first
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    const auto spec1 = file_spec(d.file.string());
+    const auto spec2 = file_spec(f2.string());
+    const auto spec3 = file_spec(f3.string());
+    const std::string key1 = spark_key(spec1), key2 = spark_key(spec2), key3 = spark_key(spec3);
+
+    REQUIRE(mech->watch_incarnation(key1, spec1.params, 81).has_value());
+    REQUIRE(stall.wait_entered(8000ms)); // the worker is parked INSIDE the sink, off-lock
+    // Two more keys join the same directory while it is parked: the directory's next report is
+    // staged as ONE batch with an entry per key, and its first entry is delivery #2 - the throw.
+    REQUIRE(mech->watch_incarnation(key2, spec2.params, 82).has_value());
+    REQUIRE(mech->watch_incarnation(key3, spec3.params, 83).has_value());
+    stall.release();
+
+    REQUIRE(eventually(
+        [&] { return file_debug_counters_for_test(*mech)->established_failed == 1; }, 8000ms));
+    // The initial report plus the two batch entries that were NOT dropped.
+    REQUIRE(eventually([&] { return log.established_count() >= 3; }, 8000ms));
+    const auto dropped = log.dropped_entries();
+    REQUIRE(dropped.size() == 1);
+    const std::string dropped_key = dropped[0].key;
+    CHECK((dropped_key == key1 || dropped_key == key2 || dropped_key == key3));
+    CHECK(log.count_key_reports(dropped_key) == (dropped_key == key1 ? 1u : 0u));
+
+    // No re-stage: once everything settled nothing else is delivered or attempted.
+    REQUIRE(stable_for([&] { return log.calls_made(); }, 600ms, 8000ms));
+    CHECK(file_debug_counters_for_test(*mech)->established_failed == 1);
+    CHECK(log.established_count() == 3);
+
+    // The worker survived: re-adopting key1 under a fresh incarnation reports again. (File
+    // stages a directory's report per key, so the siblings - including the dropped key - are
+    // re-reported by that unrelated later mark; the dropped report itself was never re-staged.)
+    REQUIRE(mech->watch_incarnation(key1, spec1.params, 84).has_value());
+    REQUIRE(eventually([&] { return log.has(key1, 84, SparkCoverage::Notification); }, 8000ms));
+    CHECK(file_debug_counters_for_test(*mech)->established_failed == 1);
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): stop() with a staged but unserved joiner report "
+          "drops it undispatched and returns once the parked worker is released "
+          "(CH-8, characterisation)",
+          "[spark][established][windows]") {
+    namespace fs = std::filesystem;
+    struct Ch8 {
+        std::atomic<bool> stop_entered{false};
+        std::atomic<bool> stop_returned{false};
+        ParkGate gate;
+        EstLog log;
+    };
+    ScratchDir scratch("est_ch8");
+    const fs::path f2 = scratch.dir / "f2.txt";
+    { std::ofstream(f2) << "seed"; }
+    const auto st = std::make_shared<Ch8>();
+    auto& gate = st->gate;
+    auto& log = st->log;
+    log.stall_on_call = 1; // the initial Notification report parks the worker inside the sink
+    log.stall = &gate;
+    std::unique_ptr<ISparkMechanism> mech = make_file_mechanism();
+    REQUIRE(mech);
+    ISparkMechanism* const mp = mech.get();
+    std::jthread stopper; // not joinable until the stop() call below
+    OpenGateOnExit open_gate{gate}; // after `stopper`: the gate opens BEFORE the join
+    bool wedged = false;
+    struct LeakIfWedged {
+        std::unique_ptr<ISparkMechanism>& m;
+        std::jthread& t;
+        const bool& wedged;
+        ~LeakIfWedged() {
+            if (wedged) {
+                (void)m.release(); // a stop() that never returns can never be joined
+                t.detach();
+            }
+        }
+    } leak_if_wedged{mech, stopper, wedged};
+
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kInc1 = 81, kInc2 = 82;
+    const auto spec1 = file_spec(scratch.file.string());
+    const auto spec2 = file_spec(f2.string());
+    const std::string key1 = spark_key(spec1), key2 = spark_key(spec2);
+    REQUIRE(mech->watch_incarnation(key1, spec1.params, kInc1).has_value());
+    REQUIRE(gate.wait_entered(8000ms)); // the worker is parked INSIDE the sink, off-lock
+    // A second key joining the directory marks its report due; the parked worker cannot drain it.
+    REQUIRE(mech->watch_incarnation(key2, spec2.params, kInc2).has_value());
+    REQUIRE(log.calls_made() == 1);
+
+    stopper = std::jthread([st, mp] {
+        st->stop_entered.store(true, std::memory_order_release);
+        mp->stop();
+        st->stop_returned.store(true, std::memory_order_release);
+    });
+    REQUIRE(eventually([&] { return st->stop_entered.load(std::memory_order_acquire); }, 5000ms));
+    // No public signal shows stop() has set its stop flag, so this is a bounded window, not proof.
+    std::this_thread::sleep_for(500ms);
+    CHECK_FALSE(st->stop_returned.load(std::memory_order_acquire)); // weak: a negative window
+    gate.release();
+    if (!eventually([&] { return st->stop_returned.load(std::memory_order_acquire); }, 10000ms)) {
+        wedged = true;
+        FAIL("stop() did not return within 10 s of the parked worker being released");
+    }
+    stopper.join();
+
+    CHECK(log.count_key_reports(key2) == 0);
+    CHECK(log.count(key1, kInc1) == 1);
+    CHECK(log.calls_made() == 1);
+    CHECK(stable_for([&] { return log.calls_made(); }, 300ms, 3000ms));
+    const auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->live_dirs == 0);
+    CHECK(d->established_failed == 0);
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("File mechanism (Windows, direct): a join storm on one directory while the "
+          "establishment sink is parked never blocks a joiner, and once released every joined "
+          "key is reported once against the directory's latest stamp, then the mechanism is "
+          "idle and stop() returns (CH-6, characterisation)",
+          "[spark][established][windows]") {
+    constexpr std::size_t kJoiners = 64;
+    constexpr SparkIncarnation kInc1 = 81, kJoinerIncBase = 1000;
+    struct Ch6 {
+        std::atomic<std::size_t> finished{0};
+        std::atomic<std::size_t> refused{0};
+        std::atomic<bool> stop_returned{false};
+        std::vector<std::string> keys;
+        std::vector<SparkSpec> specs;
+        std::vector<SparkIncarnation> incs;
+        std::vector<std::chrono::steady_clock::time_point> started; // slot i: joiner thread only
+        ParkGate gate;
+        EstLog log;
+    };
+    ScratchDir scratch("est_ch6");
+    const auto st = std::make_shared<Ch6>();
+    auto& gate = st->gate;
+    auto& log = st->log;
+    log.stall_on_call = 1; // the initial Notification report parks the worker inside the sink
+    log.stall = &gate;
+    std::unique_ptr<ISparkMechanism> mech = make_file_mechanism();
+    REQUIRE(mech);
+    ISparkMechanism* const mp = mech.get();
+    std::jthread joiner;  // not joinable until the storm starts
+    std::jthread stopper; // not joinable until the stop() call below
+    OpenGateOnExit open_gate{gate}; // after both threads: the gate opens BEFORE either join
+    bool wedged = false;
+    struct LeakIfWedged {
+        std::unique_ptr<ISparkMechanism>& m;
+        std::jthread& a;
+        std::jthread& b;
+        const bool& wedged;
+        ~LeakIfWedged() {
+            if (wedged) {
+                (void)m.release(); // a call that never returns can never be joined
+                if (a.joinable())
+                    a.detach();
+                if (b.joinable())
+                    b.detach();
+            }
+        }
+    } leak_if_wedged{mech, joiner, stopper, wedged};
+
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    // Capture `st` here (unused otherwise) so the MECHANISM OBJECT ITSELF anchors it for as
+    // long as the mechanism exists — including if `leak_if_wedged` below releases it without
+    // calling stop() first. Unlike CH-8's `stopper` thread (which stays blocked inside stop()
+    // for exactly as long as a genuine wedge persists, keeping its own [st, mp] capture alive
+    // the whole time), `joiner` below runs a BOUNDED loop (each watch_incarnation call has its
+    // own 5s caller_wait_budget) and returns — dropping its `st` copy — even if the leaked
+    // mechanism's internal worker is still genuinely wedged forever afterward. Anchoring `st`
+    // in the mechanism's own stored callbacks ties its lifetime to the one object that could
+    // still dispatch into it, regardless of which test thread finishes first.
+    mech->start([st](const std::string&, SparkData) {},
+               [st](const std::string&, bool, std::string_view) {});
+
+    const auto spec1 = file_spec(scratch.file.string());
+    const std::string key1 = spark_key(spec1);
+    for (std::size_t i = 0; i < kJoiners; ++i) {
+        st->specs.push_back(
+            file_spec((scratch.dir / ("join" + std::to_string(i) + ".txt")).string()));
+        st->keys.push_back(spark_key(st->specs.back()));
+        st->incs.push_back(kJoinerIncBase + i);
+    }
+    st->started.resize(kJoiners);
+
+    REQUIRE(mech->watch_incarnation(key1, spec1.params, kInc1).has_value());
+    REQUIRE(gate.wait_entered(8000ms)); // the worker is parked INSIDE the sink, off-lock
+    REQUIRE(log.calls_made() == 1);
+    const auto before = file_debug_counters_for_test(*mech);
+    REQUIRE(before.has_value());
+    const auto storm_begin = std::chrono::steady_clock::now();
+
+    // On its own thread so a joiner wedged behind the parked sink fails a deadline, not hangs.
+    joiner = std::jthread([st, mp] {
+        for (std::size_t i = 0; i < st->keys.size(); ++i) {
+            st->started[i] = std::chrono::steady_clock::now();
+            if (!mp->watch_incarnation(st->keys[i], st->specs[i].params, st->incs[i]).has_value())
+                st->refused.fetch_add(1, std::memory_order_relaxed);
+            st->finished.fetch_add(1, std::memory_order_release);
+        }
+    });
+    const auto storm_over = [&] {
+        return st->finished.load(std::memory_order_acquire) == kJoiners;
+    };
+    if (!eventually(storm_over, 10000ms)) {
+        gate.release(); // a joiner queued behind the sink would resume now
+        wedged = !eventually(storm_over, 5000ms);
+        FAIL("the join storm did not finish within 10 s while the sink was parked");
+    }
+    joiner.join();
+    CHECK(st->refused.load() == 0);
+
+    // Parked: nothing more was delivered, and the directory was joined, not re-armed.
+    CHECK(log.calls_made() == 1);
+    const auto during = file_debug_counters_for_test(*mech);
+    REQUIRE(during.has_value());
+    CHECK(during->live_dirs == 1);
+    CHECK(during->probe_launched == before->probe_launched);
+
+    gate.release();
+    const auto all_reported = [&] {
+        std::set<std::string> seen;
+        for (const auto& e : log.established())
+            if (e.coverage == SparkCoverage::Notification)
+                seen.insert(e.key);
+        return std::ranges::all_of(st->keys,
+                                   [&](const std::string& k) { return seen.contains(k); });
+    };
+    REQUIRE(eventually(all_reported, 8000ms));
+    REQUIRE(stable_for([&] { return log.calls_made(); }, 300ms, 5000ms));
+
+    // One post-release batch reports every key on the directory, all at its latest stamp.
+    const auto all = log.established();
+    CHECK(all.size() == kJoiners + 2);
+    CHECK(log.calls_made() == all.size()); // nothing was dropped
+    const auto seq1 = log.for_key(key1);
+    REQUIRE(seq1.size() == 2);
+    CHECK(seq1[0].incarnation == kInc1);
+    CHECK(seq1[1].incarnation == kInc1);
+    CHECK(seq1[0].coverage == SparkCoverage::Notification);
+    CHECK(seq1[1].coverage == SparkCoverage::Notification);
+    CHECK(seq1[1].at >= storm_begin);
+    const auto batch_at = seq1[1].at;
+    std::size_t accounted = seq1.size();
+    for (std::size_t i = 0; i < kJoiners; ++i) {
+        INFO("joiner " << i);
+        const auto seq = log.for_key(st->keys[i]);
+        accounted += seq.size();
+        REQUIRE(!seq.empty());
+        CHECK(seq.size() == 1);
+        CHECK(seq[0].incarnation == st->incs[i]);
+        CHECK(seq[0].coverage == SparkCoverage::Notification);
+        CHECK(seq[0].at >= st->started[i]); // never earlier than the join it answers
+        CHECK(seq[0].at == batch_at);
+    }
+    CHECK(accounted == all.size()); // no report for any key outside the storm
+
+    REQUIRE(eventually(
+        [&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; }, 5000ms));
+    const auto after = file_debug_counters_for_test(*mech);
+    REQUIRE(after.has_value());
+    CHECK(after->live_dirs == 1);
+    CHECK(after->live_ancestors == 0);
+    CHECK(after->retiring == 0);
+    CHECK(after->probe_launched == before->probe_launched);
+    CHECK(after->synthetic_fires == before->synthetic_fires);
+    CHECK(after->established_failed == before->established_failed);
+    CHECK(after->emit_failed == before->emit_failed);
+
+    stopper = std::jthread([st, mp] {
+        mp->stop();
+        st->stop_returned.store(true, std::memory_order_release);
+    });
+    if (!eventually([&] { return st->stop_returned.load(std::memory_order_acquire); }, 10000ms)) {
+        wedged = true;
+        FAIL("stop() did not return within 10 s of the joined keys being reported");
+    }
+    stopper.join();
+    CHECK(log.calls_made() == kJoiners + 2); // an orderly stop() dispatches nothing
+    const auto stopped = file_debug_counters_for_test(*mech);
+    REQUIRE(stopped.has_value());
+    CHECK(stopped->live_dirs == 0);
+    CHECK(stopped->live_ancestors == 0);
+    CHECK(stopped->retiring == 0);
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("File mechanism (Windows, direct): unwatch() and an orderly stop() report nothing "
+          "(#4340 FF-15)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_nonrep_a"), b("est_nonrep_b");
+    EstLog log;
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    const auto spec_a = file_spec(a.file.string());
+    const auto spec_b = file_spec(b.file.string());
+    const std::string key_a = spark_key(spec_a), key_b = spark_key(spec_b);
+
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, 71).has_value());
+    REQUIRE(mech->watch_incarnation(key_b, spec_b.params, 72).has_value());
+    REQUIRE(eventually([&] { return log.established_count() >= 2; }));
+
+    mech->unwatch(key_a);
+    std::this_thread::sleep_for(500ms);
+    CHECK(log.established_count() == 2); // unwatch() added no report (no None for key_a)
+
+    mech->stop();
+    std::this_thread::sleep_for(300ms);
+    CHECK(log.established_count() == 2); // an orderly stop() added none either
+    CHECK(log.for_key(key_b).size() == 1);
+}
+
+TEST_CASE("File mechanism (Windows, direct): an incarnation rebind on an existing key is "
+          "forward-only - a lower incarnation never replaces a higher one (#4340 FF-16)",
+          "[spark][established][windows]") {
+    ScratchDir a("est_rebind");
+    EstLog log;
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    const auto spec = file_spec(a.file.string());
+    const std::string key = spark_key(spec);
+
+    // 42 -> 50 (a higher incarnation rebinds), then 50 -> 42 (a lower one must NOT).
+    REQUIRE(mech->watch_incarnation(key, spec.params, 42).has_value());
+    REQUIRE(eventually([&] { return log.for_key(key).size() >= 1; }));
+    REQUIRE(mech->watch_incarnation(key, spec.params, 50).has_value());
+    REQUIRE(eventually([&] { return log.for_key(key).size() >= 2; }));
+    REQUIRE(mech->watch_incarnation(key, spec.params, 42).has_value());
+    REQUIRE(eventually([&] { return log.for_key(key).size() >= 3; }));
+    REQUIRE(stable_for([&] { return log.for_key(key).size(); }, 400ms, 5000ms));
+
+    const auto seq = log.for_key(key);
+    REQUIRE(seq.size() == 3);
+    CHECK(seq[0].incarnation == 42);
+    CHECK(seq[1].incarnation == 50); // forward rebind: the re-report carries the new incarnation
+    CHECK(seq[2].incarnation == 50); // NOT 42: a later, lower incarnation never wins
+    for (const auto& e : seq)
+        CHECK(e.coverage == SparkCoverage::Notification);
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (Windows, direct): an unwatch and a re-watch landing between a report "
+          "being staged and dispatched leave the new incarnation clean, and a sink that "
+          "re-enters unwatch()/watch_incarnation() does not deadlock (#4340 FF-17)",
+          "[spark][established][windows]") {
+    // The File twin of RF-17 (see its rationale, including the deliberate leak of a wedged
+    // mechanism and the co-leaked shared `Race` block) minus the "fire" step: the parked thread
+    // is the IOCP worker itself, so a write's completion is only QUEUED while it is parked and
+    // there is no deterministic fire-inside-the-window to observe.
+    ScratchDir a("est_race_a"), sac("est_race_sac"), s("est_race_s"), b("est_race_b"),
+        b2("est_race_b2");
+    constexpr SparkIncarnation kX = 42, kY = 43, kSac = 80, kS = 51, kB = 61, kB2 = 62;
+    const auto spec_a = file_spec(a.file.string());
+    const auto spec_sac = file_spec(sac.file.string());
+    const auto spec_s = file_spec(s.file.string());
+    const auto spec_b = file_spec(b.file.string());
+    const auto spec_b2 = file_spec(b2.file.string());
+    const std::string key_a = spark_key(spec_a), key_sac = spark_key(spec_sac),
+                      key_s = spark_key(spec_s), key_b = spark_key(spec_b),
+                      key_b2 = spark_key(spec_b2);
+    struct Race {
+        FileProbeGate occupy;
+        ParkGate hook_park1, hook_park2;
+        std::atomic<int> hook_calls{0};
+        std::atomic<bool> stale_phase{false}, reentered{false}, reentry_done{false},
+            reentry_ok{false};
+        EstLog log;
+    };
+    const auto st = std::make_shared<Race>();
+    auto& log = st->log;
+    auto& occupy = st->occupy;
+    auto& hook_park1 = st->hook_park1;
+    auto& hook_park2 = st->hook_park2;
+    bool wedged = false;
+    std::unique_ptr<ISparkMechanism> mech = make_file_mechanism();
+    REQUIRE(mech);
+    ISparkMechanism* const mp = mech.get();
+    // Declared AFTER `mech`: see RF-17 for the exit order this buys.
+    OpenGateOnExit open1{hook_park1}, open2{hook_park2};
+    yuzu::test::ScopeExit open_occupy{[st] { st->occupy.release(); }};
+    struct LeakIfWedged {
+        std::unique_ptr<ISparkMechanism>& m;
+        const bool& wedged;
+        ~LeakIfWedged() {
+            if (wedged)
+                (void)m.release(); // a thread deadlocked inside the sink can never be joined
+        }
+    } leak_if_wedged{mech, wedged};
+
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_lane_cap = 1;
+        ctl.caller_wait_budget = 5000ms;
+        ctl.health_grace = 60000ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    auto record = log.sink();
+    REQUIRE(mech->set_established_sink(
+        [st, mp, record, key_a, key_sac, params_sac = spec_sac.params](
+            const std::string& key, SparkIncarnation inc, std::chrono::steady_clock::time_point at,
+            SparkCoverage cov) {
+            record(key, inc, at, cov);
+            // Only the STALE X report re-enters (the initial establishment must not).
+            if (st->stale_phase.load(std::memory_order_acquire) && key == key_a && inc == kX &&
+                !st->reentered.exchange(true)) {
+                mp->unwatch(key_sac);
+                st->reentry_ok.store(mp->watch_incarnation(key_sac, params_sac, 91).has_value(),
+                                     std::memory_order_release);
+                st->reentry_done.store(true, std::memory_order_release);
+            }
+        }));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kX).has_value());
+    REQUIRE(mech->watch_incarnation(key_sac, spec_sac.params, kSac).has_value());
+    REQUIRE(eventually([&] { return log.established_count() >= 2; }));
+    REQUIRE(eventually(
+        [&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; }, 5000ms));
+
+    {
+        FileMechanismTestControls ctl;
+        // `st` rides along only to keep the gate alive for as long as any copy of this hook
+        // (a probe worker holds one) exists.
+        ctl.probe_hook = [st, gate_hook = occupy.hook_for(s.dir)](std::wstring_view dir) {
+            gate_hook(dir);
+        };
+        ctl.emit_bookkeeping_hook = [st] {
+            const int n = st->hook_calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (n == 1)
+                st->hook_park1.park(); // pass N
+            else if (n == 2)
+                st->hook_park2.park(); // pass N+1: A's report staged, not yet dispatched
+        };
+        ctl.caller_wait_budget = 40ms;
+        ctl.admission_backoff_seed = 50ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->watch_incarnation(key_s, spec_s.params, kS).has_value()); // S's probe parks
+    REQUIRE(eventually([&] { return occupy.parked.load() == 1; }, 2000ms));
+    REQUIRE(mech->watch_incarnation(key_b, spec_b.params, kB).has_value()); // lane full: Deferred
+    REQUIRE(hook_park1.wait_entered(8000ms)); // pass N parked
+
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kX).has_value()); // A's report due
+    REQUIRE(mech->watch_incarnation(key_b2, spec_b2.params, kB2).has_value());
+    std::this_thread::sleep_for(200ms); // a LOWER bound only: nothing can visit B2 while parked
+    hook_park1.release();
+    REQUIRE(hook_park2.wait_entered(8000ms)); // pass N+1: [A, X, Notification] staged, undispatched
+
+    // A is unwatched and re-watched under Y (the lane is full, so Y is Deferred).
+    mech->unwatch(key_a);
+    REQUIRE(mech->watch_incarnation(key_a, spec_a.params, kY).has_value());
+
+    st->stale_phase.store(true, std::memory_order_release);
+    hook_park2.release();
+    if (!eventually([&] { return st->reentry_done.load(std::memory_order_acquire); }, 10000ms)) {
+        // Only a re-entry that STARTED and never returned is a proven wedge (see RF-17).
+        wedged = st->reentered.load(std::memory_order_acquire) &&
+                 !st->reentry_done.load(std::memory_order_acquire);
+        FAIL("the sink's re-entry into unwatch()/watch_incarnation() did not complete within "
+             "10 s ("
+             << (wedged ? "it started and never returned: the sink is being called with the "
+                          "mechanism lock held (#4181 shape)"
+                        : "it never started: the stale report was not dispatched")
+             << ")");
+    }
+    CHECK(st->reentry_ok.load(std::memory_order_acquire));
+
+    occupy.release();
+    REQUIRE(eventually(
+        [&] {
+            return log.has(key_a, kY, SparkCoverage::Notification) &&
+                   log.has(key_sac, 91, SparkCoverage::Notification) &&
+                   log.has(key_b, kB, SparkCoverage::Notification) &&
+                   log.has(key_b2, kB2, SparkCoverage::Notification);
+        },
+        10000ms));
+
+    // The stale X report was delivered at most once beyond the initial one, as the
+    // Notification it was staged as.
+    CHECK(log.count(key_a, kX) <= 2);
+    for (const auto& e : log.for_key(key_a))
+        if (e.incarnation == kX)
+            CHECK(e.coverage == SparkCoverage::Notification);
+    // Y's own log is unaffected by X: only Y-incarnation reports, ending at Notification.
+    std::vector<EstLog::Entry> y;
+    for (const auto& e : log.for_key(key_a))
+        if (e.incarnation == kY)
+            y.push_back(e);
+    REQUIRE_FALSE(y.empty());
+    CHECK(y.back().coverage == SparkCoverage::Notification);
+
+    mech->stop();
 }
 
 // ── File T6-analogue (#2012 PR-B2, criterion #15, reentrancy half) ──────────
@@ -5938,6 +10995,459 @@ TEST_CASE("Registry mechanism (direct): a sweeper whose passes keep failing repo
     mech->stop();
 }
 
+// ── #4704: the sweeper's pass-outcome lines are written OFF mu_ ──────────────
+//
+// Before #4704 sweeper_main() wrote its `pass failed`, `failing persistently` and
+// `pass recovered` lines while holding mu_, so a blocked log sink stalled every other
+// mu_ taker (watch()/unwatch() behind arm()/disarm(), apply_test_controls(), stop()), not
+// only the sweeper. Each case parks the sweeper INSIDE the sink on one of those lines
+// (PfStallLogger's on_hit runs on the sweeper thread before the sleep; it blocks on a
+// test-owned gate) and requires a mu_ taker to complete while the sweeper is still parked.
+// Falsifier: move `log_pass_outcome(po)` above either branch's `lk.unlock()` in
+// sweeper_main() and the matching case(s) fail at the 2000 ms `done` wait (verified red on
+// DGRHP, PR #5004). PfStallLogger's preconditions apply: one instance at a time, declared before
+// the mechanism, `hits() > 0` asserted (#3355), and no other thread logs while it lives -
+// the driver below emits nothing on the test thread, the probe worker, or the TP_WAIT
+// callback (its emit is a no-op, so on_fire()'s emit-threw warn cannot fire).
+namespace {
+
+struct RegLogGate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool released{false};
+    void release() {
+        { std::lock_guard lk(m); released = true; }
+        cv.notify_all();
+    }
+    void wait_released() {
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return released; });
+    }
+};
+
+struct RegLogOffLock {
+    const char* stall_target; // the sweeper line to park on
+    bool drive_recovery;      // park on the recovery branch (after the failing passes)
+};
+
+void reg_run_log_off_lock(const RegLogOffLock& sc) {
+    ScratchRegKey a("log_off_lock");
+    // Every captured piece of state is declared BEFORE stall_log and the mechanism
+    // (locals unwind in reverse: the mechanism joins its sweeper first, then the logger
+    // restores the previous default logger, then the gate and atomics die).
+    std::atomic<bool> failing{false};
+    std::atomic<bool> parked{false};
+    RegLogGate gate;
+    // PfStallLogger copies the default logger's level; the `recovered` line is INFO, so a
+    // raised default level would hide it from the sink and fail this case for a reason
+    // unrelated to mu_ (the operator manual's own "--log-level warn hides the recovery").
+    INFO("default logger level " << static_cast<int>(spdlog::default_logger()->level()));
+    REQUIRE(spdlog::default_logger()->level() <= spdlog::level::info);
+    PfStallLogger stall_log(sc.stall_target, 0ms);
+    stall_log.set_on_hit([&] {
+        parked.store(true, std::memory_order_release);
+        gate.wait_released(); // the sweeper is now where a blocked sink would hold it
+    });
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech != nullptr);
+    // Release on EVERY exit path (a failed REQUIRE included) BEFORE `mech` is destroyed:
+    // ~WindowsRegistryMechanism joins a sweeper that would otherwise be parked for ever.
+    // Declared after `mech` so it runs first.
+    struct ReleaseOnExit {
+        RegLogGate& g;
+        ~ReleaseOnExit() { g.release(); }
+    } release_on_exit{gate};
+    // apply_test_controls REPLACES every hook on each call, so both installs supply the set.
+    const auto controls = [&] {
+        RegistryMechanismTestControls ctl;
+        ctl.sweep_cadence = 5ms;
+        ctl.sweep_hook = [&] {
+            if (failing.load(std::memory_order_acquire))
+                throw std::bad_alloc{};
+        };
+        return ctl;
+    };
+    REQUIRE(set_registry_test_controls_for_test(*mech, controls()));
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    const auto spec = registry_spec("HKCU", a.sub);
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value()); // control-path establishment
+    // Only now start failing: a pass that parked under mu_ BEFORE watch() (the pre-#4704
+    // code) would hang watch() with no release in sight instead of failing this case.
+    failing.store(true, std::memory_order_release);
+    a.write(1); // consumed notification -> re-arm published -> passes run and throw (sre6-1)
+    if (sc.drive_recovery) {
+        REQUIRE(eventually([&] { return mech->stats().inert; }, 8000ms));
+        failing.store(false, std::memory_order_release); // the next pass succeeds -> `recovered`
+    }
+    REQUIRE(eventually([&] { return parked.load(std::memory_order_acquire); }, 8000ms));
+    // The oracle: a mu_ taker completes while the sweeper is parked in the sink.
+    // set_registry_test_controls_for_test() is a bare lock_guard(mu_) plus a nudge (no OS
+    // work, no logging). Pre-#4704 it blocked here until the gate released.
+    std::atomic<bool> done{false};
+    std::thread taker([&] {
+        (void)set_registry_test_controls_for_test(*mech, controls());
+        done.store(true, std::memory_order_release);
+    });
+    // CHECK, not REQUIRE: `taker` is joinable below and must be joined on the red path too
+    // (the release unparks the sweeper, which unlocks mu_, so the taker then completes).
+    CHECK(eventually([&] { return done.load(std::memory_order_acquire); }, 2000ms));
+    // Still parked: hits() increments only after on_hit RETURNS, so 0 here proves the taker
+    // completed while the sweeper was inside the sink (the ordering pin, see §3.3).
+    CHECK(stall_log.hits() == 0);
+    gate.release();
+    taker.join();
+    // #3355 FALSE-GREEN guard: the parked line really went through the library's logger.
+    CHECK(eventually([&] { return stall_log.hits() >= 1; }, 5000ms));
+    mech->stop();
+}
+
+} // namespace
+
+TEST_CASE("Registry mechanism (direct): the `sweeper pass failed` line is written off mu_ - "
+          "a mu_ taker completes while the sink is parked on it (#4704)",
+          "[spark][mechanism][windows][logofflock]") {
+    reg_run_log_off_lock({.stall_target = "sweeper pass failed (consecutive #1)",
+                          .drive_recovery = false});
+}
+
+TEST_CASE("Registry mechanism (direct): the `sweeper failing persistently` line is written off "
+          "mu_ - a mu_ taker completes while the sink is parked on it (#4704)",
+          "[spark][mechanism][windows][logofflock]") {
+    reg_run_log_off_lock({.stall_target = "sweeper failing persistently",
+                          .drive_recovery = false});
+}
+
+TEST_CASE("Registry mechanism (direct): the `sweeper pass recovered` line is written off mu_ - "
+          "a mu_ taker completes while the sink is parked on it (#4704)",
+          "[spark][mechanism][windows][logofflock]") {
+    reg_run_log_off_lock({.stall_target = "sweeper pass recovered after",
+                          .drive_recovery = true});
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): while every sweeper pass fails the staged None is "
+          "not delivered, and after recovery the sequence is [Notification, None, Notification] "
+          "(CH-1 direct layer, characterisation)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_outage_direct");
+    // Everything a callback or hook below captures is declared BEFORE `mech`: locals unwind in
+    // reverse order, so a fatal REQUIRE destroys `mech` (joining its threads) before this state.
+    EstLog log;
+    std::atomic<bool> failing{false};
+    std::atomic<int> passes{0};
+    std::atomic<int> emits{0};
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.sweep_hook = [&] {
+            passes.fetch_add(1, std::memory_order_relaxed);
+            if (failing.load(std::memory_order_acquire))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start(
+        [&](const std::string&, SparkData) { emits.fetch_add(1, std::memory_order_acq_rel); },
+        [](const std::string&, bool, std::string_view) {});
+
+    constexpr SparkIncarnation kToken = 91;
+    const auto spec = registry_spec("HKCU", a.sub);
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch_incarnation(key, spec.params, kToken).has_value());
+    REQUIRE(eventually([&] { return log.has(key, kToken, SparkCoverage::Notification); }));
+    // Idle sweeper before the outage starts, so the first failing pass is the write's own nudge.
+    REQUIRE(stable_for([&] { return passes.load(std::memory_order_relaxed); }, 300ms, 5000ms));
+    CHECK_FALSE(mech->stats().inert);
+
+    failing.store(true, std::memory_order_release);
+    a.write(1); // consumes the one-shot notify: on_fire stages the None marker, then emits off-lock
+    // Synchronisation, not polling: the emit runs after the marker is staged, and every pass now
+    // throws before its drain, so from here the marker exists and cannot be delivered.
+    REQUIRE(eventually([&] { return emits.load(std::memory_order_acquire) >= 1; }, 8000ms));
+    REQUIRE(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->sweep_pass_failed >= 3; }, 8000ms));
+    REQUIRE(eventually([&] { return mech->stats().inert; }, 8000ms));
+    CHECK(log.established_count() == 1);
+    CHECK_FALSE(log.has(key, kToken, SparkCoverage::None));
+    CHECK(registry_debug_counters_for_test(*mech)->established_failed == 0);
+
+    failing.store(false, std::memory_order_release);
+    REQUIRE(eventually([&] { return !mech->stats().inert; }, 15000ms));
+    REQUIRE(eventually([&] { return log.established_count() >= 3; }, 15000ms));
+    REQUIRE(stable_for([&] { return log.established_count(); }, 400ms, 5000ms));
+    const auto seq = log.established();
+    REQUIRE(seq.size() == 3);
+    for (const auto& e : seq)
+        CHECK(e.incarnation == kToken);
+    CHECK(seq[0].coverage == SparkCoverage::Notification);
+    CHECK(seq[1].coverage == SparkCoverage::None);
+    CHECK(seq[2].coverage == SparkCoverage::Notification);
+
+    mech->stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a sweeper outage reads None once the mechanism is "
+          "inert with established_at unchanged, and the query follows the recovery "
+          "(CH-1 engine layer)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_outage_engine");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    std::atomic<bool> failing{false};
+    std::atomic<int> passes{0};
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        ctl.sweep_cadence = 300ms; // failure retries back off from this: three span 900 ms
+        ctl.sweep_hook = [&] {
+            passes.fetch_add(1, std::memory_order_relaxed);
+            if (failing.load(std::memory_order_acquire))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] {
+        auto e = engine.subscription_establishment(*sub);
+        return e.has_value() && e->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    const auto est0 = *est->established_at;
+    // Idle sweeper before the outage starts, so the first failing pass is the write's own nudge.
+    REQUIRE(stable_for([&] { return passes.load(std::memory_order_relaxed); }, 600ms, 5000ms));
+
+    const auto fired_before = count_kind(got, key, SparkEventKind::Fired);
+    failing.store(true, std::memory_order_release);
+    a.write(1); // consumes the one-shot notify: on_fire stages the None marker, then emits off-lock
+    // Synchronisation, not polling: the Fired event is emitted after the marker is staged, and
+    // every pass throws before its drain, so from here the marker exists and cannot be delivered.
+    REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Fired) > fired_before; },
+                       8000ms));
+
+    // (1) The stale window: the cache still holds the pre-outage Notification. The counter is
+    // read AFTER the query and inert flips only on the third failure, so < 3 proves the query
+    // ran before the flip.
+    auto stale = engine.subscription_establishment(*sub);
+    const auto sampled = registry_debug_counters_for_test(*raw);
+    REQUIRE(sampled.has_value());
+    {
+        INFO("the stale-window sample was taken after the third failed pass");
+        REQUIRE(sampled->sweep_pass_failed < 3);
+    }
+    REQUIRE(stale.has_value());
+    CHECK(stale->coverage == SparkCoverage::Notification);
+    REQUIRE(stale->established_at.has_value());
+    CHECK(*stale->established_at == est0);
+    REQUIRE(eventually(
+        [&] { return registry_debug_counters_for_test(*raw)->sweep_pass_failed >= 1; }, 8000ms));
+
+    // (2) Inert: the mechanism never delivered the None, so a None here is the engine's own
+    // overlay. This is the assertion that reads the stale Notification on an engine without it.
+    REQUIRE(eventually([&] { return raw->stats().inert; }, 8000ms));
+    auto overlaid = engine.subscription_establishment(*sub);
+    REQUIRE(overlaid.has_value());
+    CHECK(overlaid->coverage == SparkCoverage::None);
+    REQUIRE(overlaid->established_at.has_value());
+    CHECK(*overlaid->established_at == est0);
+
+    // (3) Recovery: the first good pass clears inert and the query follows the mechanism again.
+    failing.store(false, std::memory_order_release);
+    REQUIRE(eventually([&] { return !raw->stats().inert; }, 15000ms));
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        15000ms));
+    auto recovered = engine.subscription_establishment(*sub);
+    REQUIRE(recovered.has_value());
+    REQUIRE(recovered->established_at.has_value());
+    CHECK(*recovered->established_at == est0);
+    CHECK(registry_debug_counters_for_test(*raw)->established_failed == 0);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Registry mechanism (Windows, direct): an adoption re-report staged while the sweeper "
+          "is failing is delivered after recovery, the throwing sink drops it, and nothing "
+          "re-stages it (CH-4 direct layer, characterisation)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_adopt_backoff");
+    constexpr SparkIncarnation kInc1 = 81;
+    constexpr SparkIncarnation kInc2 = 82;
+    // Everything a callback or hook below captures is declared BEFORE `mech`: locals unwind in
+    // reverse order, so a fatal REQUIRE destroys `mech` (joining its threads) before this state.
+    EstLog log;
+    log.throw_if = [inc2 = kInc2](std::size_t, const EstLog::Entry& e) {
+        return e.incarnation == inc2;
+    };
+    std::atomic<bool> failing{false};
+    std::atomic<int> passes{0};
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech);
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.sweep_hook = [&] {
+            passes.fetch_add(1, std::memory_order_relaxed);
+            if (failing.load(std::memory_order_acquire))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    REQUIRE(mech->set_established_sink(log.sink()));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch_incarnation(key, spec.params, kInc1).has_value());
+    REQUIRE(eventually([&] { return log.has(key, kInc1, SparkCoverage::Notification); }));
+    // Idle sweeper before the outage starts, so the first failing pass is the adoption's own nudge.
+    REQUIRE(stable_for([&] { return passes.load(std::memory_order_relaxed); }, 300ms, 5000ms));
+
+    failing.store(true, std::memory_order_release);
+    // Adoption: the existing watch is rebound to kInc2, its re-report is marked due and the
+    // sweeper nudged. Every pass throws before its drain, so the report stays staged.
+    REQUIRE(mech->watch_incarnation(key, spec.params, kInc2).has_value());
+    REQUIRE(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->sweep_pass_failed >= 3; }, 8000ms));
+    REQUIRE(eventually([&] { return mech->stats().inert; }, 8000ms));
+    CHECK(log.calls_made() == 1);
+    CHECK(log.count(key, kInc2) == 0);
+    CHECK(log.dropped_entries().empty());
+
+    failing.store(false, std::memory_order_release);
+    REQUIRE(eventually(
+        [&] { return registry_debug_counters_for_test(*mech)->established_failed == 1; }, 15000ms));
+    REQUIRE(eventually([&] { return !mech->stats().inert; }, 15000ms));
+    // A re-staged persistent throw would keep this climbing.
+    REQUIRE(stable_for([&] { return log.calls_made(); }, 600ms, 8000ms));
+    CHECK(log.calls_made() == 2);
+    CHECK(registry_debug_counters_for_test(*mech)->established_failed == 1);
+    const auto dropped = log.dropped_entries();
+    REQUIRE(dropped.size() == 1);
+    CHECK(dropped[0].incarnation == kInc2);
+    CHECK(dropped[0].coverage == SparkCoverage::Notification);
+    CHECK(log.count(key, kInc2) == 0);
+    CHECK(log.count_key_reports(key) == 1); // only the initial kInc1 report was ever delivered
+
+    mech->stop();
+}
+
+TEST_CASE("Registry spark (real mechanism): a disarm racing a re-arm while the sweeper is failing "
+          "reads None with no established_at throughout, then Notification after recovery "
+          "(CH-4 engine layer, characterisation; no sink throw is injected)",
+          "[spark][established][windows]") {
+    ScratchRegKey a("est_adopt_engine");
+    // Declared BEFORE `engine` (locals unwind in reverse): a fatal REQUIRE then destroys
+    // the engine, joining its threads, before this state their callbacks capture.
+    Collector got;
+    std::atomic<bool> failing{false};
+    std::atomic<int> passes{0};
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.caller_wait_budget = 5000ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.sweep_hook = [&] {
+            passes.fetch_add(1, std::memory_order_relaxed);
+            if (failing.load(std::memory_order_acquire))
+                throw std::bad_alloc{};
+        };
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = registry_spec("HKCU", a.sub);
+    auto sub1 = engine.arm(*c, spec);
+    REQUIRE(sub1.has_value());
+    REQUIRE(eventually([&] {
+        auto e = engine.subscription_establishment(*sub1);
+        return e.has_value() && e->coverage == SparkCoverage::Notification;
+    }));
+    // Idle sweeper before the outage starts, so the first failing pass is the adoption's own nudge.
+    REQUIRE(stable_for([&] { return passes.load(std::memory_order_relaxed); }, 300ms, 5000ms));
+
+    failing.store(true, std::memory_order_release);
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, spec); // the mechanism adopts the live watch
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+    CHECK_FALSE(engine.subscription_establishment(*sub1).has_value());
+
+    // Until the mechanism goes inert the adopted key must never read a positive: its Armed is
+    // fresh, and the adoption report is held back by the failing passes.
+    bool never_positive = true;
+    REQUIRE(eventually(
+        [&] {
+            const auto e = engine.subscription_establishment(*sub2);
+            if (!e.has_value() || e->coverage != SparkCoverage::None ||
+                e->established_at.has_value())
+                never_positive = false;
+            return raw->stats().inert;
+        },
+        8000ms));
+    CHECK(never_positive);
+    CHECK(registry_debug_counters_for_test(*raw)->sweep_pass_failed >= 3);
+    auto est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    CHECK(est->coverage == SparkCoverage::None);
+    CHECK_FALSE(est->established_at.has_value());
+
+    failing.store(false, std::memory_order_release);
+    REQUIRE(eventually([&] { return !raw->stats().inert; }, 15000ms));
+    REQUIRE(eventually(
+        [&] {
+            auto e = engine.subscription_establishment(*sub2);
+            return e.has_value() && e->coverage == SparkCoverage::Notification;
+        },
+        15000ms));
+    est = engine.subscription_establishment(*sub2);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+    CHECK(registry_debug_counters_for_test(*raw)->established_failed == 0);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
 TEST_CASE("Registry spark (real mechanism): disarm() returns in bounded time while its drain runs "
           "detached (#2012 PR-B1 sre6-4)",
           "[spark][mechanism][windows][walkoff]") {
@@ -6175,9 +11685,109 @@ TEST_CASE("Service spark (real mechanism): two spark keys folding onto one servi
     CHECK(std::get<ServiceSparkData>(got.at(1).data).state ==
           ServiceRunState::Running); // ...same service, same resolved state
 
+    // M3 (rung 9c PR-6 item 1): the F4 unified branch reports establishment
+    // for the SECOND (coalescing) key unconditionally, mirroring Linux's M1
+    // coalescing coverage.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*second);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
     engine.disarm(*first);
     engine.disarm(*second);
     engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): Winmgmt reaches Notification coverage with a "
+          "stamped established_at (M3)",
+          "[spark][mechanism][windows]") {
+    // Winmgmt is always present and running on any Windows host, read-only
+    // here (never stopped/started) — the Windows twin of Linux's M1
+    // systemd-journald.service case, STRICT for the same reason (H7): a real
+    // resolvable, subscribable service must reach Notification, not settle
+    // for Poll.
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub = engine.arm(*c, service_spec("Winmgmt"));
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] { return got.count() >= 1; }));
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
+
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): a disarm racing a re-arm (adoption) still lets "
+          "the mechanism report establishment against the fresh incarnation (M3)",
+          "[spark][mechanism][windows]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub1 = engine.arm(*c, service_spec("Winmgmt"));
+    REQUIRE(sub1.has_value());
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub1);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, service_spec("Winmgmt"));
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub2);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
+TEST_CASE("Service mechanism (Windows, direct): set_established_sink seals at start(), same "
+          "one-way contract as the fake (M3)",
+          "[spark][mechanism][windows]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech);
+    CHECK(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->stop();
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {})); // one-way: still sealed after stop()
 }
 
 TEST_CASE("Service spark (real mechanism): thread count settles to 1 persistent worker (plus "
@@ -6388,6 +11998,11 @@ struct ServiceEmitCollector {
     std::mutex mu;
     std::vector<std::pair<std::string, ServiceRunState>> emits;
     std::vector<std::tuple<std::string, bool, std::string>> faults; // key, faulted, reason
+    /// rung 9c PR-6 item 1: key, incarnation, coverage — every established
+    /// report the mechanism has made, in order. Installed via
+    /// set_established_sink() BEFORE start() (an addition to this
+    /// test-owned collector, not an existing helper — M4/M3's own seam).
+    std::vector<std::tuple<std::string, SparkIncarnation, SparkCoverage>> established;
     SparkEmitFn emit_fn() {
         return [this](const std::string& key, SparkData data) {
             std::lock_guard lk(mu);
@@ -6401,13 +12016,197 @@ struct ServiceEmitCollector {
             faults.emplace_back(key, faulted, std::string(reason));
         };
     }
+    SparkEstablishedFn established_fn() {
+        return [this](const std::string& key, SparkIncarnation inc,
+                     std::chrono::steady_clock::time_point, SparkCoverage cov) {
+            std::lock_guard lk(mu);
+            established.emplace_back(key, inc, cov);
+        };
+    }
     std::size_t emit_count() {
         std::lock_guard lk(mu);
         return emits.size();
     }
+    std::size_t established_count() {
+        std::lock_guard lk(mu);
+        return established.size();
+    }
+    /// Count of Notification reports for `key` — M3's live-transition
+    /// re-report observer counts THIS, not emit_count(), since an engine
+    /// query holding first-wins state cannot show a re-report at all.
+    std::size_t notification_count_for(const std::string& key) {
+        std::lock_guard lk(mu);
+        return static_cast<std::size_t>(std::count_if(
+            established.begin(), established.end(), [&](const auto& e) {
+                return std::get<0>(e) == key && std::get<2>(e) == SparkCoverage::Notification;
+            }));
+    }
 };
 
 } // namespace
+
+// Live transition, direct-mechanism variant — env-gated (YUZU_SPARK_LIVE_SERVICE),
+// mirrors the engine-level live test above but installs a test-local sink
+// directly via set_established_sink() before start(), so it can observe every
+// Notification RE-REPORT the fired-scan's `:1919`-shape re-arm produces —
+// something an engine query (first-wins on established_at) structurally
+// cannot show (M3).
+TEST_CASE("Service mechanism (direct): a live service transition re-reports Notification on "
+          "every fired-scan re-arm, not just the first (M3)",
+          "[spark][mechanism][windows][live]") {
+    const char* env = std::getenv("YUZU_SPARK_LIVE_SERVICE");
+    if (!env || !*env) {
+        SUCCEED("YUZU_SPARK_LIVE_SERVICE unset — skipping live service integration test");
+        return;
+    }
+    const std::string name(env);
+    const auto spec = service_spec(name);
+    const std::string key = spark_key(spec);
+
+    auto mech = make_service_mechanism();
+    REQUIRE(mech != nullptr);
+    ServiceEmitCollector got;
+    REQUIRE(mech->set_established_sink(got.established_fn()));
+    mech->start(got.emit_fn(), got.fault_fn());
+
+    REQUIRE(mech->watch_incarnation(key, spec.params, 1).has_value());
+
+    // Toggle externally while this waits for at least 3 observed terminal
+    // transitions (the emit channel) — mirrors the engine-level live test's
+    // own wait shape.
+    REQUIRE(eventually([&] { return got.emit_count() >= 3; }, 60000ms));
+
+    // Oracle: every report's token == 1 (this mechanism instance only ever
+    // watched this key once, at incarnation 1); the count of Notification
+    // reports for `key` is >= the count of terminal transitions observed —
+    // the fired-scan's `:1919` re-arm re-reports Notification each time,
+    // which the emit channel alone (edge-dedup baseline) would never reveal.
+    {
+        std::lock_guard lk(got.mu);
+        for (const auto& [k, inc, cov] : got.established) {
+            if (k == key)
+                CHECK(inc == 1);
+        }
+    }
+    CHECK(got.notification_count_for(key) >= got.emit_count());
+
+    mech->stop();
+}
+
+TEST_CASE("Service mechanism (direct): a parked probe's None-on-teardown report lands "
+          "immediately, before the probe even resolves; release delivers a Notification "
+          "report carrying the watch's token (M4a)",
+          "[spark][mechanism][windows]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech != nullptr);
+    ServiceProbeGate gate;
+    {
+        ServiceMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(L"Winmgmt");
+        REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    ServiceEmitCollector got;
+    REQUIRE(mech->set_established_sink(got.established_fn()));
+    mech->start(got.emit_fn(), got.fault_fn());
+
+    const auto spec = service_spec("Winmgmt");
+    const std::string key = spark_key(spec);
+    REQUIRE(mech->watch_incarnation(key, spec.params, 1).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    // begin_probe()'s own unconditional None stage (right after
+    // teardown_watch, BEFORE probe_lane_.launch()) lands synchronously on the
+    // Add — it does not wait for the probe to resolve. By the time the probe
+    // has provably parked, exactly the initial None report already exists.
+    REQUIRE(eventually([&] { return got.established_count() >= 1; }, 2000ms));
+    {
+        std::lock_guard lk(got.mu);
+        REQUIRE(got.established.size() >= 1);
+        CHECK(std::get<0>(got.established[0]) == key);
+        CHECK(std::get<1>(got.established[0]) == 1);
+        CHECK(std::get<2>(got.established[0]) == SparkCoverage::None);
+    }
+
+    gate.release();
+    REQUIRE(eventually([&] { return got.notification_count_for(key) >= 1; }, 3000ms));
+
+    // Oracle (deliberately loose per the plan: "no exact count" — the
+    // immediate-callback re-arm on a real, live-changing Winmgmt can add
+    // further positive reports beyond the first): every report for this key
+    // carries token 1 (the only incarnation this mechanism instance ever
+    // watched it under) — the initial None (asserted above) included.
+    {
+        std::lock_guard lk(got.mu);
+        for (const auto& [k, inc, cov] : got.established) {
+            if (k != key)
+                continue;
+            CHECK(inc == 1);
+            (void)cov;
+        }
+    }
+
+    mech->stop();
+}
+
+TEST_CASE("Service mechanism (direct): a probe parked for a retired watch's token never "
+          "resolves — a re-watch under a NEW token gets its own clean reports (M4b)",
+          "[spark][mechanism][windows]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech != nullptr);
+    ServiceProbeGate gate;
+    {
+        ServiceMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(L"Winmgmt");
+        REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    ServiceEmitCollector got;
+    REQUIRE(mech->set_established_sink(got.established_fn()));
+    mech->start(got.emit_fn(), got.fault_fn());
+
+    const auto spec = service_spec("Winmgmt");
+    const std::string key = spark_key(spec);
+
+    // Token 1's probe parks and is left parked — this watch is about to be
+    // RETIRED, never resolved.
+    REQUIRE(mech->watch_incarnation(key, spec.params, 1).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    // begin_probe()'s own unconditional None stage lands for token 1 too,
+    // before its probe even resolves — snapshot how many reports exist so
+    // the oracle below only checks reports produced AFTER the retirement,
+    // not this legitimate token-1 report.
+    REQUIRE(eventually([&] { return got.established_count() >= 1; }, 2000ms));
+    std::size_t baseline = 0;
+    {
+        std::lock_guard lk(got.mu);
+        baseline = got.established.size();
+    }
+
+    mech->unwatch(key);
+    // Re-watch under a NEW token while the OLD probe is STILL parked — the
+    // retired SvcWatch's eventual probe result is never resolve_probe()'d
+    // against the new one (a fresh SvcWatch object, a fresh begin_probe()).
+    REQUIRE(mech->watch_incarnation(key, spec.params, 2).has_value());
+
+    gate.release(); // frees BOTH the stale parked probe (discarded on
+                    // retirement) and lets token 2's own probe proceed
+    REQUIRE(eventually([&] { return got.notification_count_for(key) >= 1; }, 3000ms));
+
+    // Every report for this key produced AFTER the retirement carries the
+    // NEW token — the retired watch's result is silently discarded, never
+    // misattributed.
+    {
+        std::lock_guard lk(got.mu);
+        REQUIRE(got.established.size() > baseline);
+        for (std::size_t i = baseline; i < got.established.size(); ++i) {
+            const auto& [k, inc, cov] = got.established[i];
+            if (k != key)
+                continue;
+            CHECK(inc == 2);
+            (void)cov;
+        }
+    }
+
+    mech->stop();
+}
 
 TEST_CASE("Service mechanism (direct): a parked establishment probe for one service does not "
           "stall a sibling's establishment (#2012/#3840 PR-B3)",
@@ -6533,10 +12332,12 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
         REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
     }
     ServiceEmitCollector got;
+    REQUIRE(mech->set_established_sink(got.established_fn())); // H15, rung 9c PR-6 item 1
     mech->start(got.emit_fn(), got.fault_fn());
 
     const auto spec_a = service_spec("Winmgmt");
-    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+    const std::string key = spark_key(spec_a);
+    REQUIRE(mech->watch_incarnation(key, spec_a.params, 7).has_value());
 
     // Contained: the throw is a genuine backend failure (never WorkerThrew
     // silently discarded), and dispatches a fault — proving the mechanism's
@@ -6556,7 +12357,7 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
     {
         std::lock_guard lk(got.mu);
         REQUIRE_FALSE(got.faults.empty());
-        CHECK(std::get<0>(got.faults.back()) == spark_key(spec_a));
+        CHECK(std::get<0>(got.faults.back()) == key);
         CHECK(std::get<1>(got.faults.back())); // faulted == true
     }
     {
@@ -6564,6 +12365,41 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
         REQUIRE(d.has_value());
         CHECK(d->probe_backend_failed > 0);
     }
+    // H15 (rung 9c PR-6 item 1): the SAME WorkerThrew outcome that faults the
+    // key also stages None coverage for it — the established channel must
+    // not stay silent (or stuck at a stale positive) just because the
+    // backend failure classification is "never a false Stopped", which is a
+    // statement about the RUN-STATE emit channel, not about coverage.
+    //
+    // Counted, not baselined (adversarial-review finding, post-synthesis
+    // correction of an earlier baseline-snapshot draft of this test): TWO
+    // distinct None reports for (key, incarnation 7) must land within this
+    // window — begin_probe()'s own unconditional pre-throw stage (:1601)
+    // PLUS resolve_probe()'s WorkerThrew-branch stage (:1759, the row this
+    // test actually exists to pin). A baseline snapshot taken after
+    // confirming only the first has two independent failure modes a count
+    // does not: the probe lane's injected throw resolves near-instantly, so
+    // a snapshot read a few instructions after the first None is confirmed
+    // can race past the second one too and produce a false RED on correct
+    // code; and the window must stay short enough that :1759's OWN 30s
+    // retry cadence (kAbsentRetryMs) cannot contribute a masking THIRD
+    // None via a fresh begin_probe() call if :1759 is genuinely missing —
+    // 3s is comfortably inside that margin. Falsifier: removing ONLY
+    // resolve_probe's `stage_coverage(w, SparkCoverage::None, established)`
+    // call at spark_service.cpp:1759 must drop this count to exactly 1
+    // within the same 3s window (mutation-verified on DGRHP).
+    CHECK(eventually(
+        [&] {
+            std::lock_guard lk(got.mu);
+            std::size_t none_count = 0;
+            for (const auto& e : got.established) {
+                if (std::get<0>(e) == key && std::get<1>(e) == 7 &&
+                    std::get<2>(e) == SparkCoverage::None)
+                    ++none_count;
+            }
+            return none_count >= 2;
+        },
+        3000ms));
     mech->stop();
 }
 
@@ -8576,8 +14412,10 @@ TEST_CASE("File mechanism (direct): a commit failure landing inside watch()'s ow
     std::atomic<bool> last_faulted{false};
     mech->start([](const std::string&, SparkData) {},
                 [&](const std::string&, bool faulted, std::string_view) {
-                    faults.fetch_add(1, std::memory_order_acq_rel);
+                    // Value first, count second: the test spins on the count and then reads
+                    // the value, so the count must be the last thing published.
                     last_faulted.store(faulted, std::memory_order_release);
+                    faults.fetch_add(1, std::memory_order_acq_rel);
                 });
     const auto spec = file_spec(a.file.string());
     REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());

@@ -1,0 +1,25 @@
+REAL CAPTURE
+
+File: usage_live_macos.txt
+Host: alex's Mac (Darwin 25.6.0), 2026-09-14
+DB path: /private/tmp/yuzu-uat/agent-data/tar.db (mode 644, owner alex, WAL)
+Writing agent: pid 50138, `yuzu-agent --data-dir /tmp/yuzu-uat/agent-data`, built from
+  branch feat/wave7-pr72a-forensics-tar-usage (the usage fold dev carries as #4269,
+  merge 4ab9b9c83); live tar_config schema_version = 7 at capture time.
+Command:
+  sqlite3 -readonly "$DB" "SELECT COUNT(*) FROM usage_live" > usage_live_macos.txt
+
+This file is the COUNT ONLY (one integer line) — app_usage_parsers.hpp's
+only read of usage_live is `SELECT COUNT(*) FROM usage_live` (kOpenRunsSql);
+no app_usage query ever selects a pid, exe_key, or user column from this
+table, so committing the ~700+ live pid/username rows this host's capture
+actually had would add nothing to the tests and would leak real pids/users
+needlessly.
+
+Captured value: 741 (open runs on this host at capture time).
+
+app_usage_test_seed.hpp's seed_from_fixture_dir() reads this single integer
+N, REQUIREs it parses and N >= 1, then inserts N placeholder rows via
+insert_usage_live(db, i, "(placeholder)", "", 0) for i in 1..N — the row
+bodies are placeholders because no app_usage query reads them; only the
+count matters, and that count is the real captured value.

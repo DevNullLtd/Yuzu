@@ -36,7 +36,7 @@ import close_linked_issues as cli  # noqa: E402
 # 1. Parser corpus: (name, body fragment, expected same-repo closing numbers)
 
 PARSER_CORPUS = [
-    # -- real bodies (verbatim fragments from merged Tr3kkR/Yuzu PRs) --------
+    # -- real bodies (verbatim fragments from merged DevNullLtd/Yuzu PRs) --------
     ("PR #1711 negated (MANDATORY negative)",
      "Hardening for the response/execution read surface (#1634, **partial** — does **not** close #1634).",
      []),
@@ -58,8 +58,9 @@ PARSER_CORPUS = [
     ("chain with and", "fixes #1, #2 and #3", [1, 2, 3]),
     ("colon form", "Resolves: #41", [41]),
     ("GH- form", "closed GH-77", [77]),
-    ("URL form", "Fixes https://github.com/Tr3kkR/Yuzu/issues/612", [612]),
-    ("same-repo qualified", "Closes Tr3kkR/Yuzu#99", [99]),
+    ("URL form", "Fixes https://github.com/DevNullLtd/Yuzu/issues/612", [612]),
+    ("same-repo qualified", "Closes DevNullLtd/Yuzu#99", [99]),
+    ("pre-transfer slug still same-repo", "Closes Tr3kkR/Yuzu#98", [98]),
     ("cross-repo excluded", "Closes octo/kit#5 and fixes other/repo#6", []),
     ("newline between keyword and ref", "Closes\n#61", [61]),
     ("negation stops at contrast", "This does not fix #12, but closes #13", [13]),
@@ -180,7 +181,17 @@ class _FakeWorld:
             "issue_with_comments": cli.issue_with_comments,
             "has_open_linked_pr": cli.has_open_linked_pr,
             "gh_api": cli.gh_api,
+            "has_write_access": cli.has_write_access,
         }
+        # Marker trust is a real collaborators-API lookup in production; these
+        # are network-free tests, so resolve it from the fixture's own
+        # author_association instead. The fixtures still express intent as
+        # OWNER/MEMBER/COLLABORATOR; only the PRODUCTION resolver changed.
+        cli.has_write_access = lambda login: any(
+            ((c.get("user") or {}).get("login")) == login
+            and (c.get("author_association") or "") in {"OWNER", "MEMBER", "COLLABORATOR"}
+            for cs in self.comments.values() for c in cs
+        )
         cli.issue_with_comments = lambda n: (
             self.issues.get(n),
             cli.trusted_comment_blob(self.comments.get(n, [])),
@@ -282,6 +293,38 @@ def run_plan_tests(failures):
         plan = cli.build_plan([_pr(504, "Closes #55")], dnc)
     if [(a) for _p, n, a, _r, _i in plan if n == 55] != [cli.SKIP]:
         failures.append(f"marker trust: collaborator marker must suppress (idempotency), got {plan}")
+
+    # Org-transfer regression (2026-09-28, Tr3kkR/Yuzu -> DevNullLtd/Yuzu).
+    # author_association reports MEMBER for ANY org member, and DevNullLtd's
+    # default_repository_permission is `read`, so association is no longer a
+    # proxy for push access. Trust must follow the collaborators API instead:
+    # a MEMBER who cannot push must NOT be able to suppress a close.
+    saved_hwa = cli.has_write_access
+    member_ro = [{"user": {"login": "readonly-org-member"},
+                  "author_association": "MEMBER",
+                  "body": "<!-- yuzu-close-linked: pr=505 issue=56 -->"}]
+    world = _FakeWorld(issues={56: _issue(56, labels=["bug"])}, comments={56: member_ro})
+    with world:
+        cli.has_write_access = lambda login: False   # the API says: no push
+        try:
+            plan = cli.build_plan([_pr(505, "Closes #56")], dnc)
+        finally:
+            cli.has_write_access = saved_hwa
+    if [(a) for _p, n, a, _r, _i in plan if n == 56] != [cli.CLOSE]:
+        failures.append(
+            f"marker trust: a read-only org MEMBER must not suppress the close, got {plan}")
+
+    # ...and the same login DOES suppress once the API grants push.
+    world = _FakeWorld(issues={56: _issue(56, labels=["bug"])}, comments={56: member_ro})
+    with world:
+        cli.has_write_access = lambda login: login == "readonly-org-member"
+        try:
+            plan = cli.build_plan([_pr(505, "Closes #56")], dnc)
+        finally:
+            cli.has_write_access = saved_hwa
+    if [(a) for _p, n, a, _r, _i in plan if n == 56] != [cli.SKIP]:
+        failures.append(
+            f"marker trust: push-capable author must suppress (idempotency), got {plan}")
 
     # Cap goes through the plan (CAPSKIP) and never reaches per-issue actions.
     world = _FakeWorld(issues={})
@@ -398,8 +441,8 @@ def run_snapshot_and_misc_tests(failures):
     if key not in cli.capskip_title(123, 7):
         failures.append("capskip: search key must be a substring of the generated title")
 
-    for bad in ("", "https://github.com/Tr3kkR/Yuzu/issues/2139",
-                "https://github.com/Tr3kkR/Yuzu/issues/2139#issuecomment-notanumber"):
+    for bad in ("", "https://github.com/DevNullLtd/Yuzu/issues/2139",
+                "https://github.com/DevNullLtd/Yuzu/issues/2139#issuecomment-notanumber"):
         if cli.verify_approval_url(bad):
             failures.append(f"approval-url: {bad!r} must be rejected")
 

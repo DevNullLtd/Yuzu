@@ -7,10 +7,14 @@ if host_machine.system() == 'windows'
 elif host_machine.system() == 'darwin'
   # Wave 3 (#2380/ADR-3002 promotion): the "system" action reads the IOKit
   # IOPlatformExpertDevice registry entry natively (kIOPlatformSerialNumberKey
-  # / kIOPlatformUUIDKey) instead of shelling out to `ioreg`. Same dependency
-  # shape as tests/meson.build's agent_test_native_deps (PLAN-08) — agent-core
-  # itself links no IOKit/CoreFoundation on darwin, so this plugin pulls its
-  # own copy.
+  # / kIOPlatformUUIDKey) instead of shelling out to `ioreg`. Same dependency shape as
+  # tests/meson.build's agent_test_native_deps (PLAN-08). As of C0 (dex_macos_perf.cpp)
+  # agent-core DOES link IOKit/CoreFoundation on darwin (its own hard appleframeworks
+  # dependency, agents/core/meson.build) — but a shared_library's own `dependencies:` are
+  # NOT propagated to a `link_with:` consumer by Meson (unlike
+  # `declare_dependency(dependencies: [...])`, which yuzu_agent_core_dep does not use for
+  # this), so this plugin must still carry its own copy of the frameworks it directly
+  # includes headers from.
   hardware_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'],
                                include_type: 'system')
 endif

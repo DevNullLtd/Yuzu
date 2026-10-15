@@ -1,0 +1,10 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-23 · euid 0 · leg-hash 9cf003de2f97
+== action=secure_boot
+secure_boot|linux|secure_boot|-|absent
+secure_boot|linux|setup_mode|-|absent
+[result_status] OK / FULL /
+
+== action=code_integrity
+code_integrity|linux|lsm|-|unreadable
+code_integrity|linux|lockdown|-|unreadable
+[result_status] CONSTRAINED / PARTIAL / lsm:errno_19,lockdown:errno_19

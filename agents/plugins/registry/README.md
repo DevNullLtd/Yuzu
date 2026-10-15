@@ -345,5 +345,4 @@ registry|unsupported|Windows registry is not available on this platform
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/unit/test_registry_local_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/1.9-command-capability-registry.added.md` · `changelog.d/1328-update-registry-postgres.changed.md` · `changelog.d/20260803-registry-list-profiles.added.md` · `changelog.d/20260803-registry-user-hive-fix.fixed.md` · `changelog.d/20260818-wave3-antivirus-native-wmi-registry.changed.md` · `changelog.d/2204-descriptor-seam-and-registry-sections.added.md` · `changelog.d/3386-spark-legacy-delta-registry.added.md`
 <!-- END GENERATED -->

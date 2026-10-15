@@ -44,7 +44,7 @@ A definition can exist standalone (without a set or pack). Sets group definition
 
 - **Substrate, not scripts.** Definitions target stable plugin primitives. OS-specific syscalls stay inside the plugin layer. Content authors never write shell commands.
 - **Everything is an InstructionDefinition.** Ad-hoc commands, scheduled tasks, policy checks, and remediation actions all use the same definition-to-execution-to-response pipeline.
-- **Typed end-to-end.** Parameter schemas validate input before dispatch. Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export).
+- **Typed end-to-end.** Parameter schemas validate input before dispatch on `POST /api/instructions/{id}/execute` (no other dispatch surface validates yet). Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export).
 - **Governed execution.** Every state-changing action can require approval. Every execution is audited. Every response is persisted.
 
 ### Two Definition Types
@@ -79,10 +79,13 @@ spec:
 
 ### Saving YAML via API
 
+Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
+
 ```bash
 # Save a definition from a YAML file (form-encoded; the yaml_source field
 # carries the document verbatim)
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/yaml \
   --data-urlencode "yaml_source@definitions/process-list.yaml"
 
@@ -100,6 +103,53 @@ The Instruction Management page provides two authoring modes:
 - **Code mode** -- a CodeMirror editor with YAML syntax highlighting, live validation, and auto-complete for known plugin/action pairs.
 
 Both modes are served as HTMX fragments.
+
+**Saving keeps what the YAML does not carry.** The editor's Save writes only the
+fields the YAML expresses (name, plugin, action, description, and the optional
+`type`, `version`, `concurrency` and `approval`). Everything else stored on the
+definition -- its instruction set, enabled flag, TTLs, result schema,
+visualization, response templates, platforms, minimum agent version, required
+plugins and readable payload -- is kept. When the YAML omits `type`, `version`,
+`concurrency` or `approval`, the stored value is kept as well; a value that
+differs from the stored one is an intentional edit and is written, and a change
+of `approval` is recorded in the audit detail as `approval_mode: <old> -> <new>`.
+
+**Library list.** The Definitions tab lists up to 100 definitions by default.
+`GET /fragments/instructions` takes `name`, `plugin`, `type` and `limit` (maximum
+500); a cut list says "Showing the first N. Narrow the filter." The "Needs
+approval" column and the instruction sets panel appear for callers who hold
+`InstructionDefinition:Read` and `InstructionSet:Read` respectively.
+
+**Page controls follow permissions.** New, Edit, Import, Delete and the set
+controls appear for callers who hold `InstructionDefinition:Write`,
+`InstructionDefinition:Delete`, `InstructionSet:Write` and `InstructionSet:Delete`
+respectively, not for a role. Each capability is probed once per page render, and
+a denied probe is audited as a denial, so loading the page as a caller who lacks
+a capability writes one denial row for it.
+
+**Sets.** The sets panel lists each set with the number of definitions in it.
+New set asks for a name and description. Delete set states that its definitions
+stay and become unassigned. Each library row has a set select that assigns the
+definition to a set or clears it.
+
+**Response templates.** Templates on a library row loads that definition's
+templates: the built-in default (never editable) first, then the authored ones.
+New, Edit and Delete open dialogs that call
+`/api/v1/definitions/{id}/response-templates`. Filters are written one per line as
+`column | op | value`.
+
+**Import and export.** Import definition takes the JSON document that Export
+produces (Ed25519-signed or not); unsigned documents can be refused by policy and
+a duplicate id is refused. When the audit record could not be written the page
+says so. Export saves the definition as `<id>.json`.
+
+**Dispatch.** Selecting a definition on the Executions tab reads its parameters
+from `GET /api/v1/instructions/{id}`; `grant_secret` and `grant_id` are write-only
+password inputs. The Target select offers a scope expression with Validate
+(syntax only) and Preview (needs `Infrastructure:Read`). Dispatch always
+confirms, naming the instruction, `plugin:action`, type and target; a definition
+whose approval mode is not `auto` says it will be submitted for approval and not
+run, and an expression that was not previewed needs `DISPATCH` typed to send.
 
 ---
 
@@ -304,6 +354,7 @@ metadata:
 ```bash
 # Create an instruction set
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instruction-sets \
   -H "Content-Type: application/json" \
   -d '{
@@ -313,6 +364,7 @@ curl -s -b cookies.txt \
 
 # Delete a set (cascades to contained definitions)
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instruction-sets/abc123
 ```
 
@@ -333,14 +385,14 @@ Parameters use a JSON Schema subset. The root object describes the input shape; 
 | `datetime` | ISO 8601 timestamp | String | `"2026-03-17T18:20:00Z"` |
 | `guid` | UUID / GUID | String | `"550e8400-e29b-41d4-a716-446655440000"` |
 
-Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. The server validates values against declared types and constraints before dispatch.
+Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. `POST /api/instructions/{id}/execute` validates the request's `params` against the declared types and constraints before dispatch (see [Parameter validation](#parameter-validation)); no other dispatch surface does yet.
 
 ### Validation Constraints
 
 | Constraint | Applicable Types | Description |
 |---|---|---|
-| `maxLength` | `string` | Maximum character count. |
-| `minLength` | `string` | Minimum character count. |
+| `maxLength` | `string` | Maximum length in bytes (UTF-8). |
+| `minLength` | `string` | Minimum length in bytes (UTF-8). |
 | `pattern` | `string` | Regex the value must match. |
 | `enum` | `string` | List of allowed values. |
 | `minimum` | `int32`, `int64` | Minimum value (inclusive). |
@@ -379,6 +431,90 @@ parameters:
       type: boolean
       default: false
 ```
+
+### Parameter validation
+
+`POST /api/instructions/{id}/execute` validates the request's `params` against the definition's stored
+`parameter_schema` before the approval gate, strictly (details and error bodies: [REST API](rest-api.md)).
+A refused call creates no approval ticket, execution row or dispatch. Enforced as declared:
+
+- a name the schema does not declare is refused (path `/*`); a required name without a `default` must
+  be sent; a `default` satisfies `required` but is **not** injected, so the plugin still receives only
+  what you sent;
+- `type`, `enum` (case-sensitive), `pattern` (anchor it: it is a search, not a full match), `minimum`/`maximum`
+  (`int32` also gets the 32-bit range) and `minLength`/`maxLength`;
+- an integer is a JSON integer or a string of digits with an optional leading `-` (`"+5"`, `" 5"`,
+  `"5.0"` and JSON `5.0` are refused); a boolean is `true`/`false` or the strings `"true"`/`"false"`;
+- `null` is never read as an omission: a parameter refuses it (omit the key instead);
+- a string containing a NUL character is refused.
+
+A definition that stores no schema (empty, whitespace or `{}`, which is what the YAML editor stores for a
+definition created there) is not validated. The YAML editor, `PUT /api/instructions/{id}` and
+response-template changes **keep** the stored schema: editing `spec.parameters` in the YAML editor does not
+change what execute enforces.
+
+Limits on a stored schema (a schema over a limit is refused when it is written, and a stored one that is
+over a limit makes execute answer `500`):
+
+| Limit | Value |
+|---|---|
+| schema text | 262144 bytes |
+| properties per schema | 128 |
+| members per `enum` | 256 |
+| `pattern` length | 1024 bytes |
+| compiled pattern size | 32768 RE2 instructions each, 65536 per schema, and RE2's 512 KiB memory budget per pattern |
+| integer `minimum`/`maximum` | magnitude below 2^53 |
+| string matched against a `pattern` | 64 KiB |
+| matching work per request (or per schema, for `default`s) | (bytes + 1) x pattern size, plus one unit per `enum` member compared, up to 16777216 |
+
+`enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
+poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
+that route does not read `enabled`.
+
+### Replacing a stored parameter schema
+
+No route replaces a stored schema in place: `PUT /api/instructions/{id}`, the YAML editor and
+response-template changes keep it, and `POST /api/instructions/import` answers `409` for an id that
+already exists. To replace one (a wrong or legacy schema, a `500` from execute, or a corrected bundled
+definition on an existing install), export the definition, delete it and import it again with a
+corrected `parameter_schema`:
+
+1. `GET /api/instructions/{id}/export` (`InstructionDefinition:Read`) and keep the document. It carries
+   the fields import reads, including `yaml_source`, `instruction_set_id` and
+   `response_templates_spec`, which the delete removes (the delete and re-import also reset `created_at`,
+   which import never reads). It carries **no** `signature` or `publicKey`.
+2. Edit its `parameter_schema` (a string holding the schema JSON). Unless the server runs with
+   `--allow-unsigned-definitions`, the edited document must also be signed before import, or the import
+   answers `400` as unsigned: add a hex `signature` and `publicKey` (an Ed25519 signature over the exact
+   bytes of `yaml_source`, 128 and 64 hex characters). The signature covers `yaml_source` only, so `plugin`, `action`, `type`, `approval_mode` and `concurrency_mode` are read from it and must agree with the envelope. A definition whose `yaml_source` is empty cannot be
+   signed (import answers an error about a signature without `yaml_source`), so only the unsigned flag
+   works for it.
+3. Rehearse the import, because step 5 cannot be rehearsed (an existing id answers `409`) and a refused
+   import leaves the definition deleted: `POST /api/instructions/import` the corrected, signed document
+   once with a different `id` (import reads `id` from the document and accepts any id that is free), confirm
+   it is accepted, then `DELETE` that temporary id. The signature covers only the `yaml_source` bytes, so it
+   stays valid. The temporary definition is live until it is deleted.
+4. `DELETE /api/instructions/{id}` (`InstructionDefinition:Delete`, audit action `instruction.delete`).
+5. `POST /api/instructions/import` with the edited document (`InstructionDefinition:Write`, audit action
+   `instruction.import`). The schema is checked as it is written, so a bad one is refused with a `400`.
+
+The signature covers only the `yaml_source` bytes (not the schema, plugin, action, `approval_mode` or
+`created_by`), and the verifier takes `publicKey` from the request, so it is an integrity check and not
+publisher authentication. See [REST API](rest-api.md).
+
+- A bundled definition is tombstoned by the delete, so the bundled reseed does not bring the old one back.
+  Any public import skips the tombstone, whether signed or unsigned under `--allow-unsigned-definitions`
+  (both run as a non-seed insert), so the replacement lands and later boots leave it alone. The tombstone is
+  permanent: a replaced bundled definition never receives later bundled corrections from the reseed.
+- The delete removes only the definition row. A schedule that references the id has its occurrences skipped
+  and audited as `definition_unknown` until the id exists again. A policy does not name the instruction; its
+  fragment does (`check_instruction`, `fix_instruction` and `post_check_instruction`, which falls back to
+  `check_instruction`). Check, fix and verify dispatches that name a missing id log `unknown check/fix instruction`
+  and send nothing, a remediation then reports `fix dispatch failed (unknown instruction or no agents)`, `POST /api/workflows/{id}/execute` for
+  a workflow with a step that names it answers `400` (`references unknown instruction`), and a pending
+  approval keeps its `definition_id` (no foreign key was found). Check policy fragments, stored workflows and
+  pending approvals for the id before deleting. Other references were not checked.
+- Between steps 4 and 5 the definition does not exist, and a refused import leaves it deleted. Have the corrected (and, unless the unsigned flag is set, signed) document ready and rehearsed before step 4, and do both in one maintenance window.
 
 ---
 
@@ -460,7 +596,7 @@ When a user (or MCP tool) executes an instruction that requires approval:
 
 1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. The execution is queued, not dropped.
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
-3. **Approvals tab.** The pending request is visible in the **Approvals** tab of the dashboard. The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded.
+3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded. On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
 The submitter cannot approve their own request. A different user with the appropriate role must review it.
 
@@ -890,6 +1026,7 @@ POST /api/instructions
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions \
   -H "Content-Type: application/json" \
   -d '{
@@ -916,6 +1053,7 @@ PUT /api/instructions/{id}
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X PUT http://localhost:8080/api/instructions/crossplatform.service.inspect \
   -H "Content-Type: application/json" \
   -d '{
@@ -933,6 +1071,7 @@ DELETE /api/instructions/{id}
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instructions/crossplatform.service.inspect
 ```
 
@@ -946,6 +1085,7 @@ Accepts `Content-Type: application/x-yaml`. Parses the YAML, extracts metadata a
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/yaml \
   -H "Content-Type: application/x-yaml" \
   --data-binary @my-definition.yaml
@@ -974,6 +1114,7 @@ POST /api/instructions/import
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/import \
   -H "Content-Type: application/json" \
   -d @exported-definition.json
@@ -1011,6 +1152,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 - `agent_ids` — optional array of specific agent IDs to target.
 - `scope` — optional scope expression (e.g., `group:servers`, `os:windows AND tag:prod`), or `__all__` for every enrolled agent. **Omit both `scope` and `agent_ids`** to broadcast. A *supplied* empty string, a non-string `scope`, an empty `agent_ids`, a non-array `agent_ids`, or a non-string entry is refused with `400` rather than widened to the whole fleet (#2500) — a target the caller named that resolves to nothing is an error, not a request for everything.
 - `params` — key-value parameters to pass to the plugin action. Keys should match the definition's `parameter_schema`.
+  This route checks them against it (see [Parameter validation](#parameter-validation)).
 
 **Response (200):**
 
@@ -1030,6 +1172,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/filesystem.exists/execute \
   -H "Content-Type: application/json" \
   -d '{"params":{"path":"C:\\Windows"}}'
@@ -1069,6 +1212,7 @@ POST /api/instruction-sets
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instruction-sets \
   -H "Content-Type: application/json" \
   -d '{
@@ -1087,6 +1231,7 @@ Cascade-deletes all definitions in the set.
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instruction-sets/SET-001
 ```
 
@@ -1107,6 +1252,14 @@ curl -s -b cookies.txt http://localhost:8080/api/schedules
 # List only enabled schedules
 curl -s -b cookies.txt "http://localhost:8080/api/schedules?enabled_only=true"
 ```
+
+The dashboard's Schedules tab (see [Dashboard UI](#13-dashboard-ui) below) is backed by the
+versioned `GET /api/v1/schedules` twin, not the legacy endpoint above. If the schedule store is
+temporarily unreachable, the tab shows "Schedule list temporarily unavailable — retry shortly"
+instead of an empty list. Schedule reads (dashboard, REST v1, and MCP `list_schedules` alike) are
+capped at 100 rows; if a fleet has more schedules than that, the tab shows a partial-list notice
+above the table, and `GET /api/v1/schedules`'s JSON response carries `result_truncated_by_cap: true`
+(see [REST API](rest-api.md#get-apiv1schedules)) — the two are the same underlying signal.
 
 #### Create a schedule
 
@@ -1175,7 +1328,8 @@ POST /api/approvals/{id}/approve
 
 The reviewer must be a different operator than the submitter — self-approval
 is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
-and the denied attempt is recorded in the audit log.
+and the denied attempt is recorded in the audit log. The `comment` is capped at
+4,000 bytes (HTTP 400 beyond that).
 
 ```bash
 curl -s -b cookies.txt \
@@ -1288,6 +1442,8 @@ curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
 
+Cancelling an execution that already finished (`succeeded`, `completed` or `cancelled`) answers `409` and changes nothing; the Executions page offers Cancel only for executions that are still running. Per-device results and the live view are on the page's detail pane.
+
 ---
 
 ## 13. Dashboard UI
@@ -1299,9 +1455,21 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | Tab | Description |
 |---|---|
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
-| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. Pass `?definition_id=<id>` in the page URL to pre-filter the list to one definition. |
+| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. The Executions page (`/executions`) takes `?definition_id=<id>` and `?status=<s>` to pre-filter the list and `?id=<execution>` to open one. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
-| **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
+| **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
+
+**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
+
+**Workflows page.** `/workflows` is a page in the sidebar under Instructions (its workflow actions are described below): the workflow definitions (name, description, step count; selecting one lists its steps with each step's failure policy) and the recurring schedules. Schedules run a single instruction on the cadence the scheduler really applies (once, every N minutes, daily, weekly or monthly; time of day, weekday and day of month are stored but not used) and are not linked to workflows. A schedule you did not create shows only whether it targets all devices or a subset.
+
+The definitions table also shows each workflow's Last run and Result (the newest run you may see: "Not run" when there is none, "None visible" when runs exist only on devices outside your scope, "Unknown" when the list of newest runs was cut off before it reached that workflow). Selecting a workflow loads its latest run in the **Latest run** panel (status, start, duration, device count and one row per step) and the **Recent runs** disclosure lists its ten newest runs; selecting one loads it. A step shown as *Dispatched* means the command was sent: it says nothing about the result on a device, and for a caller confined to a device scope it reads *Dispatched (run-wide)* because the send covered the run's whole target list. A skipped step says why only for the three reasons the engine writes (condition not met, previous step failed, workflow aborted); a failed step shows its error text when the engine stored one, otherwise "No detail.". A run is visible to you only if at least one of its target devices is in your scope; a run you may not see and a run that does not exist look the same.
+
+**Workflow actions.** **New workflow** (shown when you hold `Workflow:Write`) opens a dialog for the workflow's YAML; the server's message is shown if the YAML is refused, and nothing runs until you run it. Each row's **Run now** (needs `Workflow:Execute`) opens a device checklist built from the connected devices you may see (filter box, the first 200 matches shown, at most 500 selected); without permission to list devices it falls back to a box of device ids, one per line. Each step is sent to every selected device in order; a step whose instruction needs approval is refused, and device results are not collected on this page. The server runs the whole workflow before it answers, so the page waits 8 seconds, then says the run may keep running on the server, disables that workflow's Run now and checks its newest run every 5 seconds for up to 10 minutes. Check Recent runs before running it again. **Delete** in the Steps panel (needs `Workflow:Delete`) retires the workflow after a confirmation; run history is kept and there is no undelete in the console. A control you may not use is shown disabled with the permission it needs. Instruction names appear on step rows only if you also hold `InstructionDefinition:Read`; otherwise the step's label or instruction id is shown. **Schedule actions.** Each schedule row has **Enable**/**Disable** and **Delete**, enabled only on schedules you created (a schedule with no recorded creator is nobody's, so both stay disabled). **Enable** needs `Schedule:Write` and `Execution:Execute` and asks for confirmation because the schedule then runs without anyone present; **Disable** needs `Schedule:Write` and is one click; **Delete** needs `Schedule:Delete` and confirms first. After a change the list is re-read and the stored state shown. **New schedule** (needs `Schedule:Write` and `Execution:Execute`; the instruction list needs `InstructionDefinition:Read`) takes a name, an enabled instruction, a cadence (once runs at the next scheduler tick, about now; the scheduler ignores time of day), targets, whether each run needs approval and parameters as JSON. Leaving targets empty needs an explicit acknowledgement that it reaches every device. A final summary shows the instruction's approval mode before the schedule is created enabled; a run can still be refused when it fires. Not verified by running a workflow against a live fleet: that the server keeps running a workflow after the page stops waiting.
+
+Who sees what: Administrator, Operator, PlatformEngineer, Viewer and ITServiceOwner hold `Workflow:Read` and see all definitions; runs follow the fleet-read scope of the account. A caller scoped only to management groups is refused the definitions and schedules panels (the existing global-grant rule) but sees runs that include a device in scope. ITServiceOwner can create, enable and delete its own schedules elsewhere but has no Run, New workflow or Delete workflow control, and a service-scoped token is refused the schedules panel outright.
+
+Operational notes: listing definitions reads each workflow's steps with one query per row (up to 101 per page load, newest first), so the page asks for 101 and never renders the YAML. Opening the page or refreshing a denied panel writes a denial audit row for each refused panel, so a denied panel is not polled; reading a run's detail writes `workflow_execution.detail.fetch`. Not verified by running it: that a run keeps going on the server when the browser disconnects, and the content of the `perm_fn` denial audit rows for the refused panels.
 
 ### YAML Editor
 
@@ -1343,7 +1511,7 @@ When the dispatched (plugin, action) reverse-resolves to an enabled `Instruction
 
 - **First-match arbitrariness.** When multiple enabled definitions share `(plugin, action)` and more than one declares a visualization, the alphabetically-first definition wins. Authors should ensure at most one chart-bearing definition per `(plugin, action)` — or dispatch via the Instructions tab (which carries `definition_id` explicitly).
 - **F5 mid-dispatch.** Reloading the dashboard within the 2-second window cancels the deferred chart load. Re-dispatch to recover.
-- **Row cap.** Each chart's underlying response read is capped at 10 000 rows. When the cap is hit, the payload includes `rows_capped: true`; the dashboard renders the chart from the truncated set and the `command.dispatch` audit detail records the truncation.
+- **Row cap.** Each chart's underlying response read is capped at 10 000 rows. The read is also capped at 50 MiB of row payload. `rows_capped: true` means the 10 000-row cap cut the read; when either the row cap or the 50 MiB cap cut it, the payload also carries `result_truncated_by_cap: true` and `truncation_cause` (`row_cap` or `byte_cap`). The dashboard renders the chart from the truncated set and shows a "Partial result" notice in the chart's card above the chart, naming which cap cut it. The chart is fetched independently of the results table, so the notice appears on every page that shows the chart deck, including the filtered results view.
 - **No definition? No chart.** Free-form `(plugin, action)` dispatches that don't correspond to any enabled definition with `spec.visualization` produce only the standard tabular results — the dashboard does not render an empty chart card.
 - **Dashboard YAML editor strips `spec.visualization`.** The dashboard's CodeMirror editor (`POST /api/instructions/yaml`) saves the YAML source verbatim into `yaml_source` but its schema-aware field extractor (`instruction_yaml`, which indexes the id/name/plugin/action/type/description/concurrency/approval columns from both the canonical nested and flat schemas) does not extract `spec.visualization` into the indexed `visualization_spec` column. Result: editing a chart-bearing definition in the dashboard editor and saving silently disables its chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or via a server restart that triggers the bundled-content auto-import. Author chart-bearing definitions through `POST /api/v1/definitions/import` rather than the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
 

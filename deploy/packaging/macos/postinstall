@@ -222,14 +222,17 @@ restore_previous() {
     remove_managed_plugins "$INCOMING_MANIFEST"
     rm -f "$MANIFEST"
     rm -rf "$APP" "$INCOMING_APP"
-    rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib
+    rm -f /usr/local/bin/yuzu-agent /usr/local/bin/libyuzu_agent_core.dylib /usr/local/lib/libyuzu_agent_core.dylib
     [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \
         ditto "$recovery/LaunchDaemons/com.yuzu.agent.plist" "$PLIST"
     [[ ! -d "$recovery/YuzuAgent.app" ]] || ditto "$recovery/YuzuAgent.app" "$APP"
     [[ ! -e "$recovery/loose/yuzu-agent" ]] || \
         ditto "$recovery/loose/yuzu-agent" /usr/local/bin/yuzu-agent
     [[ ! -e "$recovery/loose/libyuzu_agent_core.dylib" ]] || \
-        ditto "$recovery/loose/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib
+        ditto "$recovery/loose/libyuzu_agent_core.dylib" /usr/local/bin/libyuzu_agent_core.dylib
+    # A package from before #5144 kept the core dylib in /usr/local/lib.
+    [[ ! -e "$recovery/loose/legacy-lib/libyuzu_agent_core.dylib" ]] || \
+        ditto "$recovery/loose/legacy-lib/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib
     [[ ! -e "$recovery/package-mode" ]] || ditto "$recovery/package-mode" "$MODE_FILE"
     [[ ! -e "$recovery/package-files.list" ]] || \
         ditto "$recovery/package-files.list" "$MANIFEST"
@@ -304,14 +307,14 @@ sync
 require_stopped
 remove_managed_plugins "$MANIFEST"
 rm -rf "$APP"
-rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib
+rm -f /usr/local/bin/yuzu-agent /usr/local/bin/libyuzu_agent_core.dylib /usr/local/lib/libyuzu_agent_core.dylib
 if [[ "$MODE" == "bundle" ]]; then
     mv "$INCOMING_APP" "$APP"
     rm -f "$INCOMING_BUNDLE_ARCHIVE"
 else
     mv /usr/local/bin/.yuzu-agent.incoming /usr/local/bin/yuzu-agent
-    [[ ! -e /usr/local/lib/.libyuzu_agent_core.incoming.dylib ]] || \
-        mv /usr/local/lib/.libyuzu_agent_core.incoming.dylib /usr/local/lib/libyuzu_agent_core.dylib
+    [[ ! -e /usr/local/bin/.libyuzu_agent_core.incoming.dylib ]] || \
+        mv /usr/local/bin/.libyuzu_agent_core.incoming.dylib /usr/local/bin/libyuzu_agent_core.dylib
 fi
 mkdir -p "$PLUGIN_DIR"
 for incoming_plugin in "$INCOMING_PLUGIN_DIR"/*; do
@@ -336,9 +339,9 @@ if [[ "$MODE" == "bundle" ]]; then
 else
     chown root:wheel /usr/local/bin/yuzu-agent
     chmod go-w /usr/local/bin/yuzu-agent
-    if [[ -e /usr/local/lib/libyuzu_agent_core.dylib ]]; then
-        chown root:wheel /usr/local/lib/libyuzu_agent_core.dylib
-        chmod go-w /usr/local/lib/libyuzu_agent_core.dylib
+    if [[ -e /usr/local/bin/libyuzu_agent_core.dylib ]]; then
+        chown root:wheel /usr/local/bin/libyuzu_agent_core.dylib
+        chmod go-w /usr/local/bin/libyuzu_agent_core.dylib
     fi
     harden_managed_plugins "$MANIFEST"
 fi

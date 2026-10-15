@@ -45,6 +45,7 @@
 #include <yuzu/agent/guard_systemd.hpp> // parse_active_state, systemd_error_name_is_absence,
                                         // systemd_state_is_transitional, normalize_unit_name,
                                         // valid_unit_name — pure, all-platform, shared with the guard
+#include <yuzu/log_token.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -134,6 +135,21 @@ struct PendingFault {
     bool faulted;
     std::string reason;
 };
+/// A staged establishment-signal report (rung 9c PR-6 item 1) — see
+/// SparkEstablishedFn's own doc comment for the field semantics. `incarnation`
+/// is this key's recorded value in `key_incarnation_` AT THE MOMENT this entry
+/// was staged (Linux has no cross-tick staleness window to guard against — see
+/// drop_stale()'s doc comment for the same-tick Remove+Add staging race
+/// Windows's separate `key_epoch` exists to close; Linux's on_props_changed
+/// runs synchronously on the poll thread (see the Cmd::Remove handling
+/// above) so no such window exists — so unlike Windows's twin there is no
+/// separate `key_epoch` to carry).
+struct PendingEstablished {
+    std::string key;
+    SparkIncarnation incarnation;
+    std::chrono::steady_clock::time_point at;
+    SparkCoverage coverage;
+};
 
 /// One watched systemd unit, poll-thread-confined (no lock — see the class
 /// comment on LinuxServiceMechanism). Distinct spark keys ("ssh" vs
@@ -148,6 +164,10 @@ struct UnitWatch {
     std::optional<ServiceRunState> last; ///< edge-dedup baseline; nullopt until the first terminal
     bool faulted{false};
     std::chrono::steady_clock::time_point next_backstop{};
+    /// Last-STAGED establishment coverage (rung 9c PR-6 item 1) — the per-watch
+    /// cache a coalescing/adopting key's unconditional report reads back; written
+    /// by every row of the coverage table, never read for any gating decision.
+    SparkCoverage coverage{SparkCoverage::None};
 };
 
 int on_props_changed(sd_bus_message*, void* userdata, sd_bus_error*) {
@@ -178,6 +198,25 @@ public:
         // caller's lock. (Gate-8 round 2 cpp-safety.)
         std::lock_guard teardown(teardown_mu_);
         std::lock_guard lk(mu_);
+        // One-way seal (rung 9c PR-6 item 1): start() being CALLED is what seals
+        // the establishment sink, whether or not this call does anything else —
+        // set first, before the idempotent early-return, so a repeat start()
+        // can never re-open the window. Never cleared by stop(): SparkEngine
+        // itself is single-shot (spark_engine.hpp's own header doc), so no
+        // production caller ever needs to re-arm the sink after a stop().
+        sink_sealed_ = true;
+        // Governance UP-1(B) hazard (security-guardian Gate-8): this guard reads
+        // the SAME started_ this class's run()-catch blocks now flip to false on
+        // an uncaught worker-thread exception. ISparkMechanism::start() is
+        // documented "called exactly once by SparkEngine::start()" and has
+        // exactly one production call site — E6-capped, not reachable today —
+        // but a hypothetical second start() after a thread death would fall
+        // through here instead of early-returning: it would open a fresh
+        // sd_bus/eventfd over the still-live bus_/wake_fd_ (leaking them) and
+        // then move-assign thread_ over a still-joinable std::thread, which
+        // calls std::terminate(). Do not add a second production call to
+        // SparkEngine::start() without also hardening this guard to match
+        // stop()'s resource-conjunction shape.
         if (started_)
             return; // idempotent
         emit_ = std::move(emit);
@@ -210,6 +249,17 @@ public:
 
     std::expected<void, std::string> watch(const std::string& key,
                                            const SparkParams& params) override {
+        // The engine never calls this overload in production (it always calls
+        // watch_incarnation() below) — kept for direct/test callers that predate
+        // the establishment signal. kNoSparkIncarnation is a valid, harmless
+        // identity: nothing rejects it, it simply never matches a real engine
+        // incarnation.
+        return watch_incarnation(key, params, kNoSparkIncarnation);
+    }
+
+    std::expected<void, std::string> watch_incarnation(const std::string& key,
+                                                        const SparkParams& params,
+                                                        SparkIncarnation incarnation) override {
         const auto* sp = std::get_if<ServiceSparkParams>(&params);
         if (!sp)
             return std::unexpected("service mechanism: params are not ServiceSparkParams");
@@ -226,9 +276,17 @@ public:
         if (inert_)
             return std::unexpected("system bus unavailable — service sparks unsupported on this "
                                    "host");
-        pending_.push_back(Cmd{Cmd::Add, key, normalize_unit_name(sp->service_name)});
+        pending_.push_back(Cmd{Cmd::Add, key, normalize_unit_name(sp->service_name), incarnation});
         wake();
         return {};
+    }
+
+    bool set_established_sink(SparkEstablishedFn sink) override {
+        std::lock_guard lk(mu_);
+        if (sink_sealed_)
+            return false;
+        established_ = std::move(sink);
+        return true;
     }
 
     void unwatch(const std::string& key) override {
@@ -307,6 +365,12 @@ public:
         std::lock_guard lk(mu_);
         emit_ = nullptr;
         fault_ = nullptr;
+        // established_ is cleared here too (nulled only after the poll thread has
+        // joined, mirroring emit_/fault_) but sink_sealed_ is DELIBERATELY left
+        // set — an ordinary stop() reports NOTHING further (R4: matches
+        // subscription_health's stale-after-stop precedent), and the seal itself
+        // is one-way for this instance's life, not a per-lifecycle latch.
+        established_ = nullptr;
         inert_.store(false, std::memory_order_release);
         pending_.clear();
     }
@@ -315,9 +379,12 @@ public:
     /// slow-op are ReadDirectoryChangesW-specific — #1979/#1980/#1982); its own
     /// fault-tiering and retry counters are tracked separately (#1929/#1931). What it
     /// MUST publish is `inert`, so the fleet can tell a service mechanism that bound
-    /// the system bus from one that never did (the container case).
+    /// the system bus from one that never did (the container case). `inert_` here is
+    /// ENTIRELY boot-time (#4685) — Linux Service has no runtime-inert concept, unlike
+    /// File/Registry — so `.boot_inert` is the same atomic, not a separate flag.
     [[nodiscard]] SparkMechanismStats stats() const override {
-        return {.inert = inert_.load(std::memory_order_acquire)};
+        const bool boot = inert_.load(std::memory_order_acquire);
+        return {.inert = boot, .boot_inert = boot};
     }
 
 private:
@@ -325,6 +392,7 @@ private:
         enum Op { Add, Remove } op;
         std::string key;
         std::string unit; // only meaningful for Add
+        SparkIncarnation incarnation{kNoSparkIncarnation}; // only meaningful for Add
     };
 
     void wake() {
@@ -356,7 +424,7 @@ private:
         } else {
             spdlog::warn("spark_service: LoadUnit '{}' transient error (name='{}', {}) — "
                          "reopening, no false Stopped",
-                         uw.unit, err.name ? err.name : "(none)",
+                         ::yuzu::log_key_token(uw.unit), err.name ? err.name : "(none)",
                          err.message ? err.message : err_str(r < 0 ? -r : 0));
             res = ResolveResult::BusError;
         }
@@ -383,7 +451,7 @@ private:
         } else {
             spdlog::warn("spark_service: ActiveState read transient error for '{}' (name='{}') — "
                          "reopening, no false drift",
-                         uw.unit, err.name ? err.name : "(none)");
+                         ::yuzu::log_key_token(uw.unit), err.name ? err.name : "(none)");
         }
         if (s)
             free(s);
@@ -421,18 +489,26 @@ private:
     // failure without ever routing through those two call sites, silently
     // swallowing the fault signal for every unit on the connection.
     void arm_unit(sd_bus* bus, UnitWatch& uw, std::vector<PendingEmit>& emits,
-                  std::vector<PendingFault>& faults) {
+                  std::vector<PendingFault>& faults, std::vector<PendingEstablished>& established) {
         uw.slot.reset(); // drop the old match (and its bus ref) first
+        // Unconditional (rung 9c PR-6 item 1, round-4 MF1): discarding the old
+        // match genuinely means coverage is None until re-established below,
+        // even when re-establishment resolves microseconds later in this same
+        // synchronous call — mirrors Windows's begin_probe() staging None right
+        // after its own teardown_watch().
+        stage_coverage(uw, SparkCoverage::None, established);
         switch (resolve_path(bus, uw)) {
         case ResolveResult::BusError:
             bus_ok_ = false;
             fault_all(true, "system bus lost", faults);
+            drop_coverage_all(established);
             uw.next_backstop = std::chrono::steady_clock::now() +
                                std::chrono::milliseconds(kAbsentRetryMs);
             return;
         case ResolveResult::NotFound:
             uw.path.clear();
             set_terminal(uw, ServiceRunState::Stopped, emits);
+            stage_coverage(uw, SparkCoverage::Poll, established);
             uw.next_backstop = std::chrono::steady_clock::now() +
                                std::chrono::milliseconds(kAbsentRetryMs);
             return;
@@ -443,12 +519,15 @@ private:
         int r = sd_bus_match_signal(bus, &slot, kDest, uw.path.c_str(), kPropsIface,
                                     "PropertiesChanged", &on_props_changed, &uw);
         if (r < 0) {
-            spdlog::warn("spark_service: match arm failed for '{}': {}", uw.unit, err_str(-r));
+            spdlog::warn("spark_service: match arm failed for '{}': {}",
+                         ::yuzu::log_key_token(uw.unit), err_str(-r));
             if (auto st = read_state(bus, uw)) {
                 set_terminal_from_systemd(uw, *st, emits);
+                stage_coverage(uw, SparkCoverage::Poll, established);
             } else {
                 bus_ok_ = false;
                 fault_all(true, "system bus lost", faults);
+                drop_coverage_all(established);
             }
             uw.next_backstop = std::chrono::steady_clock::now() +
                                std::chrono::milliseconds(kAbsentRetryMs);
@@ -457,9 +536,16 @@ private:
         uw.slot.reset(slot);
         if (auto st = read_state(bus, uw)) {
             set_terminal_from_systemd(uw, *st, emits);
+            // Notification only if the mechanism-wide Subscribe() call itself
+            // succeeded (H7) — a bare successful match-rule registration alone
+            // never delivers a signal without it; falls back to Poll (the
+            // bounded backstop reconcile) otherwise.
+            stage_coverage(uw, subscribed_ ? SparkCoverage::Notification : SparkCoverage::Poll,
+                          established);
         } else {
             bus_ok_ = false;
             fault_all(true, "system bus lost", faults);
+            drop_coverage_all(established);
         }
         uw.next_backstop = std::chrono::steady_clock::now() +
                            std::chrono::milliseconds(kHealthyReconcileMs);
@@ -478,7 +564,41 @@ private:
         }
     }
 
-    void dispatch(std::vector<PendingEmit>& emits, std::vector<PendingFault>& faults) {
+    // Stage an establishment report for EVERY key on `uw`, UNCONDITIONALLY
+    // (rung 9c PR-6 item 1, round-4 MF1: every row of the coverage table stages
+    // regardless of whether this is an "edge" — the engine is idempotent on
+    // repeated coverage and first-wins on established_at, so a redundant report
+    // costs nothing worse than a wasted round trip). `uw.coverage` is written
+    // here as the LAST-STAGED value and read only by a later coalescing/
+    // adopting key's own unconditional report. Fresh Clock::now() taken HERE,
+    // at the statement — never a loop-top local (MF4: a stale `now` could stamp
+    // established_at before armed_at).
+    void stage_coverage(UnitWatch& uw, SparkCoverage cov, std::vector<PendingEstablished>& out) {
+        uw.coverage = cov;
+        for (const auto& k : uw.keys)
+            out.push_back({k, key_incarnation_.at(k), std::chrono::steady_clock::now(), cov});
+    }
+
+    // The coverage twin of fault_all's connection-wide broadening (F2: kept
+    // INDEPENDENT of fault_all's own edge-gating) — every call site that
+    // discovers a connection-wide bus loss calls both. Unlike fault_all, this
+    // is NEVER edge-gated: a unit already faulted from a prior loss still gets
+    // its coverage re-confirmed None on a second, independent loss discovery,
+    // or a stale positive value could survive under an already-faulted key.
+    void drop_coverage_all(std::vector<PendingEstablished>& out) {
+        for (auto& [name, uwp] : units_)
+            stage_coverage(*uwp, SparkCoverage::None, out);
+    }
+
+    void dispatch(std::vector<PendingEmit>& emits, std::vector<PendingFault>& faults,
+                 std::vector<PendingEstablished>& established) {
+        // Established first (no ordering requirement from the plan; picked so a
+        // consumer observing a Fired/Faulted event for a key can already see its
+        // establishment report land no later than the same dispatch batch).
+        for (auto& e : established)
+            if (established_)
+                established_(e.key, e.incarnation, e.at, e.coverage);
+        established.clear();
         for (auto& e : emits)
             if (emit_)
                 emit_(e.key, SparkData{ServiceSparkData{e.state}});
@@ -489,20 +609,48 @@ private:
         faults.clear();
     }
 
+    // MF3: invalidate every currently-tracked key's coverage to None, by
+    // reference (no SparkEstablishedFn copy, no allocation) — called as the
+    // FIRST statement of each of run()'s exception catch blocks, before any
+    // log call, so a worker-thread exception leaves no stale positive coverage
+    // for the engine to keep trusting. Hard constraint: zero spdlog calls
+    // inside the per-key loop (#2270 is exactly logging breaking a guarantee
+    // like this one). noexcept: every fallible call inside is caught, and
+    // std::terminate is the honest outcome if that invariant is ever wrong.
+    void invalidate_established_noexcept() noexcept {
+        const SparkEstablishedFn& sink = established_; // reference: no copy; nulled only after join
+        if (!sink)
+            return;
+        const auto now = std::chrono::steady_clock::now(); // noexcept
+        for (const auto& [key, inc] : key_incarnation_) {
+            try {
+                sink(key, inc, now, SparkCoverage::None);
+            } catch (...) {
+            }
+        }
+    }
+
     void run() try {
         auto* bus = static_cast<sd_bus*>(bus_);
         bus_ok_ = true;
         std::vector<PendingEmit> emits;
         std::vector<PendingFault> faults;
+        std::vector<PendingEstablished> established;
 
         // Subscribe so systemd emits unit signals to us at all — non-fatal if
         // it fails (degrades to the bounded backstop reconcile only), mirrors
         // guard_systemd.cpp's subscribe(). Re-run after every reopen.
+        // subscribed_ (H7, rung 9c PR-6 item 1) records the OUTCOME — a
+        // per-unit PropertiesChanged match registering successfully means
+        // nothing for real Notification coverage if the daemon was never told
+        // to emit unit signals to this connection in the first place.
         auto subscribe = [&] {
             sd_bus_error err = SD_BUS_ERROR_NULL;
             sd_bus_message* reply = nullptr;
-            if (sd_bus_call_method(bus, kDest, kMgrPath, kMgrIface, "Subscribe", &err, &reply, "") <
-                0)
+            subscribed_ =
+                sd_bus_call_method(bus, kDest, kMgrPath, kMgrIface, "Subscribe", &err, &reply, "") >=
+                0;
+            if (!subscribed_)
                 spdlog::warn("spark_service: Subscribe failed ({}) — falling back to bounded "
                              "reconcile only",
                              err.message ? err.message : "(none)");
@@ -523,6 +671,7 @@ private:
                         spdlog::warn("spark_service: bus lost ({}) — reconnecting", err_str(-r));
                         bus_ok_ = false;
                         fault_all(true, "system bus lost", faults);
+                        drop_coverage_all(established);
                         break;
                     }
                     if (stop_.load(std::memory_order_acquire) || r == 0)
@@ -543,6 +692,7 @@ private:
                     } else {
                         bus_ok_ = false;
                         fault_all(true, "system bus lost", faults);
+                        drop_coverage_all(established);
                         break;
                     }
                 }
@@ -556,8 +706,6 @@ private:
             }
             for (auto& cmd : cmds) {
                 if (cmd.op == Cmd::Add) {
-                    if (key_unit_.contains(cmd.key))
-                        continue; // idempotent — this key is already watched
                     auto it = units_.find(cmd.unit);
                     const bool is_new_unit = (it == units_.end());
                     UnitWatch* uw;
@@ -569,11 +717,36 @@ private:
                     } else {
                         uw = it->second.get();
                     }
-                    uw->keys.insert(cmd.key);
+                    // Exception-safety (governance UP-1(A), adjudicated
+                    // LOW-today/MEDIUM-post-flip): populate every map
+                    // stage_coverage()'s .at() later reads FIRST, insert into
+                    // .keys LAST — a bad_alloc between these statements now
+                    // leaves a harmless orphan map entry (persists for this
+                    // mechanism instance's lifetime — neither platform's
+                    // stop() clears key_incarnation_/key_epoch_, and no
+                    // Remove/Add for this key ever runs afterward: the SAME
+                    // exception that creates the orphan also propagates
+                    // straight to run()'s own outer catch, permanently
+                    // admission-gating the mechanism via UP-1(B)'s fix below)
+                    // instead of a .keys member .at() will trip on, killing
+                    // the whole mechanism worker thread.
+                    // Forward-only rebind (H1): a stale/duplicate Add can
+                    // never regress this key's recorded incarnation — H1's
+                    // submission ordering (the engine holds this type's
+                    // mech-ops lock across check+submit) means one should never
+                    // actually arrive here below the current value in
+                    // production; this is defence-in-depth, not a live path.
+                    auto& inc_slot = key_incarnation_[cmd.key];
+                    if (cmd.incarnation > inc_slot)
+                        inc_slot = cmd.incarnation;
                     key_unit_.emplace(cmd.key, cmd.unit);
+                    // no-op if cmd.key is already present — see the unified
+                    // branch below for why that ("adoption") is now handled
+                    // rather than skipped.
+                    uw->keys.insert(cmd.key);
                     if (is_new_unit) {
                         if (bus_ok_) {
-                            arm_unit(bus, *uw, emits, faults);
+                            arm_unit(bus, *uw, emits, faults, established);
                         } else {
                             // Bus is down: this key is faulted from the moment
                             // it arms; reopen's re-arm-all pass will resolve it.
@@ -584,19 +757,39 @@ private:
                             // sd_bus_open_system every iteration until the bus
                             // recovers (governance Gate-3 cpp-expert finding).
                             uw->faulted = true;
+                            uw->coverage = SparkCoverage::None;
                             uw->next_backstop = std::chrono::steady_clock::now() +
                                                 std::chrono::milliseconds(kAbsentRetryMs);
                             faults.push_back({cmd.key, true, "system bus lost"});
+                            established.push_back(
+                                {cmd.key, inc_slot, std::chrono::steady_clock::now(),
+                                 SparkCoverage::None});
                         }
-                    } else if (uw->last) {
+                    } else {
+                        // F4: ONE unconditional branch covers both COALESCE
+                        // (cmd.key is genuinely new to this unit) and ADOPTION
+                        // (cmd.key was already mapped to this exact unit — its
+                        // disarm's unwatch() was skipped by
+                        // SparkEngine::disarm()'s M2 staleness recheck and a
+                        // fresh arm() landed on the still-live watch). Both need
+                        // the SAME honest report of the unit's CURRENT coverage,
+                        // whether or not this is an "edge" for the emit/fault
+                        // channels below — round-4 MF1's unconditional-staging
+                        // rule.
+                        established.push_back(
+                            {cmd.key, inc_slot, std::chrono::steady_clock::now(), uw->coverage});
                         // An existing (already-resolved) unit gains a new
                         // subscriber key — give it the initial state too, since
-                        // engine subscribers are keyed per-spec. If the unit is
-                        // currently faulted, tell the new key that too (UP-2,
-                        // governance Gate-4 unhappy-path) — otherwise it'd be
-                        // handed a cached value the mechanism doesn't itself
-                        // trust yet, with no fault signal until the NEXT edge.
-                        emits.push_back({cmd.key, *uw->last});
+                        // engine subscribers are keyed per-spec.
+                        if (uw->last)
+                            emits.push_back({cmd.key, *uw->last});
+                        // Hoisted OUT of the `uw->last` guard (round-4 fix,
+                        // alongside the established push above): a unit that is
+                        // faulted but has NEVER resolved a terminal state
+                        // (bus-down since arm, no `last` yet) previously told a
+                        // coalescing/adopting key NOTHING about the fault — the
+                        // same "silently withheld" shape this whole fix exists
+                        // to close (UP-2, governance Gate-4 unhappy-path).
                         if (uw->faulted)
                             faults.push_back({cmd.key, true, "system bus lost"});
                     }
@@ -606,17 +799,23 @@ private:
                         continue; // unknown/already-removed key — idempotent
                     const std::string unit = kit->second;
                     key_unit_.erase(kit);
+                    key_incarnation_.erase(cmd.key);
                     auto uit = units_.find(unit);
                     if (uit == units_.end())
                         continue;
                     uit->second->keys.erase(cmd.key);
+                    // Freed synchronously, no Windows-style retiring_/quiescence list
+                    // needed here: on_props_changed() runs synchronously inside
+                    // sd_bus_process() on this SAME poll thread that also processes
+                    // Cmd::Remove, so there is no in-flight-callback window an async
+                    // APC (Windows's NotifyServiceStatusChangeW hazard) could land in.
                     if (uit->second->keys.empty())
                         units_.erase(uit); // slot RAII releases the match here
                 }
             }
 
             // 4) Dispatch everything collected above — with NO lock held.
-            dispatch(emits, faults);
+            dispatch(emits, faults, established);
             if (stop_.load(std::memory_order_acquire))
                 break;
 
@@ -675,6 +874,7 @@ private:
                              "every armed key is now silently dead",
                              err_str(errno));
                 fault_all(true, "mechanism thread terminating", faults);
+                drop_coverage_all(established);
                 // fault_all only covers already-armed units — a watch() that
                 // landed in pending_ this same tick was never armed at all,
                 // so it has no units_ entry for fault_all to find. Without
@@ -689,7 +889,7 @@ private:
                             faults.push_back({cmd.key, true, "mechanism thread terminating"});
                     pending_.clear();
                 }
-                dispatch(emits, faults);
+                dispatch(emits, faults, established);
                 break;
             }
             if (fds[wake_idx].revents & POLLIN) {
@@ -737,7 +937,7 @@ private:
                     // otherwise flap recovered→faulted within the same
                     // dispatch batch (governance Gate-6 sre finding).
                     for (auto& [name, uwp] : units_) {
-                        arm_unit(bus, *uwp, emits, faults);
+                        arm_unit(bus, *uwp, emits, faults, established);
                         if (!bus_ok_)
                             break; // the connection died again mid-pass — fault_all(true)
                                    // inside arm_unit already covers every unit including
@@ -751,7 +951,7 @@ private:
                     }
                     if (bus_ok_)
                         fault_all(false, "recovered", faults); // only now confirmed still up
-                    dispatch(emits, faults);
+                    dispatch(emits, faults, established);
                     spdlog::info("spark_service: system bus reconnected");
                 } else {
                     if (nb)
@@ -763,17 +963,60 @@ private:
                 for (auto& [name, uwp] : units_) {
                     if (uwp->next_backstop > now2)
                         continue;
-                    arm_unit(bus, *uwp, emits, faults);
+                    arm_unit(bus, *uwp, emits, faults, established);
                     if (!bus_ok_)
                         break; // same reasoning as the reopen-rearm-all loop above
                 }
-                dispatch(emits, faults);
+                dispatch(emits, faults, established);
             }
         }
     } catch (const std::exception& e) {
-        spdlog::error("spark_service: poll thread exception: {} — mechanism stopping", e.what());
+        // MF3, first statement of the catch block: invalidate every currently-
+        // tracked key's coverage to None BEFORE anything else, so an exception
+        // mid-loop can never leave a stale positive coverage the engine keeps
+        // trusting after this thread is gone.
+        invalidate_established_noexcept();
+        // Governance UP-1(B): mark this mechanism no longer accepting new watches.
+        // Without this, watch_incarnation() (gated only on started_/inert_, neither
+        // of which this catch block otherwise touches) would keep silently queuing
+        // Cmd::Add into a pending_ deque nobody will ever drain again, returning
+        // SUCCESS to the engine forever — a zombie mechanism indistinguishable
+        // from a healthy idle one (I6 false-assurance). started_, NOT inert_: the
+        // heartbeat's stats() publishes inert_ fleet-wide ("no system bus" is the
+        // documented common-case meaning) — flipping it here would misreport a
+        // worker-thread-death fault as a boot-time bus-unavailable condition, a
+        // DIFFERENT false diagnostic. started_ is unpublished and mu_-guarded like
+        // every other write to it in this class.
+        {
+            std::lock_guard lk(mu_);
+            started_ = false;
+        }
+        try {
+            spdlog::error("spark_service: poll thread exception: {} — mechanism stopping",
+                          e.what());
+        } catch (...) {
+        }
     } catch (...) {
-        spdlog::error("spark_service: poll thread unknown exception — mechanism stopping");
+        invalidate_established_noexcept();
+        // Governance UP-1(B): mark this mechanism no longer accepting new watches.
+        // Without this, watch_incarnation() (gated only on started_/inert_, neither
+        // of which this catch block otherwise touches) would keep silently queuing
+        // Cmd::Add into a pending_ deque nobody will ever drain again, returning
+        // SUCCESS to the engine forever — a zombie mechanism indistinguishable
+        // from a healthy idle one (I6 false-assurance). started_, NOT inert_: the
+        // heartbeat's stats() publishes inert_ fleet-wide ("no system bus" is the
+        // documented common-case meaning) — flipping it here would misreport a
+        // worker-thread-death fault as a boot-time bus-unavailable condition, a
+        // DIFFERENT false diagnostic. started_ is unpublished and mu_-guarded like
+        // every other write to it in this class.
+        {
+            std::lock_guard lk(mu_);
+            started_ = false;
+        }
+        try {
+            spdlog::error("spark_service: poll thread unknown exception — mechanism stopping");
+        } catch (...) {
+        }
     }
 
     /// Serialises start() and stop() END TO END against each other and against themselves,
@@ -783,9 +1026,18 @@ private:
     /// them. Held across the join; mu_ is NOT (the poll thread needs it).
     /// LOCK ORDER: teardown_mu_ → mu_. Never the reverse.
     std::mutex teardown_mu_;
-    std::mutex mu_;                    ///< guards ONLY pending_, emit_/fault_, and started_ (inert_ is atomic)
+    std::mutex mu_;                    ///< guards ONLY pending_, emit_/fault_/established_, started_, sink_sealed_ (inert_ is atomic)
     SparkEmitFn emit_;
     SparkFaultFn fault_;
+    /// Establishment-signal sink (rung 9c PR-6 item 1) — set once via
+    /// set_established_sink() before start(), read WITHOUT mu_ from run() (the
+    /// poll thread), exactly like emit_/fault_ above: the write happens-before
+    /// the thread is spawned and the clear in stop() happens-after it joins, so
+    /// there is never a concurrent access to race.
+    SparkEstablishedFn established_;
+    /// One-way latch (rung 9c PR-6 item 1): set true by start() being called,
+    /// never cleared. See set_established_sink()'s own doc comment.
+    bool sink_sealed_{false};
     std::deque<Cmd> pending_;
     bool started_{false};
     /// The system bus never opened at start() — permanent for this instance. THE
@@ -803,8 +1055,21 @@ private:
     // Poll-thread-confined (no lock): touched only from run(), and from stop()
     // after the thread has joined.
     bool bus_ok_{true};
+    /// Whether the mechanism-wide Subscribe() call currently holds (H7, rung 9c
+    /// PR-6 item 1) — set by the `subscribe` lambda in run(), on every call
+    /// (initial connect AND every reopen). A per-unit PropertiesChanged match
+    /// registering successfully means nothing for real Notification coverage
+    /// without this: systemd never emits unit signals to a connection that
+    /// never subscribed.
+    bool subscribed_{false};
     std::unordered_map<std::string, std::unique_ptr<UnitWatch>> units_; ///< keyed by normalized unit name
     std::unordered_map<std::string, std::string> key_unit_;            ///< spark key -> normalized unit name
+    /// spark key -> the SparkEngine-minted incarnation of its CURRENT
+    /// subscription (rung 9c PR-6 item 1) — forward-only rebind on Cmd::Add
+    /// (H1), erased in lockstep with key_unit_ on Cmd::Remove. This is the
+    /// identity an established report is stamped with and the identity the
+    /// engine's report_established checks before trusting one.
+    std::unordered_map<std::string, SparkIncarnation> key_incarnation_;
 };
 
 } // namespace
@@ -1019,6 +1284,18 @@ struct PendingFault {
     std::string reason;
     std::uint64_t key_epoch{0}; ///< see PendingEmit::key_epoch
 };
+/// A staged establishment-signal report (rung 9c PR-6 item 1) — see
+/// SparkEstablishedFn's own doc comment for the field semantics. `key_epoch`
+/// is PendingEmit::key_epoch's twin, checked by the SAME drop_stale() this
+/// key's emits/faults already go through — Windows's async establishment
+/// path has the same same-tick staleness window those two guard against.
+struct PendingEstablished {
+    std::string key;
+    SparkIncarnation incarnation;
+    std::chrono::steady_clock::time_point at;
+    SparkCoverage coverage;
+    std::uint64_t key_epoch{0}; ///< see PendingEmit::key_epoch
+};
 
 /// Pending-operation state of one watch's establishment — INDEPENDENT of its
 /// health/armed status (mirrors spark_registry.cpp's ProbeState). Idle: no
@@ -1161,6 +1438,11 @@ struct SvcWatch {
     /// distinct from backend (OpenServiceW/Notify) failures, which retry on
     /// the existing fixed kAbsentRetryMs cadence.
     unsigned admission_attempts{0};
+    /// Last-STAGED establishment coverage (rung 9c PR-6 item 1) — the
+    /// per-watch cache a coalescing/adopting key's unconditional report reads
+    /// back; written by every row of the coverage table, never read for any
+    /// gating decision.
+    SparkCoverage coverage{SparkCoverage::None};
 };
 
 void CALLBACK notify_cb(PVOID param) {
@@ -1189,6 +1471,14 @@ public:
 
     void start(SparkEmitFn emit, SparkFaultFn fault) override {
         std::lock_guard lk(mu_);
+        // One-way seal (rung 9c PR-6 item 1): start() being CALLED is what
+        // seals the establishment sink, whether or not this call does
+        // anything else — set first, before the idempotent early-return, so
+        // a repeat start() can never re-open the window. Never cleared by
+        // stop(): SparkEngine itself is single-shot (spark_engine.hpp's own
+        // header doc), so no production caller ever needs to re-arm the sink
+        // after a stop().
+        sink_sealed_ = true;
         if (started_)
             return; // idempotent
         emit_ = std::move(emit);
@@ -1227,6 +1517,17 @@ public:
 
     std::expected<void, std::string> watch(const std::string& key,
                                            const SparkParams& params) override {
+        // The engine never calls this overload in production (it always calls
+        // watch_incarnation() below) — kept for direct/test callers that predate
+        // the establishment signal. kNoSparkIncarnation is a valid, harmless
+        // identity: nothing rejects it, it simply never matches a real engine
+        // incarnation.
+        return watch_incarnation(key, params, kNoSparkIncarnation);
+    }
+
+    std::expected<void, std::string> watch_incarnation(const std::string& key,
+                                                        const SparkParams& params,
+                                                        SparkIncarnation incarnation) override {
         const auto* sp = std::get_if<ServiceSparkParams>(&params);
         if (!sp)
             return std::unexpected("service mechanism: params are not ServiceSparkParams");
@@ -1238,9 +1539,17 @@ public:
             return std::unexpected("service mechanism not started");
         if (!scm_ok_)
             return std::unexpected("SCM unavailable — service sparks unsupported on this host");
-        pending_.push_back(Cmd{Cmd::Add, key, to_wide(sp->service_name)});
+        pending_.push_back(Cmd{Cmd::Add, key, to_wide(sp->service_name), incarnation});
         wake_signal();
         return {};
+    }
+
+    bool set_established_sink(SparkEstablishedFn sink) override {
+        std::lock_guard lk(mu_);
+        if (sink_sealed_)
+            return false;
+        established_ = std::move(sink);
+        return true;
     }
 
     void unwatch(const std::string& key) override {
@@ -1280,6 +1589,12 @@ public:
         std::lock_guard lk(mu_);
         emit_ = nullptr;
         fault_ = nullptr;
+        // established_ is cleared here too (nulled only after the mechanism
+        // thread has joined, mirroring emit_/fault_) but sink_sealed_ is
+        // DELIBERATELY left set — an ordinary stop() reports NOTHING further
+        // (R4: matches subscription_health's stale-after-stop precedent), and
+        // the seal itself is one-way for this instance's life.
+        established_ = nullptr;
         scm_ok_ = false;
         started_inert_.store(false, std::memory_order_release);
         pending_.clear();
@@ -1287,9 +1602,12 @@ public:
 
     /// See the Linux twin: this mechanism tracks none of the File-mechanism counters,
     /// but it MUST publish `inert` so an SCM-denied service mechanism is distinguishable
-    /// from a healthy idle one.
+    /// from a healthy idle one. `started_inert_` here is ENTIRELY boot-time (#4685) —
+    /// Windows Service has no runtime-inert concept either — so `.boot_inert` is the
+    /// same atomic, not a separate flag.
     [[nodiscard]] SparkMechanismStats stats() const override {
-        return {.inert = started_inert_.load(std::memory_order_acquire)};
+        const bool boot = started_inert_.load(std::memory_order_acquire);
+        return {.inert = boot, .boot_inert = boot};
     }
 
 private:
@@ -1297,6 +1615,7 @@ private:
         enum Op { Add, Remove } op;
         std::string key;
         std::wstring name; // only meaningful for Add
+        SparkIncarnation incarnation{kNoSparkIncarnation}; // only meaningful for Add
     };
 
     void wake_signal() {
@@ -1339,13 +1658,18 @@ private:
     // probe is ever outstanding per watch; the guard below is defense-in-
     // depth against that invariant being violated by a future change, not a
     // path exercised today.
-    void begin_probe(SvcWatch& w) {
+    void begin_probe(SvcWatch& w, std::vector<PendingEstablished>& established) {
         if (w.probe == ProbeState::Pending) {
             spdlog::error("spark_service: begin_probe() called with a probe already outstanding "
                          "for a watched service — ignoring (an admission invariant was violated)");
             return;
         }
         teardown_watch(w);
+        // Unconditional (rung 9c PR-6 item 1, round-4 MF1): tearing the old
+        // registration down genuinely means coverage is None until
+        // re-established below, whether that happens synchronously-feeling
+        // (probe launches, resolves later) or fails to launch at all.
+        stage_coverage(w, SparkCoverage::None, established);
 
         // A retry of an obligation already Deferred (admission backoff OR a
         // resolved backend/absent retry cadence) is NOT a fresh obligation —
@@ -1424,6 +1748,30 @@ private:
                                               kServiceAdmissionBackoffCap);
     }
 
+    // Stage an establishment report for EVERY key on `w`, UNCONDITIONALLY
+    // (rung 9c PR-6 item 1, round-4 MF1: every row of the coverage table
+    // stages regardless of whether this is an "edge" — the engine is
+    // idempotent on repeated coverage and first-wins on established_at, so a
+    // redundant report costs nothing but a wasted round trip). `w.coverage`
+    // is written here as the LAST-STAGED value and read only by a later
+    // coalescing/adopting key's own unconditional report. Fresh Clock::now()
+    // taken HERE, at the statement — never a loop-top local (MF4: a stale
+    // `now` could stamp established_at before armed_at).
+    void stage_coverage(SvcWatch& w, SparkCoverage cov, std::vector<PendingEstablished>& out) {
+        w.coverage = cov;
+        for (const auto& k : w.keys)
+            out.push_back({k, key_incarnation_.at(k), Clock::now(), cov, key_epoch_.at(k)});
+    }
+
+    // Connection-wide coverage loss — every call site that discovers the
+    // mechanism thread itself is about to die (WAIT_FAILED) calls this for
+    // every currently-watched key, unconditionally (never edge-gated, unlike
+    // the fault channel's own per-watch faulted check).
+    void drop_coverage_all(std::vector<PendingEstablished>& out) {
+        for (auto& [name, wp] : svcs_)
+            stage_coverage(*wp, SparkCoverage::None, out);
+    }
+
     // base * 2^(attempts-1), saturating at cap (attempts >= 1) — copied
     // verbatim from spark_registry.cpp's own already-reviewed helper rather
     // than a bit-shift reimplementation, deliberately: this restructure
@@ -1452,7 +1800,8 @@ private:
     // register failure is a fault (never a false Stopped — the UP-4 class
     // guard_systemd.cpp's ResolveResult split guards against on Linux).
     void resolve_probe(SvcWatch& w, DetachedResult<ServiceProbeResult> r,
-                       std::vector<PendingEmit>& emits, std::vector<PendingFault>& faults) {
+                       std::vector<PendingEmit>& emits, std::vector<PendingFault>& faults,
+                       std::vector<PendingEstablished>& established) {
         w.probe = ProbeState::Idle;
         if (!r.has_value()) {
             // WorkerThrew or ResultAllocFailed — contained inside the lane;
@@ -1478,6 +1827,7 @@ private:
                 for (const auto& k : w.keys)
                     faults.push_back({k, true, reason, key_epoch_.at(k)});
             }
+            stage_coverage(w, SparkCoverage::None, established);
             // ProbeState::Deferred (not Idle) — a due next_retry with probe
             // still Idle would never be picked up by run()'s retry scan,
             // which gates specifically on Deferred (#2012/#3840 PR-B3, found
@@ -1504,6 +1854,7 @@ private:
                     for (const auto& k : w.keys)
                         faults.push_back({k, false, "recovered", key_epoch_.at(k)});
                 }
+                stage_coverage(w, SparkCoverage::Poll, established);
             } else {
                 spdlog::warn("spark_service: OpenService failed for a watched service (err={})",
                              res.err);
@@ -1513,6 +1864,7 @@ private:
                     for (const auto& k : w.keys)
                         faults.push_back({k, true, "OpenService failed", key_epoch_.at(k)});
                 }
+                stage_coverage(w, SparkCoverage::None, established);
             }
             // Deferred, not Idle — an absent service needs its periodic
             // re-poll picked up by the retry scan too; see the comment above.
@@ -1541,6 +1893,7 @@ private:
                 for (const auto& k : w.keys)
                     faults.push_back({k, true, "NotifyServiceStatusChange failed", key_epoch_.at(k)});
             }
+            stage_coverage(w, SparkCoverage::None, established);
             // Deferred, not Idle — see the comment on the two branches above.
             w.probe = ProbeState::Deferred;
             // See the grace_counted comment above — already definitively
@@ -1562,6 +1915,10 @@ private:
             for (const auto& k : w.keys)
                 faults.push_back({k, false, "recovered", key_epoch_.at(k)});
         }
+        // Notification coverage, timestamped right after this ERROR_SUCCESS —
+        // live OS-level notification genuinely exists for this watch from this
+        // statement (H10, rung 9c PR-6 item 1).
+        stage_coverage(w, SparkCoverage::Notification, established);
         w.next_retry = {}; // event-driven now; no polling backstop needed while armed
     }
 
@@ -1641,7 +1998,15 @@ private:
                 v.end());
     }
 
-    void dispatch(std::vector<PendingEmit>& emits, std::vector<PendingFault>& faults) {
+    void dispatch(std::vector<PendingEmit>& emits, std::vector<PendingFault>& faults,
+                 std::vector<PendingEstablished>& established) {
+        // Established first (no ordering requirement from the plan; picked so a
+        // consumer observing a Fired/Faulted event for a key can already see its
+        // establishment report land no later than the same dispatch batch).
+        for (auto& e : established)
+            if (established_)
+                established_(e.key, e.incarnation, e.at, e.coverage);
+        established.clear();
         for (auto& e : emits)
             if (emit_)
                 emit_(e.key, SparkData{ServiceSparkData{e.state}});
@@ -1655,6 +2020,7 @@ private:
     void run() try {
         std::vector<PendingEmit> emits;
         std::vector<PendingFault> faults;
+        std::vector<PendingEstablished> established;
 
         while (!stop_.load(std::memory_order_acquire)) {
             // Compute the wait timeout: soonest per-service retry deadline,
@@ -1725,6 +2091,7 @@ private:
                     for (const auto& k : wp->keys)
                         faults.push_back({k, true, "mechanism thread terminating"});
                 }
+                drop_coverage_all(established);
                 // Same reasoning as the Linux mechanism: a watch() that
                 // landed in pending_ this same tick was never armed at all,
                 // so the loop above (which only walks svcs_) can't find it —
@@ -1738,7 +2105,7 @@ private:
                             faults.push_back({cmd.key, true, "mechanism thread terminating"});
                     pending_.clear();
                 }
-                dispatch(emits, faults);
+                dispatch(emits, faults, established);
                 break;
             }
 
@@ -1762,16 +2129,16 @@ private:
                                      // Pending with an engaged call on Launched
                         if (auto res = wp->call->try_take()) {
                             wp->call.reset();
-                            resolve_probe(*wp, std::move(*res), emits,
-                                         faults); // may deliver APCs via its own
-                                                   // NotifyServiceStatusChangeW registration
+                            resolve_probe(*wp, std::move(*res), emits, faults,
+                                         established); // may deliver APCs via its own
+                                                        // NotifyServiceStatusChangeW registration
                         } else {
                             grace_check(*wp, now2, faults);
                         }
                     } else if (wp->probe == ProbeState::Deferred) {
                         if (wp->next_retry <= now2) {
-                            begin_probe(*wp); // may deliver APCs via its own
-                                              // SleepEx(0,TRUE) (teardown_watch)
+                            begin_probe(*wp, established); // may deliver APCs via its own
+                                                            // SleepEx(0,TRUE) (teardown_watch)
                         } else {
                             // Not yet due for retry — still grace-check it
                             // (#2012/#3840 PR-B3 review): a no-op once
@@ -1798,8 +2165,6 @@ private:
             }
             for (auto& cmd : cmds) {
                 if (cmd.op == Cmd::Add) {
-                    if (key_svc_.contains(cmd.key))
-                        continue; // idempotent
                     const std::wstring folded = fold_ci(cmd.name);
                     auto it = svcs_.find(folded);
                     const bool is_new = (it == svcs_.end());
@@ -1812,29 +2177,99 @@ private:
                     } else {
                         w = it->second.get();
                     }
-                    w->keys.insert(cmd.key);
-                    key_svc_.emplace(cmd.key, folded);
+                    // Exception-safety (governance UP-1(A), adjudicated
+                    // LOW-today/MEDIUM-post-flip): populate every map
+                    // stage_coverage()'s .at() later reads FIRST, insert into
+                    // .keys LAST — a bad_alloc between these statements now
+                    // leaves a harmless orphan map entry (persists for this
+                    // mechanism instance's lifetime — neither platform's
+                    // stop() clears key_incarnation_/key_epoch_, and no
+                    // Remove/Add for this key ever runs afterward: the SAME
+                    // exception that creates the orphan also propagates
+                    // straight to run()'s own outer catch, permanently
+                    // admission-gating the mechanism via UP-1(B)'s fix below)
+                    // instead of a .keys member .at() will trip on, killing
+                    // the whole mechanism worker thread.
                     // A fresh subscription epoch for `cmd.key` specifically —
                     // NOT `w->probe_gen` (#2012/#3840 PR-B3 review, round 2):
                     // this is the identity drop_stale() checks, and it must
                     // track THIS key's own Add/Remove lifecycle, independent
                     // of the shared watch's probe activity or of any other
-                    // key coalesced onto the same watch.
+                    // key coalesced onto the same watch. Bumped UNCONDITIONALLY
+                    // (including the adoption case, now that the early
+                    // idempotent-continue above is gone) — an adopted key is a
+                    // genuinely new subscription lifecycle from the engine's
+                    // own perspective (a fresh SubscriptionId/incarnation), so
+                    // any not-yet-dispatched entry staged under the OLD epoch
+                    // must still be considered stale.
                     const std::uint64_t this_key_epoch = ++gen_;
                     key_epoch_[cmd.key] = this_key_epoch;
+                    // Forward-only rebind (H1): a stale/duplicate Add can
+                    // never regress this key's recorded incarnation — H1's
+                    // submission ordering means one should never actually
+                    // arrive here below the current value in production; this
+                    // is defence-in-depth, not a live path.
+                    auto& inc_slot = key_incarnation_[cmd.key];
+                    if (cmd.incarnation > inc_slot)
+                        inc_slot = cmd.incarnation;
+                    key_svc_.emplace(cmd.key, folded);
+                    // no-op if cmd.key is already present — see the unified
+                    // branch below for why that ("adoption") is now handled
+                    // rather than skipped.
+                    w->keys.insert(cmd.key);
                     if (is_new) {
-                        begin_probe(*w);
-                    } else if (w->last) {
+                        begin_probe(*w, established);
+                    } else {
+                        // F4: ONE unconditional branch covers both COALESCE
+                        // (cmd.key is genuinely new to this watch) and
+                        // ADOPTION (cmd.key was already mapped to this exact
+                        // watch — its disarm's unwatch() was skipped by
+                        // SparkEngine::disarm()'s M2 staleness recheck and a
+                        // fresh arm() landed on the still-live watch). Both
+                        // need the SAME honest report of the watch's CURRENT
+                        // coverage, whether or not this is an "edge" for the
+                        // emit/fault channels below — round-4 MF1's
+                        // unconditional-staging rule.
+                        //
+                        // w->fired guard (adversarial-review finding, post-
+                        // round-4): the one-shot NotifyServiceStatusChangeW
+                        // registration is CONSUMED the instant the OS
+                        // delivers it (notify_cb sets `fired`), but this
+                        // drain runs BEFORE the fired-flag scan below that
+                        // re-arms it and corrects `w->coverage` — an APC for
+                        // THIS watch can land during an unrelated Add's own
+                        // begin_probe/teardown_watch SleepEx(0,TRUE) earlier
+                        // in THIS SAME drain. Between those two points
+                        // `w->coverage` still reads the stale pre-fire value
+                        // (typically Notification) even though no live
+                        // registration currently exists for it. Reporting
+                        // that stale value here would first-wins-stamp the
+                        // adopting incarnation's established_at from a
+                        // registration that was already consumed — a
+                        // timestamp the later fired-scan's own correction
+                        // (None on a failed re-arm) can never retract. Fold
+                        // `fired` into the reported value rather than
+                        // `w->coverage` alone: the fired-scan itself re-
+                        // stages the truth once it actually re-arms.
+                        established.push_back({cmd.key, inc_slot, Clock::now(),
+                                               w->fired ? SparkCoverage::None : w->coverage,
+                                               this_key_epoch});
                         // Same UP-2 fix as the Linux mechanism: hand a
                         // newly-coalescing key the fault status too, not just
-                        // the cached state. Uses w->fault_reason (governance
+                        // the cached state.
+                        if (w->last)
+                            emits.push_back({cmd.key, *w->last, this_key_epoch});
+                        // Hoisted OUT of the `w->last` guard (round-4 fix,
+                        // alongside the established push above): a watch that
+                        // is faulted but has NEVER resolved a terminal state
+                        // previously told a coalescing/adopting key NOTHING
+                        // about the fault. Uses w->fault_reason (governance
                         // review) rather than a hardcoded literal — the
                         // watch's actual fault cause may be a Notify-
                         // registration failure or a health-grace timeout, not
                         // an OpenService failure; spark_file.cpp's own
                         // "review finding 9" fixed the identical class of bug
                         // for its coalescing joins.
-                        emits.push_back({cmd.key, *w->last, this_key_epoch});
                         if (w->faulted)
                             faults.push_back({cmd.key, true, w->fault_reason, this_key_epoch});
                     }
@@ -1845,6 +2280,7 @@ private:
                     const std::wstring folded = kit->second;
                     key_svc_.erase(kit);
                     key_epoch_.erase(cmd.key);
+                    key_incarnation_.erase(cmd.key);
                     auto sit = svcs_.find(folded);
                     if (sit == svcs_.end())
                         continue;
@@ -1898,11 +2334,19 @@ private:
                         LocalFree(wp->notify.pszServiceNames);
                         wp->notify.pszServiceNames = nullptr;
                     }
+                    // MF1 (rung 9c PR-6 item 1, round-4): observing `fired`
+                    // itself stages/mutates NOTHING — the fired-scan's own
+                    // clear-then-gate shape was exactly the defect round 3's
+                    // review caught. Every outcome below is staged by the
+                    // SAME unconditional table every other site uses: a
+                    // failed re-arm routes through begin_probe() (-> None,
+                    // its own unconditional stage); a successful re-arm
+                    // stages Notification explicitly at the two sites below.
                     if (wp->notify_status != ERROR_SUCCESS) {
                         // MARKED_FOR_DELETE / CLIENT_LAGGING or similar — the
                         // ServiceStatus is not trustworthy; re-resolve from
                         // scratch (-> absent path if truly gone).
-                        begin_probe(*wp);
+                        begin_probe(*wp, established);
                         continue;
                     }
                     if (is_pending(wp->current_state)) {
@@ -1910,7 +2354,9 @@ private:
                         // one-shot so the terminal state is still seen.
                         if (NotifyServiceStatusChangeW(wp->svc.get(), kNotifyMask, &wp->notify) !=
                             ERROR_SUCCESS)
-                            begin_probe(*wp);
+                            begin_probe(*wp, established);
+                        else
+                            stage_coverage(*wp, SparkCoverage::Notification, established);
                         continue;
                     }
                     // Terminal: re-arm the one-shot FIRST (it is consumed on
@@ -1920,7 +2366,9 @@ private:
                                                                     &wp->notify) == ERROR_SUCCESS;
                     set_terminal(*wp, map_terminal(wp->current_state), emits);
                     if (!rearmed)
-                        begin_probe(*wp);
+                        begin_probe(*wp, established);
+                    else
+                        stage_coverage(*wp, SparkCoverage::Notification, established);
                 }
                 if (!any) {
                     break; // converged — nothing fired this pass
@@ -1964,10 +2412,14 @@ private:
             // already relaunched a newer probe — by the command drain that
             // ran in between (#2012/#3840 PR-B3 review, kickoff doc's
             // required stale-generation discard). No-op for the common case
-            // where nothing changed underneath a staged entry.
+            // where nothing changed underneath a staged entry. `established`
+            // goes through the SAME filter (rung 9c PR-6 item 1) — Windows's
+            // async establishment path has the identical same-tick staleness
+            // window emits/faults already guard against.
             drop_stale(emits);
             drop_stale(faults);
-            dispatch(emits, faults);
+            drop_stale(established);
+            dispatch(emits, faults, established);
         }
 
         // Thread exit path: tear down every outstanding registration on THIS
@@ -1978,19 +2430,84 @@ private:
         for (auto& [name, wp] : svcs_)
             teardown_watch(*wp);
     } catch (const std::exception& e) {
-        spdlog::error("spark_service: mechanism thread exception: {} — mechanism stopping",
-                      e.what());
+        // MF3, first statement of the catch block: invalidate every
+        // currently-tracked key's coverage to None BEFORE anything else, so
+        // an exception mid-loop can never leave a stale positive coverage the
+        // engine keeps trusting after this thread is gone — THEN the existing
+        // teardown, THEN the existing log (now wrapped).
+        invalidate_established_noexcept();
+        // Governance UP-1(B): mark this mechanism no longer accepting new watches.
+        // scm_ok_, NOT started_: WindowsServiceMechanism::stop() early-returns on a
+        // bare `if (!started_) return` (unlike Linux's resource-conjunction guard)
+        // — flipping started_ here would make a later stop() skip thread_.join()
+        // entirely, and the eventual ~thread() on a still-joinable thread calls
+        // std::terminate(). scm_ok_ is atomic (no lock needed), unpublished by
+        // stats() (which reads the distinct started_inert_ flag, untouched here),
+        // and is already one of watch_incarnation()'s two admission guards —
+        // flipping it alone correctly makes a future arm() return "SCM unavailable"
+        // instead of silently queuing into a dead thread.
+        scm_ok_.store(false, std::memory_order_release);
         for (auto& [name, wp] : svcs_)
             teardown_watch(*wp);
+        try {
+            spdlog::error("spark_service: mechanism thread exception: {} — mechanism stopping",
+                          e.what());
+        } catch (...) {
+        }
     } catch (...) {
-        spdlog::error("spark_service: mechanism thread unknown exception — mechanism stopping");
+        invalidate_established_noexcept();
+        // Governance UP-1(B): mark this mechanism no longer accepting new watches.
+        // scm_ok_, NOT started_: WindowsServiceMechanism::stop() early-returns on a
+        // bare `if (!started_) return` (unlike Linux's resource-conjunction guard)
+        // — flipping started_ here would make a later stop() skip thread_.join()
+        // entirely, and the eventual ~thread() on a still-joinable thread calls
+        // std::terminate(). scm_ok_ is atomic (no lock needed), unpublished by
+        // stats() (which reads the distinct started_inert_ flag, untouched here),
+        // and is already one of watch_incarnation()'s two admission guards —
+        // flipping it alone correctly makes a future arm() return "SCM unavailable"
+        // instead of silently queuing into a dead thread.
+        scm_ok_.store(false, std::memory_order_release);
         for (auto& [name, wp] : svcs_)
             teardown_watch(*wp);
+        try {
+            spdlog::error("spark_service: mechanism thread unknown exception — mechanism stopping");
+        } catch (...) {
+        }
     }
 
-    std::mutex mu_; ///< guards ONLY pending_ + the start/stop flags (scm_ok_ is atomic)
+    // MF3: invalidate every currently-tracked key's coverage to None, by
+    // reference (no SparkEstablishedFn copy, no allocation) — called as the
+    // FIRST statement of each of run()'s exception catch blocks, before any
+    // teardown or log call, so a worker-thread exception leaves no stale
+    // positive coverage for the engine to keep trusting. Hard constraint:
+    // zero spdlog calls inside the per-key loop (#2270 is exactly logging
+    // breaking a guarantee like this one). noexcept: every fallible call
+    // inside is caught, and std::terminate is the honest outcome if that
+    // invariant is ever wrong.
+    void invalidate_established_noexcept() noexcept {
+        const SparkEstablishedFn& sink = established_; // reference: no copy; nulled only after join
+        if (!sink)
+            return;
+        const auto now = std::chrono::steady_clock::now(); // noexcept
+        for (const auto& [key, inc] : key_incarnation_) {
+            try {
+                sink(key, inc, now, SparkCoverage::None);
+            } catch (...) {
+            }
+        }
+    }
+
+    std::mutex mu_; ///< guards ONLY pending_, emit_/fault_/established_, started_, sink_sealed_ (scm_ok_ is atomic)
     SparkEmitFn emit_;
     SparkFaultFn fault_;
+    /// Establishment-signal sink (rung 9c PR-6 item 1) — set once via
+    /// set_established_sink() before start(), read WITHOUT mu_ from run() (the
+    /// mechanism thread), exactly like emit_/fault_: the write happens-before
+    /// the thread is spawned and the clear in stop() happens-after it joins.
+    SparkEstablishedFn established_;
+    /// One-way latch (rung 9c PR-6 item 1): set true by start() being called,
+    /// never cleared. See set_established_sink()'s own doc comment.
+    bool sink_sealed_{false};
     std::deque<Cmd> pending_;
     bool started_{false};
     std::atomic<bool> scm_ok_{false};
@@ -2014,15 +2531,29 @@ private:
     // stop() after the thread has joined.
     std::unordered_map<std::wstring, std::unique_ptr<SvcWatch>> svcs_; ///< keyed by folded name
     std::unordered_map<std::string, std::wstring> key_svc_;           ///< spark key -> folded name
-    /// spark key -> subscription epoch, bumped in `++gen_` whenever `key_svc_`
-    /// actually gains an entry for that key (a genuinely new or freshly
-    /// re-added subscription — never on the idempotent-Add no-op branch).
-    /// This is the identity `drop_stale()` checks — deliberately NOT
-    /// `SvcWatch::probe_gen`, which tracks probe LAUNCHES and is bumped by
-    /// events (a same-watch re-arm-failure retry) that have nothing to do
-    /// with whether `key`'s own subscription is still the one a staged
-    /// emit/fault was produced for (#2012/#3840 PR-B3 review, round 2).
+    /// spark key -> subscription epoch, bumped in `++gen_` EVERY time an Add
+    /// for that key is processed (rung 9c PR-6 item 1: this now includes the
+    /// adoption case — a key that was already in key_svc_ — since removing
+    /// the old idempotent-continue there; an adopted key is a genuinely new
+    /// subscription lifecycle from the engine's own perspective, so any
+    /// not-yet-dispatched entry staged under the OLD epoch must still be
+    /// considered stale). This is the identity `drop_stale()` checks —
+    /// deliberately NOT `SvcWatch::probe_gen`, which tracks probe LAUNCHES and
+    /// is bumped by events (a same-watch re-arm-failure retry) that have
+    /// nothing to do with whether `key`'s own subscription is still the one a
+    /// staged emit/fault/established was produced for (#2012/#3840 PR-B3
+    /// review, round 2).
     std::unordered_map<std::string, std::uint64_t> key_epoch_;
+    /// spark key -> the SparkEngine-minted incarnation of its CURRENT
+    /// subscription (rung 9c PR-6 item 1) — forward-only rebind on Cmd::Add
+    /// (H1), erased in lockstep with key_svc_/key_epoch_ on Cmd::Remove. This
+    /// is the identity an established report is stamped with and the identity
+    /// the engine's report_established checks before trusting one. A
+    /// DIFFERENT identity from key_epoch_ above: this one names WHICH watch
+    /// (from the engine's perspective) a report is about; key_epoch_ names
+    /// whether a staged-but-not-yet-dispatched entry is still current within
+    /// THIS mechanism's own same-tick window.
+    std::unordered_map<std::string, SparkIncarnation> key_incarnation_;
     /// Removed watches awaiting quiescence before real free — see the
     /// Cmd::Remove handling and the reap loop in run() for why a watch isn't
     /// freed synchronously on removal.

@@ -12,7 +12,9 @@ table disagree, the table wins.
   idempotent, an execute-once CAS, or an advisory-lock SINGLE-WRITER retention
   pass. Some ReplicaSafe passes MUST run per-replica and must never be
   leader-gated — the event-outbox poll (`poll_event_outbox_once`) is the reference
-  case (ADR-2002 §5: every replica polls its own bus, or non-leader SSE goes dark).
+  case (ADR-2002 §5: every replica polls its own bus, or non-leader SSE goes dark);
+  the `/readyz` Postgres reachability probe (`pg_reachability_probe.tick`, HA WS-8)
+  is another — each replica must measure its own path to Postgres.
 - **FencedLeaderOnly** — side-effecting singleton work that double-fires across
   replicas (agent dispatch: schedule tick, policy remediation, quarantine
   reconcile; CRL numbering). Runs only on the WS-3 fenced leader. *Enforcement is
@@ -39,9 +41,10 @@ passes on `health_recompute_thread_` are folded into a single
 `health_store.recompute_metrics` entry (they are all ReplicaSafe; the CRL publish,
 which is NOT, is enumerated separately). Passes on their own dedicated component
 threads (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
-projector, the two store-worker delivery pools) each get their own entry too — the
-2026-09-07 sweep (methodology recorded in the `kBackgroundJobs` header) brought the
-table to 40 after an earlier revision missed eight of these.
+projector, the two store-worker delivery pools, and — since HA WS-8 — the Postgres
+reachability probe) each get their own entry too — the 2026-09-07 sweep
+(methodology recorded in the `kBackgroundJobs` header) brought the table to 40 after
+an earlier revision missed eight of these; later additions are recorded in that header.
 
 ## How classification is enforced — and its honest limit
 
@@ -52,10 +55,11 @@ table to 40 after an earlier revision missed eight of these.
   `consteval` lookup that makes removing/renaming its table entry a **build failure**
   (the `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
   DisabledUntilFixed passes (incl. the concurrency reconciler), plus the load-bearing
-  ReplicaSafe ones (the event-outbox poll, the three retention prunes, the app_perf
-  rollup upsert, and the must-run-per-replica / shared-PG-writing passes the sweep
-  added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
-  projector, MCP bridge sweep + session gc, store-worker delivery pools).
+  ReplicaSafe ones (the event-outbox poll, the four retention prunes (incl.
+  `offline_endpoint_store.run_retention_prune`, #5678), the app_perf rollup upsert,
+  and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
+  projector, MCP bridge sweep + session gc, store-worker delivery pools, the HA WS-8
+  Postgres reachability probe).
 - That proves **named⇒classified** for those sites. It does **not** yet prove
   **pass⇒named** for every dispatch site — a `consteval`/CI sweep visiting *all* of
   them is a tracked follow-up (#4094) — so completeness rests on this table, the
@@ -70,7 +74,9 @@ The three formerly-bare wall-clock prunes — `app_perf_fleet_store`,
 `preflight_run_store`, `deployment_run_store` — now run through the shared
 `pg::run_clock_guarded_prune` helper (`server/core/src/pg/pg_retention_guard.hpp`):
 the full seven-part clock guard + a `pg_try_advisory_xact_lock` making it
-SINGLE-WRITER-safe, reading Postgres `now()` in-SQL (the shared clock). The
+SINGLE-WRITER-safe, reading Postgres `now()` in-SQL (the shared clock). A fourth,
+`offline_endpoint_store.run_retention_prune` (#5678), adopts the same helper on
+`preflight_runner_thread_` (keyed on the PG-authored `last_seen_at`). The
 `concurrency_claims` reconciler gained the same advisory lock, but **not** the shared
 clock — its clock authority stays replica-local and its part-3 sanitiser is
 floors-only, so it is **DisabledUntilFixed**, not ReplicaSafe, until the

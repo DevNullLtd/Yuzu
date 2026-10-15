@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cctype>
 #include <array>
 #include <chrono>
 #include <functional>
@@ -9,6 +8,8 @@
 #include <string_view>
 #include <unordered_set>
 #include <vector>
+
+#include <yuzu/protective_actions.hpp>
 
 #include "authz_model.hpp"
 #include "dispatch_target_shape.hpp"
@@ -71,23 +72,58 @@ struct ConfinedDispatchSink {
     /// fallback.
     std::function<int()> send_to_all_unfiltered;
     /// Every currently-known agent id, used to narrow a broadcast when the
-    /// caller IS filtered.
+    /// caller IS filtered. HA WS-5 (ADR-2002 §7a): once `known_agent_ids` is
+    /// wired to a presence-merged source (`AgentRegistry::all_ids()`), a
+    /// Broadcast/None candidate is no longer by construction always locally
+    /// known — see `prepare_route_fallback` and `presence_widens` below,
+    /// both updated for exactly this reason.
     std::function<std::vector<std::string>()> known_agent_ids;
     /// WS-4 4.2b Task C (fallback-only gateway routing-directory consult,
-    /// #4246). Called ONCE per arm — Group/Scope/Ids only, never
-    /// Broadcast/None, whose candidates come from `known_agent_ids()` and are
-    /// therefore by construction always locally known — with the arm's FULL
-    /// candidate list, BEFORE any `send_to` call for that arm. Default
-    /// (unset — every dispatch before this slice, and every dispatch with no
-    /// directory wired, e.g. `forward_legacy_command`'s Broadcast-only sink)
-    /// is a pure no-op: `send_to` alone decides delivery, unchanged. Returns
-    /// true iff the batched directory read itself degraded
+    /// #4246). Called ONCE per arm — with the arm's FULL candidate list,
+    /// BEFORE any `send_to` call for that arm. Default (unset — every
+    /// dispatch before this slice, and every dispatch with no directory
+    /// wired, e.g. `forward_legacy_command`'s Broadcast-only sink) is a pure
+    /// no-op: `send_to` alone decides delivery, unchanged. Returns true iff
+    /// the batched directory read itself degraded
     /// (store_unavailable/db_error) — surfaced as
     /// `ArmDispatchResult::route_unreadable` /
     /// `ConfinedDispatchOutcome::route_unreadable` (see that field's own doc
     /// comment: this slice only DEFINES and PRODUCES the flag; wiring its
     /// outbox-reschedule / cascade consumption is the next task).
+    ///
+    /// HA WS-5 update: Broadcast/None's `confined_broadcast()` now calls this
+    /// too, on its FILTERED path — Group/Scope/Ids always did; Broadcast's
+    /// candidates stopped being "by construction always locally known" the
+    /// moment `known_agent_ids` could return a presence-only (remote) id, and
+    /// an unprepared remote id would otherwise reach `send_to` with no
+    /// directory consult, silently fail, and land in `not_sent` — a
+    /// wired-but-behaviorally-dead reader, the exact class of bug WS-4 hit
+    /// twice before shipping. `confined_broadcast`'s UNFILTERED fast path
+    /// (`send_to_all_unfiltered`) does NOT call this — see
+    /// `presence_widens` below for how that path stays safe instead.
     std::function<bool(const std::vector<std::string>& candidates)> prepare_route_fallback;
+    /// HA WS-5 (governance Gate 4 unhappy-path hardening, 2026-09-22):
+    /// `AgentRegistry::has_remote_presence(candidates)` — a SINGLE-lock
+    /// membership check against the registry's CURRENT local state, given
+    /// the candidate list `confined_broadcast()` already fetched via
+    /// `known_agent_ids()`. `confined_broadcast()`'s UNFILTERED fast path
+    /// (`send_to_all_unfiltered`, which walks ONLY local sessions and has no
+    /// per-id hook to consult the directory) is eligible only when this
+    /// returns false — i.e. presence added nothing reachable this call, so
+    /// the fast path's local-only walk is provably complete. This
+    /// SUPERSEDES an earlier `local_agent_count()`-vs-`known_agent_ids().
+    /// size()` comparison, which was racy: those were two SEPARATE lock
+    /// acquisitions, so concurrent local churn between them could make the
+    /// SIZES coincidentally match while the SETS differed, silently taking
+    /// the fast path with a presence-only id still in `candidates`. A direct
+    /// membership check against the already-fetched list has no such gap —
+    /// see `has_remote_presence`'s own doc comment. UNSET (a test/legacy
+    /// sink that predates this field) is treated as "presence widens" (an
+    /// unconditional true) by `confined_broadcast` — so an unmigrated sink
+    /// always takes the SLOW (filtered, `prepare_route_fallback`-covered)
+    /// path instead of silently skipping this check: fail-closed on missing
+    /// wiring, never fail-open into a stale fast path.
+    std::function<bool(const std::vector<std::string>& candidates)> presence_widens;
 };
 
 /// Targets the CALLER has already resolved. Each arm reads only its own field;
@@ -221,6 +257,11 @@ struct ArmDispatchResult {
     /// stronger and more actionable of the two facts, matching the ordering
     /// `denied_quarantined` already uses relative to `not_sent`.
     std::vector<std::string> unknown_plugin;
+    /// #5294: ids that were reachable but withheld because a per-OS kill
+    /// switch is OFF for the target's known agent OS. Checked AFTER `contained`
+    /// (quarantine is the stronger fact) and BEFORE `unknown_plugin`.
+    std::vector<std::string> kill_switched_os;
+    std::size_t kill_switched_os_count = 0;
     /// How many were withheld for plugin absence, always -- same
     /// count-vs-identities split as `denied_quarantined_count`, though unlike
     /// quarantine there is no fail-closed mode here to make the two diverge;
@@ -320,6 +361,15 @@ struct ConfinedDispatchOutcome {
     /// `denied_quarantined_count` exactly; see `ArmDispatchResult::unknown_plugin`.
     std::vector<std::string> unknown_plugin;
     std::size_t unknown_plugin_count = 0;
+    /// #5294: ids withheld by a per-OS kill switch; see
+    /// `ArmDispatchResult::kill_switched_os`.
+    std::vector<std::string> kill_switched_os;
+    std::size_t kill_switched_os_count = 0;
+    /// #5294: presence was degraded while a per-OS switch was OFF, so the
+    /// dispatch was refused BEFORE targeting (fail closed -- never narrowed to
+    /// this replica's local sessions). Like `containment_unreadable` it is a
+    /// distinct cause from "no agents reached".
+    bool os_gate_unreadable = false;
     /// WS-4 4.2b Task C -- mirrors `ArmDispatchResult::route_unreadable`,
     /// threaded out here the same way `containment_unreadable` already is.
     /// See that field's doc comment; only ever set for the Group/Scope/Ids
@@ -328,61 +378,10 @@ struct ConfinedDispatchOutcome {
     bool route_unreadable = false;
 };
 
-/// #881: case-insensitive predicate for the quarantine control-channel
-/// exemption. Pure — no store access — so a test can bind it directly without
-/// a live `QuarantineStore`. Normalises to lowercase itself
-/// (`ServerImpl::dispatch_confined` already lowercases the ACTION at its own
-/// call site, never the plugin) so `"Quarantine"`/`"QUARANTINE"` exempt
-/// exactly like `"quarantine"`.
-///
-/// Keyed on the `(plugin, ACTION)` pair against a CLOSED set — not on the
-/// plugin name alone. All four actions the plugin registers today
-/// (quarantine, unquarantine, status, whitelist) are exempt, deliberately:
-/// narrowing it to `unquarantine` alone would break re-isolation (a fresh
-/// `quarantine` action against an already-contained device), whitelist repair
-/// of a contained device's exceptions, and #3127's retry path — all of which
-/// are the plugin managing its OWN containment state, not an operator
-/// reaching a quarantined agent through some other plugin. Keying on the
-/// plugin alone would have let a FIFTH action added later inherit the bypass
-/// silently, with nothing in review to notice; see the closed-set comment in
-/// the body.
-[[nodiscard]] inline bool is_quarantine_control_plugin(std::string_view plugin,
-                                                       std::string_view action) {
-    constexpr std::string_view kQuarantinePlugin{"quarantine"};
-    auto iequals = [](std::string_view a, std::string_view b) {
-        if (a.size() != b.size())
-            return false;
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(a[i])) != b[i])
-                return false;
-        }
-        return true;
-    };
-    if (!iequals(plugin, kQuarantinePlugin))
-        return false;
-
-    // Keyed on the (plugin, ACTION) pair, not the plugin alone.
-    //
-    // Exempting a whole plugin means a FUTURE action inherits the exemption
-    // silently — the plugin declares exactly four today, and a fifth would
-    // arrive already able to bypass containment with nothing in review to
-    // notice. This set is closed against the plugin's declared actions
-    // (`acts[]` in quarantine_plugin.cpp); anything else is gated.
-    //
-    // Why all four are here rather than release alone: `unquarantine` IS the
-    // release path; `status` is read-only and answering it for a contained host
-    // is the point; `whitelist` is how a management path is repaired, and
-    // gating it would make a host whose whitelist is wrong unrecoverable
-    // remotely — the stranding this control exists to avoid; and `quarantine`
-    // on an already-contained host is the re-dispatch #3127 relies on. An
-    // action NOT on this list gets no exemption even on this plugin.
-    for (const auto allowed : {std::string_view{"quarantine"}, std::string_view{"unquarantine"},
-                               std::string_view{"status"}, std::string_view{"whitelist"}}) {
-        if (iequals(action, allowed))
-            return true;
-    }
-    return false;
-}
+// The closed quarantine-control predicate lives in the shared pure header so the
+// agent dispatch gate, which follows, consumes the identical set; re-exported
+// here so existing server-side callers and tests compile unchanged.
+using yuzu::protective::is_quarantine_control_plugin;
 
 /// The bounded-staleness budget (#881 spec item 6): a `nullopt` read served
 /// from the last-known-good snapshot is trusted only while the snapshot is
@@ -447,6 +446,11 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 /// not by itself enough for anyone reviewing the containment surface:
 ///   - `tar_fleet_snapshot` requests a READ-ONLY topology snapshot.
 ///   - `asset_tags_sync` writes device tags. No execution.
+///   - `inventory_sync_now` asks ONE agent to re-run its daily-sync source(s)
+///     and report (`__sync__.now`, ADR-0016 update). Read-only, no execution;
+///     operator-REQUESTED via `POST /api/v1/hardware/{id}/sync` (which gates
+///     the operator on Execution:Execute for that device) but system-DISPATCHED,
+///     so it rides this door. Not quarantine-gated, same as tar_fleet_snapshot.
 ///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
 ///     ENFORCE, and is therefore the one exempt channel that mutates the
 ///     endpoint. It is NOT arbitrary command execution: the assertion
@@ -459,7 +463,12 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 ///     `execute_instruction` is refused — deliberate, since enforcing a
 ///     baseline on a compromised host is the point, but it is the enumerator
 ///     to think hardest about before adding a sibling.
-enum class SystemReservedPush { tar_fleet_snapshot, guardian_push_rules, asset_tags_sync };
+enum class SystemReservedPush {
+    tar_fleet_snapshot,
+    guardian_push_rules,
+    asset_tags_sync,
+    inventory_sync_now,
+};
 
 /// Label for one enumerator. A switch with no `default:` so a new enumerator
 /// fails to compile here rather than silently metering as something else.
@@ -472,6 +481,8 @@ system_reserved_push_label(SystemReservedPush push) {
         return "__guard__.push_rules";
     case SystemReservedPush::asset_tags_sync:
         return "asset_tags.sync";
+    case SystemReservedPush::inventory_sync_now:
+        return "__sync__.now";
     }
     return "unknown"; // unreachable while the switch stays exhaustive
 }
@@ -479,9 +490,9 @@ system_reserved_push_label(SystemReservedPush push) {
 /// Every enumerator, so the boot pre-seed cannot fall out of step with the
 /// call sites — same reason `kQuarantineGateOutcomes` exists. An internal push
 /// that has never fired must read as zero, not as an absent series.
-inline constexpr std::array<SystemReservedPush, 3> kSystemReservedPushes{
+inline constexpr std::array<SystemReservedPush, 4> kSystemReservedPushes{
     SystemReservedPush::tar_fleet_snapshot, SystemReservedPush::guardian_push_rules,
-    SystemReservedPush::asset_tags_sync};
+    SystemReservedPush::asset_tags_sync, SystemReservedPush::inventory_sync_now};
 
 /// The two outcomes a system-reserved push can have at the registry seam.
 /// `sent` means `AgentRegistry::send_to` accepted the frame (for a
@@ -642,11 +653,19 @@ struct QuarantineDegradationResult {
 /// function) on an agent with no reported inventory at all, so a
 /// freshly-registered or gateway-relayed agent is never wrongly withheld for
 /// absence of DATA rather than absence of the plugin.
+/// The protective set is carved out inside `ids_missing_plugin` (see its
+/// declaration).
+///
+/// `os_kill_switched` (#5294) follows the identical empty-is-safe argument:
+/// the ids a per-OS kill switch withholds, built once per dispatch by
+/// `AgentRegistry::ids_with_os`. It is checked after containment (quarantine
+/// is the stronger, more actionable fact) and before plugin absence.
 [[nodiscard]] inline ArmDispatchResult
 dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
                        const authz::VisibleSet& exec_visible, bool broadcast_on_none,
                        const ContainmentGate& gate, const ConfinedDispatchSink& sink,
-                       const std::unordered_set<std::string>& plugin_missing = {}) {
+                       const std::unordered_set<std::string>& plugin_missing = {},
+                       const std::unordered_set<std::string>& os_kill_switched = {}) {
     ArmDispatchResult result;
 
     // #881: the ONE per-id containment check every arm applies AFTER the
@@ -682,6 +701,15 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             return true;
         }
         return false;
+    };
+
+    // #5294: the per-OS kill-switch sibling of `contained`, same shape.
+    const auto os_killed = [&](const std::string& aid) -> bool {
+        if (!os_kill_switched.contains(aid))
+            return false;
+        result.kill_switched_os.push_back(aid);
+        ++result.kill_switched_os_count;
+        return true;
     };
 
     // #3424/#3511: the plugin-presence sibling of `contained` above, same
@@ -729,11 +757,32 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
     // exactly the dispatches where it matters, never on the common case where
     // every agent has the plugin.
     const auto confined_broadcast = [&]() -> int {
-        if (!exec_visible && !gate.enforced && plugin_missing.empty())
+        // HA WS-5 (ADR-2002 §7a): `known_agent_ids()` can now include
+        // presence-only (remote) ids, so the fast path below — which walks
+        // ONLY local sessions via `send_to_all_unfiltered` and has no per-id
+        // hook to consult the routing directory for one — is eligible only
+        // when presence added nothing reachable this call. A DIRECT
+        // membership check against the already-fetched `candidates`
+        // (`presence_widens`), not a two-call size comparison — the latter
+        // raced (governance Gate 4 unhappy-path finding, 2026-09-22): see
+        // `presence_widens`'s own doc comment. Unset (a sink predating this
+        // field) is treated as "presence widens" (true), so a genuinely
+        // non-empty fleet always falls through to the filtered path below.
+        auto candidates = authz::filter_to_scope(sink.known_agent_ids(), exec_visible);
+        const bool widened = sink.presence_widens ? sink.presence_widens(candidates) : true;
+        if (!exec_visible && !gate.enforced && plugin_missing.empty() &&
+            os_kill_switched.empty() && !widened)
             return sink.send_to_all_unfiltered();
+        // WS-4 4.2b Task C: same batched-before-the-walk shape Group/Scope/Ids
+        // already use — Broadcast/None previously skipped this call on the
+        // (pre-WS-5) assumption that a broadcast candidate is always locally
+        // known; that assumption no longer holds once known_agent_ids() can
+        // return a presence-only id (see the sink field's own doc comment).
+        if (sink.prepare_route_fallback)
+            result.route_unreadable = sink.prepare_route_fallback(candidates);
         int n = 0;
-        for (const auto& aid : authz::filter_to_scope(sink.known_agent_ids(), exec_visible))
-            if (!contained(aid) && !plugin_absent(aid) && sink.send_to(aid))
+        for (const auto& aid : candidates)
+            if (!contained(aid) && !os_killed(aid) && !plugin_absent(aid) && sink.send_to(aid))
                 ++n;
         return n;
     };
@@ -748,7 +797,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.group_members);
             for (const auto& aid : *targets.group_members) {
-                if (!authz::in_scope(exec_visible, aid) || contained(aid) || plugin_absent(aid))
+                if (!authz::in_scope(exec_visible, aid) || contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
                     ++result.sent;
@@ -770,7 +819,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.scope_matched);
             for (const auto& aid : authz::filter_to_scope(*targets.scope_matched, exec_visible)) {
-                if (contained(aid) || plugin_absent(aid))
+                if (contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
                     ++result.sent;
@@ -785,7 +834,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.agent_ids);
             for (const auto& aid : authz::filter_to_scope(*targets.agent_ids, exec_visible)) {
-                if (contained(aid) || plugin_absent(aid))
+                if (contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
                     ++result.sent;

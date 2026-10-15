@@ -280,20 +280,20 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
  * must serialise this against the collectors (they hold `collect_mu_` for their
  * whole enumerate→diff→set_state cycle); this function takes no lock itself.
  *
- * #538/UP-1 (fail-safe ordering): on enable→disable the baseline is cleared
- * BEFORE the `_enabled` flag is flipped, and the flag is flipped only if the
- * clear persisted. If the clear fails (e.g. SQLITE_BUSY), the source is left
- * ENABLED and this returns `false` — never a disabled source with a stale
- * baseline (which would reintroduce the ghost-event bug on re-enable).
+ * #538/UP-1 + #1654 (all-or-nothing): every non-usage transition -- the baseline
+ * clear on enable->disable, the `_enabled` flag and `_paused_at` -- commits as ONE
+ * transaction. If it fails (e.g. SQLITE_BUSY) nothing changed and this returns
+ * `false`: never a disabled source with a stale baseline, and never an enabled
+ * source with a wiped one.
  *
  * @param db        The TAR database.
  * @param source    Source name (e.g. "process", "tcp", "service", "user").
  * @param new_value Either `"true"` or `"false"`. Other values are rejected
  *                  upstream by the configure action.
  * @param now_epoch Current epoch seconds — used as the paused_at timestamp.
- * @return true on success; false ONLY when an enable→disable transition could
- *         not clear the baseline (the source is left enabled). Non-disabling
- *         transitions always return true.
+ * @return true iff the transition committed; false when it could not be persisted
+ *         (source left in its previous state) or when `new_value` is not
+ *         "true"/"false" or `source` is not a registry source.
  */
 [[nodiscard]] bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
                                                    std::string_view new_value, int64_t now_epoch);

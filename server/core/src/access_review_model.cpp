@@ -1,6 +1,7 @@
 #include "access_review_model.hpp"
 
 #include "api_token_store.hpp"
+#include "data_export.hpp"
 #include "directory_sync.hpp"
 #include "engine_principal_store.hpp"
 #include "rbac_store.hpp"
@@ -256,46 +257,16 @@ build_access_review(AuthDB* users, RbacStore* rbac, EnginePrincipalStore* engine
 
 namespace {
 
-/// CWE-1236 (CSV/formula injection): a field whose FIRST byte is one of
-/// these is executed as a formula by Excel/Sheets when the exported CSV is
-/// opened there — `=`/`+`/`-`/`@` trigger a formula, and a leading tab
-/// (0x09) or CR (0x0d) can smuggle one past a naive "starts with =" filter.
-/// `principal_id`/`display_name`/`owner_or_email`/role names are all
-/// influenceable by an external identity provider (SCIM username, engine
-/// display_name) — not a theoretical input for a compliance evidence
-/// export a reviewer is expected to open in a spreadsheet.
-bool is_formula_trigger(char c) {
-    return c == '=' || c == '+' || c == '-' || c == '@' || c == '\t' || c == '\r';
-}
-
-/// Neutralize a formula-injection-triggering leading byte by prefixing a
-/// literal `'` — Excel/Sheets render a leading apostrophe as a text-cell
-/// marker (not part of the value) rather than executing what follows.
-/// Applied BEFORE the RFC-4180 quoting pass below.
-std::string neutralize_formula(const std::string& field) {
-    if (!field.empty() && is_formula_trigger(field.front()))
-        return "'" + field;
-    return field;
-}
-
-/// RFC 4180-style field escaping: quote when the field contains a comma,
-/// double-quote, or newline; double any interior double-quotes. Formula-
-/// injection neutralization (above) runs first.
+/// RFC 4180-style field escaping, including CWE-1236 formula-injection
+/// neutralization (`principal_id`/`display_name`/`owner_or_email`/role names
+/// are all influenceable by an external identity provider -- not a
+/// theoretical input for a compliance evidence export a reviewer is expected
+/// to open in a spreadsheet). Delegates to the shared `data_export::csv_escape`
+/// chokepoint -- this file was the original precedent for the fix; every CSV
+/// exporter routes through the same helper now, rather than each forking its
+/// own copy.
 std::string csv_field(const std::string& field) {
-    const std::string neutralized = neutralize_formula(field);
-    const bool needs_quote =
-        neutralized.find_first_of(",\"\r\n") != std::string::npos;
-    if (!needs_quote)
-        return neutralized;
-    std::string out = "\"";
-    for (char c : neutralized) {
-        if (c == '"')
-            out += "\"\"";
-        else
-            out += c;
-    }
-    out += "\"";
-    return out;
+    return data_export::csv_escape(field);
 }
 
 std::string csv_join_roles(const std::vector<std::string>& roles) {
@@ -310,13 +281,20 @@ std::string csv_join_roles(const std::vector<std::string>& roles) {
 
 } // namespace
 
-std::string to_csv(const std::vector<AccessReviewRow>& rows) {
+std::string to_csv(const std::vector<AccessReviewRow>& rows, const std::string& rbac_enforcement) {
     std::ostringstream ss;
     // Locale-independent numeric formatting (cpp-expert NICE): under a
     // grouping locale (e.g. "de_DE"), the default-imbued stream would emit
     // thousands separators into effective_permission_count/last_activity_ms
     // — corrupting the CSV's numeric columns for any downstream parser.
     ss.imbue(std::locale::classic());
+    // A3 (RBAC delivery plan): unconditional leading metadata line — present
+    // even for an empty `rows` population, so "no grants" is never ambiguous
+    // with "the stamp was omitted". Emitted verbatim: `rbac_enforcement` is
+    // always one of the three fixed literals the caller derived via
+    // `access_review_rbac_enforcement()`, never externally influenced, so
+    // csv_field's RFC-4180/CWE-1236 handling does not apply here.
+    ss << "# rbac_enforcement=" << rbac_enforcement << "\r\n";
     ss << "principal_type,principal_id,display_name,owner_or_email,roles,"
           "effective_permission_count,last_activity_ms,last_activity_kind,"
           "classification,lifecycle_state,source\r\n";
@@ -329,6 +307,10 @@ std::string to_csv(const std::vector<AccessReviewRow>& rows) {
            << csv_field(r.source) << "\r\n";
     }
     return ss.str();
+}
+
+std::string access_review_rbac_enforcement(const RbacStore* rbac) {
+    return std::string(to_string(rbac_enforcement_label(rbac)));
 }
 
 } // namespace yuzu::server

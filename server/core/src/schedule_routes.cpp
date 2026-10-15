@@ -1,6 +1,7 @@
 #include "schedule_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
 
@@ -86,6 +87,17 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         try {
+            // #2437-class guard: raw-text depth check before parse -
+            // "parameters" is dumped a few lines below
+            // (params_raw = j["parameters"].dump()), so the check has to run
+            // on the raw text before any allocation.
+            if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                res.status = 400;
+                res.set_content(
+                    nlohmann::json({{"error", "request body nests too deeply"}}).dump(),
+                    "application/json");
+                return;
+            }
             auto j = nlohmann::json::parse(req.body);
             InstructionSchedule sched;
             sched.name = j.value("name", "");

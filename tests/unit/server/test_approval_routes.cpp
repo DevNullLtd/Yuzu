@@ -335,6 +335,53 @@ TEST_CASE("approval_routes: reject round-trip over HTTP, with the real audit row
     CHECK(row->status == "rejected");
 }
 
+TEST_CASE("approval_routes: a decision's success trigger asks the old tab to refresh and an "
+          "over-long comment is a 400 with the exact message",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto a = mgr->submit("def-trig-a", "submitter1", "group:x", "", ApprovalOrigin::kInstruction);
+    auto r = mgr->submit("def-trig-r", "submitter1", "group:x", "", ApprovalOrigin::kInstruction);
+    REQUIRE(a.has_value());
+    REQUIRE(r.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.wire();
+
+    // Too long: refused before any state change, through the existing denial branch.
+    const std::string too_long =
+        R"({"comment":")" + std::string(kMaxReviewCommentBytes + 1, 'a') + R"("})";
+    auto refused = h.sink.Post("/api/approvals/" + *a + "/approve", too_long);
+    REQUIRE(refused);
+    CHECK(refused->status == 400);
+    CHECK(body(refused->body)["error"] == "comment too long (max 4000 bytes)");
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "approval.approve");
+    CHECK(h.audits[0].result == "denied");
+    CHECK(h.events.empty());
+    auto still = mgr->get(*a);
+    REQUIRE(still.has_value());
+    CHECK(still->status == "pending");
+
+    // Success: the HX-Trigger JSON keeps the toast and adds refreshApprovals (both routes).
+    auto trig = [](const httplib::Response& res) {
+        REQUIRE(res.has_header("HX-Trigger"));
+        return nlohmann::json::parse(res.get_header_value("HX-Trigger"));
+    };
+    auto ok_a = h.sink.Post("/api/approvals/" + *a + "/approve", "{}");
+    REQUIRE(ok_a);
+    CHECK(ok_a->status == 200);
+    auto ta = trig(*ok_a);
+    CHECK(ta["showToast"]["message"] == "Approved");
+    CHECK(ta["refreshApprovals"] == true);
+    auto ok_r = h.sink.Post("/api/approvals/" + *r + "/reject", "{}");
+    REQUIRE(ok_r);
+    CHECK(ok_r->status == 200);
+    auto tr = trig(*ok_r);
+    CHECK(tr["showToast"]["message"] == "Rejected");
+    CHECK(tr["refreshApprovals"] == true);
+}
+
 TEST_CASE("approval_routes: self-approval is denied (segregation of duties), audited as "
           "denied, and never emits an event",
           "[server][routes][approval_routes][pg]") {
@@ -419,6 +466,26 @@ TEST_CASE("approval_routes: GET /api/approvals filters by status and submitted_b
     REQUIRE(by_submitter);
     auto op1_arr = body(by_submitter->body)["approvals"];
     CHECK(op1_arr.size() == 2); // def-a (pending) + def-c (approved)
+}
+
+TEST_CASE("GET /api/approvals: an out-of-enum status is rejected with 400, not silently "
+          "producing a false-empty result (Gate 8 governance finding, #2146 A2-R4)",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    REQUIRE(mgr->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.wire();
+
+    // Pre-fix: this silently produced approvals:[] -- indistinguishable from
+    // a genuinely empty match -- instead of rejecting the malformed input,
+    // same defect class as GET /api/v1/approvals and MCP
+    // list_pending_approvals had before their own #2146 A2-R4 fix.
+    auto res = h.sink.Get("/api/approvals?status=aproved");
+    REQUIRE(res);
+    CHECK(res->status == 400);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

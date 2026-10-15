@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: probe_wave7.exe prefetch DOSKEY.EXE-DDFD0A8D.pf DOSKEY.EXE-DDFD0A8D.pf.decompressed  (RtlGetCompressionWorkSpaceSize + RtlDecompressBufferEx, COMPRESSION_FORMAT_XPRESS_HUFF, run in the admin SSH session)
+date: 2026-09-06
+status: REAL CAPTURE
+note: probe output, not reconstructed -- NTSTATUS 0x00000000 (STATUS_SUCCESS) both for RtlGetCompressionWorkSpaceSize and RtlDecompressBufferEx; decompressed bytes 4-7 = SCCA. Full NTSTATUS/size values recorded verbatim in probes/the-rig-probe-findings.md.

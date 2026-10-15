@@ -36,6 +36,16 @@ struct LiveKind {
     // does not yet render the dashboard-only multi-card kinds (A1 backfill, #1649).
     std::string plugin2;
     std::string action2;
+    // Generic pipe-row rendering (round-3 item 11 — physical-kit panels). A non-empty
+    // `columns` means this kind's output is a flat `<row_prefix>|field1|field2|...`
+    // table with no bespoke parsing/typed-row struct: device_routes.cpp's
+    // render_live_result() dispatches it straight to the shared
+    // render_device_live_generic(columns, rows) renderer (device_ui.cpp) instead of a
+    // one-off render_device_live_KIND function. Leave both empty for every kind that
+    // still has (or needs) a bespoke renderer — this is additive, not a replacement
+    // for the existing typed-row kinds above.
+    std::string row_prefix;
+    std::vector<std::string> columns;
 };
 
 inline std::optional<LiveKind> resolve_kind(const std::string& kind) {

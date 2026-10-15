@@ -18,17 +18,23 @@ namespace yuzu::server {
 SoftwareCatalogRollup::SoftwareCatalogRollup(SoftwareInventoryStore& store,
                                              std::chrono::seconds interval,
                                              yuzu::MetricsRegistry* metrics)
-    : store_(store), interval_(interval <= std::chrono::seconds{0} ? std::chrono::seconds{3600}
-                                                                   : interval),
+    : store_(store),
+      interval_(interval <= std::chrono::seconds{0} ? std::chrono::seconds{3600} : interval),
       metrics_(metrics) {}
 
-SoftwareCatalogRollup::~SoftwareCatalogRollup() { stop(); }
+SoftwareCatalogRollup::~SoftwareCatalogRollup() {
+    stop();
+}
 
 void SoftwareCatalogRollup::start() {
     if (thread_.joinable())
         return; // already started
     stop_.store(false, std::memory_order_release);
     thread_ = std::thread([this] { run(); });
+}
+
+void SoftwareCatalogRollup::request_stop() noexcept {
+    stop_.store(true, std::memory_order_release);
 }
 
 void SoftwareCatalogRollup::stop() {
@@ -63,15 +69,23 @@ void SoftwareCatalogRollup::run() {
         // calls std::terminate — catch, log, keep ticking.
         try {
             const auto t0 = std::chrono::steady_clock::now();
-            YUZU_ASSERT_BACKGROUND_JOB("software_catalog_rollup.refresh_catalog_rollup"); // WS-10 ReplicaSafe
-            const bool ok = store_.refresh_catalog_rollup();
+            YUZU_ASSERT_BACKGROUND_JOB(
+                "software_catalog_rollup.refresh_catalog_rollup"); // WS-10 ReplicaSafe
+            const bool ok = store_.refresh_catalog_rollup(
+                [this] { return stop_.load(std::memory_order_acquire); });
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            // A refresh aborted by shutdown is a cancel, not a failure: counting it as
+            // outcome="error" would let a restart mid-refresh trip the rollup-failing alert.
+            // The store cannot tell stop from budget, so the worker decides: stop_ set =>
+            // cancelled; a budget-exhausted or failed refresh stays outcome="error" + warn.
+            const bool cancelled = !ok && stop_.load(std::memory_order_acquire);
             if (metrics_) {
-                metrics_
-                    ->counter("yuzu_inventory_catalog_rollup_total",
-                              {{"outcome", ok ? "success" : "error"}})
-                    .increment();
+                if (!cancelled)
+                    metrics_
+                        ->counter("yuzu_inventory_catalog_rollup_total",
+                                  {{"outcome", ok ? "success" : "error"}})
+                        .increment();
                 metrics_->gauge("yuzu_inventory_catalog_rollup_duration_seconds").set(secs);
                 if (ok) {
                     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -81,7 +95,10 @@ void SoftwareCatalogRollup::run() {
                         .set(static_cast<double>(now));
                 }
             }
-            if (!ok)
+            if (cancelled)
+                spdlog::info(
+                    "Software catalogue rollup: refresh cancelled by shutdown — keeping last-good");
+            else if (!ok)
                 spdlog::warn(
                     "Software catalogue rollup: refresh failed — keeping last-good rollup");
         } catch (const std::exception& e) {

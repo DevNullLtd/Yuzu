@@ -155,13 +155,13 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           languages: actions
           config-file: ./.github/codeql/codeql-config.yml
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           # Distinct category from the nightly Linux leg's actions scan so
           # the two analysis series don't overwrite each other's alerts.
@@ -380,8 +380,9 @@ jobs:
             --x-manifest-root="$GITHUB_WORKSPACE"
 
       # Install Erlang/OTP + rebar3 for the gateway custom_target. The
-      # meson `gateway` custom_target fires when `find_program('rebar3')`
-      # succeeds at configure time; on the self-hosted Linux runner
+      # meson `gateway` custom_target is scheduled when rebar3 is found AND
+      # configure resolves an Erlang/OTP 28.4 or later 28.x (else it is
+      # skipped with a WARNING); on the self-hosted Linux runner
       # rebar3 sits at /home/github-runner/.local/bin/rebar3 so the
       # custom_target IS scheduled, and the Build step then dies with
       # `/usr/bin/env: 'escript': No such file or directory` if Erlang
@@ -399,8 +400,8 @@ jobs:
       # +`$GITHUB_PATH` plumbing (PR #923) which could not find Erlang
       # at all when the runner lacked a kerl/asdf/brew install — the
       # 2026-05-10 and 2026-05-17 scheduled runs both failed on this
-      # branch. Linux only — Windows uses build_gateway.py's C:\Erlang
-      # junction lookup.
+      # branch. Linux only — on Windows configure resolves the OTP under
+      # C:\Program Files (C:\Erlang is never searched).
       - name: Install Erlang/OTP and rebar3 (linux)
         if: matrix.os == 'linux'
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
@@ -413,7 +414,7 @@ jobs:
           rebar3-version: '3.24'
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           languages: ${{ matrix.languages }}
           # The leading `+` means "augment the default suite" (applies
@@ -520,7 +521,7 @@ jobs:
         # reliably suppress findings whose location is a transitively-
         # included header in compiled C/C++. The `output` directory
         # holds the raw SARIF for post-processing.
-        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           category: "${{ matrix.category }}"
           output: codeql-sarif
@@ -576,7 +577,7 @@ jobs:
           done
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: codeql-sarif
           category: "${{ matrix.category }}"

@@ -1,0 +1,11 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-21 · euid 501 · leg-hash ea8979e16417
+== action=wdac_policy
+wdac_policy|unsupported|windows_only_concept
+[result_status] UNAVAILABLE / PARTIAL / windows_only_concept
+[rc] 1
+
+== action=applocker_policy
+applocker_policy|unsupported|windows_only_concept
+[result_status] UNAVAILABLE / PARTIAL / windows_only_concept
+[rc] 1
+

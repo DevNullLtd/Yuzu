@@ -1,0 +1,20 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-21 · LocalSystem (elevated) · leg-hash ea8979e16417
+== action=wdac_policy
+wdac|EmodePolicyRequired|0|unmodelled
+wdac|SkuPolicyRequired|0|unmodelled
+wdac|VerifiedAndReputablePolicyState|0|disabled
+wdac|SAC_PreviousState|4294967295|unmodelled
+wdac_cip|{0283AC0F-FFF1-49AE-ADA1-8A933130CAD6}|present
+wdac_cip|{0939ED82-BFD5-4D32-B58E-D31D3C49715A}|present
+wdac_cip|{1283AC0F-FFF1-49AE-ADA1-8A933130CAD6}|present
+wdac_cip|{1678656C-05EF-481F-BC5B-EBD8C991502D}|present
+wdac_cip|{1939ED82-BFD5-4D32-B58E-D31D3C49715A}|present
+wdac_cip|{2678656C-05EF-481F-BC5B-EBD8C991502D}|present
+wdac_cip|{60FD87F8-4593-44A0-91B0-2E0DA022F248}|present
+wdac_cip|{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}|present
+[result_status] OK / FULL / registry_ci_policy
+
+== action=applocker_policy
+applocker|none|absent|0
+[result_status] OK / FULL / registry_srpv2
+

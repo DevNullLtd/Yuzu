@@ -30,7 +30,9 @@
 /// stronger evidence that a route still calls the right gate than a regex
 /// over source text would be.
 
+#include "instruction_param_schema.hpp"
 #include "instruction_routes.hpp"
+#include "instruction_schema_test_util.hpp"
 #include "test_route_sink.hpp"
 
 #include "instruction_store.hpp"
@@ -112,6 +114,7 @@ struct Harness {
     // auth_allow/auth_username so tests can prove a route never gates on
     // it (see instruction_routes.hpp's header comment).
     std::string resolve_session_username{"alice"};
+    std::string resolve_session_auth_source{"local"}; ///< "api_token" = a token session (not gated)
 
     bool audit_succeeds{true};
     std::vector<AuditRow> audits;
@@ -153,6 +156,7 @@ struct Harness {
                 return std::nullopt;
             auth::Session s;
             s.username = resolve_session_username;
+            s.auth_source = resolve_session_auth_source;
             return s;
         };
         deps.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
@@ -166,6 +170,9 @@ struct Harness {
             emits.push_back({event_type, attrs, payload_data});
         };
         instruction::register_instruction_routes(sink, deps);
+        // A browser sends these on every same-origin write; the cross-site tests clear or
+        // override them.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     }
 };
 
@@ -723,8 +730,60 @@ TEST_CASE("instruction_routes: POST import success/duplicate both audit, unlike 
     CHECK(body(second->body)["audit_emitted"] == true);
 }
 
-TEST_CASE("instruction_routes: instruction-set create/list/delete, with the documented "
-          "audit ASYMMETRY -- create audits NOTHING, delete audits denial but not success",
+TEST_CASE("instruction_routes: POST import refuses an invalid or over-cap parameter_schema with a "
+          "400 and a denied audit row",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const auto envelope = [](const std::string& id, const std::string& schema) {
+        return json{{"id", id},
+                    {"name", "Schema Gate"},
+                    {"version", "1.0"},
+                    {"type", "question"},
+                    {"plugin", "os_info"},
+                    {"action", "os_name"},
+                    {"parameter_schema", schema}}
+            .dump();
+    };
+
+    auto bad = h.sink.Post(
+        "/api/instructions/import",
+        envelope("test.route.import.badschema",
+                 R"({"type":"object","properties":{"p":{"type":"nosuchtype"}}})"));
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "instruction.import");
+    CHECK(h.audits[0].result == "denied");
+    CHECK(h.audits[0].detail.rfind("parameter_schema is not a valid parameter schema:", 0) == 0);
+    CHECK(body(bad->body)["audit_emitted"] == true);
+    {
+        const auto got = w.store.get_definition("test.route.import.badschema");
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->has_value());
+    }
+
+    auto big = h.sink.Post("/api/instructions/import",
+                           envelope("test.route.import.bigschema",
+                                    std::string(instr::kMaxParameterSchemaBytes + 1, ' ')));
+    REQUIRE(big);
+    CHECK(big->status == 400);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "denied");
+    CHECK(h.audits[1].detail == "parameter_schema is larger than the 262144-byte limit");
+    {
+        const auto got = w.store.get_definition("test.route.import.bigschema");
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->has_value());
+    }
+}
+
+TEST_CASE("instruction_routes: instruction-set create/list/delete write an attempt row BEFORE "
+          "the change and an outcome row after, and a repeated delete audits the not-found denial",
           "[pg][server][routes][instruction_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
     PgWired w{db.dsn()};
@@ -738,7 +797,14 @@ TEST_CASE("instruction_routes: instruction-set create/list/delete, with the docu
     CHECK(create->status == 200);
     auto id = body(create->body)["id"].get<std::string>();
     REQUIRE(!id.empty());
-    CHECK(h.audits.empty()); // create_set: no audit call at all, pre-existing gap
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == "instruction_set.create");
+    CHECK(h.audits[0].result == "attempted"); // before the change, so no id yet
+    CHECK(h.audits[0].target_id.empty());
+    CHECK(h.audits[1].action == "instruction_set.create");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_type == "InstructionSet");
+    CHECK(h.audits[1].target_id == id);
 
     auto list = h.sink.Get("/api/instruction-sets");
     REQUIRE(list);
@@ -747,19 +813,90 @@ TEST_CASE("instruction_routes: instruction-set create/list/delete, with the docu
     for (const auto& s : body(list->body)["sets"])
         found = found || (s["id"] == id);
     CHECK(found);
-    CHECK(h.audits.empty()); // GET is unaudited too
+    CHECK(h.audits.size() == 2); // GET stays unaudited
 
     auto del = h.sink.Delete("/api/instruction-sets/" + id);
     REQUIRE(del);
     CHECK(del->status == 200);
-    CHECK(h.audits.empty()); // delete_set SUCCESS is unaudited -- the asymmetry
+    REQUIRE(h.audits.size() == 4);
+    CHECK(h.audits[2].action == "instruction_set.delete");
+    CHECK(h.audits[2].result == "attempted");
+    CHECK(h.audits[2].target_id == id);
+    CHECK(h.audits[3].action == "instruction_set.delete");
+    CHECK(h.audits[3].result == "success");
+    CHECK(h.audits[3].target_id == id);
 
     auto redelete = h.sink.Delete("/api/instruction-sets/" + id);
     REQUIRE(redelete);
     CHECK(redelete->status == 404);
-    REQUIRE(h.audits.size() == 1); // the not-found DENIAL, unlike success, IS audited
-    CHECK(h.audits[0].action == "instruction_set.delete");
-    CHECK(h.audits[0].result == "denied");
+    REQUIRE(h.audits.size() == 6);
+    CHECK(h.audits[4].result == "attempted");
+    CHECK(h.audits[5].action == "instruction_set.delete");
+    CHECK(h.audits[5].result == "denied");
+}
+
+TEST_CASE("instruction_routes: a set create/delete whose attempt audit row is not stored is "
+          "refused with 503 and changes nothing (ADR-0033 section 9)",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    // A set that exists before the audit store fails.
+    auto seeded = h.sink.Post("/api/instruction-sets", json{{"name", "Keep Me"}}.dump());
+    REQUIRE(seeded);
+    auto keep_id = body(seeded->body)["id"].get<std::string>();
+    const auto sets_before = w.store.list_sets();
+    REQUIRE(sets_before);
+
+    h.audit_succeeds = false;
+    auto create = h.sink.Post("/api/instruction-sets", json{{"name", "Never Created"}}.dump());
+    REQUIRE(create);
+    CHECK(create->status == 503);
+    CHECK(create->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(body(create->body)["error"]["code"] == 503);
+    auto del = h.sink.Delete("/api/instruction-sets/" + keep_id);
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(del->get_header_value("Sec-Audit-Failed") == "true");
+
+    h.audit_succeeds = true;
+    const auto sets_after = w.store.list_sets();
+    REQUIRE(sets_after);
+    CHECK(sets_after->size() == sets_before->size()); // nothing created, nothing deleted
+    bool still_there = false;
+    for (const auto& s : *sets_after)
+        still_there = still_there || s.id == keep_id;
+    CHECK(still_there);
+}
+
+TEST_CASE("instruction_routes: a set name or description over the page's bounds is a 400",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    auto long_name = h.sink.Post(
+        "/api/instruction-sets",
+        json{{"name", std::string(kMaxInstructionSetNameLen + 1, 'n')}}.dump());
+    REQUIRE(long_name);
+    CHECK(long_name->status == 400);
+    auto long_desc = h.sink.Post(
+        "/api/instruction-sets",
+        json{{"name", "ok"}, {"description", std::string(kMaxInstructionSetDescriptionLen + 1, 'd')}}
+            .dump());
+    REQUIRE(long_desc);
+    CHECK(long_desc->status == 400);
+    auto at_limit = h.sink.Post(
+        "/api/instruction-sets",
+        json{{"name", std::string(kMaxInstructionSetNameLen, 'n')},
+             {"description", std::string(kMaxInstructionSetDescriptionLen, 'd')}}
+            .dump());
+    REQUIRE(at_limit);
+    CHECK(at_limit->status == 200);
 }
 
 TEST_CASE("instruction_routes: instruction-set create with the SAME name twice "
@@ -781,7 +918,7 @@ TEST_CASE("instruction_routes: instruction-set create with the SAME name twice "
     REQUIRE(second);
     CHECK(second->status == 200); // NOT 409 -- see the TEST_CASE name
     CHECK(body(first->body)["id"] != body(second->body)["id"]);
-    CHECK(h.audits.empty()); // still no audit call on this route, either way
+    CHECK(h.audits.size() == 4); // each create is its own attempted + success pair
 }
 
 TEST_CASE("instruction_routes: GET editor fragment pre-fills from a real definition, "
@@ -863,6 +1000,190 @@ TEST_CASE("instruction_routes: POST yaml save create+update round-trip audits su
     CHECK(h.audits.size() == 2); // unchanged -- the mismatch guard never audits
 }
 
+TEST_CASE("instruction_routes: a JSON PUT and a YAML editor save keep the stored "
+          "parameter_schema, even a legacy one the write gate would refuse",
+          "[pg][server][routes][instruction_routes][param-schema]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: test.route.schema.keep\n  displayName: Schema Keep\nspec:\n  plugin: "
+        "os_info\n  action: os_name\n  type: question\n  parameters:\n    type: object\n";
+    auto create = h.sink.Post("/api/instructions/yaml", "yaml_source=" + url_encode_form(yaml),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    const std::string id = "test.route.schema.keep";
+    auto stored = [&] { return (*w.store.get_definition(id))->parameter_schema; };
+
+    const std::string schema = R"({"type":"object","properties":{"p":{"type":"string"}}})";
+    yuzu::server::test::force_parameter_schema(w.pool, id, schema);
+    auto put = h.sink.Put("/api/instructions/" + id, json{{"description", "via put"}}.dump());
+    REQUIRE(put);
+    CHECK(put->status == 200);
+    CHECK((*w.store.get_definition(id))->description == "via put");
+    CHECK(stored() == schema);
+
+    auto edit = h.sink.Post("/api/instructions/yaml",
+                            "id=" + id + "&yaml_source=" + url_encode_form(yaml),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(edit);
+    CHECK(edit->body.find("Definition updated") != std::string::npos);
+    CHECK(stored() == schema);
+
+    // A legacy row past the 256 KiB cap is still editable through both routes.
+    const std::string legacy(instr::kMaxParameterSchemaBytes + 1, ' ');
+    yuzu::server::test::force_parameter_schema(w.pool, id, legacy);
+    auto put2 = h.sink.Put("/api/instructions/" + id, json{{"description", "legacy put"}}.dump());
+    REQUIRE(put2);
+    CHECK(put2->status == 200);
+    auto edit2 = h.sink.Post("/api/instructions/yaml",
+                             "id=" + id + "&yaml_source=" + url_encode_form(yaml),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(edit2);
+    CHECK(edit2->body.find("Definition updated") != std::string::npos);
+    CHECK(stored() == legacy);
+}
+
+TEST_CASE("instruction_routes: a YAML editor save carries forward every column the YAML does "
+          "not express, and audits an approval_mode change",
+          "[pg][server][routes][instruction_routes][yaml-merge]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    // Plant a definition created the way JSON/API clients create them: approval
+    // 'always', a set, templates, a disabled flag, TTLs.
+    auto set_id = w.store.create_set(InstructionSet{.name = "Keep Set"});
+    REQUIRE(set_id.has_value());
+    InstructionDefinition d;
+    d.id = "test.route.yaml.merge";
+    d.name = "Merge Test";
+    d.version = "2.0.0";
+    d.type = "action";
+    d.plugin = "os_info";
+    d.action = "os_name";
+    d.enabled = false;
+    d.instruction_set_id = *set_id;
+    d.gather_ttl_seconds = 41;
+    d.response_ttl_days = 9;
+    d.approval_mode = "always";
+    d.concurrency_mode = "per-definition";
+    d.platforms = "linux";
+    d.min_agent_version = "9.9.9";
+    d.required_plugins = "os_info";
+    d.readable_payload = "Look at it";
+    d.result_schema = R"({"columns":["c"]})";
+    d.visualization_spec = R"({"kind":"table"})";
+    d.response_templates_spec = R"([{"name":"mine"}])";
+    d.yaml_source = "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+                    "id: test.route.yaml.merge\n  displayName: Merge Test\nspec:\n  plugin: "
+                    "os_info\n  action: os_name\n";
+    REQUIRE(w.store.create_definition(d).has_value());
+    h.audits.clear();
+
+    // Editor YAML carries none of approval / type / version / concurrency.
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: test.route.yaml.merge\n  displayName: Merge Test Renamed\nspec:\n  plugin: "
+        "os_info\n  action: os_name\n";
+    auto edit = h.sink.Post("/api/instructions/yaml",
+                            "id=test.route.yaml.merge&yaml_source=" + url_encode_form(yaml),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(edit);
+    CHECK(edit->body.find("Definition updated") != std::string::npos);
+
+    auto got = w.store.get_definition("test.route.yaml.merge");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    const auto& s = **got;
+    CHECK(s.name == "Merge Test Renamed"); // the YAML edit landed
+    CHECK(s.approval_mode == "always");    // not downgraded to auto
+    CHECK(s.type == "action");             // not reset to question
+    CHECK(s.version == "2.0.0");
+    CHECK(s.concurrency_mode == "per-definition");
+    CHECK(s.instruction_set_id == *set_id);
+    CHECK_FALSE(s.enabled);                // not forced back to enabled
+    CHECK(s.gather_ttl_seconds == 41);
+    CHECK(s.response_ttl_days == 9);
+    CHECK(s.platforms == "linux");
+    CHECK(s.min_agent_version == "9.9.9");
+    CHECK(s.required_plugins == "os_info");
+    CHECK(s.readable_payload == "Look at it");
+    CHECK(s.result_schema == d.result_schema);
+    CHECK(s.visualization_spec == d.visualization_spec);
+    CHECK(s.response_templates_spec == d.response_templates_spec);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].detail.empty()); // approval_mode unchanged: no detail
+
+    // An explicit approval in the YAML IS an edit, and is audited with both values.
+    const std::string yaml2 = yaml + "  approval: auto\n";
+    auto edit2 = h.sink.Post("/api/instructions/yaml",
+                             "id=test.route.yaml.merge&yaml_source=" + url_encode_form(yaml2),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(edit2);
+    CHECK(edit2->body.find("Definition updated") != std::string::npos);
+    CHECK((**w.store.get_definition("test.route.yaml.merge")).approval_mode == "auto");
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].detail == "approval_mode: always -> auto");
+}
+
+TEST_CASE("instruction_routes: a YAML save made against a stale editor copy is a 409 and "
+          "changes nothing; one made against the current copy lands",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    InstructionDefinition d;
+    d.id = "test.route.yaml.stale";
+    d.name = "Stale Test";
+    d.version = "1.0.0";
+    d.type = "action";
+    d.plugin = "os_info";
+    d.action = "os_name";
+    d.approval_mode = "always";
+    d.yaml_source = "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+                    "id: test.route.yaml.stale\n  displayName: Stale Test\nspec:\n  plugin: "
+                    "os_info\n  action: os_name\n";
+    REQUIRE(w.store.create_definition(d).has_value());
+    const auto loaded = (**w.store.get_definition("test.route.yaml.stale")).updated_at;
+
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: test.route.yaml.stale\n  displayName: Renamed\nspec:\n  plugin: os_info\n  "
+        "action: os_name\n";
+    auto stale = h.sink.Post("/api/instructions/yaml",
+                             "id=test.route.yaml.stale&updated_at=" + std::to_string(loaded - 1) +
+                                 "&yaml_source=" + url_encode_form(yaml),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(stale);
+    CHECK(stale->status == 409);
+    CHECK((**w.store.get_definition("test.route.yaml.stale")).name == "Stale Test");
+
+    auto bad = h.sink.Post("/api/instructions/yaml",
+                           "id=test.route.yaml.stale&updated_at=abc&yaml_source=" +
+                               url_encode_form(yaml),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+
+    auto fresh = h.sink.Post("/api/instructions/yaml",
+                             "id=test.route.yaml.stale&updated_at=" + std::to_string(loaded) +
+                                 "&yaml_source=" + url_encode_form(yaml),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(fresh);
+    CHECK(fresh->body.find("Definition updated") != std::string::npos);
+    CHECK((**w.store.get_definition("test.route.yaml.stale")).name == "Renamed");
+}
+
 TEST_CASE("instruction_routes: POST validate-yaml against a real store still needs no "
           "store access and passes/fails identically",
           "[pg][server][routes][instruction_routes]") {
@@ -903,4 +1224,51 @@ TEST_CASE("instruction_routes: wiring -- server.cpp still calls "
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_instruction_routes(") != std::string::npos);
+}
+
+TEST_CASE("instruction_routes: a cookie-session write that is cross-site or carries no "
+          "Origin/Referer is refused (403, audited) and changes nothing; a token session is not "
+          "gated",
+          "[pg][server][routes][instruction_routes][csrf]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::unordered_map<std::string, std::string> cross_site[] = {
+        {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}},
+        {{"Host", "yuzu.test"}, {"Referer", "https://evil.test/x"}},
+        {{"Host", "yuzu.test"}}, // a browser always sends one on a write
+    };
+    for (const auto& hdrs : cross_site) {
+        h.sink.default_headers = hdrs;
+        h.audits.clear();
+        auto set = h.sink.Post("/api/instruction-sets", json{{"name", "Evil"}}.dump());
+        REQUIRE(set);
+        CHECK(set->status == 403);
+        auto imp = h.sink.Post("/api/instructions/import", "{}");
+        REQUIRE(imp);
+        CHECK(imp->status == 403);
+        auto yaml = h.sink.Post("/api/instructions/yaml", "yaml_source=x",
+                                "application/x-www-form-urlencoded");
+        REQUIRE(yaml);
+        CHECK(yaml->status == 403);
+        auto del = h.sink.Delete("/api/instruction-sets/whatever");
+        REQUIRE(del);
+        CHECK(del->status == 403);
+        REQUIRE(h.audits.size() == 4);
+        for (const auto& a : h.audits)
+            CHECK(a.action == "csrf.denied"); // refused before any attempt row or change
+    }
+    const auto sets = w.store.list_sets();
+    REQUIRE(sets);
+    CHECK(sets->empty());
+
+    // An API/MCP token is not riding a cookie: no Origin is needed.
+    h.sink.default_headers.clear();
+    h.resolve_session_auth_source = "api_token";
+    auto token_write = h.sink.Post("/api/instruction-sets", json{{"name", "Via Token"}}.dump());
+    REQUIRE(token_write);
+    CHECK(token_write->status == 200);
 }

@@ -1,1 +1,0 @@
-- macOS: agent-core gained a bounded, fork-safe subprocess runner and the macOS capabilities that build on it — filesystem digital-signature and version-info collection (`codesign`/`plutil`), an event-log query deadline (`log show`), and certificate management (login-keychain-aware read honouring the `store` parameter, plus a verified tri-state safe delete). (#2273, #2274)

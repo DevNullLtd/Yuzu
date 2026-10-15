@@ -15,10 +15,12 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   the `yuzu-weetam-windows` pool), one macOS variant (appleclang debug on the
   `yuzu-bigmags-macos` pool), plus `proto-compat`. Wall target: <10 min per leg.
 - **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
-  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS. **No
+  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS (except
+  a docs-only push, which runs preflight plus the required-check stubs, #5320).
+  **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
   the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
-  only ONE leg (gcc-15/debug) runs the full 11-shard `server-pg` suite on a
+  only ONE leg (gcc-15/debug) runs the full 14-shard `server-pg` suite on a
   push; the other three legs run a small `[pg-smoke]`-tagged subset instead —
   see "PG push-leg policy" below. PR coverage is unaffected (the PR `exclude:`
   already trims the matrix to gcc-15/debug alone, which always resolves to
@@ -26,6 +28,11 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   2026-08-28)**, the Windows matrix carries the identical `pg_mode` key via
   the same `include:` mechanism (debug=full, release=smoke) — Windows and
   Linux now share one `pg_mode` concept, not two independently-invented ones.
+  **Since #5320** the push trigger has no `paths` filter: a docs-only push
+  (for example a changelog-only release commit) runs `preflight` and the
+  `docs-required-checks` stubs instead of the matrix, so the required contexts
+  still appear on the `main` commit a release tags. See "Docs-only changes
+  (#1978, #5320)" below.
 - **Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC +
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
@@ -65,6 +72,12 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   runs 4 runner agents under one OS identity and a fixed path is a cross-job
   collision class (#1038 R-15).
 
+  libpq's own connect-time write-write race on its `static_std_strings`/
+  `static_client_encoding` globals (`pqSaveParameterStatus`) is suppressed by
+  a compiled-in `__tsan_default_suppressions` hook in
+  `tests/unit/test_runner_main.cpp`, kept honest by the
+  `tests/test_no_connless_pq_escape.py` tripwire (#1611).
+
   On Test **failure or job cancellation**, the TSan job's `Capture stack trace
   under gdb` diagnostic (`scripts/ci/tsan-gdb-capture.py`) derives **every**
   failing test binary from the meson junit, maps each to its binary+args via
@@ -81,8 +94,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   2026-07-14.
 
 `workflow_dispatch` only works once a workflow file exists on the **default
-branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are
-dormant until merged.
+branch (`main`)**; the run then uses the workflow definition at whatever
+`--ref` it is dispatched on, which must also carry the file. Cron schedules
+likewise need `main`. New workflows added on `dev` are dormant until merged.
 
 ### Trusted fork pull-request CI
 
@@ -91,22 +105,30 @@ must never emit healthy self-hosted runner outputs, because fork code is not
 trusted to execute on Big Tam or Wee Tam. The ordinary preflight fails red
 when it detects a fork; it does not bypass runner control.
 
-After static review, a maintainer may approve one immutable fork revision.
-First run the hosted review workflow and wait for it to pass:
+After static review, a maintainer may approve one immutable fork revision. Both
+fork workflows execute fork code, and a `workflow_dispatch` run's GitHub
+Actions cache scope is the ref it was dispatched on — so they are never
+dispatched on `main` or `dev`. Cut a throwaway quarantine branch from the PR's
+base (normally `origin/dev`), named for the PR; `ci.yml`'s `trusted_inputs`
+step and the review workflow both refuse any other ref (#4471). First run the
+hosted review workflow and wait for it to pass:
 
 ```bash
-gh workflow run fork-dynamic-review.yml --ref main \
+git push origin origin/dev:refs/heads/trusted-fork/pr-123
+gh workflow run fork-dynamic-review.yml --ref trusted-fork/pr-123 \
   -f pr_number=123 -f head_sha=<40-character-head-sha>
 gh run list --workflow=fork-dynamic-review.yml --limit 5
 ```
 
-Then dispatch the trusted gate using that exact SHA and successful review run:
+Then dispatch the trusted gate on the same branch using that exact SHA and
+successful review run, and delete the branch once both runs have finished:
 
 ```bash
-gh workflow run trusted-fork-ci.yml --ref main \
+gh workflow run trusted-fork-ci.yml --ref trusted-fork/pr-123 \
   -f pr_number=123 \
   -f head_sha=<40-character-head-sha> \
   -f review_run_id=<successful-review-run-id>
+git push origin --delete trusted-fork/pr-123   # housekeeping; the wrapper already purged the scope
 ```
 
 The wrapper requires the PR to remain open, verifies that its current head is
@@ -118,11 +140,280 @@ the PAT is consumed by a hosted, base-workflow-revision runner-control step
 before the approved fork revision is checked out. Trusted self-hosted jobs
 start from a clean workspace, use run-private ccache/test state, disable vcpkg
 binary sources, and purge the workspace afterwards. They never read or write
-the normal `runner.tool_cache` caches. This deliberate approval therefore
-executes the full PR gate without turning a reviewed fork into a cache-publisher
-or exposing the administration-scoped PAT to fork-controlled code.
+the normal `runner.tool_cache` caches.
+
+The GitHub Actions cache is confined the same way. A run restores only from its
+own ref, the default branch, and a PR's base, so nothing written in
+`trusted-fork/pr-123`'s scope is reachable from `main`, `dev`, or any PR — and
+because any code executing in a run can write that run's scope, no in-workflow
+save gate could have closed this on its own (the canary's
+`trusted_execution != 'true'` gates are defence in depth behind it). The
+wrapper's final `purge-quarantine-cache` job then deletes every entry in that
+scope; `fork-dynamic-review.yml` carries an identical job that purges its own
+scope right after the hosted review finishes, so no window exists in which the
+review run's (at that point unapproved) writes are restorable by the gate's
+canary leg on the same ref. Deleting the branch does not purge caches by
+itself — unread entries would otherwise linger for seven days. Cutting the
+branch from the PR's base also means the run uses that
+base's `ci.yml` rather than `main`'s. Two operational consequences: trusted
+dispatches for DIFFERENT PRs no longer share `ci.yml`'s own concurrency group
+(each resolves a distinct `github.ref`), so they run in parallel rather than
+queuing behind an unrelated PR's build — `trusted-fork-ci.yml`'s own
+`concurrency:` group still serialises two dispatches for the SAME PR, so a
+re-approval waits for the run already in flight rather than racing it; and the
+trusted canary reads only its own (empty) scope plus `main`, so it is a cold
+build. This deliberate approval
+therefore executes the full PR gate without turning a reviewed fork into a
+cache-publisher or exposing the administration-scoped PAT to fork-controlled
+code.
 
 ## Gates outside the tier ladder
+
+### Release re-publish guard (`release-guard`, #5282)
+
+The first job in `release.yml`. It refuses any run whose ref is not a tag
+(a `workflow_dispatch` from a branch would otherwise pass, since a branch has
+no release, and push `:latest` from branch content) or whose tag is not shaped
+`vX.Y.Z` / `vX.Y.Z-{alpha,beta,rc}N` (the alphabet the prerelease classifier
+and the `:latest` enable assume). It then reads
+`gh api -i repos/<repo>/releases/tags/<tag>` and fails the run if the tag
+already has a published GitHub release. Every image-publishing job
+(`docker-publish`, `docker-publish-postgres`, `docker-publish-chisel`,
+`docker-publish-agent-bundle`), the `release` job and the three build jobs list
+it in `needs`, so a refused run stops before any build, provenance attestation
+or image push. Before it, a run started against an already-released tag (by
+mistake, or a superseded run) pushed new digests over `:X.Y.Z` (and
+`:X.Y`/`:latest` on a stable tag) that no longer matched the release's signed
+`SHA256SUMS` and SBOMs; the only existing-release check was in `Create GitHub
+Release`, after every push, and it skipped with a notice and went green. That
+step now fails instead, because a release appearing there means one arrived
+after the guard ran.
+
+It fails closed on the HTTP status line alone: `404` proceeds, `200` refuses,
+and anything else (no status line, 401/403/429/5xx) fails the run. gh's exit
+code and stderr prose are never interpreted. The step body is executed against
+a stubbed `gh` by `tests/shell/test_release_guard.sh` (in preflight's shell
+gate tests), which also checks that every job holding `packages: write` needs
+the guard.
+
+**Per-push tag re-check.** Two runs for one tag at different commits (a re-tag
+while a run is in flight, or a moved tag whose push webhook never fired) both
+pass the guard, because no release exists yet. So every image push and the
+release creation run `scripts/ci/check-release-tag-sha.sh` immediately before
+acting: it reads the tag from `origin` with `git ls-remote` and refuses unless
+the tag (or its peeled commit) is still this run's `GITHUB_SHA`, failing closed
+on any error. A run whose tag has moved away from its commit refuses at its
+next publishing step, and a re-run of a failed job re-checks too. It cannot
+see a tag moved away and back again while two runs are in flight (A -> B -> A):
+cancel in-flight release runs for a tag before re-tagging it (#5478). The script is tested by
+`tests/shell/test_release_tag_sha.sh`; `test_release_guard.sh` checks that
+each publishing job runs it once, before its first push.
+
+**There is no override.** A published release's assets and signatures describe
+the images it shipped, so any re-push over it breaks verification. To ship
+different images, cut a new version. To redo a release whose published content
+is itself wrong, delete the GitHub release first (destructive; the release
+skill requires operator confirmation), then start a fresh run, which recreates
+the release with a `SHA256SUMS` that matches its images.
+
+Limits: the guard's read-only token cannot see a **draft** release — one made
+by hand, or one `gh release create` leaves behind when interrupted while
+uploading assets (it creates a draft, uploads, then publishes). The `release`
+job's own check sees drafts and fails. Deleting an unpublished draft is not
+destructive (nothing was published): delete it, then re-run failed jobs on the
+newest run.
+
+Residual paths that can still leave `:X.Y.Z` digests and the signed
+`SHA256SUMS` apart, none closed by this change: a draft release the guard
+cannot see; a hand-run `gh release create`; the seconds between a publish
+step's tag re-check and its push; a tag moved away and back again while two
+runs are in flight (#5478); re-running an OLDER run of the tag (#5242: a re-run
+does not repeat `release-guard`); and `:latest`/`:X.Y` landing on an older
+version when runs for two tags finish out of order (#5462).
+
+### Release artifact gate (`scripts/check-release-artifacts.sh`, release job)
+
+Runs in `release.yml`'s `release` job after the artifacts are downloaded and
+flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
+`gh release create`. When it fails, no GitHub release, `SHA256SUMS` or
+signature exists yet, but **the container images are already published**:
+the `release` job needs `docker-publish`, `docker-publish-postgres` and
+`docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
+`:latest`) first (the agent-bundle image needs `release`, so it is not
+published), and the build jobs' provenance attestations are already recorded.
+`docker-publish-chisel` joined the release's needs in #5242, so the release
+waits for the chisel builds (minutes with a warm cache, much longer cold) and
+the three chisel images' SBOMs are always release assets, inside `SHA256SUMS`;
+before that they were attached only when those jobs finished first, and rc2,
+rc4 and rc6 shipped without some of them. On a stable tag `:latest` therefore points
+at a release that does not exist until the release is fixed. It fails the
+release when:
+
+- an expected archive, installer glob or SBOM is missing or empty (#362/#408);
+- an asset name contains a character GitHub rewrites on upload (anything but
+  letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
+  digit), which would make `SHA256SUMS` and the provenance name an asset that
+  does not exist (#5141);
+- a `.deb`/`.rpm`/`.exe`/`.pkg` does not carry the tag's version in the form
+  its builder writes; the error prints the expected pattern (#5141). The usual
+  cause is a package left in a reused self-hosted workspace by an earlier
+  build of another version.
+
+Recovery: find the offending file in the error. For a stale file, clear the
+runner workspace and start a fresh run of the same tag with
+`gh workflow run release.yml --ref vX.Y.Z`, following the release skill's
+Recovery steps (no release exists for the tag, no other run for it is queued
+or running). "Re-run failed jobs" does not fix this case: it re-runs only the
+`release` job, which downloads the same stale artifact again. The workflow
+enforces the first of those steps itself: `release-guard` refuses a run when
+the tag already has a published release (#5282, above). For any other failed
+job, recovery is "Re-run failed jobs" on the NEWEST run for the tag (digests
+kept; each push re-checks the tag), never on an older run (#5242); a fresh run
+is the fallback (release skill, Recovery).
+For a builder naming defect, a fresh run builds the tag's original commit
+again, so fix the builder, then delete and re-push the tag at the fixed commit.
+Either way the images are rebuilt and re-pushed under the same tags.
+
+If the release cannot be fixed promptly on a stable tag, move `:latest` back
+to the previous release's images. The gate has no override; the naming forms
+it checks are a second copy of the builders' naming, and its header lists
+where each lives.
+
+### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
+
+Every Linux native artifact carries the glibc / libstdc++ floor of the host
+that built it by accident (#5143). The gate makes the floor an explicit,
+committed promise and measures every build against it. It is specified by
+ADR-2003 (Proposed, PR #5631; the ADR is not on `dev` yet). **In S0 it is
+report-only: nothing it finds can fail a build or a release.** S2 turns it on.
+
+- **The script** runs `objdump -T` and `readelf -d` over every ELF under a
+  staging directory and compares the versioned symbols it imports
+  (`GLIBC_x.y`, `GLIBCXX_x.y.z`, `CXXABI_x.y.z`, `LIBSYSTEMD_n`, `BLKID_n`,
+  `OPENSSL_x.y.z`, anything else reported verbatim) with a floor file, by
+  numeric version. It also flags any forbidden symbol (`EVP_sm4_*`) and any
+  `RUNPATH`/`RPATH` entry not anchored at `$ORIGIN`. The header of
+  `scripts/ci/check-elf-floor.sh` is the canonical reference for the flags,
+  exit codes, floor-file schema and baseline schema. Four cases are never read
+  as clean: a directory with no ELF in it, an ELF the tools cannot read (or a
+  stub with the ELF magic and no room for a header), a directory that cannot be
+  listed, and ELFs not reached before the aggregate deadline. Under
+  `--enforce` each is an error; in report-only each is a warning and the exit
+  stays 0.
+- **Modes.** `--report-only` (the default) prints violations, emits
+  `::warning::` annotations and a job-summary table on GitHub Actions, and
+  exits 0. `--enforce` exits 1 on any violation. It is implemented and tested
+  but wired nowhere yet. Usage and configuration errors exit 2 in both modes.
+- **Floor files** are `deploy/packaging/linux-floor-agent.json` (glibc 2.28,
+  `GLIBCXX_3.4.25`, `CXXABI_1.3.11`, `LIBSYSTEMD` 239 plus the Red Hat
+  `LIBSYSTEMD_240` backport, `BLKID_1.0`) and
+  `deploy/packaging/linux-floor-server.json` (glibc 2.34, `GLIBCXX_3.4.29`,
+  `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
+  `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
+  measurement. Changing one is a floor decision (ADR-2003 (Proposed, PR #5631),
+  "Floor review rule"), not a tuning edit. A typo in a family key would silently
+  ungate that family (families absent from `max` are only reported), so the
+  loader requires `GLIBC`, the script reports a measured family one edit away
+  from a listed key, and the test pins the exact key set of both shipped
+  files.
+- **Baseline.** `deploy/packaging/linux-floor-baseline.json` is the measured
+  gap of the v0.14.1 Linux x64 release artifacts (`agent`, `server` and
+  `gateway` sets: per ELF the highest tag per family and the offending
+  symbols). It is evidence, not an input: nothing reads it to decide pass or
+  fail. To regenerate it from a release, download and extract the release
+  tarballs into empty scratch directories (check each against the signed
+  `SHA256SUMS`; the v0.14.1 values are `yuzu-linux-x64.tar.gz`
+  `46e42df0026eb57460414c6c62bf7ab9ef9816e1f8c799286006fde61cc0385f` and
+  `yuzu-gateway-linux-x64.tar.gz`
+  `e4d45e0f256801af5fe28c188431221df87e0274dabaa48e768464706ecae1eb`), then
+  run the script once per set against the same output file (each run replaces
+  only its own set):
+
+  ```bash
+  B=deploy/packaging/linux-floor-baseline.json; rm -f "$B"
+  scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-agent.json \
+    --dir <the yuzu-<VERSION>-linux-x64 directory inside the tarball> \
+    --exclude bin/yuzu-server --set-name agent \
+    --source "v0.14.1 yuzu-linux-x64.tar.gz (all ELFs except bin/yuzu-server)" --emit-baseline "$B"
+  scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-server.json \
+    --dir <the yuzu-<VERSION>-linux-x64 directory inside the tarball> \
+    --include bin/yuzu-server --set-name server \
+    --source "v0.14.1 yuzu-linux-x64.tar.gz (bin/yuzu-server)" --emit-baseline "$B"
+  scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-server.json \
+    --dir <the yuzu-gateway-<VERSION>-linux-x64 directory inside the tarball> \
+    --set-name gateway \
+    --source "v0.14.1 yuzu-gateway-linux-x64.tar.gz (ERTS, NIFs, crypto.so)" --emit-baseline "$B"
+  ```
+
+  Run with the real v0.14.1 tarballs this reproduces the committed file
+  byte-for-byte; for another release change the version in the `--source`
+  labels.
+
+  Point `--dir` at the directory inside the tarball (the one that holds
+  `bin/`), not at its parent, so artifact keys carry no version. Output is
+  deterministic (sorted, no timestamps or paths): a refresh diffs cleanly. A
+  set whose scan was incomplete (a PROBLEM, an unreadable or unscanned ELF)
+  carries an `incomplete` list; the committed baseline has none. The
+  floor-review rule in ADR-2003 (Proposed, PR #5631) says when to refresh it.
+- **Release wiring.** `release.yml`'s `build-linux` job runs the script
+  report-only on the staged tarball contents right after "Package archive"
+  (agent set, then server set) in a `continue-on-error` step, and uploads the
+  per-set text reports, the full per-ELF reports and a `baseline.json` as the
+  `linux-elf-floor-report` artifact (14 days). The artifact deliberately has no
+  `yuzu-` prefix: the `release` job downloads every `yuzu-*` artifact. The
+  step is bounded (`timeout-minutes: 10`, and the script's own aggregate
+  deadline of 240s per run), so a hung `objdump` cannot stall a release for
+  long. The release step does **not** scan the gateway at all until S3; the
+  `gateway` set in the committed baseline was measured by hand from the
+  release tarball.
+- **Pre-release QA.** `pre-release.yml`'s `install-rpm` matrix gained
+  `rockylinux:8` and `amazonlinux:2023` as **non-gating** legs
+  (`continue-on-error` via `matrix.experimental`). They are expected to fail
+  on 0.14.x artifacts until S2. A failure there turns neither the job nor the
+  Pre-release QA report red: a `continue-on-error` leg reports `success` to
+  `needs.install-rpm.result`, so the gap is visible in the run graph and in a
+  step summary the failed leg writes, **not** in the QA report table.
+- **Tests.** `tests/shell/test_check_elf_floor.sh` (in preflight's "Shell gate
+  tests") builds fixture ELFs with `gcc` and a linker version script, so the
+  tags it checks are synthesized and the result does not depend on the host's
+  glibc.
+- **Notes for S2 (the slice that enforces).** (a) Only the agent promotes on
+  `rockylinux:8`: the server and gateway promise glibc 2.34 and are not
+  expected green there, so scope that leg to the agent package or keep it
+  non-gating for the others. (b) The gate scans the `${STAGING}` tarball
+  directory, but `build-deb.sh` and `build-rpm.sh` read `build-linux`
+  directly: point the package builders at the gated directory, or re-run the
+  gate on the extracted `.deb`/`.rpm` payload. (c) Flipping `--enforce` makes
+  this a release gate; add its entry to "Gates outside the tier ladder" (and a
+  routed-concern row) in that change. (d) Remove `continue-on-error: true`
+  from the `release.yml` gate step when `--enforce` is wired: a swallowed exit
+  1 would never gate. `tests/shell/test_check_elf_floor.sh` runs a tripwire
+  (`tests/shell/elf_floor_workflow_tripwire.py`, PyYAML) over every workflow
+  and local composite action. It flags a step that runs, or probably runs
+  (mode chosen through a variable or env, a wrapper script, a composite
+  action), `check-elf-floor.sh --enforce` when the step or its job has any
+  `continue-on-error` other than a literal false, when the run text has
+  `|| true`, `|| :`, `|| exit 0` or `set +e`, or when the gate's output is
+  piped (`| tee`) without `pipefail` (the default `bash -e` would report
+  `tee`'s status); report-only steps are never flagged. It is a guard, not a
+  proof, and it assumes enforcement whenever it cannot tell. **Not caught:**
+  a reusable workflow (`uses: ./.github/workflows/x.yml`) called from a job
+  with `continue-on-error`; a command held in an env var and run through
+  `bash -c "$CMD"` or `eval`; a wrapper outside `scripts/` and
+  `.github/actions/`, or code the repo does not contain; shell-level swallows
+  such as `|| echo`, `; true` or `trap`; and YAML nested so deeply that PyYAML
+  recurses out, which is reported as its own error (exit 4) rather than
+  analysed. It is vacuous today (only `--report-only` is wired); its detector
+  is pinned on synthetic fixtures, one per bypass shape. The test needs PyYAML: `ci.yml`'s
+  preflight installs it hash-pinned, and the test fails (rather than skips)
+  under GitHub Actions if it is missing. (e) The report
+  artifact is kept 14 days and the results are not in CI history: S2 should
+  persist per-release results (commit the baseline diff, or extend the
+  CI-history capture) and consider running the gate on the `ci.yml` Linux
+  package artifact before tagging. (f) The pre-existing "Package archive" step
+  runs `mkdir -p "$STAGING"` without clearing it, so a re-run of the same tag
+  on a reused workspace scans stale ELFs: S2 should `rm -rf "$STAGING"` first.
+  (g) The gateway is not scanned by the release step until S3.
 
 ### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
 
@@ -164,7 +455,31 @@ requests only, not a required check today) runs
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
-suite also runs.
+suite also runs (the touch-rule one off Windows only, #5428).
+
+### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
+
+`scripts/ci/check-definition-descriptions.py` lints the description text of every shipped
+`InstructionDefinition` (the text an agentic worker reads through `discover_instructions`): the
+definition description, each parameter description, each result-column description, and
+non-empty tags. It walks the files `server/core/scripts/embed_content.py` ships (every `*.yaml`
+under `content/definitions` and `content/packs`, recursively) and lints only documents whose
+`kind` is `InstructionDefinition`. It is a ratchet over
+`scripts/ci/definition-descriptions-baseline.json`: a failure absent from the baseline is `NEW`
+and fails the run, and a baselined failure that no longer fails is `STALE` and also fails it, so
+the baseline only shrinks (delete the entry in the change that fixes it). `--update-baseline`
+rewrites it from the tree; run it deliberately, never to hide a new failure, and never in CI.
+
+Two places run the same test, `tests/test_definition_descriptions.py`. The `definition-descriptions`
+job in `docs-lint.yml` (check name "Definition descriptions") is **advisory**: the workflow's own
+header names only "CHANGELOG order" as its required check. It installs PyYAML from
+`requirements-ci.txt` with `--require-hashes` (a `--user` install, skipped when PyYAML is already
+importable), so it reaches PyPI and is its own job so that an outage reds only this check. The
+same test is registered as the `definition descriptions` test in `tests/meson.build` (suite
+`docs`), and the `linux` and `windows` jobs of `ci.yml` list `--suite docs`, so the ratchet is
+enforced on the required `Linux gcc-15 debug` and `Windows MSVC debug` legs without depending on
+the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
+but it cannot touch `content/` or the baseline, which are classified as code.
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
@@ -295,6 +610,15 @@ build time and nothing at boot — it breaks only the healthcheck, so Compose pa
 every container `unhealthy` forever and anything with `depends_on: condition:
 service_healthy` never starts, with no application failure to point at.
 
+The `server` role also probes one non-healthcheck dependency of the same image:
+the reference compose's one-shot `ca-export` service
+(`deploy/docker/docker-compose.reference-gateway.yml`) runs the server image with
+`/bin/sh -ec` and calls `install`, so the probe checks that `/bin/sh` runs and
+`install` is on its path, and a base-image change that drops either fails the
+gate instead of leaving the agent's `depends_on: ca-export` waiting forever. It
+runs as the image's default user while `ca-export` runs as root, so it proves
+presence and executability, not that user's write access.
+
 `yuzu-postgres` is published and healthchecked too (`pg_isready` + `psql`), but it
 is `FROM postgres:*` — those tools are the image's whole purpose — so it has no
 role in the gate and `docker-publish-postgres` has no pre-push check. `agent-chisel`
@@ -302,9 +626,12 @@ is gated **pre-emptively**: no compose healthchecks an agent image today.
 
 The probes are a hard-coded copy of the healthcheck commands, so both the script
 and the workflow's change-filter carry a **KEEP IN SYNC** list of every file that
-defines one — including the two easy-to-miss ones,
-`scripts/test/docker-compose.upgrade-test.yml` and the compose heredocs inlined in
-`pre-release.yml`.
+defines one — including the easy-to-miss
+`scripts/test/docker-compose.upgrade-test.yml`. `pre-release.yml` no longer
+inlines a compose stack: its integration, soak and upgrade jobs run the shipped
+`deploy/docker/docker-compose.reference-gateway.yml` through
+`scripts/ci/qa-stack.sh`, so that template's server healthcheck is the one they
+exercise.
 
 `scripts/ci/verify-healthcheck-invariants.sh` is the gate. It runs each image's
 real healthcheck probe **against a live HTTP listener** in a shared network
@@ -343,6 +670,163 @@ with no `cache-to`), so it never evicts release layers and adds no cache directo
 likewise has no `cache-to`: it shares one buildkitd instance with the push build,
 so the push hits BuildKit's own solver cache and rebuilds nothing.
 
+### Pre-release QA (`pre-release.yml`)
+
+**Trigger.** `workflow_run` on a completed `Release` run whose head is a `v*` tag
+and whose conclusion is `success`, or by hand: `gh workflow run pre-release.yml
+-f tag=v0.14.0-rc3`. A `workflow_run` trigger always runs the copy of this
+file on `main`, whatever branch the release was cut from.
+
+**Detective, not preventive.** It starts after the release is already
+published and never blocks one. A red run says the published release has a
+defect to fix in the next one.
+
+**Jobs.** `resolve` finds the tag, verifies `SHA256SUMS`, and picks the previous
+stable release: the highest non-draft, non-prerelease `vX.Y.Z` strictly lower
+than the tag under test (#5150). The other jobs check the following:
+
+- **integration**: the reference stack starts, the dashboard answers over
+  HTTPS against the install CA, the gateway is ready, the connected-agent
+  gauges (server and gateway) are at least 1, an `os_info` command
+  round-trips, and no service has restarted.
+- **install-deb / install-rpm**: for each of server, agent and gateway, exactly
+  one package is in the release. It installs, ships its systemd unit, and
+  removes cleanly. It must also run: `--version` for server and agent. The
+  gateway is started the way its systemd unit starts it: as the unit's
+  `User=`, with its `Environment=` and its `EnvironmentFile=`
+  (`/etc/yuzu/gateway.env`, the distribution cookie). The `yuzu_gw`
+  application must be running within 30s, the node must still answer 10s
+  later, and `stop` must succeed. A bare `ping` is not enough: it answers
+  once Erlang distribution is up, even when the application refuses to
+  start. The legs are ubuntu:22.04/24.04/26.04 and debian:12 for .deb, and
+  fedora:42 and rockylinux:9 for .rpm (installed with `dnf`); rockylinux:8 and
+  amazonlinux:2023 also run for .rpm but are non-gating (see "Linux ELF floor
+  gate"). If a leg's libc or libstdc++ is older than the build's, the job fails
+  and names the glibc floor (#5143). A gateway whose crypto NIF cannot load is
+  named as #5171. A missing package fails; it is not skipped (#5151).
+- **install-windows**: two install/uninstall passes. With `/NOTLS` the service
+  must start and stay Running. With the default TLS posture the agent must
+  fail closed because no CA is pinned. The uninstall wait is bounded (#5145).
+- **install-macos**: the `.pkg` is present and installs, `--version` runs, the
+  launchd plist is in place, and at least 5 plugins are installed.
+- **artifact-verify**: checks the archive contents and ELF hardening (a
+  missing NX fails; PIE, RELRO and stack canaries only warn), and that each
+  `.deb` control `Version` equals the tag's Debian spelling (`0.14.0~rc3`); a
+  mismatch fails. The RPM metadata step only prints. The ARM64 archive is checked only when the
+  release ships one (#5135).
+- **security-scan**: Trivy scans the server and gateway images. Its findings
+  are informational and do not fail the run, but an image that cannot be
+  pulled fails the job.
+- **soak-test**: ten minutes on the stack. Every 30s it checks that all four
+  services are running with 0 restarts, at least one agent is connected, and
+  the gateway is ready. About once a minute it also round-trips a command. At
+  the end the registration counters (`yuzu_agents_registered_total`,
+  `yuzu_gw_agents_connected_total`, read once the gateway shows the agent's
+  stream) must be unchanged: an agent that reconnected between samples, or a
+  gateway that replayed registrations, fails the soak. A failed metric fetch
+  fails its sample and is reported as a fetch failure, not as 0. Memory
+  growth over 2x, measured from the first successful round-trip (after
+  warm-up), is a warning only. Crash signatures in the server, agent and
+  gateway logs fail the job. For the gateway that includes OTP process crashes
+  (`crasher: initial call`) and supervisor restarts (`Supervisor: ...
+  Context: child_terminated`), in the header-less format the reference
+  `sys.config` logger writes. It also includes the VM dying outright: an ERTS
+  abort (`<file>.c:<line>:<func>(): Internal error`), a failed boot
+  (`Kernel pid terminated`) and a crash dump (`GW_CRASH_PAT` in
+  `scripts/ci/qa-stack.sh`, locked by `tests/test_qa_stack_crash_pat.py`).
+  Postgres logs are not checked.
+- **upgrade-test**: brings up the previous stable release and upgrades every
+  service in place, keeping the Postgres volume, CA and agent data dir. The
+  same agent must reconnect running the new version. All services must be
+  running with 0 restarts, and a command must round-trip.
+
+**What the stack jobs run.** Integration, soak and upgrade use
+`scripts/ci/qa-stack.sh` to run the **checkout's** reference template
+(`deploy/docker/docker-compose.reference-gateway.yml`, #5134). The images are
+the tag's own, pinned by `YUZU_VERSION`. The gateway `sys.config`, and the path
+it is mounted at, come from the tag. Any difference between the tag's template
+and the checkout's is printed as a warning and diffed in the job summary.
+
+**Reporting.** In the `QA Report` job, a cell reads PASS only when that suite
+ran and passed. The upgrade reads NOT TESTED when the previous release predates
+the reference template, or when there is no previous stable release. A suite
+that did not run reads NOT RUN, with the reason. With any such gap, the
+headline is `PASSED WITH GAPS (<n> not tested)` and the run still exits 0. Any
+failure or cancellation makes it `FAILED`. If no successful release triggered
+the run, it reads `NOT RUN`. `has-stack` separates "predates" (exit 3) from
+"could not reach GitHub" (exit 1), so an outage fails the upgrade job instead
+of reading as NOT TESTED.
+
+**Expected failures.** These reds are intended, not flakes.
+
+- Artifacts from the v0.13.0 era fail the rpm install (#5142), the macOS
+  install (#5144) and the Windows install (#5147, #1468). Those defects are
+  fixed from 0.14.0-rc3 on.
+- From 0.14.0-rc3 on, until the glibc/libstdc++ floor (#5143) is decided,
+  these legs stay red: install-deb on ubuntu:22.04 and debian:12, the
+  ubuntu:24.04 server (GLIBCXX_3.4.34), and install-rpm on rockylinux:9 (the
+  gateway's bundled ERTS needs GLIBC_2.38 too).
+- The gateway stays red on fedora:42 until #5171 is fixed: its bundled OTP
+  crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
+  same defect is waiting behind #5143 on rockylinux:9.
+
+**Gateway-upstream peer authorization and the rigs.** The server refuses to start with
+`--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
+(`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from
+the build under test pass the flag: `scripts/integration-test.sh` (in both its plaintext and
+`--tls` branches), `scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh`
+and the locally built full, sanitizer and viz UAT composes. None of them exercises a pinned
+gateway hop, and no workflow under `.github/` invokes `integration-test.sh` (it runs from
+`scripts/run-tests.sh`); running its `--tls` branch with a real pinned gateway leaf is a deferred
+follow-up. The pre-release `integration` job (`scripts/ci/qa-stack.sh`) starts no server itself:
+it runs this checkout's reference-gateway template on the release's published images, so any
+acknowledgement or pin that rig needs belongs in that template (an environment variable, which an
+image older than the flag ignores), not in the script.
+
+**Gateway peer authorization gates.** Four pieces enforce it in CI. (1) The `linux` job in
+`ci.yml` installs the `postgresql-client` apt package (it provides `psql`) and runs the step
+"Gateway peer boot-decision CLI test" (`tests/shell/test_gateway_peer_boot_refusal.sh`) against the
+built server with `YUZU_REQUIRE_PSQL=1`: the test creates one database per row through `psql`, so a
+missing `psql` is a failure under that variable (and under `GITHUB_ACTIONS=true`), never a skip, and
+a skipped step cannot be a green job that never ran. Besides the refusal and control rows (each
+boot configuration against its expected exit and message), the test places real calls against the
+listeners of the controls rows: anonymous calls (no client certificate) on the agent port, client-
+certificate calls that present the default gateway leaf (admitted by the automatic pin, answered by
+the real handler) and the default server leaf (a valid certificate of the same CA that is not the
+pinned one: status 16 with `not_pinned`), and listener-port rows that repeat the certificate pair on
+the dedicated gateway-upstream listener, where a call with no client certificate fails at the TLS
+handshake instead of being answered with status 16. One further row group covers the second
+deployment shape, operator-supplied certificates (`--cert/--key/--ca-cert` plus
+`--gateway-peer-pin-file` naming the gateway leaf): it generates an operator CA and leaves, asserts
+the enforce boot line carries the gateway leaf's SPKI prefix, and calls the gateway-upstream listener
+presenting the pinned leaf (answered by the real handler), an unpinned serverAuth leaf (status 16,
+`not_pinned`) and a clientAuth-only leaf (status 16, `no_server_auth_eku`). (2) The `docs` suite carries a lexical Python
+gate, `tests/test_gateway_peer_registration_lexical.py` (Meson test "gateway-upstream guard
+registration lexical gate", no build required), which fails if the gateway-upstream service is
+registered other than through the guard. It reads `server.cpp` after removing comments, blanking
+string and character literals (raw strings included, recognised only at an identifier boundary),
+stripping a leading byte-order mark, joining backslash-newline splices and removing C++14 digit
+separators, so none of those can hide a registration. Its rules: exactly three
+`builder.RegisterService` calls with the expected arguments; no generic service; one `ServerBuilder`
+that is never passed or copied; the unguarded handler used only in allow-listed contexts; the
+member order of `agent_service_`, `gateway_service_`, `gateway_peer_guard_` and `agent_server_`, all
+at the brace depth of the `ServerImpl` class body, with exactly two guard constructions; only header
+includes (and imports); and a tree-wide scan so no other source file under `server/` names
+`ServerBuilder` or a `Register*Service` API. It is lexical only, not a data-flow analysis. (3) The restart-advice lint
+`tests/test_gateway_peer_restart_advice_lint.py` runs as the "Gateway peer restart-advice lint"
+step of `docs-lint.yml` on every PR (docs-only PRs skip the Meson `docs` suite) and as the Meson
+test "gateway peer restart-advice docs lint": every place that gives gateway-restart advice
+after a peer-authorization refusal must carry the `5183` token (digit boundaries, so `15183`
+does not count) anywhere in the same paragraph, table row, list item or alert annotation, and a
+conditional marker (`only if` or `unless`) in the same sentence as the restart phrase or in the
+next one. Text is matched after markdown marks are stripped, advice that is negated (`do not
+restart the gateway`) is ignored, each file has a pinned minimum number of matching paragraphs so
+a reworded runbook cannot silently drop out of the lint's reach, and the expiry runbook must say a
+gateway redial is required. (4) The rigs
+above, which carry the acknowledgement. The decision record,
+[Gateway peer authorization (minimal), 2026-10-07](security-reviews/gateway-peer-authz-minimal-2026-10-07.md),
+states what none of these cover.
+
 ## Self-hosted runner topology
 
 | Runner | Host | Jobs |
@@ -351,11 +835,15 @@ so the push hits BuildKit's own solver cache and rebuilds nothing.
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix + `release.yml` build-macos. Only pre-release `install-macos` stays GitHub-hosted (`macos-14`, an install-to-root smoke test). Release **signing/notarization is deferred** — macOS releases currently ship UNSIGNED (Phase B = on-token `rcodesign`). Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
-**Retired 2026-06-21:** `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
+**Retired 2026-06-21** (removed from the inventory afterwards): `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
 `yuzu-shulgi`) and `yuzu-local-windows` (Shulgi native Windows) — superseded by
-Big Tam and Wee Tam. Remove them from `.github/runner-inventory.json` to silence
-the inventory sentinel. `proto-compat` and `cache-prune-linux` use the bare
-`[self-hosted, Linux, X64]` label (no compiler), so they resolve to Big Tam.
+Big Tam and Wee Tam, and removed from `.github/runner-inventory.json`.
+`proto-compat` and `cache-prune-linux` are pinned to `yuzu-bigtam-linux`; they
+previously used the bare `[self-hosted, Linux, X64]` label, which Shulgi's WSL2
+runner also carried, so they could land there instead of on Big Tam. The runners
+were deregistered on the GitHub side on 2026-10-03 (per the repo admin). With the pin, `proto-compat` queues (it does not fail) while all four
+Big Tam slots are busy. When no Big Tam runner is online, the preflight job
+fails (required pool `bigtam`) and `proto-compat` is skipped.
 
 ### Ubuntu 26.04 migration (Big Tam) — COMPLETE
 
@@ -405,7 +893,7 @@ for fast, download-free builds:
 - **mold** linker (`apt install mold`), wired via `-fuse-ld=mold` in the gcc-15 /
   clang-21 native files — large cut in link time on the big `yuzu-server` /
   `yuzu-agent` binaries and the release LTO link.
-- **meson** 1.11.1 + the rest of `requirements-ci.txt` persist in the runner
+- **meson** 1.12.0 + the rest of `requirements-ci.txt` persist in the runner
   user's `~/.local`, so the per-job `pip install --user --require-hashes` is a
   no-op (no re-download).
 - **rpm** (rpmbuild) installed for release.yml's packaging step — absent on a
@@ -485,7 +973,7 @@ point, `--num-processes 2` — deliberately, rather than guessing ahead of
 data. One sample (cold cache, first run of the branch on Wee Tam):
 `Test (non-pg suites)` 4m30s, `Test (pg shards, full)` 10m02s (602s) —
 the pg step alone was 61% of the 16m32s total job, confirming the plan's
-own diagnosis that 11 shards through 2 workers leaves real serialization
+own diagnosis that the then-11 pg shards (14 now) through 2 workers leave real serialization
 on the table. (This baseline is itself only one sample — the huge margin
 in every subsequent push's improvement makes that imprecision moot, but
 it's not a second-sampled median the way k=4 and later are.)
@@ -537,8 +1025,9 @@ step's box-contention noise on an otherwise-stable pg-shards step — see
 push 2's paragraph above). This is the current head's width; no push 4
 (k=8) has been made. `docs/ci-architecture.md`'s own worst-case job-budget arithmetic
 (below, under "Worst-case job-budget arithmetic") and the round-count
-math (11 shards over 6 workers is already 2 scheduling rounds —
-identical to 11 over 8) are why k=6 is where the staged widening
+math (at the then-11 shards, 11 over 6 workers is already 2 scheduling rounds,
+identical to 11 over 8; at 14 shards k=6 is 3 rounds against 2 at k=8, see the
+2026-10-11 paragraph) are why k=6 is where the staged widening
 stopped rather than continuing to k=8; going wider buys no
 round-reduction here and only adds CCD-thread-contention risk on Wee
 Tam's fixed 16-thread envelope.
@@ -628,7 +1117,9 @@ just the 8 pg shards: the Linux Test step ran one `meson test` invocation with
 no `--suite`/name filter at all. Fix: split the Test step into 3
 `flake-retry.py` invocations, cheap-first (fail-fast via `bash -e`) — 21 tests
 across 5 cheap suites (`agent`/`docs`/`proto`/`tar`/`gateway`) run first, then
-the 3 non-pg server tests, both uncapped (neither touches Postgres); the 8 pg
+the 3 non-pg server tests, both uncapped (neither touches Postgres) — status as
+of that day; see "Within-job cap extended to the non-pg step" at the end of
+this section for what changed; the 8 pg
 shards, isolated by exact name into their own `with-test-slot.sh`-gated call,
 run last with the pool dedicated entirely to them. 21+3+8 = 32, verified as an
 exact partition of the full registered test set before trusting it in CI.
@@ -767,6 +1258,109 @@ discipline the rest of this PR applies to the Windows widths — this
 paragraph exists to make the new fact visible to the next reviewer, not to
 resolve it unilaterally.
 
+**Re-derived 2026-10-11 after shards M, N, O and P (pg-shard rebalance).** The
+pg suite grew to 16 shards during this rebalance (12 on dev before it; 15 after
+the first step, P added by the follow-up below) and was then merged back to 14
+to meet the maintainer limit of 14 pg shards (J into I, P into M; see the last
+paragraph of this section). The arithmetic below is for the final 14. Shards M
+and N were carved from C (12
+tags moved, C 886 to 542 cases) and shard O from F (its `[dex]` clause, F 532
+to 418 cases; the 28 cases tagged both `[dex]` and `[mcp]` go to O). The
+motivation was the weecolin Windows runner. The old figures of C 895s and F
+765s came from re-running shards C and F alone with `--timeout-multiplier 3`
+(so the 700s cap did not apply) on that box BEFORE its Postgres restart
+(localhost DSN, 2s connects, 14 shards timed out). After the restart the old
+12-shard layout (branch 32a37a5ac, 4-wide, full server suite, wall 1090s)
+measured C TIMEOUT at 700s, F 585s, A 386s, E 343s, D 282s, L 267s, G 249s,
+H 244s, K 192s, J 170s, I 162s, B 137s. Linux 4-wide on a loaded box measured
+C 629s and F 470s (profiled on the pr2-sweep binary, which carries 28 more C
+cases and 9 more F cases than the dev base: C 914 against 886, F 541 against
+532).
+
+The theoretical degenerate ceiling grows with the count, as the paragraph
+above predicted for any addition. At the final 14 shards: 14 * 700 = 9800
+test-seconds, and at the Linux `--num-processes 2` that is 7 rounds of two
+shards, so 7 * 700 = 4900s = 81.7 minutes. That figure ALONE (it excludes checkout, build and the non-pg test step, so the real margin is smaller) is now under the
+Linux job's `timeout-minutes: 90` (`.github/workflows/ci.yml`, the `linux`
+job), by 8.3 minutes; with the up-to-30-minute slot wait
+(`YUZU_TEST_SLOT_TIMEOUT_MIN`) it is about 112 minutes, which still exceeds
+the 90-minute limit, before checkout and build time. For comparison, the 16-
+and 15-shard layouts (never on dev) were 8 rounds, 5600s = 93.3 minutes, over
+the limit on their own (about 123 minutes with the slot wait), and the actual
+dev base of 12 shards was 6 rounds, 4200s = 70 minutes (about 100 minutes with
+the slot wait). The ceiling is a figure that requires every shard to hit its
+own cap, not an expected case: the degenerate figure applies only when every
+shard runs to 700s, and the makespan is lower whenever any shard finishes
+under its cap (the earlier "BEST and WORST makespan are the same number" holds
+only in that all-at-cap case). The expected case moves the other way, see the
+measured Windows run of the 16-shard layout below. On Windows the pg step runs
+`--num-processes 6` (`ci.yml`, "Test (pg shards, full)" in the `windows`
+job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
+65 minutes with a 30-minute slot wait for the pg step alone. The job also
+acquires a slot for its non-pg step, so the worst case with both 30-minute
+waits is 95 minutes plus that step's own run time, still under that job's
+`timeout-minutes: 120`. The Linux slot-wait case is the one that still needs
+attention: the "revisit the 700s per-shard budget or the Linux
+`--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
+above) remains open, with a less severe trigger than at 16 shards (the
+all-at-cap ceiling alone now fits the job limit; the ceiling plus a full slot
+wait does not). Neither number is adjusted here. The tag assignment is the
+tuning knob (move a tag between M and N, or O and F), documented in
+`tests/meson.build` above shard M.
+
+**Follow-up, same day: shard P carved from C.** A healthy-Postgres Windows
+run of an intermediate 15-shard layout (4-wide, under heavier box load; this
+layout was never on dev) measured C 542s (only 23% under the 700s
+timeout), F 552s, A 615s, E 535s, D 450s, O 424s, K 269s, I 263s, J 260s,
+B 175s and M 99s; Linux 4-wide on a loaded box ran C 254s and the others
+113-258s, so C's Windows/Linux ratio was about 2.1. C's profile was flat (542
+cases, 148s solo serial, mean 0.27s per case), so its cost is per-test
+Postgres setup and the lever is case count. Shard P takes six C-resident tags
+(`[rest]`, `[auth]`, `[dashboard]`, `[adversarial]`, `[authz_model]`,
+`[app_perf]`): 202 cases and 46.9% of C's profiled seconds, leaving C 340
+cases. Scaling C's 542s by the profiled share predicted P about 254s and C
+about 288s. Measured on the 16-shard layout (weecolin Windows, restarted
+Postgres, 4-wide, full server suite, 23/23 OK, wall 1064s; this is the
+unmerged 16-shard layout, measured before the J and P merges below): A 393s, F 347s,
+E 335s, D 287s, G 256s, O 247s, H 246s, L 236s, N 228s, C 185s, K 176s,
+J 173s, I 169s, P 148s, B 140s, M 83s. So C and P came in under the
+prediction (predicted 288/254, measured 185/148); the intermediate run above
+was under heavier box load, so the two are not a like-for-like comparison.
+The tightest shards are now A (393s, 43.9% under the cap), F and E; every
+shard is at least 43% under 700s. P is a new shard rather than more M clauses
+because the same C-based scaling (an estimate) would have put M near 350s
+(M's 99s in the intermediate run plus P's predicted 254s); also an estimate:
+M's `[readyz]` cases are likely dominated by waits that do not scale with
+setup cost. Partition proof: the 16 shards' union equals the `[pg]`
+population (4729), no case runs twice, the 202 cases leaving C are exactly
+P's, and every other shard is set-identical. Rebalance by moving a TAG
+(between P and C, or M and N, or O and F) before touching any timeout.
+
+**Final step, same day: shards J and P merged into I and M (14 pg shards).**
+The maintainer limit is at most 14 pg shards, so the 16-shard layout above
+never shipped. Shards J and P were merged into I and M on 2026-10-11 to stay
+at 14 pg shards; the names J and P no longer exist (the gaps are deliberate,
+noted in `tests/meson.build`). Each merged entry's spec is the earlier shard's
+clause list followed by the later shard's clause list verbatim (M then P;
+I then J), every clause keeping its own exclusions, so no case moved between
+any other shards. Partition proof (`--list-tests` on the built binary, by
+name, file and line): the union of the 14 shards equals the `[pg]` population
+(4729), zero duplicates, merged M = old M + old P (278 cases), merged I = old
+I + old J (550 cases), and every other shard is set-identical. The measured
+Windows times quoted in this section are from the 16-shard layout, not the
+merged one. ESTIMATES for the merged shards are sums of those measured times
+(startup is shared, so slightly less): M + P is 83 + 148 = 231s on Windows
+(Linux 135 + 100 = 235s, from the 16-shard Linux run) and I + J is 169 + 173 =
+342s (Linux 119 + 119 = 238s, same run); the estimate was
+low for I. MEASURED on the merged 14-shard layout (Windows weecolin, 4-wide,
+restarted Postgres, 21/21 OK): I 398s, A 393s, F 351s, E 340s, D 303s, G 282s,
+H 257s, O 254s, M 239s, N 239s, L 238s, C 195s, K 160s, B 136s, so merged I is
+the longest pole by 5s and every shard is at least 43% under 700s. Linux
+4-wide, same layout, 23/23 OK: I 307s, A 284s, M 264s, F 263s, E 259s. These
+runs were on a shared box, so treat the ordering among the top shards as
+noise-level. Re-measure on the first CI run. Priorities are now merged M
+185 and merged I 245 (all 14 distinct); see `tests/meson.build`.
+
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
 the 10 pg shard names and the 3 non-pg server test names directly in `ci.yml`,
 hand-synced against `tests/meson.build`'s own tag filters and
@@ -838,7 +1432,7 @@ Two hardening decisions worth knowing before touching this again:
   (`AllTestsSkippedExitCode`) on every DSN-less UNFILTERED `meson test` —
   local dev without Postgres, and any future sanitizer/nightly leg that runs
   the whole suite — breaking that skip contract, the same reason shards
-  D/G/H/I/J already carry the flag. Loud-fail duty for a genuinely broken or
+  D/G/H/I already carry the flag (I now also covers J's former clauses). Loud-fail duty for a genuinely broken or
   missing DSN moved to ci.yml's own `Resolve pg_mode + assert Postgres DSN`
   step (runs immediately after `Ensure Postgres`, before ANY test invocation,
   full or smoke) and to the checker's exact-count + flag-present assertions
@@ -883,8 +1477,8 @@ inert). Tracked on #3443, not silently dropped.
 
 **Nightly and sanitizer legs are unaffected and still run the full
 population, redundantly**: both invoke `meson test` UNFILTERED (no `--suite`
-at all), so every `test()` entry runs once regardless of suite — the 11 pg
-shards AND the smoke entry both fire, meaning the 11 `[pg-smoke]` cases
+at all), so every `test()` entry runs once regardless of suite, so all the
+`server-pg` shards AND the smoke entry both fire, meaning the 11 `[pg-smoke]` cases
 execute twice there. Harmless (seconds of cost) but real, and not specific
 to any one platform — the same is true of a plain local `meson test` in any
 worktree. Not worth special-casing.
@@ -894,7 +1488,7 @@ PG-tagged invocation in the Test sequence, so (per the JUnit-overwrite
 behavior the "Persistent runner-local test history" section below
 documents for both platforms) it is what `ci-suite-stats` sees for that
 leg's PG timing — a full leg's `ci-suite-stats` entry still reflects the
-11-shard run, not the smoke entry, since `pg_mode` fully separates which
+full-shard run, not the smoke entry, since `pg_mode` fully separates which
 one actually executes per leg. The same overwrite silently drops the
 non-pg step's own `flake-retry` recovery reporting from that job's
 queryable history too, not just its per-suite timing rows — the non-pg
@@ -915,9 +1509,9 @@ a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
 concurrently, leaving at least one Big Tam runner unclaimed by it — a no-op
 on `pull_request` events (already a single-leg matrix via the existing
 `exclude`). This is a mitigation, not a guarantee: the freed runner is not
-reserved for any specific job. `proto-compat` (this same workflow) targets
-the bare `[self-hosted, Linux, X64]` label every Big Tam Linux runner also
-carries and runs on the same push trigger — it can claim the freed runner
+reserved for any specific job. `proto-compat` (this same workflow) is pinned
+to the same `yuzu-bigtam-linux` label, so it draws on the same four runners,
+and runs on the same push trigger — it can claim the freed runner
 itself before a queued PR job does (its own `timeout-minutes: 5` means it
 self-frees quickly, but it is a real same-push competitor, not just the
 already-named nightly-overlap case). A stacked nightly run, another
@@ -993,6 +1587,33 @@ done here. Response to either trigger is rebalancing/splitting the
 affected shard(s) or reverting to slots=2, never another timeout
 increase. Tracked: #3443.
 
+**Within-job cap extended to the non-pg step (2026-09-18).** The "3 non-pg
+server tests, both uncapped" status above (now 6 named entries, see the
+count-drift note on `ci.yml`'s comment) turned out to matter even though those
+tests don't touch Postgres: `--num-processes 2` was added to both
+`flake-retry.py` invocations in the "Test (non-pg suites)" step, matching the
+value already established for this box's pg-shard step. Evidence: on two
+independently-diagnosed CI runs (PR #4532 run 35307458479, PR #4566 run
+35361987460, no diff in common), that step's own `meson test` invocation
+failed exactly one Catch2 case each time — both async/timing assertions in
+the spark/guardian suite — consistent with the same within-job CPU-steal
+mechanism this section already proved for the pg shards, just flipping a
+timing assertion instead of hitting a hard per-shard timeout.
+
+This is **not** a fix for the much larger ~20-case failure list CI actually
+reported for those same two runs (`content_dist`/`script_exec`/`event_logs`/
+`wifi`/`windows_updates`/`software_actions`/`license_scan`). A `build-ci`
+review found that list is produced by `flake-retry.py`'s `catch2_failed_cases()`
+classifier, which re-runs the whole failed binary a second time, solo, outside
+meson's orchestrator entirely — untouched by `--num-processes` or by
+`with-test-slot.sh`. Why that solo re-run reports a different failure set than
+the original run (and drops the original run's own failing case from its own
+list) is not diagnosed; tracked as #4580. Cross-job `with-test-slot.sh` gating
+was deliberately not added to the non-pg step yet — this step's own duration
+is still short, so the within-job cap ships first per this section's "one axis
+at a time" practice; #4580's outcome may argue for cross-job gating here too,
+once the actual mechanism is understood.
+
 ### Persistent runner-local test history
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its
@@ -1047,6 +1668,26 @@ no macOS data yet. `release.yml` build-macos is now self-hosted on BigMags too (
 signing/notarization deferred to Phase B). Only the `pre-release.yml`
 `install-macos` smoke test stays GitHub-hosted (`macos-14`, ephemeral).
 
+The macOS job installs Erlang/OTP 28 + rebar3 per run, on the same major/minor line as the
+Linux leg (macOS pins the exact patch, the other legs float), so the gateway is built and
+its eunit/ct suites run on macOS too. It downloads the prebuilt `erlef/otp_builds` OTP
+tarball and the rebar3 escript into `$RUNNER_TEMP` (per agent, per job) and verifies pinned
+SHA-256s, rather than using `erlef/setup-beam`: setup-beam re-copies one
+`/opt/ci/tool_cache/otp/...` tree that both BigMags agents share, and a debug + release
+pair starting together raced on it. Dependabot does not bump these pins; the bump and
+hash-mismatch procedure is in `docs/darwin-compat.md` ("Erlang gateway in macOS CI").
+Before #4841 it had no Erlang and Meson silently skipped the gateway.
+
+Every CI leg that runs tests (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan, and the dispatch-only
+`fork-dynamic-review.yml` Linux leg, which installs Erlang via `erlef/setup-beam` like the other Linux legs) now runs
+`scripts/ci/assert-gateway-tests.py <builddir>` straight after configure (`meson setup`, or `scripts/setup.sh` in the fork review leg), so a missing `rebar3` (gateway tests not registered)
+fails the Configure step rather than skipping. It is deliberately a post-configure check, not the `-Drequire_gateway` project
+option: a non-default project option stored in these persistent, branch-shared build dirs makes every older branch's
+`meson setup --reconfigure` fail with `Unknown options` (measured, #4851). `tests/test_gateway_test_summary.py` pins that
+every such `meson setup` is followed by the check, that none passes `-Drequire_gateway`, and (by globbing
+every `.github/workflows/*.yml`, so a new or renamed workflow is covered) that every job running `meson test` or `flake-retry.py`
+has the check at or before its first test step.
+
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
 and opens a `runner-inventory-drift` issue on mismatch. Both the sentinel
@@ -1071,6 +1712,8 @@ pool causes nightly preflight to fail and the nightly alert opens
 `nightly-broken`; the repository discipline remains **no merge to main while
 that issue is open**. Follow `docs/ci-troubleshooting.md` before closing it.
 
+### Docs-only changes (#1978, #5320)
+
 As of #1978, preflight also emits a `code_changed` output (from
 `scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
 `&& code_changed == 'true'`, so a docs-only PR skips the whole matrix. The
@@ -1078,8 +1721,43 @@ matrix-expanded required contexts (`Linux gcc-15 debug`, `Windows MSVC debug`,
 `macOS debug`) would otherwise stay "Expected" forever on a docs-only PR
 (a top-level-skipped matrix job emits none of its inner check names), so a
 `docs-required-checks` stub emits those exact names as success when
-`code_changed == 'false'`. `ci.yml` no longer path-filters `pull_request`;
-the `push:` trigger keeps its docs `paths-ignore`.
+`code_changed == 'false'`. `ci.yml` path-filters neither trigger.
+
+Since #5320 the same applies to a push to `main`/`dev`. The push trigger used
+to keep a docs `paths` allow-list, so a changelog-only push started no run and
+the required contexts never appeared on the commit; the v0.14.0 release commit
+(50a81af91) was tagged on an operator decision for that reason. Now every push
+runs, and the codegate step's push arm sets `code_changed=false` only when:
+
+1. the previous tip's newest `ci.yml` push run on the branch concluded
+   `success` — a newer pending run cancels an older pending one in this
+   workflow's concurrency group, so without this a docs push arriving behind a
+   running build would cancel a code push's pending run and the code would
+   never be built; it also stops a docs commit turning a red code commit
+   green;
+2. the compare API reports the push as a fast-forward (`ahead`) listing 1–299
+   files (empty is missing evidence; 300 is the API cap, so the list may be
+   truncated); and
+3. every listed path, and every rename's previous path, is docs-only.
+
+Any API error or other answer builds. The classification set is unchanged,
+including the BR-010 carve-out: a push touching `docs/os-capability-matrix.md`
+builds and runs its drift gate. A docs-only push therefore costs
+`trusted_inputs`, `preflight`, three stub jobs and `detect-ci-changes`, all
+GitHub-hosted (plus the CI canary when the push touches a workflow file — the
+CI-infrastructure classifier decides that separately). The required contexts on
+such a commit read `success` (Preflight, the three stubs, CHANGELOG order) or
+`skipped` (Proto backward-compat). `success` on those three names for a
+docs-only commit means *inherited from the predecessor's build*, not *built*;
+the run's summary says so. On a PR a skipped required context satisfies the
+ruleset and an absent one does not; a push commit is never evaluated by the
+ruleset, so on `main` the only consumer of these contexts is the release
+skill's tag gate, which reads them the same way. The
+push arm is executed against a stubbed `gh` by
+`tests/shell/test_codegate_push.sh`.
+
+Which contexts are required is a repository ruleset setting ("Protect Main",
+"Protect Dev"), not part of `ci.yml`; #5320 did not change it.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 
@@ -1204,9 +1882,9 @@ libpq connection attempt inside a PG-tagged test.
 
 | Platform | pg shards | Migration-DDL tests | Notes |
 |---|---|---|---|
-| Linux (gcc-15/debug, every PR + primary push) | full (11 shards) | run | ADR-0006 reference platform |
+| Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
 | Linux (other push legs) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
-| Windows (debug, every PR + push) | full (11 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
+| Windows (debug, every PR + push) | full (14 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
 | Windows (release, push only) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR |
 | macOS | none (ADR-0035) | n/a | server is Linux-only |
 
@@ -1400,6 +2078,49 @@ to `known-flaky.json`), grep the junit failure text for
 `[EpIntegShared]`, `[AccRevShared]`, `acc_rev_reset`) — a cluster of those in
 one file is one PG-instance event, not a test bug.
 
+## Agent unit-test shards (#5073)
+
+The agent suite's single `agent unit tests` entry (one serial Catch2 process,
+240 s budget) is three entries over the same `yuzu_agent_tests` binary:
+`agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
+'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
+and conservative headroom rather than a measured need: the only measured
+contention figure is for the server `~[pg]` suite, 289 s with no other test
+phase running (c0) to 603 s with four overlapping (c4), about 2.1x, across jobs on
+the pre-#3443 combined step, per "Windows test-phase
+concurrency gate"; it has not been re-measured for the agent shards) and
+`--allow-running-no-tests`. That flag is what stops the zero-match shard C from
+failing when `meson test --suite agent --test-args '[tag]'` appends a second
+positional spec. It does not make that a targeted run: Catch2 binds the extra
+spec to the LAST comma-separated OR term only, so it is exact only for shard C,
+it widens shards A and B, and a mistyped tag is no longer loud. Run the binary
+directly for a targeted run (`build-*/tests/yuzu_agent_tests '[tag]'`, see
+`docs/build-guide.md` "Direct binary invocation"). Repro (2026-10-01, Linux
+`build-linux/tests/yuzu_agent_tests`, `<shard spec> '[nonexistent_zzz]'
+--list-tests --allow-running-no-tests`): shard A lists 319 cases, B 437, C 0 (B's count changed in
+the 2026-10-04 re-balance; A's did not).
+Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
+nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
+sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`
+is unsharded and unchanged.
+
+Partition rule and measured balance live in the comment above the entries in
+`tests/meson.build`: a case runs in the lowest-numbered shard holding any of its
+tags, shard C is the AND-NOT complement so new tests land there, and every
+inclusion term ends `~[.]~[tsan-heavy]~[flaky-4086]` because an inclusion term
+does not drop hidden cases by itself. `'agent shard partition invariant'`
+(`suite: ['agent', 'agent-checks']`, defined outside `if build_server`) runs
+`scripts/ci/check-pg-shard-partition.py --family agent`, the same script and
+`check_partition()` as the server shards: it proves against the real binary that
+every case of `~[.]~[tsan-heavy]~[flaky-4086]` is in exactly one shard. It also
+fails if a shard spec term does not end with that suffix (the meson
+`agent_shard_suffix` and the script literal are hand-synced), if a spec is not a
+shape flake-retry's isolated retry can strip, or if two shard entry names are
+equal or one contains another. It proves exactness, not balance: it prints per-shard case counts as an informational
+notice, and the drift signal is the 80%-of-budget table above. Per-entry history
+in `test-runs.db` / `ci_test_suites` is keyed by entry name, so it restarts under
+the new names.
+
 ## Workflow-PR canary
 
 `ci.yml`'s `detect-ci-changes` + `canary` jobs run when a PR, or a push to
@@ -1458,7 +2179,10 @@ than a slow one.
 
 **Pushes to `dev` are what keep the cache warm.** GHA cache scope lets a PR job
 read its own ref, the default branch, and its base branch — never a sibling
-PR's. Every PR bases on `dev`, so a dev-scoped entry serves all of them; main-only
+PR's. The same rule is what confines a trusted-fork run: it is dispatched on a
+throwaway `trusted-fork/pr-<N>` branch, so whatever fork code writes lands in a
+scope no `dev`/`main`/PR run can restore from, and the wrapper purges it after
+the run (#4471). Every PR bases on `dev`, so a dev-scoped entry serves all of them; main-only
 warming left the scope empty for five weeks and each PR saved a private ~843 MB
 duplicate (#3233). Note the canary key hashes `vcpkg.json` /
 `vcpkg-configuration.json` / `triplets/x64-linux.cmake`, which the
@@ -1480,15 +2204,14 @@ databases (thresholds and semantics: "Test-database lifecycle" above).
 ## Chiselled demo images + agent bundle (release-time)
 
 `docker-publish-chisel` (in `release.yml`) builds the server/gateway/agent
-`*.chisel` images multi-arch — linux/amd64 native + linux/arm64 via **QEMU**
-— on the self-hosted Linux runner. The emulated arm64 vcpkg-from-source
-compile can hold that single runner slot up to its 360-min timeout, so the
-job carries a `cancel-in-progress: true` concurrency group (a re-tagged
-release supersedes a stale build instead of queueing behind it). It is
-**not** in the `release` job's `needs:`, so a slow/failed demo-image build
-never blocks the actual release. The sustainable fix for the QEMU cost is a
-native arm64 runner — the open decision tracked in `docs/demo-environment.md`
-("Publishing").
+`*.chisel` images for linux/amd64 on the self-hosted Linux runner (the
+QEMU-emulated arm64 leg was dropped; re-adding arm64 is the open decision in
+`docs/demo-environment.md`, "Publishing"). It carries a
+`cancel-in-progress: true` concurrency group, so a re-tagged release supersedes
+a stale build instead of queueing behind it, and a 120-min timeout. Since
+#5242 it **is** in the `release` job's `needs:`: the release waits for it
+(1–16 min on rc1–rc6) so the chisel SBOMs are always in `SHA256SUMS`, and a
+failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
 release's own signed agent archives) on a GitHub-hosted runner — no

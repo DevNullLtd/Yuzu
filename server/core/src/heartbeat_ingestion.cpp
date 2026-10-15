@@ -9,6 +9,7 @@
 #include <yuzu/metrics.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -17,7 +18,9 @@
 namespace yuzu::server {
 
 void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
-                                std::string_view agent_id, std::string_view via) {
+                                std::string_view agent_id, std::string_view via,
+                                std::string_view resolved_session_id,
+                                PresenceBatch* presence_batch) {
     const std::string agent_id_str(agent_id);
     const std::string via_str(via);
 
@@ -36,13 +39,29 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     // stores stay authoritative). Does not touch the executions-ladder
     // invariants (the command_id -> execution_id correlation / polchk-):
     // those live on the CommandResponse path, not here.
-    if (offline_store_) {
+    // #5686: while the batch is tripped, skip this entry's upsert unless it is
+    // a half-open probe (see PresenceBatch).
+    if (offline_store_ && presence_batch && presence_batch->store_failed &&
+        ++presence_batch->skips_since_fail < presence_batch->next_probe) {
+        ++presence_batch->skipped; // a later probe or the next batch refreshes this row
+    } else if (offline_store_) {
         std::string hostname;
         std::string os;
+        std::string agent_version;
+        std::string arch;
         if (auto sess = registry_.get_session(agent_id_str)) {
             hostname = sess->hostname;
             os = sess->os;
+            agent_version = sess->agent_version;
+            arch = sess->arch;
         }
+        // HA WS-5: threaded through so a later graceful disconnect can
+        // session-guard its presence clear (remove_if_session via presence_departure.hpp) — see
+        // agent_service_impl.cpp / gateway_service_impl.cpp. Read under the
+        // registry lock: map_session rewrites it in place.
+        const std::string session_id = resolved_session_id.empty()
+                                           ? registry_.session_id_of(agent_id_str)
+                                           : std::string(resolved_session_id);
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
@@ -52,7 +71,32 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // SHOULD-1). Staleness is driven entirely by the server-side
         // last_heartbeat_ms. Wire a real agent ts here when one exists, or drop
         // the column — tracked as a follow-up.
-        offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0);
+        //
+        // agent_version/arch: a session-lookup miss above leaves both blank,
+        // which upsert() treats as "preserve the last-known value" (round-3 v2
+        // columns) rather than blanking a value this store already learned.
+        const bool upserted = offline_store_->upsert(agent_id_str, hostname, os, now_ms,
+                                                     /*agent_ts=*/0, agent_version, arch,
+                                                     session_id);
+        if (presence_batch) {
+            if (upserted) {
+                presence_batch->store_failed = false;
+                presence_batch->skips_since_fail = 0;
+                presence_batch->next_probe = 1;
+            } else {
+                // First failure of a streak: the very next entry is the probe
+                // (next_probe=1), so an isolated failure costs only itself.
+                // Each further consecutive failure doubles the spacing.
+                const bool was_tripped = presence_batch->store_failed;
+                presence_batch->store_failed = true;
+                ++presence_batch->failed;
+                presence_batch->skips_since_fail = 0;
+                presence_batch->next_probe =
+                    was_tripped ? std::min(presence_batch->next_probe * 2,
+                                           PresenceBatch::kMaxProbeSpacing)
+                                : 1;
+            }
+        }
     }
 
     // Guardian heartbeat reconcile (M5 / #1209): if the agent reported its applied

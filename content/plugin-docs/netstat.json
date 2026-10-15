@@ -530,9 +530,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
-    "changelog": [
-      "changelog.d/3403-netstat-attribution-action.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/netstat.yaml",
       "content/definitions/netstat_attribution.yaml"

@@ -171,7 +171,10 @@ TEST_CASE("retention guard: a held advisory lock makes the pass SKIP",
     CHECK(r.skipped_lock);
     CHECK(r.deleted == 0);
     CHECK(count_rows(pool) == 5); // untouched — the holder wins the tick
-    PQexec(holder.get(), "SELECT pg_advisory_unlock(hashtext('rg_test:t_prune'))");
+    // Own the PGresult: a bare PQexec() here leaked it, which LeakSanitizer fails the
+    // nightly ASan leg on (3,288 bytes, test_pg_retention_guard.cpp).
+    PgResult unlock{PQexec(holder.get(), "SELECT pg_advisory_unlock(hashtext('rg_test:t_prune'))")};
+    CHECK(unlock.status() == PGRES_TUPLES_OK);
 }
 
 TEST_CASE("retention guard: an unusable persisted anchor DECLINES (BadState)",

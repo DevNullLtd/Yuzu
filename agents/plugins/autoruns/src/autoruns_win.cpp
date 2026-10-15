@@ -152,6 +152,7 @@ std::string_view hive_status_token(yuzu::win::HiveAccessStatus st) {
     case yuzu::win::HiveAccessStatus::not_found:         return "not_found";
     case yuzu::win::HiveAccessStatus::privilege_missing: return "privilege_missing";
     case yuzu::win::HiveAccessStatus::mount_failed:      return "mount_failed";
+    case yuzu::win::HiveAccessStatus::file_refused:      return "file_refused";
     }
     return "not_found";
 }

@@ -1,0 +1,78 @@
+Directory: tests/unit/fixtures/wave10/runtimes/linux/
+Fixtures for the runtimes Linux-leg tests (tests/unit/test_runtimes_parsers.cpp loads the
+three capture files; tests/unit/test_runtimes_linux_parsers.cpp materializes tree.manifest and
+jdk_layouts.manifest and reads mountinfo_docker_nfs4.txt).
+One directory-level provenance file; every fixture below is labelled. The three capture
+files are REAL CAPTURE from command-only Docker containers (no long-running service,
+nothing installed beyond the stated apt packages); tree.manifest carries per-section
+labels, including two RECONSTRUCTION lines named in the file itself.
+
+host:      Docker Desktop (linux/arm64 containers) on macOS
+identity:  root inside the container (the images' default)
+date:      2026-09-21
+
+-- temurin17_release.txt --
+status:    REAL CAPTURE
+image:     eclipse-temurin:17 (Ubuntu 26.04 base, Temurin 17.0.20+8)
+command:   docker run --rm eclipse-temurin:17 cat /opt/java/openjdk/release
+lines:     19 (budget 25)
+
+-- debian_openjdk17_release.txt --
+status:    REAL CAPTURE
+image:     debian:bookworm, after `apt-get install -y openjdk-17-jre-headless python3-minimal`
+           (openjdk-17-jre-headless 17.0.20.1+1-1~deb12u1; python3-minimal was installed for a
+           since-cut python action and does not affect the release file)
+command:   cat /usr/lib/jvm/java-17-openjdk-*/release   (resolved to
+           /usr/lib/jvm/java-17-openjdk-arm64/release)
+note:      Debian's release file has NO IMAGE_TYPE key (the test asserts flavour
+           `unmodelled` for it); /usr/lib/jvm/java-1.17.0-openjdk-arm64 is a second entry
+           for the same install.
+lines:     9 (budget 25)
+
+-- dotnet_shared_listing.txt --
+status:    REAL CAPTURE
+image:     mcr.microsoft.com/dotnet/runtime:8.0 (Debian 12 bookworm)
+command:   cd /usr/share/dotnet && find shared -mindepth 2 -maxdepth 2 | sort
+note:      the runtime image has no sdk/ directory; the `sdk/<version>` shape is covered
+           by inline strings in the test, not by a capture.
+lines:     1 (budget 5)
+
+-- tree.manifest --
+status:    REAL CAPTURE structure (the two release files above verbatim as T: payloads; the
+           /usr/share/dotnet listing above as a D: entry) with two RECONSTRUCTION lines
+           labelled in the manifest: the java-1.17.0-openjdk-arm64 alias being a symlink,
+           and the empty contents of the dotnet version directory.
+loaded by: tests/unit/test_runtimes_linux_parsers.cpp (materialized under a yuzu_test_
+           TempDir per case)
+
+-- jdk_layouts.manifest --
+status:    REAL CAPTURE structure of four package layouts (each under its own roots/<distro>/
+           directory), trimmed to the paths the walk reads. RECONSTRUCTION: every regular file
+           other than the SUSE `release` is an EMPTY placeholder (the capture recorded names,
+           not contents), and the Ubuntu .jinfo file is empty.
+host:      Docker Desktop (linux/arm64 containers, kernel Linux 7.0.12-linuxkit), root in the
+           container, command-only `docker run --rm`, 2026-09-24
+commands:  ls -la <jvm root>; find <jvm root> -maxdepth 4 \( -name release -o -name java -o
+           -name bin -o -name jre \) -exec ls -ld {} +
+ubuntu2204-openjdk8:    ubuntu:22.04 after `apt-get install -y --no-install-recommends
+           openjdk-8-jre-headless` (8u504-ga-1ubuntu1~22.04.3): /usr/lib/jvm holds the
+           java-8-openjdk-arm64 home, a java-1.8.0-openjdk-arm64 alias symlink and a .jinfo file.
+rocky9-openjdk8:        rockylinux:9 after `dnf install -y java-1.8.0-openjdk-headless`
+           (1.8.0.504.b01-1.2.el9_8.aarch64): the home has jre/bin/java only (no bin/), plus five
+           alias symlinks (four into /etc/alternatives).
+alpine320-openjdk8:     alpine:3.20 after `apk add openjdk8-jre-base`: java-1.8-openjdk with bin/java
+           and jre/bin/java, plus the default-jvm and java-8-openjdk alias symlinks.
+opensuse156-openjdk17:  opensuse/leap:15.6 after `zypper -n in --no-recommends
+           java-17-openjdk-headless` (17.0.18.0-150400.3.63.1): the JVMs live under /usr/lib64/jvm
+           and /usr/lib/jvm does not exist; the `release` payload is `cat
+           /usr/lib64/jvm/java-17-openjdk-17/release` verbatim (it has no IMAGE_TYPE, and
+           IMPLEMENTOR="N/A").
+note:      none of the three OpenJDK 8 homes contains a `release` file (the find prints none).
+
+-- mountinfo_docker_nfs4.txt --
+status:    REAL CAPTURE (the file verbatim, 12 lines; the nfs4 mount is the last line)
+host:      Docker Desktop VM (Linux 7.0.12-linuxkit aarch64); a privileged alpine:3.20 container
+           with an NFSv4 mount of a second container (itsthenetwork/nfs-server-alpine exporting a
+           named volume) at /mnt/nfs
+command:   mount -t nfs4 -o vers=4,proto=tcp,port=2049 <server>:/ /mnt/nfs ; cat /proc/self/mountinfo
+date:      2026-09-24

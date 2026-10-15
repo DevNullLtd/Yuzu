@@ -313,7 +313,16 @@ private:
     /// Build the JSON body to POST. For a single event this is the raw
     /// payload_json. For a batched flush, the events are wrapped in a
     /// JSON array under `{"events":[…]}`.
-    static std::string build_batch_body(const std::vector<BufferedEvent>& events);
+    ///
+    /// #2437-class guard: each event's raw `payload_json` is depth-checked
+    /// BEFORE `nlohmann::json::parse` ever sees it (see mcp_jsonrpc.hpp's
+    /// `json_exceeds_depth`): a too-deep event is preserved as a raw string
+    /// element, the same fallback already used for a genuinely unparseable
+    /// event, rather than being parsed into a tree whose `.dump()` below
+    /// would be unboundedly recursive. `target_id` is for the log line only
+    /// (identifiers, never the payload).
+    static std::string build_batch_body(const std::vector<BufferedEvent>& events,
+                                        int64_t target_id);
 
     // LAST-DECLARED MEMBER (#3261 governance hardening, ported from the
     // SQLite era) - see the identical comment history on

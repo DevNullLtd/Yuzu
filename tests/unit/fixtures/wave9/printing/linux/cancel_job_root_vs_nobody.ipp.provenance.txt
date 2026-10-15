@@ -1,0 +1,40 @@
+status: REAL CAPTURE
+
+host: ubuntu:26.04 (linux/arm64) Docker container on this Mac, cupsd 2.4.16
+      (Debian/Ubuntu packaging: `Require user @OWNER @SYSTEM` on Cancel-Job,
+      `SystemGroup root lpadmin` in cups-files.conf — see
+      grep-Cancel-Job / grep-SystemGroup output quoted in the I93-7 commit)
+date: 2026-09-08 (UTC, see `date -u` at capture time)
+identity: id -u = 0 (root, real container root — no PeerCred impersonation
+          needed; the header is sent anyway to match printing_plugin.cpp's
+          real do_clear_queue request shape)
+
+request: Cancel-Job (0x0008), printer `yuzu_test`, job-id 1, requesting-
+user-name=root, request-id 1 — plus header `Authorization: PeerCred root`.
+Job 1 was submitted as `nobody` (`su -s /bin/sh nobody -c 'lp -d yuzu_test
+/etc/hosts'`) onto a queue backed by socket://127.0.0.1:9100 (nothing
+listening — jobs stay queued, the printer itself was `cupsdisable`d
+immediately after creation so nothing dispatches before capture).
+
+exact command:
+  cd tests/unit/fixtures/wave9/printing/linux
+  python3 build_request.py cancel-job yuzu_test 1 root > /tmp/req1.ipp
+  curl --unix-socket /run/cups/cups.sock -s -X POST \
+      -H 'Content-Type: application/ipp' \
+      -H 'Authorization: PeerCred root' \
+      --data-binary @/tmp/req1.ipp \
+      http://localhost/ -o cancel_job_root_vs_nobody.ipp
+
+decoded result: 72 bytes; HTTP 200; status-code 0x0000 (successful-ok) —
+root, an @SYSTEM member (SystemGroup root lpadmin), cancelling a job it
+does NOT own succeeds. Verified afterward: `lpstat -o yuzu_test` no longer
+lists job 1.
+
+WHAT THIS PROVES: this is the discriminating identity-mismatch control
+this Mac's earlier macOS capture (P93-1) could NOT provide — every local
+macOS account there is a print operator via _lpoperator's nested groups,
+so no principal on that host can be refused purely by identity. Here, a
+genuinely different, unprivileged principal (nobody, uid 65534) owns the
+target job, and a SYSTEM-group principal (root) cancels it successfully —
+this is the measured basis for promoting the Linux `clear_queue` descriptor
+row from CONSTRAINED/PROVISIONAL to SUPPORTED (rung 1).

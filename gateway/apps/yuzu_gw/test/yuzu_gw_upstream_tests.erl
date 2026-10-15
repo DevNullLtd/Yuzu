@@ -35,6 +35,8 @@ upstream_test_() ->
       {"empty flush sends no rpc", fun empty_flush_no_rpc/0},
       {"proxy_register returns response", fun proxy_register_ok/0},
       {"proxy_register returns error", fun proxy_register_error/0},
+      {"HA WS-4 4.4 (c-1/CH-2): a real http_error shape does not crash",
+       fun proxy_register_http_error/0},
       {"proxy_inventory returns response", fun proxy_inventory_ok/0},
       {"notify_stream_status does not crash on error", fun notify_no_crash/0},
       {"connect notification advertises command_dispatch_tag_v1", fun notify_advertises_dispatch_tag_capability/0},
@@ -50,7 +52,7 @@ setup() ->
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
     %% Use a long interval so flushes don't happen automatically during tests.
-    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
+    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 5),
     {ok, HBPid} = yuzu_gw_heartbeat_buffer:start_link(),
     {ok, UpPid} = yuzu_gw_upstream:start_link(),
@@ -142,14 +144,41 @@ proxy_register_ok() ->
     ?assertMatch({ok, #{session_id := <<"new-sess">>}}, Result).
 
 proxy_register_error() ->
+    %% HA WS-4 4.4 fix: grpcbox_client:unary/5's REAL error return for a
+    %% genuine (non-transport) grpc status is a 3-ELEMENT tuple — `error`,
+    %% the `{Status, Message}` pair, and the trailers map
+    %% (grpcbox_client.erl's unary_handler, via recv_trailers/1) — not the
+    %% OLD mocked shape here (`{error, {Status, Message, Trailers}}`, a
+    %% 2-element tuple whose 2nd element was itself a 3-tuple), which this
+    %% test previously used and do_rpc's matching clause mirrored. That
+    %% shape does not match ANYTHING grpcbox actually returns, so do_rpc's
+    %% corresponding clause could never fire against the real dependency —
+    %% both were wrong together. Fixed to the real shape.
     meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
-            _       -> {error, {14, <<"UNAVAILABLE">>, #{}}}
+            _       -> {error, {14, <<"UNAVAILABLE">>}, #{}}
         end
     end),
     Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertMatch({error, {14, _}}, Result).
+
+proxy_register_http_error() ->
+    %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 / chaos-injector
+    %% CH-2): a FOURTH real grpcbox_client:unary/5 return shape,
+    %% `{http_error, {Status, Message}, Trailers}` (a non-grpc-layer HTTP
+    %% error), previously matched no clause in do_rpc and would have crashed
+    %% this gen_server with a case_clause exception.
+    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
+        case binary:match(Path, <<"ProxyRegister">>) of
+            nomatch -> {ok, #{}, #{}};
+            _       -> {http_error, {502, <<>>}, #{}}
+        end
+    end),
+    Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    ?assertMatch({error, {internal, _}}, Result),
+    %% Above all: the gen_server survived and answers normally.
+    ?assert(is_pid(whereis(yuzu_gw_upstream))).
 
 proxy_inventory_ok() ->
     meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
@@ -169,7 +198,8 @@ notify_no_crash() ->
             _       -> {error, connection_refused}
         end
     end),
-    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>),
+    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>,
+                                           <<"test-home-1">>),
     timer:sleep(100),
     %% The upstream process should still be alive.
     ?assert(is_process_alive(whereis(yuzu_gw_upstream))).
@@ -185,11 +215,10 @@ notify_advertises_dispatch_tag_capability() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged => true}, #{}}
     end),
-    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>),
-    timer:sleep(100),
-    Calls = meck:history(grpcbox_client),
-    NotifyReqs = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
-                         binary:match(Path, <<"NotifyStreamStatus">>) =/= nomatch],
+    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>,
+                                           <<"test-home-1">>),
+    %% The RPC runs in a process the upstream spawns, so poll for it.
+    NotifyReqs = await_rpcs(<<"NotifyStreamStatus">>),
     ?assert(length(NotifyReqs) > 0),
     [LastReq | _] = lists:reverse(NotifyReqs),
     ?assert(lists:member(<<"command_dispatch_tag_v1">>,
@@ -200,8 +229,11 @@ buffer_retained_on_failure() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(50),
+    HBPid = whereis(yuzu_gw_heartbeat_buffer),
+    HBPid ! flush,
+    %% Barrier, not a sleep: the reply proves the drain flush was handled
+    %% before meck history is reset (see await_rpcs/1).
+    _ = sys:get_state(HBPid),
     meck:reset(grpcbox_client),
 
     %% Queue 3 heartbeats.
@@ -214,8 +246,7 @@ buffer_retained_on_failure() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
+    _ = flush_and_await(),
 
     %% Now make flush succeed and add one more heartbeat.
     meck:reset(grpcbox_client),
@@ -231,12 +262,7 @@ buffer_retained_on_failure() ->
     timer:sleep(20),
 
     %% Trigger flush — should include all 4 heartbeats (3 retained + 1 new).
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
-
-    Calls = meck:history(grpcbox_client),
-    BatchCalls = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
-                         binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
+    BatchCalls = flush_and_await(),
     ?assert(length(BatchCalls) > 0),
     [LastBatch | _] = BatchCalls,
     HBs = maps:get(heartbeats, LastBatch, []),
@@ -247,8 +273,11 @@ buffer_cap_on_failure() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(50),
+    HBPid = whereis(yuzu_gw_heartbeat_buffer),
+    HBPid ! flush,
+    %% Barrier, not a sleep: the reply proves the drain flush was handled
+    %% before meck history is reset (see await_rpcs/1).
+    _ = sys:get_state(HBPid),
     meck:reset(grpcbox_client),
 
     %% Queue 10 heartbeats (exceeds cap of 5).
@@ -261,8 +290,7 @@ buffer_cap_on_failure() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
+    _ = flush_and_await(),
 
     %% Now make flush succeed.
     meck:reset(grpcbox_client),
@@ -276,16 +304,42 @@ buffer_cap_on_failure() ->
     end),
 
     %% Trigger flush — should include at most 5 (capped) heartbeats.
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
-
-    Calls = meck:history(grpcbox_client),
-    BatchCalls = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
-                         binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
+    BatchCalls = flush_and_await(),
     ?assert(length(BatchCalls) > 0),
     [LastBatch | _] = BatchCalls,
     HBs = maps:get(heartbeats, LastBatch, []),
     ?assert(length(HBs) =< 5).
+
+%% Poll meck history for the grpcbox_client:unary requests whose path contains
+%% PathBin; returns them in call order. Replaces a fixed `timer:sleep(N)` before
+%% reading history, which is an UPPER-bound race on a loaded runner (#4851 runs
+%% this suite on macOS CI for the first time; BigMags shares its CPU between
+%% two agents, and fixed sleeps have already flaked twice there). The RPC runs
+%% in another process (the heartbeat buffer, or a notifier the upstream
+%% spawns), and meck records each call with an async cast to its own process,
+%% so history is polled every 10ms up to a 2s deadline. Callers only claim
+%% "this RPC was sent with these contents", so the deadline changes nothing
+%% they assert.
+await_rpcs(PathBin) ->
+    await_rpcs(PathBin, erlang:monotonic_time(millisecond) + 2000).
+
+await_rpcs(PathBin, Deadline) ->
+    Reqs = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _}
+                       <- meck:history(grpcbox_client),
+                   binary:match(Path, PathBin) =/= nomatch],
+    case Reqs =:= [] andalso erlang:monotonic_time(millisecond) < Deadline of
+        true -> timer:sleep(10), await_rpcs(PathBin, Deadline);
+        false -> Reqs
+    end.
+
+%% Send the heartbeat buffer a `flush`, then wait for its BatchHeartbeat RPC.
+%% sys:get_state/1 is a system message queued behind `flush`, so its reply
+%% proves the flush handler has run (and fails the test here if it crashed).
+flush_and_await() ->
+    Pid = whereis(yuzu_gw_heartbeat_buffer),
+    Pid ! flush,
+    _ = sys:get_state(Pid),
+    await_rpcs(<<"BatchHeartbeat">>).
 
 %%% R-3 (#1243): classify_tls_error/1 picks TLS handshake failures out of the
 %%% upstream transport-error term (so they get a distinct metric) without

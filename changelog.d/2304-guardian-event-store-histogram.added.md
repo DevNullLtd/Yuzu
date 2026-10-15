@@ -1,1 +1,0 @@
-- Guardian ingest now exposes a per-status store-duration histogram `yuzu_server_guardian_event_store_duration_seconds{status}` (inserted/redelivered/conflict/error), timing the `insert_event_classified` store operation with a 0.1ms-10s bucket ladder. A validation signal for the planned off-write-path compare (#2298); the go/no-go itself needs a concurrent benchmark.

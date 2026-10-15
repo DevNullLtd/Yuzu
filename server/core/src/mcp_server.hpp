@@ -25,12 +25,14 @@
 // reuse discipline as kek_routes.hpp above. Also brings in UploadGrantStore
 // fully defined, so no separate include is needed for that.
 #include "file_retrieval_routes.hpp"
-#include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
+#include "discovered_devices_model.hpp" // list_discovered_devices read seam (DiscoveredDevicesReadFn)
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
+#include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
+#include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
-#include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
+#include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
@@ -56,10 +58,14 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
-#include "schedule_engine.hpp"
+#include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): the public in-process schedule-read API seam
+#include "schedule_engine.hpp" // still needed for the ScheduleEngine* build_handler param -- see set_schedule_api's doc comment
+#include "scope_eval_error.hpp" // #4981 PR-2: ScopeEvalError — ScopeEvaluateFn's typed failure surface
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
-#include "workflow_engine.hpp" // #4030: WorkflowEngine — list_workflows/get_workflow/get_workflow_execution
+#include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
+#include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
+#include "workflow_engine.hpp" // still needed for the WorkflowEngine* build_handler param -- see set_workflow_api's doc comment
 // #4027: DeviceRow (via device_routes.hpp) + TarRetentionPausedScan/
 // TarPausedSourceRow + the tar_*_json pure builders the read-twin MCP tools
 // share with their REST siblings (api-twin-recipe.md Rule 1).
@@ -85,6 +91,7 @@ namespace yuzu::server {
 class HttpRouteSink; // #2542 PR-6: register_routes(HttpRouteSink&, ...) overload
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
+class AppUsageStore; // wave 7 PR7.2 app-usage projection (get_agent_app_usage)
 // EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
 // (assign_engine_role/unassign_engine_role/list_engine_roles) AND the PR 4.3
 // engine-principal lifecycle tools (ADR-1005 item 2b). Forward-declared
@@ -108,6 +115,10 @@ class PluginConfigStore;
 // handler, which is the same shape). Forward-declared (pointer-only in the
 // setter below); the .cpp includes preflight_run_store.hpp for the definition.
 class PreflightRunStore;
+// Read-only deployment list/detail (list_deployments / get_deployment). Forward-declared
+// (pointer-only in the setter below); the .cpp includes deployment_routes.hpp, which pulls in
+// the store definition and the shared JSON builders.
+class DeploymentRunStore;
 // #2146 Batch B1 — backs get_guardian_device_compliance (the SAME BaselineStore
 // GET /guaranteed-state/device-compliance already reads). Forward-declared
 // (pointer-only in the setter below); the .cpp includes baseline_store.hpp for
@@ -514,6 +525,19 @@ public:
     /// both tools answer "unavailable" rather than crashing.
     void set_preflight_run_store(PreflightRunStore* store) { preflight_run_store_ = store; }
 
+    /// The deployment run store, backing `list_deployments` and `get_deployment`
+    /// (mirror GET /api/v1/deployments[/{id}], owner-scoped, read-only). Unset
+    /// (`nullptr`, the default) => both tools answer "unavailable". This is the live
+    /// `/auto` engine's store, NOT the dormant `SoftwareDeploymentStore`.
+    void set_deployment_run_store(DeploymentRunStore* store) { deployment_run_store_ = store; }
+    /// Network discovery read seam, backing `list_discovered_devices` (mirrors
+    /// GET /api/v1/network/discovered-devices; same shared builders). A
+    /// function rather than a store so tests inject fixtures. Unset (empty,
+    /// the default) => the tool answers "unavailable" rather than crashing.
+    void set_discovered_devices_reader(DiscoveredDevicesReadFn reader) {
+        discovered_devices_reader_ = std::move(reader);
+    }
+
     /// #2146 Batch B2 — the scope-walking result-set store, backing the 12
     /// result-set MCP tools (`list_result_sets` through `delete_result_set`).
     /// Same setter idiom as `set_preflight_run_store` above. Unset
@@ -538,19 +562,19 @@ public:
     /// #2146 Batch B3 — the fleet-visualization store trio backing
     /// `get_fleet_topology`/`get_host_topology` (mirrors GET
     /// /api/v1/viz/fleet/topology and GET /api/v1/viz/host/{id}/topology).
-    /// Same setter idiom as `set_preflight_run_store` above. `offline_store`
-    /// may be null (offline hosts are then not stale-flagged, matching
-    /// `VizRoutes`' own null-offline-store legacy behavior); `kill_switch`
+    /// Same setter idiom as `set_preflight_run_store` above. `offline_roster_fn`
+    /// may be empty (an unwired roster: offline hosts are then not
+    /// merged and the topology is live-only, with no degraded flag); `kill_switch`
     /// may be null (then the viz kill switch is never consulted on the MCP
     /// path — production MUST wire the same `--viz-disable` /
     /// `yuzu_viz_disabled` atomic the REST `VizRoutes` registration uses, or
     /// disabling the feature would silently leave the MCP twins reachable).
     /// Unset `fleet_topology_store` (`nullptr`, the default) ⇒ both tools
     /// answer "unavailable" rather than crashing.
-    void set_viz_deps(FleetTopologyStore* fleet_topology_store, OfflineEndpointStore* offline_store,
+    void set_viz_deps(FleetTopologyStore* fleet_topology_store, OfflineRosterFn offline_roster_fn,
                       const std::atomic<bool>* kill_switch) {
         fleet_topology_store_ = fleet_topology_store;
-        offline_endpoint_store_ = offline_store;
+        offline_roster_fn_ = std::move(offline_roster_fn);
         viz_kill_switch_ = kill_switch;
     }
 
@@ -597,6 +621,24 @@ public:
                                                   const std::string& securable_type,
                                                   const std::string& operation)>;
     void set_list_read_fn(ListReadFn fn) { list_read_fn_ = std::move(fn); }
+
+    /// #4981 PR-2 — `preview_scope_targets`'s SOLE scope-evaluation callback:
+    /// a thin closure over `AgentRegistry::evaluate_scope` with the caller's
+    /// tag/custom-properties/result-set stores already bound (the SAME
+    /// binding shape `command_routes.cpp`'s Scope arm and
+    /// `wire_and_dispatch_confined`, dispatch_scope_ladder.hpp, already use —
+    /// see `scope_preview.hpp`'s identically-shaped `yuzu::server::ScopeEvaluateFn`
+    /// for the full contract this mirrors, independently declared per this
+    /// class's own `Fn`-alias convention rather than a shared type import).
+    /// Injected rather than threading `AgentRegistry*`/`CustomPropertiesStore*`
+    /// raw pointers into this class (matches `set_result_set_store`'s "one
+    /// setter per borrowed dependency" idiom). MUST be called BEFORE
+    /// `build_handler()`. Unset (`{}`, the default) makes
+    /// `preview_scope_targets` answer `kInternalError` (misconfigured call
+    /// site), same posture as `fleet_read_fn_` unwired.
+    using ScopeEvaluateFn = std::function<std::expected<std::vector<std::string>, ScopeEvalError>(
+        const yuzu::scope::Expression&, const std::string& principal)>;
+    void set_scope_evaluate_fn(ScopeEvaluateFn fn) { scope_evaluate_fn_ = std::move(fn); }
 
     /// #2146 Batch B1 — the injected-callback twin of `RestApiV1::GuardianPushFn`
     /// (rest_api_v1.hpp), backing `push_guardian_rules`. Same shape (scope +
@@ -658,32 +700,96 @@ public:
         response_visible_set_fn_ = std::move(fn);
     }
 
-    /// #4035: the SAME cross-store fleet provider `DexRoutes`/`RestApiV1`
-    /// already receive (see `RestApiV1::DexFleetFn`'s doc comment,
-    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda into all
-    /// three surfaces so the dashboard fragment, the REST twin, and this MCP
-    /// twin can never read a different fleet snapshot for the same request.
-    /// Unset (default-constructed) degrades the fleet-dependent DEX tools
-    /// (get_dex_health/get_dex_trends/get_dex_overview/get_dex_catalogue_group)
-    /// to their "no reporting agents" suppressed shape — never a crash.
-    using DexFleetFn = std::function<DexFleet()>;
-    void set_dex_fleet_fn(DexFleetFn fn) { dex_fleet_fn_ = std::move(fn); }
+    /// ADR-0031 WS-A4 (fifth family): the SAME in-process DEX signals API seam
+    /// the REST `/api/v1/dex/*` handlers use — server.cpp wires the IDENTICAL
+    /// instance so the MCP DEX signal tools can never disagree with REST on the
+    /// signal/experience model. The DEX signal tools REQUIRE it: their
+    /// harmonized `if (!dex_api_)` readiness guard returns the "Guaranteed State
+    /// store unavailable" error when it is null — server.cpp wires it iff the
+    /// store is present, so null ⟺ store absent, mirroring verify_api's
+    /// null→error contract.
+    void set_dex_api(std::shared_ptr<const DexApi> a) { dex_api_ = std::move(a); }
 
-    /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
-    /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
-    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda
-    /// (`visible_set_fn`) into the dashboard fragment, the REST twin, and this
-    /// MCP twin, so `get_dex_app`/`get_dex_overview` confine their
-    /// devices/top_devices lists to the caller's management-group scope
-    /// (ADR-0017 World A) exactly like `/fragments/dex/app` and
-    /// `/fragments/dex/overview` already do. This is a SECOND, independent
-    /// belt alongside `deny_fleet_wide_service_scoped` — that closes the
-    /// service-scoped-token axis, this closes the confined-OPERATOR axis.
-    /// Unset (default-constructed) degrades to "no confinement" (matching the
-    /// fragment's own unwired-`visible_set_fn_` posture), never a crash.
-    using DexVisibleFn =
-        std::function<std::optional<std::set<std::string>>(const std::string& username)>;
-    void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }
+    /// ADR-0031 WS-A4 (sixth family): the SAME in-process DEX app-perf-over-time
+    /// API seam the REST `/api/v1/dex/perf/*` handlers use (server.cpp wires the
+    /// IDENTICAL instance) — backs the 9 MCP DEX perf tool twins +
+    /// get_dex_device_app_perf. server.cpp constructs it UNCONDITIONALLY
+    /// (never null) — each backing store pointer is checked individually
+    /// inside the impl, matching the old per-lambda null-checks; the tools'
+    /// `!dex_perf_api_` readiness guard is defense-in-depth, never expected to
+    /// fire. `AppPerfProviders` (the pre-seam bundle) is retired (#4626) — the
+    /// dashboard fragments now route through this same seam too.
+    void set_dex_perf_api(std::shared_ptr<const DexPerfApi> a) { dex_perf_api_ = std::move(a); }
+
+    // #4035 hardening (governance) introduced a bespoke `DexVisibleFn`
+    // resolver for `get_dex_app`/`get_dex_overview`/`get_dex_signal_detail` —
+    // retired (WS-A4 PR-1 fix round, sec-1/sec-2): see
+    // `RestApiV1::DexVisibleFn`'s retirement comment (rest_api_v1.hpp) for
+    // the full rationale — the bare `perm_fn`/`tier_allows` gate in front of
+    // it resolved GLOBAL roles only, so this resolver's confinement was
+    // dormant on every admitted call. Per the WS-A4 PR-1 decision (see the
+    // same rest_api_v1.hpp comment) all three tools REVERTED to base
+    // gating instead of moving onto `fleet_read_fn_`: every value they
+    // return is a fleet-wide aggregate (an ADR-0017 INV-3 concern, not a
+    // per-caller-confinement one), so they gate on the bare
+    // `perm_fn`/`tier_allows` (`GuaranteedState:Read`: a global grant, or with
+    // RBAC off any authenticated non-service/non-engine session) plus the base MCP `ServiceScopeClass`
+    // service-token deny — no per-caller confinement resolver, dormant or
+    // otherwise, on any of the three.
+
+    /// ADR-0031 WS-A4 (seventh family): the SAME in-process schedule-read API
+    /// seam the REST `GET /api/v1/schedules` handler and the dashboard
+    /// fragment (`GET /fragments/schedules`) use — server.cpp wires the
+    /// IDENTICAL instance so `list_schedules` can never disagree with either.
+    /// A SETTER, not a `build_handler` parameter (unlike `network_api`) —
+    /// mirrors `set_dex_perf_api` above: `build_handler`'s own
+    /// `ScheduleEngine* schedule_engine` parameter is now unused inside the
+    /// `list_schedules` handler body (superseded by this seam) but is kept,
+    /// unremoved, for constructor-signature stability — a bounded, two-site
+    /// ripple (the two `ScheduleEngine* schedule_engine` forwarding-overload
+    /// parameters in mcp_server.cpp that construct `build_handler`'s caller),
+    /// not an open-ended one; a disclosed, deferred follow-up, not an
+    /// oversight (matrix doc, `schedule` family row). Unset (default-constructed
+    /// null) ⇒ the tool's own `!schedule_api_`
+    /// readiness guard answers "Schedule engine unavailable", matching the
+    /// pre-seam `!schedule_engine` guard's behaviour exactly.
+    void set_schedule_api(std::shared_ptr<const ScheduleApi> a) { schedule_api_ = std::move(a); }
+
+    /// ADR-0031 WS-A4 (eighth family): the SAME in-process workflow-read API
+    /// seam the REST `GET /api/v1/workflows[/{id}]` and
+    /// `GET /api/v1/workflow-executions[/{id}]` handlers use — server.cpp
+    /// wires the IDENTICAL instance so `list_workflows`/`get_workflow`/
+    /// `get_workflow_execution`/`list_workflow_executions` can never
+    /// disagree with REST v1.
+    /// A SETTER, not a `build_handler` parameter — mirrors `set_schedule_api`
+    /// above: `build_handler`'s own `WorkflowEngine* workflow_engine`
+    /// parameter is now unused inside these tool bodies (superseded by
+    /// this seam) but is kept, unremoved, for constructor-signature
+    /// stability — a bounded, disclosed, deferred follow-up, not an
+    /// oversight (matrix doc, `workflow` family row). Unset (default-
+    /// constructed null) ⇒ the tools' own `!workflow_api_` readiness guard
+    /// answers "Workflow engine unavailable", matching the pre-seam
+    /// `!workflow_engine` guard's behaviour exactly.
+    void set_workflow_api(std::shared_ptr<const WorkflowApi> a) { workflow_api_ = std::move(a); }
+
+    /// ADR-0031 WS-A4 (ninth family): the SAME in-process Guardian-read API
+    /// seam the REST `GET /api/v1/guaranteed-state/*` handlers use —
+    /// server.cpp wires the IDENTICAL instance so the eight Guardian read
+    /// tools can never disagree with REST v1 (`get_guardian_schemas` stays
+    /// outside the seam, store-free — see guardian_api.hpp). `build_handler`'s
+    /// own `GuaranteedStateStore* guaranteed_state_store` parameter stays
+    /// wired too — the eight Guardian tool bodies below now call
+    /// `guardian_api_` exclusively for their reads, but the rule/baseline
+    /// MUTATOR tools (`create_guardian_rule` etc., no public seam of their
+    /// own) still need the raw store. server.cpp constructs this
+    /// UNCONDITIONALLY (never null) — each of the two backing store
+    /// pointers is checked INDIVIDUALLY inside the impl (guardian_api.cpp),
+    /// mirroring dex_perf_api's own multi-dependency posture: a null
+    /// `guaranteed_state_store_` degrades every method, a null
+    /// `baseline_store_` degrades ONLY device_compliance. The tools' own
+    /// `!guardian_api_` guard is therefore defense-in-depth only, matching
+    /// the pre-seam `!guaranteed_state_store` guard's practical behaviour.
+    void set_guardian_api(std::shared_ptr<const GuardianApi> a) { guardian_api_ = std::move(a); }
 
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
@@ -737,7 +843,6 @@ public:
                             ResponseScopeFn response_scope_fn = {},
                             SoftwareInventoryStore* software_inventory_store = nullptr,
                             yuzu::MetricsRegistry* metrics = nullptr,
-                            AppPerfProviders app_perf_providers = {},
                             QuarantineStore* quarantine_store = nullptr,
                             TagPushFn tag_push_fn = {},
                             // A2 discovery (roadmap Issue 17.1): backs discover_plugins.
@@ -881,7 +986,19 @@ public:
                             // polic* routes use, so all three surfaces can never
                             // disagree. Trailing optional dep; nullptr leaves those
                             // tools on the pre-seam "Policy store unavailable" degrade.
-                            std::shared_ptr<const ComplianceApi> compliance_api = nullptr);
+                            std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                            // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API
+                            // seam — backs `list_agents`/`get_agent_details`. The SAME
+                            // instance `DeviceRoutes`/REST GET /api/v1/devices[/{id}]
+                            // use, so all three surfaces can never disagree. Trailing
+                            // optional dep; nullptr leaves both tools on the pre-seam
+                            // "internal error"/unwired degrade.
+                            std::shared_ptr<const DeviceApi> device_api = nullptr,
+                            // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
+                            // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                            // (kept last across the device_api merge) so adding it can never shift a
+                            // later positional caller's arguments.
+                            AppUsageStore* app_usage_store = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -931,7 +1048,6 @@ public:
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
@@ -993,7 +1109,14 @@ public:
                          CaRoutes::ExportCsrFn export_csr_fn = {},
                          CaRoutes::ImportChainFn import_chain_fn = {},
                          // ADR-0031 WS-A4: see build_handler's doc comment above.
-                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr);
+                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                         // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
+                         // forwarded to it for `list_agents`/`get_agent_details`.
+                         std::shared_ptr<const DeviceApi> device_api = nullptr,
+                         // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
+                         // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                         // (kept last across the device_api merge).
+                         AppUsageStore* app_usage_store = nullptr);
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -1016,7 +1139,6 @@ public:
                          ResponseScopeFn response_scope_fn = {},
                          SoftwareInventoryStore* software_inventory_store = nullptr,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         AppPerfProviders app_perf_providers = {},
                          QuarantineStore* quarantine_store = nullptr,
                          TagPushFn tag_push_fn = {},
                          yuzu::server::detail::AgentRegistry* agent_registry = nullptr,
@@ -1054,7 +1176,14 @@ public:
                          CaRoutes::ExportCsrFn export_csr_fn = {},
                          CaRoutes::ImportChainFn import_chain_fn = {},
                          // ADR-0031 WS-A4: see build_handler's doc comment above.
-                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr);
+                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                         // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
+                         // forwarded to it for `list_agents`/`get_agent_details`.
+                         std::shared_ptr<const DeviceApi> device_api = nullptr,
+                         // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
+                         // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                         // (kept last across the device_api merge).
+                         AppUsageStore* app_usage_store = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
@@ -1092,25 +1221,34 @@ private:
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
     PreflightRunStore* preflight_run_store_{nullptr};
+    DeploymentRunStore* deployment_run_store_{nullptr};
+    DiscoveredDevicesReadFn discovered_devices_reader_;
     // #2146 Batch B2 — see set_result_set_store above.
     ResultSetStore* result_set_store_{nullptr};
+    // #4981 PR-2 — see set_scope_evaluate_fn above.
+    ScopeEvaluateFn scope_evaluate_fn_;
     // #2146 Batch B1 — see set_baseline_store above.
     BaselineStore* baseline_store_{nullptr};
     // #2146 Batch B1 — see set_guardian_push_fn above.
     GuardianPushFn guardian_push_fn_;
     // #2146 Batch B3 — see set_viz_deps above.
     FleetTopologyStore* fleet_topology_store_{nullptr};
-    OfflineEndpointStore* offline_endpoint_store_{nullptr};
+    yuzu::server::OfflineRosterFn offline_roster_fn_;
     const std::atomic<bool>* viz_kill_switch_{nullptr};
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};
     // #4033 — see set_response_visible_set_fn above.
     ResponseVisibleSetFn response_visible_set_fn_;
-    // #4035 — see set_dex_fleet_fn above.
-    DexFleetFn dex_fleet_fn_;
-    // #4035 hardening (governance) — see set_dex_visible_fn above.
-    DexVisibleFn dex_visible_fn_;
+    // ADR-0031 WS-A4 (fifth family) — see set_dex_api above.
+    std::shared_ptr<const DexApi> dex_api_;
+    std::shared_ptr<const DexPerfApi> dex_perf_api_;
+    // ADR-0031 WS-A4 (seventh family) — see set_schedule_api above.
+    std::shared_ptr<const ScheduleApi> schedule_api_;
+    // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.
+    std::shared_ptr<const WorkflowApi> workflow_api_;
+    // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
+    std::shared_ptr<const GuardianApi> guardian_api_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

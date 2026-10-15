@@ -1,1 +1,0 @@
-- Windows installer and Debian package builds no longer pass a dead `/DContentDir=` define to Inno Setup, and the Debian build script's header no longer claims it copies a `content/` directory it stopped copying. The configure-time PyYAML failure now tells you to re-run with `meson setup --wipe` rather than `--reconfigure`, which does not re-probe.

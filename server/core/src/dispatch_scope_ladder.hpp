@@ -23,6 +23,7 @@
 #include "management_group_store.hpp"
 #include "result_set_store.hpp"
 #include "scope_engine.hpp"
+#include "scope_eval_error.hpp"
 #include "scope_yaml.hpp"
 #include "tag_store.hpp"
 
@@ -52,12 +53,80 @@ namespace yuzu::server {
 /// WHEN to fire them. Each is called at most once per resolve.
 struct ScopeLadderAudit {
     /// A referenced result-set failed the owner check (absent/expired/not
-    /// owned) — one call per failing ref (governance M1 forensic row).
+    /// owned) — one call per failing ref (governance M1 forensic row). #4981
+    /// PR-1: also fired (with the failing result-set id) when
+    /// `evaluate_scope_fn` itself returns `ScopeEvalError::Kind::OwnerCheckFailed`
+    /// — the TOCTOU case where a set passes `gate_scope_dispatch`'s earlier
+    /// forensic pass but is deleted before this ladder's own registry
+    /// evaluation runs — so that abort gets the same per-ref-row +
+    /// abort-row pair the gate path already produces, never an abort row
+    /// with no ref anywhere.
     std::function<void(const std::string& ref)> resolution_failed;
-    /// The whole evaluation aborted; reason is one of "db_degraded",
-    /// "owner_check_failed", "principal_unresolved".
+    /// The whole evaluation aborted; `reason` is `to_string(ScopeAbortReason)`
+    /// — see that enum below for the full vocabulary.
     std::function<void(const std::string& reason)> evaluation_aborted;
 };
+
+/// The FIXED vocabulary of reasons `resolve_scope_targets` can abort for —
+/// #4981 PR-1: replaces the pre-#4981 heuristic
+/// (`principal.empty() ? "principal_unresolved" : "db_degraded"`), which
+/// could not distinguish an owner-check failure or a presence degrade from a
+/// generic store degrade. Directly mapped from `ScopeEvalError::Kind`
+/// (`scope_eval_error.hpp`) wherever the abort originates from
+/// `evaluate_scope_fn`; `DbDegraded`/`OwnerCheckFailed` are ALSO produced
+/// earlier in the ladder, by `resolve_scope_aliases`/`gate_scope_dispatch`
+/// respectively, before `evaluate_scope_fn` is ever called.
+enum class ScopeAbortReason {
+    DbDegraded,
+    OwnerCheckFailed,
+    PrincipalUnresolved,
+    Unresolvable,
+    PresenceDegraded,
+};
+
+/// Audit-log string vocabulary for `ScopeAbortReason` — MUST agree pairwise
+/// with `scope_eval_error.hpp`'s `to_string(ScopeEvalError::Kind)` (see
+/// `test_dispatch_confined_arms.cpp`'s vocabulary-agreement test). `Unresolvable`
+/// gets ITS OWN string ("unresolvable") rather than reusing "db_degraded" —
+/// unreachable on every real production ladder path (both stores are always
+/// wired there), but a defensive/test-only case still deserves a correct,
+/// non-misleading label rather than borrowing an unrelated one.
+inline const char* to_string(ScopeAbortReason r) {
+    switch (r) {
+    case ScopeAbortReason::DbDegraded:
+        return "db_degraded";
+    case ScopeAbortReason::OwnerCheckFailed:
+        return "owner_check_failed";
+    case ScopeAbortReason::PrincipalUnresolved:
+        return "principal_unresolved";
+    case ScopeAbortReason::Unresolvable:
+        return "unresolvable";
+    case ScopeAbortReason::PresenceDegraded:
+        return "presence_degraded";
+    }
+    return "unknown";
+}
+
+/// Map `evaluate_scope`'s typed failure surface onto the ladder's own
+/// abort-reason vocabulary — the two enums are near-duplicates by design
+/// (`scope_eval_error.hpp` stays a small, dependency-free header a caller
+/// bypassing the ladder, e.g. `PolicyEvaluator::resolve_targets`, can use
+/// without pulling in this much heavier header).
+inline ScopeAbortReason to_abort_reason(ScopeEvalError::Kind k) {
+    switch (k) {
+    case ScopeEvalError::Kind::Unresolvable:
+        return ScopeAbortReason::Unresolvable;
+    case ScopeEvalError::Kind::PrincipalUnresolved:
+        return ScopeAbortReason::PrincipalUnresolved;
+    case ScopeEvalError::Kind::StoreDegraded:
+        return ScopeAbortReason::DbDegraded;
+    case ScopeEvalError::Kind::OwnerCheckFailed:
+        return ScopeAbortReason::OwnerCheckFailed;
+    case ScopeEvalError::Kind::PresenceDegraded:
+        return ScopeAbortReason::PresenceDegraded;
+    }
+    return ScopeAbortReason::DbDegraded;
+}
 
 /// `matched == nullopt` means ABORT — the caller must not dispatch (ADR-0036
 /// fail-closed; mirrors `ConfinedDispatchTargets::scope_matched`'s null-is-
@@ -65,10 +134,14 @@ struct ScopeLadderAudit {
 /// scope SYNTAX (as opposed to a degraded store or a failed owner check):
 /// `/api/command` surfaces it as its own 400; `ServerImpl::dispatch_confined`
 /// has no response to write and — matching its pre-existing behaviour —
-/// simply reaches nobody, no audit row.
+/// simply reaches nobody, no audit row. `abort_reason` (#4981 PR-1) is set
+/// whenever `matched` is absent for a reason OTHER than a parse error — a
+/// direct, typed record of WHY, for a caller/test that wants more than the
+/// string handed to `ScopeLadderAudit::evaluation_aborted`.
 struct ScopeLadderResult {
     std::optional<std::vector<std::string>> matched;
     std::optional<std::string> parse_error;
+    std::optional<ScopeAbortReason> abort_reason;
 };
 
 /// The ladder itself: alias resolution -> owner-check gate -> parse ->
@@ -78,8 +151,8 @@ struct ScopeLadderResult {
 /// principal is supplied — never in the ladder's control flow.
 inline ScopeLadderResult resolve_scope_targets(
     std::string_view scope_expr, const std::string& principal, ResultSetStore* result_set_store,
-    const std::function<std::optional<std::vector<std::string>>(const yuzu::scope::Expression&)>&
-        evaluate_scope_fn,
+    const std::function<std::expected<std::vector<std::string>, ScopeEvalError>(
+        const yuzu::scope::Expression&)>& evaluate_scope_fn,
     const ScopeLadderAudit& audit) {
     ScopeLadderResult result;
 
@@ -87,8 +160,9 @@ inline ScopeLadderResult resolve_scope_targets(
     if (!resolved_scope) {
         spdlog::error("scope dispatch: resolve_scope_aliases degraded ({})",
                       to_string(resolved_scope.error()));
+        result.abort_reason = ScopeAbortReason::DbDegraded;
         if (audit.evaluation_aborted)
-            audit.evaluation_aborted("db_degraded");
+            audit.evaluation_aborted(to_string(ScopeAbortReason::DbDegraded));
         return result;
     }
 
@@ -97,8 +171,9 @@ inline ScopeLadderResult resolve_scope_targets(
         gate_scope_dispatch(*resolved_scope, principal, result_set_store, failing_refs);
     if (gate == ScopeDispatchGate::AbortDbDegraded) {
         spdlog::error("scope dispatch: owner-check scan degraded");
+        result.abort_reason = ScopeAbortReason::DbDegraded;
         if (audit.evaluation_aborted)
-            audit.evaluation_aborted("db_degraded");
+            audit.evaluation_aborted(to_string(ScopeAbortReason::DbDegraded));
         return result;
     }
     if (gate == ScopeDispatchGate::AbortOwnerCheck) {
@@ -106,8 +181,9 @@ inline ScopeLadderResult resolve_scope_targets(
         for (const auto& ref : failing_refs)
             if (audit.resolution_failed)
                 audit.resolution_failed(ref);
+        result.abort_reason = ScopeAbortReason::OwnerCheckFailed;
         if (audit.evaluation_aborted)
-            audit.evaluation_aborted("owner_check_failed");
+            audit.evaluation_aborted(to_string(ScopeAbortReason::OwnerCheckFailed));
         return result;
     }
 
@@ -117,14 +193,26 @@ inline ScopeLadderResult resolve_scope_targets(
         return result;
     }
 
-    if (auto matched = evaluate_scope_fn(*parsed)) {
-        result.matched = std::move(matched);
+    auto matched = evaluate_scope_fn(*parsed);
+    if (matched) {
+        result.matched = std::move(*matched);
         return result;
     }
-    spdlog::error(
-        "scope dispatch: evaluate_scope degraded (result-set membership preload failed)");
+    // #4981 PR-1: a TOCTOU owner-check failure surfacing HERE (rather than at
+    // gate_scope_dispatch above) means the referenced set passed the gate's
+    // earlier forensic pass but was deleted/expired before evaluate_scope_fn's
+    // own registry evaluation ran — fire the SAME per-ref resolution_failed
+    // row the gate path fires above, so this abort gets a ref in the audit
+    // trail too (otherwise a caller sees "owner_check_failed" with no ref
+    // anywhere, unlike the gate-path case).
+    if (matched.error().kind == ScopeEvalError::Kind::OwnerCheckFailed &&
+        !matched.error().detail.empty() && audit.resolution_failed)
+        audit.resolution_failed(matched.error().detail);
+    result.abort_reason = to_abort_reason(matched.error().kind);
+    spdlog::error("scope dispatch: evaluate_scope degraded (reason={})",
+                  to_string(*result.abort_reason));
     if (audit.evaluation_aborted)
-        audit.evaluation_aborted(principal.empty() ? "principal_unresolved" : "db_degraded");
+        audit.evaluation_aborted(to_string(*result.abort_reason));
     return result;
 }
 
@@ -176,7 +264,8 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
     const authz::VisibleSet& exec_visible, bool broadcast_on_none, const ContainmentGate& gate,
     const DispatchResolvers& resolvers, const ConfinedDispatchSink& sink,
     const ConcurrencyClaimFn& claim_fn = nullptr,
-    const std::unordered_set<std::string>& plugin_missing = {}) {
+    const std::unordered_set<std::string>& plugin_missing = {},
+    const std::unordered_set<std::string>& os_kill_switched = {}) {
     ConfinedDispatchOutcome outcome;
     outcome.containment_unreadable = gate.enforced && gate.fail_closed;
     const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
@@ -204,13 +293,15 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         ConfinedDispatchTargets t;
         t.group_members = &members;
         const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
-                                              plugin_missing);
+                                              plugin_missing, os_kill_switched);
         outcome.sent = r.sent;
         outcome.denied_quarantined = r.denied_quarantined;
         outcome.denied_quarantined_count = r.denied_quarantined_count;
         outcome.not_sent = r.not_sent;
         outcome.unknown_plugin = r.unknown_plugin;
         outcome.unknown_plugin_count = r.unknown_plugin_count;
+        outcome.kill_switched_os = r.kill_switched_os;
+        outcome.kill_switched_os_count = r.kill_switched_os_count;
         outcome.route_unreadable = r.route_unreadable;
         return outcome;
     }
@@ -227,13 +318,15 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         ConfinedDispatchTargets t;
         t.scope_matched = &*ladder.matched;
         const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
-                                              plugin_missing);
+                                              plugin_missing, os_kill_switched);
         outcome.sent = r.sent;
         outcome.denied_quarantined = r.denied_quarantined;
         outcome.denied_quarantined_count = r.denied_quarantined_count;
         outcome.not_sent = r.not_sent;
         outcome.unknown_plugin = r.unknown_plugin;
         outcome.unknown_plugin_count = r.unknown_plugin_count;
+        outcome.kill_switched_os = r.kill_switched_os;
+        outcome.kill_switched_os_count = r.kill_switched_os_count;
         outcome.route_unreadable = r.route_unreadable;
         return outcome;
     }
@@ -249,13 +342,15 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         }
     }
     const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
-                                          plugin_missing);
+                                          plugin_missing, os_kill_switched);
     outcome.sent = r.sent;
     outcome.denied_quarantined = r.denied_quarantined;
     outcome.denied_quarantined_count = r.denied_quarantined_count;
     outcome.not_sent = r.not_sent;
     outcome.unknown_plugin = r.unknown_plugin;
     outcome.unknown_plugin_count = r.unknown_plugin_count;
+    outcome.kill_switched_os = r.kill_switched_os;
+    outcome.kill_switched_os_count = r.kill_switched_os_count;
     outcome.route_unreadable = r.route_unreadable;
     return outcome;
 }
@@ -356,6 +451,18 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         [&registry] { return registry.all_ids(); },
         [route_fallback](const std::vector<std::string>& candidates) {
             return route_fallback->prepare(candidates);
+        },
+        // HA WS-5: this is the PRIMARY production dispatch surface (MCP
+        // execute_instruction, workflows, scheduled dispatch, policy
+        // remediation, via wire_and_dispatch_confined) — governance Gate 3
+        // (architect, 2026-09-22) caught this site missing from the initial
+        // WS-5 diff, which would have silently killed confined_broadcast's
+        // unfiltered fast path here (an unset presence_widens is treated as
+        // "widens", forcing the slow filtered + prepare_route_fallback path
+        // on every unfiltered fleet-wide dispatch through this surface,
+        // even single-replica) had it shipped unwired.
+        [&registry](const std::vector<std::string>& candidates) {
+            return registry.has_remote_presence(candidates);
         }};
 
     // #3424/#3511: one registry read per dispatch, same lifecycle as `gate`
@@ -370,7 +477,34 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // "share the one read across arms rather than skip it for small
     // dispatches" reasoning. Revisit if this shows up in profiling on a
     // large fleet under a high single-target dispatch rate.
-    const auto plugin_missing = registry.ids_missing_plugin(cmd.wire().plugin());
+    const auto plugin_missing =
+        registry.ids_missing_plugin(cmd.wire().plugin(), cmd.wire().action());
+
+    // Protective-action exemption: a protective command carries an empty OS
+    // set (see `kill_switch_denial`), so no presence read can refuse it.
+    //
+    // #5294: the per-OS kill-switch id set, computed BEFORE `claim_fn` exists so
+    // a refusal here can never leak a claim. A degraded presence read with a
+    // per-OS switch OFF refuses the whole dispatch (fail closed) instead of
+    // narrowing enforcement to this replica's local sessions.
+    //
+    // A fail-closed containment gate (the `containment_unreadable` predicate
+    // in `resolve_and_dispatch_confined`) already withholds every id, so the
+    // presence read is skipped: the dispatch then reports `containment_unreadable`,
+    // the cause the routed-concerns cascade ranks first, rather than a second
+    // store's `os_gate_unreadable` shadowing it.
+    static const std::unordered_set<std::string> kNoOsKillSwitch{};
+    auto os_kill_switched = registry.ids_with_os(
+        (gate.enforced && gate.fail_closed) ? kNoOsKillSwitch : cmd.kill_switched_os());
+    if (!os_kill_switched) {
+        ConfinedDispatchOutcome refused;
+        refused.command_id = command_id;
+        refused.os_gate_unreadable = true;
+        spdlog::error("wire_and_dispatch_confined: refusing dispatch of {}.{} -- presence "
+                      "unreadable while a per-OS kill switch is OFF",
+                      cmd.wire().plugin(), cmd.wire().action());
+        return refused;
+    }
 
     // ADR-1007: per-device concurrency claim. Only wired for
     // concurrency_mode == "per-device" with a definition_id supplied and a
@@ -422,7 +556,7 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
 
     auto outcome =
         resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible, broadcast_on_none, gate,
-                                      resolvers, sink, claim_fn, plugin_missing);
+                                      resolvers, sink, claim_fn, plugin_missing, *os_kill_switched);
     outcome.command_id = command_id;
 
     // ADR-1007 claim-leak fix: `claim_fn` above ran BEFORE the send, so every
@@ -447,9 +581,14 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // does, so an id withheld for a missing plugin holds an open claim too.
     // No fail-closed analogue here (plugin-presence has no degraded-read
     // mode), so unlike `denied_quarantined` this list is never elided.
+    //
+    // #5294: `outcome.kill_switched_os` is the FOURTH bucket in the same leak
+    // class -- `os_killed` runs the identical "claimed, then `continue` before
+    // send" shape, so without releasing it the target stays excluded for the
+    // claim TTL after the per-OS switch is restored.
     if (claim_fn && execution_tracker) {
         std::size_t leaked = outcome.not_sent.size() + outcome.denied_quarantined.size() +
-                             outcome.unknown_plugin.size();
+                             outcome.unknown_plugin.size() + outcome.kill_switched_os.size();
         if (leaked > 0) {
             // One batched UPDATE (#881 discipline — matches `claim_fn`'s own
             // unnest-batched INSERT), not a per-id loop: a large not_sent set
@@ -462,6 +601,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
                               outcome.denied_quarantined.end());
             to_release.insert(to_release.end(), outcome.unknown_plugin.begin(),
                               outcome.unknown_plugin.end());
+            to_release.insert(to_release.end(), outcome.kill_switched_os.begin(),
+                              outcome.kill_switched_os.end());
             // definition_id scoping (Gate 2 security-guardian finding, PR
             // #3784 fix round): execution_id alone is NOT a safe match key
             // here — every workflow-step dispatch (workflow_routes.cpp)
@@ -476,9 +617,10 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
                                                           to_release);
             spdlog::info("wire_and_dispatch_confined: released {} per-device concurrency "
                          "claim(s) for execution_id={} that were taken but never delivered "
-                         "(undelivered={}, quarantine-denied={}, unknown-plugin={})",
+                         "(undelivered={}, quarantine-denied={}, unknown-plugin={}, os-kill-switched={})",
                          leaked, execution_id, outcome.not_sent.size(),
-                         outcome.denied_quarantined.size(), outcome.unknown_plugin.size());
+                         outcome.denied_quarantined.size(), outcome.unknown_plugin.size(),
+                         outcome.kill_switched_os.size());
         }
     }
     return outcome;

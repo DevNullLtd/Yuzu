@@ -5,9 +5,8 @@ name: Runner inventory sentinel
 # drift and opens (or comments on) a tracking issue labelled
 # `runner-inventory-drift` so operators are notified within 30 min.
 #
-# Why this exists: Yuzu's CI depends on two self-hosted runners
-# (yuzu-wsl2-linux on Shulgi WSL2, yuzu-local-windows on Shulgi native
-# Windows). If either goes offline silently, CI queues without obvious
+# Why this exists: Yuzu's CI depends on self-hosted runner pools (Big Tam,
+# Wee Tam, BigMags). If a runner goes offline silently, CI queues without obvious
 # signal until someone notices the "queued for 30 minutes" pattern.
 # This sentinel is the explicit `something that says` invariant —
 # see memory feedback_ci_infra_priorities.md for the "diagnosability
@@ -27,7 +26,7 @@ name: Runner inventory sentinel
 # loud with an actionable "create a PAT" message on the gh api call.
 # To create the PAT: gh-web → Settings → Developer settings → Personal
 # access tokens → Fine-grained tokens → Generate, repository permission =
-# "Administration: read-only" on Tr3kkR/Yuzu, then `gh secret set
+# "Administration: read-only" on DevNullLtd/Yuzu, then `gh secret set
 # RUNNER_INVENTORY_TOKEN < pat.txt`. See docs/ci-troubleshooting.md.
 
 on:

@@ -123,14 +123,17 @@ Gateway changes use `/gateway-dialyzer` and `/gateway-eunit`; workflow changes u
 
 ### Dependabot or promoted fork
 
-Use `fork-dynamic-review.yml`, whose trusted default-branch definition checks out the exact approved
-SHA and builds on a fresh GitHub-hosted Linux runner with a read-only token, no secrets, and no shared
-dependency cache. Dispatch it with `pr_number=<n>` and `head_sha=$HEAD`, then verify the completed
-run's inputs and conclusion. Never approve the ordinary `ci.yml` for an external fork: it contains
-self-hosted legs. Dependabot must always reach dynamic testing; use its existing restricted CI runs
-and dispatch the hosted-only workflow when those runs are missing or do not provide adequate coverage.
-If the hosted-only workflow is not yet present on the default branch, remain static and report the
-coverage gap; never substitute a local or self-hosted execution.
+Use `fork-dynamic-review.yml`, whose definition (dispatchable once it is on the default branch) checks
+out the exact approved SHA and builds on a fresh GitHub-hosted Linux runner with a read-only token, no
+secrets, and no shared dependency cache. Dispatch it on a throwaway `trusted-fork/pr-<n>` quarantine
+branch cut from the PR's base — it refuses `main`/`dev`, because the dispatch ref is the run's cache
+scope (#4471; runbook `docs/ci-troubleshooting.md` 1.2) — with `pr_number=<n>` and
+`head_sha=$HEAD`, then verify the completed run's inputs and conclusion. Never approve the ordinary
+`ci.yml` for an external fork: it contains self-hosted legs. Dependabot must always reach dynamic
+testing; use its existing restricted CI runs and dispatch the hosted-only workflow when those runs
+are missing or do not provide adequate coverage. If the hosted-only workflow is not yet present on
+the default branch, remain static and report the coverage gap; never substitute a local or
+self-hosted execution.
 
 Do not create a local dependency symlink, run local setup/build/test, approve a self-hosted runner, or
 execute artifacts downloaded from these runs. A missing dynamic run is a coverage gap, not CI green.

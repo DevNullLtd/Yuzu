@@ -1,1 +1,0 @@
-- The Guardian lifecycle journal's heartbeat retry-persist is now bounded per tick, in both batches and records, so a slow-but-succeeding KvStore cannot hold the agent's Guardian mutex for an unbounded run of writes. Boot and shutdown flushes still drain everything they are given. Dormant until the `prefer_spark` backend is enabled; no stored data is affected.

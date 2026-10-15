@@ -34,7 +34,9 @@
  * blocking a multi-minute sleep on shutdown. Lanes hard-join (they are Guardian-
  * owned, never detached like the SparkEngine consumer); a sweep observes the
  * runtime's stopping flag and commits nothing, so a join waits only for the
- * current bounded read, not a whole cadence. (A truly hung reader is the
+ * current bounded read, not a whole cadence, plus the synchronous #4606 T_detect log
+ * write that a sweep now performs after its read (guardian_spark_timing.hpp). (A truly
+ * hung reader is the
  * blocked-reader shutdown bound the runtime documents; the agent hard-exit is the
  * final backstop.)
  *

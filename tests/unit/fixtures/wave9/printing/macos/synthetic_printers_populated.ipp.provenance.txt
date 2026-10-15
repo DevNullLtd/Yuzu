@@ -1,0 +1,23 @@
+status: SYNTHETIC — hand-assembled against this plugin's own
+printing_ipp.hpp wire grammar. It exercises decoder group/attribute/bounds
+logic. It is NOT evidence of cupsd behaviour and MUST NOT be cited in a
+descriptor note, README sentence, or code comment as though it were.
+
+What this file is: a byte-accurate CUPS-Get-Printers response (status
+successful-ok 0x0000, request-id 17) hand-assembled against
+printing_ipp.hpp's wire grammar — one printer-attributes group naming
+`yuzu_test`, printer-state=3 (idle), printer-state-reasons=none,
+printer-uri-supported, printer-make-and-model, queued-job-count=1. It
+exercises the decoder's group/attribute/bounds-check logic and
+printers_from_ipp's field mapping for shapes the real Tier A captures
+cannot reach (this host has no configured print queues, so no real
+CUPS-Get-Printers response here can ever contain a populated
+printer-attributes group).
+
+Promotion path: Phase B (`bash capture.sh --phase-b`, requires sudo)
+creates a real throwaway `yuzu_test` queue and replaces this file with a
+genuine capture, at which point this provenance file is rewritten to
+`status: REAL CAPTURE` with host, date, `id -u`, and the exact command
+used. Until Phase B runs, this fixture stays SYNTHETIC.
+
+identity (of this synthetic construction): id -u = 501 (alex)

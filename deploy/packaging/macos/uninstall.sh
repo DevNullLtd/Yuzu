@@ -82,6 +82,7 @@ rm -rf "/Library/Application Support/YuzuAgent/YuzuAgent.app" \
        "/Library/Application Support/YuzuAgent/.YuzuAgent.incoming.app" \
        /usr/local/lib/yuzu/.plugins.incoming
 rm -f /usr/local/bin/yuzu-agent /usr/local/bin/.yuzu-agent.incoming \
+      /usr/local/bin/libyuzu_agent_core.dylib /usr/local/bin/.libyuzu_agent_core.incoming.dylib \
       /usr/local/lib/libyuzu_agent_core.dylib /usr/local/lib/.libyuzu_agent_core.incoming.dylib \
       /usr/local/lib/yuzu/.bundle-contents.incoming.zip \
       "$PLIST" /Library/LaunchDaemons/.com.yuzu.agent.incoming.plist \

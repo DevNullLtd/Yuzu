@@ -1,0 +1,107 @@
+Tree: tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/ (MATERIALIZED AT RUNTIME --
+see re-key note immediately below; this file used to live inside that directory when the
+tree was tracked on disk verbatim).
+Package: P91-5 (peripherals Linux leg) capture; re-keyed by P91-7 (Architect respec,
+2026-09-08) -- see "Storage re-key" below. Byte content and provenance are unchanged;
+only where the data lives on disk changed.
+
+== Storage re-key (P91-7, 2026-09-08) ==
+
+35 of the 58 attribute-file paths below use a literal ':' in a path segment
+(sysfs's own device-address grammar: "0000:00:01.0", "1-0:1.0", "0-0:1.1"). NTFS
+rejects ':' in a filename outright (ERROR_INVALID_NAME), so a plain `git checkout`
+of a branch tracking these paths verbatim fails on Windows -- this broke both the-rig
+and the required "Windows MSVC" self-hosted CI checkout job. Filed and fixed under an
+Architect respec of P91-7 (see tests/unit/fixtures/wave9/probes/the-rig-pr91a-verification.md,
+"Part A / Storage re-key" section, for the full incident record).
+
+Fix: the tree is no longer tracked on disk path-for-path. Every attribute file's
+relative path (colons included) and exact content is instead one line of
+`sysfs_tree.manifest` (this directory), a single portable-named text file with no
+illegal Windows path characters anywhere in ITS OWN name -- only inside the text
+values on each line, which is just data, not a path. `test_peripherals_linux_parsers.cpp`
+materializes the manifest onto disk under a fresh TempDir at the start of each of the
+three walk-case tests (usb_rows_at / pci_rows_at / thunderbolt_rows_at), recreating
+the real colon-bearing names the walk code under test keys on (is_usb_interface_entry,
+the thunderbolt retimer ':' grammar) -- so those assertions exercise genuine colon
+names exactly as before, just never persisted as tracked git blobs. On Windows,
+where NTFS cannot hold those names, materialization is not attempted at all: the three
+walk cases report Catch2 SKIP() naming the NTFS constraint instead of failing. The four
+pure-parser cases (parse_hex_attr, parse_pci_class, is_usb_interface_entry,
+is_tb_domain_entry) and the two negative/error cases (absent bus directory, unreadable
+root) never touched the tracked tree's path structure and are unaffected.
+
+Manifest line format: `<relative-path-from-sysfs_tree-root>\t<exact-attribute-content>`,
+one sysfs attribute file per line, content excluding the trailing newline (the
+materializer appends exactly one '\n' per file, matching every attribute file's
+original single-trailing-newline shape, verified byte-for-byte against the pre-re-key
+tree before it was deleted).
+
+No value below was regenerated, resampled, or edited as part of this re-key -- every
+byte in sysfs_tree.manifest is a straight copy of the tree this section's history
+describes. What follows, unchanged from the original P91-5 capture record:
+
+== sys/bus/pci/devices/ -- REAL CAPTURE ==
+host: this Mac, Docker Desktop's Linux VM (linuxkit)
+command: docker run --rm debian:12 sh -c 'for d in /sys/bus/pci/devices/*; do
+  cat $d/vendor $d/device $d/class $d/subsystem_vendor $d/subsystem_device;
+  readlink -f $d/driver; done'
+container image digest: debian:12 (pulled 2026-09-08)
+status: REAL CAPTURE, materialised attribute-by-attribute into this tree
+  (one file per sysfs attribute, matching the container's own file content
+  exactly -- no synthesised values). The container exposed 14 PCI devices,
+  13 of them virtio (vendor 0x1af4); 10 of the 13 virtio devices are
+  reproduced here to stay inside the fixture's file-count budget. Two
+  ("0000:00:01.0" virtio-net, "0000:00:0e.0" virtio-rng) additionally carry
+  a `driver` file holding the driver name as plain text -- the fixture
+  substitution this package's spec calls for in place of a real symlink
+  (`readlink -f $d/driver` showed `virtio-pci` for both); the rest omit
+  `driver` entirely to exercise the "-" fallback for a device with no
+  bound-driver attribute captured.
+lines: 58 files total across pci+usb+thunderbolt (budget 60)
+
+== sys/bus/usb/devices/ -- REAL CAPTURE ==
+host: same container as above
+command: docker run --rm debian:12 sh -c 'for h in usb1 usb2; do for a in
+  idVendor idProduct bDeviceClass bDeviceSubClass manufacturer product
+  serial speed; do cat /sys/bus/usb/devices/$h/$a; done; done'
+status: REAL CAPTURE. usb1 and usb2 are the container's two vhci_hcd root
+  hubs (class 09 == hub); both carry their real idVendor/idProduct/class/
+  subclass. usb1 additionally captures manufacturer/product/serial/speed;
+  usb2 omits them to exercise read_attr's ENOENT -> "-" fallback path (the
+  attribute files genuinely do not exist for a Linux 7.0.12-linuxkit
+  vhci_hcd root hub in this container -- not a fixture omission). The
+  container's own per-hub interface entries ("1-0:1.0", "2-0:1.0", real
+  device names, real bInterfaceClass=09 content) are reproduced verbatim to
+  exercise the ':' skip rule against genuine interface-entry names, not a
+  synthesised one.
+
+== sys/bus/thunderbolt/devices/ -- RECONSTRUCTION ==
+status: RECONSTRUCTED, not captured. Neither this Mac nor the Docker Linux
+  VM exposes a Thunderbolt bus (`docker run --rm debian:12 sh -c 'ls
+  /sys/bus/thunderbolt 2>&1'` -> No such file or directory), so no live
+  Linux venue was available to capture from -- the same gap
+  peripherals_plugin.cpp's descriptor already documents for this leg
+  ("walk verified against a sysfs fixture tree only; no live Linux venue
+  with a Thunderbolt bus in this run").
+basis: Documentation/ABI/testing/sysfs-bus-thunderbolt (upstream Linux
+  kernel documentation) for the attribute set and naming grammar:
+    - What: /sys/bus/thunderbolt/devices/domainX
+      (domain == host controller; X is a small integer)
+    - What: /sys/bus/thunderbolt/devices/domainX/security
+      (per-domain security level: none|user|secure|dponly|usbonly)
+    - What: /sys/bus/thunderbolt/devices/<domain>-<port>[.<port>...]
+      (a router; N-M is a first-hop device, N-M.K a deeper one)
+    - What: .../<device>/vendor_name, device_name, unique_id, generation,
+      authorized
+      (the device identity/state attributes this package's spec names)
+    - Retimer child nodes are named "<parent>:<index>.<index>" (a ':'
+      separates the retimer suffix from its parent router's own N-M name)
+  domain0 carries a real ABI attribute (security=user). 0-0 and 0-1 are
+  synthesised devices (Apple Inc. vendor/model strings, RFC-4122-shaped
+  unique_id, generation 4 == USB4/TB4) built from the documented attribute
+  grammar, not read from any real hardware. 0-0:1.1 is a retimer child of
+  0-0 (per the ':' grammar above) carrying a device_name attribute
+  specifically so the walk test can prove it is skipped despite having
+  readable, valid-looking content -- a retimer entry that happened to be
+  empty would not exercise the ':' filter at all.

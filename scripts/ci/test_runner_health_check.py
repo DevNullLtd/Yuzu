@@ -199,7 +199,7 @@ class MainTests(unittest.TestCase):
                 {
                     "GITHUB_OUTPUT": str(self.output),
                     "GITHUB_EVENT_NAME": "pull_request",
-                    "GITHUB_REPOSITORY": "Tr3kkR/Yuzu",
+                    "GITHUB_REPOSITORY": "DevNullLtd/Yuzu",
                     "GITHUB_HEAD_REPOSITORY": "contributor/Yuzu",
                 },
                 clear=True,
@@ -393,6 +393,41 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("TRUSTED_FORK_CI_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}", wrapper)
         self.assertIn("RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}", wrapper)
 
+        # #4471 quarantine-ref contract. ci.yml's trusted_inputs step is covered
+        # behaviourally by tests/shell/test_trusted_inputs_validate.sh, and
+        # fork-dynamic-review.yml's own quarantine guard by
+        # tests/shell/test_fork_dynamic_review_validate.sh (both extraction
+        # harnesses) -- this string pin is a cheap structural backstop, not
+        # the only net. The wrapper's purge job is the sole actions:write
+        # holder, checks nothing out, and must never hand that grant to the
+        # reusable gate.
+        quarantine = "^refs/heads/trusted-fork/pr-${PR_NUMBER}(-[0-9a-fA-F]{7,40})?$"
+        review = (ROOT / ".github" / "workflows" / "fork-dynamic-review.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(quarantine, review)
+        self.assertIn(quarantine, self.job("ci.yml", "trusted_inputs"))
+        purge = self.job("trusted-fork-ci.yml", "purge-quarantine-cache")
+        self.assertIn("actions: write", purge)
+        self.assertEqual(wrapper.count("actions: write"), 1)
+        self.assertNotIn("actions/checkout", purge)
+        self.assertIn("if: always()", purge)
+        self.assertIn("needs: [trusted-gate]", purge)
+        # The purge job's own scope guard is a separate spelling (no PR number
+        # in scope there); pin it so it cannot drift or vanish unnoticed.
+        self.assertIn("^refs/heads/trusted-fork/pr-[1-9][0-9]*(-[0-9a-fA-F]{7,40})?$", purge)
+
+    def test_codeql_query_filters_are_exactly_the_documented_two(self) -> None:
+        """#4471: the poisonable-step exclusion is the trade-off that stops
+        alert #5177 re-firing on every preflight step; a query-id rename or an
+        accidental broadening would silently reopen or over-suppress it."""
+        config = (ROOT / ".github" / "codeql" / "codeql-config.yml").read_text(encoding="utf-8")
+        ids = re.findall(r"(?m)^\s*-\s*exclude:\n\s*id:\s*(\S+)\s*$", config)
+        self.assertEqual(
+            ids,
+            ["cpp/poorly-documented-function", "actions/cache-poisoning/poisonable-step"],
+        )
+
         # linux + windows carry the full boundary: conditional clean:false
         # (safe only with their branch-switch wipe step + vcpkg sentinel) plus
         # the trusted-fork cache-isolation trio.
@@ -406,6 +441,55 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
                 self.assertIn("CCACHE_DIR=$cache_root/ccache", job)
                 self.assertIn("Purge trusted-fork workspace", job)
+
+    def test_pr_derived_checkout_refs_stay_in_the_quarantined_workflows(self) -> None:
+        """#4471: CodeQL's actions/cache-poisoning/poisonable-step is excluded in
+        .github/codeql/codeql-config.yml because its model cannot see the
+        trusted-fork/pr-<N> quarantine. This sweep is the in-repo replacement:
+        a workflow that checks out a PR-derived ref must be one of the two that
+        carry the quarantine assertion. Extending the allowlist is a security
+        decision, not a routine edit. Any dispatch input or job output used as a
+        checkout ref counts (deliberately broad). Only `with:` blocks written
+        after the `uses:` line are inspected — every checkout in this repo is
+        written that way."""
+        allowed = {"ci.yml", "fork-dynamic-review.yml"}
+        pr_derived = re.compile(
+            r"refs/pull/|github\.event\.pull_request\.head|inputs\.|needs\.[A-Za-z0-9_-]+\.outputs\."
+        )
+        offenders = []
+        # GitHub loads BOTH extensions ("must have either a .yml or .yaml file
+        # extension" — Workflow syntax docs); adversarial-review (CDX-4471-02 /
+        # kimi P2) mutation-proved that globbing only *.yml lets an offending
+        # *.yaml workflow pass unseen. zizmor.yml's own grep already covers
+        # both (`--include='*.yml' --include='*.yaml'`) — match that pattern.
+        for path in sorted(
+            p for ext in ("*.yml", "*.yaml") for p in (ROOT / ".github" / "workflows").glob(ext)
+        ):
+            text = path.read_text(encoding="utf-8")
+            # A checkout step's `with:` block: the indented lines after the
+            # `uses:` line (either `- uses:` or `- name:` + `uses:` form) up to
+            # the next `- ` step.
+            for step in re.finditer(
+                r"(?m)^[ \t]*(?:- )?uses: actions/checkout@[^\n]*\n((?:(?![ \t]*- )[ \t]+[^\n]*\n)*)",
+                text,
+            ):
+                ref = re.search(r"(?m)^[ \t]*ref:[ \t]*(.+)$", step.group(1))
+                if ref and pr_derived.search(ref.group(1)) and path.name not in allowed:
+                    offenders.append(f"{path.name}: ref: {ref.group(1).strip()}")
+        self.assertEqual(offenders, [])
+
+    def test_fork_review_guard_precedes_checkout(self) -> None:
+        """#4471 (adversarial-review CDX-4471-03 / kimi K3): the extraction
+        test keys on step NAME only, so a future reorder that moves the
+        checkout above the quarantine-ref guard would keep every existing
+        assertion green while checking out unreviewed fork code first. Pin
+        the ORDER, not just the presence, of the two steps."""
+        review = self.job("fork-dynamic-review.yml", "linux")
+        validate_at = review.find("- name: Validate immutable inputs")
+        checkout_at = review.find("- name: Check out exact PR revision")
+        self.assertNotEqual(validate_at, -1)
+        self.assertNotEqual(checkout_at, -1)
+        self.assertLess(validate_at, checkout_at)
 
         # macOS deliberately keeps actions/checkout's default clean:true (a
         # fresh workspace every run is a *stronger* fork-isolation boundary; the
@@ -447,6 +531,65 @@ class WorkflowWiringTests(unittest.TestCase):
         )
         self.assertIn("runner_control_crash", sentinel)
         self.assertIn("failed before it could emit typed evidence", sentinel)
+
+
+    def test_self_hosted_runner_label_lists_are_pinned_to_a_declared_pool(self) -> None:
+        """A bare [self-hosted, Linux, X64] list matches every runner carrying
+        those default labels, including runners outside the inventory (a retired
+        runner stayed registered and took proto-compat and cache-prune jobs).
+        Every self-hosted `runs-on:` / matrix `runner:` label list must carry a
+        yuzu-* pool label and be a subset of some declared runner's labels.
+
+        Covers: inline flow lists (single or multi-line), block lists, and a
+        bare `runs-on: self-hosted` string, in *.yml and *.yaml workflows.
+        Skips any list containing a `${{ }}` expression. Does not cover
+        `runs-on: ${{ matrix.runner }}` itself (its matrix `runner:` lists are
+        scanned instead), the `runs-on: {group:, labels:}` mapping form, or
+        matrix keys other than `runner:`. Labels are compared case-insensitively
+        and trailing `# comments` are ignored."""
+        inventory = json.loads(
+            (ROOT / ".github" / "runner-inventory.json").read_text(encoding="utf-8")
+        )
+        declared = [set(r["labels"]) for r in inventory["expected_runners"]]
+        flow = re.compile(r"^[ \t-]*(?:runs-on|runner):[ \t]*\[([^\]]*)\]", re.MULTILINE)
+        block = re.compile(
+            r"^[ \t]*runs-on:[ \t]*\n((?:[ \t]+-[ \t]*[^\n]+\n?)+)", re.MULTILINE
+        )
+        string = re.compile(
+            r"^[ \t]*runs-on:[ \t]*['\"]?(self-hosted)['\"]?[ \t]*(?:#.*)?$",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        offenders: list[str] = []
+
+        def norm(raw: str) -> str:
+            return raw.split("#", 1)[0].strip().strip("'\"").lower()
+
+        declared = [{x.lower() for x in d} for d in declared]
+
+        def check(name: str, labels: set[str], shown: str) -> None:
+            if "self-hosted" not in labels or any("${{" in x for x in labels):
+                return
+            pooled = any(label.startswith("yuzu-") for label in labels)
+            if not pooled or not any(labels <= d for d in declared):
+                offenders.append(f"{name}: {shown}")
+
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
+        self.assertTrue(workflows)
+        for path in workflows:
+            text = path.read_text(encoding="utf-8")
+            for m in flow.finditer(text):
+                labels = {norm(p) for p in m.group(1).split(",") if norm(p)}
+                check(path.name, labels, f"[{m.group(1).strip()}]")
+            for m in block.finditer(text):
+                labels = {
+                    norm(ln.strip()[1:])
+                    for ln in m.group(1).splitlines()
+                    if ln.strip().startswith("-") and norm(ln.strip()[1:])
+                }
+                check(path.name, labels, f"block {sorted(labels)}")
+            for m in string.finditer(text):
+                offenders.append(f"{path.name}: runs-on: {m.group(1)} (bare string)")
+        self.assertEqual([], offenders)
 
 
 if __name__ == "__main__":

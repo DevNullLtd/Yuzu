@@ -6,7 +6,12 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers three families — `network`, `verify`, `compliance` (see FAMILIES below).
+covers nine families — `network`, `verify`, `compliance`, `device`, `dex`,
+`dex_perf`, `schedule`, `workflow`, `guardian` (see FAMILIES below; this
+docstring previously read "five", already stale by `dex_perf` before the
+`schedule` family was added, then stale again at "seven" once `workflow`
+landed, then again at "eight" once `guardian` landed — corrected here each
+time, not merely for the family that caught it).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
@@ -77,8 +82,8 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks three families — `network`, `verify` and
-`compliance` — each contributing its dashboard/UI, REST-route (or seamed routes)
+FAMILY COVERAGE: today this checks nine families — `network`, `verify`, `compliance`,
+`device`, `dex`, `dex_perf`, `schedule`, `workflow` and `guardian` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
 set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
@@ -159,11 +164,157 @@ FORBIDDEN_HEADER_PATTERNS = [
     "agent_registry.hpp",
     "pg/*.hpp",
     "*_api_local.hpp",
+    # `schedule` (seventh family) / a future `workflow` seam, Fable review:
+    # `ScheduleEngine`/`WorkflowEngine` are Postgres-backed stores
+    # (`pg::PgPool&` constructor dependency) but are named `*_engine.hpp`,
+    # not `*_store.hpp` — the first pattern above does not catch them, and
+    # neither is named `agent_registry.hpp`. Without this pair, an abstract
+    # seam header could `#include`/forward-declare either and CI would stay
+    # green — the same blindness class `agent_registry.hpp` above was added
+    # to close, just for a different store header naming convention.
+    "schedule_engine.hpp",
+    "workflow_engine.hpp",
 ]
 
+# ── Impl-purity rule (ADR-0031 WS-A4, Fable review) ──────────────────────────
+# A CORE `*_api.cpp` implementation is the store-backed side of the seam, so it
+# legitimately reaches stores (network/verify/compliance/device/dex `_api.cpp`
+# all include their family's stores). What it MUST NOT reach is the
+# PRESENTATION / transport layer: a route header (`*_routes.hpp`), a view-type
+# header (`*_view_types.hpp`), a renderer (`*_ui.hpp`), or `<httplib.h>`. The
+# core→presentation include inversion this rule prevents shipped once (dex_api.cpp
+# `#include "dex_routes.hpp"` for the window resolvers, which transitively pulled
+# httplib) and the store-only FORBIDDEN_HEADER_PATTERNS above could not catch it
+# — a route header is not a store header. `httplib.h` is EXTERNAL (resolves to
+# no in-tree path, so the closure walk never visits it as a Path); it is caught
+# by an include-SPELLING scan across the closure instead of the resolved-path
+# match the other patterns use.
+IMPL_FORBIDDEN_HEADER_PATTERNS = [
+    "*_routes.hpp",
+    "*_view_types.hpp",
+    "*_ui.hpp",
+]
+IMPL_TUS = [
+    "server/core/src/network_api.cpp",
+    "server/core/src/verify_api.cpp",
+    "server/core/src/compliance_api.cpp",
+    "server/core/src/device_api.cpp",
+    "server/core/src/dex_api.cpp",
+    "server/core/src/dex_perf_api.cpp",
+    "server/core/src/schedule_api.cpp",
+    "server/core/src/workflow_api.cpp",
+    # dex_read_model.cpp backs the same LocalDexApi (it defines the builders +
+    # serializers) — PR #4582 FIX 4 dropped its dex_routes.hpp (httplib) include,
+    # hoisting the last symbols it needed (dex_signal_groups → dex_types.hpp,
+    # dex_device_score → dex_read_builders.hpp). NOTE: this check is INCLUDE-purity
+    # (no presentation/httplib header in the TU's include closure), NOT link-purity
+    # — dex_read_model.cpp used to still CALL symbols whose definitions lived in
+    # the presentation dex_routes.cpp, a core→presentation LINK residual tracked
+    # in #4579. That residual is now CLOSED (ADR-0031 WS-A4 PR-1 F1 fix,
+    # 2026-09-28: the definitions moved into dex_types.cpp/dex_window.cpp/
+    # dex_read_model.cpp) and enforced by the LINK-level twin this include-purity
+    # check cannot be — scripts/ci/check_core_presentation_link.py, wired as the
+    # meson test() `dex link no presentation symbols` (suite:server) since it
+    # needs compiled objects, unlike this pure source-tree walk.
+    "server/core/src/dex_read_model.cpp",
+    # dex_app_perf_model.cpp backs the same LocalDexPerfApi (it defines
+    # app_perf_fleet_trend/app_perf_group_trend/app_perf_device_summaries +
+    # dex_device_app_perf_json, ADR-0031 WS-A4 DexPerfApi seam) and was already
+    # httplib/routes-free from its first commit (unlike dex_read_model.cpp, it
+    # never had the DEX-signals-seam's presentation include to drop).
+    "server/core/src/dex_app_perf_model.cpp",
+    "server/core/src/guardian_api.cpp",
+    # guardian_model.cpp backs the same LocalGuardianApi (it defines
+    # guardian_status_rollup/guardian_agent_status_rollup/
+    # guardian_rule_agent_status_rows/guardian_device_all_guards/
+    # guardian_device_compliance_rollup, ADR-0031 WS-A4 GuardianApi seam,
+    # ninth family) and was already httplib/routes-free — the dashboard
+    # fragments that also call it (`guardian_routes.cpp`) reach it as a
+    # SIBLING include, not the other way around.
+    "server/core/src/guardian_model.cpp",
+]
+# ── Abstract-header store-type probe (ADR-0031 WS-A4, FortitudeEtc / PR #4582) ─
+# The store-HEADER patterns above do NOT catch an abstract seam header that
+# NAMES a store type without INCLUDING its header — e.g. a forward-declared
+# `class GuaranteedStateStore;` plus a `build_dex_*(GuaranteedStateStore*,…)`
+# signature. dex_api.hpp shipped exactly that (10 GuaranteedStateStore mentions;
+# the four sibling abstract headers: 0), because dex_read_model.hpp bundled the
+# store-reaching builders with the pure model structs. This probe closes that
+# gap: for each family's ABSTRACT `*_api.hpp`, no file in its transitive include
+# closure may name a store type token in CODE (comments are stripped first).
+# A store-pointer-taking signature is caught for free — the type name appears.
+ABSTRACT_API_HEADERS = [
+    "server/core/src/network_api.hpp",
+    "server/core/src/verify_api.hpp",
+    "server/core/src/compliance_api.hpp",
+    "server/core/src/device_api.hpp",
+    "server/core/src/dex_api.hpp",
+    "server/core/src/dex_perf_api.hpp",
+    "server/core/src/schedule_api.hpp",
+    "server/core/src/workflow_api.hpp",
+    "server/core/src/guardian_api.hpp",
+]
+# Most store class names end in "Store" (GuaranteedStateStore, RbacStore, …); the
+# regex catches any of them used as a type. Store/infra type names that do NOT end
+# in "Store" are listed EXPLICITLY. Three kinds belong here:
+#   - store ROW/data types (defined in a `*_store.hpp`): `AppPerfDailyRow` (from
+#     app_perf_daily_store.hpp) — reachable from dex_api.hpp via the gap-#2
+#     serializer before PR #4582.
+#   - store/infra CLASS names the "Store" suffix misses: `AuthDB`, `AgentRegistry`,
+#     `ExecutionTracker`, `PgPool` — data/identity/registry/pool types that must
+#     never surface in an abstract seam header (some, e.g. auth_db.hpp /
+#     execution_tracker.hpp, are not even in FORBIDDEN_HEADER_PATTERNS, so this
+#     name probe is their only guard). Added per the #4582 Fable review; verified
+#     absent from all five abstract-header closures today (no false-fire).
+#   - `AppPerfFleetRow` (from app_perf_fleet_store.hpp) — the DexPerfApi seam's own
+#     raw B2 store row. It carries per-`(version,day)` histogram arrays the
+#     `kDexCohortFloor` suppression must apply to BEFORE anything crosses the
+#     seam, so `dex_perf_api.hpp` exposes only the floor-applied `AppPerfTrendPoint`
+#     (a pure type, see `dex_app_perf_model.hpp`), never this raw type. Two SIBLING row types
+#     — `AppPerfVersionDeviceRow` (app_perf_daily_store.hpp) and `AppPerfAppSummary`
+#     (app_perf_fleet_store.hpp) — were RELOCATED into the pure `app_perf_types.hpp`
+#     instead of denylisted, because the version-devices drill and the app picker
+#     are floor-FREE / no-suppression-needed resources that legitimately return
+#     those rows verbatim across the seam (see their own doc comments). Only
+#     `AppPerfDailyRow` and `AppPerfFleetRow` — the two row types a floor/audit
+#     gate must interpose on BEFORE crossing — stay store-side and denylisted.
+# This is a hand-maintained denylist (a new such type is a manual add) — the
+# `*_store.hpp` include check remains the backstop for any full-definition leak.
+# NOT listed: `AppPerfCohortRow`, a PURE comparison type in `app_perf_compare.hpp`
+# (the verify seam's own pure model) that legitimately appears in verify_api.hpp's
+# closure — it is NOT a store type, so listing it would be a false positive.
+STORE_TYPE_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*Store\b")
+# `ScheduleEngine`/`WorkflowEngine`: `schedule` (seventh family) / a future
+# `workflow` seam, Fable review — the same naming-convention gap
+# `FORBIDDEN_HEADER_PATTERNS`' `schedule_engine.hpp`/`workflow_engine.hpp`
+# entries close for the HEADER-include probe, closed here for the
+# TYPE-NAME-in-code probe (a forward-declared `class ScheduleEngine;` plus a
+# `list_schedules(ScheduleEngine*, …)` signature names the type without
+# including its header).
+EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AppPerfFleetRow", "AuthDB",
+                           "AgentRegistry", "ExecutionTracker", "PgPool",
+                           "ScheduleEngine", "WorkflowEngine"]
+
+# `<httplib.h>` allowlist for the impl-purity scan: one PRE-EXISTING core coupling.
+# `event_bus.hpp` is a CORE SSE primitive (the legacy `GET /events` content-provider
+# bus + `StreamBudget`) that includes `<httplib.h>` for `httplib::DataSink&`.
+# `network_api.cpp` and `device_api.cpp` reach it TRANSITIVELY through their own
+# stores (not through any presentation header) — a core→core dependency that
+# predates this seam and is NOT the presentation-inversion this rule targets.
+# Exempting it by name keeps the transitive-httplib ban meaningful for any NEW
+# path while not forcing an out-of-scope network/device refactor; the broader
+# "should a core *_api.cpp transitively touch httplib via a core SSE primitive"
+# question is a WS-B2 physical-split concern (core owns no httplib once extracted),
+# out of scope for this seam and tracked as #4579, not this round.
+# `dex_api.cpp` reaches NEITHER event_bus.hpp NOR httplib — its fix is fully clean.
+IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}  # root-relative, exact file only
+
 # ── Family definitions ────────────────────────────────────────────────────
-# Three families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
-# #4250, the SECOND family) and `compliance` (the THIRD). Each set covers the
+# Nine families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# #4250, the SECOND family), `compliance` (the THIRD, #4337), `device`
+# (the FOURTH, #4484), `dex` (the FIFTH — the DEX signals seam), `dex_perf`
+# (the SIXTH — the DEX app-perf-over-time seam), `schedule` (the SEVENTH),
+# `workflow` (the EIGHTH) and `guardian` (the NINTH). Each set covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot
@@ -183,11 +334,31 @@ FORBIDDEN_HEADER_PATTERNS = [
 # instead of borrowing `dex_routes.hpp` for one type alias - which is what
 # actually makes this family's closure clean, not merely dropping one include.
 FAMILIES = {
+    "device": {
+        "tus": [
+            "server/core/src/device_routes.cpp",
+            "server/core/src/device_ui.cpp",
+            "server/core/src/device_api.hpp",
+            "server/core/src/device_api_local.hpp",
+            # device_lens_routes.{cpp,hpp} — the DEX/Guardian device-page lens
+            # fragments, split out of device_routes.cpp in the SAME wave but
+            # left outside this enforced set until their own rewire (issue
+            # #4576 + the guardian-lens deferral). Now onto the DexApi/
+            # GuardianApi abstract seams (see device_lens_routes.hpp's own
+            # banner) — enrolled here alongside device_routes.cpp/device_ui.cpp
+            # rather than as a standalone family, since it is this family's
+            # own presentation surface, just a second TU.
+            "server/core/src/device_lens_routes.cpp",
+            "server/core/src/device_lens_routes.hpp",
+        ],
+    },
     "network": {
         "tus": [
             "server/core/src/network_routes.cpp",
             "server/core/src/network_ui.cpp",
             "server/core/src/network_perf_model.cpp",
+            "server/core/src/discovered_devices_model.hpp",
+            "server/core/src/discovered_devices_model.cpp",
             "server/core/src/network_api.hpp",
             "server/core/src/network_api_local.hpp",
         ],
@@ -213,6 +384,168 @@ FAMILIES = {
             "server/core/src/compliance_model.cpp",
             "server/core/src/compliance_api.hpp",
             "server/core/src/compliance_api_local.hpp",
+        ],
+    },
+    # `dex` (ADR-0031 WS-A4, the FIFTH family through the seam) — the DEX
+    # signals / experience-score surface (GuaranteedStateStore-backed
+    # `/api/v1/dex/*` reads). The enforced set is the four PURE seam headers:
+    # `dex_types.hpp` (the relocated DEX leaf PODs), `dex_read_model.hpp` (the
+    # pure model structs + model-only JSON serializers), and the abstract/local
+    # api pair. Their closures must contain NO store header AND name no store
+    # TYPE (the abstract-header probe below enforces the latter). `dex_types.hpp`
+    # was relocated out of the CATASTROPHIC `guaranteed_state_store.hpp` in slice
+    # 1a; the store-reaching `build_dex_*_model(GuaranteedStateStore*,…)` builders
+    # (and `dex_device_app_perf_json`, which names `AppPerfDailyRow`) were then
+    # split out of `dex_read_model.hpp` into the core-only `dex_read_builders.hpp`
+    # (PR #4582, FortitudeEtc review) — before that split `dex_api.hpp`
+    # transitively NAMED `GuaranteedStateStore` and was not store-type-free like
+    # its siblings. The IMPL TUs `dex_read_model.cpp`, `dex_api.cpp` and
+    # `dex_read_builders.hpp`'s other includers are OUTSIDE this set: they
+    # legitimately reach the store (core side of the seam), like every other
+    # family's `*_api.cpp`. The CONSUMERS `rest_api_v1.cpp` / `mcp_server.cpp` /
+    # `dex_routes.cpp` are multi-family / mixed TUs and stay
+    # INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the other
+    # families' twin-registration files. REST and MCP both route through
+    # `DexApi`; `device_lens_routes.cpp`'s `/fragments/device/dex` lens is ALSO
+    # now rewired onto `DexApi` (issue #4576) and is enforced too — but via the
+    # `device` family's TU set above (it is that family's own second
+    # presentation TU), not this one, since `dex`'s enforced set here is
+    # header-only.
+    "dex": {
+        "tus": [
+            "server/core/src/dex_types.hpp",
+            "server/core/src/dex_read_model.hpp",
+            "server/core/src/dex_api.hpp",
+            "server/core/src/dex_api_local.hpp",
+        ],
+    },
+    # dex_perf: the SIXTH family — DexPerfApi, the DEX app-perf-over-time
+    # sequel to `dex` (DEX signals). REST and MCP ARE rewired through this
+    # seam (zero remaining direct AppPerfProviders/DexPerfFn calls in
+    # rest_api_v1.cpp/mcp_server.cpp). #4626 additionally rewired and ENROLLED
+    # the dashboard consumer TUs (`dex_perf_ui.cpp`, `dex_app_perf_ui.hpp`,
+    # `dex_app_perf_ui.cpp`) — the retired `AppPerfProviders` bundle's last
+    # production consumer — so this family now enforces its UI TUs too,
+    # narrowing the gap to `network`'s five-consumer-enforced posture.
+    # `dex_routes.cpp`/`.hpp` (the ROUTE-registration half) stay OUTSIDE this
+    # set, same as `dex`'s own `dex_routes.cpp` — that TU also registers the
+    # still-store-coupled DEX-SIGNALS fragments (GuaranteedStateStore-backed,
+    # out of scope for both `dex` and `dex_perf`'s own seam builds), so
+    # enforcing it would require splitting the DEX-signals dashboard rewire
+    # (tracked #4576) into this family's scope, which it is not.
+    "dex_perf": {
+        "tus": [
+            "server/core/src/app_perf_types.hpp",
+            "server/core/src/dex_app_perf_pure.hpp",
+            "server/core/src/dex_perf_model.hpp",
+            "server/core/src/dex_perf_api.hpp",
+            "server/core/src/dex_perf_api_local.hpp",
+            "server/core/src/dex_perf_ui.cpp",
+            "server/core/src/dex_app_perf_ui.hpp",
+            "server/core/src/dex_app_perf_ui.cpp",
+        ],
+    },
+    # `schedule` (ADR-0031 WS-A4, the SEVENTH family through the seam) — the
+    # recurring-schedule READ surface (GET /fragments/schedules, GET
+    # /api/v1/schedules, MCP list_schedules — all three share ONE
+    # ScheduleApi::list_schedules call). Header-only posture, same reason as
+    # `dex`/`dex_perf`: the consumer TU (`workflow_routes.cpp`) is
+    # multi-family (it also holds the unseamed `workflow` family's routes),
+    # so it stays INSPECTED-NOT-ENFORCED like every other family's
+    # multi-family consumer, not because a rewire is outstanding — both REST
+    # v1 and the dashboard fragment ARE rewired (server.cpp / mcp_server.cpp
+    # both call the seam). `schedule_types.hpp` was relocated out of
+    # `schedule_engine.hpp`; `schedule_model.hpp`/`.cpp` (schedule_row_json)
+    # was split out of the entangled `workflow_model.hpp`, which previously
+    # bundled it with the (unseamed) workflow builders and `#include`d BOTH
+    # `schedule_engine.hpp` AND `workflow_engine.hpp` despite claiming
+    # "pure, I/O-free" — the exact anti-pattern the `dex_perf` seam's own
+    # design note (PR #4582) warns against. The unversioned legacy
+    # `/api/schedules` POST/DELETE/enable mutators (`schedule_routes.cpp`)
+    # are a SEPARATE, deliberately untouched capability with no public
+    # REST v1/MCP twin — nothing to carve out of this family's enforced set,
+    # unlike `compliance`'s WS-A3 mutator gap.
+    "schedule": {
+        "tus": [
+            "server/core/src/schedule_types.hpp",
+            "server/core/src/schedule_model.hpp",
+            "server/core/src/schedule_model.cpp",
+            "server/core/src/schedule_api.hpp",
+            "server/core/src/schedule_api_local.hpp",
+        ],
+    },
+    # `workflow` (ADR-0031 WS-A4, the EIGHTH family through the seam) — the
+    # multi-step-workflow READ surface (GET /api/v1/workflows[/{id}], GET
+    # /api/v1/workflow-executions[/{id}], MCP list_workflows/get_workflow/
+    # list_workflow_executions/get_workflow_execution). Header-only
+    # posture, same reason as
+    # `dex`/`dex_perf`/`schedule`: the consumer TU (`workflow_routes.cpp`) is
+    # multi-family (it also holds the legacy unversioned GET routes and
+    # every mutator, plus `schedule`'s own legacy `/api/schedules` routes),
+    # so it stays INSPECTED-NOT-ENFORCED like every other family's
+    # multi-family consumer, not because a rewire is outstanding — both REST
+    # v1 and MCP ARE rewired (server.cpp / mcp_server.cpp both call the
+    # seam). `workflow_types.hpp` was relocated out of `workflow_engine.hpp`;
+    # `workflow_model.hpp` was made genuinely pure by pointing it at
+    # `workflow_types.hpp` instead of the store-coupled `workflow_engine.
+    # hpp` (it needed no FURTHER split by this eighth family — it DID
+    # originally bundle another family's builder, `schedule_row_json`, but
+    # the seventh family's own PR already split that out into
+    # `schedule_model.hpp`, so by the time `workflow` landed there was
+    # nothing left to carve out). The legacy unversioned GET
+    # routes and every `POST`/`DELETE`/`.../execute` mutator
+    # (`workflow_routes.cpp`) are a SEPARATE, deliberately untouched
+    # capability with no public REST v1/MCP twin of their own (the
+    # mutators) or sharing the SAME store call as their v1 twin without
+    # themselves being the versioned resource (the legacy GETs) — nothing
+    # to carve out of this family's enforced set, unlike `compliance`'s
+    # WS-A3 mutator gap.
+    "workflow": {
+        "tus": [
+            "server/core/src/workflow_types.hpp",
+            "server/core/src/workflow_model.hpp",
+            "server/core/src/workflow_model.cpp",
+            "server/core/src/workflow_execution_list_model.hpp",
+            "server/core/src/workflow_execution_list_model.cpp",
+            "server/core/src/list_keyset.hpp",
+            "server/core/src/list_keyset.cpp",
+            "server/core/src/workflow_api.hpp",
+            "server/core/src/workflow_api_local.hpp",
+        ],
+    },
+    # `guardian` (ADR-0031 WS-A4, the NINTH family) — the Guardian /
+    # Guaranteed State READ surface: `GuaranteedStateStore`-backed
+    # `GET /api/v1/guaranteed-state/{rules,rules/{id},status,
+    # status/{agent_id},rules/{id}/status,agents/{id}/rules,events}` +
+    # `BaselineStore`-backed `device-compliance` — eight of the family's
+    # nine public resources, each with a live MCP twin. The ninth,
+    # `schemas`/MCP `get_guardian_schemas`, is deliberately outside the
+    # seam (a compiled-in, store-free catalog — see guardian_api.hpp).
+    # Enforced at the HEADER level only, same posture as
+    # `dex`/`dex_perf`/`schedule`/`workflow` and for the SAME reason:
+    # `rest_api_v1.cpp`/`mcp_server.cpp` are multi-family TUs, and
+    # `guardian_routes.cpp` — UNLIKE those four siblings — has no
+    # single-family enforced TU of its own to add here either, because it
+    # interleaves the seamed READ fragments with the rule/baseline
+    # MUTATORS (no public REST/MCP twin — `compliance`'s own WS-A3 gap
+    # shape, #4334) in one translation unit; carving the mutators out into
+    # a `policy_admin_routes.hpp`-style sibling file is a disclosed,
+    # separate follow-up, not done by this seam. `guardian_types.hpp` holds
+    # both the relocated `GuaranteedState*` row/query/error types (out of
+    # `guaranteed_state_store.hpp`) AND the five pre-existing pure result
+    # structs relocated out of `guardian_model.hpp` (that header itself
+    # forward-declares `GuaranteedStateStore`/`BaselineStore` and so cannot
+    # sit in this family's enforced set — see its own file banner).
+    # `device_lens_routes.cpp`'s `/fragments/device/guardian` fragment IS now
+    # rewired onto this seam (`GuardianApi::device_guards`, mirroring the
+    # `dex` family's own ISSUE #4576 rewire) and enforced — but via the
+    # `device` family's TU set, not this one, since `guardian`'s own enforced
+    # set here is header-only (see the `device` family entry above).
+    "guardian": {
+        "tus": [
+            "server/core/src/guardian_types.hpp",
+            "server/core/src/guardian_api.hpp",
+            "server/core/src/guardian_api_local.hpp",
         ],
     },
 }
@@ -382,6 +715,124 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     return ok
 
 
+def _includes_httplib(path: Path) -> bool:
+    """True if `path` has a `#include` of httplib.h (angle or quote). Used to
+    detect the EXTERNAL header the closure walk never visits as a resolved
+    Path (see check_impl_purity)."""
+    for _is_angle, name in parse_includes(path):
+        if Path(name).name == "httplib.h":
+            return True
+    return False
+
+
+def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
+    """Every family's `*_api.cpp` impl TU must NOT reach a presentation /
+    transport header — `*_routes.hpp`, `*_view_types.hpp`, `*_ui.hpp`, or
+    `<httplib.h>` — anywhere in its transitive include closure. The impl is the
+    store-backed side of the seam (it legitimately reaches stores), so this is a
+    DIFFERENT forbidden set from the family rule; a route/view/ui header is not a
+    store header, which is exactly why the store-only patterns missed the
+    dex_api.cpp -> dex_routes.hpp -> httplib inversion. A missing declared TU is
+    a HARD ERROR (same posture as check_family)."""
+    ok = True
+    for rel in tus:
+        tu = (roots.root / rel).resolve()
+        if not tu.is_file():
+            gh("error", f"check-seam-closure: impl-purity: expected impl TU not found: {rel}")
+            ok = False
+            continue
+        visited, parent, _unresolved = closure(tu, roots)
+        # (a) presentation in-tree headers via resolved-path basename match.
+        for f in sorted(visited, key=str):
+            hit, pat = is_forbidden_header(f, roots.root, patterns=IMPL_FORBIDDEN_HEADER_PATTERNS)
+            if not hit:
+                continue
+            chain = chain_to(f, parent, tu)
+            chain_str = " -> ".join(str(c.relative_to(roots.root)) for c in chain)
+            gh("error",
+               f"check-seam-closure: impl-purity: {rel} reaches presentation header "
+               f"{f.relative_to(roots.root)} (matches {pat!r}) via include chain: {chain_str}")
+            ok = False
+        # (b) <httplib.h> via include-SPELLING scan (external -> never a visited Path),
+        #     minus the IMPL_HTTPLIB_ALLOWED pre-existing core-SSE coupling.
+        for f in sorted({tu} | visited, key=str):
+            if str(f.relative_to(roots.root)).replace("\\", "/") in IMPL_HTTPLIB_ALLOWED:
+                continue
+            if _includes_httplib(f):
+                gh("error",
+                   f"check-seam-closure: impl-purity: {rel} reaches <httplib.h> via "
+                   f"{f.relative_to(roots.root)} — a core *_api.cpp must not depend on "
+                   f"the httplib transport layer")
+                ok = False
+    return ok
+
+
+def _strip_comments(text: str) -> str:
+    """Blank ordinary string/char literal CONTENTS first, then remove /* */
+    block comments and // line comments (covers /// doc comments too). Not a
+    full C++ lexer. Blanking literals before comment-stripping is load-bearing:
+    a `//` or `/*` INSIDE a string literal (e.g. `const char* u = "http://h";`)
+    would otherwise be treated as a comment and over-strip a real store-type
+    token that follows the literal on the same line — the exact bypass this
+    probe exists to prevent (#4582 review). After the literal-blank the pass is
+    sound in the direction that matters: it can under-strip (a leftover token
+    just produces an author-resolved false positive), and can no longer
+    over-strip via an ordinary literal. RESIDUAL: raw string literals
+    (`R"(...)"`) are not lexed, so a `//` inside one could still over-strip;
+    accepted because no abstract `*_api.hpp` closure contains a raw string (a
+    selftest case pins the ordinary-literal fix)."""
+    text = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', text)  # blank string literals
+    text = re.sub(r"'(?:\\.|[^'\\\n])*'", "''", text)  # blank char literals
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return text
+
+
+def names_store_type(path: Path):
+    """Returns the first store-type token this file NAMES in code (comments
+    stripped), or None. Catches both `*Store` class names (regex) and the
+    non-`Store` store row/data types (EXTRA_STORE_TYPE_TOKENS)."""
+    code = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+    m = STORE_TYPE_TOKEN_RE.search(code)
+    if m:
+        return m.group(0)
+    for tok in EXTRA_STORE_TYPE_TOKENS:
+        if re.search(r"\b" + re.escape(tok) + r"\b", code):
+            return tok
+    return None
+
+
+def check_abstract_headers_store_type_free(headers: list[str],
+                                           roots: Roots = DEFAULT_ROOTS) -> bool:
+    """Each family's ABSTRACT `*_api.hpp` — and every header in its transitive
+    include closure — must NAME no store type in code (see the probe's block
+    comment above). A missing declared header is a HARD ERROR."""
+    ok = True
+    for rel in headers:
+        tu = (roots.root / rel).resolve()
+        if not tu.is_file():
+            gh("error", f"check-seam-closure: abstract-header probe: header not found: {rel}")
+            ok = False
+            continue
+        visited, parent, _unresolved = closure(tu, roots)
+        for f in sorted({tu} | visited, key=str):
+            tok = names_store_type(f)
+            if tok is None:
+                continue
+            if f == tu:
+                chain_str = str(f.relative_to(roots.root))
+            else:
+                chain = chain_to(f, parent, tu)
+                chain_str = " -> ".join(str(c.relative_to(roots.root)) for c in chain)
+            gh("error",
+               f"check-seam-closure: abstract-header {rel} reaches a header that NAMES store "
+               f"type {tok!r}: {f.relative_to(roots.root)} — an abstract seam header's closure "
+               f"must be store-type-free (forward-decl / store-pointer signature included) via: "
+               f"{chain_str}")
+            ok = False
+    return ok
+
+
 def run_check() -> int:
     ok = True
     checked = 0
@@ -389,10 +840,20 @@ def run_check() -> int:
         checked += 1
         if not check_family(name, spec["tus"]):
             ok = False
+    impl_ok = check_impl_purity(IMPL_TUS)
+    if not impl_ok:
+        ok = False
+    abstract_ok = check_abstract_headers_store_type_free(ABSTRACT_API_HEADERS)
+    if not abstract_ok:
+        ok = False
     if ok:
         print(f"check-seam-closure: OK ({checked} famil"
-              f"{'y' if checked == 1 else 'ies'} checked, all closures free "
-              f"of store-layer and core-only `*_api_local.hpp` headers)")
+              f"{'y' if checked == 1 else 'ies'} header-closure checked + "
+              f"{len(IMPL_TUS)} impl TUs impl-purity checked + "
+              f"{len(ABSTRACT_API_HEADERS)} abstract headers store-type-free checked; "
+              f"all closures free of store-layer / core-only `*_api_local.hpp` headers, "
+              f"impls free of presentation/httplib headers, and abstract headers name no "
+              f"store type)")
     return 0 if ok else 1
 
 

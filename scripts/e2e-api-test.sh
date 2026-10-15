@@ -71,7 +71,16 @@ assert_eq() {
 assert_contains() {
     TESTS=$((TESTS + 1))
     local desc="$1" needle="$2" haystack="$3"
-    if echo "$haystack" | grep -q "$needle"; then
+    # A here-string, not `echo "$haystack" | grep -q "$needle"`: that pipeline can
+    # spuriously report no-match under `set -o pipefail` when the needle is found
+    # early in a large multi-line haystack — grep(1) exits the instant it matches,
+    # closing the pipe while echo(1) is still mid-write of the remaining bytes,
+    # SIGPIPE kills echo, and pipefail surfaces THAT non-zero exit rather than
+    # grep's success (this exact failure was already hand-worked-around once, at
+    # the openapi.json check below, but every other large-body assert_contains
+    # call site — e.g. GET /metrics — stayed exposed). A here-string has no writer
+    # process to SIGPIPE.
+    if grep -qF -- "$needle" <<< "$haystack"; then
         pass "$desc"
     else
         fail "$desc (expected to contain '$needle')"
@@ -116,6 +125,15 @@ assert_status_any() {
 # ── curl wrappers ────────────────────────────────────────────────────
 # Each sets HTTP_STATUS (3-digit code) and HTTP_BODY (response body).
 # Body is written to a temp file; status code is captured via -w.
+#
+# Cookie-session writes must behave like a same-site browser: the Instructions
+# write routes refuse a cookie-authorised POST/PUT/DELETE that carries neither
+# Origin nor Referer (browser_write_is_cross_site). SITE_ORIGIN is the
+# scheme://host:port of SERVER_URL, so it matches the Host curl sends. The MCP
+# transport is the opposite: it rejects any Origin outside its DNS-rebinding
+# allowlist and accepts an absent one, so it gets none.
+SITE_ORIGIN=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#' <<< "$SERVER_URL")
+origin_for() { case "$1" in */mcp/*) ;; *) printf '%s' "$SITE_ORIGIN" ;; esac; }
 
 http_get() {
     local url="$1"
@@ -128,9 +146,10 @@ http_get() {
 
 http_post() {
     local url="$1" data="$2" content_type="${3:-application/json}"
+    local origin; origin=$(origin_for "$url")
     sleep 0.05
     HTTP_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" \
+        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} \
         -X POST -H "Content-Type: $content_type" \
         -d "$data" \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
@@ -150,8 +169,9 @@ http_post_login() {
 
 http_put() {
     local url="$1" data="$2"
+    local origin; origin=$(origin_for "$url")
     HTTP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" \
+        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} \
         -X PUT -H "Content-Type: application/json" \
         -d "$data" \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
@@ -160,8 +180,9 @@ http_put() {
 
 http_delete() {
     local url="$1"
+    local origin; origin=$(origin_for "$url")
     HTTP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" \
+        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} \
         -X DELETE \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
     HTTP_BODY=$(cat "$RESP_BODY" 2>/dev/null || echo "")
@@ -417,6 +438,20 @@ else
     fail "API token creation did not return a token"
 fi
 
+# Same-site gate exemption: a bearer-token write with no Origin/Referer is not
+# refused by the gate (a token is not an ambient credential). The cookie-session
+# counterpart, which must be refused, is in section 10.
+if [[ -n "$API_TOKEN" ]]; then
+    GATE_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" -X POST \
+        -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
+        -d "{\"name\":\"e2e-gate-token-instr\",\"plugin\":\"os_info\",\"action\":\"os_name\",\"type\":\"question\"}" \
+        "$SERVER_URL/api/instructions" 2>/dev/null) || GATE_STATUS="000"
+    assert_status_any "bearer-token POST /api/instructions without Origin is not refused by the same-site gate" \
+        "$GATE_STATUS" 200 201 400 503
+    GATE_ID=$(extract_json_field "id" "$(cat "$RESP_BODY")")
+    [[ -n "$GATE_ID" ]] && http_delete "$SERVER_URL/api/instructions/$GATE_ID"
+fi
+
 # GET /api/v1/tokens -> 200, contains label
 http_get "$SERVER_URL/api/v1/tokens"
 assert_eq "GET /api/v1/tokens returns 200" "200" "$HTTP_STATUS"
@@ -631,6 +666,16 @@ else
     log "  (Could not capture instruction ID — skipping GET/DELETE)"
     # Still count as tested via the POST above
 fi
+
+# Same-site gate (deliberate negative check): the helpers above send Origin, as a
+# browser does. A cookie-session write with NO Origin/Referer must be refused 403
+# (the bearer-token exemption is checked in section 4).
+GATE_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
+    -b "$COOKIE_JAR" -X POST -H "Content-Type: application/json" \
+    -d "{\"name\":\"e2e-gate-instr\",\"plugin\":\"os_info\",\"action\":\"os_name\",\"type\":\"question\"}" \
+    "$SERVER_URL/api/instructions" 2>/dev/null) || GATE_STATUS="000"
+assert_eq "cookie-session POST /api/instructions without Origin returns 403" "403" "$GATE_STATUS"
+assert_contains "  ...refused as cross-site" "cross-site request refused" "$(cat "$RESP_BODY")"
 
 log ""
 
@@ -1109,6 +1154,10 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/mcp"
     "/fragments/settings/nvd"
     "/fragments/settings/directory"
+    "/fragments/workflows"
+    "/fragments/schedules?view=page"
+    "/fragments/workflow-runs"
+    "/fragments/workflow-runs/e2e-no-such-run"
 )
 
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do
@@ -1131,12 +1180,91 @@ DASH_FRAGMENTS=(
     "/fragments/schedules"
     "/fragments/health/summary"
     "/fragments/compliance/summary"
+    "/fragments/policy-fragments"
+    "/fragments/dashboard/policies"
+    "/fragments/dashboard/activity"
+    "/fragments/dashboard/health"
 )
 
 for frag in "${DASH_FRAGMENTS[@]}"; do
     http_get "$SERVER_URL$frag"
     assert_status_any "GET $frag" "$HTTP_STATUS" 200 400 404
 done
+
+# Home: the landing and sign-in page. With the admin session it must show the signed-in
+# panel (never a redirect); the summary fragment below must answer with its own markup.
+http_get "$SERVER_URL/home"
+assert_eq "GET /home status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *'aria-label="Signed in"'* ]]; then
+    pass "GET /home shows the signed-in panel"
+else
+    fail "GET /home missing the signed-in panel"
+fi
+
+# Landing page without a session: the sign-in form, never a redirect; a screen page goes to
+# /home?next=<key>; /login forwards to /home keeping only a valid key.
+http_get_noauth "$SERVER_URL/home"
+assert_eq "GET /home (no session) status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *'id="signin"'* && "$HTTP_BODY" != *'aria-label="Signed in"'* ]]; then
+    pass "GET /home with no session shows the sign-in form"
+else
+    fail "GET /home with no session is not the sign-in form"
+fi
+for pair in "/devices|/home?next=devices" "/compliance|/home?next=compliance" "/login?next=%2Fevil|/home" "/login?next=devices|/home?next=devices"; do
+    from="${pair%%|*}"; want="${pair##*|}"
+    got=$(curl -s -o /dev/null -w "%{http_code} %{redirect_url}" "$SERVER_URL$from" 2>/dev/null || echo "000 ")
+    TESTS=$((TESTS + 1))
+    if [[ "$got" == "302 $SERVER_URL$want" ]]; then
+        pass "GET $from (no session) -> 302 $want"
+    else
+        fail "GET $from (no session) answered '$got', want '302 $SERVER_URL$want'"
+    fi
+done
+
+# An htmx panel request with no session: 401 + HX-Redirect to the landing page, never a 302
+# that XHR would follow and swap the sign-in page into the panel.
+hx=$(curl -s -o /dev/null -D - -H "HX-Request: true" "$SERVER_URL/fragments/dashboard/summary" 2>/dev/null | tr -d '\r')
+TESTS=$((TESTS + 1))
+if [[ "$hx" == HTTP/*\ 401* && "$hx" == *[Hh][Xx]-[Rr]edirect:\ /home* ]]; then
+    pass "htmx request with no session -> 401 with HX-Redirect: /home"
+else
+    fail "htmx request with no session did not answer 401 + HX-Redirect"
+fi
+
+# Dashboard: the admin session is unconfined, so the page and the summary fragment must
+# answer 200 with their own markup. The loose status list above would also accept a route
+# that was never registered.
+http_get "$SERVER_URL/"
+assert_eq "GET / status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *'id="dash-readout"'* && "$HTTP_BODY" == *'hx-get="/fragments/dashboard/summary"'* ]]; then
+    pass "GET / carries the readout placeholder"
+else
+    fail "GET / missing the dash-readout placeholder"
+fi
+http_get "$SERVER_URL/fragments/dashboard/summary"
+assert_eq "GET /fragments/dashboard/summary status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *'id="dash-readout"'* && "$HTTP_BODY" == *'id="dash-attention"'* && "$HTTP_BODY" == *'id="dash-estate"'* ]]; then
+    pass "GET /fragments/dashboard/summary carries all three panels"
+else
+    fail "GET /fragments/dashboard/summary missing a panel"
+fi
+
+# /fragments/executions renders a store degrade as a 200 body carrying data-degraded (the
+# dashboard drops 4xx/5xx bodies), so the loose status list above cannot see one. The
+# admin session this script uses is unconfined and the stack is healthy: require a plain 200
+# with no degrade marker.
+http_get "$SERVER_URL/fragments/executions"
+assert_eq "GET /fragments/executions status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *data-degraded=* ]]; then
+    fail "GET /fragments/executions rendered a degrade note (data-degraded)"
+else
+    pass "GET /fragments/executions has no degrade marker"
+fi
 
 log ""
 

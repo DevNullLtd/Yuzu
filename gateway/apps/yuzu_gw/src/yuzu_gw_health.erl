@@ -7,6 +7,9 @@
 %%%   GET /readyz  — readiness probe (200 if all core processes alive,
 %%%                  503 if any are down or circuit breaker is open)
 %%%
+%%% Readiness also requires the registry's session index table: without it
+%%% every heartbeat is rejected.
+%%%
 %%% Designed to coexist with the Prometheus /metrics endpoint (port 9568).
 %%% @end
 %%%-------------------------------------------------------------------
@@ -124,6 +127,7 @@ health_check() ->
 readiness_check() ->
     Checks = [
         check_process(<<"registry">>, yuzu_gw_registry),
+        check_session_index(),
         check_process(<<"upstream">>, yuzu_gw_upstream),
         check_process(<<"agent_sup">>, yuzu_gw_agent_sup),
         check_process(<<"router">>, yuzu_gw_router),
@@ -143,6 +147,12 @@ check_process(Name, RegisteredName) ->
         undefined -> {Name, false};
         Pid       -> {Name, erlang:is_process_alive(Pid)}
     end.
+
+%% Heartbeat admission reads the registry's session index; without the table
+%% every heartbeat is rejected, so the gateway is not ready even though the
+%% registry process is alive.
+check_session_index() ->
+    {<<"sessions_index">>, yuzu_gw_registry:session_index_available()}.
 
 check_circuit_breaker() ->
     try

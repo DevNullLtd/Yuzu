@@ -7,7 +7,12 @@ Postgres** profile, which removes that single point of failure with automatic fa
 
 > HA-Postgres is the **storage** availability axis. It is independent of server-tier HA (running
 > multiple server replicas). You can run either without the other. See ADR-2002 for the whole
-> picture.
+> picture. Until the server-tier safe-to-scale gate lifts (ADR-2002 §7c), run exactly one server replica; the
+> durable gateway session resolution (WS-5) does not lift that gate.
+>
+> SCIM Group mutations are serialized within one server process; when more than one server
+> replica runs, send SCIM provisioning traffic to a single replica (see
+> [`scim-provisioning.md`](scim-provisioning.md), Known limits).
 
 > ⚠️ **Before any customer-facing use, read [Production requirements](#production-requirements-read-before-deploying).**
 > The shipped Compose profile runs a **single etcd** and a **single HAProxy** — both single points of
@@ -138,6 +143,22 @@ production-grade. You **must**:
   reconnects. These are transient — a retry succeeds — and are bounded by the RTO above. Operators
   running behind the agentic/REST API should expect a short window of 5xx responses during the
   ~30–40 s failover, not a sustained outage.
+- **`/readyz` goes red on every server replica for the failover, then green.** Each replica's
+  reachability probe (HA WS-8) sees the old primary go away — or, briefly, reaches a node that is
+  still a standby — and reports not ready until it reaches the new primary; recovery is one
+  successful probe (about 2 s). A load balancer health-checking `/readyz` stops routing during
+  that window; one that fails open when all backends are down keeps forwarding and gets `503`s.
+  The probe drops its connection whenever it lands on a server that refuses writes, so a proxy,
+  DNS name or read-any port that sends a *new* connection to a standby cannot pin it there. With a
+  multi-host DSN (`host=n1,n2,n3`; the server requires `target_session_attrs=read-write` there and
+  adds it when absent) libpq walks the hosts for the probe exactly as for the pool, and the probe gives
+  each host its own deadline (the pool's `connect_timeout`, 10 s unless you set one), so a frozen
+  first host costs one timeout instead of holding the probe; with `connect_timeout=0` it does not move
+  on, because the pool would not either. `load_balance_hosts` is refused at startup — in the DSN, the environment or a service file.
+  List the Postgres servers themselves, not a pooler per node: a pooler (pgbouncer) can keep reporting
+  a demoted node as writable to libpq and keeps its server connections open across the demotion.
+  One host name that resolves to several addresses: a silent address makes the probe give up that
+  name's other addresses (the pool would try them), so list the addresses as hosts instead.
 
 ## Backup and disaster recovery
 

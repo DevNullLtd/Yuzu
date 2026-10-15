@@ -70,7 +70,7 @@ static_assert(std::has_unique_object_representations_v<GuardianJournalStats>,
 // are deliberately separate structs/tables (SUM vs MAX rollup, sparse vs
 // emit-including-0 - see both headers), so each carries its own pin: an age added to
 // GuardianJournalAgeStats without a kGuardianJournalAgeMetrics row is a build break
-// here, and it must never be "fixed" by squeezing the age into the 32-counter table.
+// here, and it must never be "fixed" by squeezing the age into the 33-counter table.
 static_assert(sizeof(GuardianJournalAgeStats) ==
                   detail::kNGuardianJournalAgeMetrics * sizeof(std::uint64_t),
               "GuardianJournalAgeStats field count != kGuardianJournalAgeMetrics row count "
@@ -119,6 +119,7 @@ GuardianJournalStats all_nonzero_stats() {
     s.evicted_unclassified = 30;
     s.send_orphan_exceptions = 31;
     s.send_stalls = 32;
+    s.send_order_hold_releases = 33;
     return s;
 }
 
@@ -143,7 +144,7 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
     }
 
     // FIELD -> KEY BIND. The three checks around this one are all key-SET checks: they
-    // prove the writer and reader agree on WHICH 32 keys exist, and nothing more. Swap
+    // prove the writer and reader agree on WHICH 33 keys exist, and nothing more. Swap
     // two values in the emitter - put(<stage_dropped key>, s.stage_failures) - and the
     // emitted key set is byte-identical, so every one of them still passes while the
     // server sums one counter under another counter's gauge and the wrong fleet alert
@@ -182,6 +183,7 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_journal_evicted_unclassified", "30"},
         {"yuzu.guardian_send_orphan_exceptions", "31"},
         {"yuzu.guardian_send_stalls", "32"},
+        {"yuzu.guardian_send_order_hold_releases", "33"},
     };
     // Per-key, NOT `CHECK(tags == expected)`. Catch2 has no StringMaker for
     // std::pair and neither CATCH_CONFIG_ENABLE_PAIR_STRINGMAKER nor

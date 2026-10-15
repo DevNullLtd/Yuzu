@@ -30,11 +30,15 @@
 #include "device_ci_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
+#include "offline_endpoint_store.hpp" // HA WS-5: presence session clear on disconnect
+#include "presence_departure.hpp"
 #include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_ingestion.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_ingestion.hpp"
+#include "app_usage_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
@@ -146,7 +150,17 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 
     // Fast path: agent already enrolled from a prior connection — skip enrollment
     {
-        auto prior = auth_mgr_.get_pending_status(info.agent_id());
+        // WS-6 6.2: five-state read. A store ERROR must never read as "absent"
+        // (an unreadable denied/approved row would fall through to
+        // add_pending/consume): fail closed with UNAVAILABLE so the agent retries
+        // on its normal reconnect backoff (accepted=false is a PERMANENT
+        // rejection to the agent, agent.cpp:1649-1657 — #3401).
+        auto prior_result = auth_mgr_.get_pending_status(info.agent_id());
+        if (!prior_result) {
+            spdlog::error("Register: enrollment status read failed for agent {}", info.agent_id());
+            return enrollment_store_status(prior_result.error());
+        }
+        const auto& prior = *prior_result;
         if (prior && *prior == auth::PendingStatus::approved) {
             spdlog::info("Agent {} re-registering (already enrolled)", info.agent_id());
             is_reauth = true;
@@ -159,13 +173,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         // the legitimate agent could no longer enroll (token-depletion DoS,
         // W1.4 UP-M3). Checking the recorded denial here pre-empts the consume.
         //
-        // Residual (gov #1134 UP-1/UP-2): `prior` is a snapshot read before the
-        // consume, so an admin denial that races into the snapshot→consume
-        // window still burns one use (the agent is then correctly blocked by the
-        // ensure_enrolled defence-in-depth below). This kills the practical DoS
-        // — a persistently-denied attacker no longer depletes tokens — but the
-        // narrow race is closed only by option (b) refund-on-deny, tracked as a
-        // follow-up.
+        // The snapshot→consume race (gov #1134 UP-1/UP-2) is closed since WS-6 6.2:
+        // `consume_and_enroll` re-checks the denial atomically and ROLLS BACK the
+        // token use if an admin denied the agent in that window (#1135). This
+        // pre-check stays as the cheap early exit that skips the consume txn.
         if (prior && *prior == auth::PendingStatus::denied) {
             // gov #1134 (Tr3kkR): this early short-circuit returns before the
             // legacy denied-handling code, which used to emit an
@@ -229,13 +240,48 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // -- W1.4 / #827 atomic consume ------------------------------------
             // The prior validate_enrollment_token returned a bare bool with a
             // race window between "valid?" and "++use_count". Replaced with
-            // consume_enrollment_token which performs the check-and-increment
-            // under one unique_lock and reports the typed outcome so we can
-            // audit the lost-race case with attribution.
-            auto claim_result =
-                auth_mgr_.consume_enrollment_token(enrollment_token, info.agent_id());
-            if (!claim_result.has_value()) {
-                auto err = claim_result.error();
+            // consume_and_enroll (WS-6 6.2 folded the standalone
+            // consume-then-enroll pair into one atomic store transaction) which
+            // reports the typed outcome so we can audit the lost-race case with
+            // attribution.
+            // WS-6 6.2: shape pre-check BEFORE the consume (pre-auth Postgres
+            // amplification: a caller-supplied junk token must not cost a write
+            // txn). A shape-invalid token cannot exist, so it is answered exactly
+            // like a well-formed token that matched nothing: a synthetic
+            // `not_found` flows through the SAME rejection block below (same
+            // metric, audit row, analytics event and uniform public message), and
+            // is therefore not an oracle. Descriptive fields are sanitised, not
+            // rejected (see sanitize_enrollment_text).
+            std::expected<auth::ConsumeEnrollResult, StoreError> consumed =
+                yuzu::server::enrollment_token_shape_valid(enrollment_token)
+                    ? auth_mgr_.consume_and_enroll(
+                          enrollment_token, info.agent_id(),
+                          yuzu::server::sanitize_enrollment_text(info.hostname()),
+                          yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                          yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                          yuzu::server::sanitize_enrollment_text(info.agent_version()))
+                    : std::expected<auth::ConsumeEnrollResult, StoreError>{
+                          auth::ConsumeEnrollResult{
+                              .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
+                              .token_error = auth::EnrollmentTokenError::not_found,
+                              .already_consumed_by = {}}};
+            if (!consumed) {
+                spdlog::error("Register: enrollment consume failed for agent {}", info.agent_id());
+                return enrollment_store_status(consumed.error());
+            }
+            if (consumed->kind == auth::ConsumeEnrollResult::Kind::admin_denied) {
+                // Valid token, admin-denied agent: the store rolled the use back.
+                metrics_
+                    .counter("yuzu_register_denied_total",
+                             {{"source", "direct"}, {"event", "security"}})
+                    .increment();
+                response->set_accepted(false);
+                response->set_reject_reason("enrollment denied by administrator");
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
+            if (consumed->kind == auth::ConsumeEnrollResult::Kind::token_rejected) {
+                auto err = consumed->token_error;
                 auto variant = yuzu::server::enrollment_rejection_variant_name(err);
                 auto metric_name = yuzu::server::enrollment_rejection_metric_name(err);
                 spdlog::warn("Agent {} enrollment-token consume rejected: variant={}",
@@ -253,14 +299,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 // For race-loss the audit detail names the winner so an
                 // operator can reconstruct "agent X tried to enroll with a
                 // token already consumed by agent Y". We look the winner
-                // up via the token-hash (constant-time scan); empty result
-                // means the token row was concurrently revoked/expired
-                // between consume and the lookup — rare but possible.
-                std::string already_consumed_by;
-                if (err == auth::EnrollmentTokenError::already_consumed) {
-                    auto hash = auth::AuthManager::sha256_hex(enrollment_token);
-                    already_consumed_by = auth_mgr_.last_consumer_for_token_hash(hash);
-                }
+                // up in the same store transaction as the failed consume.
+                // (WS-6 6.2: the store classifies the miss and returns the last
+                // consumer in the same transaction.)
+                const std::string already_consumed_by = consumed->already_consumed_by;
 
                 // Audit row — W1.1 audit_log → bool pattern. The handler
                 // observes the return so a dropped audit row surfaces via
@@ -336,9 +378,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 return grpc::Status::OK;
             }
 
-            // Success path. The token has been atomically claimed (use_count
-            // already incremented under the lock).
-            const auto& claim = claim_result.value();
+            // Success path. The token use was counted AND the agent enrolled in
+            // ONE store transaction (consume_and_enroll), so the success audit row
+            // below only ever describes a completed enrollment.
+            const auto& claim = consumed->claim;
             spdlog::info("Agent {} auto-enrolled via enrollment token id={} ({}/{})",
                          info.agent_id(), claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
@@ -386,15 +429,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 }
             }
 
-            // Persist enrollment so reconnections don't need a valid token.
-            // Returns false if the agent was explicitly denied by an admin.
-            if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(), info.platform().os(),
-                                           info.platform().arch(), info.agent_version())) {
-                response->set_accepted(false);
-                response->set_reject_reason("enrollment denied by administrator");
-                response->set_enrollment_status("denied");
-                return grpc::Status::OK;
-            }
+            // (Enrollment was persisted by consume_and_enroll above, so
+            // reconnections don't need a valid token.)
         } else {
             // Tier 1.5: Auto-approve policies -- check before pending queue
             auth::ApprovalContext approval_ctx;
@@ -414,9 +450,18 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 spdlog::info("Agent {} auto-approved by policy: {}", info.agent_id(), matched_rule);
                 // Persist enrollment so reconnections skip enrollment entirely.
                 // Returns false if admin-denied — admin denials outrank auto-approve.
-                if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
-                                               info.platform().os(), info.platform().arch(),
-                                               info.agent_version())) {
+                auto enrolled_auto = auth_mgr_.ensure_enrolled(
+                    info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
+                    yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                    yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                    yuzu::server::sanitize_enrollment_text(info.agent_version()),
+                    yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule));
+                if (!enrolled_auto) {
+                    spdlog::error("Register: auto-approve enroll failed for agent {}",
+                                  info.agent_id());
+                    return enrollment_store_status(enrolled_auto.error());
+                }
+                if (!*enrolled_auto) {
                     response->set_accepted(false);
                     response->set_reject_reason("enrollment denied by administrator");
                     response->set_enrollment_status("denied");
@@ -425,17 +470,35 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 // Fall through to normal registration
             } else {
                 // Tier 1: No token, no policy match -- check the pending queue
-                auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
+                auto pending_result = auth_mgr_.get_pending_status(info.agent_id());
+                if (!pending_result) {
+                    spdlog::error("Register: pending-status read failed for agent {}",
+                                  info.agent_id());
+                    return enrollment_store_status(pending_result.error());
+                }
+                const auto& pending_status = *pending_result;
 
                 if (!pending_status) {
                     // First time seeing this agent -- add to pending queue
-                    auth_mgr_.add_pending_agent(info.agent_id(), info.hostname(),
-                                                info.platform().os(), info.platform().arch(),
-                                                info.agent_version());
+                    auto added = auth_mgr_.add_pending_agent(
+                        info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
+                        yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                        yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                        yuzu::server::sanitize_enrollment_text(info.agent_version()));
+                    if (!added) {
+                        spdlog::error("Register: add_pending failed for agent {}", info.agent_id());
+                        return enrollment_store_status(added.error());
+                    }
 
                     response->set_accepted(false);
                     response->set_reject_reason("awaiting admin approval");
                     response->set_enrollment_status("pending");
+                    if (!*added) {
+                        // Another Register (this or another replica) queued the agent
+                        // between our read and insert: same answer, but the SSE +
+                        // analytics event fire once per queued agent, by the winner.
+                        return grpc::Status::OK;
+                    }
                     bus_.publish("pending-agent", info.agent_id());
                     spdlog::info("Agent {} placed in pending approval queue", info.agent_id());
                     if (auto analytics_store = analytics_store_.lock()) {
@@ -812,6 +875,26 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
         } catch (...) {
             spdlog::warn("ReportInventory: software_licensing ingest threw unknown exception for "
                          "agent {} — acked",
+                         agent_id);
+        }
+    }
+    if (app_usage_store_ && app_usage_store_->is_open()) {
+        try {
+            ingest_app_usage_report(*app_usage_store_, agent_id, *request, *response, &metrics_);
+        } catch (const std::exception& ex) {
+            // P11: unlike the sibling blocks above, a swallowed throw here with no
+            // nack lets the agent's SyncScheduler advance last_hash and go
+            // hash-only for a day with nothing persisted — the nack forces a full
+            // resend next cycle. Follow-up issue filed at delivery to retrofit the
+            // four sibling blocks (installed_software/app_perf/device_ci/
+            // software_licensing) with the same nack; do not do it here.
+            response->add_need_full("app_usage");
+            spdlog::warn("ReportInventory: app_usage ingest threw for agent {} — nacked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            response->add_need_full("app_usage");
+            spdlog::warn("ReportInventory: app_usage ingest threw unknown exception for agent {} "
+                         "— nacked",
                          agent_id);
         }
     }
@@ -1449,7 +1532,16 @@ grpc::Status AgentServiceImpl::Subscribe(
     // Agent disconnected — use session-aware cleanup so a stale Subscribe
     // handler doesn't clobber a newer connection from the same agent_id.
     registry_.clear_stream_if_session(agent_id, session_id);
-    registry_.remove_agent_if_session(agent_id, session_id);
+    const bool removed_current_session = registry_.remove_agent_if_session(agent_id, session_id);
+    // HA WS-5 (ADR-2002 §7a): mirror the departure into durable presence
+    // (session clear, row kept for the roster, #5678) via the helper both
+    // disconnect paths share — it carries the removed_current_session gate
+    // and its false-negative rationale (a stale disconnect must not touch a
+    // live agent's row).
+    mirror_departure_to_presence(
+        removed_current_session,
+        heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr, agent_id,
+        session_id);
     // PR 10 hardening — evict pushed-snapshot slot too (sec-M4 / UP-5).
     // Without this, deregistered agents render as ghost cubes
     // indefinitely from the cached last-known-good snapshot.

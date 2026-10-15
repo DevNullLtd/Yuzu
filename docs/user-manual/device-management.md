@@ -51,6 +51,18 @@ curl -s -X DELETE http://localhost:8080/api/settings/pending-agents/agent-001 \
   -b "$COOKIE"
 ```
 
+`DELETE` only succeeds against a row that is still `pending` — it returns `409` if the agent has
+already been approved or denied, refusing to silently reverse that admin decision (WS-6 6.2). A
+Tier 1 agent removed while genuinely pending simply re-enters the pending queue on its next
+reconnect attempt, same as if it had never been seen. Before this guard, removing an already-
+*approved* row (typically a Tier 2, token-enrolled agent) deleted the row backing its enrollment
+with no admin decision behind it and no audit trail — that specific gap is now closed, since an
+approved row can no longer be removed via this endpoint at all. There is no remaining asymmetry for
+the remove-then-reconnect case: a still-`pending` agent (Tier 1 or Tier 2, before it has presented a
+valid token) behaves identically either way, and a Tier 2 agent's token-based enrollment
+(`consume_and_enroll`) creates a fresh `approved` row on the next successful token presentation
+regardless of whether a prior pending row existed.
+
 ### Tier 2: Pre-Shared Enrollment Tokens
 
 For automated deployments, administrators generate **enrollment tokens** -- time-limited and use-limited secrets that agents present at registration for immediate enrollment without manual approval.
@@ -116,7 +128,7 @@ curl -s -X DELETE http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c
   -b "$COOKIE"
 ```
 
-Tokens are persisted in `enrollment-tokens.cfg` alongside the server configuration file. They survive server restarts.
+Tokens are persisted in the PostgreSQL `auth.enrollment_tokens` table (WS-6 6.2) — shared by every server replica, not a per-replica file. They survive server restarts and image swaps. A pre-6.2 install's `enrollment-tokens.cfg` is imported once, automatically, at the first 6.2 boot (see `docs/adr/2002-high-availability-architecture.md` §8).
 
 ### Tier 3: Platform Trust (Planned)
 
@@ -132,7 +144,9 @@ Administrators can configure rules that automatically approve agents matching sp
 
 **Add an auto-approval rule:**
 
-The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments.
+The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments. The four writes below are dashboard writes: a request whose `Origin` (or `Referer`) names a different site is refused with `403`; a request with neither header (curl, automation) is accepted, as for the other Settings writes.
+
+Every write is recorded before it is applied: an `attempt` audit row is written first and, if it cannot be stored, the write is refused with `503` (`Sec-Audit-Failed: true`) and nothing changes. A rule that cannot be saved to disk is refused with `500` and nothing changes. Error responses are the standard JSON error body; the dashboard shows a toast.
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve \
@@ -142,7 +156,11 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve \
 
 This rule automatically approves any agent whose hostname matches the glob pattern `web-*.example.com`.
 
-Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`.
+Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. A value is at most 253 characters and a label at most 128. A rule that would match every machine (a hostname glob of only `*`, or an `ip_subnet` of `/0`) is refused.
+
+**These rules are not a strong admission control.** `hostname_glob` and `cloud_provider` match strings the registering agent states about itself (its hostname and attestation provider); any client that can reach the Register endpoint can claim a matching value, which makes such a rule no stronger than `*`. `ip_subnet` matches the connection's peer address. `trusted_ca` can never match today because Register does not yet populate the CA fingerprint. Verified proof for the first two is reserved for a later tier. Treat `any`-mode `hostname_glob`/`cloud_provider` rules as a convenience for a trusted network, not as a security boundary.
+
+If the saved policy file (`auto-approve.cfg`) is damaged (a line with an unknown type, a short line, or a `mode:` other than exactly `any` or `all`), the server activates no auto-approve rules at start (every agent waits for manual approval), logs an error, and keeps the original as `auto-approve.cfg.rejected`; re-create the rules in Settings.
 
 **Set the auto-approve match mode:**
 
@@ -204,13 +222,13 @@ These fields are used by the [Scope Engine](scope-engine.md) for device targetin
 
 ### Dashboard
 
-The **Devices** page (`/devices`) lists the **currently-connected** agents and requires the **`Infrastructure:Read`** permission — the same gate as the agent list (`/api/agents`). It uses the same visibility provider, so an operator without `Infrastructure:Read` cannot reach it; note that, exactly like `/api/agents`, an operator who *does* hold `Infrastructure:Read` sees the whole connected fleet here (per-team **list** filtering beyond that gate is not applied today — the per-team control is enforced per device, below). Each row shows hostname, OS, architecture, online status, and per-device DEX score. Filter by OS or search by name; click any row to open that device's page. **DEX scoring is per-render, never fleet-wide:** a device-page open scores that one device, and the list scores only the rows actually rendered after filtering (`devices_fn` is identity-only) — no page load may trigger a whole-fleet scoring pass.
+**`/devices` now 302-redirects to `/hardware`** (the Hardware CI list — round-3, see `docs/user-manual/inventory.md`) — the old standalone Devices page no longer renders directly; a bookmarked `/devices` link still works, since browsers follow the redirect transparently. Hardware's own list requires **`Inventory:Read`** rather than the old page's `Infrastructure:Read`; every seeded built-in role holding one also holds the other, so no default-role regression, but a custom role granted `Infrastructure:Read` alone loses list access via the old URL. Each row shows hostname, OS, architecture, online status, and per-device DEX score, plus (new) agent version, claimed IP, and tags. Filter by OS or search by name; click any row to open that device's Hardware CI record. **DEX scoring is per-render, never fleet-wide:** opening a record scores that one device, and the list scores only the rows actually rendered after filtering — no page load may trigger a whole-fleet scoring pass.
 
 > The list is sourced from the live connection registry, so it shows connected devices only (there is no offline/status filter). Enrolled-but-offline devices and real last-seen times arrive with the persistent device-inventory slice.
 
-#### Device page (`/device?id=`)
+#### Device page (`/device?id=`, redirects to `/hardware/ci?id=`)
 
-The per-device page is the shared entity view reached from any dashboard, organised into lens tabs:
+The per-device page is the shared entity view reached from any dashboard, organised into lens tabs — the same lens-tab machinery renders both the legacy device page's tabs and the Hardware CI record's Overview/DEX/Guardian tabs:
 
 Every per-device route is scoped to the device's management group (a global grant **or** a role assigned on the device's group / an ancestor): opening a device outside your scope returns *forbidden*, never its data.
 
@@ -219,6 +237,8 @@ Every per-device route is scoped to the device's management group (a global gran
 | **Device info** | Identity (agent ID, OS, arch, version), tags, group membership. | `Infrastructure:Read`, scoped to the device |
 | **DEX** | Per-device DEX score + a summary of recent signal observations, with a link to the full DEX drill-down (which carries an *Application performance over time* panel — retained daily per-app-version CPU/memory from the central store, no live query, no `Execute`). | `GuaranteedState:Read`, scoped to the device. Signal-history view audited as `dex.device.view`; the app-perf panel audited as `dex.device.app_perf.view` (separate verb) |
 | **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). | `GuaranteedState:Read`, scoped to the device (audited as `guardian.device.view`) |
+
+A device with zero reported guards renders "No guards evaluated" even if the fleet-wide rule catalogue read is itself degraded — the per-device read no longer depends on the catalogue's own health for a zero-row device (a small, disclosed rendering delta from the ADR-0031 WS-A4 seam rewire).
 
 #### Get live info
 
@@ -249,6 +269,27 @@ The **ARP** card now works on all three platforms, with per-OS limits: Windows r
 The **Processes (tree)** and **ARP** cards depend on the `processes/list_tree` and `network_config/arp` agent actions, which ship with agents built from this release onward. An older agent that predates them returns an `unknown action` response, which currently renders as an **empty card** — upgrade the agent to populate those cards. (Tracked follow-up: have the agent emit an explicit "unsupported on this agent version" note instead of an empty card.)
 
 The machine-readable equivalents (for agentic workers and automation) are `GET /api/v1/dex/devices/{id}` (the per-device DEX read model), `GET /api/v1/dex/devices/{id}/app-perf` (the REST twin of the *Application performance over time* panel — the retained per-`(app, version, day)` history, same `dex.device.app_perf.view` audit, fail-closed), and `POST /api/v1/dex/devices/{id}/live?kind=uptime|processes` (the live dispatch — POST because it has a side effect; the dashboard's additional cards — process tree, services, users, network, capture sources — are dashboard-only pending the REST/JSON A1 backfill **#1649**). They enforce the same scoped permissions and emit the same audit verbs as these panels. **They differ in failure mode, though:** the REST endpoints are **audit-fail-closed** — if the audit row cannot persist they return `503` + `Sec-Audit-Failed: true` and serve no data (or, for `/live`, dispatch nothing), whereas these dashboard panels set `Sec-Audit-Failed: true` on the response but continue to render (a transient audit hiccup must not blank the dashboard). Alert on `Sec-Audit-Failed: true` from **either** surface as a SOC 2 CC7.2 evidence-gap signal. See [REST API — DEX](rest-api.md).
+
+##### Physical
+
+The Hardware CI record's own **Live** lens (`/hardware` → device → **Live** tab) hx-gets the same `/fragments/device/live/*` fragments as the device page above — same dispatch-and-poll machinery, same cards — and adds ten physical-hardware cards, each wiring an already-shipped agent plugin action into the shared card renderer:
+
+| Card | Source | Audit verb | OS |
+|---|---|---|---|
+| **Disks** — per-disk model, capacity, media type, and interface | `hardware/disks` | `device.live.hw_disks` | all |
+| **Memory** — installed memory modules: slot, capacity, type, speed | `hardware/memory` | `device.live.hw_memory` | all |
+| **Processors** — installed CPU(s): model, cores, threads, clock speed | `hardware/processors` | `device.live.hw_processors` | all |
+| **Drivers** — installed device drivers: name, version, date, provider, class | `hardware/drivers` | `device.live.hw_drivers` | Windows, Linux |
+| **Battery** — presence, charge state, percent, time-to-empty, cycle count, health | `power_health/battery` | `device.live.battery` | all |
+| **Thermal** — thermal zone status and temperature | `power_health/thermal` | `device.live.thermal` | all |
+| **Disk health (SMART)** — per-disk SMART health, percent used, spare percent | `disk_actions/smart` | `device.live.smart` | Windows, macOS |
+| **Volumes** — mounted volumes: mount points, backing device, filesystem, size | `disk_actions/volumes` | `device.live.volumes` | Windows, macOS |
+| **Network adapters** — adapter name, MAC, link speed, status | `network_config/adapters` | `device.live.adapters` | all |
+| **Wi-Fi** — current association: SSID, signal, security, BSSID/channel | `wifi/connected` | `device.live.wifi` | all |
+
+All ten are machine-health reads (hardware attributes, not per-user behavioral data) and require **`Execution:Execute`** plus `GuaranteedState:Read`, scoped to the device's management group — same gating as every other live card. **Drivers** is Windows- and Linux-only: the agent enumerates no equivalent driver registry on macOS. **Disk health (SMART)** and **Volumes** are Windows- and macOS-only: the `disk_actions` plugin's Linux leg does not back either action. The remaining six (Disks, Memory, Processors, Battery, Thermal, Network adapters, Wi-Fi) report on all three platforms.
+
+**Deferred: disk-encryption status.** BitLocker/FileVault/LUKS state (`bitlocker/state`) was investigated for this round and dropped, not shipped. Its three platform legs return incompatible wire shapes — Windows a 5-field volume/conversion/percent/method/protection record, Linux a 3-field volume/crypto-type/active-or-inactive record with entirely different field semantics at the same positions, and macOS a bare 1-field enabled/disabled flag — so one generic column table would mislabel the Linux and macOS data. It needs a bespoke per-OS renderer rather than the shared card table; filed as a follow-up.
 
 ### REST API
 
@@ -306,8 +347,13 @@ The full set of agent command-line flags:
 | `--cert-thumbprint` | SHA-1 thumbprint for cert store lookup (hex) | (none) |
 | `--cert-dir` | Directory for the auto-provisioned per-agent mTLS credential (env `YUZU_CERT_DIR`) | `<data-dir>/certs` |
 | `--no-auto-provision-cert` | Disable PKI auto-provisioning (do not request a per-agent client certificate at enrollment) | (enabled) |
-| `--plugin-dir` | Directory containing plugin shared libraries | `./plugins` |
-| `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
+| `--plugin-dir` | Directory containing plugin shared libraries (env `YUZU_PLUGIN_DIR`). The default is `<exe_dir>/../plugins`, where `<exe_dir>` is the directory part of the path the agent was started by (`argv[0]`), not resolved through `PATH` or symlinks. Started by absolute path, as the published agent image (`yuzu-agent-chisel`, `ENTRYPOINT ["/usr/local/bin/yuzu-agent"]`) does, it is `/usr/local/plugins`. Nothing is installed there: the image's default `CMD` passes `--plugin-dir /usr/lib/yuzu/plugins`. Started by bare name through `PATH`, `argv[0]` has no directory part, so the default resolves against the working directory (`<cwd>/../plugins`). A compose `command:` (or `docker run` argument) override replaces the image's `CMD`, so it must restate `--plugin-dir` | `<exe_dir>/../plugins` |
+| `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`; lowercase and case sensitive, and an unrecognised value, including `WARN`, is treated as `off`; `--verbose` forces `trace` whatever this says). The `agent_actions` plugin's `set_log_level` action (needs `Infrastructure:Write` and, through the REST command dispatch, `Execution:Execute`) changes it at runtime but does not persist it, so it reverts when the agent restarts (env `YUZU_LOG_LEVEL`) | `info` |
+| `--log-file` | Path for an on-disk log file, written in addition to the console. A Windows service agent has no console, so it defaults to `yuzu-agent.log` under its data directory (env `YUZU_LOG_FILE`) | (none) |
+| `--log-max-size` | Size in bytes at which the agent's log file rotates. Applies whenever the agent writes a log file (`--log-file`, or the Windows-service default above), otherwise ignored (env `YUZU_LOG_MAX_SIZE`) | `52428800` (50 MB) |
+| `--log-max-files` | Number of rotated log files kept. Applies whenever the agent writes a log file, otherwise ignored (env `YUZU_LOG_MAX_FILES`) | `5` |
+
+Agent logging is asynchronous (#4666 PR-2): a producer thread enqueues a formatted line onto a fixed-size 8192-slot queue and returns; one dedicated worker thread does the actual sink I/O, so a stalled log destination no longer blocks the agent. Under sustained overload the queue silently drops the oldest still-queued lines (`overrun_oldest`) rather than growing or blocking. There is no `--log-sync` flag to opt back into synchronous logging. A shutdown that cannot tear this logger down within an internal 2-second grace, or that fails outright while doing so, self-exits with a new code, 5 (distinct from the existing 1/3/4); see "Stopping a wedged agent" in [Server Administration](server-admin.md) for the full exit-code reference and the async-logging behavior details, and "If log volume matters" in the same page for the level-gating consequence for the SIGINT/SIGTERM shutdown log line (it goes silent at `--log-level warn` or above).
 
 ### Per-agent mTLS auto-provisioning (PKI)
 
@@ -341,6 +387,15 @@ generates a fresh keypair + CSR and the server issues a **new** leaf with a
 (`GET /api/v1/ca/issued`) as an orphaned row that no live agent holds — this is
 harmless, but if you reconcile the inventory you should expect one orphan per
 key-loss event and may revoke it for tidiness. No manual re-enrollment is needed.
+The same happens when the key is unreadable or unparseable at startup, or when
+`agent-client.pem` no longer matches `agent-client.key` (an interrupted renewal
+replaced the key but not the leaf): the agent logs `agent_csr: ... treating the
+credential as missing`, enrols without a client certificate (accepted under
+gradual enforcement) and receives a new leaf. A transient read failure of the key
+file triggers this too. After upgrading to this version, any agent already
+holding a mismatched pair re-enrols once on its first restart; the signer applies
+a per-agent 30 s floor and no global limit, so expect one issued row per such
+agent.
 
 > **Revocation is not bypassable by key deletion.** Auto-re-provisioning applies
 > only when the agent's prior cert was *not* revoked. If you **revoke** an
@@ -358,7 +413,7 @@ key-loss event and may revoke it for tidiness. No manual re-enrollment is needed
 > off the data plane — the server never sees the agent's leaf on the
 > gateway→server hop. To decommission a gateway-proxied agent promptly, also
 > disconnect it at the gateway/management layer. Through-gateway cryptographic
-> revocation is planned with the QUIC transport migration. See
+> revocation is tracked in #5578 (no committed release). See
 > `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
 
 ### Windows Certificate Store Integration
@@ -475,8 +530,8 @@ Unless noted, these endpoints accept form-encoded parameters and return HTML fra
 | `POST` | `/api/settings/enrollment-tokens` | Generate an enrollment token (form-encoded) | HTMX |
 | `POST` | `/api/settings/enrollment-tokens/batch` | Generate tokens in batch (JSON in, JSON out) | JSON |
 | `DELETE` | `/api/settings/enrollment-tokens/{token_id}` | Revoke a token | HTMX |
-| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`) | HTMX |
-| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`) | HTMX |
+| `POST` | `/api/settings/auto-approve` | Add a rule (form: `type`, `value`, `label`); `400` and nothing saved for an unknown type, empty value, `:` or control character in value or label, malformed `ip_subnet` (IPv4 with optional `/0-32`) or `trusted_ca` that is not 64 hex characters | HTMX |
+| `POST` | `/api/settings/auto-approve/mode` | Set match mode (form: `mode=any\|all`); other values return `400` | HTMX |
 | `POST` | `/api/settings/auto-approve/{index}/toggle` | Enable/disable a rule | HTMX |
 | `DELETE` | `/api/settings/auto-approve/{index}` | Delete a rule | HTMX |
 | `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart) | HTMX |

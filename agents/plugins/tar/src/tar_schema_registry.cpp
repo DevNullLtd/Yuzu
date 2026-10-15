@@ -37,11 +37,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"macos",   OsSupportStatus::kSupportedConstrained, "endpoint_security",
                  "Endpoint Security NOTIFY_EXEC/EXIT stream (gap-free, full image "
                  "path, accurate ppid, owning user from the audit token) where the "
-                 "framework + entitlement are present (full Xcode SDK build, "
-                 "com.apple.developer.endpoint-security.client, root). Falls back to "
-                 "the KERN_PROC_ALL sysctl poll otherwise. Names-only on BOTH paths "
-                 "— no command line (works-council posture); the poll blanks the "
-                 "proc_pidpath image it would otherwise place in cmdline."},
+                 "ES SDK was detected at build time and the entitlement + root are "
+                 "present at runtime (com.apple.developer.endpoint-security.client). "
+                 "Falls back to the KERN_PROC_ALL sysctl poll otherwise. Names-only "
+                 "on BOTH paths — no command line (works-council posture); the poll "
+                 "blanks the proc_pidpath image it would otherwise place in cmdline."},
             },
             .granularities = {
                 {
@@ -386,8 +386,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "top-N representative only (<= 2N/tick), failures → empty."},
                 {"linux",   OsSupportStatus::kSupported,  "procfs",
                  "One /proc/[pid]/stat pass per tick — comm, utime+stime, rss, "
-                 "starttime; no ptrace, no per-process handles. Names are the "
-                 "kernel's 15-char comm (joins process_live). version is "
+                 "starttime, flags; no ptrace, no per-process handles. Names are "
+                 "the kernel's 15-char comm (joins process_live). version is "
                  "always '' (on-disk version capture is a follow-up)."},
                 {"macos",   OsSupportStatus::kPlanned,    "libproc",
                  "proc_pid_rusage / proc_taskinfo per sysctl PID list."},
@@ -405,6 +405,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"instances",   "INTEGER"},
                         {"cpu_pct",     "REAL"},
                         {"ws_bytes",    "INTEGER"},
+                        {"is_kthread",  "INTEGER"},
                     },
                 },
                 {
@@ -415,6 +416,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"hour_ts",       "INTEGER"},
                         {"name",          "TEXT"},
                         {"version",       "TEXT"},
+                        {"is_kthread",    "INTEGER"},
                         {"samples",       "INTEGER"},
                         {"instances_max", "INTEGER"},
                         {"cpu_avg",       "REAL"},
@@ -1304,6 +1306,43 @@ std::vector<std::string> accepted_capture_methods_for_os(std::string_view source
     return methods;
 }
 
+std::optional<OsSupportStatus> os_support_status(std::string_view source_name,
+                                                 std::string_view os) {
+    const auto rank = [](OsSupportStatus s) {
+        switch (s) {
+            case OsSupportStatus::kSupported: return 3;
+            case OsSupportStatus::kSupportedConstrained: return 2;
+            case OsSupportStatus::kPlanned: return 1;
+            default: return 0;
+        }
+    };
+    std::optional<OsSupportStatus> best;
+    for (const auto& src : capture_sources()) {
+        if (src.name != source_name)
+            continue;
+        for (const auto& sup : src.os_support) {
+            if (sup.os != os)
+                continue;
+            if (!best || rank(sup.status) > rank(*best))
+                best = sup.status;
+        }
+    }
+    return best;
+}
+
+std::string_view supported_capture_method(std::string_view source_name, std::string_view os) {
+    for (const auto& src : capture_sources()) {
+        if (src.name != source_name)
+            continue;
+        for (const auto& sup : src.os_support) {
+            if (sup.os == os && (sup.status == OsSupportStatus::kSupported ||
+                                 sup.status == OsSupportStatus::kSupportedConstrained))
+                return sup.capture_method;
+        }
+    }
+    return "none";
+}
+
 std::string effective_network_capture_method([[maybe_unused]] std::string_view configured) {
     // The collect_fast NETWORK leg — `enumerate_connections()` — always polls,
     // regardless of the stored `network_capture_method`: the per-OS platform
@@ -1408,6 +1447,15 @@ bool is_queryable_table(std::string_view real_table_name) {
         std::unordered_set<std::string> s{"tar_state", "tar_config", "tar_cursor"};
         for (const auto& [real, ref] : table_ref_map())
             s.insert(real);
+        // #4260: app-usage tables are read ONLY through the Forensics-gated
+        // single-target app_usage plugin reads, never through generic tar.sql
+        // (Infrastructure:Read). Remove them from the allowlist after the loop
+        // above so the SQLite authorizer (tar_query_authorizer) denies every
+        // access path -- direct name, $Usage_* placeholder, alias, JOIN, or
+        // subquery -- post-translation, matching the tar_events #760 UP-8
+        // no-oracle reasoning this function already documents.
+        for (const char* usage_table : {"usage_live", "usage_daily", "usage_daily_user"})
+            s.erase(usage_table);
         return s;
     }();
     return allowed.contains(std::string(real_table_name));
@@ -1548,16 +1596,20 @@ GROUP BY (ts / 3600) * 3600)";
     }
 
     // ── Per-app perf rollups (BRD A2) — per (hour, app name, version) ────
+    // is_kthread rides the GROUP BY as an identity column (module_hourly's
+    // is_kernel precedent) — never aggregated, since every instance sharing
+    // one (name, version) group agrees on it (derive_proc_samples OR's it
+    // across instances of the same name).
     if (source_name == "procperf") {
         if (target_suffix == "hourly") {
-            return R"(INSERT INTO procperf_hourly (hour_ts, name, version, samples, instances_max,
-    cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes)
-SELECT (ts / 3600) * 3600, name, version, COUNT(*), MAX(instances),
+            return R"(INSERT INTO procperf_hourly (hour_ts, name, version, is_kthread, samples,
+    instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes)
+SELECT (ts / 3600) * 3600, name, version, is_kthread, COUNT(*), MAX(instances),
        AVG(cpu_pct), MAX(cpu_pct),
        CAST(AVG(ws_bytes) AS INTEGER), MAX(ws_bytes)
 FROM procperf_live
 WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, name, version)";
+GROUP BY (ts / 3600) * 3600, name, version, is_kthread)";
         }
     }
 

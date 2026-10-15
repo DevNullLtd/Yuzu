@@ -4,9 +4,9 @@
  *
  * FIRST Objective-C++ (`.mm`) translation unit in the Yuzu tree. CoreWLAN is a
  * public framework shipped in the base macOS SDK (present with the Command Line
- * Tools SDK — unlike EndpointSecurity, which needs full Xcode), so this always
- * compiles on a dev box. Built with `-fobjc-arc`; only reads autoreleased
- * objects, so no manual retain/release. See agents/plugins/wifi/meson.build.
+ * Tools SDK), so this always compiles on a dev box. Built with `-fobjc-arc`;
+ * only reads autoreleased objects, so no manual retain/release. See
+ * agents/plugins/wifi/meson.build.
  */
 
 #import <CoreWLAN/CoreWLAN.h>

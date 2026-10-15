@@ -58,6 +58,9 @@ gpb::GuaranteedStateEvent guardian_outbox_entry_to_event(const OutboxEntry& e,
     case OutboxDomain::Health:
         // Health/Lifecycle carry guard_type/rule_name on the entry (Compliance carries
         // them inside drift); set them so the wire event is fully identified (#2237).
+        // This serialization (below) is duplicated byte-for-byte in guardian_engine.cpp's
+        // emit_guard_event health arm (legacy FileGuard's own guard.unhealthy path,
+        // PR #4748) with no coupling test between the two copies — tracked as #4782.
         ev.set_guard_type(e.guard_type);
         ev.set_rule_name(e.rule_name);
         // healthy = the watch recovered (Unknown -> Known); !healthy = a read error

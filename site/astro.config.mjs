@@ -6,8 +6,13 @@ import stripFirstH1 from './src/remark/strip-first-h1.mjs';
 
 // GitHub Pages project site: served under /Yuzu/. Change `site` if a custom
 // domain is added later (then drop `base`).
+//
+// The host tracks the repo OWNER and GitHub does NOT redirect Pages on a repo
+// transfer the way it redirects repo URLs — a stale host here silently emits
+// wrong canonical URLs and a wrong sitemap. Updated for the DevNullLtd org
+// transfer (2026-09-28).
 export default defineConfig({
-  site: 'https://tr3kkr.github.io',
+  site: 'https://devnullltd.github.io',
   base: '/Yuzu',
   trailingSlash: 'always',
   markdown: {

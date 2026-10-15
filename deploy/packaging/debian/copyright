@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: Yuzu
 Upstream-Contact: noreply@yuzu.io
-Source: https://github.com/Tr3kkR/Yuzu
+Source: https://github.com/DevNullLtd/Yuzu
 
 Files: *
 Copyright: 2024-2026 Nathan Dornbrook

@@ -344,8 +344,10 @@ bool nstat_stream_is_stalled(std::int64_t last_event_ts, std::int64_t started_ts
 // method is a no-op / returns empty and start() returns false so the caller
 // falls back to the existing sysctl-based poll (enumerate_connections /
 // collect_tcp_quality's Linux/Windows/other-macOS-fallback paths) cleanly.
-// Unlike tar_proc_es.cpp's Endpoint Security guard, nstat needs no extra
-// framework-detection macro: it is a plain kctl socket over libSystem
+// Unlike tar_proc_es.cpp's Endpoint Security guard (a lib+header pair
+// needing its own build-time find_library()/has_header() probe -- see
+// docs/darwin-compat.md's EndpointSecurity row), nstat needs NO detection
+// macro at all: it is a plain kctl socket over libSystem
 // (<sys/kern_control.h> etc.), always available on any macOS SDK — full
 // Xcode or Command Line Tools alike.
 #if defined(__APPLE__)

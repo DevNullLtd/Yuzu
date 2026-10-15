@@ -57,6 +57,7 @@
 #include "schedule_arming_check.hpp"
 #include "schedule_engine.hpp"
 #include "schedule_runner.hpp"
+#include "test_auth_db_pg_helper.hpp" // AuthDbPg — the last-admin guard's auth.users JOIN (BLOCKING #1)
 
 #include "../test_helpers.hpp"
 
@@ -342,9 +343,26 @@ struct Harness {
 TEST_CASE("arming_check (auto path): a schedule whose creator lost the required permission "
           "does not fire, and re-fires once permission is restored",
           "[server][routes][mcp][schedule][pg]") {
-    TWINS_RBAC(rbac);
+    // RbacStore is co-located on a real AuthDbPg's pool (not TWINS_RBAC's own,
+    // separate database) so the last-admin guard's `auth.users` JOIN
+    // (BLOCKING #1) can see the seeded users below — same fixture-colocation
+    // fix as test_rbac_store.cpp's RBAC_STORE_WITH_AUTH macro, applied
+    // file-locally here since TWINS_RBAC's "optwinsrbac" template has no
+    // other caller to keep in sync with.
+    yuzu::test::AuthDbPg twins_auth_fx_;
+    RbacStore rbac{twins_auth_fx_.pool()};
+    REQUIRE(rbac.is_open());
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
+    // A second Administrator holder so unassigning carol's grant below doesn't
+    // trip the A2 last-Administrator guard (delivery plan §2) — this test is
+    // about arming re-verification, not that guard. Both need a live
+    // `auth.users` row for the guard's JOIN to count them.
+    REQUIRE(twins_auth_fx_->upsert_user("twins-other-admin", "hash", "salt", auth::Role::user)
+               .has_value());
+    REQUIRE(twins_auth_fx_->upsert_user("carol", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "twins-other-admin", "Administrator"})
+               .has_value());
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "carol", "Administrator"}).has_value());
     auto id = h.make_due("carol", /*requires_approval=*/false);
 
@@ -370,9 +388,21 @@ TEST_CASE("arming_check (auto path): a schedule whose creator lost the required 
 TEST_CASE("arming_check (approval path): a schedule whose creator lost the required "
           "permission does not submit an approval ticket and does not fire",
           "[server][routes][mcp][schedule][pg]") {
-    TWINS_RBAC(rbac);
+    // See the identical comment in the auto-path test above — RbacStore is
+    // co-located on a real AuthDbPg's pool so the last-admin guard's
+    // `auth.users` JOIN (BLOCKING #1) can see the seeded users.
+    yuzu::test::AuthDbPg twins_auth_fx_;
+    RbacStore rbac{twins_auth_fx_.pool()};
+    REQUIRE(rbac.is_open());
     TWINS_INSTR(instr_pool);
     Harness h{instr_pool, rbac};
+    // A second Administrator holder — see the identical comment in the
+    // auto-path test above (A2 last-Administrator guard).
+    REQUIRE(twins_auth_fx_->upsert_user("twins-other-admin", "hash", "salt", auth::Role::user)
+               .has_value());
+    REQUIRE(twins_auth_fx_->upsert_user("dave", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "twins-other-admin", "Administrator"})
+               .has_value());
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "dave", "Administrator"}).has_value());
     auto id = h.make_due("dave", /*requires_approval=*/true);
 
@@ -429,10 +459,20 @@ constexpr TwinRow kExpectedTwins[] = {
     // REST twin gates on).
     {"list_preflight_runs", "Infrastructure", "Read", true},
     {"get_deployment_preview", "SoftwareDeployment", "Read", true},
+    {"list_deployments", "SoftwareDeployment", "Read", true},
+    {"get_deployment", "SoftwareDeployment", "Read", true},
+    // Estate E-2: the discovered-devices read twin, pinned against the REST
+    // GET /api/v1/network/discovered-devices gate in network_routes.cpp.
+    {"list_discovered_devices", "Infrastructure", "Read", true},
     // #4030: executions/workflows/schedules read-twin programme.
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},
     {"get_workflow_execution", "Workflow", "Read", true},
+    {"list_workflow_executions", "Workflow", "Read", true},
+    // #2146 A2-R1 - pinned against the new GET /api/v1/executions/{id}/children
+    // (rest_api_v1.cpp) and legacy GET /api/executions/{id}/children
+    // (execution_routes.cpp) handlers' shared (securable, operation) gate.
+    {"get_execution_children", "Execution", "Read", true},
     // #4029 (api-parity Batch A content/catalog half): instruction-definition
     // read twins, pinned against instruction_definition_model.hpp / the new
     // GET /api/v1/instructions* routes (rest_api_v1.cpp).
@@ -485,6 +525,9 @@ constexpr TwinRow kExpectedTwins[] = {
     // #4035: the 8 genuinely-new REST+MCP twins from the same issue.
     {"get_dex_app", "GuaranteedState", "Read", true},
     {"list_dex_apps", "GuaranteedState", "Read", true},
+    // ADR-0031 WS-A4 PR-1: the Catalogue View 1 REST+MCP
+    // twin, pinned against GET /api/v1/dex/catalogue (rest_api_v1.cpp).
+    {"get_dex_catalogue", "GuaranteedState", "Read", true},
     {"get_dex_catalogue_group", "GuaranteedState", "Read", true},
     {"get_dex_device_history", "GuaranteedState", "Read", true},
     {"get_dex_observation", "GuaranteedState", "Read", true},
@@ -557,6 +600,21 @@ constexpr TwinRow kExpectedTwins[] = {
     {"create_software_deployment", "SoftwareDeployment", "Execute", false},
     {"rollback_software_deployment", "SoftwareDeployment", "Execute", false},
     {"cancel_software_deployment", "SoftwareDeployment", "Execute", false},
+    // Wave 7 PR7.2 — app-usage read surface. Pinned against
+    // app_usage_routes.cpp's own gate (GET /api/v1/forensics/agents/{id}/
+    // app-usage), same (securable, operation) the MCP twin enforces.
+    {"get_agent_app_usage", "Forensics", "Read", true},
+    // #2146 A2-R4 (review finding, PR #4656) — approval-review read twins.
+    // Pinned against rest_api_v1.cpp's GET /api/v1/approvals and GET
+    // /api/v1/approvals/pending/count, same Approval:Read gate the MCP
+    // twins' tier_allows/perm_fn calls enforce.
+    {"list_pending_approvals", "Approval", "Read", true},
+    {"get_pending_approval_count", "Approval", "Read", true},
+    // M.9 software catalogue twins, pinned against
+    // GET /api/v1/inventory/software/catalogue{,/versions} (rest_api_v1.cpp): the same
+    // Inventory:Read gate the REST routes take through require_fleet_read.
+    {"query_software_catalogue", "Inventory", "Read", true},
+    {"get_software_versions", "Inventory", "Read", true},
 };
 
 } // namespace
@@ -625,6 +683,7 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_tar_retention_paused",
             "get_guardian_status",
             "list_guardian_rules",
+            "get_pending_approval_count",
         };
         if (!kNoArgTools.contains(expected.tool))
             CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");

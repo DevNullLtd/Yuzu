@@ -1,0 +1,305 @@
+## Peripherals Definitions
+## Reports USB, PCI and Thunderbolt/USB4 bus inventory. Read-only.
+## Plugin: peripherals | Actions: usb, pci, thunderbolt
+##
+## Sources by platform:
+##   Windows: SetupAPI SetupDiGetClassDevsW(USB enumerator) + SPDRP_HARDWAREID/
+##            COMPATIBLEIDS (usb); SetupAPI (PCI enumerator) (pci); SetupAPI
+##            PCI enumerator, DEVICEDESC contains Thunderbolt/USB4 (thunderbolt
+##            — CONSTRAINED, string-heuristic identification, no Thunderbolt
+##            device class in SetupAPI).
+##   macOS:   IOKit IOServiceMatching(IOUSBHostDevice) (usb);
+##            IOServiceMatching(IOPCIDevice) (pci);
+##            IOServiceMatching(IOThunderboltSwitch) (thunderbolt).
+##   Linux:   /sys/bus/usb/devices sysfs attribute reads (usb);
+##            /sys/bus/pci/devices sysfs attribute reads (pci);
+##            /sys/bus/thunderbolt/devices sysfs reads (thunderbolt —
+##            CONSTRAINED, fixture-verified with no live Linux Thunderbolt
+##            venue in this run).
+##
+## SCOPE: three bus-inventory kinds only. displays/bluetooth/audio/camera are
+## PR9.1c, deferred until after this PR merges.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.peripherals.usb
+  displayName: USB Device Inventory
+  version: 1.0.0
+  description: >
+    Reports one row per USB device: bus path, vendor/product id, device
+    class/subclass, vendor/product strings, serial number, negotiated speed,
+    and whether the node is itself a hub. A host with no USB devices reports
+    a single `usb|none` row rather than silence.
+  tags: [peripherals, usb, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: peripherals
+    action: usb
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # usb|<bus_path>|<vendor_id>|<product_id>|<class>|<subclass>|<vendor>|<product>|<serial>|<speed>|<is_hub>
+    columns:
+      - name: bus_path
+        type: string
+        description: 'Platform-native bus location for this device (e.g. a SetupAPI device instance path, a sysfs bus path, or an IOKit registry path).'
+        example: "1-2.1"
+        platforms: [windows, linux, darwin]
+      - name: vendor_id
+        type: string
+        description: 'USB vendor id, 4 lowercase hex digits.'
+        example: "046d"
+        platforms: [windows, linux, darwin]
+      - name: product_id
+        type: string
+        description: 'USB product id, 4 lowercase hex digits.'
+        example: "c52b"
+        platforms: [windows, linux, darwin]
+      - name: class
+        type: string
+        description: 'USB device class code, 2 lowercase hex digits.'
+        example: "09"
+        platforms: [windows, linux, darwin]
+      - name: subclass
+        type: string
+        description: 'USB device subclass code, 2 lowercase hex digits.'
+        example: "00"
+        platforms: [windows, linux, darwin]
+      - name: vendor
+        type: string
+        description: 'Vendor string, where the device or platform exposes one; "-" otherwise.'
+        example: Logitech
+        platforms: [windows, linux, darwin]
+      - name: product
+        type: string
+        description: 'Product string, where the device or platform exposes one; "-" otherwise.'
+        example: USB Receiver
+        platforms: [windows, linux, darwin]
+      - name: serial
+        type: string
+        description: 'Device serial number, where exposed; "-" otherwise.'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: speed
+        type: string
+        description: 'Negotiated link speed, platform-native token (e.g. "480" Mbps); "-" where unread.'
+        example: "480"
+        platforms: [windows, linux, darwin]
+      - name: is_hub
+        type: boolean
+        description: 'Whether this node is itself a USB hub. Values: 1 (hub), 0 (not a hub) — a digit, never true/false.'
+        example: "0"
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - vendor_id
+      operations:
+        - count
+
+  readablePayload: "Report USB device inventory"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [peripherals]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.peripherals.pci
+  displayName: PCI Device Inventory
+  version: 1.0.0
+  description: >
+    Reports one row per PCI/PCIe device: bus path, vendor/device id, class
+    code, subsystem vendor/device id, bound driver, and a human-readable
+    description. A host with no PCI devices reports a single `pci|none` row
+    rather than silence.
+  tags: [peripherals, pci, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: peripherals
+    action: pci
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # pci|<bus_path>|<vendor_id>|<device_id>|<class>|<subsystem_vendor>|<subsystem_device>|<driver>|<description>
+    columns:
+      - name: bus_path
+        type: string
+        description: 'Platform-native PCI bus location (e.g. a SetupAPI device instance path, a sysfs bus path, or an IOKit registry path).'
+        example: "0000:00:02.0"
+        platforms: [windows, linux, darwin]
+      - name: vendor_id
+        type: string
+        description: 'PCI vendor id, 4 lowercase hex digits.'
+        example: "8086"
+        platforms: [windows, linux, darwin]
+      - name: device_id
+        type: string
+        description: 'PCI device id, 4 lowercase hex digits.'
+        example: "9a49"
+        platforms: [windows, linux, darwin]
+      - name: class
+        type: string
+        description: 'PCI class code (base class + subclass + programming interface), 6 lowercase hex digits.'
+        example: "030000"
+        platforms: [windows, linux, darwin]
+      - name: subsystem_vendor
+        type: string
+        description: 'PCI subsystem vendor id, 4 lowercase hex digits; "0000" where unread.'
+        example: "1028"
+        platforms: [windows, linux, darwin]
+      - name: subsystem_device
+        type: string
+        description: 'PCI subsystem device id, 4 lowercase hex digits; "0000" where unread.'
+        example: "0a5c"
+        platforms: [windows, linux, darwin]
+      - name: driver
+        type: string
+        description: 'Bound driver name, where the platform exposes one; "-" otherwise.'
+        example: i915
+        platforms: [windows, linux, darwin]
+      - name: description
+        type: string
+        description: 'Human-readable device description, where the platform exposes one; "-" otherwise.'
+        example: 'Intel Iris Xe Graphics'
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - vendor_id
+      operations:
+        - count
+
+  readablePayload: "Report PCI device inventory"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [peripherals]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.peripherals.thunderbolt
+  displayName: Thunderbolt/USB4 Inventory
+  version: 1.0.0
+  description: >
+    Reports one row per Thunderbolt/USB4 node — the bus_inventory fold of
+    host controllers and attached devices. Windows and Linux are CONSTRAINED:
+    Windows identifies Thunderbolt/USB4 controllers by a string heuristic
+    over the PCI enumerator (SetupAPI exposes no dedicated Thunderbolt device
+    class), and the Linux sysfs walk is fixture-verified only, with no live
+    Thunderbolt bus reachable in this run. A host with no Thunderbolt/USB4
+    bus reports a single `thunderbolt|none` row rather than silence.
+  tags: [peripherals, thunderbolt, usb4, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: peripherals
+    action: thunderbolt
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # thunderbolt|<path>|<role>|<vendor>|<model>|<unique_id>|<generation>|<authorized>
+    columns:
+      - name: path
+        type: string
+        description: 'Platform-native location for this node (e.g. a SetupAPI device instance path, a sysfs bus path, or an IOKit registry path).'
+        example: "domain0/0-0"
+        platforms: [windows, linux, darwin]
+      - name: role
+        type: string
+        description: 'Reported node role. Values: host_controller, device.'
+        example: host_controller
+        platforms: [windows, linux, darwin]
+      - name: vendor
+        type: string
+        description: 'Vendor string, where the platform exposes one; "-" otherwise.'
+        example: "Apple Inc."
+        platforms: [windows, linux, darwin]
+      - name: model
+        type: string
+        description: 'Model/device name string, where the platform exposes one; "-" otherwise.'
+        example: 'Thunderbolt 4 Pro Dock'
+        platforms: [windows, linux, darwin]
+      - name: unique_id
+        type: string
+        description: 'Node-unique identifier, where the platform exposes one; "-" otherwise.'
+        example: "00340000-0044-4123-8000-000103ffffff"
+        platforms: [windows, linux, darwin]
+      - name: generation
+        type: string
+        description: 'Reported Thunderbolt/USB4 generation, where the platform exposes one (e.g. "4"); "-" otherwise.'
+        example: "4"
+        platforms: [windows, linux, darwin]
+      - name: authorized
+        type: string
+        description: 'Security-level authorization state, where the platform exposes one. Values: 1 (authorized), 0 (not authorized), - (not exposed by this platform mechanism).'
+        example: "1"
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - role
+      operations:
+        - count
+
+  readablePayload: "Report Thunderbolt/USB4 device inventory"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [peripherals]
+
+status:
+  phase: active

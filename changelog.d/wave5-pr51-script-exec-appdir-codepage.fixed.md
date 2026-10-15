@@ -1,1 +1,0 @@
-- **`script_exec`'s Windows app-directory search stage no longer narrows through the active code page.** The app-directory search path is now converted via UTF-16→UTF-8 directly, matching `content_dist`'s existing pattern; an install path outside the active code page no longer risks silent corruption.

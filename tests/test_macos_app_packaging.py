@@ -471,7 +471,7 @@ reject_unmanaged_plugin_collisions
         preinstall = (ROOT / "deploy/packaging/macos/preinstall").read_text()
         postinstall = (ROOT / "deploy/packaging/macos/postinstall").read_text()
         uninstall = (ROOT / "deploy/packaging/macos/uninstall.sh").read_text()
-        self.assertIn('rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib', postinstall)
+        self.assertIn('rm -f /usr/local/bin/yuzu-agent /usr/local/bin/libyuzu_agent_core.dylib /usr/local/lib/libyuzu_agent_core.dylib', postinstall)
         self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('harden_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('collides with an unmanaged third-party plugin', postinstall)

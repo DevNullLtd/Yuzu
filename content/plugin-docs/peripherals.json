@@ -1,0 +1,810 @@
+{
+  "actions": [
+    {
+      "action": "pci",
+      "definition_ids": [
+        "crossplatform.peripherals.pci"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/sys/bus/pci/devices sysfs attribute reads",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "IOKit IOServiceMatching(IOPCIDevice)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "SetupAPI (PCI enumerator)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "thunderbolt",
+      "definition_ids": [
+        "crossplatform.peripherals.thunderbolt"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "walk verified against a sysfs fixture tree only; no live Linux venue with a Thunderbolt bus in this run",
+          "mechanism": "/sys/bus/thunderbolt/devices sysfs reads",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "IOKit IOServiceMatching(IOThunderboltSwitch)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "string-heuristic identification; no Thunderbolt device class in SetupAPI",
+          "mechanism": "SetupAPI PCI enumerator, DEVICEDESC contains Thunderbolt/USB4",
+          "rung": "1",
+          "support": "constrained"
+        }
+      }
+    },
+    {
+      "action": "usb",
+      "definition_ids": [
+        "crossplatform.peripherals.usb"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/sys/bus/usb/devices sysfs attribute reads",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "IOKit IOServiceMatching(IOUSBHostDevice)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "SetupAPI SetupDiGetClassDevsW(USB enumerator) + SPDRP_HARDWAREID/COMPATIBLEIDS",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Windows Thunderbolt identification is a string heuristic, not a device class.** SetupAPI's PCI enumerator exposes no dedicated Thunderbolt/USB4 device class, so the Windows leg matches `DEVICEDESC` containing \"Thunderbolt\" or \"USB4\" (case-insensitive) on the PCI walk. It also only ever surfaces the host controller — SetupAPI's PCI enumerator cannot see a downstream Thunderbolt device — so every Windows Thunderbolt row reports role `host_controller`.",
+    "**Linux Thunderbolt support is fixture-tree-verified only.** The `/sys/bus/thunderbolt/devices` walk has been exercised against a synthetic sysfs fixture tree (`tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/`); no live Linux host with an actual Thunderbolt bus has run this leg in this project to date.",
+    "**Linux `pci` never reports a `description`.** Unlike Windows (`DEVICEDESC`) and macOS (`IOName`), no sysfs attribute carries a human-readable PCI device description, so the Linux `pci` action's `description` field is always `-`.",
+    "**macOS `pci` reports the matched service's child class name as `driver`, not a kext/bundle identifier.** `IORegistryEntryGetChildEntry` in the service plane returns a generic IOKit class name (e.g. `IOPCI2PCIBridge`), which is the closest available proxy to \"what's bound to this device\" on macOS — it is not the driver bundle identifier a Windows `INF`/driver-key lookup or a Linux `driver` symlink would give.",
+    "**Windows `pci`'s subsystem vendor/device fields are always `0000`.** SetupAPI's `SPDRP_HARDWAREID` `SUBSYS_` token and a driver-key lookup for the bound driver name are out of Wave-2 scope; both fields report the honest-unfilled `0000`/`-` sentinel rather than a guess (`peripherals_win.cpp`'s `emit_pci_row`)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports one row per PCI/PCIe device: bus path, vendor/device id, class code, subsystem vendor/device id, bound driver, and a human-readable description. A host with no PCI devices reports a single `pci|none` row rather than silence.",
+      "display_name": "PCI Device Inventory",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.peripherals.pci",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports one row per Thunderbolt/USB4 node — the bus_inventory fold of host controllers and attached devices. Windows and Linux are CONSTRAINED: Windows identifies Thunderbolt/USB4 controllers by a string heuristic over the PCI enumerator (SetupAPI exposes no dedicated Thunderbolt device class), and the Linux sysfs walk is fixture-verified only, with no live Thunderbolt bus reachable in this run. A host with no Thunderbolt/USB4 bus reports a single `thunderbolt|none` row rather than silence.",
+      "display_name": "Thunderbolt/USB4 Inventory",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.peripherals.thunderbolt",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports one row per USB device: bus path, vendor/product id, device class/subclass, vendor/product strings, serial number, negotiated speed, and whether the node is itself a hub. A host with no USB devices reports a single `usb|none` row rather than silence.",
+      "display_name": "USB Device Inventory",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.peripherals.usb",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "USB, PCI and Thunderbolt/USB4 device inventory",
+  "how_it_works": "Three independent bus walks, dispatched by action name (`peripherals_plugin.cpp`): `usb` and `pci` enumerate the platform's device tree for that bus, one row per device; `thunderbolt` is the bus_inventory fold — one row per Thunderbolt/USB4 node, host controller or attached device, from whatever mechanism each OS exposes for that bus (there is no single \"Thunderbolt API\" the way there is a PCI or USB one). Every leg is a pure device-tree read: no configuration, no authorization-state change, no write of any kind. A leg that finds nothing still emits one `<kind>|none` row rather than silence, and a leg that cannot even attempt the read emits `<kind>|unavailable|<token>` and reports a degraded result status — never a plain empty result standing in for a failure. This plugin is deliberately NOT the source of PCI/USB vendor-ID-to-name lookups (no `pci.ids`/`usb.ids` database is shipped or parsed — vendor/product strings, where present, come straight from the OS), never shells out to a subprocess on any leg, and does not yet cover displays, Bluetooth, audio or camera devices (scoped out at Wave 1 planning, deferred to a later PR).",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "25220299bc79",
+  "manifest_version": 1,
+  "name": "peripherals",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Platform-native PCI bus location (e.g. a SetupAPI device instance path, a sysfs bus path, or an IOKit registry path).",
+          "example": "0000:00:02.0",
+          "name": "bus_path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "PCI vendor id, 4 lowercase hex digits.",
+          "example": "8086",
+          "name": "vendor_id",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "PCI device id, 4 lowercase hex digits.",
+          "example": "9a49",
+          "name": "device_id",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "PCI class code (base class + subclass + programming interface), 6 lowercase hex digits.",
+          "example": "030000",
+          "name": "class",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "PCI subsystem vendor id, 4 lowercase hex digits; \"0000\" where unread.",
+          "example": "1028",
+          "name": "subsystem_vendor",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "PCI subsystem device id, 4 lowercase hex digits; \"0000\" where unread.",
+          "example": "0a5c",
+          "name": "subsystem_device",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Bound driver name, where the platform exposes one; \"-\" otherwise.",
+          "example": "i915",
+          "name": "driver",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Human-readable device description, where the platform exposes one; \"-\" otherwise.",
+          "example": "Intel Iris Xe Graphics",
+          "name": "description",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.peripherals.pci"
+    },
+    {
+      "columns": [
+        {
+          "description": "Platform-native location for this node (e.g. a SetupAPI device instance path, a sysfs bus path, or an IOKit registry path).",
+          "example": "domain0/0-0",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Reported node role. Values: host_controller, device.",
+          "example": "host_controller",
+          "name": "role",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Vendor string, where the platform exposes one; \"-\" otherwise.",
+          "example": "Apple Inc.",
+          "name": "vendor",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Model/device name string, where the platform exposes one; \"-\" otherwise.",
+          "example": "Thunderbolt 4 Pro Dock",
+          "name": "model",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Node-unique identifier, where the platform exposes one; \"-\" otherwise.",
+          "example": "00340000-0044-4123-8000-000103ffffff",
+          "name": "unique_id",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Reported Thunderbolt/USB4 generation, where the platform exposes one (e.g. \"4\"); \"-\" otherwise.",
+          "example": "4",
+          "name": "generation",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Security-level authorization state, where the platform exposes one. Values: 1 (authorized), 0 (not authorized), - (not exposed by this platform mechanism).",
+          "example": "1",
+          "name": "authorized",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.peripherals.thunderbolt"
+    },
+    {
+      "columns": [
+        {
+          "description": "Platform-native bus location for this device (e.g. a SetupAPI device instance path, a sysfs bus path, or an IOKit registry path).",
+          "example": "1-2.1",
+          "name": "bus_path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "USB vendor id, 4 lowercase hex digits.",
+          "example": "046d",
+          "name": "vendor_id",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "USB product id, 4 lowercase hex digits.",
+          "example": "c52b",
+          "name": "product_id",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "USB device class code, 2 lowercase hex digits.",
+          "example": "09",
+          "name": "class",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "USB device subclass code, 2 lowercase hex digits.",
+          "example": "00",
+          "name": "subclass",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Vendor string, where the device or platform exposes one; \"-\" otherwise.",
+          "example": "Logitech",
+          "name": "vendor",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Product string, where the device or platform exposes one; \"-\" otherwise.",
+          "example": "USB Receiver",
+          "name": "product",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Device serial number, where exposed; \"-\" otherwise.",
+          "example": "-",
+          "name": "serial",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Negotiated link speed, platform-native token (e.g. \"480\" Mbps); \"-\" where unread.",
+          "example": "480",
+          "name": "speed",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether this node is itself a USB hub. Values: 1 (hub), 0 (not a hub) — a digit, never true/false.",
+          "example": "0",
+          "name": "is_hub",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "boolean",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.peripherals.usb"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows, one per device, written via `write_output()`. Every field beyond the fixed-vocabulary `role` column goes through the shared untrusted-output escaper; a device with no value for a given optional field reports `-` rather than an empty or omitted field. A bus with no devices reports a single `<kind>|none` row; a leg that could not attempt the read at all reports `<kind>|unavailable|<token>` instead of any device rows.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None documented for this plugin (`docs/agent-privilege-model.md`)",
+      "if_refused": "`SetupDiGetClassDevsW` fails, action reports `<kind>|unavailable|windows:setupapi:getclassdevs_failed:<GetLastError>`",
+      "measured": "2026-09-08, bare-metal, the-rig, `LocalSystem (elevated)` — P91-7's real MSVC capture (`docs/samples/windows.txt`)",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "None — IOKit registry property reads are unprivileged",
+      "if_refused": "`IOServiceGetMatchingServices` itself fails (`kr != KERN_SUCCESS`), action reports `<kind>|unavailable|macos:iokit:matching_failed`; a query that succeeds but matches zero services is a clean `<kind>|none`, not a failure",
+      "measured": "2026-09-08, bare-metal, this Mac (`braga`), unprivileged (uid 501) — real `ioreg`-equivalent captures behind P91-6's fixtures (`tests/unit/fixtures/wave9/peripherals/macos/*.provenance.txt`); no root-privileged run of this plugin has been captured yet, so the root identity above is the documented production default, not a measured one",
+      "os": "macOS",
+      "runs_as": "agent daemon, root today (LaunchDaemon carries no `UserName` key — `docs/agent-privilege-model.md` TL;DR); this plugin's own reads need no elevation beyond that default"
+    },
+    {
+      "grant": "None — sysfs bus directories under `/sys/bus/{usb,pci,thunderbolt}/devices` are world-readable by default",
+      "if_refused": "The bus directory exists but is unreadable (EACCES) or another listing error occurs, action reports `<kind>|unavailable|linux:sysfs:eacces` or `linux:sysfs:read_failed`; an absent bus directory (no such bus on this host) is a clean `<kind>|none`, not a failure",
+      "measured": "2026-09-14, container (Docker VM on this Mac), root (`euid 0`) — a real live capture (`docs/samples/linux.txt`, I91-6/I91-7), plus the fixture tree at `tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/` (P91-5/P91-7) for the walk-logic unit tests",
+      "os": "Linux",
+      "runs_as": "agent daemon, default"
+    }
+  ],
+  "readme": "agents/plugins/peripherals/README.md",
+  "result_status": [
+    {
+      "completeness": "`FULL`",
+      "provenance": "—",
+      "status": "`OK`",
+      "when": "The leg attempted the read and either found devices or found none (`<kind>|none`) — an empty bus is a complete answer, not a degradation."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`linux:sysfs:eacces`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: the bus's `devices` directory exists but could not be opened (permission denied)."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`linux:sysfs:read_failed`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: the bus's `devices` directory exists but listing it failed for a reason other than EACCES."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`macos:iokit:matching_failed`",
+      "status": "`CONSTRAINED`",
+      "when": "macOS: `IOServiceGetMatchingServices` itself returned a non-success `kern_return_t` — the IOKit main port was unreachable, not merely \"no matches\"."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`windows:setupapi:getclassdevs_failed`",
+      "status": "`CONSTRAINED`",
+      "when": "Windows: `SetupDiGetClassDevsW` itself failed; the row and status reason carry the literal token with `GetLastError()`'s numeric code appended."
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "usb",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 2,
+          "rows": [
+            "usb|usb1|1d6b|0002|09|00|Linux 7.0.12-linuxkit vhci_hcd|USB/IP Virtual Host Controller|vhci_hcd.0|480|1",
+            "usb|usb2|1d6b|0003|09|00|Linux 7.0.12-linuxkit vhci_hcd|USB/IP Virtual Host Controller|vhci_hcd.0|10000|1"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "pci",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 14,
+          "rows": [
+            "pci|0000:00:08.0|1af4|105a|018000|1af4|005a|virtio-pci|-",
+            "pci|0000:00:0d.0|1af4|105a|018000|1af4|005a|virtio-pci|-",
+            "pci|0000:00:10.0|1af4|1045|058000|1af4|0045|virtio-pci|-",
+            "pci|0000:00:01.0|1af4|1041|020000|1af4|0041|virtio-pci|-",
+            "pci|0000:00:07.0|1af4|1042|018000|1af4|0042|virtio-pci|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "thunderbolt",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 1,
+          "rows": [
+            "thunderbolt|none"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-14",
+        "host_class": "container",
+        "leg_hash": "25220299bc79",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "usb",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 2,
+          "rows": [
+            "usb|02200000|05ac|800c|09|00|Apple|USB3 Gen2 Hub|7423J07|super+|1",
+            "usb|02100000|05ac|800b|09|00|Apple|USB2 Hub|7423J07|high|1"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "pci",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 8,
+          "rows": [
+            "pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge",
+            "pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge",
+            "pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge",
+            "pci|0:0:0(2:2)|106b|100c|060400|0000|0000|ApplePCIEHostBridge|pci-bridge",
+            "pci|0:2:0(1:1)|106b|100c|060400|0000|0000|ApplePCIEHostBridge|pci-bridge"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "thunderbolt",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 3,
+          "rows": [
+            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b1|-|-",
+            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b0|-|-",
+            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b3|-|-"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-14",
+        "host_class": "bare-metal",
+        "leg_hash": "25220299bc79",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "usb",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 24,
+          "rows": [
+            "usb|USB/VID_046D&PID_C548&MI_03/7&247BA993&0&0003|046d|c548|03|00|(Standard system devices)|USB Input Device|-|-|0",
+            "usb|USB/VID_0B05&PID_18F3/9876543210|0b05|18f3|00|00|(Standard USB Host Controller)|USB Composite Device|-|-|0",
+            "usb|USB/VID_0B0E&PID_2E56&MI_03/9&3135CDCD&0&0003|0b0e|2e56|03|00|(Standard system devices)|USB Input Device|-|-|0",
+            "usb|USB/VID_0B0E&PID_2E56/6CFBEDC4770B|0b0e|2e56|00|00|(Standard USB Host Controller)|USB Composite Device|-|-|0",
+            "usb|USB/VID_8087&PID_0029/8&384B90AF&0&6|8087|0029|e0|01|Intel Corporation|Intel(R) Wireless Bluetooth(R)|-|-|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "pci",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 48,
+          "rows": [
+            "pci|PCI/VEN_1022&DEV_1444&SUBSYS_00000000&REV_00/3&11583659&0&C4|1022|1444|060000|0000|0000|-|PCI standard host CPU bridge",
+            "pci|PCI/VEN_1022&DEV_1486&SUBSYS_88081043&REV_00/4&231A312E&0&0141|1022|1486|108000|0000|0000|-|AMD PSP 11.0 Device",
+            "pci|PCI/VEN_8086&DEV_1539&SUBSYS_85F01043&REV_03/6&2AD155D1&0&0028000A|8086|1539|020000|0000|0000|-|Intel(R) I211 Gigabit Network Connection",
+            "pci|PCI/VEN_1022&DEV_1441&SUBSYS_00000000&REV_00/3&11583659&0&C1|1022|1441|060000|0000|0000|-|PCI standard host CPU bridge",
+            "pci|PCI/VEN_1022&DEV_1485&SUBSYS_88081043&REV_00/6&313998C&0&0040000A|1022|1485|130000|0000|0000|-|AMD PCI"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "thunderbolt",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 1,
+          "rows": [
+            "thunderbolt|none"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-08",
+        "host_class": "bare-metal",
+        "leg_hash": "25220299bc79",
+        "os": "windows",
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "LocalSystem (elevated)"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "usb",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "pci",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "thunderbolt",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/peripherals.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/peripherals/src/peripherals_legs.hpp",
+      "agents/plugins/peripherals/src/peripherals_linux.cpp",
+      "agents/plugins/peripherals/src/peripherals_linux_parsers.hpp",
+      "agents/plugins/peripherals/src/peripherals_macos.cpp",
+      "agents/plugins/peripherals/src/peripherals_macos_parsers.hpp",
+      "agents/plugins/peripherals/src/peripherals_parsers.hpp",
+      "agents/plugins/peripherals/src/peripherals_plugin.cpp",
+      "agents/plugins/peripherals/src/peripherals_win.cpp",
+      "agents/plugins/peripherals/src/peripherals_win_parsers.hpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_peripherals_linux_parsers.cpp",
+      "tests/unit/test_peripherals_local_dispatcher.cpp",
+      "tests/unit/test_peripherals_macos_parsers.cpp",
+      "tests/unit/test_peripherals_parsers.cpp",
+      "tests/unit/test_peripherals_win_parsers.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. Each of the three actions is also a gathered definition (`crossplatform.peripherals.usb`/`.pci`/`.thunderbolt`, 300s TTL).",
+    "**Not consumed by** daily-sync, TAR, DEX, or metrics.",
+    "**Sensitivity.** Rows carry hardware identifiers (USB/PCI vendor and product ids, serial numbers, Thunderbolt unique ids) that can fingerprint a specific device, and vendor/product strings that name installed peripheral hardware — a software/hardware inventory by another route. No row carries a username or account name.",
+    "**Siblings:** `hardware` (system/BIOS/CPU/memory/disk inventory — this plugin covers the bus-attached device tree `hardware` does not)."
+  ]
+}

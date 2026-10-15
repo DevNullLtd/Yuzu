@@ -12,7 +12,7 @@ tells you where it belongs.
 |-------------------|-----------------------------------------------|----------------------------------------------------------------------------------------------|
 | GitHub Actions    | `uses: ...@vX` in every `.github/workflows/*` | Dependabot (weekly) — `.github/dependabot.yml` `github-actions` entry                         |
 | Windows SDK       | `10.0.26100.0` in the Windows build/provisioning contract | Deliberate reviewed PR; `tests/test_windows_sdk_contract.py` prevents drift (Dependabot tracks the MSVC action, not its `with.sdk` input) |
-| Docker base images| `FROM` in `deploy/docker/*`                   | Dependabot (weekly) — `.github/dependabot.yml` `docker` entry                                 |
+| Docker base images| `FROM` in `deploy/docker/*`                   | Dependabot (weekly) — `.github/dependabot.yml` `docker` entry. Digest refreshes flow; the `erlang` major, the `ubuntu` major/minor and the `alpine` major/minor are ignored there and moved by hand. The gateway's `alpine` runtime must stay on the `erlang:28-alpine` builder's Alpine release until the gateway is on OTP 29.1 or newer (#2150; `Dockerfile.gateway`'s abi-guard enforces it) |
 | Python tooling    | `requirements-ci.txt` (repo root)             | Dependabot (weekly) — `.github/dependabot.yml` `pip` entry                                    |
 | npm tooling       | `package-lock.json` in `site/`, `tests/puppeteer/`, `deploy/docker/cedar-vale/app/` | Dependabot (weekly, grouped per directory) — `.github/dependabot.yml` `npm` entry; see "npm tooling" below |
 | vcpkg baseline    | `vcpkg.json` `builtin-baseline`               | Scheduled workflow — `.github/workflows/vcpkg-baseline-update.yml` (monthly PR, hands-off)     |
@@ -65,9 +65,15 @@ is stored in two files at the repo root:
 
 These are consumed by:
 
-- `.github/workflows/ci.yml` — all six jobs `pip3/pip/pipx install` from it
-  (with `--require-hashes` so a tampered package breaks the install).
-- `.github/workflows/release.yml` — Windows and macOS release builds.
+- `.github/workflows/ci.yml` — the Linux and macOS jobs `pip3/pip/pipx install`
+  from it (with `--require-hashes` so a tampered package breaks the install).
+- `.github/workflows/release.yml` — the Linux and macOS release builds.
+
+The Windows jobs in both workflows install nothing from it: they use the
+runner's pre-provisioned toolchain, whose meson is pinned separately by
+`deploy/windows/toolchain-contract.json` (see `docs/windows-build.md`). A
+meson bump here therefore does not reach Windows until the contract and the
+runner are updated to match.
 
 `scripts/setup.sh` assumes a `meson` binary is already on PATH and does
 not install one — local developers are responsible for matching the
@@ -236,11 +242,12 @@ Yuzu embeds third-party JavaScript at build time via `embed_js.py` (chunked raw-
 | HTMX runtime | `server/core/src/static_js_bundle.cpp` (chunked at hand) | `kHtmxJs` | https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js | 2.0.4, 50,918 bytes |
 | HTMX SSE extension | same TU | `kSseJs` | https://unpkg.com/htmx-ext-sse@2.2.2/sse.js | 2.2.2, 8,897 bytes |
 | Apache ECharts | `server/core/vendor/echarts.min.js` | `kEChartsJs` | unpkg.com/echarts/dist/echarts.min.js | 5.6.0, 1,034,102 bytes |
-| Inter variable webfont | `server/core/vendor/inter/InterVariable.woff2` | `kInterVariableWoff2` | https://github.com/rsms/inter | 4.0, 345,588 bytes |
+| IBM Plex Sans webfont (400, 500, 600) | `server/core/vendor/ibm-plex/ibm-plex-sans-latin-{400,500,600}-normal.woff2` | `kIbmPlexSans{400,500,600}Woff2` | https://www.npmjs.com/package/@ibm/plex-sans (IBM's own prebuilt `fonts/split/woff2/IBMPlexSans-{Regular,Medium,SemiBold}-Latin1.woff2`, vendored byte-identical; never re-subset: OFL Reserved Font Name "Plex") | 1.1.0, 20,984 / 21,960 / 22,260 bytes |
+| IBM Plex Mono webfont (400, 500) | `server/core/vendor/ibm-plex/ibm-plex-mono-latin-{400,500}-normal.woff2` | `kIbmPlexMono{400,500}Woff2` | https://www.npmjs.com/package/@ibm/plex-mono (IBM's own prebuilt `fonts/split/woff2/IBMPlexMono-{Regular,Medium}-Latin1.woff2`, same rule) | 2.5.0, 17,544 / 17,868 bytes |
 | Three.js (ES module) | `server/core/vendor/three.module.min.js` | `kThreeJs` | https://unpkg.com/three@0.168.0/build/three.module.min.js | r168, 685,408 bytes |
 | Three.js OrbitControls | `server/core/vendor/three-orbit-controls.js` | `kThreeOrbitJs` | https://unpkg.com/three@0.168.0/examples/jsm/controls/OrbitControls.js | r168, 32,134 bytes |
 | Yuzu chart adapter | `server/core/src/charts_js_bundle.cpp` (hand-written) | `kYuzuChartsJs` | first-party | n/a |
-| Yuzu fleet renderer | `server/core/src/yuzu_viz_js_bundle.cpp` (hand-written) | `kYuzuVizJs` | first-party | n/a |
+| Yuzu fleet renderer | `yuzu_viz_js_bundle.cpp` (generated at build time from `server/core/static/yuzu-viz.js`) | `kYuzuVizJs` | first-party | n/a |
 
 ### Refresh procedure (vendored vendor JS only)
 
@@ -258,7 +265,7 @@ For HTMX / ECharts / Three.js / OrbitControls — anything we did NOT author:
 
 For Three.js specifically: r150+ is ES-module-only upstream. The OrbitControls module's top-level `import { ... } from 'three'` MUST resolve through the importmap declared in `viz_page_ui.cpp`. A refresh that splits OrbitControls into multiple files (e.g. PR-bundled with TransformControls) requires extending the importmap in lockstep. The `[viz][page]` test pins `from 'three'` and `class OrbitControls` substrings in the vendored file as a refresh canary.
 
-For Inter font: a binary `.woff2` refresh follows the same pattern but uses `embed_binary.py`, not `embed_js.py`.
+For the IBM Plex fonts: a binary `.woff2` refresh follows the same pattern but uses `embed_binary.py`, not `embed_js.py`, and one custom target per file in `server/core/meson.build` (`plex_fonts`). Take IBM's own prebuilt files as-is from the `@ibm/plex-sans` and `@ibm/plex-mono` npm packages (`npm pack @ibm/plex-sans@<version> @ibm/plex-mono@<version>`, extract into a scratch directory, never run anything from it) — never subset, convert or otherwise modify them (the OFL Reserved Font Name "Plex" forbids a modified version under that name), and do not substitute Fontsource or Google Fonts builds. Each served face is the `Latin1` file of IBM's split build (`package/fonts/split/woff2/IBMPlex{Sans,Mono}-{Regular,Medium,SemiBold}-Latin1.woff2`) copied byte-for-byte to the served file name in the table above, so routes and `yuzu.css` do not change. IBM's other subsets (`Latin2`, `Latin3`, `Pi`, Greek, Cyrillic) are not vendored; a character outside the Latin1 file falls back to the next family in the stack, and the Latin1 file does not cover the arrows (`Pi`). Keep `server/core/vendor/ibm-plex/LICENSE.txt` equal to the packages' `LICENSE.txt` (line endings are normalised to LF by `.gitattributes`). On a refresh, update four things together: the per-weight byte counts in `test_static_js_bundle.cpp` (`kExpectedPlex`); the package versions, tarball integrity, package paths and SHA-256 lines in `server/core/vendor/ibm-plex/ibm-plex-NOTICE.txt` (`shasum -a 256 server/core/vendor/ibm-plex/*.woff2`); the version and byte-count columns in the two table rows above; and, if a refresh changes which characters the product's UI strings need, re-compare the files' `cmap` tables against the characters the UI uses.
 
 ### Why these aren't in Dependabot
 

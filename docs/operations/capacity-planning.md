@@ -36,6 +36,11 @@
 | CPU | < 1% idle | < 2% idle | Spikes during command execution |
 | Network | ~1 KB/30s | ~1 KB/30s | Heartbeat only when idle |
 
+The "Typical"/"With TAR" RAM figures above do not yet include one fixed addition: since #4666 PR-2,
+the agent's async log hand-off queue pre-allocates 8193 x 408 bytes = 3,342,744 bytes (~3.34 MB, about
+3.19 MiB) of RSS unconditionally at startup, whether or not anything is logged. This is on top of both
+figures, on every OS.
+
 TAR disk usage: ~2-3 MB/day with 7-day retention (default). A busy workstation with many processes may use up to 10 MB/day.
 
 ## Gateway Sizing

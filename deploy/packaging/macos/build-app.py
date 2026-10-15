@@ -176,7 +176,7 @@ def require_es_sdk() -> None:
     header = sdk / "usr/include/EndpointSecurity/EndpointSecurity.h"
     linker_stub = sdk / "usr/lib/libEndpointSecurity.tbd"
     if not header.is_file() or not linker_stub.is_file():
-        raise BundleError("full Xcode EndpointSecurity SDK headers and linker stub are required for this bundle lane")
+        raise BundleError("the active SDK must ship the EndpointSecurity header and linker stub for this bundle lane")
 
 
 def find_first(paths: Iterable[Path]) -> Path:

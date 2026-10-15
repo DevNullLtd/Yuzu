@@ -301,7 +301,7 @@ struct CapabilitySeed {
 }
 
 /// A small, representative seed catalogue — NOT a full mirror of
-/// `RbacStore`'s 27 securables × 8 operations catalogue. It exists so PR1.9 has real
+/// `RbacStore`'s 38 securables × 8 operations catalogue. It exists so PR1.9 has real
 /// rows to migrate and so this header's own tests exercise `is_valid`, not
 /// to be the registry itself (that is explicitly out of scope here). Covers
 /// an ordinary CRUD securable (`Response:Read`), a Tag write (mirrors

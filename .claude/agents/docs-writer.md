@@ -82,7 +82,7 @@ bullets above, the Review Checklist — enumerates where to LOOK, not what is
 required. A gap you find there is a candidate finding, sized by derivation; it is a
 missing *required* doc only if it also lands in one of the six. For the YAML
 InstructionDefinition, `yaml-dsl-spec.md` §14 and roadmap/capability-map cases,
-that means item 6: open `.claude/routed-concerns.md` and confirm a row names the
+that means item 6: open the four routed-concern tables (`.claude/routed-concerns.md`, `.claude/routed-concerns-access-control.md`, `.claude/routed-concerns-security-posture.md`, `.claude/routed-concerns-software-estate.md`) and confirm a row names the
 file as an update obligation for the changed surface. Today none does — assume NOT
 required until a row says otherwise; the checklist entries above remain candidate
 findings sized by derivation.

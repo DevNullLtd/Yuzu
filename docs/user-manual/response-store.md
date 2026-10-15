@@ -69,9 +69,9 @@ filtering and pagination.
 |---|---|---|
 | `agent_id` | string | Filter by agent |
 | `status` | integer | Filter by status (integer enum value) |
-| `since` | integer | Only responses after this Unix timestamp |
-| `until` | integer | Only responses before this Unix timestamp |
-| `limit` | integer | Number of responses to return (default 100) |
+| `since` | integer | Only responses at or after this Unix timestamp (inclusive); omit for no lower bound, `0` is accepted and matches the same rows |
+| `until` | integer | Only responses at or before this Unix timestamp (inclusive); omit for no upper bound, must be `1` or more (`0` is `400`) |
+| `limit` | integer | Number of responses to return (default 100, at most 1000; zero or below means the default). Asking for more than 1000 and getting a full page sets `result_truncated_by_cap` in the envelope |
 | `offset` | integer | Offset for pagination (default 0) |
 
 **Response envelope:**
@@ -82,6 +82,10 @@ filtering and pagination.
   "count": 42
 }
 ```
+
+When the caller asked for more than 1000 rows and the page came back full (exactly 1000 rows), the
+envelope also carries `"result_truncated_by_cap": true`: more rows may exist past the ceiling. The
+field is absent otherwise.
 
 **Example --- fetch all responses for an instruction:**
 
@@ -132,8 +136,8 @@ fleet-wide statistics without downloading every row.
 | `op_column` | string | Column for sum/avg/min/max operations |
 | `agent_id` | string | Filter by agent |
 | `status` | integer | Filter by status |
-| `since` | integer | Only responses after this Unix timestamp |
-| `until` | integer | Only responses before this Unix timestamp |
+| `since` | integer | Only responses at or after this Unix timestamp (inclusive); omit for no lower bound, `0` is accepted and matches the same rows |
+| `until` | integer | Only responses at or before this Unix timestamp (inclusive); omit for no upper bound, must be `1` or more (`0` is `400`) |
 
 **Response:**
 
@@ -171,7 +175,10 @@ filter parameters to the response query endpoint.
 
 The dedicated export endpoint supports both CSV and JSON formats with the same
 filter parameters as the query endpoint. It defaults to a higher limit
-(10,000 rows) for bulk exports.
+(10,000 rows) for bulk exports. Numeric parameters must be one whole base-10 integer
+(`since=1e9`, `limit=100abc`, `status=0x1` and `since=1.5` are `400`, not a different
+filter); omitting `since` or `until` means no bound on that side, `since=0` is accepted and matches the same rows as omitting it, and `until=0` or a negative
+value is `400`.
 
 **Query parameters:**
 
@@ -180,9 +187,9 @@ filter parameters as the query endpoint. It defaults to a higher limit
 | `format` | string | Export format: `csv` or `json` (default: `json`) |
 | `agent_id` | string | Filter by agent |
 | `status` | integer | Filter by status |
-| `since` | integer | Only responses after this Unix timestamp |
-| `until` | integer | Only responses before this Unix timestamp |
-| `limit` | integer | Number of responses to export (default 10,000) |
+| `since` | integer | Only responses at or after this Unix timestamp (inclusive); omit for no lower bound, `0` is accepted and matches the same rows |
+| `until` | integer | Only responses at or before this Unix timestamp (inclusive); omit for no upper bound, must be `1` or more (`0` is `400`) |
+| `limit` | integer | Number of responses to export (default and maximum 10,000; zero or below serves one row) |
 
 **Example --- export instruction responses as CSV:**
 
@@ -202,6 +209,28 @@ curl -s -b cookies.txt \
 
 The CSV format includes the columns:
 `id`, `instruction_id`, `agent_id`, `timestamp`, `status`, `output`, `error_detail`.
+
+**A bounded export can be cut.** Besides the row limit, an export stops once the rows served
+carry 50 MiB of `output` plus `error_detail` (always on whole rows, and at least one row is
+served; the last row kept can run past the cap by up to its own size: about 4 MiB for text output,
+up to about 12 MiB for output dense in invalid bytes or NULs, because each field is cut to 2 MiB at
+ingest before invalid bytes and NULs are replaced by the 3-byte U+FFFD; this includes the `error_detail` written when a terminal frame closes a running row). The cap is not
+configurable. A cut export, whether by the row limit with more matching rows left, or by the byte
+cap, is marked, so check for it before trusting a bulk pull: the JSON envelope has a top-level
+`"result_truncated_by_cap": true`, and a CSV file ends with one extra trailer record,
+`# result_truncated_by_cap cause=row_cap` (or `byte_cap`) padded with empty fields to the header's
+width. The trailer is the signal that reaches every consumer. Agent output is arbitrary, so a
+quoted cell can contain text that looks like the trailer: parse the file as CSV and read the final
+record, do not regex-match lines. Two out-of-body signals accompany
+it: a CSV response carries an `X-Result-Truncated-By-Cap: true` header, and the download is named
+`responses-<instruction_id>-truncated.<json|csv>` instead of `responses-<instruction_id>.<json|csv>`.
+A plain `curl -o responses.csv ...` keeps neither (curl picks the file name and drops the headers);
+`curl -OJ` keeps the name, and `curl -sS -D - -o responses.csv ...` prints the headers. An uncut
+export carries none of these. To read past a cap there is no cursor: pull once per `agent_id`, or
+set `until` to the oldest `timestamp` received (inclusive, so rows tied at that second return
+again: de-duplicate on `id`). In the JSON envelope, `count` is the number of rows served. The
+REST v1 twin (`GET /api/v1/responses/{id}/export`) marks a cut the same way, with the JSON flag
+under `pagination` and a 10-field CSV trailer.
 
 ### Generic JSON-to-CSV export
 

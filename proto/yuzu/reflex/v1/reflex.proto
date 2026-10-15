@@ -1,0 +1,192 @@
+syntax = "proto3";
+
+package yuzu.reflex.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option cc_enable_arenas = true;
+
+// Reflex wire protocol for the Yuzu Reflex agent-local automated-response
+// system. See docs/reflex-design.md (the canonical, line-by-line contract)
+// and docs/adr/0021-spark-reflex-architecture.md (Decisions 2, 4, 5, 6, 7, 8,
+// 9, 10 and the 2026-09-17 amendment).
+//
+// Transport reuses the CommandRequest/CommandResponse bidi stream, on TWO
+// independent legs, both carried as opaque `payload` bytes — NOT the
+// `parameters` map or the `output` string (proto3 string values must be
+// valid UTF-8 and serialized proto bytes are not; see agent.proto
+// CommandRequest.payload / CommandResponse.payload). No gateway regen is
+// needed for either leg (no reflex_pb module exists on the Erlang side).
+//
+// CONTROL LEG — reserved plugin name "__reflex__" (deploy push + status
+// only; mirrors the "__guard__" two-halves reserved-name interception):
+//   Server -> Agent:  plugin="__reflex__" action="push_sets"  payload=ReflexSetPush
+//   Server -> Agent:  plugin="__reflex__" action="get_status" (no payload)
+//   Agent  -> Server: plugin="__reflex__" action="status"     payload=ReflexSetStatus
+//
+// OUTCOME LEG — Reflex deliberately has NO outcome message in this file.
+// A fired/completed/failed/timed_out/aborted/suppressed Reflex chain reuses
+// the EXISTING "__guard__"/"event" channel (guaranteed_state.proto
+// GuaranteedStateEvent), discriminated by the new, CLOSED-SET
+// GuaranteedStateEvent.family field ("" | "guardian" | "reflex" — an
+// unrecognized value is refused at ingest, never silently guardian), with
+// the ReflexOutcome shape carried as JSON in GuaranteedStateEvent.detail_json
+// (the same generic-detail pattern already used for DEX's "process.crashed"
+// observations); GuaranteedStateEvent.rule_id stays EMPTY for family=="reflex"
+// rows (set_id/reflex_id are additive fields there instead — never a
+// rule_id-squat). This keeps Reflex on the platform's ONE agent->server
+// unsolicited-event channel and ONE server-side ingest router chokepoint
+// (ADR-0021 Decision 6) rather than opening a second one — only the eventual
+// storage destination (a Reflex-only `reflex_outcomes` table) forks on
+// `family`. Decision 8 ("one versioned per-device document, one generation
+// counter, replacing GuaranteedStatePush") is a SEPARATE, accepted-interim
+// exception this proto's ReflexSetPush/generation knowingly carries — see
+// the 2026-09-17 ADR-0021 amendment. See docs/reflex-design.md "Wire
+// contract".
+
+// One plugin invocation within a Reflex's Reaction chain.
+message ReflexReaction {
+  string plugin = 1;
+  string action = 2;
+  map<string, string> params = 3;
+
+  // Chain-flow gate: does this Reaction run given the PRIOR Reaction's
+  // result? "always" | "on_success" | "on_failure". The first Reaction in
+  // a chain is always "always" (server-validated, not enforced by the wire
+  // type). NOT to be confused with `execute_gate` below — the two fields
+  // sit on the same message but answer unrelated questions.
+  string gate = 4;
+
+  uint32 timeout_ms = 5;    // default 10_000, max 120_000 (server-validated)
+  bool capture_output = 6;  // default false; captured output capped at 4 KiB
+
+  // Deliberately NOT carried: a wire copy of this pair's
+  // CommandCapabilityRegistry::ExecuteGate/DispatchClass classification. An
+  // earlier draft carried one as a single `execute_gate` string, but
+  // ExecuteGate (Unspecified|None|AdminOrApproval|AlwaysApproval) and
+  // DispatchClass (ReadOnly|Mutating|Destructive) are two independent axes
+  // that do not collapse into one string without losing information (e.g.
+  // AdminOrApproval+Destructive is unrepresentable), and no agent-side
+  // consumer reads it back (R8 confirmed) — dropped rather than shipped
+  // unused and lossy. The classification lives server-side only
+  // (reflex_schema_registry.cpp, not yet landed — R4), consulted once at
+  // compile time by `dangerous_reactions_in_spec()`
+  // (see docs/reflex-design.md "Safety chokepoint").
+}
+
+// The Spark binding for a Reflex: a detection type plus its parameters.
+// `type` is an OPEN set published server-side by
+// reflex_schema_registry.cpp's `spark_types()` (not yet landed — R4) — it
+// does NOT mirror agents/core/include/yuzu/agent/spark.hpp's SparkType enum
+// verbatim. Shipped today (agent-side): file, service, disk, interval,
+// startup, registry (Windows-only). Planned, not yet landed: plist (macOS,
+// A6), process (ES-backed, A7). See docs/reflex-design.md "Spark types and
+// per-type facts" for the full table and the per-type {{spark.edge}} list.
+// The published per-type param schema lives server-side, never on the wire.
+message ReflexSparkBlock {
+  string type = 1;
+  map<string, string> params = 2;
+}
+
+// A Spark-to-Reactions binding: the agent-local unit that fires when its
+// Spark emits an event (subject to cooldown/rate caps) and runs its
+// Reaction chain (sequential, at most 4 deep, each gated on the prior
+// result).
+message Reflex {
+  string reflex_id = 1;   // unique WITHIN this ReflexSet, not globally
+  string name = 2;
+  bool enabled = 3;
+  ReflexSparkBlock spark = 4;
+  repeated ReflexReaction reactions = 5;
+  uint32 cooldown_ms = 6;
+  uint32 max_per_hour = 7;
+
+  // Whether an already-true condition at arm time (e.g. a service already
+  // stopped) fires immediately, vs waiting for the next edge.
+  bool fire_on_arm = 8;
+}
+
+// The deployable unit: named, versioned, assigned. Individual Reflexes
+// never deploy alone (ADR-0021 Decision 4) — exactly the Baseline grammar.
+message ReflexSet {
+  string set_id = 1;
+  string name = 2;
+  uint64 version = 3;
+  bool enabled = 4;
+
+  // SHA-256 over the canonical (key-sorted) spec JSON plus the resolved
+  // device-id list the assignment expands to at digest-compute time (sorted,
+  // deduplicated — not the raw group/tag reference alone; a membership
+  // change that alters the resolved list changes the digest, which is how a
+  // management-group membership change invalidates a standing approval).
+  // The server recomputes and compares this at every compile (ADR-0021
+  // Decision 9). A mismatch HOLDS the agent's last accepted generation for
+  // this set, never a bare omission from the push — see docs/reflex-design.md
+  // "Generation, undeploy, and push semantics" Rule 1 for the exact
+  // full_sync=true/false mechanics (omitting a refused set from a
+  // full_sync=true push would DISARM it, not hold it).
+  string digest = 5;
+  string approval_id = 6;
+  string approved_by = 7;
+  repeated Reflex reflexes = 8;
+
+  // Deliberately NOT carried: os_target. Platform filtering happens
+  // SERVER-SIDE before this message is built (reflex_push_builder.cpp's
+  // `build_reflex_push(deployed_sets, agent_os, ...)`) — an agent never
+  // receives a ReflexSet outside its own OS, so the field would be dead
+  // weight on the wire.
+  //
+  // Deliberately NOT carried: assignment[] (group_id/disposition). The
+  // server resolves the assignment to a concrete device set BEFORE building
+  // this message (the same resolved device set the D9 approval digest binds
+  // and the D4 consent gate evaluates against) — the agent receiving a
+  // ReflexSet at all IS the targeting decision; there is nothing for the
+  // agent to do with the raw group membership.
+}
+
+// Server -> Agent: the compiled push for this generation.
+message ReflexSetPush {
+  repeated ReflexSet sets = 1;
+  bool full_sync = 2;  // true = replace the agent's entire active Reflex Set collection
+  uint64 generation = 3;
+
+  // Explicit per-set removal, meaningful ONLY when full_sync=false. A
+  // full_sync=true push never needs this: "not present in `sets`" already
+  // means "removed" because full_sync replaces the whole collection. A
+  // full_sync=false DELTA has the opposite omission convention — a set_id
+  // absent from `sets` is UNTOUCHED (left exactly as last applied), which
+  // gives a delta no way to say "remove this one" without this field.
+  // Consent-loss and undeploy are the two removal causes (see
+  // docs/reflex-design.md "Generation, undeploy, and push semantics"); a
+  // compile REFUSAL is never a removal cause and never appears here — a
+  // refused set is simply absent from both `sets` and `removed_set_ids`, so
+  // it is held untouched even in the same delta that removes an unrelated
+  // set_id. Ignored (must be empty) when full_sync=true.
+  repeated string removed_set_ids = 4;
+}
+
+// Per-reflex runtime state, nested in ReflexSetStatus.
+message ReflexStatus {
+  string set_id = 1;
+  string reflex_id = 2;
+  string state = 3;  // "armed" | "unsupported" | "disabled" | "error"
+  uint64 fired_total = 4;
+  uint64 suppressed_total = 5;
+  google.protobuf.Timestamp last_fired = 6;
+}
+
+// Agent -> Server: reply to "get_status". NEVER rides the heartbeat itself
+// (HeartbeatRequest has no bytes field and the gateway's gpb has no
+// preserve_unknown_fields, so a field added there would be silently dropped
+// crossing the gateway). The actual flow: the agent's `yuzu.reflex_generation`
+// heartbeat tag (a plain string, which DOES ride the heartbeat) triggers the
+// server's reconcile, which THEN solicits a fresh "get_status" over the
+// control leg above — this message is that reply, correlated on the
+// solicited command's id.
+message ReflexSetStatus {
+  string agent_id = 1;
+  uint64 generation = 2;
+  repeated ReflexStatus reflexes = 3;
+  string platform = 4;  // "windows" | "linux" | "darwin" — the agent's own
+                         // platform string (kAgentOs); never "macos"
+}

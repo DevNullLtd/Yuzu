@@ -5,14 +5,33 @@
 // Inner classes extracted: agent_registry, agent_service_impl, gateway_service_impl, event_bus
 // Pre-existing extractions: rest_api_v1, mcp_server
 
+// #4722: this TU's own pre-existing includes pull in <windows.h> transitively somewhere ahead
+// of grpc_tls_credentials.hpp's new grpcpp/security/*.h includes (grpc's own port_platform.h
+// self-guards, but that's no help if windows.h was already fully processed earlier in THIS TU --
+// once min/max are defined by an unguarded windows.h, they stay defined for the rest of the file
+// regardless of what any later header does). Must be first, before any other include: matches
+// key_provider.cpp's established guard, just applied at file scope instead of one include site.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include <yuzu/metrics.hpp>
+#include "response_export_metrics.hpp"
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 #include "bundled_content.hpp"
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"
+#include "grpc_tls_credentials.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/server/enrollment_cfg_import.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -30,15 +49,19 @@
 #include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
+#include "tar_corruption_audit.hpp" // #1567 corruption audit gate
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
+#include "crl_publisher.hpp" // HA WS-6 CRL follow-ups (#4828-#4831)
 #include "default_certs.hpp"
 #include "sso_boot_guard.hpp" // saml_config_complete — shared with the sso-only boot guard
 #include "kek_op_lock.hpp"
 #include "kek_rotate_control.hpp"
 #include "kek_routes.hpp"
 #include "key_provider.hpp"
+#include "scoped_key_zero.hpp" // HA WS-6 CRL follow-ups (#4828): hoisted out for crl_publisher.cpp
 #include "scim_routes.hpp"
 // PR1.5c/1.6c (p14): ADR-0031 operator surface — server wiring for p5's
 // plugin-config/secret/kill-switch store + REST routes and p6's upload-grant
@@ -57,6 +80,7 @@
 #include "data_export.hpp"
 #include "deployment_store.hpp"
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
+#include "discovered_devices_reader.hpp" // make_discovered_devices_reader (core wiring)
 #include "discovery_store.hpp"
 #include "engine_principal_store.hpp"
 #include "execution_event_bus.hpp"
@@ -79,6 +103,7 @@
 #include "app_perf_cohort_reader.hpp"
 #include "app_perf_group_reader.hpp"
 #include "app_perf_rollup.hpp"
+#include "dex_app_version_failures_owner.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
@@ -87,9 +112,12 @@
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_store.hpp"
+#include "app_usage_routes.hpp"
 #include "product_registry_store.hpp"
 #include "sle_routes.hpp"
 #include "agent_decommission.hpp"
+#include "typed_inventory_sources.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -128,6 +156,7 @@
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
+#include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
 #include "instruction_routes.hpp" // #2542 PR-7: the 13-route Instruction Definitions + Instruction Sets API, extracted onto the HttpRouteSink seam
 #include "execution_routes.hpp" // #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted onto the HttpRouteSink seam
@@ -158,7 +187,23 @@
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_autoruns.hpp"
+#include "capability_decls/plugin_action_catalogue_app_usage.hpp"
+#include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
+#include "capability_decls/plugin_action_catalogue_peripherals.hpp"
+#include "capability_decls/plugin_action_catalogue_printing.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
+#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
+#include "capability_decls/plugin_action_catalogue_app_control.hpp"
+#include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_runtimes.hpp"
+#include "capability_decls/plugin_action_catalogue_platform_security.hpp"
+#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
+#include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
+#include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
+#include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -170,15 +215,29 @@
 #include "dex_blast_radius.hpp"
 #include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
+#include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "dex_routes.hpp"
 #include "network_api_local.hpp" // ADR-0031 WS-A4: core-only /network seam factory
 #include "verify_api_local.hpp" // ADR-0031 WS-A4 #4250: core-only VERIFY seam factory
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
+#include "device_containment_routes.hpp"
+#include "device_estate_routes.hpp"
+#include "hardware_routes.hpp"
+#include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
+#include "home_ui.hpp"     // sign_in_location: where a signed-out page request goes
+#include "home_panels_routes.hpp" // HM-2: Dashboard policies + events fragments
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
 #include "device_routes.hpp"
+#include "device_lens_routes.hpp"
+#include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
+#include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
+#include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
+#include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
+#include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
+#include "guardian_api_local.hpp" // ADR-0031 WS-A4 (ninth family): make_local_guardian_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -194,6 +253,8 @@
 #include "background_jobs.hpp" // WS-10: pass-classification table + YUZU_ASSERT_BACKGROUND_JOB gate
 #include "coord_dsn.hpp"       // WS-3: build the elector's dedicated coordination DSN (testable)
 #include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
+#include "pg_reachability_probe.hpp" // WS-8: runtime Postgres reachability for /readyz (ADR-2002 §12)
+#include "shutdown_drain_rules.hpp" // WS-8: stop() drain-wait decision + bounds
 #include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
 #include "policy_evaluator.hpp"
 #include "schedule_arming_check.hpp"
@@ -239,7 +300,11 @@
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
 #include "cidr_match.hpp"
+#include "gateway_mgmt_stub_pool.hpp"
 #include "gateway_route_store.hpp"
+#include "gateway_peer_audit.hpp"
+#include "gateway_peer_guard.hpp"
+#include "gateway_peer_resolution.hpp"
 #include "gateway_service_impl.hpp"
 
 #include <grpc/grpc_security_constants.h>
@@ -319,12 +384,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
 
-// Legacy UIs kept for backward compatibility (redirect to /).
-extern const char* const kChargenIndexHtml;
-extern const char* const kProcfetchIndexHtml;
-
-// Login and Settings pages (separate TUs).
-extern const char* const kLoginHtml;
+// Settings page (separate TU). The sign-in page is rendered by home_ui::render_landing.
 extern const char* const kSettingsHtml;
 
 // Help and Instruction management pages (separate TUs).
@@ -352,8 +412,6 @@ extern const std::string
     kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
 extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
-extern const std::string_view
-    kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
 // kBundledDefinitions / kBundledSets / kBundledPluginDocs: bundled_content.hpp
 
 std::string trim_ascii_whitespace(std::string_view s) {
@@ -432,6 +490,45 @@ std::optional<std::int64_t> legacy_sqlite_row_count(const std::filesystem::path&
         return std::nullopt;
     return sqlite3_column_int64(stmt.get(), 0);
 }
+
+// WS-6 6.2 - durable evidence of the one-time legacy enrollment .cfg import
+// (system principal, like the other boot-time posture rows). One row per file
+// kind that did something noteworthy: `imported` (result=success),
+// `fingerprint_mismatch` (result=warning: a restored/edited file was REFUSED)
+// or `error` (result=failure). `absent` / `already_imported` are the steady
+// state and deliberately write no row. Shared by the normal successful-boot
+// drain AND the fatal-import one-shot write (PR #5107 review, Should-fix) —
+// EXTEND this, never fork a second copy of the event shape.
+void write_enrollment_import_audit_rows(
+    yuzu::server::AuditStore& audit_store,
+    const std::vector<yuzu::server::enrollment_import::KindReport>& reports) {
+    using yuzu::server::enrollment_import::Outcome;
+    for (const auto& r : reports) {
+        if (r.outcome == Outcome::absent || r.outcome == Outcome::already_imported)
+            continue;
+        yuzu::server::AuditEvent ev;
+        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+        ev.principal = "system";
+        ev.principal_role = "system";
+        ev.action = "enrollment.import";
+        ev.target_type = "Enrollment";
+        ev.target_id = r.kind;
+        ev.detail = "source=" + r.source.string() + " sha256=" + r.fingerprint +
+                    " imported=" + std::to_string(r.counts.imported) +
+                    " skipped_existing=" + std::to_string(r.counts.skipped_existing) +
+                    " skipped_garbled=" + std::to_string(r.parse.garbled) +
+                    " recovered_colon=" + std::to_string(r.parse.recovered) +
+                    " id_disambiguated=" + std::to_string(r.counts.id_disambiguated) +
+                    " renamed=" + (r.renamed ? "true" : "false") +
+                    (r.detail.empty() ? "" : " reason=" + r.detail);
+        ev.result = r.outcome == Outcome::imported
+                        ? "success"
+                        : (r.outcome == Outcome::fingerprint_mismatch ? "warning" : "failure");
+        (void)audit_store.log(ev);
+    }
+}
 } // namespace
 } // namespace yuzu::server
 
@@ -439,23 +536,17 @@ namespace yuzu::server {
 
 namespace detail {
 
-// RAII guard that zeroes a std::string's bytes on scope exit (incl. exception
-// unwind). Used wherever a private key is transiently materialised — the CA
-// signing + CRL paths — so the crown jewel is not left in freed heap. (DRYs the
-// formerly-duplicated local KeyZero structs — gov cpp-expert SHOULD.)
-struct ScopedKeyZero {
-    std::string& s;
-    ~ScopedKeyZero() { yuzu::secure_zero(s); }
-};
+// ScopedKeyZero lives in scoped_key_zero.hpp (HA WS-6 CRL follow-ups, #4828) so crl_publisher.cpp
+// can share it without depending on this translation unit; #include'd above.
 
 // Neutralise a value for safe interpolation into a STRUCTURED `k=v k=v` audit
 // detail string (#1290 Hermes MEDIUM). agent_id is only length-bounded at the
 // Register gate — never charset-checked — and is audited verbatim. Without this,
 // an agent_id like `x via=direct` could forge the very `via=` discriminator
 // #1290 adds (field confusion), and a CRLF could split the audit line. The
-// canonical implementation now lives in web_utils.hpp so the same neutralizer
-// guards every structured-audit call site (here + tar_tree_routes.cpp) without
-// the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
+// shared mapping is yuzu::log_token (common/include/yuzu/log_token.hpp) and
+// web_utils.hpp's audit_token forwards to it, so the same neutralizer guards every
+// structured-audit call site (here + tar_tree_routes.cpp) without the rule drifting; this `using` keeps the existing `detail::audit_token(...)`
 // spellings below resolving unchanged.
 using yuzu::server::audit_token;
 
@@ -1351,7 +1442,12 @@ public:
                           "explicit agent_ids on REST (route=command), MCP execute_instruction "
                           "(route=mcp) or the dashboard exec console (route=dashboard) (#3685). "
                           "Both labels are closed sets; every reachable pair "
-                          "is pre-seeded at boot so absent() stays meaningful.",
+                          "is pre-seeded at boot so absent() stays meaningful. The "
+                          "withhold reasons quarantined, unknown_plugin and "
+                          "kill_switched_os are deliberate withholds (containment, an "
+                          "absent plugin, operator policy) rather than malformed "
+                          "targeting, and are excluded from the "
+                          "YuzuDispatchTargetRejected alert.",
                           "counter");
         // The route-level reasons below are the literals in `kRouteRejectReasons`
         // (dispatch_target_shape.hpp). They are spelled out here rather than
@@ -1397,6 +1493,9 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // Stored `parameter_schema` refusals on the instruction execute route: a separate
+        // family (a validation refusal, not a targeting one), seeded in workflow_routes.cpp.
+        seed_instruction_param_rejected_metrics(metrics_);
         // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them
@@ -1420,6 +1519,16 @@ public:
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", "result_set_parent"}, {"reason", std::string(reason)}});
+        // #4496 (+ follow-up): the from-inventory-query result-set producer
+        // (REST and its MCP twin) - its OWN reachable set, same discipline as
+        // `result_set_parent` above: this route can only ever emit these
+        // three data-quality reasons, never the targeting-shape ones.
+        for (const auto reason : {yuzu::server::kReasonQueryTruncated,
+                                  yuzu::server::kReasonPoisonExcluded,
+                                  yuzu::server::kReasonParseErrorExcluded})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "result_set_inventory_query"},
+                              {"reason", std::string(reason)}});
         // `policy_remediate` has its OWN reachable set, not the dispatch routes'.
         // It refuses `scope` outright (PolicyEvaluator::remediate takes only
         // agent_ids), so `scope_type`, `scope_empty` and `target_conflict` can
@@ -1464,6 +1573,13 @@ public:
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}});
 
+        // #5294: same three routes, same discipline, for the per-OS kill-switch
+        // filter.
+        for (const char* route : {"dispatch_closure", "command", "legacy"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonKillSwitchedOs)}});
+
         // Governance round 1 for #2557 (UP-1b): `yuzu_server_dispatch_fanout_
         // throw_total` was introduced by the #2557 extraction (the local
         // `audit_fn` wrapper in `command_routes.cpp`) but was never pre-seeded
@@ -1475,9 +1591,10 @@ public:
         // here rather than iterated from a shared array — unlike the `reason`
         // constants above, these are hardcoded per-call-site string literals
         // in `command_routes.cpp`, not sourced from a header constant: `success`/
-        // `denial` (the `audit_fn` wrapper) plus the seven `guarded()` site
+        // `denial` (the `audit_fn` wrapper) plus the nine `guarded()` site
         // names (`audit_quarantine_dispatch_fail_closed`,
         // `audit_quarantine_dispatch_denied_batch`, `audit_unknown_plugin_dispatch`,
+        // `audit_kill_switched_os_dispatch` (#5294), `audit_os_gate_unreadable` (#5294),
         // `forward_gateway_pending`, `publish(command-status)`,
         // `emit_event(command.dispatched)`, `thead_for_plugin`).
         metrics_.describe(
@@ -1490,7 +1607,9 @@ public:
             "counter");
         for (const char* phase : {"success", "denial", "audit_quarantine_dispatch_fail_closed",
                                   "audit_quarantine_dispatch_denied_batch",
-                                  "audit_unknown_plugin_dispatch", "forward_gateway_pending",
+                                  "audit_unknown_plugin_dispatch",
+                                  "audit_kill_switched_os_dispatch",
+                                  "audit_os_gate_unreadable", "forward_gateway_pending",
                                   "publish(command-status)", "emit_event(command.dispatched)",
                                   "thead_for_plugin"})
             metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
@@ -1545,7 +1664,7 @@ public:
 
         // #3402: the internal pushes that deliberately BYPASS that gate, seeded
         // across the full capability x result product. Every combination is
-        // reachable — each of the three pushes can fail at the registry seam —
+        // reachable — each of the four pushes can fail at the registry seam —
         // so unlike the per-route targeting seed above, the product is honest
         // here rather than publishing series no code path can produce.
         // `undelivered` at zero is the point: it is the value an operator needs
@@ -1614,15 +1733,72 @@ public:
         // healthy). "unauthenticated" = the gateway's mgmt-plane peer pin
         // rejected this server's cert - fleet forwarding is down until the pin
         // and the server leaf agree.
+        //
+        // HA WS-4 4.3: added the `cluster_id` label (resolved config key, or
+        // "unknown" for an unmapped cluster — NEVER the raw gateway-asserted
+        // wire value, a cardinality risk even after ingest clamping) and
+        // three outcomes: "unknown_cluster" (no configured mgmt address for
+        // a command's resolved cluster), "not_connected" (the gateway-side
+        // "agent not connected on this cluster" error, folded into "ok"
+        // before this slice — see forward_gateway_pending's comment), and
+        // "agent_mismatch" (a response naming a different agent than the
+        // one this request targeted — refused, not applied; Fable
+        // pre-implementation review finding 6a). The label SET is derived
+        // from `cfg_` here (not `gw_mgmt_pool_`, which is built later in
+        // run(), post-bootstrap) — "default" always, plus every configured
+        // `--gateway-cluster-addr` key, matching the pool's own resolution
+        // rule exactly (GatewayMgmtStubPool's file header comment).
         metrics_.describe("yuzu_server_gateway_forward_total",
                           "Gateway SendCommand forwards by terminal outcome (ok / "
                           "unauthenticated = rejected by the gateway's #1422 mgmt-plane "
-                          "peer pin / unavailable = dropped after 3 attempts / other). "
-                          "Any non-ok movement means commands to gateway-connected "
-                          "agents are being lost.",
+                          "peer pin / unavailable = dropped after 3 attempts / "
+                          "unknown_cluster = no configured address for the resolved "
+                          "cluster / not_connected = agent not connected on the dialed "
+                          "cluster / agent_mismatch = response named a different agent, "
+                          "refused / other), labelled by the resolved cluster_id "
+                          "(config key, or 'unknown' - never the raw gateway-asserted "
+                          "value). Any non-ok movement means commands to gateway-connected "
+                          "agents are being lost. A DISTINCT, non-dispatch outcome shares "
+                          "this metric name: unmapped_cluster_seen (emitted from "
+                          "gateway_service_impl.cpp at gateway CONNECT time, cluster_id "
+                          "always 'unknown') - an early-warning signal that a session "
+                          "announced an unmapped cluster before any command was even "
+                          "attempted against it, consistency-auditor Gate 4 finding.",
                           "counter");
-        for (const char* st : {"ok", "unauthenticated", "unavailable", "other"}) {
-            metrics_.counter("yuzu_server_gateway_forward_total", {{"status", st}});
+        {
+            std::unordered_set<std::string> cluster_labels{
+                std::string(yuzu::server::kDefaultGatewayClusterKey)};
+            for (const auto& id : cfg_.gateway_cluster_addresses | std::views::keys)
+                cluster_labels.insert(id);
+            // post-governance Fable review, pre-push: "unknown" was
+            // previously seeded only in multi-cluster mode, but UP-1's fix
+            // (server.cpp's forward_gateway_pending, the configured-but
+            // -unusable-pool branch) emits {cluster_id="unknown",
+            // status="unavailable"} in EITHER mode — a boot-time credential
+            // failure is exactly as possible with --gateway-command-addr
+            // alone as with --gateway-cluster-addr. Unconditional now, so
+            // that signal's absent-vs-zero convention holds in both modes.
+            cluster_labels.insert(std::string(yuzu::server::kUnknownGatewayClusterLabel));
+            for (const auto& cl : cluster_labels) {
+                for (const char* st : {"ok", "unauthenticated", "unavailable", "other",
+                                       "unknown_cluster", "not_connected", "agent_mismatch"}) {
+                    metrics_.counter("yuzu_server_gateway_forward_total",
+                                     {{"cluster_id", cl}, {"status", st}});
+                }
+            }
+            // sre Gate 3: unmapped_cluster_seen (gateway_service_impl.cpp's
+            // CONNECTED-time early-warning counter) is a DISTINCT event from
+            // the dispatch-time outcomes above — always fired with cluster_id
+            // "unknown" — and was missing from this seed, breaking the
+            // absent-vs-zero convention for exactly the metric designed to
+            // warn an operator BEFORE the first dropped command. Only
+            // meaningful once "unknown" is even in the label set (multi
+            // -cluster mode configured), same gate as that insert above.
+            if (!cfg_.gateway_cluster_addresses.empty()) {
+                metrics_.counter("yuzu_server_gateway_forward_total",
+                                 {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                                  {"status", "unmapped_cluster_seen"}});
+            }
         }
 
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
@@ -1736,6 +1912,21 @@ public:
                           "gauge");
         metrics_.describe("yuzu_pg_connect_failed_total",
                           "Total PostgreSQL connection attempts that failed", "counter");
+        // HA WS-8 (ADR-2002 §12): the runtime reachability probe behind /readyz.
+        metrics_.describe("yuzu_server_pg_reachable",
+                          "1 when this replica's dedicated reachability probe can reach a writable "
+                          "Postgres primary (the /readyz pg_reachable row), else 0",
+                          "gauge");
+        metrics_.describe("yuzu_server_pg_reachability_last_success_age_seconds",
+                          "Seconds since this replica's Postgres reachability probe last succeeded",
+                          "gauge");
+        metrics_.describe("yuzu_server_pg_reachability_probe_failures_total",
+                          "Total Postgres reachability probes that failed or reached a server "
+                          "that refuses writes",
+                          "counter");
+        // Pre-seeded so the series reads 0, not absent, before the first failure
+        // (docs/observability-conventions.md — keeps a future rate()/absent() rule honest).
+        (void)metrics_.counter("yuzu_server_pg_reachability_probe_failures_total");
         metrics_.describe("yuzu_pg_acquire_timeout_total",
                           "Total PostgreSQL pool acquires that timed out before a connection was "
                           "available",
@@ -1753,7 +1944,7 @@ public:
         // Installed-software inventory observability (ADR-0016; #1664/#1675).
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
-                          "(stored/touched/need_full/error/dropped/rejected)",
+                          "(stored/touched/need_full/error/dropped/rejected/rejected_depth)",
                           "counter");
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
@@ -1762,8 +1953,8 @@ public:
                           "histogram");
         // RbacStore observability (ADR-0041). Described + zero-seeded up front so
         // the HELP/TYPE lines and closed dims exist on an idle server — critical
-        // here because a degrade means fleet-wide authz DENY (a PG blip denies
-        // every authorized request), so absent-series alerting must work before
+        // here because a degrade refuses the requests whose authorization read
+        // failed (fail-closed), so absent-series alerting must work before
         // the first degrade ever fires (Gate 6 sre BLOCKING / Gate 4 consistency).
         metrics_.describe("yuzu_server_rbac_read_degrade_total",
                           "Authorization reads/refreshes that hit a degraded store, by reason "
@@ -1776,8 +1967,11 @@ public:
                           "its existing decision from cache, this counts a data-quality or "
                           "staleness condition rather than a denied check - see the alert's "
                           "reason filter before assuming any nonzero rate here pages). "
-                          "A sustained non-zero rate in the denying reasons is a fleet-wide authz "
-                          "availability event, not mass access-denial - alert on it. "
+                          "A sustained non-zero rate in the denying reasons means authorization "
+                          "reads are failing and the requests that needed a failed read are "
+                          "refused (an operator check only on a permission-cache miss; a "
+                          "service-scoped token on every fleet-read or scoped-permission "
+                          "request whose ITServiceOwner ceiling read fails) - alert on it. "
                           "A circuit-breaker-open denial (#2703 Gate 7 item 1 commit B) is recorded "
                           "under pool_acquire_timeout, not a distinct reason - it is one of that "
                           "reason's own two contributing failure modes (see "
@@ -1788,6 +1982,85 @@ public:
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
+        // Last-Administrator guard refusals: A2's role-unassign guard
+        // (RbacStore::unassign_role) and, since #4966, the account-lifecycle guard
+        // (RbacStore::deactivate_account / set_local_role: a deactivation or a demotion
+        // that would remove the last member of a protected administrator population). Both
+        // mean an operator (or an IdP) tried to remove the fleet's last administrator, not a
+        // store fault. Zero-seeded per transport so an idle server carries every closed
+        // series from boot.
+        metrics_.describe("yuzu_server_rbac_last_admin_guard_refused_total",
+                          "Requests refused by a last-remaining-Administrator guard: RBAC "
+                          "role-unassign (POST/DELETE /api/v1/rbac/roles/{name}/assignments "
+                          "and its MCP twins) and account deactivation or demotion (dashboard "
+                          "Settings and SCIM), by transport. A sustained non-zero rate is an "
+                          "operator or IdP repeatedly trying to remove the fleet's last "
+                          "administrator, not a store fault - compare against "
+                          "yuzu_server_rbac_read_degrade_total to rule that out. A SCIM "
+                          "compensation undo the guard refused is NOT counted here (it is not "
+                          "an IdP removal attempt); see yuzu_scim_compensation_failed_total. "
+                          "Every refusal is counted, including repeats; a critical analytics "
+                          "event accompanies each SCIM refusal (a no-op under "
+                          "--no-analytics; the audit row and this counter still fire).",
+                          "counter");
+        for (const auto transport : {"rest", "mcp", "dashboard", "scim"})
+            metrics_.counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                             {{"transport", transport}});
+        // #4966: a store fault inside the account-lifecycle guard (a lock wait that expired, a
+        // lost connection, an unwired guard), by the guarded operation. NOT a refusal: the
+        // request was neither allowed nor judged. Counted in AuthManager, so the dashboard, SCIM
+        // and every other caller through it share one series. No alert rule ships with it yet
+        // (a later change owns the alerts).
+        metrics_.describe("yuzu_server_rbac_lifecycle_store_failure_total",
+                          "Store faults inside the account-lifecycle last-Administrator guard, "
+                          "by operation (deactivate: account removal; set_role: role write; "
+                          "would_strand: the advisory pre-check, after which the request still "
+                          "proceeds to the guarded write; grant_read: the SCIM "
+                          "pre-provisioning Administrator-grant read). The unwired fail-closed "
+                          "arm also counts, for deactivate and set_role only. A sustained "
+                          "non-zero rate means deprovisioning or role changes are being "
+                          "answered with a store-unavailable error rather than judged, except "
+                          "for would_strand, which never stops the request (SCIM answers 503 "
+                          "with Retry-After; the dashboard role route gives no retry hint): "
+                          "look at yuzu_pg_pool_waiters and "
+                          "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
+                          "holder.",
+                          "counter");
+        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read"})
+            metrics_.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}});
+        // #4966: a SCIM same-request compensation (the guarded undo of a just-created or
+        // just-revived account) that did NOT complete. Written beside the
+        // scim.user.compensation_failed audit row and critical event.
+        metrics_.describe("yuzu_scim_compensation_failed_total",
+                          "SCIM provisioning compensations (the guarded undo of an account "
+                          "created or revived earlier in the same request) that did not "
+                          "complete, by outcome (guard_refused_last_administrator: the account "
+                          "is left active; deactivated_but_session_wipe_failed: deactivated, a "
+                          "session may survive; store_failure: state indeterminate). Every "
+                          "increment needs operator attention: check the account. The "
+                          "critical analytics event that accompanies it is a no-op "
+                          "under --no-analytics; the audit row and this counter still fire.",
+                          "counter");
+        for (const auto outcome : {"guard_refused_last_administrator",
+                                   "deactivated_but_session_wipe_failed", "store_failure"})
+            metrics_.counter("yuzu_scim_compensation_failed_total", {{"outcome", outcome}});
+        // #4966: SCIM Group role-recompute members NOT applied in one Group request. Promotions
+        // after the first failed guarded write of the request are skipped (the fail-safe
+        // direction); a member whose reads failed is "undetermined" (its role was left untouched).
+        // Demotions are always attempted, so there is no demotion series. Both series are seeded
+        // so a zero is visible and stays seeded as evidence.
+        metrics_.describe("yuzu_scim_group_recompute_skipped_total",
+                          "SCIM Group role-recompute members not applied in one Group request, "
+                          "by cause. promotion: skipped after the first failed guarded write "
+                          "of the request. undetermined: a read the decision needed failed, so "
+                          "the member's role was left untouched and it is unknown whether an "
+                          "administrator was kept. Each increment is recorded by one "
+                          "scim.group.recompute_incomplete audit row naming the members (first 20 "
+                          "named; the count is exact); there is no automatic repair (see the "
+                          "SCIM provisioning guide, Known limits).",
+                          "counter");
+        for (const auto cause : {"promotion", "undetermined"})
+            metrics_.counter("yuzu_scim_group_recompute_skipped_total", {{"cause", cause}});
         // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
         // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
         // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since
@@ -1826,13 +2099,39 @@ public:
             "kRbacGenerationRefreshMs. Per-process, per-replica - not fleet-wide.",
             "gauge");
         metrics_.gauge("yuzu_server_rbac_breaker_open");
+        // A1 (RBAC enforcement enable/disable toggle). Described + zero-seeded
+        // up front, same rationale as the block above.
+        metrics_.describe(
+            "yuzu_server_rbac_enforcement_enabled",
+            "This replica's CACHED view of the durable rbac_enabled flag "
+            "(RbacStore::rbac_enabled_) - published at store construction, on "
+            "every set_rbac_enabled/set_rbac_enforcement call, and on this "
+            "replica's own generation refresh. Cross-replica convergence is "
+            "bounded by the ~1s generation refresh; a fleet-wide view is "
+            "min()/max() across replicas.",
+            "gauge");
+        metrics_.gauge("yuzu_server_rbac_enforcement_enabled");
+        metrics_.describe(
+            "yuzu_server_rbac_enforcement_toggle_total",
+            "Business outcomes of PUT /api/v1/rbac/enforcement and its MCP twin "
+            "set_rbac_enforcement, by transport (rest/mcp) and result "
+            "(applied/unchanged/refused/failed). refused is an operator hitting "
+            "the caller-survives guard (RbacStore::set_rbac_enforcement) - not a "
+            "store fault; failed is a store/txn failure and correlates with "
+            "yuzu_server_rbac_read_degrade_total. Zero-seeded for all 8 series "
+            "so an idle server carries every dimension from boot.",
+            "counter");
+        for (const auto transport : {"rest", "mcp"})
+            for (const auto result : {"applied", "unchanged", "refused", "failed"})
+                metrics_.counter("yuzu_server_rbac_enforcement_toggle_total",
+                                 {{"transport", transport}, {"result", result}});
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
-                          "generic - generic is the ADR-0037 InventoryStore). /readyz stays "
-                          "green under pure pool saturation, so "
+                          "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
+                          "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
         // Management-group CONFINEMENT store observability (ADR-0042). The
@@ -1844,9 +2143,10 @@ public:
         metrics_.describe("yuzu_server_mgmt_group_read_degrade_total",
                           "Management-group confinement reads (get_agent_groups / "
                           "get_ancestor_ids / get_descendant_ids / get_member_agents_in_subtrees "
-                          "/ get_assignments_for_principal / get_visible_agents) that returned a "
-                          "degrade (nullopt/DenyAll) rather than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error)",
+                          "/ get_assignments_for_principal / get_visible_agents / "
+                          "get_members_checked, incl. the legacy get_members() wrapper - "
+                          "#1762) that returned a degrade (nullopt/DenyAll) rather than a "
+                          "result, by reason (store_not_open/pool_acquire_timeout/query_error)",
                           "counter");
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", reason}});
@@ -1884,7 +2184,7 @@ public:
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
                           "staleness window (two missed daily cycles) - a freshness/liveness signal, "
-                          "by source",
+                          "by source (installed_software, app_usage)",
                           "gauge");
         metrics_.describe("yuzu_inventory_stale_count_unavailable_total",
                           "Times the stale-agents freshness count could not be computed (pool "
@@ -1938,6 +2238,9 @@ public:
         for (const auto result : {"swept", "capped", "noop", "declined", "declined_no_anchor",
                                   "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
+        // #4644/#4703 response-route observability: strict-parse rejections and cut
+        // exports, closed label sets seeded by the same header the emit sites use.
+        seed_response_metrics(metrics_);
         // DEX app-perf-over-time (B1/B2) — ingest, rollup, and read-degrade signals.
         // Described up front so the HELP/TYPE lines exist on an idle server (a
         // low-traffic deployment otherwise ships these series invisible until the
@@ -2000,6 +2303,22 @@ public:
         // Fleet health metrics (aggregated from agent heartbeat status_tags)
         metrics_.describe("yuzu_fleet_agents_healthy",
                           "Number of agents reporting healthy via heartbeat", "gauge");
+        metrics_.describe("yuzu_fleet_tar_db_corruption_agents",
+                          "Agents whose TAR database has ever been quarantined as corrupt "
+                          "(cumulative per agent since install; a rising value is the signal)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_plugin_init_failed",
+                          "Agents reporting a plugin that failed init, by plugin name (absent "
+                          "when none; at most 64 named labels, the rest under plugin=other)",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_inventory_sync_skipping",
+                          "Agents currently reporting heartbeats whose daily-sync source skipped "
+                          "its latest collection cycle(s) (heartbeat tag "
+                          "yuzu.sync.<source>.skip_streak > 0; agents that do not emit it are "
+                          "not counted), by source; correlate with "
+                          "yuzu_inventory_stale_agents, never subtract (different populations, "
+                          "see metrics.md)",
+                          "gauge");
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
                           "Windows agents (DEX enabled) reporting their DEX signal observer is not "
                           "fully healthy (no channel armed, or a channel subscription dropped at "
@@ -2346,10 +2665,10 @@ public:
         // the SAME table AgentHealthStore::recompute_metrics clears and publishes from
         // (guardian_journal_fleet_tags.hpp), so a new signal cannot ship with a gauge but
         // no HELP, or with HELP that drifts from what the rollup actually computes.
-        // Unlabelled by design; all 30 are ABSENT until some agent's journal reports.
+        // Unlabelled by design; all 33 are ABSENT until some agent's journal reports.
         // Read the type-honesty note on kGuardianJournalMetrics before writing an
         // alert: no sound alerting form exists over these fleet sums yet (neither
-        // increase() nor bare `> 0` survives a churning population), so the 30 are
+        // increase() nor bare `> 0` survives a churning population), so the 33 are
         // MONITOR-ONLY until a per-agent axis lands (#2083-class; see the note).
         for (const auto& m : detail::kGuardianJournalMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
@@ -2369,6 +2688,10 @@ public:
         // from (guardian_health_fleet_tags.hpp), same reason as the journal block
         // above: a new signal cannot ship with a gauge but no HELP.
         for (const auto& m : detail::kGuardianHealthMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        // #5403, #4472: the pending-Spark-Disarm and compensating-teardown age rows, rolled
+        // up as MAX (their own table).
+        for (const auto& m : detail::kGuardianHealthAgeMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
         metrics_.describe(detail::kGuardianHealthReportingGauge,
                           detail::kGuardianHealthReportingHelp, "gauge");
@@ -2677,6 +3000,33 @@ public:
                           "non-zero value since a revocation means the public CRL is stale (PKI PR4)",
                           "counter");
         (void)metrics_.counter("yuzu_server_ca_crl_publish_failures_total");
+        // #4830: the bare counter above can't tell a bad CA key apart from a lock timeout or a
+        // lost COMMIT ack. `reason` is CaStore::PublishFailReason's label
+        // (kPublishFailReasonLabels, ca_store.hpp) — a closed, compiler-enforced set, so this
+        // loop and every increment site (crl_publisher.cpp) can never drift apart. Additive: the
+        // bare counter above stays the alert source (docs/prometheus/yuzu-alerts.yml keys off
+        // it unchanged); this is the triage breakdown.
+        metrics_.describe("yuzu_server_ca_crl_publish_failure_reason_total",
+                          "Internal-CA CRL (re)publish failures broken down by cause (#4830) - "
+                          "see docs/user-manual/metrics.md for the label vocabulary. Sibling to "
+                          "yuzu_server_ca_crl_publish_failures_total, which stays the unlabelled "
+                          "alert source.",
+                          "counter");
+        for (const auto& reason_label : CaStore::kPublishFailReasonLabels)
+            metrics_.counter("yuzu_server_ca_crl_publish_failure_reason_total",
+                             {{"reason", std::string(reason_label)}});
+        // #4830: has_unpublished_revocations()'s own read failing is a CHECK failure, not a
+        // publish failure — no publish was even attempted, so it must not feed either counter
+        // above (a reader conflating the two would wrongly conclude CRLs are failing to
+        // publish). A sustained non-zero rate means the freshness pass's self-heal is silently
+        // disabled (crl_publisher.cpp's freshness_tick() backs off 1 minute per occurrence
+        // rather than retrying every 15s tick).
+        metrics_.describe("yuzu_server_ca_unpublished_revocation_check_failures_total",
+                          "The freshness pass's has_unpublished_revocations() read failed (#4830) "
+                          "- the CRL self-heal check was skipped, not that a publish failed. A "
+                          "sustained non-zero rate means self-heal is effectively disabled.",
+                          "counter");
+        (void)metrics_.counter("yuzu_server_ca_unpublished_revocation_check_failures_total");
         metrics_.describe("yuzu_server_ca_reissue_blocked_total",
                           "Agent CSR re-issuance refused because a revoked, non-expired cert "
                           "already exists for that identity (sign_agent_csr's revocation-bypass "
@@ -2742,7 +3092,8 @@ public:
                           "Total requests refused 503 by an is_store_unavailable fail-closed "
                           "guard on the auth/MFA surface, by route",
                           "counter");
-        for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate"}) {
+        for (auto route :
+             {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate", "password_change"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
         // #2396 / #2401: reason-labelled sibling of the counter above. Same
@@ -2754,21 +3105,63 @@ public:
         // (reason=query_error) vs an undecryptable/absent secret
         // (reason=secret_unavailable). Lets SRE tell a transient retry-storm
         // apart from a uniform outage, which the route-only counter above cannot
-        // (#2401). Only the initial POST /login handler is instrumented; the
-        // other is_store_unavailable->503 auth sites (login/mfa, stepup, enroll,
-        // elevate) keep only yuzu_auth_secret_unavailable_total{route}. Reason
+        // (#2401). Only the initial POST /login handler and the self-service
+        // password change (route=password_change, which shares its lockout
+        // helper, #5342) are instrumented; the other is_store_unavailable->503
+        // auth sites (login/mfa, stepup, enroll, elevate) keep only
+        // yuzu_auth_secret_unavailable_total{route}. Reason
         // token matches the yuzu_*_read_degrade_total family. Bounded, pre-seeded
         // closed label set per docs/observability-conventions.md so absent()
         // alerts stay meaningful.
         metrics_.describe("yuzu_auth_read_degrade_total",
                           "Requests refused 503 by an is_store_unavailable fail-closed guard in "
-                          "the initial POST /login handler, labelled by why the auth store was "
-                          "unavailable (pool_acquire_timeout / query_error / secret_unavailable)",
+                          "the initial POST /login handler or the self-service password change, "
+                          "by route and by why the auth store was unavailable "
+                          "(pool_acquire_timeout / query_error / secret_unavailable)",
                           "counter");
-        for (auto reason : {"pool_acquire_timeout", "query_error", "secret_unavailable"}) {
-            metrics_.counter("yuzu_auth_read_degrade_total",
-                             {{"route", "login"}, {"reason", reason}});
+        // route=password_change: POST /api/v1/users/me/password shares /login's
+        // lockout helper (AuthRoutes::verify_password_with_lockout), so its
+        // fail-closed refusals land here too (#5342).
+        for (auto route : {"login", "password_change"}) {
+            for (auto reason : {"pool_acquire_timeout", "query_error", "secret_unavailable"}) {
+                metrics_.counter("yuzu_auth_read_degrade_total",
+                                 {{"route", route}, {"reason", reason}});
+            }
         }
+        // #5342: outcomes of the two local-password routes. kind=self is
+        // POST /api/v1/users/me/password, kind=admin is
+        // POST /api/v1/users/{name}/password; result is ok / denied / error.
+        // kind=self,result=denied includes wrong current passwords (which can
+        // indicate guessing through the change route) alongside the other
+        // refusals; the closed 2x3 set is pre-seeded (#5177: increase() never
+        // sees the first event of a series born at 1).
+        metrics_.describe("yuzu_auth_password_changes_total",
+                          "Local-password change/reset outcomes, by kind (self|admin) and result "
+                          "(ok|denied|error)",
+                          "counter");
+        for (auto kind : {"self", "admin"}) {
+            for (auto result : {"ok", "denied", "error"}) {
+                metrics_.counter("yuzu_auth_password_changes_total",
+                                 {{"kind", kind}, {"result", result}});
+            }
+        }
+        // #5274: cfg users whose yuzu-server.cfg hash differs from their
+        // auth.users row at boot (dead cfg credentials; the stored one wins).
+        // Set once by AuthManager::report_stale_cfg_credentials after
+        // set_auth_db; pre-seeded to 0 for cfg-file-only boots.
+        metrics_.describe("yuzu_auth_cfg_credentials_stale",
+                          "yuzu-server.cfg users whose password hash differs from the auth "
+                          "store at boot (the cfg is seed-only; the stored credential wins)",
+                          "gauge");
+        metrics_.gauge("yuzu_auth_cfg_credentials_stale").set(0.0);
+        // #5342/#5274: a credential check that passed against the hash it read,
+        // then found a different hash under the row lock (the password changed
+        // mid-login), and was denied. Unlabelled; pre-seeded to 0.
+        metrics_.describe("yuzu_auth_credential_changed_during_verify_total",
+                          "Password verifications denied because the stored hash changed "
+                          "between the verify read and the row-locked recheck",
+                          "counter");
+        metrics_.counter("yuzu_auth_credential_changed_during_verify_total");
         // Gate 5 chaos-injector CH-3/UP-6 follow-up (#4020): the ONE
         // caller-visible signal that get_user_role() is about to floor a
         // legacy-API-token-authenticated request's role to Role::user
@@ -2800,6 +3193,51 @@ public:
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
                         "invalidate_user", "invalidate", "mark_mfa", "elevate"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        // WS-6 6.2: enrollment tokens + pending agents are AuthDB-only (Postgres,
+        // shared by every replica) and fail CLOSED on any store failure. This
+        // counts each degrade so an operator can tell "agents cannot enroll /
+        // the approval queue is unreadable" from a quiet fleet. `op` = the
+        // AuthManager call; `reason` = no_store (no AuthDB attached: shutdown /
+        // never wired) | pool_acquire_timeout (no PG lease) | query_error (a
+        // statement/txn ran and failed). Bad caller input is NOT a degrade.
+        metrics_.describe("yuzu_auth_enrollment_store_degrade_total",
+                          "Enrollment-token / pending-agent store calls that failed closed "
+                          "(labelled by op and reason: no_store / pool_acquire_timeout / "
+                          "query_error); Register returns UNAVAILABLE and the admin views "
+                          "return 503 or an unknown state, never an empty or zero result",
+                          "counter");
+        for (auto op : {"create_token", "consume", "list_tokens", "revoke_token", "add_pending",
+                        "ensure_enrolled", "pending_status", "list_pending", "approve", "deny",
+                        "bulk_approve", "bulk_deny", "remove"})
+            for (auto reason : {"no_store", "pool_acquire_timeout", "query_error"})
+                metrics_.counter("yuzu_auth_enrollment_store_degrade_total",
+                                 {{"op", op}, {"reason", reason}});
+        // WS-6 6.2: the one-time legacy enrollment .cfg import. `kind` = tokens |
+        // pending; `outcome` = imported | already_imported | fingerprint_mismatch |
+        // absent | error. A steady-state boot is `absent` (nothing to import) or
+        // `already_imported` (file survived a failed rename). fingerprint_mismatch means
+        // a restored old backup / edited file was REFUSED (Postgres state stands); error
+        // means the server refused to start.
+        metrics_.describe("yuzu_server_enrollment_import_total",
+                          "One-time legacy enrollment .cfg import outcomes per file kind "
+                          "(kind: tokens / pending; outcome: imported / already_imported / "
+                          "fingerprint_mismatch / absent / error)",
+                          "counter");
+        for (auto kind : {"tokens", "pending"})
+            for (auto outcome : {"imported", "already_imported", "fingerprint_mismatch",
+                                 "absent", "error"})
+                metrics_.counter("yuzu_server_enrollment_import_total",
+                                 {{"kind", kind}, {"outcome", outcome}});
+        metrics_.describe("yuzu_server_enrollment_import_rows_total",
+                          "Rows handled by the one-time legacy enrollment .cfg import "
+                          "(result: imported / skipped_existing / skipped_garbled / "
+                          "recovered_colon / id_disambiguated / unplaceable)",
+                          "counter");
+        for (auto kind : {"tokens", "pending"})
+            for (auto result : {"imported", "skipped_existing", "skipped_garbled",
+                                "recovered_colon", "id_disambiguated", "unplaceable"})
+                metrics_.counter("yuzu_server_enrollment_import_rows_total",
+                                 {{"kind", kind}, {"result", result}});
         metrics_.describe("yuzu_auth_session_reap_total",
                           "Expired durable operator-session rows deleted by the clock-guarded "
                           "retention sweep",
@@ -2828,6 +3266,16 @@ public:
                           "DB-clock-authored, ADR-2002 section 4)",
                           "counter");
         metrics_.counter("yuzu_auth_local_clock_backward_total");
+        // Break-glass use (SOC 2 CC6.6), incremented by AuthRoutes once the armed
+        // break-glass account's password verifies. Pre-seeded to 0 because the
+        // event is rare by design: an unseeded counter is born at 1, and
+        // increase() cannot see the first sample of a series, so
+        // YuzuBreakGlassLogin would miss the first use after every restart.
+        metrics_.describe("yuzu_auth_break_glass_login_total",
+                          "Password-verified logins by the armed break-glass account under "
+                          "--auth-mode=sso-only (the TOTP challenge still follows)",
+                          "counter");
+        metrics_.counter("yuzu_auth_break_glass_login_total");
         // HA WS-1(1b), ADR-2002 section 5: command_id -> execution_id
         // correlation-table retention (ExecutionTracker's PG-backed
         // command_execution table, replacing AgentServiceImpl's former
@@ -2948,12 +3396,102 @@ public:
                           "counter");
         for (auto reason : {"pool_exhausted", "query_failed"})
             metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
+        // #4982: ExecutionTracker::set_agents_targeted / ::mark_cancelled were
+        // log-only on failure at every REST/MCP call site — a sustained
+        // pool/query degrade on either had no Prometheus signal, only an
+        // spdlog::error line. `op` names which call failed, `surface` which
+        // family of handler hit it. Pre-seeded below so absent() stays
+        // meaningful (same closed-label-set convention as
+        // yuzu_exec_correlation_read_degrade_total above). A sustained
+        // mark_cancelled failure specifically can leave an execution row
+        // stranded at status='running' forever (#4982) — see the stuck-row
+        // sweep this issue also adds for the recovery side.
+        //
+        // #4982 fix round 2 (Fix 5): the identical swallowed-failure pattern
+        // also existed, uninstrumented, at the equivalent call sites in
+        // workflow_routes.cpp, schedule_runner.cpp and
+        // command_outbox_delivery.cpp — three more dispatch/redispatch
+        // surfaces than the original REST/MCP pair. `surface` widens to 5
+        // values (rest|mcp|workflow|schedule|outbox); 2 ops x 5 surfaces = 10
+        // pre-seeded series, but {op=set_agents_targeted,surface=outbox}
+        // (governance Gate 4 finding, happy-path) can fire on neither success
+        // nor failure and reads 0 forever by construction, not drift:
+        // command_outbox_delivery.cpp's set_agents_targeted write moved into
+        // the atomic CommandDeliveryFinalizationOwner::mark_sent_with_target,
+        // whose own failure counts via the pre-existing
+        // yuzu_server_command_outbox_deliver_degrade_total instead.
+        // {op=set_agents_targeted,surface=schedule} is dead for the same
+        // reason: schedule_runner.cpp never calls set_agents_targeted at all
+        // (grepped - it only ever calls mark_cancelled with surface=schedule;
+        // dispatch for a schedule-originated command sets agents_targeted,
+        // if at all, via the outbox delivery path above, which counts under
+        // surface=outbox). 8 of the 10 pre-seeded series are reachable
+        // (review round 2, Doomgoose PR #5226).
+        metrics_.describe("yuzu_exec_tracker_bookkeeping_failed_total",
+                          "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
+                          "failed (pool exhaustion or a failed statement) at a dispatch call "
+                          "site, by op (set_agents_targeted|mark_cancelled) and surface "
+                          "(rest|mcp|workflow|schedule|outbox). No retry is attempted inline - "
+                          "retrying in an already-degraded-store request handler/background "
+                          "worker risks doubling request latency or delaying the next tick for "
+                          "no reliability gain.",
+                          "counter");
+        for (auto op : {"set_agents_targeted", "mark_cancelled"})
+            for (auto surface : {"rest", "mcp", "workflow", "schedule", "outbox"})
+                metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                 {{"op", op}, {"surface", surface}});
+        // #4982 Part B — the recovery side of the counter above:
+        // reap_stuck_running_executions() (execution_tracker.cpp) cancels an
+        // execution row permanently wedged at status='running',
+        // agents_targeted=0, via ONE atomic in-transaction `UPDATE ...
+        // RETURNING id` that re-checks the full candidate predicate at
+        // mutation time — NOT a separate post-commit mark_cancelled() call
+        // (fix round 2 TOCTOU close; see that method's own comment).
+        // outcome="cancelled" counts by the number of rows the RETURNING set
+        // actually confirmed transitioned this pass; outcome="not_cancelled"
+        // counts candidates the earlier SELECT chose that the atomic UPDATE's
+        // RETURNING set excluded — the row no longer matched the predicate at
+        // mutation time (a genuine dispatch landed, the outbox row moved back
+        // to pending, or the row otherwise changed between the SELECT and the
+        // UPDATE), never a failed write (the UPDATE statement failing outright
+        // aborts the whole pass as outcome="degraded" instead — see below);
+        // outcome="clock_anomaly"/"would_wipe" each count once per pass
+        // DECLINED for that reason (an implausible now()/anchor reading, or
+        // candidates being an implausibly large fraction of all running
+        // executions — likely a systemic bug, not a genuine backlog);
+        // outcome="degraded" counts a pass that failed outright (pool/query
+        // degradation). Bounded 5-value closed set, pre-seeded below so
+        // absent() stays meaningful (same convention as the gateway-route
+        // reap outcome family).
+        metrics_.describe("yuzu_exec_tracker_stuck_reap_total",
+                          "reap_stuck_running_executions() pass outcomes (#4982 Part B), by "
+                          "outcome (cancelled|not_cancelled|would_wipe|clock_anomaly|degraded|"
+                          "capped|skipped). cancelled/not_cancelled increment by the per-row "
+                          "count for an accepted pass; would_wipe/clock_anomaly/degraded "
+                          "increment once per declined/failed pass; capped increments once per "
+                          "ACCEPTED pass whose true backlog exceeded the per-pass cap - a "
+                          "sustained non-zero capped rate means the reaper is chronically behind "
+                          "even though it is successfully cancelling every pass, same meaning as "
+                          "the gateway-route-reap sibling's ok_capped; skipped increments once "
+                          "when another replica already held the advisory lock this tick - "
+                          "routine on a multi-replica deployment, same meaning as that sibling's "
+                          "own skipped.",
+                          "counter");
+        for (const char* outcome : {"cancelled", "not_cancelled", "would_wipe", "clock_anomaly",
+                                     "degraded", "capped", "skipped"})
+            metrics_.counter("yuzu_exec_tracker_stuck_reap_total", {{"outcome", outcome}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
-        // once, iff `seed_admin_if_empty` actually seeded the sole admin row
-        // (an empty `auth.users` table) — a no-op (table already populated,
-        // the common case on every restart) leaves this at 0. No labels: the
-        // event is binary and rare enough that a plain counter (0 forever, or
-        // 1 after the one genuine fresh-start boot) is the whole signal.
+        // once, iff `cfg_.auth_fresh_start_seeded` is set — main.cpp sets it
+        // from `RbacStore::provision_first_admin`'s outcome (the fresh-start
+        // Administrator bootstrap, and the SOLE production seeder now —
+        // `seed_admin_if_empty` has no production caller; see
+        // `Config::auth_fresh_start_seeded`'s doc comment) — true iff the
+        // sole admin row was actually inserted
+        // into a genuinely-empty `auth.users` table this boot. A no-op
+        // (table already populated, the common case on every restart)
+        // leaves this at 0. No labels: the event is binary and rare enough
+        // that a plain counter (0 forever, or 1 after the one genuine
+        // fresh-start boot) is the whole signal.
         metrics_.describe("yuzu_auth_fresh_start_reset_total",
                           "1 iff this boot seeded the sole admin user into an empty auth.users "
                           "table (fresh-start), 0 otherwise",
@@ -2990,8 +3528,11 @@ public:
         metrics_.describe("yuzu_scim_provenance_denied_total",
                           "Total SCIM mutations refused because the target account's "
                           "provisioning_source is not 'scim' (or its role was elevated outside "
-                          "SCIM's ownership) - SCIM attempting to touch an account it does not "
-                          "own is a misconfigured-IdP or compromised-IdP signal",
+                          "SCIM's ownership), or (#4966) a POST or active:true reactivation "
+                          "named a username that already holds an Administrator grant or whose "
+                          "deactivated record has a non-user role - SCIM attempting to touch "
+                          "an account it does not own is a misconfigured-IdP or compromised-IdP "
+                          "signal",
                           "counter");
         // SCIM v2 Groups->role application core (#2021). Bumped only when
         // recompute_scim_user_role ACTUALLY changes a role (promotion or
@@ -3012,9 +3553,10 @@ public:
         // a durable role change that could not be applied, distinct from
         // yuzu_scim_role_changes_total's success path.
         metrics_.describe("yuzu_scim_role_change_failures_total",
-                          "Total SCIM-driven role changes that failed to write to AuthDB during "
-                          "group-membership recompute - a sustained non-zero rate means role "
-                          "changes are silently not taking effect",
+                          "Total SCIM-driven role changes that did not complete during "
+                          "group-membership recompute: the guarded write failed, or the role "
+                          "changed but its durable session wipe failed - a sustained non-zero "
+                          "rate means role changes are not taking effect cleanly",
                           "counter");
         // ADR-2001 D1/D2 (governance Gate 7 BLOCKING fix, #3): describe()'d
         // unconditionally here rather than left to lazily create at first
@@ -3202,6 +3744,8 @@ public:
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
         metrics_.counter("yuzu_scim_provenance_denied_total");
+        metrics_.counter("yuzu_scim_role_changes_total");
+        metrics_.counter("yuzu_scim_role_change_failures_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
         metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
@@ -3278,12 +3822,30 @@ public:
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
+        // #4856: two sources share this counter, both by reason
+        // (store_not_open/pool_acquire_timeout/query_error) — "guardian_state"
+        // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
+        // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
+        // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
+        // agent_rule_statuses*/rule_names*/errored_rule_count, fail-hard: the
+        // caller gets a std::expected error and aborts the push/reconcile
+        // rather than fan out empty/stale data). Pre-seeded below (same closed
+        // {reason x source} cross-product pre-seed pattern as
+        // yuzu_server_kek_operations_total above) so absent()/rate() alerting
+        // is meaningful before the first degrade ever fires.
         metrics_.describe("yuzu_server_guardian_read_degrade_total",
                           "Guardian rules/status/DEX reads that returned degraded (could not "
-                          "read) rather than a genuine result, by reason and source. A sampled "
-                          "warn accompanies each new degrade episode; the catastrophic reads "
-                          "(rules/status) abort the push/reconcile rather than fan out empty.",
+                          "read) rather than a genuine result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(guardian_state = DEX/observation reads, fail-soft, empty result "
+                          "served; guardian_rules = authoritative rule/status reads, fail-hard, "
+                          "push/reconcile aborts rather than fans out empty). A sampled warn "
+                          "accompanies each new degrade episode.",
                           "counter");
+        for (const auto source : {"guardian_state", "guardian_rules"})
+            for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+                metrics_.counter("yuzu_server_guardian_read_degrade_total",
+                                 {{"reason", reason}, {"source", source}});
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
                           "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
@@ -3291,6 +3853,26 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
+        // json-dump-depth-guard fix: a rule whose stored spec_json nests past
+        // kMcpMaxJsonDepth is excluded from every push it would otherwise be
+        // included in (build_agent_push, guardian_push_builder.cpp) - this is
+        // the fleet-wide signal that a rule silently stopped enforcing (the
+        // rule's own detail page also shows an "invalid data" state, but an
+        // operator who never opens that specific rule would otherwise have no
+        // tell). A rule_id that fails the create-time charset/length contract
+        // (#4665) is excluded the same way — reason=invalid_rule_id, added
+        // alongside depth_exceeded when the push-builder's server-side filter
+        // for it landed. Pre-seed BOTH closed reason values so each series
+        // exists at zero on a healthy fleet (docs/observability-conventions.md:
+        // every known label combination of a closed-set label is initialised).
+        metrics_.describe("yuzu_guardian_push_rule_excluded_total",
+                          "Guardian rules excluded from a push, by reason (depth_exceeded, "
+                          "invalid_rule_id)",
+                          "counter");
+        metrics_.counter("yuzu_guardian_push_rule_excluded_total",
+                         {{"reason", "depth_exceeded"}});
+        metrics_.counter("yuzu_guardian_push_rule_excluded_total",
+                         {{"reason", "invalid_rule_id"}});
         // T12 (design doc §7): engine-credential overlap-pair rotation sweep.
         // Deliberately a bounded `reason` label set (currently one value,
         // "successor_unused") and NOT `event="security"` — this is an
@@ -3768,7 +4350,7 @@ public:
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
         }
 
-        // Gateway command-forwarding client (gw_mgmt_channel_/gw_mgmt_stub_) is
+        // Gateway command-forwarding client (gw_mgmt_pool_, HA WS-4 4.3) is
         // built in run(), AFTER bootstrap_default_certs() — for a default-cert
         // install the client cert/key paths are empty here and only populated by
         // the bootstrap, and the mutual-TLS dial (HIGH-2 #1314) needs them. Same
@@ -4187,6 +4769,12 @@ public:
                               "failed (database reachable but the endpoint_state schema could "
                               "not be created/opened)");
                 startup_failed_ = true;
+            } else {
+                // HA WS-5 governance hardening (Gate 3 sre finding): this
+                // store is now load-bearing for cross-replica scope
+                // evaluation, not just the viz page, so its fail-soft
+                // degrade paths need a counter, not just a debug log.
+                offline_endpoint_store_->set_metrics(&metrics_);
             }
         }
 
@@ -4434,6 +5022,56 @@ public:
                         startup_failed_ = true;
                     } else {
                         auth_mgr_.set_auth_db(auth_db_.get());
+                        // #5274 (#5342 Gate 7): the cfg file is seed-only now
+                        // that AuthDB is wired — warn, by name, about any cfg
+                        // user whose stored credential has since diverged, and
+                        // publish the count. Before any listener binds, so no
+                        // login has hydrated users_ yet (it holds cfg entries
+                        // only).
+                        (void)auth_mgr_.report_stale_cfg_credentials();
+
+                        // WS-6 6.2: one-time import of the legacy per-replica
+                        // enrollment-tokens.cfg / pending-agents.cfg into Postgres.
+                        // Runs HERE - right after the auth store is wired and
+                        // before any listener binds, so no Register can be served
+                        // against a half-imported enrollment set - and never from a
+                        // main.cpp one-shot (--mfa-reset / --generate-tokens must
+                        // not import or rename). A missing file is a no-op; a PG
+                        // error with a file present refuses to start (like the
+                        // first-boot admin seed): a half-known enrollment set is
+                        // worse than no boot. On a normal boot the reports are
+                        // kept and drained into the audit store once it's built
+                        // below (audit_store_ isn't constructed yet at this point
+                        // in the boot sequence).
+                        auto imported = enrollment_import::run_legacy_enrollment_import(
+                            *auth_db_,
+                            enrollment_import::Locations{cfg_.data_dir,
+                                                         cfg_.auth_config_path.parent_path()},
+                            &metrics_);
+                        if (imported.fatal) {
+                            spdlog::error("[PG] Refusing to start: the one-time legacy enrollment "
+                                          ".cfg import failed with a file present (see the "
+                                          "[enrollment-import] lines above)");
+                            startup_failed_ = true;
+                            // The refusal above means `audit_store_` (below) is
+                            // never constructed on THIS boot, and a later boot's
+                            // reports are a fresh, unrelated import attempt — so
+                            // the documented enrollment.import failure row
+                            // (docs/observability-conventions.md) would otherwise
+                            // never be written for the failure that actually
+                            // caused this refusal (PR #5107 review, Should-fix).
+                            // A one-shot AuditStore over the same still-open
+                            // pg_pool_ writes it here, best-effort (a dead audit
+                            // store is exactly the kind of failure this row would
+                            // have described anyway; the loud spdlog::error above
+                            // is the primary signal either way).
+                            AuditStore one_shot_audit(*pg_pool_, cfg_.audit_retention_days);
+                            if (one_shot_audit.is_open())
+                                write_enrollment_import_audit_rows(one_shot_audit,
+                                                                   imported.reports);
+                        } else {
+                            enrollment_import_reports_ = std::move(imported.reports);
+                        }
                     }
                 }
             }
@@ -4548,6 +5186,59 @@ public:
                         startup_failed_ = true;
                     }
                 }
+            }
+        }
+        // Wave 7: execution_artifacts (the first Forensics-class plugin)
+        // ships default-off — an operator must explicitly enable it via
+        // PUT /api/v1/plugin-config/execution_artifacts/kill-switch. Seeded
+        // immediately after the store is constructed and open; ON CONFLICT
+        // DO NOTHING (plugin_config_store.cpp) means this never clobbers an
+        // operator's own kill-switch decision on a restart.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "execution_artifacts",
+                    "default-off: forensics class (Wave 7); enable per PUT "
+                    "/api/v1/plugin-config/execution_artifacts/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: execution_artifacts default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
+        // Wave 10: browser_inventory (Forensics class, per-user browser
+        // profile data) ships default-off — an operator must
+        // explicitly enable it via PUT
+        // /api/v1/plugin-config/browser_inventory/kill-switch. Seeded
+        // immediately after the store is constructed and open; ON CONFLICT
+        // DO NOTHING (plugin_config_store.cpp) means this never clobbers an
+        // operator's own kill-switch decision on a restart.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "browser_inventory",
+                    "default-off: forensics class (Wave 10); enable per PUT "
+                    "/api/v1/plugin-config/browser_inventory/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: browser_inventory default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
+        // Wave 8: privacy_permissions (per-app sensitive-permission grants —
+        // camera/microphone/location/full-disk-access equivalents) ships
+        // default-off, same Forensics-class posture as execution_artifacts. An
+        // operator must explicitly enable it via PUT
+        // /api/v1/plugin-config/privacy_permissions/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "privacy_permissions",
+                    "default-off: forensics class (Wave 8); enable per PUT "
+                    "/api/v1/plugin-config/privacy_permissions/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: privacy_permissions default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
             }
         }
 
@@ -4847,6 +5538,18 @@ public:
                     legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "audit.db",
                                                              "AuditStore", {"audit_events"});
                     audit_store_->start_cleanup();
+                    // #5342 Gate 8: the ADR-0012 §3 query owner for a local
+                    // account's credential change — the credential, its
+                    // sessions, provisional MFA, lockout and audit row(s) in
+                    // ONE transaction on the shared pool. Needs AuthDB,
+                    // SessionStore and AuditStore on THIS pool (all three are:
+                    // auth_db_/session_store_ above, audit_store_ here); the
+                    // one-pool assumption is what makes its cross-schema
+                    // transaction possible (credential_change_owner.hpp).
+                    // Nulled on auth_mgr_ at teardown beside set_auth_db.
+                    credential_change_owner_ =
+                        std::make_unique<CredentialChangeOwner>(*pg_pool_, audit_store_.get());
+                    auth_mgr_.set_credential_change_owner(credential_change_owner_.get());
                 }
             }
             // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
@@ -4868,6 +5571,18 @@ public:
                     legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "ca.db", "CaStore",
                                                              {"ca_root", "ca_issued",
                                                               "ca_crl_versions"});
+                    // HA WS-6 CRL follow-ups (#4828-#4831): auth_key_provider_ is guaranteed
+                    // non-null here (constructed under the same pg_pool_ && !startup_failed_
+                    // guard, earlier in this same function — a construction failure there would
+                    // have set startup_failed_ and short-circuited this block too). Reuses it
+                    // rather than minting a second FileKeyProvider over the same directory (the
+                    // pattern several other secret codecs in this function already follow).
+                    crl_publisher_ = std::make_unique<CrlPublisher>(CrlPublisher::Deps{
+                        .ca_store = ca_store_.get(),
+                        .metrics = &metrics_,
+                        .audit_store = audit_store_.get(),
+                        .key_provider = auth_key_provider_.get(),
+                    });
                 }
             }
             // PR 10 hardening — wire AuditStore into FleetTopologyStore
@@ -4921,6 +5636,18 @@ public:
                     });
             }
 
+            // WS-6 6.2 - durable evidence of the one-time legacy enrollment .cfg
+            // import (system principal, like the other boot-time posture rows).
+            // Shared with the fatal-import one-shot write above
+            // (write_enrollment_import_audit_rows) — a `startup_failed_` boot
+            // never reaches here (audit_store_ isn't built), which is exactly
+            // why that path writes its own row via a throwaway AuditStore
+            // instead of relying on this drain.
+            if (audit_store_ && audit_store_->is_open()) {
+                write_enrollment_import_audit_rows(*audit_store_, enrollment_import_reports_);
+                enrollment_import_reports_.clear();
+            }
+
             // Gate 7 compliance F-1 — durable evidence that the viz
             // kill-switch took effect. The per-request `kill_switch` audit
             // row in VizRoutes only fires when a request actually hits a
@@ -4944,6 +5671,55 @@ public:
                             "(--viz-disable / YUZU_VIZ_DISABLE)";
                 ev.result = "success";
                 (void)audit_store_->log(ev);
+            }
+
+            // #1567: tar.db corruption audit. AgentHealthStore surfaces candidates
+            // from heartbeat tags; the gate dedups DURABLY against the audit store
+            // itself (one row per agent + quarantine identity across health-store
+            // prunes, server restarts and HA node switches).
+            {
+                auto latest = [this](const std::string& agent_id)
+                    -> std::optional<std::optional<std::string>> {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return std::nullopt;
+                    AuditQuery q;
+                    q.action = detail::kTarCorruptionAuditAction;
+                    q.target_id = agent_id;
+                    q.limit = 1;
+                    auto rows = audit_store_->query(q);
+                    if (!rows)
+                        return std::nullopt; // degraded store: retry on a later heartbeat
+                    if (rows->empty())
+                        return std::optional<std::string>{};
+                    return detail::decode_tar_quarantine_from_detail(rows->front().detail);
+                };
+                auto gate = std::make_shared<detail::TarCorruptionAuditGate>(std::move(latest));
+                health_store_.set_corruption_sink([this, gate](const std::string& agent_id,
+                                                               int64_t total,
+                                                               const std::string& quarantine) {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return;
+                    if (!gate->should_log(agent_id, quarantine))
+                        return;
+                    // Reservation completes the slot even if AuditEvent construction
+                    // or audit_store_->log() throws (log() is not noexcept).
+                    detail::TarCorruptionAuditGate::Reservation res(*gate);
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "system";
+                    ev.principal_role = "system";
+                    ev.action = detail::kTarCorruptionAuditAction;
+                    ev.target_type = detail::kTarCorruptionAuditTargetType;
+                    ev.target_id = agent_id;
+                    ev.detail = detail::encode_tar_corruption_detail(total, quarantine);
+                    ev.result = "success";
+                    if (audit_store_->log(ev))
+                        res.logged(agent_id, quarantine);
+                    else
+                        res.failed();
+                });
             }
 
             // #802 / W7.4 — mirror the viz-disable audit emission pattern:
@@ -5082,11 +5858,26 @@ public:
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
 
+            // HA WS-5 (ADR-2002 §7a): wire cross-replica presence into scope
+            // evaluation / all_ids(). Same window `reap_stale_sessions` uses
+            // for local liveness (cfg_.session_timeout), so a single
+            // replica's presence-derived liveness window matches its own
+            // local one — see AgentRegistry::configure_presence's doc
+            // comment. A null offline_endpoint_store_ (construction failed —
+            // ADR-0007 fails the server closed before reaching here in
+            // production) leaves presence unconfigured: local-only behavior,
+            // unchanged from pre-WS-5.
+            registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);
+
             // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
             // applied policy generation on every heartbeat; if it trails the
             // current generation it missed a push (was offline when the push fired,
             // or has just reconnected — sync_with_server is a no-op pull), so
-            // re-push its applicable rules. Reads the generation, never bumps it, so
+            // re-push its applicable rules. An agent also reports generation 0
+            // (intermittently, see the agent's back-off) while
+            // a boot re-arm failure is unresolved (#5513), however current its
+            // persisted generation is; the same full_sync re-push is the catch-up
+            // for that case too. Reads the generation, never bumps it, so
             // catching one lagging agent up does not make the rest of the fleet look
             // stale (the cascade M6's monotonic counter is designed to avoid).
             heartbeat_ingestion_->set_guardian_reconcile_fn(
@@ -5230,17 +6021,18 @@ public:
                                 return cached->second;
                             bool member = false;
                             if (auto parsed = yuzu::scope::parse(expr)) {
-                                // No rs_store/principal passed here. If this
-                                // rule's scope references from_result_set:,
-                                // evaluate_scope now ABORTS (nullopt, H1)
-                                // rather than silently evaluating the atom
-                                // false — value_or({}) then collapses to "not
-                                // a member", i.e. the rule is NOT pushed to
-                                // this agent. Arming nothing is the safe
-                                // direction here; the old comment's "cannot
-                                // degrade" claim was wrong for exactly the
-                                // NOT-combinator case.
-                                for (const auto& id : registry_.evaluate_scope(
+                                // No rs_store/principal passed here — this is a
+                                // LOCAL-ONLY dispatch (send_system_reserved), so
+                                // evaluate_scope_local (#4981 PR-1 B4) is the
+                                // correct entry point: it shares evaluate_scope's
+                                // Unresolvable/StoreDegraded abort semantics for
+                                // from_result_set:/props.<key> atoms with no
+                                // store wired (value_or({}) then collapses that
+                                // to "not a member" — arming nothing is the safe
+                                // direction), but can NEVER abort for a presence
+                                // reason, so a presence-store blip cannot
+                                // periodically disarm this scoped rule.
+                                for (const auto& id : registry_.evaluate_scope_local(
                                          *parsed, tag_store_.get(),
                                          custom_properties_store_.get())
                                          .value_or(std::vector<std::string>{}))
@@ -5252,7 +6044,7 @@ public:
                             scope_member.emplace(expr, member);
                             return member;
                         },
-                        /*full_sync=*/true, current);
+                        /*full_sync=*/true, current, &metrics_);
                     // Unique per re-push (random suffix) so a same-generation reconcile
                     // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
                     const auto command_id =
@@ -5886,7 +6678,32 @@ public:
                     {"rbac_config", "securable_types", "operations", "roles", "role_permissions",
                      "principal_roles", "groups", "group_members"});
                 spdlog::info("RbacStore initialized (schema rbac_store)");
+                // #4966: the last-Administrator guard for account lifecycle
+                // (deactivation + role writes). AuthManager borrows the store and reaches
+                // the guard through its thin wrappers; auth_db_ and rbac_store_ share
+                // pg_pool_ (the one-pool assumption the owner's cross-schema transaction
+                // needs). Wired here, not beside set_credential_change_owner: rbac_store_
+                // does not exist until this block. Nulled at teardown beside
+                // set_credential_change_owner(nullptr).
+                auth_mgr_.set_rbac_store(rbac_store_.get());
             }
+        }
+        // #4966 boot self-check: an AuthDB without the guard would leave
+        // AuthManager::remove_user_checked / update_role_checked failing closed on
+        // every call (they never fall back to the unguarded AuthDB write). Refuse to
+        // start instead of serving a console where no account can be removed or
+        // re-roled. Exactly that condition, via the SAME decision the runtime arms use;
+        // a store that failed to open already set startup_failed_ above.
+        if (!startup_failed_ &&
+            auth::AuthManager::lifecycle_guard_unwired(auth_mgr_.auth_db_ptr() != nullptr,
+                                                       auth_mgr_.has_rbac_store())) {
+            spdlog::error("[PG] Refusing to start: AuthDB is configured but the RbacStore "
+                          "last-Administrator guard is not wired to AuthManager (#4966). The "
+                          "RbacStore failed to open or the wiring is missing: see the RbacStore "
+                          "error logged above this line (a migration or database fault); the "
+                          "guard cannot run without it and no account can be removed or "
+                          "re-roled while it is absent");
+            startup_failed_ = true;
         }
 
         // Engine-principal namespace collision-scan preflight (design doc
@@ -6170,6 +6987,8 @@ public:
                               "could not be created/opened)");
                 startup_failed_ = true;
             } else {
+                dex_app_version_failures_owner_ = std::make_unique<DexAppVersionFailuresOwner>(
+                    *pg_pool_, cfg_.guardian_event_retention_days);
                 legacy_sqlite_probe::warn_if_legacy_rows(
                     cfg_.db_dir() / "guaranteed-state.db", "GuaranteedStateStore",
                     {"guaranteed_state_rules", "guardian_meta", "guardian_agent_rule_status",
@@ -6746,6 +7565,24 @@ public:
                 inventory_store_->set_metrics(&metrics_);
                 if (gateway_service_)
                     gateway_service_->set_inventory_store(inventory_store_.get());
+                // Defence-in-depth purge (adjudication P1): a typed source's rows
+                // never belong in the generic store — is_typed_inventory_source is
+                // the PRIMARY control (the gateway ProxyInventory generic-blob loop
+                // skips these sources outright); this sweep is hygiene for a
+                // newer-agent/older-server window where a typed blob landed here
+                // before the exclusion took effect (or before a source was
+                // promoted to typed at all). Never fails closed on a purge miss —
+                // the exclusion, not the purge, is what a caller must rely on.
+                for (const char* s : {"installed_software", "app_perf", "device_ci",
+                                      "software_licensing", "app_usage"}) {
+                    if (!is_typed_inventory_source(s))
+                        continue;
+                    if (!inventory_store_->delete_source(s))
+                        spdlog::warn("[PG] Boot purge: InventoryStore::delete_source(\"{}\") "
+                                     "reported failure (non-fatal — hygiene sweep, not a startup "
+                                     "gate)",
+                                     s);
+                }
             }
         }
 
@@ -6846,6 +7683,30 @@ public:
                     gateway_service_->set_software_licensing_store(software_licensing_store_.get());
             }
         }
+        // Typed per-agent last-used app-usage projection — born-on-Postgres (Wave
+        // 7 PR7.2, ADR-0016 §5, app_usage daily-sync source). Independent of the
+        // stores above (its own schema, its own fail-closed). Wires BOTH server
+        // entry points (direct ReportInventory + gateway ProxyInventory) to the
+        // app_usage ingest seam, which is otherwise dead: agent_service_/
+        // gateway_service_ already carry the set_app_usage_store() setter + the
+        // ingest call, but skip it while the store pointer is null. The
+        // /api/v1/forensics/agents/{agent_id}/app-usage READ route is registered
+        // below (in the route-wiring block) against this store.
+        if (pg_pool_ && !startup_failed_) {
+            app_usage_store_ = std::make_unique<AppUsageStore>(*pg_pool_);
+            if (!app_usage_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: app_usage store migration/open failed "
+                              "(database reachable but the app_usage_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                app_usage_store_->set_metrics(&metrics_);
+                agent_service_.set_app_usage_store(app_usage_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_app_usage_store(app_usage_store_.get());
+            }
+        }
+
         // ProductRegistryStore — SLE canonical product identities + match links
         // (ADR-0024 Decision 4). Sibling of the licensing store: its own schema, its
         // own fail-closed open. The UCE module's compliance evaluator (ADR-1005) is
@@ -7141,6 +8002,129 @@ public:
         spdlog::error("**********************************************************************");
     }
 
+    /// Gateway-upstream peer authorization: resolve the mode, build the guard.
+    ///
+    /// Runs in run() AFTER certificate bootstrap (so the effective listener
+    /// credentials are known) and BEFORE the gRPC builder is created, so a refusal
+    /// exits before any port is bound. The decision itself is the pure
+    /// `gateway_peer::resolve_gateway_peer_authz`; this function only gathers its
+    /// inputs, logs, and constructs the one `GatewayPeerGuardedService` the builder
+    /// registers. Returns false on a refusal (the caller sets `startup_failed_`).
+    ///
+    /// Pins are fixed here, once: there is no reload, freshness window or revocation read.
+    ///
+    /// LIFETIME: the policy holds an immutable pin set by `shared_ptr`; the audit sink captures
+    /// `this` and runs on gRPC worker threads. That is safe for the same reason the CA wiring
+    /// above is: stop() runs `agent_server_->Shutdown(deadline)` BEFORE any member is destroyed.
+    /// `agent_server_` is declared after `gateway_peer_guard_` (the guard outlives the server's
+    /// last call), and `gateway_peer_guard_` after `gateway_service_` (the inner handler outlives
+    /// the guard).
+    [[nodiscard]] bool setup_gateway_peer_guard() {
+        namespace gp = yuzu::server::gateway_peer;
+
+        metrics_.describe(std::string{gp::kAuthzModeMetric},
+                          "Gateway-upstream peer authorization mode: 1 for the active mode "
+                          "(enforce; insecure_ack = acknowledged DISABLED on plaintext or without "
+                          "a client CA; insecure_ack_tls = acknowledged DISABLED while TLS and a "
+                          "client CA are on; disabled = service off)",
+                          "gauge");
+        for (const auto m : gp::kRunnableAuthzModes)
+            metrics_.gauge(std::string{gp::kAuthzModeMetric},
+                           {{"mode", std::string{gp::to_label(m)}}})
+                .set(0);
+
+        const bool mgmt_override = !cfg_.mgmt_tls_server_cert.empty() ||
+                                   !cfg_.mgmt_tls_server_key.empty() ||
+                                   !cfg_.mgmt_tls_ca_cert.empty();
+        gp::ListenerFacts facts;
+        facts.tls_enabled = cfg_.tls_enabled;
+        facts.using_default_certs = cfg_.using_default_certs;
+        facts.using_default_agent_certs = cfg_.using_default_agent_certs;
+        facts.mgmt_override = mgmt_override;
+        facts.agent_ca_present = !cfg_.tls_ca_cert.empty();
+        facts.mgmt_ca_present = !cfg_.mgmt_tls_ca_cert.empty();
+        facts.agent_creds_are_default_files =
+            !default_cert_set_.server_cert.empty() &&
+            cfg_.tls_server_cert == default_cert_set_.server_cert &&
+            !default_cert_set_.ca_cert.empty() && cfg_.tls_ca_cert == default_cert_set_.ca_cert;
+        const gp::ListenerPosture posture = gp::derive_listener_posture(facts);
+
+        gp::ResolutionInputs in;
+        in.service_enabled = (gateway_service_ != nullptr);
+        in.tls_enabled = cfg_.tls_enabled;
+        in.ca_present = posture.ca_present;
+        in.grpc_creds_are_default = posture.grpc_creds_are_default;
+        in.hex_pins = cfg_.gateway_peer_pins;
+        in.pin_files = cfg_.gateway_peer_pin_files;
+        in.insecure_ack = cfg_.insecure_gateway_peer;
+        in.cert_group = cfg_.cert_group;
+        in.default_gateway_cert_path = default_cert_set_.gateway_cert.string();
+
+        const gp::Resolution res = gp::resolve_gateway_peer_authz(in);
+        for (const auto& w : res.warnings)
+            spdlog::warn("gateway peer authorization: {}", w);
+
+        const auto set_mode = [this](gp::AuthzMode m) {
+            metrics_.gauge(std::string{gp::kAuthzModeMetric},
+                           {{"mode", std::string{gp::to_label(m)}}})
+                .set(1);
+        };
+
+        switch (res.mode) {
+        case gp::AuthzMode::Refuse:
+            spdlog::error("gateway peer authorization: {}", res.refusal);
+            return false;
+        case gp::AuthzMode::Disabled:
+            set_mode(res.mode);
+            return true;
+        case gp::AuthzMode::InsecureAck:
+        case gp::AuthzMode::InsecureAckTls:
+            set_mode(res.mode);
+            // The ONE loud line (the resolution's warnings do not repeat it).
+            spdlog::error("*** {}", res.alarm);
+            // Durable evidence that the acknowledged-disabled posture was in force. The audit
+            // store is constructed in the ServerImpl constructor, well before run() calls this
+            // function, so it is open here (the same shape as server.viz_disabled and
+            // server.unsigned_packs_allowed, which are written once the store exists).
+            // A skipped or failed write is warned about by the helper.
+            (void)gp::write_audit_row_or_warn(
+                audit_store_ && audit_store_->is_open(),
+                [this](const AuditEvent& ev) { return audit_store_->log(ev); },
+                gp::make_authz_disabled_audit_event(res.mode, in.tls_enabled));
+            gateway_peer_guard_ = std::make_unique<detail::GatewayPeerGuardedService>(
+                *gateway_service_, detail::GatewayPeerGuardedService::AcknowledgedInsecure{},
+                &metrics_);
+            return true;
+        case gp::AuthzMode::Enforce:
+            break;
+        }
+
+        auto boot = gp::build_boot_pins(in, res);
+        if (!boot) {
+            spdlog::error("gateway peer authorization: {}", boot.error());
+            return false;
+        }
+        for (const auto& w : boot->warnings)
+            spdlog::warn("gateway peer authorization: {}", w);
+        if (res.auto_pin) {
+            spdlog::info("gateway peer authorization: enforcing; the default gateway certificate "
+                         "({}) is pinned automatically (default gRPC certificates in use); {}",
+                         res.auto_pin_file, gp::format_pin_prefixes(*boot->pins));
+        } else {
+            spdlog::info("{}", gp::enforce_boot_line(*boot->pins, cfg_.gateway_peer_pins.size(),
+                                                     cfg_.gateway_peer_pin_files.size()));
+        }
+
+        detail::GatewayPeerGuardedService::AuditSink audit = [this](const AuditEvent& ev) {
+            return audit_store_ && audit_store_->is_open() && audit_store_->log(ev);
+        };
+        gateway_peer_guard_ = std::make_unique<detail::GatewayPeerGuardedService>(
+            *gateway_service_, gp::GatewayPeerPolicy{std::move(boot->pins)}, std::move(audit),
+            &metrics_);
+        set_mode(res.mode);
+        return true;
+    }
+
     ~ServerImpl() override { stop(); }
 
     [[nodiscard]] bool startup_failed() const override { return startup_failed_; }
@@ -7175,27 +8159,48 @@ public:
         // unauthenticated container — including a compromised agent with no
         // CA-issued cert — can no longer push commands to the fleet. Only a
         // plaintext stack (--no-tls, dev/demo) keeps insecure credentials.
-        if (!cfg_.gateway_command_address.empty()) {
+        //
+        // HA WS-4 4.3: gw_mgmt_pool_ replaces the pre-4.3 single
+        // gw_mgmt_channel_/gw_mgmt_stub_ pair — one shared credentials object
+        // (built once, below), reused across every cluster's channel
+        // (GatewayMgmtStubPool's contract; the mgmt-plane peer pin, #1422,
+        // lives per-cluster on the GATEWAY side, not something core varies
+        // its own identity for). Built whenever EITHER
+        // --gateway-command-addr OR --gateway-cluster-addr is set — the
+        // latter alone is a valid multi-cluster-only configuration with no
+        // default/legacy address (GatewayMgmtStubPool handles an empty
+        // default_address correctly, see its constructor).
+        if (!cfg_.gateway_command_address.empty() || !cfg_.gateway_cluster_addresses.empty()) {
             std::shared_ptr<grpc::ChannelCredentials> gw_creds;
             if (cfg_.tls_enabled) {
                 gw_creds = build_gateway_command_credentials();
                 if (!gw_creds)
-                    // fail-closed: leave gw_mgmt_stub_ null → command forwarding off.
-                    spdlog::error("Gateway command forwarding NOT enabled for {} — could not "
-                                  "build mutual-TLS credentials.",
-                                  cfg_.gateway_command_address);
+                    // fail-closed: leave gw_mgmt_pool_ null → command forwarding off.
+                    spdlog::error("Gateway command forwarding NOT enabled — could not build "
+                                  "mutual-TLS credentials.");
             } else {
-                spdlog::warn("Gateway command plane to {} is PLAINTEXT (--no-tls): the command "
-                             "fan-out plane is unauthenticated — keep it on a trusted network.",
-                             cfg_.gateway_command_address);
+                spdlog::warn("Gateway command plane is PLAINTEXT (--no-tls): the command "
+                             "fan-out plane is unauthenticated — keep it on a trusted network.");
                 gw_creds = grpc::InsecureChannelCredentials();
             }
             if (gw_creds) {
-                gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address, gw_creds);
-                gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
-                spdlog::info("Gateway command forwarding enabled: {} ({})",
-                             cfg_.gateway_command_address,
-                             cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+                gw_mgmt_pool_ = std::make_unique<yuzu::server::GatewayMgmtStubPool>(
+                    cfg_.gateway_command_address, cfg_.gateway_cluster_addresses, gw_creds);
+                if (gw_mgmt_pool_->multi_cluster_mode()) {
+                    spdlog::info(
+                        "Gateway command forwarding enabled: multi-cluster mode, {} cluster(s) "
+                        "configured via --gateway-cluster-addr ({})",
+                        gw_mgmt_pool_->known_clusters().size(),
+                        cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+                    if (gateway_service_) {
+                        gateway_service_->set_known_gateway_clusters(
+                            &gw_mgmt_pool_->known_clusters());
+                    }
+                } else {
+                    spdlog::info("Gateway command forwarding enabled: {} ({})",
+                                 cfg_.gateway_command_address,
+                                 cfg_.tls_enabled ? "mutual TLS" : "plaintext");
+                }
             }
         }
 
@@ -7323,20 +8328,17 @@ public:
                 // serve-or-503, it does NOT build). Best-effort: a failure just means
                 // /ca/crl returns 503 until the next revoke republishes.
                 //
-                // WS-3 note (adversarial review CDX-P1-01/K7): this boot-time one-shot
-                // is an AUTOMATIC CRL publish that is deliberately NOT leader-gated —
-                // it runs before the elector is constructed (below), and gating it
-                // would skip the boot CRL on the single-replica deployment (leadership
-                // is acquired asynchronously). It is a SEPARATE call site from WS-10's
-                // classified `ca.publish_crl` background pass (the freshness re-publish
-                // in the health loop, which IS gated). Cross-replica crlNumber-
-                // allocation atomicity for BOTH sites is WS-6's job (durable CRL
-                // numbering); until then a concurrent multi-replica *boot* could race
-                // the number — E6-capped today (single-replica is the only supported
-                // topology). Tracked: #4126 (WS-6).
-                if (!publish_crl())
+                // Deliberately NOT leader-gated (#4126, re-decided in HA WS-6 6.1): it
+                // runs before the elector is constructed (below), and gating it would
+                // skip the boot CRL on a single replica (leadership is acquired
+                // asynchronously). It is safe ungated because publish_crl() allocates
+                // the crlNumber under CaStore::publish_next_crl's cross-replica table
+                // lock: N replicas booting together publish up to N consecutive CRLs,
+                // never a duplicate number — at most N-1 redundant versions, harmless. Distinct from WS-10's
+                // `ca.publish_crl` freshness pass in the health loop, which stays gated.
+                if (!publish_crl(/*background=*/false, /*skipped=*/nullptr, CrlTrigger::Startup))
                     spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
-                                 "the next revocation republishes");
+                                 "the leader's freshness pass or the next revocation republishes");
             }
             // else: nullopt — genuinely no root (operator brought their own certs) —
             // no signer/recognizer/revocation-checker wiring, same as before.
@@ -7344,6 +8346,12 @@ public:
 
         grpc::EnableDefaultHealthCheckService(true);
 
+        // KEEP IN SYNC with `gateway_peer::derive_listener_posture` (gateway_peer_resolution.hpp):
+        // the credential choice below (management override, strict default set, reused operator
+        // credentials) is what that function mirrors to decide whether the gateway-upstream
+        // listener has a client CA and runs on the default set. Changing which credentials the
+        // gateway-upstream listener (`mgmt_creds`) uses without changing the function makes the
+        // boot decision describe a listener that no longer exists.
         std::shared_ptr<grpc::ServerCredentials> agent_creds = grpc::InsecureServerCredentials();
         std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
@@ -7406,6 +8414,13 @@ public:
             }
         }
 
+        // Gateway-upstream peer authorization: decide the mode and build the guard
+        // BEFORE the builder exists, so a refusal exits before any port is bound.
+        if (!setup_gateway_peer_guard()) {
+            startup_failed_ = true;
+            return;
+        }
+
         grpc::ServerBuilder builder;
         // ADR-1005 Interim rules (execution-plan PR 1.1): one interceptor on the
         // ONE builder — covers agent, management, and gateway-upstream services
@@ -7453,13 +8468,28 @@ public:
         builder.AddListeningPort(cfg_.listen_address, agent_creds);
         builder.AddListeningPort(cfg_.management_address, mgmt_creds);
         builder.RegisterService(&agent_service_);
+        // ManagementService is a PLACEHOLDER with no RPCs today. When it gains its first real
+        // RPC, put that RPC behind a guard of the GatewayPeerGuardedService kind BEFORE it
+        // answers anything. The descriptor tripwire in
+        // tests/unit/server/test_gateway_peer_guard.cpp already covers this service: it fails
+        // if a method appears or if an unauthenticated call is not refused.
         builder.RegisterService(&mgmt_service_);
 
         if (gateway_service_) {
+            if (!gateway_peer_guard_) {
+                spdlog::error("gateway peer authorization: no guard was built; refusing to "
+                              "register the gateway-upstream service unguarded");
+                startup_failed_ = true;
+                return;
+            }
             // Gateway upstream uses the same credentials as the management listener
             // (internal traffic, typically mTLS between gateway and server).
             builder.AddListeningPort(cfg_.gateway_upstream_address, mgmt_creds);
-            builder.RegisterService(gateway_service_.get());
+            // REGISTER THE GUARD, NEVER gateway_service_: the guard is the only registration
+            // of the gateway-upstream service. It wraps the inner handler and decides who may
+            // call. tests/test_gateway_peer_registration_lexical.py fails if this site
+            // registers anything else.
+            builder.RegisterService(gateway_peer_guard_.get());
             spdlog::info("Gateway upstream service enabled on {}", cfg_.gateway_upstream_address);
         }
 
@@ -7487,6 +8517,40 @@ public:
         // thread wedged in an uncancellable fetch.
         if (nvd_sync_) {
             nvd_sync_->start();
+        }
+
+        // HA WS-8 (ADR-2002 §12): the runtime "can this replica reach the `yuzu`
+        // primary?" signal for /readyz. Constructed past every fail-closed check
+        // (same #1867 rationale as the NVD thread above), and its FIRST probe runs
+        // SYNCHRONOUSLY here, before start_web_server() binds the listener, so
+        // there is no post-bind `not_yet_probed` 503 window (every libpq wait is
+        // deadline-bounded: a single host at most kConnectDeadline, a host list the
+        // pool's connect_timeout per host address — the same wait as one of the
+        // pool's own connects — plus kQueryDeadline; a host-name lookup is bounded
+        // by the system resolver). A failing first probe does NOT fail boot: the
+        // pool just proved Postgres reachable, so a failure here is a transient
+        // blip or a broken dedicated-connection DSN —
+        // either way /readyz reports it loudly and the node stays out of rotation,
+        // which is the correct posture, rather than refusing to start.
+        if (pg_pool_ && !startup_failed_) {
+            // The raw DSN, not build_coord_dsn's: the probe must connect exactly as
+            // the pool does (same parameters, same connect_timeout default), and
+            // its own client-side deadlines bound every socket wait.
+            pg_reachability_probe_ = PgReachabilityProbe::make_libpq(
+                cfg_.postgres_dsn,
+                PgReachabilityProbe::Observer{.on_failure = [this] {
+                    metrics_.counter("yuzu_server_pg_reachability_probe_failures_total")
+                        .increment();
+                }},
+                std::string(PgReachabilityProbe::kProbeSql), pg_pool_->connect_timeout_s());
+            pg_reachability_probe_->probe_once();
+            const auto v = pg_reachability_probe_->verdict();
+            if (v != pg_reachability::Verdict::Ready) {
+                spdlog::error("[readyz] boot-time Postgres reachability probe failed "
+                              "(pg_reachable={}); /readyz reports not ready until it succeeds",
+                              pg_reachability::reason(v));
+            }
+            pg_reachability_probe_->start();
         }
 
         // WS-3 (ADR-2002 §3/§6/§10): construct the fenced leader elector and start
@@ -7596,22 +8660,23 @@ public:
         start_web_server();
 
         // M/H3 follow-up (2026-07-10 review): start_web_server() can set
-        // startup_failed_ (SCIM boot failure) and return before launching
-        // the web listener, but by this point the agent/management gRPC
-        // listeners are already live (BuildAndStart above). Re-check here,
-        // before spinning up any more threads or reaching
-        // agent_server_->Wait() below, so a SCIM boot failure genuinely
-        // halts the process instead of serving on the gRPC ports with a
-        // broken web/SCIM surface. stop() is safe to call this early — every
-        // thread/store it joins or resets is joinable()/nullptr-guarded, and
-        // it also runs from ~ServerImpl (guarded against double-entry by the
-        // lifecycle_mu_/teardown_complete_ completion barrier — #3007), so calling
-        // it here and letting the destructor run again afterward is a deliberate
-        // no-op the second time (same thread, sequential — not a wait).
+        // startup_failed_ (SCIM boot failure, or #4722 HTTPS cipher-pin
+        // failure) and return before launching the web listener, but by this
+        // point the agent/management gRPC listeners are already live
+        // (BuildAndStart above). Re-check here, before spinning up any more
+        // threads or reaching agent_server_->Wait() below, so a startup
+        // failure genuinely halts the process instead of serving on the gRPC
+        // ports with a broken web/SCIM surface. stop() is safe to call this
+        // early — every thread/store it joins or resets is
+        // joinable()/nullptr-guarded, and it also runs from ~ServerImpl
+        // (guarded against double-entry by the lifecycle_mu_/teardown_complete_
+        // completion barrier — #3007), so calling it here and letting the
+        // destructor run again afterward is a deliberate no-op the second
+        // time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
-                         "(SCIM boot failure); stopping the already-started agent/management "
-                         "gRPC listeners.");
+                         "(SCIM boot failure or HTTPS cipher-pin failure — see the preceding "
+                         "error); stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
         }
@@ -7803,6 +8868,22 @@ public:
                     else
                         metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
                 }
+                // App-usage freshness gauge (Wave 7 PR7.2): same staleness window and
+                // degrade-holds-prior-value/unavailable-counter posture as the
+                // installed_software block above — see its comment for the rationale.
+                if (app_usage_store_) {
+                    constexpr std::int64_t kAppUsageStaleWindowSecs = 2 * 24 * 60 * 60;
+                    const std::int64_t cutoff =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        kAppUsageStaleWindowSecs;
+                    if (auto stale = app_usage_store_->count_stale_agents(cutoff))
+                        metrics_.gauge("yuzu_inventory_stale_agents", {{"source", "app_usage"}})
+                            .set(static_cast<double>(*stale));
+                    else
+                        metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
+                }
                 // #2530 B7 — KEK cluster-state gauges, sampled HERE rather
                 // than from GET /status (a gauge refreshed only on a /status
                 // call would go stale and miss a lock held by another server
@@ -7989,41 +9070,34 @@ public:
                 // eventually serves a CRL past its nextUpdate (external validators
                 // reject an expired CRL), and a failed startup pre-publish would
                 // leave /ca/crl 503 with no self-heal. Re-publish when the latest
-                // CRL is missing or within 24h of nextUpdate. publish_crl()
-                // serialises + bumps the crlNumber; once it runs, nextUpdate jumps
-                // 7 days out so this fires at most ~once/6 days in steady state.
-                if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
-                    // Backoff (steady_clock — immune to NTP jumps): after a failed
-                    // freshness publish, don't retry every tick — wait 5 min so a
-                    // persistent failure (bad CA key) doesn't spam logs + the
-                    // failure counter (gov L1/L5).
+                // CRL is missing or within 24h of nextUpdate; once it runs,
+                // nextUpdate jumps 7 days out so this fires ~once/6 days.
+                //
+                // HA WS-6 6.1 (UP-1): ALSO re-publish when the latest CRL was not
+                // built from the current revoked set — a revoke whose own publish
+                // failed (lock timeout, pool exhaustion) would otherwise stay out of
+                // the served CRL until the nextUpdate window, and retrying the revoke
+                // returns "already revoked" without publishing. The check compares
+                // counts in the database, never timestamps from different replicas'
+                // clocks, so clock skew cannot make it fire repeatedly.
+                // HA WS-6 CRL follow-ups (#4828-#4831): the decision (staleness/self-heal
+                // check), the publish, and the backoff bookkeeping all moved into
+                // CrlPublisher::freshness_tick() — see crl_publisher.hpp's header banner for
+                // #4828 AC4 (this is what makes the self-heal wiring actually unit-testable) and
+                // the WS-3 two-planes rule this split preserves. This site keeps ONLY the two
+                // gate checks below; CrlPublisher itself never touches the leader elector.
+                if (crl_publisher_) {
                     const auto now_steady = std::chrono::steady_clock::now();
-                    if (now_steady >= crl_freshness_retry_after_) {
-                        // nextUpdate is a wall-clock epoch → compare with wall time.
-                        const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
-                        auto latest = ca_store_->latest_crl();
-                        const bool stale =
-                            !latest || (latest->next_update - now_epoch) < 24 * 3600;
-                        if (stale) {
-                            YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly (crlNumber)
-                            // WS-3 3.2: the background freshness re-publish bumps
-                            // crlNumber (a DB single-writer), so gate it to the fenced
-                            // leader — two replicas must not diverge the number. The
-                            // OPERATOR revoke path (ca_routes.cpp) publishes on its own
-                            // plane and is deliberately NOT gated here (two-dispatch-
-                            // planes rule; it carries no background-job assert).
-                            // Numbering correctness itself is WS-6.
-                            if (leader_gate_permits<background_job_class("ca.publish_crl")>(
-                                    leader_elector_.get())) {
-                                if (publish_crl())
-                                    spdlog::info(
-                                        "PKI: CRL re-published for freshness (nextUpdate window)");
-                                else
-                                    crl_freshness_retry_after_ =
-                                        now_steady + std::chrono::minutes(5);
-                            }
-                        }
-                    }
+                    YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly
+                    // WS-3 3.2: only the fenced leader runs this pass, so N replicas
+                    // don't each publish a redundant CRL. Numbering correctness does
+                    // NOT depend on this gate — publish_next_crl's table lock provides
+                    // it (WS-6 6.1). The OPERATOR revoke path (ca_routes.cpp) publishes
+                    // on its own plane and is deliberately NOT gated (two-dispatch-
+                    // planes rule; it carries no background-job assert).
+                    if (leader_gate_permits<background_job_class("ca.publish_crl")>(
+                            leader_elector_.get()))
+                        crl_publisher_->freshness_tick(now_steady);
                 }
                 // UP-1 (Gate 4 unhappy-path, 2026-08-21): build the revoked set ONCE per
                 // tick from a typed serials-only read and ABORT the sweep on a degraded
@@ -8859,6 +9933,8 @@ public:
             .app_perf_daily = app_perf_daily_store_.get(),
             .device_inventory = device_inventory_store_.get(),
             .software_licensing = software_licensing_store_.get(),
+            .app_usage = app_usage_store_.get(),
+            .offline_endpoint = offline_endpoint_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
@@ -8896,14 +9972,58 @@ public:
         spdlog::info("Shutting down server...");
         draining_.store(true, std::memory_order_release);
 
-        // Graceful drain: wait for in-flight executions (up to 30s)
-        if (execution_tracker_) {
-            for (int i = 0; i < 30; ++i) {
-                auto running = execution_tracker_->query_executions({.status = "running"});
-                if (running.empty())
+        // Graceful drain (HA WS-8, ADR-2002 §12): /readyz now answers 503
+        // `draining`; keep the listener open — and every other route serving —
+        // for at least --shutdown-drain-seconds so a load balancer stops routing
+        // here BEFORE the socket closes, and for as long as executions are in
+        // flight (capped at kExecutionDrainCap). Decision + bounds:
+        // shutdown_drain_rules.hpp.
+        {
+            using namespace std::chrono;
+            // The two ROLL-UPS start no new work from here on (RD-1): the catalogue
+            // roll-up is told to stop without a join (an in-flight recompute is
+            // cancelled at its next poll, last-good kept, and joined by stop()); the
+            // app-perf loop watches draining_ itself. Those two are the maintenance
+            // passes whose join can wait out a long statement budget (120s / 60s); a
+            // recompute starting inside the grace would otherwise add that AFTER it.
+            // Other passes are unaffected —
+            // their stops are already bounded (e.g. NVD sync's 5s cancel-then-detach).
+            if (software_catalog_rollup_)
+                software_catalog_rollup_->request_stop();
+            const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
+                                               shutdown_drain::kMaxShutdownDrainSeconds)};
+            if (min_grace.count() > 0) {
+                spdlog::info("Draining: /readyz reports 503; holding the listener open for {}s "
+                             "so load balancers stop routing here (--shutdown-drain-seconds)",
+                             min_grace.count());
+            }
+            const auto drain_start = steady_clock::now();
+            auto last_log = drain_start;
+            for (;;) {
+                const auto elapsed = steady_clock::now() - drain_start;
+                std::size_t running = 0;
+                // Queried every tick, whatever the reachability probe says. Skipping
+                // it while the probe was not Ready (tried in governance round 1) ended
+                // the drain early on a probe false-negative — the probe refused at
+                // max_connections, or a slow probe query — while the pool still
+                // served and executions were still completing (Gate 8 UP-G8-1).
+                // Residual, pre-existing: against a FROZEN primary this pooled query
+                // has no client-side deadline and can overrun the cap.
+                if (execution_tracker_ && elapsed < shutdown_drain::kExecutionDrainCap)
+                    running = execution_tracker_->query_executions({.status = "running"}).size();
+                if (!shutdown_drain::keep_draining(elapsed, min_grace, running > 0))
                     break;
-                spdlog::info("Draining: {} executions in flight, waiting...", running.size());
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (running > 0) {
+                    spdlog::info("Draining: {} executions in flight, waiting...", running);
+                } else if (steady_clock::now() - last_log >= seconds(10)) {
+                    // A countdown, so a long grace does not read as a hang and invite
+                    // the second signal that hard-exits (UP-11).
+                    spdlog::info("Draining: {}s of the {}s grace left",
+                                 duration_cast<seconds>(min_grace - elapsed).count(),
+                                 min_grace.count());
+                    last_log = steady_clock::now();
+                }
+                std::this_thread::sleep_for(seconds(1));
             }
         }
 
@@ -8915,10 +10035,11 @@ public:
         // the server fully live and EVERY route (except /readyz, which
         // already checks draining_ above) admitted and FULLY PROCESSED for
         // the whole cascade's duration, including racing new work against
-        // stores this same function tears down a few lines later. The 30s
-        // execution-drain window above already gives a load balancer a
-        // /readyz-503 grace period before this point, so closing the
-        // listening socket here does not shorten that signal.
+        // stores this same function tears down a few lines later. The drain
+        // wait above is the load balancer's /readyz-503 grace period: it lasts
+        // at least --shutdown-drain-seconds (default 0 — set it for any
+        // LB-fronted deployment), and longer only while executions are in
+        // flight. With neither, the socket closes here immediately.
         //
         // begin_closing() BEFORE web_server_->stop(): flips the shutdown
         // signal the /events, /api/v1/events, and dashboard-executions-
@@ -8976,6 +10097,16 @@ public:
         if (web_server_) {
             web_server_->stop();
         }
+
+        // HA WS-8: stop the Postgres reachability probe's loop thread. Its OBJECT
+        // is deliberately NOT reset here — /readyz handlers already admitted may
+        // still be running until listen() returns (bounded by the web-thread wait
+        // below), and they read the probe's snapshot. The join is normally one
+        // poll slice (~200ms): every libpq wait in the probe observes stop(). Not
+        // bounded by us: a host-name lookup (system resolver timeouts) or a GSSAPI
+        // exchange inside libpq that is in progress when stop() arrives.
+        if (pg_reachability_probe_)
+            pg_reachability_probe_->stop();
 
         // Signal AuthDB's provisional-MFA reaper to stop up front (it is owned
         // inside AuthDB, not a ServerImpl member thread, so it is not in the
@@ -9301,6 +10432,12 @@ public:
         // set_session_store; null it before session_store_ destructs with the
         // rest of this object's members.
         auth_mgr_.set_session_store(nullptr);
+        // #5342: same contract for the credential-change owner (borrows
+        // pg_pool_ + audit_store_, both reset below).
+        auth_mgr_.set_credential_change_owner(nullptr);
+        credential_change_owner_.reset();
+        // #4966: same contract for the borrowed RbacStore (reset further below).
+        auth_mgr_.set_rbac_store(nullptr);
 
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
@@ -9329,6 +10466,24 @@ public:
         // never built these tears down cleanly too.
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
+        // HA WS-5: same discipline as the heartbeat_ingestion_ line above —
+        // registry_ outlives offline_endpoint_store_ (it is torn down much
+        // later, if ever, as part of this object's own member destruction).
+        // Corrected per governance Gate 3 (security-guardian + cpp-safety,
+        // independently, 2026-09-22): this is belt-and-braces, not a claim
+        // of an unresolved reachability gap — every thread class that could
+        // call evaluate_scope()/all_ids() (gRPC handlers via
+        // agent_server_/mgmt_server_->Shutdown(deadline) above; REST/
+        // dashboard/MCP, which share the same httplib worker pool, via
+        // web_thread_.join() a few lines above that; the policy-evaluator
+        // and every other named background thread via their own .join()
+        // calls) is ALREADY drained by this point — cpp-safety traced this
+        // as a genuine happens-before, not a "benign aligned pointer store"
+        // — matching the #2703/#3495 precedent this same stop() sequence
+        // already documents elsewhere. Nulled anyway, matching every sibling
+        // raw-pointer null-out in this block (execution_tracker_,
+        // blast_radius_detector, cert callbacks, session_store).
+        registry_.configure_presence(nullptr, cfg_.session_timeout);
         offline_endpoint_store_.reset();
         // #3425: same discipline — null the heartbeat-side caller of
         // quarantine_reconciler_ before dropping the object it calls into.
@@ -9440,6 +10595,11 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_licensing_store(nullptr);
         software_licensing_store_.reset();
+        // Per-agent app-usage store (Wave 7 PR7.2): same discipline.
+        agent_service_.set_app_usage_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_app_usage_store(nullptr);
+        app_usage_store_.reset();
         // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
         // and dereference this store only at request time; the gRPC + HTTP drains
         // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
@@ -9516,6 +10676,7 @@ public:
         agent_service_.set_guaranteed_state_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_guaranteed_state_store(nullptr);
+        dex_app_version_failures_owner_.reset();
         guaranteed_state_store_.reset();
         // RbacStore (authorization substrate, ADR-0041) borrows pg_pool_ — drop
         // before the pool. Every HTTP/gRPC/MCP handler holding the raw pointer is
@@ -9676,6 +10837,17 @@ public:
         // outcome - cpp-safety Gate 8: destruction order puts metrics_
         // strictly after the pre-existing capture targets, so its dangle
         // window is a subset of theirs; same envelope, not widened).
+        //
+        // HA WS-4 4.3 (cpp-safety Gate 3, pre-push): #3279's reach set also
+        // now includes a raw `Stub*` resolved from gw_mgmt_pool_
+        // (GatewayMgmtStubPool::resolve(), captured per-command into the same
+        // forward_gateway_pending() detached thread). Unlike metrics_ above,
+        // this one is NOT a subset-of-existing-envelope case — see the
+        // gw_mgmt_pool_.reset() call site (immediately before pg_pool_.reset()
+        // below) for why it was deliberately placed as late as practical in
+        // this function rather than mirrored next to gateway_route_store_'s
+        // reset, and why that placement restores parity with, rather than
+        // widening, the pre-4.3 timing.
         //
         // On timeout: escalate via std::_Exit, the SAME choice web_thread_
         // makes a few hundred lines up, and for the identical reason - NOT
@@ -9875,6 +11047,17 @@ public:
         if (offload_secret_codec_)
             offload_secret_codec_->set_audit_hook({});
         offload_secret_codec_.reset();
+        // CrlPublisher (HA WS-6 CRL follow-ups) borrows auth_key_provider_, audit_store_
+        // AND ca_store_ by raw pointer (its Deps struct) — reset it HERE, before any of
+        // those three, per the exact ordering discipline the RuntimeConfigStore comment
+        // above already states: every borrower of auth_key_provider_ must be reset before
+        // auth_key_provider_ itself, never left to dangle across the interval to this
+        // struct's own member-destruction order. Unreachable today only because every
+        // caller (health thread joined above, web thread joined above, boot pre-publish
+        // on main) is provably dead by this point — not because the ordering would
+        // otherwise be safe. ca_store_ itself resets later, below; that's fine, this only
+        // needs to run before auth_key_provider_/audit_store_.
+        crl_publisher_.reset();
         auth_key_provider_.reset();
         audit_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
@@ -9952,6 +11135,42 @@ public:
         ca_store_.reset();
         // RuntimeConfigStore/runtime_config_secret_codec_ already reset above,
         // before auth_key_provider_ (the codec borrows it) — see that comment.
+        //
+        // HA WS-4 4.3 (Gate 2 security-guardian finding, pre-push): gw_mgmt_pool_
+        // is deliberately reset HERE — the latest practical point in stop(), not
+        // alongside gateway_route_store_ above (where it originally sat, mirroring
+        // that store's own reset). The mirror was WRONG for this resource: unlike
+        // gateway_route_store_ (read only from gRPC handler threads that
+        // mgmt_server_->Shutdown(deadline) has already drained by that point),
+        // gw_mgmt_pool_ is also read by forward_gateway_pending()'s DETACHED,
+        // UNTRACKED std::thread(...).detach() workers (#3279 — see that comment
+        // block above response_store_.reset()/notification_store_.reset(), which
+        // this same untracked-thread class already reaches). Placing the reset
+        // where gateway_route_store_'s sits would free the pool's channels/stubs
+        // up to ~60s+ EARLIER than the pre-4.3 code ever did (the old single
+        // gw_mgmt_stub_/gw_mgmt_channel_ pair was never explicitly reset in stop()
+        // at all — it lived until IMPLICIT member destruction, which only runs
+        // after this entire function returns) — a real widening of #3279's
+        // existing UAF window, not a no-op relocation. Moving the reset here,
+        // after every other quiesce/drain this function performs, does not CLOSE
+        // #3279 (that fix is join/drain forward_gateway_pending()'s workers,
+        // tracked there).
+        //
+        // pr-rev correction (FortitudeEtc/Codex+Kimi, SHOULD 5): an earlier
+        // version of this comment claimed this placement "restores parity
+        // with the pre-4.3 timing" — that overstates it. gw_mgmt_pool_ is
+        // STILL explicitly reset here, INSIDE stop(), which is still
+        // strictly earlier than the pre-4.3 baseline (implicit member
+        // destruction, which ran only after this entire function RETURNED —
+        // i.e. after even this line). The honest claim: this is the LATEST
+        // PRACTICAL point achievable inside stop() itself, which narrows
+        // #3279's window as far as an explicit in-function reset can, but
+        // does not fully match — let alone restore — the old timing. Fully
+        // closing the gap needs #3279's actual fix (join/drain the detached
+        // workers before any reset), not a reordering within this function.
+        if (gateway_service_)
+            gateway_service_->set_known_gateway_clusters(nullptr);
+        gw_mgmt_pool_.reset();
         pg_pool_.reset();
 
         // ONLY on full completion — a path above that escalates via std::_Exit(1)
@@ -9969,60 +11188,11 @@ private:
                           const std::filesystem::path& key_path,
                           const std::filesystem::path& ca_path, bool insecure_skip_client_verify,
                           bool require_client_cert, std::string_view listener_name) const {
-        if (cert_path.empty() || key_path.empty()) {
-            spdlog::error("{} TLS requires certificate and key", listener_name);
-            return nullptr;
-        }
-
-        if (!detail::validate_key_file_permissions(key_path, listener_name)) {
-            return nullptr;
-        }
-
-        auto cert = detail::read_file_contents(cert_path);
-        auto key = detail::read_file_contents(key_path);
-        if (cert.empty() || key.empty()) {
-            spdlog::error("Failed to read {} TLS cert/key files", listener_name);
-            return nullptr;
-        }
-
-        grpc::SslServerCredentialsOptions ssl_opts;
-        grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
-        key_cert.private_key = std::move(key);
-        key_cert.cert_chain = std::move(cert);
-        ssl_opts.pem_key_cert_pairs.push_back(std::move(key_cert));
-
-        if (!ca_path.empty()) {
-            auto ca = detail::read_file_contents(ca_path);
-            if (ca.empty()) {
-                spdlog::error("Failed to read {} CA cert from {}", listener_name, ca_path.string());
-                return nullptr;
-            }
-
-            ssl_opts.pem_root_certs = std::move(ca);
-            // Under built-in default certs the agent has no client cert yet
-            // (per-agent issuance is PR3): REQUEST + VERIFY if presented, but do
-            // NOT REQUIRE — otherwise no agent could connect. Operator-provided
-            // certs keep the strict REQUIRE posture.
-            ssl_opts.client_certificate_request =
-                require_client_cert ? GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY
-                                    : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
-        } else {
-            if (!insecure_skip_client_verify) {
-                spdlog::error("{} TLS requires --ca-cert (or enable "
-                              "--insecure-skip-client-verify with YUZU_ALLOW_INSECURE_TLS=1)",
-                              listener_name);
-                return nullptr;
-            }
-            spdlog::warn("{} TLS running without client certificate verification "
-                         "(--insecure-skip-client-verify)",
-                         listener_name);
-        }
-
-        auto creds = grpc::SslServerCredentials(ssl_opts);
-        for (auto& kc : ssl_opts.pem_key_cert_pairs) {
-            yuzu::secure_zero(kc.private_key);
-        }
-        return creds;
+        // #4722: moved to grpc_tls_credentials.cpp (yuzu::server::detail) so the
+        // real-handshake test suite can drive the production builder directly.
+        return detail::build_server_tls_credentials(cert_path, key_path, ca_path,
+                                                     insecure_skip_client_verify,
+                                                     require_client_cert, listener_name);
     }
 
     // HIGH-2 (#1314): mutual-TLS client credentials for the server→gateway command
@@ -10056,42 +11226,13 @@ private:
     // Residual (tracked on #1422): no CRL/OCSP check on this path yet, so a
     // revoked-but-stolen SERVER leaf still passes until rotation; and
     // through-gateway operator identity stays app-layer.
+    // #4722: body moved to grpc_tls_credentials.cpp (yuzu::server::detail);
+    // see that header for the full #1314/#1422 narrative.
     [[nodiscard]] std::shared_ptr<grpc::ChannelCredentials>
     build_gateway_command_credentials() const {
-        if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
-            spdlog::error("Gateway command plane: TLS is enabled but the server has no "
-                          "client cert/key to present for mutual TLS — command forwarding "
-                          "DISABLED (fail-closed). Provide server certs or --no-tls.");
-            return nullptr;
-        }
-        if (cfg_.tls_ca_cert.empty()) {
-            spdlog::error("Gateway command plane: TLS is enabled but no CA cert is configured "
-                          "to verify the gateway — command forwarding DISABLED (fail-closed).");
-            return nullptr;
-        }
-        if (!detail::validate_key_file_permissions(cfg_.tls_server_key, "Gateway command plane")) {
-            return nullptr;
-        }
-        grpc::SslCredentialsOptions ssl_opts;
-        ssl_opts.pem_root_certs = detail::read_file_contents(cfg_.tls_ca_cert);
-        ssl_opts.pem_cert_chain = detail::read_file_contents(cfg_.tls_server_cert);
-        ssl_opts.pem_private_key = detail::read_file_contents(cfg_.tls_server_key);
-        if (ssl_opts.pem_root_certs.empty() || ssl_opts.pem_cert_chain.empty() ||
-            ssl_opts.pem_private_key.empty()) {
-            spdlog::error("Gateway command plane: failed to read CA/cert/key for mutual TLS — "
-                          "command forwarding DISABLED (fail-closed).");
-            yuzu::secure_zero(ssl_opts.pem_private_key);
-            return nullptr;
-        }
-        auto creds = grpc::SslCredentials(ssl_opts);
-        // Scrub all three PEM buffers from the local copy (#1314 L-1): the private
-        // key is the sensitive one, the CA/cert are public, but zeroing all three
-        // matches the KeyZeroGuard hygiene used elsewhere and leaves no cert
-        // metadata resident longer than needed.
-        yuzu::secure_zero(ssl_opts.pem_private_key);
-        yuzu::secure_zero(ssl_opts.pem_cert_chain);
-        yuzu::secure_zero(ssl_opts.pem_root_certs);
-        return creds;
+        return detail::build_mtls_client_credentials(cfg_.tls_ca_cert, cfg_.tls_server_cert,
+                                                      cfg_.tls_server_key,
+                                                      "Gateway command plane");
     }
 
     // -- PKI PR3: per-agent client-cert issuance + revocation ------------------
@@ -10779,98 +11920,23 @@ private:
         return !serial.empty() && revoked_serials.contains(serial);
     }
 
-    /// PKI PR4: build + record a new CRL version over the current revoked set,
-    /// signed by the CA, and return its DER. Backs GET /api/v1/ca/crl (served from
-    /// the recorded latest, DoS-safe) and is called by POST /api/v1/ca/revoke to
-    /// republish. Loads the CA key transiently + zeroes it (RAII). nullopt on no
-    /// CA / load / sign failure.
-    std::optional<std::vector<std::uint8_t>> publish_crl() {
-        // Serialise number-allocation + record so the crlNumber stays monotonic
-        // under concurrent publishers (gov architect SHOULD).
-        std::lock_guard<std::mutex> publish_lock(crl_publish_mu_);
-        if (!ca_store_ || !ca_store_->is_open())
-            return std::nullopt;
-        auto root_or_err = ca_store_->get_root();
-        if (!root_or_err) {
-            spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
-                          root_or_err.error());
-            return std::nullopt;
-        }
-        auto& root = *root_or_err;
-        if (!root)
-            return std::nullopt;
-        const std::filesystem::path dir =
-            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
-        FileKeyProvider kp(dir);
-        auto ca_key = kp.load_key(root->key_ref);
-        if (!ca_key) {
-            spdlog::error("PKI: cannot load CA issuing key — CRL not published");
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        detail::ScopedKeyZero ca_key_zero{*ca_key};
-
-        auto revoked_or_err = ca_store_->list_revoked();
-        if (!revoked_or_err) {
-            // ADR-0036/ADR-0053: never build a CRL over a possibly-incomplete revoked set — a
-            // degraded read here would publish a CRL that silently un-revokes every real
-            // revocation in every cache that trusts it. Abort the whole publish instead.
-            spdlog::error("PKI: CRL publish aborted — list_revoked failed: {}",
-                          revoked_or_err.error());
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        std::vector<pki::CrlRevocation> revoked;
-        for (const auto& r : *revoked_or_err) {
-            revoked.push_back(
-                {r.serial_hex,
-                 std::chrono::system_clock::time_point{std::chrono::seconds{r.revoked_at}}});
-        }
-        const auto now = std::chrono::system_clock::now();
-        const pki::Validity validity{now, now + std::chrono::hours(24 * 7)}; // 7-day nextUpdate
-        auto number_or_err = ca_store_->next_crl_number();
-        if (!number_or_err) {
-            // ADR-0053: never substitute a default number on error — see next_crl_number()'s
-            // doc comment for why the pre-migration "silently return 1" default is unsafe here.
-            spdlog::error("PKI: CRL publish aborted — next_crl_number failed: {}",
-                          number_or_err.error());
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        const std::uint64_t number = *number_or_err;
-        auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
-        if (!der) {
-            spdlog::error("PKI: build_crl failed");
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        CrlVersionRecord rec;
-        rec.version = static_cast<int64_t>(number);
-        rec.der = *der;
-        rec.this_update =
-            std::chrono::duration_cast<std::chrono::seconds>(validity.not_before.time_since_epoch())
-                .count();
-        rec.next_update =
-            std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
-                .count();
-        // #1296: stamp the signing CA's identity on the CRL row — the issuance-time
-        // cert fingerprint plus the STABLE key id (invariant across a subordinate
-        // re-key) so the CRL history is attributable to the key, not just a cert.
-        rec.issuer_fingerprint = root->fingerprint_sha256;
-        if (auto kid = pki::issuer_key_id(root->cert_pem))
-            rec.issuer_key_id = *kid;
-        if (!ca_store_->record_crl(rec)) {
-            // B-1 (#1240): do NOT report success on a persistence failure. Returning
-            // the freshly-built DER here would make the revoke handler audit
-            // ca.crl.published/success and set crl_republished:true while /ca/crl
-            // keeps serving the PREVIOUS CRL (missing the just-revoked serial) — a
-            // false success that also evades the stale-CRL alert. Fail honestly so
-            // the caller reports crl_republished:false and the failure audit fires.
-            spdlog::error("PKI: failed to record CRL v{} — reporting publish failure", number);
-            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
-            return std::nullopt;
-        }
-        return der;
+    /// PKI PR4 / HA WS-6 CRL follow-ups (#4828-#4831): build + record a new CRL version over the
+    /// current revoked set, signed by the CA, and return its DER. Backs GET /api/v1/ca/crl
+    /// (served from the recorded latest, DoS-safe) and is called by POST /api/v1/ca/revoke to
+    /// republish. `background` = the freshness pass (skip-not-queue on Busy, `*skipped` set on
+    /// skip). A thin forwarding wrapper — the real logic (key load/zero, the builder, the
+    /// retry-on-RootChanged loop, the failure counter, the system-principal audit write) lives in
+    /// `crl_publisher_` (crl_publisher.hpp), extracted so it's independently unit-testable (no
+    /// test in this suite ever constructs a `ServerImpl`). `trigger` defaults to `Operator`
+    /// because every existing caller of this exact signature (ca_routes_'s and mcp_server_'s
+    /// `PublishCrlFn` closures below) is a route/tool handler that already writes its own
+    /// `ca.crl.published` audit row via its own `audit_fn` call — only the boot pre-publish above
+    /// passes a different trigger explicitly.
+    std::optional<std::vector<std::uint8_t>> publish_crl(bool background = false,
+                                                         bool* skipped = nullptr,
+                                                         CrlTrigger trigger = CrlTrigger::Operator) {
+        return crl_publisher_ ? crl_publisher_->publish(background, skipped, trigger)
+                              : std::nullopt;
     }
 
     // -- Web server -----------------------------------------------------------
@@ -11044,6 +12110,21 @@ private:
         auto result = auth_routes_->require_fleet_read(req, res, securable_type, operation);
         if (!result)
             return {}; // admitted=false, res already written
+        return {true, result->visible_for_query()};
+    }
+
+    /// `require_fleet_read` for the Dashboard panel fragments: the same decision and scope, with
+    /// the denial row withheld (`AuthRoutes::probe_fleet_read`), so a Viewer's page load does not
+    /// fill the audit log. A refused account is shown a note instead of the figure, and a direct
+    /// request to a panel URL by a refused account likewise leaves no denial row (the PR #5859
+    /// review's ask). Not for a route whose denial must stay on the audit record.
+    yuzu::server::authz::FleetReadGate probe_fleet_read(const httplib::Request& req,
+                                                         httplib::Response& res,
+                                                         const std::string& securable_type,
+                                                         const std::string& operation) {
+        auto result = auth_routes_->probe_fleet_read(req, res, securable_type, operation);
+        if (!result)
+            return {};
         return {true, result->visible_for_query()};
     }
 
@@ -11247,6 +12328,24 @@ private:
     /// sites (only the reconcile path metered anything, and only its success).
     /// `sent` means the registry accepted the frame — for a gateway-attached
     /// agent `send_to` only QUEUES it, so this is acceptance, never delivery.
+    ///
+    /// HA WS-5 KNOWN LIMITATION (external review, 2026-09-22, accepted —
+    /// not fixed this slice): callers (Guardian rule push, TAR fleet
+    /// snapshot) can select a target `agent_id` from a presence-widened
+    /// candidate set (`AgentRegistry::all_ids()`/`evaluate_scope()`), but
+    /// this helper calls `registry_.send_to` directly with NO
+    /// `GatewayRouteFallback` directory consult — a presence-only
+    /// (cross-replica) target is always `undelivered` here, never queued via
+    /// the directory the way the 3 real `ConfinedDispatchSink` sites do.
+    /// Deliberately NOT treated as blocking: the failure is COUNTED (never
+    /// swallowed — see the metric below), and both callers' own
+    /// heartbeat-reconcile paths compare the same durable policy-generation
+    /// counter on the agent's NEXT heartbeat (wherever it lands), so this
+    /// self-heals rather than leaving a device silently unenforced
+    /// indefinitely. Fixing it properly needs the same "batch-prepare the
+    /// fallback BEFORE the per-id loop" restructuring every other consult in
+    /// this codebase uses — out of scope for a single-id helper; tracked as
+    /// a follow-up, not filed as a separate issue this round.
     [[nodiscard]] bool send_system_reserved(const std::string& agent_id,
                                             const detail::ClassifiedCommand& cmd,
                                             yuzu::server::SystemReservedPush push) {
@@ -11336,16 +12435,18 @@ private:
         // exists. `action_allowed` is fail-closed by contract — a closed store, a
         // lease timeout or a query failure all return false — so a degraded
         // config store disables the action rather than silently permitting it
-        // (ADR-0036). It is checked on EVERY dispatch and never memoized: an
-        // emergency stop that takes effect on the next cache expiry is not one.
+        // (ADR-0036). It is checked on EVERY dispatch (except a protective pair,
+        // which kill_switch_denial exempts before consulting the store) and never
+        // memoized: an emergency stop that takes effect on the next cache expiry
+        // is not one.
         auto finalized = yuzu::server::detail::finalize_classified_command(
             cap,
             plugin_config_store_ != nullptr
-                ? std::function<bool(std::string_view, std::string_view)>(
+                ? yuzu::server::detail::KillSwitchFn(
                       [this](std::string_view p, std::string_view a) {
-                          return plugin_config_store_->action_allowed(p, a);
+                          return plugin_config_store_->kill_switch_decision(p, a);
                       })
-                : std::function<bool(std::string_view, std::string_view)>{},
+                : yuzu::server::detail::KillSwitchFn{},
             plugin, action, command_id, parameters, payload, stagger_seconds, delay_seconds,
             target_arm, execution_id);
 
@@ -11400,6 +12501,9 @@ private:
             },
             [route_fallback](const std::vector<std::string>& candidates) {
                 return route_fallback->prepare(candidates);
+            },
+            [this](const std::vector<std::string>& candidates) {
+                return registry_.has_remote_presence(candidates);
             }};
     }
 
@@ -11410,8 +12514,9 @@ private:
     ///
     /// The quarantine plugin's OWN control channel is exempted WITHOUT
     /// touching `quarantine_store_` at all: `is_quarantine_control_plugin`
-    /// is pure, so a Postgres outage that fails every other dispatch closed
-    /// cannot also block the one action (release) that would end it.
+    /// (common/include/yuzu/protective_actions.hpp) is pure, so a Postgres
+    /// outage that fails every other dispatch closed cannot also block the one
+    /// action (release) that would end it.
     /// Keyed on the `(plugin, ACTION)` pair against a closed four-action set,
     /// NOT on the plugin name — a fifth action added later arrives gated
     /// rather than inheriting the bypass. See that predicate's own doc
@@ -11759,6 +12864,11 @@ private:
         }
         audit_unknown_plugin_dispatch("dispatch_closure", caller.principal, caller.principal_role,
                                       command_id, plugin, outcome.unknown_plugin_count);
+        audit_kill_switched_os_dispatch("dispatch_closure", caller.principal,
+                                        caller.principal_role, command_id, plugin,
+                                        outcome.kill_switched_os_count);
+        if (outcome.os_gate_unreadable)
+            audit_os_gate_unreadable(caller.principal, caller.principal_role, command_id, plugin);
 
         forward_gateway_pending();
         if (outcome.sent > 0)
@@ -11884,92 +12994,490 @@ private:
         }
     }
 
+    /// #4672: synthesize and apply a terminal FAILURE `CommandResponse` for a
+    /// gateway-forwarded command whose delivery will never otherwise resolve
+    /// (`forward_gateway_pending`'s `unauthenticated` / exhausted
+    /// `unavailable` / `unknown_cluster` / no-legitimate-resolution
+    /// `agent_mismatch` branches — see that function's own comments). Routes
+    /// through `process_gateway_response` — the SAME mechanism every real
+    /// gateway response already takes at this function's other call sites —
+    /// so the command_id resolves via the one established
+    /// `notify_exec_tracker` terminal-write path (executions-history-ladder
+    /// routed concern: exactly once, never a bespoke second mechanism).
+    ///
+    /// STATIC and takes `svc` explicitly (never `this`) ON PURPOSE: every
+    /// call site inside `forward_gateway_pending`'s detached per-command
+    /// thread reaches this through the ALREADY-captured `svc = &agent_service_`
+    /// raw pointer — that thread is `std::thread(...).detach()`ed and,
+    /// per #3279 (see the block a few hundred lines up this file, "KNOWN GAP,
+    /// filed as #3279, NOT fixed here"), is untracked by every shutdown
+    /// drain/quiesce mechanism this server has. #3279's own destruction-order
+    /// analysis is scoped to the raw pointers ALREADY captured there
+    /// (`svc`/`metrics`/the resolved `Stub*`); widening that detached thread's
+    /// reach with a fresh `this` capture — which this synthesis could
+    /// otherwise be tempted to take, to reach `command_outbox_store_`/
+    /// `leader_elector_` for a durable-outbox re-drive — would extend a
+    /// KNOWN, separately-tracked, human-adjudicated lifetime hazard rather
+    /// than closing this issue's own scope. See `forward_gateway_pending`'s
+    /// doc comment for the resulting, deliberate design boundary: every
+    /// branch here resolves IMMEDIATELY rather than rescheduling.
+    static void apply_gateway_forward_terminal_failure(detail::AgentServiceImpl* svc,
+                                                        const std::string& agent_id,
+                                                        const std::string& command_id,
+                                                        const std::string& reason_code,
+                                                        const std::string& detail_msg) {
+        svc->process_gateway_response(
+            agent_id, yuzu::server::build_gateway_forward_terminal_failure(
+                          command_id, reason_code, detail_msg));
+    }
+
     /// Forward any commands queued for gateway-connected agents.
+    ///
+    /// #4672 (durable resolution of the terminal-failure branches — this
+    /// function's own catastrophic-if-violated gap before this change: a
+    /// command hitting `unauthenticated`, exhausted `unavailable`,
+    /// `unknown_cluster`, `agent_mismatch`, or a generic non-UNAVAILABLE
+    /// grpc status ("other") was logged, counted, and dropped — the
+    /// dispatching operator's command_id then NEVER resolved, silently,
+    /// forever). Every one of those FIVE branches (pr-rev finding
+    /// FortitudeEtc/Codex+Kimi, MINOR, 2026-09-22: this comment previously
+    /// said "four", undercounting the pre-existing "other" branch this same
+    /// PR also fixed — see `gateway_mgmt_stub_pool.hpp`'s reason-code list)
+    /// now calls `apply_gateway_forward_terminal_failure` exactly once
+    /// before giving up, gated on `applied_terminal` so a genuinely
+    /// unresolved command_id ALWAYS eventually reaches a terminal state —
+    /// "ALWAYS" describes the per-command retry loop below; the null/empty
+    /// `gw_mgmt_pool_` short-circuit above this function's retry loop, and
+    /// a clean `Finish()` with zero frames (#4691, still open), are the
+    /// two paths outside that loop the same claim must also hold for or be
+    /// scoped around — the former is now resolved through the same helper
+    /// (see that branch's own comment); the latter is not, and is tracked.
+    ///
+    /// DELIBERATELY immediate-terminal, not a durable outbox re-drive, for
+    /// ALL FIVE branches — including the transient-looking exhausted-
+    /// `unavailable` case, which ADR-2002 §7's design note originally
+    /// intended to "stay pending... and be re-driven [with backoff]" the way
+    /// WS-3 3.3's `command_outbox_store`/`command_outbox_delivery` already
+    /// does for `route_unreadable`/`containment_unreadable`. Two independent
+    /// reasons that mechanism cannot be safely reused here without a
+    /// SEPARATE, dedicated change (tracked as a documented follow-up, not
+    /// silently deferred):
+    ///
+    ///   1. GRANULARITY MISMATCH. `command_outbox_store`'s producer API
+    ///      (`claim_and_enqueue`) is epoch-fenced and its ONLY existing
+    ///      producer (`ScheduleRunner`) runs strictly inside a
+    ///      `FencedLeaderOnly`-gated loop (`background_jobs.hpp`) — the whole
+    ///      point of the fence is that only a caller who has ALREADY
+    ///      confirmed leadership calls it. `forward_gateway_pending` is
+    ///      reachable from every replica via ordinary operator-synchronous
+    ///      dispatch (REST/MCP/dashboard), never gated on leadership, so an
+    ///      enqueue attempt here would silently no-op on a non-leader
+    ///      replica (`LeaderElector::epoch()` returns `nullopt` — there is no
+    ///      epoch to embed) — an inconsistent, replica-dependent retry that
+    ///      is worse than today's uniform drop. And `command_outbox_delivery`'s
+    ///      own "sent" means "the confined-dispatch resolution QUEUED it"
+    ///      (`ConfinedDispatchOutcome::sent`), not "the gateway RPC actually
+    ///      completed" — reusing its generic `DispatchFn` path for a
+    ///      redelivery would mark the occurrence `sent`/terminal in the
+    ///      outbox the instant `send_to` re-queues it, racing and swallowing
+    ///      the very gateway failure this redelivery exists to observe.
+    ///
+    ///   2. #3279 (see the KNOWN GAP block documented a few hundred lines up
+    ///      this file). This function's own detached per-command
+    ///      `std::thread(...).detach()` is untracked by every shutdown
+    ///      drain/quiesce mechanism this server has, and its raw-pointer
+    ///      capture list (`svc`, `metrics`, the resolved `Stub*`) is a
+    ///      carefully-scoped, individually-justified exception to that gap —
+    ///      not a precedent to extend. A durable-retry producer would need
+    ///      that thread to ALSO touch `command_outbox_store_`/
+    ///      `leader_elector_`, widening #3279's reach into two more
+    ///      ServerImpl-owned stores with no existing destruction-order
+    ///      analysis covering them. #3279 is explicitly "deferred to Dave to
+    ///      adjudicate" — expanding its blast radius as a side effect of this
+    ///      issue would be scope creep into a separately-tracked, human-owned
+    ///      decision, not a fix for it.
+    ///
+    /// `docs/adr/2002-high-availability-architecture.md` §7 is updated
+    /// alongside this change to describe the gateway-forwarding path
+    /// accurately: immediate terminal resolution today, with the durable
+    /// re-drive this function's comment above describes as a documented,
+    /// scoped-out follow-up (blocked on #3279).
     void forward_gateway_pending() {
         auto gw_pending = registry_.drain_gateway_pending();
-        if (!gw_pending.empty() && gw_mgmt_stub_) {
-            for (auto& gp : gw_pending) {
-                auto* stub = gw_mgmt_stub_.get();
-                auto* svc = &agent_service_;
-                auto* metrics = &metrics_;
-                auto cmd_id = gp.cmd.command_id();
-                spdlog::debug("Forwarding command {} to gateway for agent {}", cmd_id, gp.agent_id);
-                std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id]() {
-                    ::yuzu::server::v1::SendCommandRequest req;
-                    req.add_agent_ids(gp.agent_id);
-                    *req.mutable_command() = gp.cmd;
-                    req.set_timeout_seconds(300);
-
-                    // Retry up to 3 times on transient connection failures
-                    for (int attempt = 0; attempt < 3; ++attempt) {
-                        if (attempt > 0) {
-                            spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
-                                         attempt + 1);
-                            std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
-                        }
-
-                        grpc::ClientContext ctx;
-                        ctx.set_deadline(std::chrono::system_clock::now() +
-                                         std::chrono::seconds(300));
-                        auto reader = stub->SendCommand(&ctx, req);
-
-                        ::yuzu::server::v1::SendCommandResponse resp;
-                        int resp_count = 0;
-                        while (reader->Read(&resp)) {
-                            ++resp_count;
-                            svc->process_gateway_response(resp.agent_id(), resp.response());
-                        }
-                        auto status = reader->Finish();
-                        if (status.ok()) {
-                            spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
-                                          cmd_id, resp_count);
-                            metrics->counter("yuzu_server_gateway_forward_total",
-                                             {{"status", "ok"}})
-                                .increment();
-                            return; // success — done
-                        }
-                        // #1422: the gateway's mgmt-plane peer pin rejects with
-                        // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
-                        // grpc-message when an auth_fun rejects) — the generic
-                        // warn below would render as "failed:  (16)", which is
-                        // invisible as the fleet-wide forwarding outage it
-                        // actually is. Name the cause and the fix.
-                        if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
-                            spdlog::error(
-                                "Gateway SendCommand for {} REJECTED by the gateway's "
-                                "mgmt-plane peer pin (UNAUTHENTICATED): the cert this "
-                                "server presents does not satisfy the gateway's "
-                                "mgmt_peer_pins posture (rotated leaf? BYO cert "
-                                "without repointing the pin, or without the "
-                                "serverAuth EKU?). The gateway log's reason atom "
-                                "names the exact cause. Command forwarding to "
-                                "gateway-connected agents is DOWN until the pin and "
-                                "the server leaf agree. Command dropped.",
-                                cmd_id);
-                            metrics->counter("yuzu_server_gateway_forward_total",
-                                             {{"status", "unauthenticated"}})
-                                .increment();
-                            return; // config defect — retry cannot help
-                        }
-                        // Only retry on UNAVAILABLE (connection refused / not ready)
-                        if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
-                            spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
-                                         status.error_message(),
-                                         static_cast<int>(status.error_code()));
-                            metrics->counter("yuzu_server_gateway_forward_total",
-                                             {{"status", "other"}})
-                                .increment();
-                            return; // non-transient error — don't retry
-                        }
-                        spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
-                                     cmd_id, attempt + 1, status.error_message());
-                    }
-                    spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
-                    metrics->counter("yuzu_server_gateway_forward_total",
-                                     {{"status", "unavailable"}})
-                        .increment();
-                }).detach();
+        if (gw_pending.empty())
+            return;
+        if (!gw_mgmt_pool_ || gw_mgmt_pool_->empty()) {
+            // unhappy-path Gate 4 finding (UP-1): this shape (drain, then
+            // silently drop everything if the pool/stub isn't usable) is
+            // PRE-EXISTING — not introduced by HA WS-4 4.3 — but was already
+            // silent pre-4.3 too (no log, no metric). Gateway command
+            // forwarding being unconfigured at all is the common, silent-by
+            // -design case (no flag set); but gw_mgmt_pool_ null/empty
+            // DESPITE gateway_command_address/gateway_cluster_addresses being
+            // configured means credential construction failed at boot (see
+            // the "Gateway command forwarding NOT enabled" error a few lines
+            // up the constructor) — a real, fleet-wide, otherwise-silent loss
+            // of every gateway-routed command from then on. Surface it here,
+            // once per drain, rather than leaving an operator to notice only
+            // via the absence of expected agent activity.
+            if (!cfg_.gateway_command_address.empty() || !cfg_.gateway_cluster_addresses.empty()) {
+                spdlog::error(
+                    "Gateway command forwarding is CONFIGURED but not usable ({} command(s) "
+                    "just dropped) — see the earlier boot-time error for why "
+                    "(mutual-TLS credential construction likely failed)",
+                    gw_pending.size());
+                metrics_
+                    .counter("yuzu_server_gateway_forward_total",
+                             {{"cluster_id", std::string(yuzu::server::kUnknownGatewayClusterLabel)},
+                              {"status", "unavailable"}})
+                    .increment(static_cast<double>(gw_pending.size()));
+                // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22):
+                // the metric/log above previously left every drained command's
+                // command_id unresolved -- the exact "stuck forever" shape
+                // #4672 exists to close, just reached via a different branch
+                // (an unusable pool/stub rather than a per-command RPC
+                // failure). Resolve each one through the SAME helper the
+                // per-command retry loop below uses, so this path is no
+                // longer a silent exception to the "always reaches a
+                // terminal state" contract.
+                for (auto& gp : gw_pending) {
+                    apply_gateway_forward_terminal_failure(
+                        &agent_service_, gp.agent_id, gp.cmd.command_id(), "gateway_unavailable",
+                        "Gateway command forwarding is configured but not usable "
+                        "(mutual-TLS credential construction likely failed at boot) "
+                        "— command not delivered");
+                }
             }
+            return;
+        }
+        for (auto& gp : gw_pending) {
+            // HA WS-4 4.3: resolve per-command, against the eager pool built
+            // at boot — see GatewayMgmtStubPool's file header for the
+            // two-mode resolution rule (single-cluster mode ignores
+            // gp.cluster_id entirely; multi-cluster mode resolves it, with
+            // an unmapped cluster_id treated as a config defect below,
+            // mirroring the pre-existing UNAUTHENTICATED "retry cannot help"
+            // treatment).
+            auto resolution = gw_mgmt_pool_->resolve(gp.cluster_id);
+            auto cmd_id = gp.cmd.command_id();
+            if (!resolution.stub) {
+                spdlog::error(
+                    "Gateway SendCommand for {} DROPPED: no configured mgmt address for "
+                    "cluster_id '{}' (--gateway-cluster-addr) — command forwarding to this "
+                    "cluster is DOWN until it is added",
+                    cmd_id, gp.cluster_id.value_or("<none>"));
+                metrics_
+                    .counter("yuzu_server_gateway_forward_total",
+                             {{"cluster_id", resolution.label}, {"status", "unknown_cluster"}})
+                    .increment();
+                // #4672: a definite config gap (this cluster_id has no
+                // configured mgmt address AT ALL, resolved deterministically
+                // against boot-time config) — not a degraded read, so this is
+                // the "answered no" case dispatch_confined_arms.hpp's
+                // route_unreadable doc comment distinguishes from "the read
+                // itself could not answer", and not worth a durable backoff
+                // retry: it self-heals only via an operator adding
+                // --gateway-cluster-addr, which time alone does not fix.
+                // Resolve the command_id terminally now rather than leaving
+                // it stuck forever.
+                apply_gateway_forward_terminal_failure(
+                    &agent_service_, gp.agent_id, cmd_id, "gateway_unknown_cluster",
+                    "No configured mgmt address for cluster '" +
+                        gp.cluster_id.value_or("<none>") + "' — command not delivered");
+                continue;
+            }
+            auto* stub = resolution.stub;
+            auto* svc = &agent_service_;
+            auto* metrics = &metrics_;
+            auto expected_agent_id = gp.agent_id;
+            auto cluster_label = resolution.label;
+            spdlog::debug("Forwarding command {} to gateway (cluster '{}') for agent {}", cmd_id,
+                         cluster_label, gp.agent_id);
+            std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id, expected_agent_id,
+                        cluster_label]() {
+                ::yuzu::server::v1::SendCommandRequest req;
+                req.add_agent_ids(gp.agent_id);
+                *req.mutable_command() = gp.cmd;
+                req.set_timeout_seconds(300);
+
+                // #4672 Gate-2/Gate-3 fix (security-guardian HIGH + cpp-safety
+                // BLOCKING, independently confirmed): this MUST live outside
+                // the retry loop, not per-attempt. `process_gateway_response`
+                // is not idempotent — a second terminal write for the same
+                // command_id is a silent tracker overwrite plus a duplicate
+                // response_store row, not a safe no-op. A real terminal frame
+                // can be legitimately applied in one attempt (e.g. `Read()`
+                // delivers it) and THAT SAME attempt's `Finish()` can still
+                // report a transport-level non-OK status (stream fault after
+                // the last frame, before a clean close) or an earlier attempt
+                // can apply a response while a LATER attempt independently
+                // hits UNAUTHENTICATED/other/exhausted-UNAVAILABLE. Every
+                // synthesizing call site below must be gated on this,
+                // cumulative across the whole command's attempts — only the
+                // `agent_mismatch` site (status.ok() branch) was gated
+                // before this fix; the other three (UNAUTHENTICATED, the
+                // generic "other" branch, and exhausted-retries) were not,
+                // which could clobber an already-applied real SUCCESS/FAILURE
+                // with a synthetic FAILURE — a worse defect than the
+                // stuck-forever bug this issue set out to close.
+                bool applied_terminal = false;
+
+                // Retry up to 3 times on transient connection failures
+                for (int attempt = 0; attempt < 3; ++attempt) {
+                    if (attempt > 0) {
+                        spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
+                                     attempt + 1);
+                        std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
+                    }
+
+                    grpc::ClientContext ctx;
+                    ctx.set_deadline(std::chrono::system_clock::now() +
+                                     std::chrono::seconds(300));
+                    auto reader = stub->SendCommand(&ctx, req);
+
+                    ::yuzu::server::v1::SendCommandResponse resp;
+                    int resp_count = 0;
+                    // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD 1):
+                    // Finish() still returns OK regardless of what the
+                    // stream's individual responses classified as, so a
+                    // not_connected/agent_mismatch response was ALSO
+                    // counted "ok" below unconditionally — a misconfigured
+                    // cluster read as a healthy ok rate for commands that
+                    // never ran, contradicting gateway_mgmt_stub_pool.hpp's
+                    // own "instead of / rather than ok" doc claim for both
+                    // outcomes. Track whether this attempt saw a non-apply
+                    // outcome and gate the terminal "ok" increment on it.
+                    bool saw_non_apply = false;
+                    while (reader->Read(&resp)) {
+                        ++resp_count;
+                        // HA WS-4 4.3: classification is a pure function
+                        // (gateway_mgmt_stub_pool.hpp) — see its doc comment
+                        // for the two Fable pre-implementation review
+                        // findings (6a agent-mismatch/forgery, 1a
+                        // not_connected) it implements.
+                        auto outcome = yuzu::server::classify_gateway_forward_response(
+                            resp, expected_agent_id);
+                        if (outcome == yuzu::server::GatewayForwardOutcome::kAgentMismatch) {
+                            saw_non_apply = true;
+                            spdlog::error(
+                                "Gateway SendCommand for {} received a response for agent "
+                                "'{}' but this request targeted '{}' — REFUSING to apply it "
+                                "(possible cross-cluster response forgery)",
+                                cmd_id, resp.agent_id(), expected_agent_id);
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "agent_mismatch"}})
+                                .increment();
+                            continue;
+                        }
+                        if (outcome == yuzu::server::GatewayForwardOutcome::kNotConnected) {
+                            saw_non_apply = true;
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "not_connected"}})
+                                .increment();
+                            // pr-rev finding (FortitudeEtc/Codex+Kimi, SHOULD
+                            // 4, "mixed-version correlation"): a gateway
+                            // still running a PRE-4.3 build (rolling
+                            // upgrade window) sends this same not_connected
+                            // shape with command_id == "" — the Erlang fix
+                            // (yuzu_gw_mgmt_service.erl's stream_responses/3)
+                            // only threads the real id through a build that
+                            // HAS it. Core already knows the real command_id
+                            // (cmd_id, from the request it sent) regardless
+                            // of gateway version — repair the response
+                            // before it reaches process_gateway_response so
+                            // execution-tracker correlation works
+                            // independent of which gateway build answered.
+                            if (resp.response().command_id().empty()) {
+                                auto repaired = resp.response();
+                                repaired.set_command_id(cmd_id);
+                                svc->process_gateway_response(resp.agent_id(), repaired);
+                                // kNotConnected's classify_gateway_forward_response
+                                // contract guarantees this repaired frame is ALWAYS
+                                // FAILURE (exit_code=-1, output="not_connected"/
+                                // "agent_disconnected") -- unconditionally terminal,
+                                // safe to mark without a status() check.
+                                applied_terminal = true;
+                                continue;
+                            }
+                        }
+                        // pr-rev finding (FortitudeEtc/Codex+Kimi, BLOCKER,
+                        // 2026-09-22, empirically confirmed by both
+                        // reviewers independently): a kApply frame is NOT
+                        // guaranteed terminal -- `process_gateway_response`
+                        // also accepts a RUNNING progress frame. The
+                        // previous unconditional `applied_terminal = true`
+                        // here meant a single RUNNING frame, followed by a
+                        // stream fault and exhausted retries, permanently
+                        // suppressed every synthetic terminal-failure site
+                        // below (all four gate on `!applied_terminal`) --
+                        // the command_id stayed RUNNING forever, exactly
+                        // the bug #4672 exists to close, reintroduced via
+                        // this guard's own over-broad predicate. Only a
+                        // TERMINAL status (anything but RUNNING) may
+                        // suppress the synthetic-failure sites; a RUNNING
+                        // frame is real progress, not a resolution.
+                        svc->process_gateway_response(resp.agent_id(), resp.response());
+                        if (yuzu::server::is_terminal_command_status(resp.response().status()))
+                            applied_terminal = true;
+                    }
+                    auto status = reader->Finish();
+                    if (status.ok()) {
+                        spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
+                                      cmd_id, resp_count);
+                        // Retrying cannot help either outcome any more than
+                        // it could the pre-existing UNAUTHENTICATED branch
+                        // below (not_connected/agent_mismatch are not
+                        // transient) — still return (no retry) regardless
+                        // of saw_non_apply, just don't ALSO claim "ok".
+                        if (!saw_non_apply) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label}, {"status", "ok"}})
+                                .increment();
+                        } else if (!applied_terminal) {
+                            // #4672: every frame this stream carried (if any)
+                            // was agent_mismatch — never not_connected/apply,
+                            // both of which already resolve the command_id
+                            // above. Nothing legitimate ever answered for
+                            // OUR agent. Treated as a security-relevant
+                            // anomaly (possible cross-cluster response
+                            // forgery / stale cluster resolution), not a
+                            // transient condition worth retrying — resolve
+                            // now rather than leaving the command_id stuck.
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_agent_mismatch",
+                                "Gateway forwarding produced no legitimate response for this "
+                                "agent (agent mismatch) — command not delivered");
+                        }
+                        return; // success — done
+                    }
+                    // #1422: the gateway's mgmt-plane peer pin rejects with
+                    // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
+                    // grpc-message when an auth_fun rejects) — the generic
+                    // warn below would render as "failed:  (16)", which is
+                    // invisible as the fleet-wide forwarding outage it
+                    // actually is. Name the cause and the fix.
+                    if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
+                        spdlog::error(
+                            "Gateway SendCommand for {} REJECTED by the gateway's "
+                            "mgmt-plane peer pin (UNAUTHENTICATED): the cert this "
+                            "server presents does not satisfy the gateway's "
+                            "mgmt_peer_pins posture (rotated leaf? BYO cert "
+                            "without repointing the pin, or without the "
+                            "serverAuth EKU?). The gateway log's reason atom "
+                            "names the exact cause. Command forwarding to "
+                            "gateway-connected agents is DOWN until the pin and "
+                            "the server leaf agree. Command dropped.",
+                            cmd_id);
+                        // #4672 (fixed post-Gate-2/3: security-guardian HIGH
+                        // + cpp-safety/cpp-expert independently confirmed) —
+                        // gate on `applied_terminal`: an earlier attempt, or
+                        // this same attempt's `Read()` loop, may already have
+                        // applied a real terminal frame before `Finish()`
+                        // surfaced this UNAUTHENTICATED status. Synthesizing
+                        // here anyway would silently overwrite that real
+                        // result (tracker last-write-wins) and insert a
+                        // duplicate response_store row.
+                        //
+                        // Gate 4 happy-path SHOULD (2026-09-21): the metric
+                        // increment is gated TOO, symmetric with the write —
+                        // a command that already resolved SUCCESS on an
+                        // earlier attempt must not also bump
+                        // {"status","unauthenticated"} on a later attempt's
+                        // Finish(), which would tell an operator a command
+                        // failed when it actually succeeded.
+                        if (!applied_terminal) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label},
+                                          {"status", "unauthenticated"}})
+                                .increment();
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_unauthenticated",
+                                "Gateway REJECTED by the gateway's mgmt-plane peer pin "
+                                "(UNAUTHENTICATED) — command not delivered");
+                        }
+                        return; // config defect — retry cannot help
+                    }
+                    // Only retry on UNAVAILABLE (connection refused / not ready)
+                    if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
+                        spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
+                                     status.error_message(),
+                                     static_cast<int>(status.error_code()));
+                        // #4672: same "resolve now, don't leave the
+                        // command_id stuck" posture as every other terminal
+                        // branch here — this one is not among the issue's
+                        // four named branches, but the shape (and the fix)
+                        // is identical, and leaving it unresolved while every
+                        // sibling branch resolves would just move the bug
+                        // rather than close it. Same `applied_terminal` guard
+                        // (write AND metric, see the UNAUTHENTICATED branch
+                        // above) as every other branch here.
+                        //
+                        // Gate 4 consistency-auditor SHOULD (2026-09-21): the
+                        // metric label ("other") intentionally does NOT match
+                        // the reason code ("gateway_forward_failed") below —
+                        // this branch covers every non-UNAVAILABLE grpc
+                        // status OTHER than UNAUTHENTICATED (which has its
+                        // own label/code pair above), so "other" is the
+                        // correct, deliberately generic metric bucket for a
+                        // more specific, per-occurrence reason code. Every
+                        // other branch's label and code DO match 1:1; this is
+                        // the one deliberate exception.
+                        if (!applied_terminal) {
+                            metrics
+                                ->counter("yuzu_server_gateway_forward_total",
+                                         {{"cluster_id", cluster_label}, {"status", "other"}})
+                                .increment();
+                            // pr-rev finding (FortitudeEtc/Codex+Kimi, MINOR,
+                            // 2026-09-22): the raw status.error_message()
+                            // (peer addresses, TLS/HTTP2 transport text) is
+                            // already captured, unfiltered, in the spdlog::warn
+                            // a few lines up — the other four synthesis sites
+                            // all use a curated, static message; match that
+                            // convention here instead of persisting raw
+                            // transport text into error_detail. The numeric
+                            // grpc status code (already logged above too) is
+                            // enough to correlate a stored row back to the
+                            // server log line that has the full text.
+                            apply_gateway_forward_terminal_failure(
+                                svc, expected_agent_id, cmd_id, "gateway_forward_failed",
+                                "Gateway SendCommand RPC failed with grpc status " +
+                                    std::to_string(static_cast<int>(status.error_code())) +
+                                    " — see server logs for the transport error detail");
+                        }
+                        return; // non-transient error — don't retry
+                    }
+                    spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
+                                 cmd_id, attempt + 1, status.error_message());
+                }
+                spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
+                // #4672: retries exhausted (3 attempts, exponential backoff)
+                // — a transient-LOOKING failure that has, for THIS dispatch,
+                // behaved exactly like a permanent one. Resolve the
+                // command_id terminally now. See forward_gateway_pending's
+                // own doc comment for why this is immediate-terminal rather
+                // than a durable outbox re-drive (granularity mismatch +
+                // #3279 — deliberately scoped out, not silently dropped;
+                // tracked as #4690).
+                // Same `applied_terminal` guard (write AND metric) as the two
+                // branches above — an earlier attempt in this same 3-try
+                // loop may have already applied a real terminal frame before
+                // a later attempt exhausted on UNAVAILABLE.
+                if (!applied_terminal) {
+                    metrics
+                        ->counter("yuzu_server_gateway_forward_total",
+                                 {{"cluster_id", cluster_label}, {"status", "unavailable"}})
+                        .increment();
+                    apply_gateway_forward_terminal_failure(
+                        svc, expected_agent_id, cmd_id, "gateway_unavailable",
+                        "Gateway unreachable after 3 attempts — command not delivered");
+                }
+            }).detach();
         }
     }
 
@@ -12082,15 +13590,21 @@ private:
     // 2026-07-26 hardening round B4: distinct audit + metric for a WHOLE
     // scope evaluation ABORTING (as opposed to audit_scope_resolution_failed's
     // per-ref "not found/not owned" forensic row above). Fires when
-    // AgentRegistry::evaluate_scope() returns std::nullopt on a from_result_set:
-    // scope — either the membership preload hit a Postgres error
-    // (reason="db_degraded", ADR-0036) or a from_result_set: atom had no
-    // principal to owner-resolve against (reason="principal_unresolved", B2).
-    // Without this, a dispatch silently reduced to 0 targets by an ABORT is
-    // indistinguishable in telemetry/audit from a genuine "0 agents matched"
-    // (UP-12) — an operator investigating "why did my command reach nobody"
-    // would find nothing. The Prometheus counter makes the failure alertable
-    // rather than buried in audit.db alone (sre SHOULD).
+    // AgentRegistry::evaluate_scope() returns an error (#4981 PR-1: was
+    // std::nullopt pre-PR-1) on a from_result_set:/props.<key> scope — one of
+    // `to_string(ScopeEvalError::Kind)`'s reason strings: "db_degraded"
+    // (ADR-0036/ADR-0045, a preload hit a Postgres error),
+    // "principal_unresolved" (B2, a from_result_set: atom had no principal to
+    // owner-resolve against), "owner_check_failed" (#4981 PR-1 A3, a
+    // referenced set is absent/expired/not owned — including the Finding A
+    // TOCTOU case), "presence_degraded" (#4981 PR-1 B, the cross-replica
+    // presence read could not answer), or "unresolvable" (a store the atom
+    // needs was never wired at this call site). Without this, a dispatch
+    // silently reduced to 0 targets by an ABORT is indistinguishable in
+    // telemetry/audit from a genuine "0 agents matched" (UP-12) — an operator
+    // investigating "why did my command reach nobody" would find nothing. The
+    // Prometheus counter makes the failure alertable rather than buried in
+    // audit.db alone (sre SHOULD).
     void audit_scope_evaluation_aborted(const std::string& principal,
                                         const std::string& principal_role,
                                         const std::string& command_id, const std::string& reason) {
@@ -12105,7 +13619,11 @@ private:
         ev.principal = principal.empty() ? "unknown" : principal;
         ev.principal_role = principal_role;
         ev.action = "scope.evaluation_aborted";
-        ev.target_type = "result_set";
+        // #4981 PR-1 B6: "result_set" is only accurate for a reason that is
+        // actually ABOUT a result set (owner_check_failed) — every other
+        // reason (a presence degrade, a generic store degrade, an unwired
+        // store) has nothing to do with a result set and mislabels the row.
+        ev.target_type = (reason == "owner_check_failed") ? "result_set" : "scope";
         ev.target_id = "";
         ev.detail = "SCOPE_EVALUATION_ABORTED command=" + command_id + " reason=" + reason;
         ev.result = "failure";
@@ -12342,16 +13860,57 @@ private:
                                        const std::string& principal_role,
                                        const std::string& command_id, const std::string& plugin,
                                        std::size_t count) {
+        audit_dispatch_withheld(route, principal, principal_role, command_id, plugin, count,
+                                yuzu::server::kReasonUnknownPlugin, "plugin_not_found");
+    }
+
+    // #5294: the per-OS kill-switch sibling -- same aggregate row and metric,
+    // its own `reason`.
+    void audit_kill_switched_os_dispatch(std::string_view route, const std::string& principal,
+                                         const std::string& principal_role,
+                                         const std::string& command_id, const std::string& plugin,
+                                         std::size_t count) {
+        audit_dispatch_withheld(route, principal, principal_role, command_id, plugin, count,
+                                yuzu::server::kReasonKillSwitchedOs, "kill_switched_os");
+    }
+
+    // #5294: a dispatch refused BEFORE targeting because presence could not be
+    // read while a per-OS kill switch is OFF. Like the fail-closed quarantine
+    // row it is ONE aggregate decision with no per-agent count. Audit row only:
+    // the scheduled-path outbox already counts the cause
+    // (`yuzu_server_command_outbox_deliver_retry_cause_total`), and
+    // `yuzu_server_dispatch_target_rejected_total` carries the per-target
+    // withhold reasons, and this refusal has no per-target count.
+    void audit_os_gate_unreadable(const std::string& principal, const std::string& principal_role,
+                                  const std::string& command_id, const std::string& plugin) {
+        write_withheld_row(principal, principal_role, command_id, plugin, "os_gate_unreadable");
+    }
+
+    // Shared body of `audit_unknown_plugin_dispatch` and
+    // `audit_kill_switched_os_dispatch`: `metric_reason` is the
+    // `yuzu_server_dispatch_target_rejected_total` label, `detail_reason` the
+    // token written into the audit row's detail.
+    void audit_dispatch_withheld(std::string_view route, const std::string& principal,
+                                 const std::string& principal_role, const std::string& command_id,
+                                 const std::string& plugin, std::size_t count,
+                                 std::string_view metric_reason, std::string_view detail_reason) {
         if (count == 0)
             return;
         metrics_
             .counter("yuzu_server_dispatch_target_rejected_total",
-                     {{"route", std::string(route)},
-                      {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}})
+                     {{"route", std::string(route)}, {"reason", std::string(metric_reason)}})
             .increment(static_cast<double>(count));
-        spdlog::warn(
-            "dispatch withheld: route={} command={} plugin={} reason=unknown_plugin agents={}",
-            route, command_id, plugin, count);
+        spdlog::warn("dispatch withheld: route={} command={} plugin={} reason={} agents={}", route,
+                     command_id, plugin, metric_reason, count);
+        write_withheld_row(principal, principal_role, command_id, plugin,
+                           std::string(detail_reason) + " agents=" + std::to_string(count));
+    }
+
+    // The one `command.dispatch_withheld` audit row; `reason_tail` is the
+    // text after `reason=` (the cause token, plus `agents=N` where counted).
+    void write_withheld_row(const std::string& principal, const std::string& principal_role,
+                            const std::string& command_id, const std::string& plugin,
+                            const std::string& reason_tail) {
         if (!audit_store_)
             return;
         AuditEvent ev{};
@@ -12362,12 +13921,12 @@ private:
         ev.target_type = "Command";
         ev.target_id = "*";
         ev.detail = "COMMAND_DISPATCH_WITHHELD command=" + command_id + " plugin=" + plugin +
-                    " reason=plugin_not_found agents=" + std::to_string(count);
+                    " reason=" + reason_tail;
         ev.result = "denied";
         if (!audit_store_->log(ev))
             spdlog::error("audit write failed: command.dispatch_withheld (command={} plugin={}, "
-                          "agents={})",
-                          command_id, plugin, count);
+                          "reason={})",
+                          command_id, plugin, reason_tail);
     }
 
     // Apply stored runtime config overrides on startup. Returns false on a
@@ -12558,6 +14117,25 @@ private:
             }
             web_server_ = std::make_unique<httplib::SSLServer>(
                 cfg_.https_cert_path.string().c_str(), cfg_.https_key_path.string().c_str());
+
+            // #4722: same TLS 1.2 cipher allow-list as the gRPC listeners.
+            // httplib's create_server_context() already floors at
+            // TLS1_2_VERSION (httplib.h:16411); this pins the suites.
+            // tls_context() is the current accessor (ssl_context() is
+            // [[deprecated]]). Fail closed: an unpinned HTTPS listener must
+            // not serve. (Note: the cert-missing `return`s above deliberately
+            // do NOT set startup_failed_ — this branch is fail-closed on
+            // purpose, do not "harmonise" it away.)
+            auto* ssl_server = static_cast<httplib::SSLServer*>(web_server_.get());
+            if (!yuzu::tls::apply_tls12_cipher_list(
+                    static_cast<SSL_CTX*>(ssl_server->tls_context()))) {
+                spdlog::error("HTTPS: failed to pin the TLS 1.2 cipher list on the dashboard "
+                              "listener — refusing to serve");
+                web_server_.reset();
+                startup_failed_ = true;
+                return;
+            }
+
             spdlog::info("HTTPS enabled on port {} (cert: {}, key: {})", cfg_.https_port,
                          cfg_.https_cert_path.string(), cfg_.https_key_path.string());
         } else {
@@ -13238,6 +14816,14 @@ private:
             is_login = is_login ||
                        (req.path == "/auth/saml/start" && req.method == "GET") ||
                        (req.path == "/saml/acs"        && req.method == "POST");
+            // #5342: POST /api/v1/users/me/password verifies the current
+            // password, so it is the same online-guessing surface as /login
+            // (lockout bounds it only while --auth-lockout-threshold > 0).
+            // The admin reset (/api/v1/users/{name}/password) rides the same
+            // bucket: one predicate for the pair, no cost to a human admin.
+            is_login = is_login ||
+                       (req.method == "POST" && req.path.starts_with("/api/v1/users/") &&
+                        req.path.ends_with("/password"));
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -13278,8 +14864,8 @@ private:
             // the only credential the caller has at this point — they have no
             // session cookie yet. Hermes Agent's red-team review (2026-05-29)
             // caught the omission; without it, MFA-enrolled users are locked
-            // out because every POST /login/mfa redirects to /login before the
-            // route handler runs.
+            // out because every POST /login/mfa is redirected to the landing
+            // page (/home) before the route handler runs.
             // `/login/mfa/enroll` (PR3) is also pre-session: it completes
             // an enforced login for an un-enrolled user who has only the
             // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
@@ -13287,7 +14873,7 @@ private:
             // SAML 2.0 auth-flow routes are pre-session by design (identical
             // rationale to /auth/oidc/start + /auth/callback).  Without these
             // exemptions, a non-authenticated user trying to start SSO would be
-            // redirected to /login before the SAML flow handler runs.
+            // redirected to /home before the SAML flow handler runs.
             // The exact exempt-path decision lives in `is_login_exempt_path`
             // (web_utils.hpp) so it has direct unit coverage (H1, 2026-07-08
             // SCIM review) — this call site runs AFTER the rate limiter
@@ -13317,8 +14903,17 @@ private:
                     res.set_content(
                         R"({"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}})",
                         "application/json");
+                } else if (!req.get_header_value("HX-Request").empty()) {
+                    // An htmx panel request: a 302 would be followed silently and the
+                    // whole sign-in page swapped (script tags included) into the panel.
+                    // 401 plus HX-Redirect makes htmx leave the page instead.
+                    res.status = 401;
+                    res.set_header("HX-Redirect", "/home");
+                    res.set_content("", "text/plain");
                 } else {
-                    res.set_redirect("/login");
+                    // The landing page, carrying the requested screen as a
+                    // validated key so it can say "Sign in to open <area>."
+                    res.set_redirect(home_ui::sign_in_location(req.path));
                 }
                 return httplib::Server::HandlerResponse::Handled;
             }
@@ -13653,7 +15248,7 @@ private:
             return get_visible_agents_json(username);
         };
 
-        // #2542: page-shell/static-asset routes (25), extracted onto inline_sink
+        // #2542: page-shell/static-asset routes (29), extracted onto inline_sink
         // (this call's own HttpRouteSink seam) rather than any per-owner sink —
         // these routes are pure page-shell/static-asset serving with no owning
         // store of their own.
@@ -13677,15 +15272,6 @@ private:
                              .audit_store = audit_store_.get(),
                              .analytics_store = analytics_store_.get(),
                          });
-
-        // #2542 follow-up: the 3 NVD CVE-feed routes (/api/nvd/status,
-        // /api/nvd/sync, /api/nvd/match), extracted onto the same inline_sink
-        // seam.
-        yuzu::server::nvd::register_nvd_routes(inline_sink, yuzu::server::nvd::Deps{
-                                                                 .perm_fn = perm_fn,
-                                                                 .nvd_db = nvd_db_.get(),
-                                                                 .nvd_sync = nvd_sync_.get(),
-                                                             });
 
         // Per-device tier + management-group scope gate (wraps
         // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
@@ -13720,6 +15306,17 @@ private:
                                     const std::string& type,
                                     const std::string& op) -> yuzu::server::authz::FleetReadGate {
             return require_fleet_read(req, res, type, op);
+        };
+        // Panel variants for the Dashboard fragments: same decision path, no denial audit
+        // row (a page that renders panels per caller must not write rows for figures it
+        // merely chose not to draw). The decision is identical to the loud gate's; only the
+        // row is withheld. The bell and the approvals badge keep the loud gates.
+        auto draw_fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                         const std::string& type, const std::string& op)
+            -> yuzu::server::authz::FleetReadGate { return probe_fleet_read(req, res, type, op); };
+        auto draw_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                   const std::string& type, const std::string& op) -> bool {
+            return auth_routes_->probe_permission(req, res, type, op);
         };
         // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
         // device drills). SAME policy as get_visible_agents_json / the /devices list:
@@ -13779,42 +15376,40 @@ private:
             if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
             return std::set<std::string>(v->begin(), v->end());
         };
-        // #4035 review fix (colleague review, BLOCKING): get_dex_app's/
-        // get_dex_overview's REST v1 + MCP twins previously reused the
-        // pre-existing `visible_set_fn` below (Infrastructure:Read global
-        // bypass + ManagementGroupStore::get_visible_agents, which is
-        // PERMISSION-AGNOSTIC — see that lambda's own doc comment) as their
-        // ADR-0017 confinement belt. That resolver returns every agent
-        // visible via ANY management-group role the caller holds, not just
-        // GuaranteedState:Read — so a caller with GuaranteedState:Read on
-        // one group and any unrelated role on a second group would see the
-        // second group's device ids/crash data leak into these two DEX
-        // reads. Deliberately a NEW resolver rather than fixing
-        // `visible_set_fn` in place: that lambda is also shared by the
-        // pre-existing `/fragments/dex/app`+`/fragments/dex/overview`
-        // dashboard fragments and an unrelated inventory-devices resolver,
-        // so changing it has a wider blast radius than this fix should
-        // take on — same shape as `response_visible_set_fn` above (D3),
-        // just scoped to GuaranteedState:Read instead of Response:Read.
-        auto dex_visible_fn = [this](const std::string& username)
-            -> std::optional<std::set<std::string>> {
-            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "GuaranteedState", "Read");
-            if (global_read) return std::nullopt;
-            if (!rbac_store_ || !mgmt_group_store_) {
-                return std::set<std::string>{}; // fail-closed, no store to resolve against
-            }
-            auto v = rbac_store_->visible_agents_for_permission(username, "GuaranteedState", "Read",
-                                                                 mgmt_group_store_.get());
-            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
-            return std::set<std::string>(v->begin(), v->end());
-        };
+        // #4035 review fix's bespoke `dex_visible_fn` resolver (a global-Read
+        // bypass + `RbacStore::visible_agents_for_permission` join) is
+        // RETIRED (WS-A4 PR-1 fix round, sec-1/sec-2): this resolver's bare
+        // `check_permission` global-read bypass meant a management-group-
+        // confined-only operator was 403'd by the old `perm_fn` gate in
+        // front of it before this resolver ever ran, so its confinement was
+        // dormant on every admitted call. A later fix round tried moving GET
+        // /api/v1/dex/app, GET /api/v1/dex/overview, and GET
+        // /api/v1/dex/signals/{obs_type} (REST + MCP) onto `fleet_read_fn`
+        // below instead — but every value these three return is a
+        // fleet-wide aggregate, not a per-caller-confinable list, so per
+        // WS-A4 PR-1 all three stay on base gating: a bare
+        // `perm_fn`/`tier_allows` (`GuaranteedState:Read`: a global grant, or
+        // with RBAC off any authenticated non-service/non-engine session) plus each surface's own
+        // service-scoped-token deny. `fleet_read_fn` is NOT one of these
+        // three routes' gates (it still exists below for the OTHER routes
+        // that are genuinely per-caller-confinable, e.g. GET
+        // /api/v1/dex/perf/app/devices). See RestApiV1::DexVisibleFn's
+        // retirement comment (rest_api_v1.hpp) for the full rationale.
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
             return audit_log(req, action, result, target_type, target_id, detail);
         };
+
+        // #2542 follow-up: the NVD CVE-feed routes (/api/nvd/status, /api/nvd/sync,
+        // /api/nvd/match, plus the /fragments/auto/nvd status card), on the same
+        // inline_sink seam. Placed after audit_fn (the sync request is audited).
+        yuzu::server::nvd::register_nvd_routes(inline_sink, yuzu::server::nvd::Deps{
+                                                                 .perm_fn = perm_fn,
+                                                                 .audit_fn = audit_fn,
+                                                                 .nvd_db = nvd_db_.get(),
+                                                                 .nvd_sync = nvd_sync_.get(),
+                                                             });
 
         // #2542 PR-4: the 5-route Custom Properties API (7.6)
         // (/api/agents/:id/properties[/:key], /api/property-schemas),
@@ -13830,6 +15425,51 @@ private:
                              .audit_fn = audit_fn,
                              .store = custom_properties_store_.get(),
                          });
+
+        // Hardware record, "Tags and properties" lens: the read-only HTML twin of the
+        // custom-properties routes above. Probes run against a throwaway Response so a
+        // denied probe never writes the gate's 403 to the real one (htmx would drop it).
+        yuzu::server::device_data::register_device_data_routes(
+            inline_sink,
+            yuzu::server::device_data::Deps{
+                .auth_fn = auth_fn,
+                .scoped_probe_fn =
+                    [scoped_perm_fn](const httplib::Request& req, const std::string& type,
+                                     const std::string& op, const std::string& id) -> bool {
+                        httplib::Response probe;
+                        return scoped_perm_fn(req, probe, type, op, id);
+                    },
+                .global_probe_fn =
+                    [perm_fn](const httplib::Request& req, const std::string& type,
+                              const std::string& op) -> bool {
+                        httplib::Response probe;
+                        return perm_fn(req, probe, type, op);
+                    },
+                .properties_fn =
+                    [this](const std::string& id)
+                        -> std::optional<std::vector<yuzu::server::device_data::PropertyRow>> {
+                        if (!custom_properties_store_ || !custom_properties_store_->is_open())
+                            return std::nullopt;
+                        auto props = custom_properties_store_->get_properties(id);
+                        if (!props)
+                            return std::nullopt;
+                        std::vector<yuzu::server::device_data::PropertyRow> out;
+                        out.reserve(props->size());
+                        for (const auto& p : *props)
+                            out.push_back({p.key, p.value, p.type, p.updated_at});
+                        return out;
+                    },
+                .schemas_fn =
+                    [this]() -> std::optional<std::vector<yuzu::server::device_data::SchemaRow>> {
+                        if (!custom_properties_store_ || !custom_properties_store_->is_open())
+                            return std::nullopt;
+                        std::vector<yuzu::server::device_data::SchemaRow> out;
+                        for (const auto& s : custom_properties_store_->list_schemas())
+                            out.push_back({s.key, s.display_name, s.type, s.description,
+                                           s.validation_regex});
+                        return out;
+                    },
+            });
 
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the
         // first extracted route module whose handlers call it (see
@@ -13851,12 +15491,49 @@ private:
         // sibling) because this module needs auth_fn + the just-defined
         // deny_service_scoped_fn + audit_fn, none of which is in scope yet
         // at that earlier point.
+        // #4983: this fragment's `device_ids` (the dashboard CSV-paste
+        // import) had the identical unchecked-existence/scope gap the REST
+        // and MCP twins were fixed for in the same PR -- threads the SAME
+        // `fleet_read_fn` lambda defined above (already reused by several
+        // other Deps-based route modules) plus a direct
+        // `registry_.all_ids()` closure, the identical presence-merged
+        // domain RestApiV1's own `AllAgentIdsFn` wraps (HA WS-5) -- NOT
+        // `registry_.to_json_obj()`'s local-only snapshot, same #4981
+        // precedent reasoning as the REST fix's own wiring comment below.
         yuzu::server::result_set::register_result_set_routes(
             inline_sink, yuzu::server::result_set::Deps{
                              .auth_fn = auth_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .audit_fn = audit_fn,
+                             .fleet_read_fn = fleet_read_fn,
+                             .all_agent_ids_fn = [this] { return registry_.all_ids(); },
+                             // #5047: same belt as the /api/v1/result-sets JSON
+                             // write routes — these fragments are plain HTTP
+                             // endpoints too, not cookie-session-only. The
+                             // SOLE production factory (see its own doc
+                             // comment, auth_routes.hpp) — never re-inline
+                             // this as a local lambda; a second copy is
+                             // exactly how the original clause-5 violation
+                             // this belt exists to prevent could recur
+                             // unreviewed at a 9th call site.
+                             .tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),
                              .store = result_set_store_.get(),
+                             // Operate extras: producer picker + re-evaluate verdict. The SAME
+                             // classifier the Console and MCP consult. The permission checks
+                             // only decide what to draw, so they use the non-auditing probe:
+                             // a viewer without Execution:Execute would otherwise write an
+                             // auth.permission_required denial on every refresh. The POST
+                             // that acts keeps the auditing gate.
+                             .probe_perm_fn =
+                                 [this](const httplib::Request& req, const std::string& type,
+                                        const std::string& op) -> bool {
+                                     return auth_routes_->has_permission(req, type, op);
+                                 },
+                             .classify_fn =
+                                 [this](std::string_view p, std::string_view a) {
+                                     return capability_registry_.classify(p, a);
+                                 },
+                             .instruction_store = instruction_store_.get(),
                              .metrics = &metrics_,
                          });
 
@@ -13902,6 +15579,7 @@ private:
                              .auth_fn = auth_fn,
                              .resolve_session_fn = resolve_session_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
+                             .fleet_read_fn = draw_fleet_read_fn, // HM-2 /fragments/dashboard/health (draw-time)
                              .cfg = &cfg_,
                              .metrics = &metrics_,
                              .registry = &registry_,
@@ -13911,6 +15589,7 @@ private:
                              .draining = &draining_,
                              .server_start_time = server_start_time_,
                              .pg_pool = pg_pool_.get(),
+                             .pg_reachability_probe = pg_reachability_probe_.get(),
                              .response_store = response_store_.get(),
                              .audit_store = audit_store_.get(),
                              .instruction_store = instruction_store_.get(),
@@ -13951,6 +15630,8 @@ private:
                              .fleet_topology_store = fleet_topology_store_.get(),
                              .access_review_store = access_review_store_.get(),
                              .software_licensing_store = software_licensing_store_.get(),
+                             .plugin_config_store = plugin_config_store_.get(),
+                             .app_usage_store = app_usage_store_.get(),
                              .product_registry_store = product_registry_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
@@ -13969,6 +15650,7 @@ private:
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
                              .store = instruction_store_.get(),
+                             .csrf_trusted_origins = cfg_.csrf_trusted_origins,
                          });
 
         // #2542 PR-7: the 7-route legacy pre-v1 Executions API, extracted
@@ -14033,6 +15715,7 @@ private:
                              .fleet_read_fn = fleet_read_fn,
                              .audit_fn = audit_fn,
                              .store = response_store_.get(),
+                             .metrics = &metrics_,
                          });
 
         // #2542 PR-11: wraps AuthRoutes::deny_service_scoped_service_tag_mutation
@@ -14141,6 +15824,15 @@ private:
             inline_sink, yuzu::server::instruction_fragment::Deps{
                              .auth_fn = auth_fn,
                              .perm_fn = perm_fn,
+                             // Render-time probe: the loud gate against a throwaway
+                             // Response (idiom of scoped_probe_fn below). Each failed
+                             // probe writes one auth.permission_required denied row.
+                             .probe_perm_fn =
+                                 [perm_fn](const httplib::Request& req, const std::string& type,
+                                           const std::string& op) -> bool {
+                                     httplib::Response probe;
+                                     return perm_fn(req, probe, type, op);
+                                 },
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .store = instruction_store_.get(),
                          });
@@ -14152,7 +15844,14 @@ private:
             inline_sink, yuzu::server::approvals_fragment::Deps{
                              .auth_fn = auth_fn,
                              .perm_fn = perm_fn,
+                             .probe_perm_fn =
+                                 [perm_fn](const httplib::Request& req, const std::string& type,
+                                           const std::string& op) -> bool {
+                                     httplib::Response scratch;
+                                     return perm_fn(req, scratch, type, op);
+                                 },
                              .approval_manager = approval_manager_.get(),
+                             .instruction_store = instruction_store_.get(),
                          });
 
         // NOTE: the 3-route MCP-disabled stub module
@@ -14471,6 +16170,18 @@ private:
                         audit_unknown_plugin_dispatch(route, principal, principal_role,
                                                       command_id, plugin, count);
                     },
+                    .audit_kill_switched_os_dispatch_fn =
+                        [this](std::string_view route, const std::string& principal,
+                               const std::string& principal_role, const std::string& command_id,
+                               const std::string& plugin, std::size_t count) {
+                        audit_kill_switched_os_dispatch(route, principal, principal_role,
+                                                        command_id, plugin, count);
+                    },
+                    .audit_os_gate_unreadable_fn =
+                        [this](const std::string& principal, const std::string& principal_role,
+                               const std::string& command_id, const std::string& plugin) {
+                        audit_os_gate_unreadable(principal, principal_role, command_id, plugin);
+                    },
                     .audit_scope_resolution_failed_fn =
                         [this](const std::string& principal, const std::string& principal_role,
                                const std::string& command_id, const std::string& ref) {
@@ -14557,13 +16268,20 @@ private:
             app_perf_rollup_thread_ = std::thread([this]() {
                 spdlog::info("App-perf roll-up thread started (cadence=1h, B2 retention=180d)");
                 bool first = true;
-                while (!stop_requested_.load(std::memory_order_acquire)) {
+                // HA WS-8: `draining_` also ends the loop. It is set at the START of
+                // stop()'s drain grace, `stop_requested_` only after it — without
+                // this, an hourly roll-up could begin inside the grace and its
+                // 120s statement budget would then stack after it in the shutdown.
+                const auto halt = [this] {
+                    return stop_requested_.load(std::memory_order_acquire) ||
+                           draining_.load(std::memory_order_acquire);
+                };
+                while (!halt()) {
                     if (!first) {
                         // ~1h in 5s steps so shutdown stays responsive.
-                        for (int i = 0;
-                             i < 720 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        for (int i = 0; i < 720 && !halt(); ++i)
                             std::this_thread::sleep_for(std::chrono::seconds{5});
-                        if (stop_requested_.load(std::memory_order_acquire))
+                        if (halt())
                             break;
                     }
                     first = false;
@@ -14585,8 +16303,7 @@ private:
                         YUZU_ASSERT_BACKGROUND_JOB("app_perf_fleet_store.run_retention_prune");
                         const std::int64_t retention_win =
                             static_cast<std::int64_t>(AppPerfFleetStore::kRetentionDays) * 86400;
-                        for (int drain = 0;
-                             drain < 12 && !stop_requested_.load(std::memory_order_acquire); ++drain) {
+                        for (int drain = 0; drain < 12 && !halt(); ++drain) {
                             const int pruned = app_perf_fleet_store_->run_retention_prune(retention_win);
                             if (pruned != static_cast<int>(AppPerfFleetStore::kPruneCapPerPass))
                                 break;
@@ -14618,12 +16335,16 @@ private:
             .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
         preflight_runner_thread_ = std::thread([this]() {
-            spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d)");
+            spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d; "
+                         "endpoint_state prune hourly)");
+            std::uint64_t tick = 0;
+            constexpr int kOfflineEndpointPruneEveryNTicks = 60; // ~1h at 60s/tick
             while (!stop_requested_.load(std::memory_order_acquire)) {
                 for (int i = 0; i < 12 && !stop_requested_.load(std::memory_order_acquire); ++i)
                     std::this_thread::sleep_for(std::chrono::seconds{5});
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+                ++tick;
                 if (preflight_runner_) {
                     // tick() touches JSON, PG and gRPC dispatch — any can throw; an
                     // escaping exception would std::terminate the process, so a bad
@@ -14656,6 +16377,49 @@ private:
                         spdlog::error("deployment prune threw unknown exception — continuing");
                     }
                 }
+                // #5678 / #1545 UP-4: hourly clock-guarded prune of endpoint_state rows
+                // unseen for roster window + margin. Hosted on THIS thread, not
+                // health_recompute_thread_: the health tick's serial budget is shared
+                // with the revocation sweep, and this thread already hosts the two
+                // WS-10 prunes and nothing security-sensitive. ReplicaSafe — no
+                // leader_gate call. The window is the roster's own (kHardwareRosterWindow);
+                // the prune cutoff is that window + kPruneMargin on the PG-authored
+                // last_seen_at. The roster still reads last_heartbeat_ms on the replica
+                // clock, so the prune cannot reach a row the roster shows only while
+                // replica/PG clock skew stays under the 7 d margin.
+                // Cadence: first pass on the first tick (the bootstrap decline persists the
+                // anchor), then hourly — so the first real delete is the hourly pass ~1 h
+                // later and a server restarted more often than hourly still prunes once per
+                // boot. A prior pass may have held this thread up to the statement timeout,
+                // so re-check stop_requested_ before starting (stop() joins this thread
+                // before offline_endpoint_store_ is reset).
+                if (offline_endpoint_store_ && !stop_requested_.load(std::memory_order_acquire) &&
+                    tick % kOfflineEndpointPruneEveryNTicks == 1) {
+                    try {
+                        YUZU_ASSERT_BACKGROUND_JOB("offline_endpoint_store.run_retention_prune");
+                        // Bounded backlog drain, mirroring the app_perf prune above: a pass
+                        // that hit the cap may have more, so re-arm immediately (at most 12
+                        // passes = 12 * kPruneCapPerPass rows per replica per hour). Any
+                        // non-cap result — under-cap, a decline (0) or an error (-1) — stops
+                        // the drain until the next hourly tick.
+                        for (int drain = 0;
+                             drain < 12 && !stop_requested_.load(std::memory_order_acquire);
+                             ++drain) {
+                            const int pruned =
+                                offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow);
+                            if (pruned < 0)
+                                spdlog::warn("endpoint_state prune did not run (store not open or "
+                                             "no connection/transaction); retrying next hour");
+                            if (pruned != OfflineEndpointStore::kPruneCapPerPass)
+                                break;
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::error("endpoint_state prune threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("endpoint_state prune threw unknown exception — continuing");
+                    }
+                }
             }
             // #3495 (sre governance finding, 2026-08-30): mirrors the
             // quarantine reconciler's exit log — see policy_eval_thread_'s
@@ -14666,9 +16430,13 @@ private:
         // QuarantineContainmentReconciler (#3425) — re-applies endpoint
         // containment for an active quarantine record whose device has
         // reconnected. Same shared dispatch lambda as every other
-        // background engine; the #881 gate's is_quarantine_control_plugin
-        // exemption already lets the quarantine plugin's own actions
-        // through unmodified. Joined BEFORE the stores in stop().
+        // background engine. The shared protective predicate
+        // (yuzu::protective::is_protective_action, built on
+        // is_quarantine_control_plugin) lets the quarantine plugin's own
+        // actions through every gate unmodified: the #881 containment gate, the
+        // per-plugin/action kill switch (incl. a degraded store), the per-OS
+        // withhold and its presence read, and the plugin-presence filter.
+        // Joined BEFORE the stores in stop().
         quarantine_reconciler_ =
             std::make_unique<QuarantineContainmentReconciler>(QuarantineContainmentReconciler::Deps{
                 .quarantine_store = quarantine_store_.get(),
@@ -14997,6 +16765,16 @@ private:
                 // so this rides the same 60m cadence as the other non-PII
                 // stores above, not the tighter session cadence.
                 constexpr int kCmdExecutionReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
+                // #4982 Part B: the stuck-running-execution sweep. Tighter than
+                // the 60m correlation-table cadence above — this recovers a
+                // CORRECTNESS bug (an execution wedged at status='running'
+                // forever), not routine hygiene on an opaque-id table, so a
+                // ~15m cadence (matching the session-reap cadence) surfaces a
+                // genuinely wedged row reasonably promptly without hammering
+                // the pool for what should be a rare event. See
+                // execution_tracker.cpp's kStuckExecWindowSecs/kStuckExecMax-
+                // PlausibleSkewSecs for how this cadence sizes those constants.
+                constexpr int kStuckExecReapEveryNTicks = 450; // ~15 minutes at 2s/tick
                 // ADR-1007: per-device concurrency claim stale-claim reconciler
                 // cadence — see the call site's own comment for the rationale.
                 constexpr int kConcurrencyClaimReconcileEveryNTicks = 150; // ~5 minutes at 2s/tick
@@ -15255,6 +17033,104 @@ private:
                             }
                         }
 
+                        // 2e2) #4982 Part B: the stuck-running-execution sweep —
+                        // recovers an execution row permanently wedged at
+                        // status='running', agents_targeted=0 (see
+                        // ExecutionTracker::reap_stuck_running_executions's own
+                        // doc comment for the full false-positive-avoidance
+                        // reasoning: the outbox-pending exclusion, the
+                        // would-wipe ratio gate, and the clock-guard shape).
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kStuckExecReapEveryNTicks == 0) {
+                            if (auto reaped = execution_tracker_->reap_stuck_running_executions()) {
+                                if (reaped->cancelled > 0)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "cancelled"}})
+                                        .increment(static_cast<double>(reaped->cancelled));
+                                if (reaped->not_cancelled > 0)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "not_cancelled"}})
+                                        .increment(static_cast<double>(reaped->not_cancelled));
+                                if (reaped->would_wipe)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "would_wipe"}})
+                                        .increment();
+                                if (reaped->clock_anomaly)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "clock_anomaly"}})
+                                        .increment();
+                                if (reaped->capped)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "capped"}})
+                                        .increment();
+                                if (reaped->skipped)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "skipped"}})
+                                        .increment();
+                                // governance Gate 2 fix (security-guardian, SHOULD): this
+                                // sweep force-cancels executions the same way the
+                                // operator-initiated DELETE route does (execution_routes.cpp's
+                                // "execution.cancel" audit action) — a background actor
+                                // silently transitioning a command's terminal state is exactly
+                                // the class audit coverage exists to catch. principal="system"
+                                // (no HTTP session/token principal; matches this file's own
+                                // server.viz_disabled precedent), principal_class left at its
+                                // documented "" default (AuditEvent's own doc comment: that
+                                // field is reserved for a session/token principal this program
+                                // CAN attribute, which a background writer is not).
+                                if (audit_store_ && audit_store_->is_open()) {
+                                    const std::int64_t audit_now_s =
+                                        std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                                    // governance Gate 6 fix (sre, HIGH): a degraded audit
+                                    // pool makes every log() call wait out the full
+                                    // kWriteTimeout (4s) before failing — up to 500
+                                    // sequential calls on a capped pass could stall THIS
+                                    // thread (which also runs poll_event_outbox_once's
+                                    // every-tick cross-replica SSE delivery and the
+                                    // sibling reaps) for ~33 minutes. A pool-exhaustion
+                                    // timeout does not recover call-to-call, so break on
+                                    // the FIRST failure rather than retrying the same
+                                    // degraded pool up to 500 times; the audit gap itself
+                                    // is already counted (AuditStore::log increments
+                                    // yuzu_server_audit_emit_failed_total internally) and
+                                    // the store-degrade metric below.
+                                    for (const auto& cancelled_id : reaped->cancelled_ids) {
+                                        AuditEvent ev;
+                                        ev.timestamp = audit_now_s;
+                                        ev.principal = "system";
+                                        ev.action = "execution.cancel";
+                                        ev.target_type = "execution";
+                                        ev.target_id = cancelled_id;
+                                        ev.detail = "reap_stuck_running_executions";
+                                        ev.result = "success";
+                                        if (!audit_store_->log(ev)) {
+                                            spdlog::warn(
+                                                "stuck-execution reap: audit write failed for "
+                                                "execution_id={} -- stopping this pass's audit "
+                                                "loop early (degraded pool), remaining "
+                                                "cancellations in this pass are unaudited",
+                                                cancelled_id);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                spdlog::warn("stuck-execution reap failed: {}", reaped.error());
+                                metrics_
+                                    .counter("yuzu_exec_tracker_stuck_reap_total",
+                                             {{"outcome", "degraded"}})
+                                    .increment();
+                            }
+                        }
+
                         // 2f) Per-device concurrency claim stale-claim reconciler
                         // (ADR-1007) — piggybacks this thread's tick counter like
                         // the reaps above. A ~5m cadence: frequent enough that a
@@ -15353,11 +17229,16 @@ private:
                                         .increment();
                                 } else {
                                     if (reaped->expired_leases_reaped > 0 ||
-                                        reaped->tombstones_reaped > 0)
-                                        spdlog::info("gateway_route_store reap: {} expired "
-                                                     "lease(s), {} tombstone(s) reaped",
-                                                     reaped->expired_leases_reaped,
-                                                     reaped->tombstones_reaped);
+                                        reaped->tombstones_reaped > 0 ||
+                                        reaped->affinity_preserved_soft_tombstones > 0)
+                                        spdlog::info(
+                                            "gateway_route_store reap: {} expired lease(s), "
+                                            "{} tombstone(s) reaped, {} affinity-preserved "
+                                            "soft-tombstone(s) (#4669 fix — home_cluster_id "
+                                            "NOT cleared for these)",
+                                            reaped->expired_leases_reaped,
+                                            reaped->tombstones_reaped,
+                                            reaped->affinity_preserved_soft_tombstones);
                                     if (reaped->clock_anomaly) {
                                         spdlog::warn("gateway_route_store reap declined: "
                                                      "clock anomaly detected");
@@ -15494,7 +17375,9 @@ private:
             [this](const std::string& scope, bool full_sync) -> int {
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
             },
-            &metrics_); // #4252 — platform-support-matrix-stale counter
+            &metrics_, // #4252 — platform-support-matrix-stale counter
+            step_up_fn); // Guard edit/delete twins: same MFA step-up as the REST PUT/DELETE
+        guardian_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
 
         // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
         // perf tags (validated through the SAME dex_perf_rules the Prometheus
@@ -15539,14 +17422,10 @@ private:
                     continue;
                 DexPerfDevice d;
                 d.agent_id = id;
-                std::string os = s->os;
-                for (auto& c : os)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
-                // match classifies every macOS agent as Windows (G4 UP-1
-                // BLOCKING). Agents report "windows" / "darwin" / "linux"
-                // (agents/core/src/agent.cpp kAgentOs).
-                d.is_windows = os.starts_with("win");
+                // Normalization (incl. the "darwin contains win" G4 UP-1 fix)
+                // is the ONE shared dex_perf_os_from_session — see its doc
+                // comment in dex_perf_rules.hpp for the full rationale.
+                d.os = detail::dex_perf_os_from_session(s->os);
                 if (auto it = by_id.find(id); it != by_id.end()) {
                     const auto& tags = it->second->status_tags;
                     auto get = [&](const char* k) -> std::string {
@@ -15663,42 +17542,17 @@ private:
         // empty). The fleet + picker seams read B2; the per-device drill reads B1
         // (audited at the route); the group roll-up resolves members then aggregates
         // B1 — two bounded single-store reads composed, never a held cross-store
-        // lease (ADR-0012 §1).
-        AppPerfProviders app_perf_providers;
-        app_perf_providers.fleet =
-            [this](std::string_view app, std::string_view version)
-            -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_fleet_store_)
-                return std::nullopt;
-            return app_perf_fleet_store_->get_app_fleet_perf(app, version);
-        };
-        app_perf_providers.apps =
-            [this](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
-            if (!app_perf_fleet_store_)
-                return std::nullopt;
-            return app_perf_fleet_store_->list_apps(truncated);
-        };
-        app_perf_providers.device =
-            [this](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
-            if (!app_perf_daily_store_)
-                return std::nullopt;
-            return app_perf_daily_store_->get_agent_app_perf(agent_id);
-        };
-        app_perf_providers.group =
-            [this](std::string_view group_id, std::string_view app,
-                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
-            if (!app_perf_group_reader_ || !mgmt_group_store_)
-                return std::nullopt;
-            // Resolve members (one bounded read, lease released), THEN aggregate B1
-            // (a second bounded read) — never a lease held across the other (ADR-0012
-            // §1). An empty/unknown group → empty member list → empty 200, not a leak.
-            const auto members = mgmt_group_store_->get_members(std::string(group_id));
-            std::vector<std::string> agent_ids;
-            agent_ids.reserve(members.size());
-            for (const auto& m : members)
-                agent_ids.push_back(m.agent_id);
-            return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
-        };
+        // lease (ADR-0012 §1). `AppPerfProviders` (the pre-seam callback-bundle
+        // this block used to build) is RETIRED (#4626) — `dex_perf_api` below
+        // (make_local_dex_perf_api) now does this exact composition (fleet/apps/
+        // device/group/tag_cohort/version_devices) internally, and is the SOLE
+        // consumer every surface (REST, MCP, dashboard) reads.
+        //
+        // GAP-1 CLOSED (#4857, architect D1 ruling): the model-picker's
+        // device-model scope-selector values no longer need a standalone
+        // TagStore-reading lambda here — `DexRoutes` now derives them
+        // in-seam from `dex_perf_api`'s own `fleet_snapshot` (see
+        // `DexPerfApi`'s own doc comment).
         // ADR-0031 WS-A4 #4250: the /auto VERIFY compare resource's store-reaching
         // assembly (members-then-B1-rows, ADR-0012 §1) moved verbatim behind the
         // VerifyApi seam (verify_api.{hpp,cpp}) — ONE instance, shared by the
@@ -15710,6 +17564,18 @@ private:
         // ready, degrading every `compare()` call to the AUTHORITATIVE nullopt.
         auto verify_api =
             make_local_verify_api(*mgmt_group_store_, app_perf_cohort_reader_.get());
+        // ADR-0031 WS-A4 (sixth family): the DEX app-perf-over-time API seam —
+        // the SOLE instance backing the 9 GET /api/v1/dex/perf/* resources
+        // (minus /compare, VerifyApi's above) + GET /api/v1/dex/devices/{id}/
+        // app-perf, the MCP DEX perf tools, AND (#4626) the dashboard
+        // fragments (DexRoutes) — every consumer reads this one instance, so
+        // none can disagree. Wired with the SAME `dex_perf_fn` closure (below)
+        // DexRoutes shares, so the heartbeat-now denominator can never diverge
+        // — mirrors DexApi's own FleetFn threading (dex_api, below).
+        auto dex_perf_api = make_local_dex_perf_api(
+            dex_perf_fn, app_perf_fleet_store_.get(), app_perf_daily_store_.get(),
+            app_perf_group_reader_.get(), mgmt_group_store_.get(), tag_store_.get(),
+            dex_app_version_failures_owner_.get());
         // The dashboard scope-selector's group list (id + name only). NO per-group
         // member count: that would be an N+1 get_members() over the store on every
         // render (UP-7); the selector needs names, not counts.
@@ -15747,10 +17613,10 @@ private:
         //
         // #4035: extracted into a named variable (was inline at the
         // DexRoutes::register_routes call site below) so the SAME provider is
-        // also passed to RestApiV1::register_routes's dex_fleet_fn param —
-        // the new GET /api/v1/dex/{health,trends,overview,catalogue/group}
-        // REST twins read the identical fleet snapshot the dashboard renders
-        // against, never a second independently-computed copy.
+        // also handed to make_local_dex_api's FleetFn — the DexApi behind the
+        // GET /api/v1/dex/{health,trends,overview,catalogue/group} REST twins
+        // (and their MCP twins) reads the identical fleet snapshot the
+        // dashboard renders against, never a second independently-computed copy.
         auto dex_fleet_fn = [this]() -> DexFleet {
             DexFleet f;
             const auto ids = registry_.all_ids();
@@ -15760,18 +17626,19 @@ private:
                     std::string os = s->os;
                     for (auto& c : os)
                         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    // starts_with, NOT find — "darwin" contains "win"
-                    // (G4 UP-1; pre-existing here, fixed with the sibling).
-                    if (os.starts_with("win"))
-                        ++f.windows_online;
+                    // The shared normalizer (dex_perf_rules.hpp) folds the
+                    // "darwin contains win" G4 UP-1 fix into one place instead
+                    // of a duplicate copy of the comment at every call site.
+                    const std::string norm_os = detail::dex_perf_os_from_session(os);
                     // Per-OS online denominators (#1746) — same coverage-honest
                     // count as windows_online, so the Catalogue's single-OS
                     // filter can score a family against THAT OS's own fleet.
-                    if (os.starts_with("lin"))
+                    if (norm_os == "windows")
+                        ++f.windows_online;
+                    else if (norm_os == "linux")
                         ++f.linux_online;
-                    if (os.starts_with("darwin") || os.starts_with("macos"))
-                        ++f.macos_online; // prefix, like win/lin — keep in
-                                          // step with the store's write canon
+                    else if (norm_os == "macos")
+                        ++f.macos_online;
                     // Distinct connected OS tokens → the Catalogue's "All
                     // connected" coverage scope (render normalises darwin→macos).
                     if (!os.empty() && std::find(f.connected_os.begin(),
@@ -15820,14 +17687,18 @@ private:
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
-            // F2a: the shared fleet perf snapshot provider (defined above).
-            dex_perf_fn,
             // Per-device scope gate (same require_scoped_permission the /device routes
             // use) + the visible-agent set resolver — so the per-device DEX drills are
             // scoped and the device-id lists never enumerate out-of-scope agents.
             scoped_perm_fn, visible_set_fn,
-            // F2b app-perf-over-time providers + the scope-selector group list.
-            app_perf_providers, dex_group_list_fn);
+            // ADR-0031 WS-A4 (sixth family, #4626): the DEX app-perf-over-time
+            // API seam (F2a heartbeat-now + F2b over-time) + the scope-selector
+            // group list — replaces the retired `app_perf_providers` bundle.
+            dex_perf_api, dex_group_list_fn,
+            // The devices-by-version drill's sole gate (ADR-0017) — the SAME
+            // fleet_read_fn lambda wired into RestApiV1/McpServer, so all three
+            // surfaces resolve visibility identically.
+            fleet_read_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).
@@ -15840,8 +17711,17 @@ private:
         // MCP network tools, so all three can never disagree.
         auto network_api = make_local_network_api(health_store_, registry_, tag_store_.get());
 
+        // Discovered-devices read seam: one reader over the discovery store,
+        // shared by the REST + fragment routes below and the MCP tool. A null
+        // or unopened store yields a reader that errors, so a store fault is
+        // never rendered as "no hosts".
+        // The reader captures the raw store pointer: `discovery_store_` outlives every
+        // handler because web_server_->stop() runs before members destruct.
+        auto discovered_reader = make_discovered_devices_reader(discovery_store_.get());
+
         network_routes_ = std::make_unique<NetworkRoutes>();
-        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, network_api);
+        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, network_api,
+                                         discovered_reader);
 
         // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
         // page; Device-info lens). Sourced from the live registry (the CONNECTED
@@ -15895,10 +17775,78 @@ private:
                     return make_device_row(a);
             return std::nullopt;
         };
+        // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam (identity/
+        // list data) — the SAME instance DeviceRoutes, REST GET /api/v1/devices[/{id}]
+        // and MCP list_agents/get_agent_details use, so all three surfaces can never
+        // disagree. `make_device_row`/`devices_fn`/`lookup_fn` above are NOT retired
+        // by this rewire — they are shared infrastructure with other live consumers
+        // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
+        // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
+        auto device_api = make_local_device_api(registry_, tag_store_.get());
+        // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
+        // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
+        // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
+        // (defined above) the DEX fragments/REST/MCP already share, so the
+        // fleet denominator can never diverge between the seam and the
+        // fragments. Passed to RestApiV1::register_routes below.
+        // Gated on store presence so `!dex_api` in the REST handlers is the
+        // exact readiness signal the old `if (!guaranteed_state_store)` 503
+        // guard used: store present → wired; store absent → nullptr → 503
+        // (byte-identical). Mirrors verify_api's "null → 503" contract.
+        std::shared_ptr<yuzu::server::DexApi> dex_api;
+        if (guaranteed_state_store_)
+            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn);
+        // ADR-0031 WS-A4 (seventh family): the schedule-read API seam — ONE
+        // instance backing GET /fragments/schedules (WorkflowRoutes),
+        // GET /api/v1/schedules (also WorkflowRoutes), and MCP
+        // list_schedules, so the three can never disagree. Gated on store
+        // presence, same posture as dex_api above: `!schedule_api` reads as
+        // "engine not available" wherever a consumer checks it, matching the
+        // pre-seam `if (!schedule_engine)` guards byte-for-byte.
+        std::shared_ptr<yuzu::server::ScheduleApi> schedule_api;
+        if (schedule_engine_)
+            schedule_api = make_local_schedule_api(*schedule_engine_);
+        // ADR-0031 WS-A4 (eighth family): the workflow-read API seam — ONE
+        // instance backing GET /api/v1/workflows[/{id}] and
+        // GET /api/v1/workflow-executions/{id} (WorkflowRoutes) and MCP
+        // list_workflows/get_workflow/get_workflow_execution, so the three
+        // can never disagree. Gated on store presence, same posture as
+        // schedule_api above: `!workflow_api` reads as "engine not
+        // available" wherever a consumer checks it, matching the pre-seam
+        // `if (!workflow_engine)` guards byte-for-byte.
+        std::shared_ptr<yuzu::server::WorkflowApi> workflow_api;
+        if (workflow_engine_)
+            workflow_api = make_local_workflow_api(*workflow_engine_);
+        // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam — ONE
+        // instance backing 8 of the 9 GET /api/v1/guaranteed-state/* resources
+        // (all but the store-free `schemas`) and their MCP twins, so the two
+        // can never disagree.
+        // Constructed UNCONDITIONALLY (never null) — mirrors dex_perf_api's
+        // own multi-dependency posture, NOT dex_api's/workflow_api's
+        // store-gated one: seven of the eight methods need ONLY
+        // guaranteed_state_store_, and only device_compliance needs both, so
+        // each backing store pointer is checked INDIVIDUALLY inside the impl
+        // (guardian_api.cpp) — a null `guaranteed_state_store_` degrades
+        // every method, a null `baseline_store_` degrades ONLY
+        // device_compliance, exactly matching the pre-seam per-route
+        // `if (!guaranteed_state_store)` guards (never a combined
+        // both-required gate, which would make baseline_store_'s mere
+        // absence 503 the other seven routes too).
+        // `guaranteed_state_store_`/`baseline_store_` stay wired below too,
+        // for the rule/baseline MUTATORS this seam does not cover.
+        auto guardian_api = make_local_guardian_api(guaranteed_state_store_.get(),
+                                                     baseline_store_.get());
+        // Per-row/per-page DEX score — wraps dex_device_score against the SAME
+        // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
+        // itself already returns -1 on a null store, so no separate null-guard is
+        // needed here (matches the prior `if (store_) {...}` guard's net effect).
+        auto dex_score_fn = [this](const std::string& agent_id) -> int {
+            return dex_device_score(guaranteed_state_store_.get(), agent_id, dex_iso_since(7));
+        };
         device_routes_ = std::make_unique<DeviceRoutes>();
         device_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
-            guaranteed_state_store_.get(),
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, device_api, visible_set_fn,
+            dex_score_fn,
             // "Get live info" dispatches real read-only plugin instructions through the
             // shared chokepoint — the live-snapshot cards (processes/list_tree +
             // network_diag/connections, services/list, users/logged_on,
@@ -15934,17 +17882,31 @@ private:
             },
             audit_fn);
 
-        // InventoryRoutes — /inventory: the SOFTWARE inventory list (fleet catalogue +
-        // installs-per-version drill + find-by-name) over SoftwareInventoryStore, gated on
-        // the GLOBAL Inventory:Read (the catalogue/find aggregates are NOT mgmt-group
-        // scoped — ADR-0017 confinement inert under the global gate, caveated in the UI;
-        // FIND applies the SAME per-row Inventory:Read drop filter the REST sibling does).
-        // Plus a THIN device-CI tab sourced from the persisted, offline-survivable
-        // endpoint_state store (so offline devices still appear) joined to the registry's
-        // online set; the per-device software drill gates on scoped_perm_fn(Inventory,Read,id)
-        // and audits the access (set-and-proceed — machine-scope data). Reuses the shared
-        // auth/perm/scoped-perm/audit closures + the SAME check_scoped_permission predicate
-        // the REST /api/v1/inventory/software route uses (cross-surface parity).
+        // DeviceLensRoutes — the DEX + Guardian device-page lenses, split out of
+        // DeviceRoutes (ADR-0031 WS-A4 wave 2, see device_lens_routes.hpp's own
+        // banner) and rewired onto the DexApi/GuardianApi seams (issue #4576 +
+        // the deferred guardian-lens rewire). `dex_api` is already gated on
+        // `guaranteed_state_store_` presence above (null -> null, matching the
+        // fragment's own pre-rewire `!store_` 503-placeholder posture
+        // byte-for-byte); `guardian_api` itself is constructed unconditionally
+        // (its OWN degrade posture is per-method, not per-instance), so the
+        // SAME `guaranteed_state_store_` presence gate is applied explicitly
+        // here to preserve that byte-identical posture for this lens too.
+        // Same scope/audit wiring the lenses had inside DeviceRoutes.
+        device_lens_routes_ = std::make_unique<DeviceLensRoutes>();
+        device_lens_routes_->register_routes(
+            *web_server_, scoped_perm_fn, dex_api,
+            guaranteed_state_store_ ? DeviceLensRoutes::GuardianApiPtr{guardian_api}
+                                    : DeviceLensRoutes::GuardianApiPtr{},
+            audit_fn);
+
+        // InventoryRoutes — /software: the SOFTWARE inventory list (fleet catalogue +
+        // installs-per-version drill + "devices >" expansion) over SoftwareInventoryStore,
+        // gated solely on fleet_read_fn (ADR-0017 admit-then-filter, the same gate as the REST
+        // route and MCP tool): the catalogue and version aggregates cannot be narrowed to a
+        // management group, so a confined caller is refused them; the host view and the
+        // devices tables are admitted and narrowed by the gate's own scope. Reuses the shared
+        // auth/audit closures.
         auto inv_human_age = [](std::int64_t ms) -> std::string {
             if (ms < 0)
                 ms = 0;
@@ -15959,9 +17921,9 @@ private:
                 return std::to_string(h) + "h ago";
             return std::to_string(h / 24) + "d ago";
         };
-        auto inv_devices_fn = [this, visible_set_fn,
-                               inv_human_age](const std::string& username)
-            -> InventoryDevicesResult {
+        // The Hardware page's RosterFn: unfiltered — the FleetReadGate's own scope is the
+        // sole filter downstream, applied by HardwareRoutes.
+        auto build_hw_roster = [this, inv_human_age]() -> InventoryDevicesResult {
             InventoryDevicesResult result;
             auto& out = result.rows;
             if (!offline_endpoint_store_) {
@@ -15971,41 +17933,49 @@ private:
             // Persisted endpoints within a 30-day window — OFFLINE-INCLUSIVE (the whole
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
-            auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+            auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+            if (!apply_roster_read(result, eps)) // #5531: unread, not empty — no enrichment
+                return result;
             // currently-connected agents (live registry). all_ids() copies only the ids
             // under the registry lock — NOT to_json_obj()'s full 5-field-per-agent JSON
             // serialisation under the heartbeat/dispatch hot-path mutex (gov perf-S2).
+            // all_ids() is this replica's local sessions UNION the cached durable presence
+            // (live_presence(), refreshed at most every kPresenceCacheTtl = 3 s): a device
+            // gracefully departed from another replica can still read online here for up to
+            // that TTL (#5678), after which its cleared session_id drops it from presence.
             // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
             auto online_ids = registry_.all_ids();
             std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
-            const auto visible = visible_set_fn(username); // nullopt = sees all (global read)
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            for (const auto& e : eps) {
-                if (visible && !visible->count(e.agent_id))
-                    continue; // out of the operator's management scope
+            for (const auto& e : *eps) {
                 InventoryDeviceRow r;
                 r.agent_id = e.agent_id;
                 r.hostname = e.hostname;
                 r.os = e.os;
+                // endpoint_state v2 (round-3 merge): last-known version/arch,
+                // durable across a disconnect. Overwritten below with the live
+                // registry session's copy when the agent is currently online.
+                r.agent_version = e.agent_version;
+                r.arch = e.arch;
                 r.online = online.count(e.agent_id) > 0;
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
-                r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000); // matches the inventory stale window
+                r.stale = age_ms > kHardwareStaleAfterMs; // matches the inventory stale window
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
+                r.last_seen_ms = r.online ? now_ms : e.last_heartbeat_ms;
                 out.push_back(std::move(r));
             }
             // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
             // clamped to DeviceInventoryStore's kListRowCap (100k)" per that store's own
             // limit-clamp contract, not "zero rows" — (symmetric with the full
             // offline_endpoint_store_ materialize above), joined by agent_id via the pure
-            // attach_device_ci (inventory_ci_join.cpp). `out` is ALREADY the
-            // visible-confined roster (the loop above already dropped out-of-scope
-            // agents) — attach_device_ci only ever looks up by an agent_id already in
-            // `out`, so a CI row for an out-of-scope agent riding along in the same read
-            // is never attached, never rendered. A degrade (nullopt) leaves CI columns
-            // blank — the roster itself is still shown (this list is best-effort, unlike
-            // the Software tab's authoritative reads; see the existing empty-roster note).
+            // attach_device_ci (inventory_ci_join.cpp). `out` is the
+            // UNFILTERED roster — confinement is HardwareRoutes' `scoped_roster` on the
+            // FleetReadGate scope, downstream of this join; attach_device_ci only ever
+            // looks up by an agent_id already in `out`, never re-deriving
+            // visibility. A CI-join degrade (nullopt) leaves CI columns
+            // blank; the roster read itself is typed and handled by apply_roster_read above.
             // KNOWN FOLLOW-UP (#1783 — gov Gate 3 performance + architect + Gate 5 chaos
             // review): this reads the WHOLE fleet's CI on every render regardless of how
             // few devices are visible, unlike the Software tab's hourly rollup
@@ -16013,10 +17983,11 @@ private:
             // read-cadence-vs-write-cadence mismatch for daily-synced data. Deferred rather
             // than fixed here to keep this PR scoped to dashboard-read enrichment.
             //
-            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's audit whether
-            // the CI columns above are genuinely enriched or blank because this join
-            // failed/was unwired — an unwired store is treated the same as a live failure
-            // (mirrors AgentCiFn's documented contract for the per-device drill).
+            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's UI banner and
+            // the REST `ci_degraded` field whether the CI columns above are genuinely
+            // enriched or blank because this join failed/was unwired (the audit row is
+            // emitted regardless) — an unwired store is treated the same as a live failure
+            // (mirrors the Hardware CI record's CiDetailFn contract).
             if (device_inventory_store_) {
                 auto ci_list = device_inventory_store_->list_device_ci(0);
                 if (ci_list) {
@@ -16038,80 +18009,512 @@ private:
             } else {
                 result.ci_degraded = true;
             }
+            // Round-3 Devices-page merge: agent version/arch (session-sourced,
+            // online rows only — an offline row's version/arch come from the
+            // endpoint_state v2 columns via the CI-attach step above, not here),
+            // live IPs (TAR fleet-snapshot claims, online-only, 60 s cache), and
+            // tags (bulk-preloaded, two queries for the whole roster — never a
+            // per-row store call, matching the tag-compliance dashboard's own
+            // ADR-0050 discipline above).
+            for (auto& r : out) {
+                if (!r.online)
+                    continue;
+                if (auto sess = registry_.get_session(r.agent_id)) {
+                    r.agent_version = sess->agent_version;
+                    r.arch = sess->arch;
+                }
+            }
+            if (fleet_topology_store_) {
+                const auto ips = fleet_topology_store_->claimed_ips();
+                for (auto& r : out) {
+                    auto it = ips.find(r.agent_id);
+                    if (it != ips.end())
+                        r.ips = it->second;
+                }
+            }
+            if (tag_store_) {
+                apply_tag_read(result, tag_store_->get_distinct_keys(),
+                               [this](const std::vector<std::string>& keys) {
+                                   return tag_store_->get_values_for_keys(keys);
+                               });
+            } else {
+                result.tags_degraded = true;
+            }
             return result;
+        };
+        // One device's identity row for the Hardware CI record — checks the live
+        // registry first (online, authoritative hostname/OS), else falls back to a
+        // linear scan of the same 30-day offline_endpoint_store_ roster the list
+        // uses. FOLLOW-UP: no point read exists on OfflineEndpointStore yet
+        // (#1783-adjacent) — a per-open O(fleet) scan is acceptable for a CI record
+        // page (opened far less often than the list re-renders).
+        auto hw_identity_fn = [this, inv_human_age](const std::string& agent_id)
+            -> std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> {
+            if (auto sess = registry_.get_session(agent_id)) {
+                InventoryDeviceRow r;
+                r.agent_id = agent_id;
+                r.hostname = sess->hostname;
+                r.os = sess->os;
+                r.agent_version = sess->agent_version;
+                r.arch = sess->arch;
+                if (fleet_topology_store_)
+                    r.ips = fleet_topology_store_->ips_for(agent_id);
+                r.online = true;
+                r.last_seen = "now";
+                r.last_seen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+                return r;
+            }
+            if (!offline_endpoint_store_)
+                return std::optional<InventoryDeviceRow>{};
+            const auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+            const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+            return offline_identity_row(eps, agent_id, now_ms, inv_human_age);
+        };
+        // The full per-device CI record composition — ONE closure shared verbatim
+        // by the dashboard fragment and the REST twin, so the two can never drift
+        // on what "the CI record" means. No MCP twin exists yet (tracked as a
+        // follow-up, governance Gate 3 finding — this comment previously claimed
+        // one was already wired).
+        auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
+            HardwareCiDetail detail;
+            apply_identity_read(detail, hw_identity_fn(agent_id));
+            if (auto sess = registry_.get_session(agent_id))
+                detail.agent_version = sess->agent_version; // immutable identity field, lock-free
+            detail.ci = device_inventory_store_
+                            ? device_inventory_store_->get_device_ci(agent_id)
+                            : std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+                                  std::unexpected(CiReadError::kDegraded));
+            if (software_inventory_store_) {
+                auto sw = software_inventory_store_->get_agent_software(agent_id);
+                if (sw) {
+                    detail.software_truncated = sw->size() > kHwSoftwareCap;
+                    if (detail.software_truncated)
+                        sw->resize(kHwSoftwareCap);
+                }
+                detail.software = std::move(sw);
+                detail.software_last_seen =
+                    software_inventory_store_->source_last_seen(agent_id, "installed_software");
+            }
+            if (tag_store_) {
+                auto tags = tag_store_->get_all_tags(agent_id);
+                detail.tags = tags ? std::optional(std::move(*tags)) : std::nullopt;
+            }
+            return detail;
+        };
+        // agent_id -> hostname, one bulk read of the 30-day roster. Shared by the Software
+        // devices tables and the Quarantined devices panel.
+        auto hw_hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
+            std::unordered_map<std::string, std::string> out;
+            if (!offline_endpoint_store_)
+                return out;
+            // #5531 exception: display-only; a failed read leaves hostnames
+            // unresolved and the page falls back to the agent_id.
+            for (auto& e : offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)
+                               .value_or(std::vector<OfflineEndpoint>{}))
+                out.emplace(std::move(e.agent_id), std::move(e.hostname));
+            return out;
         };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, scoped_perm_fn,
-            [this](const SoftwareCatalogQuery& q)
-                -> std::optional<std::vector<SoftwareCatalogRow>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->software_catalog(q);
-            },
-            [this]() -> std::optional<CatalogRollupMeta> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->catalog_rollup_meta();
-            },
-            [this](const std::string& name,
-                   int limit) -> std::optional<std::vector<SoftwareVersionCount>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->software_versions(name, limit);
-            },
-            [this](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->query_software(q);
-            },
-            [this](const std::string& id) -> std::optional<std::vector<SoftwareEntry>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->get_agent_software(id);
-            },
-            inv_devices_fn,
-            // FIND per-row Inventory:Read management-group scope predicate — the SAME
-            // check_scoped_permission chokepoint the REST route + MCP tool use.
-            // FAIL-CLOSED on a corrupt/load-failed rbac.db (#1717): gates on
-            // rbac_enforcement_in_effect, NOT raw !is_rbac_enabled() (which fails OPEN — a
-            // null db reads as "RBAC off → no filter" → cross-operator IDOR). Mirrors
-            // response_agent_in_scope (server.cpp); the REST/MCP siblings still carry the raw
-            // form pending the #1717 global-gate fix, but each new list-read takes the safe
-            // primitive now (ADR-0017 ship-now, decision-independent hardening).
-            [this](const std::string& username, const std::string& agent_id) -> bool {
-                if (!rbac_enforcement_in_effect(rbac_store_.get()))
-                    return true; // loaded & explicitly disabled → legacy-open
-                return rbac_store_ && rbac_store_->check_scoped_permission(
-                                          username, "Inventory", "Read", agent_id,
-                                          mgmt_group_store_.get());
-            },
-            // Freshness KPI: current stale count (nullopt on degrade → "—" in the UI).
-            // SAME 2-missed-cycles window as the metrics sweep.
-            [this]() -> std::optional<std::int64_t> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                constexpr std::int64_t kWin = 2 * 24 * 60 * 60;
-                const std::int64_t cutoff = std::chrono::duration_cast<std::chrono::seconds>(
-                                                std::chrono::system_clock::now().time_since_epoch())
-                                                .count() -
-                                            kWin;
-                return software_inventory_store_->count_stale_agents(cutoff);
-            },
-            audit_fn,
-            // Per-device CI record (drill panel, post scoped_perm_fn gate). Mirrors
-            // agent_sw_fn_'s "unwired closure" fallback: not applicable here since this
-            // closure is always wired when device_inventory_store_ exists, and returns a
-            // live kDegraded when it doesn't (the store itself failed to construct/open).
-            // Appended after audit_fn (rather than inserted mid-signature) to match the
-            // DeviceRoutes/DexRoutes convention of growing register_routes by appending
-            // new closures with a `= {}` default (gov Gate 3 architect review).
-            [this](const std::string& id)
-                -> std::expected<std::optional<DeviceCiRecord>, CiReadError> {
-                if (!device_inventory_store_)
-                    return std::unexpected(CiReadError::kDegraded);
-                return device_inventory_store_->get_device_ci(id);
+            *web_server_,
+            InventoryRoutes::Deps{
+                .auth_fn = auth_fn,
+                // The Software fragments' SOLE gate (ADR-0017).
+                .fleet_read_fn = fleet_read_fn,
+                .catalog_fn = [this](const SoftwareCatalogQuery& q)
+                    -> std::optional<std::vector<SoftwareCatalogRow>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->software_catalog(q);
+                },
+                .catalog_meta_fn = [this]() -> std::optional<CatalogRollupMeta> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->catalog_rollup_meta();
+                },
+                .totals_fn = [this](const SoftwareCatalogQuery& q)
+                    -> std::optional<SoftwareCatalogTotals> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->software_catalog_totals(q);
+                },
+                .versions_fn = [this](const SoftwareVersionsQuery& q)
+                    -> std::optional<std::vector<SoftwareVersionCount>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->software_versions(q);
+                },
+                .fleet_fn = [this](const SoftwareFleetQuery& q)
+                    -> std::optional<std::vector<SoftwareFleetRow>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->query_software(q);
+                },
+                // Freshness KPI: current stale count (nullopt on degrade -> "—" in the UI).
+                // The SAME 48 h window as the REST/MCP catalogue's coverage.stale.
+                .stale_fn = [this]() -> std::optional<std::int64_t> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    const std::int64_t cutoff =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        software_catalogue::kStaleWindowSecs;
+                    return software_inventory_store_->count_stale_agents(cutoff);
+                },
+                // ponytail: O(fleet) registry walk per full-page render (the REST twin does the
+                // same); an O(1) connected-count when the 2M-endpoint target bites.
+                .connected_fn = [device_api]() -> std::optional<std::int64_t> {
+                    if (!device_api)
+                        return std::nullopt;
+                    return static_cast<std::int64_t>(device_api->list_devices().size());
+                },
+                // agent_id -> hostname for the host type-ahead / devices tables. One bulk read
+                // per render; endpoint_state's hostname is written on every heartbeat whether
+                // the device is online or not, so the 30-day window covers both.
+                .hostnames_fn = hw_hostnames_fn,
+                // Last synced column: the same datum the Hardware record shows as
+                // `software_last_seen`, read in bulk for one devices page.
+                .last_synced_fn = [this](const std::vector<std::string>& ids)
+                    -> std::optional<std::unordered_map<std::string, std::int64_t>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->source_last_seen_bulk("installed_software",
+                                                                            ids);
+                },
+                .audit_fn = audit_fn});
+
+        // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
+        // Software lives at /software; /inventory redirects here.
+        // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
+        // ADR-0017) — `build_hw_roster` is deliberately UNFILTERED, matching
+        // `FleetReadFn`'s own contract (never stack a second scope predicate).
+        hardware_routes_ = std::make_unique<HardwareRoutes>();
+        hardware_routes_->register_routes(
+            *web_server_, HardwareRoutes::Deps{
+                             .auth_fn = auth_fn,
+                             .scoped_perm_fn = scoped_perm_fn,
+                             .fleet_read_fn = fleet_read_fn,
+                             .audit_fn = audit_fn,
+                             .roster_fn = build_hw_roster,
+                             .ci_detail_fn = hw_ci_detail_fn,
+                             // Actions lens (generic action runner): the connected
+                             // agent's advertised plugins/actions, copied into the
+                             // gRPC-free HwPluginActions shape.
+                             .actions_fn =
+                                 [this](const std::string& id)
+                                     -> std::optional<std::vector<HwPluginActions>> {
+                                     auto sess = registry_.get_session(id);
+                                     if (!sess)
+                                         return std::nullopt;
+                                     std::vector<HwPluginActions> out;
+                                     out.reserve(sess->plugin_meta.size());
+                                     for (const auto& pm : sess->plugin_meta)
+                                         out.push_back({pm.name, pm.version, pm.actions});
+                                     return out;
+                                 },
+                             .classify_fn =
+                                 [this](std::string_view p, std::string_view a) {
+                                     return capability_registry_.classify(p, a);
+                                 },
+                             // Enabled definitions' parameter_schema for one plugin,
+                             // keyed by action — object-shaped schemas only (mirrors
+                             // discover_routes.cpp's catalogue join).
+                             .schema_fn =
+                                 [this](const std::string& plugin)
+                                     -> std::unordered_map<std::string, std::string> {
+                                     std::unordered_map<std::string, std::string> out;
+                                     if (!instruction_store_)
+                                         return out;
+                                     InstructionQuery q;
+                                     q.plugin_filter = plugin;
+                                     q.enabled_only = true;
+                                     q.limit = 500;
+                                     auto defs = instruction_store_->query_definitions(q);
+                                     if (!defs)
+                                         return out;
+                                     for (const auto& d : *defs) {
+                                         auto parsed =
+                                             nlohmann::json::parse(d.parameter_schema, nullptr, false);
+                                         if (!parsed.is_discarded() && parsed.is_object())
+                                             out[d.action] = d.parameter_schema;
+                                     }
+                                     return out;
+                                 },
+                             // Narrow ResponseStore seam for the Actions-lens result poll
+                             // (byte-identical shape to DexRoutes' own — #1634: scope the
+                             // poll read AT THE STORE SEAM).
+                             .responses_fn =
+                                 [this](const std::string& command_id, const std::string& agent_id)
+                                     -> std::vector<DexAgentResponse> {
+                                     std::vector<DexAgentResponse> out;
+                                     if (!response_store_)
+                                         return out;
+                                     ResponseQuery q;
+                                     q.agent_id = agent_id;
+                                     for (const auto& r :
+                                          response_store_->query(command_id, q)
+                                              .value_or(std::vector<StoredResponse>{}))
+                                         out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                                     return out;
+                                 },
+                             // Execute-permission PROBE against a throwaway Response — the
+                             // Read gate above already ran; this is the stricter check
+                             // before offering (or honouring) a dispatch control. Same
+                             // idiom as DeviceRoutes' live-info `can_execute`.
+                             .scoped_probe_fn =
+                                 [scoped_perm_fn](const httplib::Request& req, const std::string& type,
+                                                  const std::string& op, const std::string& id) -> bool {
+                                     httplib::Response probe;
+                                     return scoped_perm_fn(req, probe, type, op, id);
+                                 },
+                             .action_descriptions = &detail::AgentRegistry::action_descriptions(),
+                             // Parameter hints: the embedded plugin-docs manifest (pre-serialised,
+                             // byte-identical to /api/v1/discover/plugin-docs/{name}).
+                             .manifest_fn =
+                                 [](const std::string& plugin) -> std::optional<std::string> {
+                                     const auto* doc = plugin_docs_manifest(plugin);
+                                     if (!doc)
+                                         return std::nullopt;
+                                     return doc->json;
+                                 },
+                             // Sync-on-demand: system-reserved push, the Guardian-push path
+                             // (build_classified_command(system) + send_system_reserved +
+                             // forward_gateway_pending) — NOT dispatch_confined, which would
+                             // withhold `__sync__` as a plugin no agent advertises (#3511).
+                             .sync_dispatch_fn =
+                                 [this](const std::string& id, const std::string& source)
+                                     -> HardwareRoutes::HwSyncDispatchResult {
+                                     const auto now_s =
+                                         std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
+                                     const auto command_id =
+                                         "__sync__-now-" + std::to_string(now_s) + "-" +
+                                         auth::AuthManager::bytes_to_hex(
+                                             auth::AuthManager::random_bytes(8));
+                                     auto classified = build_classified_command(
+                                         yuzu::server::DispatchCaller{.system = true}, "__sync__",
+                                         "now", command_id, /*parameters=*/{{"source", source}});
+                                     if (!classified)
+                                         return {};
+                                     const bool ok = send_system_reserved(
+                                         id, *classified,
+                                         yuzu::server::SystemReservedPush::inventory_sync_now);
+                                     if (ok)
+                                         forward_gateway_pending(); // gateway agents are only QUEUED
+                                     return {ok, command_id};
+                                 },
+                             .agent_version_fn =
+                                 [this](const std::string& id) -> std::optional<std::string> {
+                                     auto sess = registry_.get_session(id);
+                                     if (!sess)
+                                         return std::nullopt;
+                                     return sess->agent_version;
+                                 },
+                             // Devices-page merge (round 3): the same 7-day DEX score
+                             // used by the standalone Devices/DEX drills. Deliberately
+                             // NOT baked into RosterFn/build_hw_roster — this must only
+                             // ever be called on the rows actually rendered on the
+                             // current page (post filter/sort/paginate), never the whole
+                             // roster (dex_device_score is one GROUP-BY query per call).
+                             .dex_score_fn =
+                                 [this](const std::string& id) -> int {
+                                     return dex_device_score(guaranteed_state_store_.get(), id,
+                                                             dex_iso_since(7));
+                                 },
+                             // List pill: the authoritative active-quarantine read (one per
+                             // list render; the snapshot the dispatch gate keeps is a 20 s
+                             // cache and is deliberately not reused for an operator display).
+                             .quarantine_list_fn =
+                                 [this](const std::vector<std::string>* ids, std::size_t limit)
+                                     -> std::optional<std::vector<QuarantineRecord>> {
+                                     if (!quarantine_store_ || !quarantine_store_->is_open())
+                                         return std::nullopt;
+                                     return quarantine_store_->list_quarantined_in(ids, limit);
+                                 },
+                         });
+
+        // DashboardSummaryRoutes — /fragments/dashboard/summary (readout, needs
+        // attention, estate state). Every figure arrives through a closure over an
+        // existing typed read; the gates are the SAME fleet_read_fn / perm_fn the
+        // sibling pages receive. `build_hw_roster` is UNFILTERED: the route narrows
+        // it by the gate's scope.
+        static_assert(static_cast<int>(home::kRosterReadCap) == OfflineEndpointStore::kQueryRowCap,
+                      "The Dashboard labels a roster read as a lower bound at the store's row cap");
+        dashboard_summary_routes_ = std::make_unique<home::DashboardSummaryRoutes>();
+        dashboard_summary_routes_->register_routes(
+            *web_server_,
+            home::Deps{
+                .auth_fn = auth_fn,
+                .deny_service_scoped_fn = deny_service_scoped_fn,
+                .fleet_read_fn = draw_fleet_read_fn,
+                .perm_fn = draw_perm_fn,
+                .now_fn = []() -> std::int64_t {
+                    return std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+                },
+                .roster_fn = build_hw_roster,
+                // TOP callers: one SQL statement instead of the 100k-row-capped roster.
+                // Online is the registry's union count (local sessions + durable
+                // presence); when that is typed-unavailable (past the presence row cap,
+                // or a presence-store error) the SQL durable-live count stands in. That
+                // count is durable presence only (local sessions not yet persisted are
+                // not in it) and uses the same TTL as the registry's presence read
+                // (cfg_.session_timeout).
+                // NOT confined: the summary route only calls this when the gate
+                // returned `scope == nullopt`, and caches a successful answer for 60 s.
+                .fleet_estate_fn =
+                    [this](std::int64_t now_ms) -> std::optional<home::EstateCounts> {
+                    if (!offline_endpoint_store_)
+                        return std::nullopt;
+                    auto c = offline_endpoint_store_->fleet_state_counts(
+                        now_ms, kHardwareRosterWindow,
+                        std::chrono::milliseconds(kHardwareStaleAfterMs), cfg_.session_timeout);
+                    if (!c)
+                        return std::nullopt;
+                    // The registry can know agents the store has no row for; the adapter
+                    // widens rather than clamps, or a live fleet reads as "no devices" (and
+                    // is cached). Registry count when it can answer, else the SQL live count.
+                    const auto known = registry_.known_agent_count();
+                    const auto r = fleet_estate_reading(
+                        *c, known ? std::optional<std::size_t>{*known} : std::nullopt);
+                    return home::EstateCounts{r.total, r.online, r.not_seen, r.offline,
+                                              r.lower_bound};
+                },
+                .compliance_fn = [compliance_api]() -> std::optional<home::ComplianceFigure> {
+                    if (!compliance_api)
+                        return std::nullopt;
+                    auto fc = compliance_api->fleet_compliance();
+                    if (!fc)
+                        return std::nullopt;
+                    return home::ComplianceFigure{fc->total_checks, fc->compliant, fc->non_compliant,
+                                                  fc->unknown, fc->compliance_pct};
+                },
+                .failed_fn = [this]() -> std::optional<std::vector<home::FailedRow>> {
+                    if (!execution_tracker_)
+                        return std::nullopt;
+                    auto rows = execution_tracker_->query_executions_checked(
+                        {.status = "failed", .limit = static_cast<int>(home::kFailedReadCap)});
+                    if (!rows)
+                        return std::nullopt;
+                    std::vector<home::FailedRow> out;
+                    out.reserve(rows->size());
+                    for (const auto& e : *rows)
+                        out.push_back({e.completed_at, e.dispatched_at});
+                    return out;
+                },
+                .approvals_fn = [this]() -> std::optional<home::ApprovalFigure> {
+                    if (!approval_manager_)
+                        return std::nullopt;
+                    auto n = approval_manager_->pending_count_checked();
+                    if (!n)
+                        return std::nullopt;
+                    home::ApprovalFigure f;
+                    f.count = *n;
+                    // "Oldest" needs the capped list; a truncated list has no honest oldest.
+                    auto list = approval_manager_->query_checked({.status = "pending"});
+                    if (list && !list->truncated) {
+                        std::int64_t oldest = 0;
+                        for (const auto& a : list->approvals)
+                            if (a.submitted_at > 0 && (oldest == 0 || a.submitted_at < oldest))
+                                oldest = a.submitted_at;
+                        if (oldest > 0)
+                            f.oldest = oldest;
+                    }
+                    return f;
+                },
+                .enrolment_fn = [this]() -> std::optional<std::int64_t> {
+                    auto pending = auth_mgr_.list_pending_agents();
+                    if (!pending)
+                        return std::nullopt;
+                    std::int64_t n = 0;
+                    for (const auto& a : *pending)
+                        if (a.status == auth::PendingStatus::pending)
+                            ++n;
+                    return n;
+                },
             });
+
+        // HM-2: Dashboard "Compliance by policy" and "Recent events" fragments (the
+        // "Server health" panel registers from health_routes.cpp, where
+        // `health_handler` is in scope). Gates are the same closures
+        // HardwareRoutes receives; the audit panel is effective-admin-only and is
+        // NOT confined (see home_panels_routes.hpp).
+        {
+            HttplibRouteSink home_panels_sink{*web_server_};
+            yuzu::server::home_panels::Deps hp;
+            hp.auth_fn = auth_fn;
+            hp.deny_service_scoped_fn = deny_service_scoped_fn;
+            hp.fleet_read_fn = draw_fleet_read_fn;
+            hp.perm_fn = draw_perm_fn;
+            // One cached read of every policy's counts; NOT confined, and only
+            // called when the gate returned `scope == nullopt`.
+            hp.policies_fn = [compliance_api]() {
+                return yuzu::server::home_panels::read_policy_panel(*compliance_api);
+            };
+            hp.audit_fn = [this](int limit) -> std::optional<std::vector<AuditEvent>> {
+                if (!audit_store_)
+                    return std::nullopt;
+                AuditQuery q;
+                q.limit = limit;
+                return audit_store_->query(q);
+            };
+            hp.now_fn = [] {
+                return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                                     std::chrono::system_clock::now()
+                                                         .time_since_epoch())
+                                                     .count());
+            };
+            // Nav-resolved: empty when no `audit` nav item exists, which omits the
+            // "Audit log" button.
+            hp.audit_href = home::resolve_links(shell::nav_groups()).audit;
+            yuzu::server::home_panels::register_dashboard_panel_routes(home_panels_sink, std::move(hp));
+        }
+
+        // Containment (quarantine) fragments — read-only twins of GET /api/v1/quarantine.
+        // The mutations are the existing POST/DELETE /api/v1/quarantine, called from page JS.
+        device_containment_routes_ = std::make_unique<DeviceContainmentRoutes>();
+        {
+            HttplibRouteSink containment_sink(*web_server_);
+            device_containment_routes_->register_routes(
+                containment_sink,
+                DeviceContainmentRoutes::Deps{
+                    .auth_fn = auth_fn,
+                    .scoped_perm_fn = scoped_perm_fn,
+                    .fleet_read_fn = fleet_read_fn,
+                    .list_fn = [this](const std::vector<std::string>* ids, std::size_t limit)
+                        -> std::optional<std::vector<QuarantineRecord>> {
+                        if (!quarantine_store_ || !quarantine_store_->is_open())
+                            return std::nullopt;
+                        return quarantine_store_->list_quarantined_in(ids, limit);
+                    },
+                    .status_fn = [this](const std::string& id)
+                        -> std::expected<std::optional<QuarantineRecord>, std::string> {
+                        if (!quarantine_store_ || !quarantine_store_->is_open())
+                            return std::unexpected(std::string("quarantine store unavailable"));
+                        return quarantine_store_->get_status(id);
+                    },
+                    .identity_fn = hw_identity_fn,
+                    .hostnames_fn = hw_hostnames_fn,
+                });
+        }
+
+        // Stored data panel — read-only twin of the gate on DELETE /api/v1/sle/agents/{id}.
+        device_estate_routes_ = std::make_unique<DeviceEstateRoutes>();
+        {
+            HttplibRouteSink estate_sink(*web_server_);
+            device_estate_routes_->register_routes(
+                estate_sink, DeviceEstateRoutes::Deps{
+                                 .scoped_perm_fn = scoped_perm_fn,
+                                 .identity_fn = hw_identity_fn,
+                             });
+        }
 
         // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the
         // NEW SoftwareLicensing securable via the FAIL-CLOSED enforcement primitive
@@ -16179,6 +18582,129 @@ private:
                 return decommission_agent(agent_id);
             },
             audit_fn);
+
+        // AppUsageRoutes — /api/v1/forensics/agents/{agent_id}/app-usage (Wave 7
+        // PR7.2). Same fail-closed enforcement primitive as SleRoutes above
+        // (sle_gate_usable/G-1) — a corrupt/load-failed rbac.db is REFUSED (503),
+        // never served a legacy-open Forensics read. Forensics is
+        // Administrator-only by design (absent from the seeded Viewer read-list,
+        // docs/authz-model.md §4).
+        auto app_usage_scoped_perm_fn = [this, sle_gate_usable](
+                                            const httplib::Request& req, httplib::Response& res,
+                                            const std::string& type, const std::string& op,
+                                            const std::string& agent_id) -> bool {
+            if (!sle_gate_usable(req, res))
+                return false;
+            return require_scoped_permission(req, res, type, op, agent_id);
+        };
+        app_usage_routes_ = std::make_unique<AppUsageRoutes>();
+        app_usage_routes_->register_routes(
+            *web_server_, app_usage_scoped_perm_fn,
+            // Single-agent drill — REAL rows + batch collected_at, together in
+            // ONE transaction (AppUsageStore::get_agent_usage_snapshot) so a
+            // concurrent write between the two reads can't pair one snapshot's
+            // rows with another's collected_at. nullopt on degrade → 503;
+            // collected_at is sourced from the usage_state PARENT row — never
+            // rows.front().collected_at, which loses the value on a legitimate
+            // replace-to-empty snapshot (#C2).
+            [this](const std::string& agent_id) -> std::optional<AppUsageSnapshot> {
+                if (!app_usage_store_)
+                    return std::nullopt;
+                auto r = app_usage_store_->get_agent_usage_snapshot(agent_id);
+                if (!r.has_value())
+                    return std::nullopt;
+                return *r;
+            },
+            audit_fn);
+
+        // Hardware record, Installed software lens: click-to-load HTML twins of the two
+        // drills above. Same gates (sle_gate_usable / require_scoped_permission) and the
+        // same fail-closed audit verbs, probed against a throwaway Response so a denied or
+        // degraded gate renders a 200 note instead of a body htmx would drop.
+        {
+            HttplibRouteSink usage_sink{*web_server_};
+            auto usage_probe = [app_usage_scoped_perm_fn](const httplib::Request& req,
+                                                          const std::string& type,
+                                                          const std::string& op,
+                                                          const std::string& id)
+                -> yuzu::server::device_data::UsageDeps::Probe {
+                using P = yuzu::server::device_data::UsageDeps::Probe;
+                httplib::Response probe;
+                if (app_usage_scoped_perm_fn(req, probe, type, op, id))
+                    return P::Allowed;
+                return probe.status == 503 ? P::Unavailable : P::Denied;
+            };
+            yuzu::server::device_data::register_device_usage_routes(
+                usage_sink,
+                yuzu::server::device_data::UsageDeps{
+                    .auth_fn = auth_fn,
+                    .probe_fn = usage_probe,
+                    .audit_fn = audit_fn,
+                    .usage_fn =
+                        [this](const std::string& id)
+                            -> std::optional<yuzu::server::device_data::AppUsageData> {
+                            if (!app_usage_store_)
+                                return std::nullopt;
+                            auto r = app_usage_store_->get_agent_usage_snapshot(id);
+                            if (!r.has_value())
+                                return std::nullopt;
+                            yuzu::server::device_data::AppUsageData out;
+                            out.collected_at = r->collected_at;
+                            out.rows.reserve(r->rows.size());
+                            for (const auto& u : r->rows)
+                                out.rows.push_back({u.exe_key, u.first_seen, u.last_seen,
+                                                    u.run_count_30d, u.total_seconds_30d});
+                            return out;
+                        },
+                    .licences_fn =
+                        [this](const std::string& id)
+                            -> std::optional<std::vector<yuzu::server::device_data::LicenceRow>> {
+                            if (!software_licensing_store_)
+                                return std::nullopt;
+                            auto rows = software_licensing_store_->agent_licenses(id);
+                            if (!rows)
+                                return std::nullopt;
+                            std::vector<yuzu::server::device_data::LicenceRow> out;
+                            out.reserve(rows->size());
+                            for (const auto& l : *rows)
+                                out.push_back({l.product, l.vendor, l.version, l.license_type,
+                                               l.state, l.channel, l.confidence, l.key_hint,
+                                               l.detector, l.expiry_at});
+                            return out;
+                        },
+                });
+        }
+
+        // Software page: the "Inventory sources" panel, the HTML twin of
+        // GET /api/v1/inventory/tables (same global Inventory:Read gate).
+        {
+            HttplibRouteSink sources_sink{*web_server_};
+            yuzu::server::device_data::register_inventory_sources_route(
+                sources_sink,
+                yuzu::server::device_data::SourcesDeps{
+                    .auth_fn = auth_fn,
+                    .global_probe_fn =
+                        [perm_fn](const httplib::Request& req, const std::string& type,
+                                  const std::string& op) -> bool {
+                            httplib::Response probe;
+                            return perm_fn(req, probe, type, op);
+                        },
+                    .sources_fn =
+                        [this]() -> std::optional<std::vector<yuzu::server::device_data::SourceRow>> {
+                        if (!inventory_store_ || !inventory_store_->is_open())
+                            return std::nullopt;
+                        auto tables = inventory_store_->list_tables();
+                        if (!tables)
+                            return std::nullopt;
+                        std::vector<yuzu::server::device_data::SourceRow> out;
+                        out.reserve(tables->size());
+                        for (const auto& t : *tables)
+                            out.push_back({t.plugin, static_cast<std::int64_t>(t.agent_count),
+                                           static_cast<std::int64_t>(t.last_collected)});
+                        return out;
+                    },
+                });
+        }
 
         // PreflightRoutes — /auto pre-flight page. A config section (per-check
         // params + thresholds) runs the live checks (app version / os_version /
@@ -16369,10 +18895,16 @@ private:
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
+        // One definition for both the viz routes and the MCP get_fleet_topology
+        // tool so the two offline-roster surfaces cannot drift.
+        const OfflineRosterFn offline_roster =
+            offline_endpoint_store_
+                ? OfflineRosterFn{[this](std::chrono::seconds w) { return offline_endpoint_store_->query_stale_within(w); }}
+                : OfflineRosterFn{};
         viz_routes_ = std::make_unique<VizRoutes>();
         viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
                                      fleet_topology_store_.get(), &metrics_, &viz_disabled_,
-                                     offline_endpoint_store_.get());
+                                     offline_roster);
 
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
@@ -16381,6 +18913,9 @@ private:
         // handlers capture `this` at registration and read the member per
         // request, so setting it afterwards would never reach a live route.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // ADR-0033 section 9: the expression-targeted Send writes its `attempted` row through
+        // this persist-reporting sink BEFORE it dispatches (unwired = that path refuses).
+        dashboard_routes_->set_persist_audit_fn(audit_fn);
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software (fleet_read_fn, defined
         // above); wiring it here too so /fragments/results migrates onto
@@ -16505,6 +19040,12 @@ private:
         WorkflowRoutes::Deps wf_deps;
         wf_deps.auth_fn = auth_fn;
         wf_deps.perm_fn = perm_fn;
+        wf_deps.csrf_trusted_origins = cfg_.csrf_trusted_origins;
+        wf_deps.probe_perm_fn = [perm_fn](const httplib::Request& req, const std::string& type,
+                                          const std::string& op) -> bool {
+            httplib::Response scratch;
+            return perm_fn(req, scratch, type, op);
+        };
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software and DashboardRoutes above;
         // used only by the executions-drawer detail route.
@@ -16536,7 +19077,12 @@ private:
         };
         wf_deps.workflow_engine = workflow_engine_.get();
         wf_deps.execution_tracker = execution_tracker_.get();
-        wf_deps.schedule_engine = schedule_engine_.get();
+        // ADR-0031 WS-A4 (seventh family): the SAME schedule_api instance
+        // constructed above (shared with mcp_server_->set_schedule_api below).
+        wf_deps.schedule_api = schedule_api;
+        // ADR-0031 WS-A4 (eighth family): the SAME workflow_api instance
+        // constructed above (shared with mcp_server_->set_workflow_api below).
+        wf_deps.workflow_api = workflow_api;
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
@@ -16574,12 +19120,14 @@ private:
         // DashboardRoutes/McpServer above: capability_registry_ is a plain
         // ServerImpl member, never conditional on another store's presence.
         wf_deps.capability_registry = &capability_registry_;
+        wf_deps.param_validators = param_validator_cache_; // #5562: one byte-bounded cache
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*
         notification_routes_ = std::make_unique<NotificationRoutes>();
         notification_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
-                                              notification_store_.get());
+                                              notification_store_.get(), resolve_session_fn,
+                                              cfg_.csrf_trusted_origins);
 
         // WebhookRoutes — /api/webhooks/*
         webhook_routes_ = std::make_unique<WebhookRoutes>();
@@ -17267,6 +19815,10 @@ private:
                         }
                         return out;
                     },
+                    // REQUIRED: `register_file_retrieval_routes` throws
+                    // `std::invalid_argument` at registration if this is unbound (pinned by
+                    // test_upload_grants_service_scope.cpp).
+                    .deny_service_scoped_fn = deny_service_scoped_fn,
                     .audit_fn = audit_fn,
                     .store = upload_grant_store_.get(),
                     .blob_root = cfg_.db_dir() / "upload-blobs",
@@ -17369,13 +19921,13 @@ private:
         discover_routes_->register_routes(*web_server_, auth_fn, perm_fn, rbac_store_.get(),
                                           instruction_store_.get(), &registry_);
 
-        // DEX app-perf-over-time read providers (slice 2). One bundle of B1/B2
-        // store seams shared by the REST endpoints and the MCP twins so both read
-        // the SAME substrate. Each lambda null-checks the store at call time and
-        // returns std::nullopt on an unwired/closed store (the read surfaces map a
-        // nullopt to a 503 degrade, never a silent empty). The `app_perf_providers`
-        // bundle is built once ABOVE (before the DexRoutes registration) so the
-        // dashboard, REST and MCP surfaces all share the same store seams.
+        // DEX app-perf-over-time read providers (slice 2). `dex_perf_api`
+        // (built once ABOVE, before the DexRoutes registration) is the ONE
+        // seam shared by the dashboard, the REST endpoints, and the MCP twins
+        // (#4626) so all three read the SAME substrate — each method
+        // null-checks its backing store at call time and returns
+        // std::nullopt on an unwired/closed store (the read surfaces map a
+        // nullopt to a 503/"unavailable" degrade, never a silent empty).
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
@@ -17395,6 +19947,35 @@ private:
             return exists.has_value() && *exists;
         };
 
+        // #4981 PR-2: the SOLE scope-evaluation closure `POST
+        // /api/v1/scope/preview` and MCP `preview_scope_targets` both bind —
+        // byte-for-byte the same binding shape `command_routes.cpp`'s Scope
+        // arm and `wire_and_dispatch_confined` (dispatch_scope_ladder.hpp)
+        // already use for a real dispatch, so a scope preview now resolves
+        // `tag:`/`props.`/`from_result_set:` atoms identically to a real
+        // dispatch instead of the old bespoke per-agent resolver that never
+        // populated the latter two (#4981's fleet-wide over-disclosure bug —
+        // see scope_preview.hpp's file header). Defined ONCE as a plain `auto`
+        // closure (RestApiV1::ScopeEvaluateFn and McpServer::ScopeEvaluateFn
+        // are independently-declared class-scoped std::function aliases with
+        // the identical signature — this codebase's convention, see
+        // ExecVisibleFn — so the SAME closure converts cleanly into either
+        // one) and passed to both RestApiV1::set_scope_evaluate_fn and
+        // McpServer::set_scope_evaluate_fn below, so REST and MCP cannot
+        // silently diverge in which agents a preview matches.
+        // #4981 PR-3: `touch_referenced_result_sets = false` — a preview is a
+        // read-only dry run; it must resolve `from_result_set:` membership
+        // identically to a real dispatch WITHOUT extending a referenced
+        // owned set's TTL merely for being named in the check (real dispatch,
+        // via command_routes.cpp's Scope arm and wire_and_dispatch_confined,
+        // is unaffected and keeps the touch at its default `true`).
+        auto scope_evaluate_fn = [this](const yuzu::scope::Expression& parsed,
+                                        const std::string& principal) {
+            return registry_.evaluate_scope(parsed, tag_store_.get(), custom_properties_store_.get(),
+                                            result_set_store_.get(), principal,
+                                            /*touch_referenced_result_sets=*/false);
+        };
+
         rest_api_v1_ = std::make_unique<RestApiV1>();
         // Both setters MUST run BEFORE register_routes() (captured by value
         // at registration time, not `this`) — see set_engine_principal_store/
@@ -17406,6 +19987,57 @@ private:
             rest_api_v1_->set_engine_principal_store(engine_principal_store_.get());
             rest_api_v1_->set_user_exists_fn(engine_owner_exists_fn);
         }
+        // #4981 PR-2 — see scope_evaluate_fn's own comment above. MUST run
+        // BEFORE register_routes(), same timing contract as the two setters
+        // immediately above.
+        rest_api_v1_->set_scope_evaluate_fn(scope_evaluate_fn);
+        // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
+        // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
+        // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
+        // registry_.to_json_obj() (the local-only agents_fn snapshot passed
+        // to register_routes below), which would reintroduce the #4981
+        // local-vs-presence mismatch one route over. MUST run BEFORE
+        // register_routes(), same timing contract as the setters above.
+        rest_api_v1_->set_all_agent_ids_fn([this] { return registry_.all_ids(); });
+        // #5342 — POST /api/v1/users/me/password + /api/v1/users/{name}/password.
+        // The current-password proof is AuthRoutes' lockout-accounted check
+        // (the SAME section POST /login runs — never a second copy); it and the
+        // principal-explicit audit writer capture auth_routes_ (constructed
+        // above, outlives route dispatch). No session cookie is minted here
+        // any more: a self-change deletes every session of the account in its
+        // own transaction and the user signs in again (#5342 Gate 7/8).
+        // The CSRF same-site gate uses the same trusted-origin allowlist as the
+        // dashboard/CA cookie POSTs (#2537). MUST run BEFORE register_routes(),
+        // same timing contract as the setters above.
+        // #5342 Gate 7/8: every audit row those routes write names the
+        // principal captured at the start of the request — refusal rows via
+        // AuthRoutes::audit_log_for_principal, the in-transaction success
+        // rows via make_audit_event_for_principal's template.
+        // The break-glass account is refused as an admin-reset target.
+        rest_api_v1_->set_password_change_deps(RestApiV1::PasswordChangeDeps{
+            &auth_mgr_, auth_routes_->password_change_verify_fn(),
+            [ar = auth_routes_.get()](const httplib::Request& req, const std::string& action,
+                                      const std::string& result, const std::string& principal,
+                                      const std::string& principal_role,
+                                      const std::string& target_type,
+                                      const std::string& target_id, const std::string& detail) {
+                return ar->audit_log_for_principal(req, action, result, principal,
+                                                   principal_role, target_type, target_id,
+                                                   detail);
+            },
+            cfg_.break_glass_user,
+            // #5342 Gate 8: the success row(s) are written INSIDE the
+            // credential-change transaction; this builds their identity half
+            // with the SAME builder audit_log_for_principal uses.
+            [ar = auth_routes_.get()](const httplib::Request& req, const std::string& principal,
+                                      const std::string& principal_role,
+                                      const std::string& target_type,
+                                      const std::string& target_id) {
+                return ar->make_audit_event_for_principal(req, /*action=*/{}, /*result=*/{},
+                                                          principal, principal_role,
+                                                          target_type, target_id);
+            }});
+        rest_api_v1_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -17592,14 +20224,19 @@ private:
                     auto parsed = yuzu::scope::parse(scope);
                     if (!parsed)
                         return -1;
-                    // No rs_store/principal passed. A scope referencing
-                    // from_result_set: now ABORTS (nullopt, H1) instead of
-                    // silently evaluating the atom false (which a NOT
-                    // combinator inverted to a fleet-wide arm);
-                    // value_or({}) collapses the abort to zero targets —
-                    // arm nothing, the safe direction on the push path.
-                    targets = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                       custom_properties_store_.get())
+                    // No rs_store/principal passed — LOCAL-ONLY dispatch
+                    // (registry_.send_to below), so evaluate_scope_local
+                    // (#4981 PR-1 B4) is correct: a from_result_set:/props.<key>
+                    // atom with no store wired still ABORTS (Unresolvable)
+                    // instead of silently evaluating the atom false (which a
+                    // NOT combinator inverted to a fleet-wide arm);
+                    // value_or({}) collapses the abort to zero targets — arm
+                    // nothing, the safe direction on the push path. Unlike
+                    // evaluate_scope, this can never abort for a presence
+                    // reason, so a presence-store blip cannot periodically
+                    // disarm this push.
+                    targets = registry_.evaluate_scope_local(*parsed, tag_store_.get(),
+                                                             custom_properties_store_.get())
                                   .value_or(std::vector<std::string>{});
                 }
 
@@ -17613,11 +20250,13 @@ private:
                     if (it == scope_cache.end()) {
                         std::unordered_set<std::string> ids;
                         if (auto parsed = yuzu::scope::parse(expr)) {
-                            // Same H1 semantics as above: a from_result_set:
-                            // atom aborts to nullopt; value_or({}) => this
-                            // agent is treated as out-of-scope (arm nothing).
-                            auto v = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                              custom_properties_store_.get())
+                            // Same evaluate_scope_local semantics as above
+                            // (#4981 PR-1 B4): a from_result_set: atom aborts;
+                            // value_or({}) => this agent is treated as
+                            // out-of-scope (arm nothing) — never a presence
+                            // abort, since this push is LOCAL-ONLY.
+                            auto v = registry_.evaluate_scope_local(*parsed, tag_store_.get(),
+                                                                    custom_properties_store_.get())
                                         .value_or(std::vector<std::string>{});
                             ids.insert(v.begin(), v.end());
                         }
@@ -17636,7 +20275,7 @@ private:
                     auto push = guardian::build_agent_push(
                         rules, agent_os,
                         [&](const std::string& expr) { return agent_in_scope(aid, expr); },
-                        full_sync, generation);
+                        full_sync, generation, &metrics_);
 
                     // Unique per push (random suffix) so two pushes in the same second
                     // can't collide on the agent's replay-dedup set (hp-F2/cons-S1).
@@ -17714,8 +20353,6 @@ private:
             [this](const std::string& username, const std::string& agent_id) -> bool {
                 return response_agent_in_scope(username, agent_id);
             },
-            // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
-            app_perf_providers,
             // PR 4.2 — fleet-wide engine role-assignment authoring surface.
             engine_principal_store_.get(),
             // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
@@ -17746,11 +20383,12 @@ private:
             // authorization gate — see rest_api_v1.cpp's route comment for
             // why it must never be stacked with perm_fn.
             fleet_read_fn,
-            // #4033: GET /api/v1/devices[/{id}]'s raw registry snapshot — the
-            // SAME underlying call as the MCP AgentsJsonFn wired into
-            // McpServer below (registry_.to_json_obj()), so the two
-            // transports read from the identical unfiltered source and can
-            // only diverge on the scope filter each applies on top.
+            // Raw registry snapshot for POST /api/v1/scope/preview. (ADR-0031
+            // WS-A4 device seam: GET /api/v1/devices[/{id}] no longer use this
+            // param — they source from DeviceApi::list_devices/lookup_device,
+            // which read the SAME registry_.to_json_obj() underneath, so the
+            // data stays identical; this closure is retained solely for
+            // /scope/preview.)
             [this]() { return registry_.to_json_obj(); },
             // #4033: GET /api/v1/management-groups/agent-count-preview's D3
             // Response:Read scope resolver — the SAME instance passed to
@@ -17759,24 +20397,55 @@ private:
             // /fragments/create-group-form fragment cannot disagree on scope
             // for the same caller.
             response_visible_set_fn,
-            // #4035: the SAME DexFleet provider DexRoutes::register_routes
-            // above already received — see its doc comment (defined once,
-            // just above the DexRoutes registration) for why this must be
-            // the identical lambda, not a second copy.
-            dex_fleet_fn,
-            // #4035 review fix (colleague review, BLOCKING): a DEDICATED
-            // GuaranteedState:Read-scoped resolver (defined above, see its
-            // own doc comment) — NOT the SAME visible_set_fn
-            // DexRoutes::register_routes above uses, despite this comment's
-            // own earlier (incorrect) claim that they should be identical.
-            // visible_set_fn's permission-agnostic join would leak a
-            // multi-role operator's OTHER groups' device ids into GET
-            // /api/v1/dex/app / GET /api/v1/dex/overview.
-            dex_visible_fn,
+            // ADR-0031 WS-A4 (fifth family): the former dex_fleet_fn arg is
+            // RETIRED — the DEX read handlers obtain the fleet through the
+            // DexApi seam's own FleetFn (wired into make_local_dex_api below),
+            // not through a register_routes param. The `dex_fleet_fn` local is
+            // still LIVE for DexRoutes (dashboard) + make_local_dex_api.
+            // The former `dex_visible_fn` register_routes arg is RETIRED
+            // (WS-A4 PR-1 fix round) — GET /api/v1/dex/app, GET
+            // /api/v1/dex/overview, and GET /api/v1/dex/signals/{obs_type}
+            // gate on the bare `perm_fn`/`GuaranteedState:Read` (round-3
+            // revert; NOT `fleet_read_fn` above — see this file's "#4035
+            // review fix's bespoke `dex_visible_fn` resolver" comment for
+            // why) and have no per-caller confinement resolver at all.
             // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
             // above and the MCP compare_app_perf_versions tool below use, so
             // all three GET /api/v1/dex/perf/compare siblings never disagree.
-            verify_api);
+            verify_api,
+            // ADR-0031 WS-A4 wave 2: the SAME DeviceApi instance DeviceRoutes
+            // above and MCP list_agents/get_agent_details below use, so all
+            // three GET /api/v1/devices[/{id}] siblings never disagree.
+            device_api,
+            // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — the DEX
+            // signal/experience handlers require this and answer 503 when it is
+            // null (constructed above iff the store is present, so `!dex_api`
+            // is the exact readiness signal the old `!guaranteed_state_store`
+            // guard was).
+            dex_api,
+            // ADR-0031 WS-A4 (sixth family): the DEX app-perf-over-time API
+            // seam — the 9 GET /api/v1/dex/perf/* handlers + the per-device
+            // drill require this and answer 503 when it is null, the exact
+            // same degrade the old `!dex_perf_fn`/`!app_perf_providers.<member>`
+            // guards produced. The SOLE instance (#4626) — also shared by
+            // DexRoutes (dashboard) and the MCP DEX perf tools below.
+            dex_perf_api,
+            // ADR-0031 WS-A4 (ninth family): the Guardian-read API seam,
+            // constructed unconditionally above — each method individually
+            // degrades when its own backing store is absent, the exact same
+            // per-route degrade the old `!guaranteed_state_store`/
+            // `!baseline_store` guards produced.
+            guardian_api,
+            // #5047: closes the cross-transport MCP-tier bypass on the 4
+            // result-set write routes — the SAME belt `require_permission`
+            // applies to every RBAC-gated route, threaded here because this
+            // family has no `perm_fn` call at all (ownership-only by
+            // design). The SOLE production factory (see its own doc
+            // comment, auth_routes.hpp) — never re-inline this as a local
+            // lambda; a second copy is exactly how the original clause-5
+            // violation this belt exists to prevent could recur unreviewed
+            // at a 9th call site.
+            auth_routes_->gateless_tier_policy_fn());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -17909,16 +20578,20 @@ private:
                         });
                     if (!decision)
                         return decision;
-                    const std::function<bool(std::string_view, std::string_view)> action_allowed =
+                    const yuzu::server::detail::KillSwitchFn action_allowed =
                         plugin_config_store_ != nullptr
-                            ? std::function<bool(std::string_view, std::string_view)>(
+                            ? yuzu::server::detail::KillSwitchFn(
                                   [this](std::string_view p, std::string_view a) {
-                                      return plugin_config_store_->action_allowed(p, a);
+                                      return plugin_config_store_->kill_switch_decision(p, a);
                                   })
-                            : std::function<bool(std::string_view, std::string_view)>{};
-                    if (auto denial =
-                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed)) {
-                        return std::unexpected(*denial);
+                            : yuzu::server::detail::KillSwitchFn{};
+                    // The dry run has no target, so it cannot see the per-OS
+                    // layer (only the all-OS denial); a per-OS withhold shows
+                    // up at dispatch as kill_switched_os_count > 0.
+                    if (auto os_set =
+                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed);
+                        !os_set) {
+                        return std::unexpected(os_set.error());
                     }
                     return decision;
                 });
@@ -17968,18 +20641,65 @@ private:
             // preview_management_group_agent_count cannot disagree with its
             // REST/fragment siblings for the same caller.
             mcp_server_->set_response_visible_set_fn(response_visible_set_fn);
-            // #4035: the SAME DexFleet provider DexRoutes/RestApiV1 already
-            // received above — see its doc comment (defined once, just above
-            // the DexRoutes registration) for why this must be the identical
-            // lambda, not a second copy.
-            mcp_server_->set_dex_fleet_fn(dex_fleet_fn);
-            // #4035 review fix (colleague review, BLOCKING): the SAME
-            // dedicated GuaranteedState:Read-scoped resolver wired into the
-            // REST registration's trailing dex_visible_fn param above (see
-            // that variable's doc comment) — NOT visible_set_fn, whose
-            // permission-agnostic join does not actually confine to this
-            // securable's grants.
-            mcp_server_->set_dex_visible_fn(dex_visible_fn);
+            // ADR-0031 WS-A4 (fifth family): the MCP DEX signal tools obtain the
+            // fleet denominator through the DexApi seam's own FleetFn (wired into
+            // make_local_dex_api below), so the former mcp_server_->set_dex_fleet_fn
+            // wiring is retired — the tools no longer read a McpServer fleet member.
+            // ADR-0031 WS-A4 (fifth family): the SAME DexApi seam instance the
+            // REST /api/v1/dex/* handlers use (constructed above, gated on
+            // store presence), so the MCP DEX signal tools and REST never
+            // disagree. nullptr when the store is absent → the tools' !dex_api_
+            // readiness guard answers "store unavailable" (byte-identical).
+            mcp_server_->set_dex_api(dex_api);
+            // ADR-0031 WS-A4 (sixth family): the SAME DexPerfApi seam instance
+            // the REST /api/v1/dex/perf/* handlers AND DexRoutes (dashboard,
+            // #4626) use, so the 9 MCP DEX app-perf tool twins +
+            // get_dex_device_app_perf never disagree with REST/dashboard.
+            // Unlike dex_api above, dex_perf_api is constructed
+            // UNCONDITIONALLY — never nullptr — because each backing store
+            // pointer is checked individually INSIDE the impl (dex_perf_api.cpp),
+            // exactly matching the old per-lambda null-checks the retired
+            // `AppPerfProviders` bundle used; the tools' !dex_perf_api_ guard
+            // therefore never fires in practice (dex_perf_api_local.hpp's own
+            // banner states this), but stays as defense-in-depth against a
+            // future wiring change, and every server's stores fail closed at boot
+            // regardless — behaviourally identical to the old direct calls.
+            mcp_server_->set_dex_perf_api(dex_perf_api);
+            // ADR-0031 WS-A4 (seventh family): the SAME schedule-read API
+            // seam instance WorkflowRoutes uses for GET /fragments/schedules
+            // and GET /api/v1/schedules (wired into wf_deps.schedule_api
+            // above), so MCP list_schedules can never disagree with either.
+            // Gated on store presence at construction (schedule_api is
+            // nullptr when schedule_engine_ was never opened); the tool's own
+            // !schedule_api_ guard then answers "engine unavailable",
+            // matching the pre-seam !schedule_engine guard exactly.
+            mcp_server_->set_schedule_api(schedule_api);
+            // ADR-0031 WS-A4 (eighth family): the SAME workflow-read API
+            // seam instance WorkflowRoutes uses for GET /api/v1/workflows
+            // [/{id}] and GET /api/v1/workflow-executions/{id} (wired into
+            // wf_deps.workflow_api above), so MCP list_workflows/
+            // get_workflow/get_workflow_execution can never disagree with
+            // REST v1. Gated on store presence at construction (workflow_api
+            // is nullptr when workflow_engine_ was never opened); the
+            // tools' own !workflow_api_ guard then answers "engine
+            // unavailable", matching the pre-seam !workflow_engine guard
+            // exactly.
+            mcp_server_->set_workflow_api(workflow_api);
+            // ADR-0031 WS-A4 (ninth family): the SAME Guardian-read API seam
+            // instance the REST GET /api/v1/guaranteed-state/* handlers use
+            // (constructed unconditionally above), so the 8 seamed MCP Guardian
+            // read tools can never disagree with REST v1 — each method
+            // individually degrades when its own backing store is absent,
+            // matching the pre-seam per-route !guaranteed_state_store/
+            // !baseline_store guards exactly.
+            mcp_server_->set_guardian_api(guardian_api);
+            // The former `mcp_server_->set_dex_visible_fn(dex_visible_fn)`
+            // wiring is RETIRED (WS-A4 PR-1 fix round) — get_dex_app/
+            // get_dex_overview/get_dex_signal_detail gate on the bare
+            // `perm_fn`/`tier_allows` (`GuaranteedState:Read`; round-3
+            // revert, NOT `fleet_read_fn_` — see the "#4035 review fix's
+            // bespoke `dex_visible_fn` resolver" comment above for why) and
+            // have no per-caller confinement resolver at all.
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment
@@ -17995,11 +20715,20 @@ private:
             // DeploymentRoutes already hold (constructed well before this
             // point, server.cpp:4041) — no new construction needed.
             mcp_server_->set_preflight_run_store(preflight_run_store_.get());
+            // Read-only deployment list/detail twins (list_deployments / get_deployment):
+            // the live /auto engine's store, already built at server.cpp:4843.
+            mcp_server_->set_deployment_run_store(deployment_run_store_.get());
+            // Network discovery read twin — the same reader NetworkRoutes holds.
+            mcp_server_->set_discovered_devices_reader(discovered_reader);
             // #2146 Batch B2 — backs the 12 result-set MCP tools. Same store
             // ResultSetRoutes/rest_api_v1's result-set routes already hold
             // (constructed well before this point) — no new construction
             // needed.
             mcp_server_->set_result_set_store(result_set_store_.get());
+            // #4981 PR-2 — see scope_evaluate_fn's own comment above (defined
+            // once, shared with rest_api_v1_->set_scope_evaluate_fn above).
+            // MUST run BEFORE register_routes()/build_handler() below.
+            mcp_server_->set_scope_evaluate_fn(scope_evaluate_fn);
             // #2146 Batch B3 — backs get_fleet_topology/get_host_topology. SAME
             // store/kill-switch/offline-store instances the REST VizRoutes
             // registration below wires (viz_routes_->register_routes(...)), so
@@ -18014,8 +20743,7 @@ private:
             // route) before any member destructs, so no handler runs past
             // that join -- same discipline as gateway_route_store_/
             // mgmt_group_store_ etc. (cpp-safety gov finding).
-            mcp_server_->set_viz_deps(fleet_topology_store_.get(), offline_endpoint_store_.get(),
-                                      &viz_disabled_);
+            mcp_server_->set_viz_deps(fleet_topology_store_.get(), offline_roster, &viz_disabled_);
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),
                 // SAME logic as the REST list_read_fn wired at the
@@ -18123,9 +20851,6 @@ private:
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
                 &metrics_,
-                // DEX app-perf-over-time read providers (slice 2) — same bundle the
-                // REST endpoints use, so MCP and REST read the SAME B1/B2 substrate.
-                app_perf_providers,
                 // #289 / Issue 13.5: the quarantine store backs the
                 // quarantine_device write tool (record + real isolate), and the
                 // tag-push closure fires the agent tag-push after set_tag exactly
@@ -18263,7 +20988,14 @@ private:
                 // and the REST /api/v1/compliance*+/api/v1/polic* twins use, so
                 // the six read tools + the yuzu://compliance/fleet resource +
                 // get_fleet_posture_fast never disagree with those siblings.
-                compliance_api);
+                compliance_api,
+                // ADR-0031 WS-A4 wave 2: the SAME DeviceApi instance DeviceRoutes
+                // and REST GET /api/v1/devices[/{id}] use, so list_agents/
+                // get_agent_details never disagree with those siblings.
+                device_api,
+                // Wave 7 PR7.2: the app_usage store, TRUE LAST parameter (kept last
+                // across the device_api merge).
+                app_usage_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------
@@ -18357,7 +21089,13 @@ private:
     /// narrowed to the caller's visible set, exactly as a named `__all__` is.
     void forward_legacy_command(const httplib::Request& req, const std::string& plugin,
                                 const std::string& action, httplib::Response& res) {
-        if (!registry_.has_any()) {
+        // HA WS-5 governance hardening (external review finding, 2026-09-22):
+        // has_any() alone is LOCAL-ONLY — see command_routes.cpp's sibling
+        // check for the full rationale. has_any_reachable() checks presence
+        // too, so a replica with zero local sessions but a healthy
+        // presence-visible fleet no longer rejects every legacy dispatch
+        // before all_ids()/evaluate_scope() ever runs.
+        if (!registry_.has_any_reachable()) {
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})",
@@ -18435,18 +21173,45 @@ private:
         }
 
         agent_service_.record_send_time(command_id);
-        // WS-4 4.2b Task D: this sink is deliberately left WITHOUT a fourth
-        // (`prepare_route_fallback`) field — this legacy forwarder is
-        // Broadcast-only (see this dispatch's own DispatchArm::Broadcast call
-        // just below), so `ArmDispatchResult::route_unreadable` can never be
-        // set here regardless; unlike the /api/command and MCP/dashboard/
-        // workflow sites (which DO wire the gateway routing-directory
-        // fallback and so DO need the `route_unreadable` cascade branch
-        // below), this site has no `route_unreadable` branch to add.
+        // WS-4 4.2b Task D note (now SUPERSEDED — see the HA WS-5 comment
+        // below): this sink was originally left WITHOUT a `prepare_route_
+        // fallback` field on the theory that a Broadcast-only forwarder's
+        // candidates are always locally known, so no directory consult was
+        // ever needed and `ArmDispatchResult::route_unreadable` could never
+        // be set here.
+        //
+        // HA WS-5 (governance Gate 4 happy-path finding, 2026-09-22): that
+        // theory broke the moment `registry_.all_ids()` could return a
+        // presence-only (cross-replica) id — this is a REAL BLOCKING bug
+        // WS-5 exposed, not a hypothetical: with no `prepare_route_fallback`
+        // and a bare `registry_.send_to(aid, ...)` (which returns `false`
+        // silently for any id absent from the LOCAL `agents_` map, no log,
+        // no metric — agent_registry.cpp's `send_to`), a presence-only id
+        // reached via this legacy forwarder was dropped with zero signal —
+        // and if at least one OTHER agent was local, the overall dispatch
+        // still reported plain success. Fixed by wiring the same
+        // `GatewayRouteFallback` the other three production
+        // `ConfinedDispatchSink` sites (`make_confined_dispatch_sink`,
+        // `dispatch_scope_ladder.hpp`) already use, so this route now
+        // reaches a cross-replica agent exactly like every other dispatch
+        // surface — see `route_unreadable`'s handling a few lines below,
+        // which this route previously had no branch for and now needs one.
+        auto legacy_route_fallback = std::make_shared<yuzu::server::GatewayRouteFallback>(
+            registry_, gateway_route_store_.get());
         const yuzu::server::ConfinedDispatchSink sink{
-            [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
+            [&](const std::string& aid) {
+                if (auto cluster = legacy_route_fallback->cluster_for(aid))
+                    return registry_.send_via_directory(aid, *classified, *cluster);
+                return registry_.send_to(aid, *classified);
+            },
             [&] { return registry_.send_to_all(*classified); },
-            [&] { return registry_.all_ids(); }};
+            [&] { return registry_.all_ids(); },
+            [legacy_route_fallback](const std::vector<std::string>& candidates) {
+                return legacy_route_fallback->prepare(candidates);
+            },
+            [&](const std::vector<std::string>& candidates) {
+                return registry_.has_remote_presence(candidates);
+            }};
         // #881: one of the two production sites that hits the unfiltered
         // `send_to_all_unfiltered` fast path in practice — a default install
         // with RBAC disabled (or a legacy-admin superuser) resolves
@@ -18457,11 +21222,34 @@ private:
         const auto containment_gate = make_containment_gate(plugin, action);
         // #3424/#3511: same lifecycle as containment_gate — one registry read
         // for this dispatch. BR-009: `classified->wire().plugin()`, not the
-        // raw `plugin` local — see the /api/command sibling site's comment.
-        const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
+        // raw `plugin` local — see the /api/command sibling site's comment. The wire
+        // action is the protective-set carve-out's input; the behavioural pin is the
+        // protective case in test_command_routes.cpp (this forwarder has no unit harness).
+        const auto plugin_missing = registry_.ids_missing_plugin(
+            classified->wire().plugin(), classified->wire().action());
+        // #5294: per-OS kill-switch ids; a degraded presence read while a
+        // per-OS switch is OFF refuses the dispatch (fail closed). A fail-closed
+        // containment gate already withholds every id and is reported first
+        // below (`containment_unreadable`), so skip the presence read rather
+        // than let `os_gate_unreadable` shadow it.
+        static const std::unordered_set<std::string> kNoOsKillSwitch{};
+        const auto os_kill_switched = registry_.ids_with_os(
+            containment_gate.fail_closed ? kNoOsKillSwitch : classified->kill_switched_os());
+        if (!os_kill_switched) {
+            spdlog::error("legacy dispatch {}:{} refused: presence unreadable while a per-OS "
+                          "kill switch is OFF",
+                          plugin, action);
+            audit_os_gate_unreadable(caller.principal, caller.principal_role, command_id, plugin);
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"agent presence could not be read while a per-OS kill switch is set — dispatch is failing closed and reaching no agent","reason":"os_gate_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
         auto result = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-            /*broadcast_on_none=*/false, containment_gate, sink, plugin_missing);
+            /*broadcast_on_none=*/false, containment_gate, sink, plugin_missing,
+            *os_kill_switched);
         int sent = result.sent;
 
         // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
@@ -18479,20 +21267,34 @@ private:
         }
         audit_unknown_plugin_dispatch("legacy", caller.principal, caller.principal_role,
                                       command_id, plugin, result.unknown_plugin_count);
+        audit_kill_switched_os_dispatch("legacy", caller.principal, caller.principal_role,
+                                        command_id, plugin, result.kill_switched_os_count);
 
         if (sent == 0) {
-            // Same four-way split as /api/command (command_routes.cpp as of
+            // Same five-way split as /api/command (command_routes.cpp as of
             // #2557 — no longer "above" in this file) — see the comment
             // there. A fail-closed gate is a fleet-wide condition, not a
             // per-agent transport failure, and reporting it as one sends the
-            // operator to the wrong subsystem. NO `route_unreadable` branch
-            // here (WS-4 4.2b Task D) — this Broadcast-only sink never wires
-            // `prepare_route_fallback` (see the sink's own comment above),
-            // so `result.route_unreadable` is always false at this site.
+            // operator to the wrong subsystem.
+            //
+            // HA WS-5 governance hardening (external review finding,
+            // 2026-09-22): this comment used to say this sink never wires
+            // `prepare_route_fallback` and so `route_unreadable` could never
+            // be set here — FALSE as of this same slice's own fix a few
+            // lines above (the sink literal now DOES wire it, the same
+            // BLOCKING bug that fix closed). This branch was the missing
+            // consumer: `result.route_unreadable` being true here means a
+            // degraded gateway-directory read, not a per-agent connectivity
+            // fact, and must not fall through to the generic catch-all
+            // below — mirrors command_routes.cpp's identical branch.
             res.status = 503;
             if (containment_gate.fail_closed) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.route_unreadable) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the gateway routing directory could not be read for one or more targets — dispatch is failing closed rather than guessing where to route","reason":"route_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else if (result.denied_quarantined_count > 0) {
                 res.set_content(
@@ -18501,6 +21303,10 @@ private:
             } else if (result.unknown_plugin_count > 0) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.kill_switched_os_count > 0) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"every target runs an OS for which this plugin action is switched off — dispatch was withheld, not attempted","reason":"kill_switched_os","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else {
                 res.set_content(
@@ -18548,7 +21354,23 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_power_health(),
         yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
+        yuzu::server::capdecls::plugin_action_catalogue_app_usage(),
+        yuzu::server::capdecls::plugin_action_catalogue_execution_artifacts(),
         yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
+        yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
+        yuzu::server::capdecls::plugin_action_catalogue_printing(),
+        yuzu::server::capdecls::plugin_action_catalogue_browser_policy(),
+        yuzu::server::capdecls::plugin_action_catalogue_update_source_trust(),
+        yuzu::server::capdecls::plugin_action_catalogue_app_control(),
+        yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),
+        yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
+        yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
+        yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_local_security_policy(),
+        yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
+        yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
+        yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
@@ -18580,11 +21402,24 @@ private:
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
-    std::shared_ptr<grpc::Channel> gw_mgmt_channel_;
-    std::unique_ptr<::yuzu::server::v1::ManagementService::Stub> gw_mgmt_stub_;
+    // Gateway-upstream peer authorization. ORDER IS LOAD-BEARING: the guard is declared after
+    // `gateway_service_` (the inner handler it delegates to) and BEFORE `agent_server_` below (so
+    // the server is destroyed first and nothing can still be calling the guard). The OTA row's
+    // agent_service_/agent_server_ order is untouched.
+    std::unique_ptr<detail::GatewayPeerGuardedService> gateway_peer_guard_;
+    // HA WS-4 4.3: replaces the pre-4.3 single gw_mgmt_channel_/gw_mgmt_stub_
+    // pair — see the construction site's comment.
+    std::unique_ptr<yuzu::server::GatewayMgmtStubPool> gw_mgmt_pool_;
     std::shared_ptr<spdlog::logger> file_logger_;
     std::unique_ptr<grpc::Server> agent_server_;
     std::unique_ptr<grpc::Server> mgmt_server_;
+    // Prepared `parameter_schema` validators (#5562): one byte-bounded cache shared by the call
+    // sites that take it from WorkflowRoutes::Deps. Declare it BEFORE every consumer (the HTTP
+    // server, background threads, any later holder of a raw reference) so it is destroyed AFTER
+    // them; the shared_ptr copies in the route lambdas are a second layer. The cache itself has
+    // no pointer into any other ServerImpl member.
+    std::shared_ptr<instr::ParamValidatorCache> param_validator_cache_ =
+        std::make_shared<instr::ParamValidatorCache>();
     std::unique_ptr<httplib::Server> web_server_;
     std::thread web_thread_;
     // #2703 Gate 7 merge-slice item 2: signalled by web_thread_'s body right
@@ -18660,6 +21495,11 @@ private:
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     std::unique_ptr<AccessReviewStore> access_review_store_;
     std::unique_ptr<AuditStore> audit_store_;
+    /// #5342: one-transaction credential-change query owner. Borrows pg_pool_
+    /// and audit_store_ — declared AFTER audit_store_ so it destructs first;
+    /// stop() also resets it explicitly (after nulling auth_mgr_'s pointer)
+    /// before audit_store_/pg_pool_ go.
+    std::unique_ptr<CredentialChangeOwner> credential_change_owner_;
     std::unique_ptr<TagStore> tag_store_;
 
     // Phase 2: Instruction system
@@ -18758,17 +21598,27 @@ private:
     std::unique_ptr<PreflightRunner> preflight_runner_; // borrows run+response stores
     std::unique_ptr<ScheduleRunner> schedule_runner_;   // borrows engine + stores (#1191)
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
+    /// Cross-schema read owner for the per-version crash and hang join (borrows
+    /// the pool; constructed with the same observation retention as the store).
+    std::unique_ptr<DexAppVersionFailuresOwner> dex_app_version_failures_owner_;
     std::unique_ptr<BaselineStore> baseline_store_;
     std::unique_ptr<CaStore> ca_store_;
+    // HA WS-6 CRL follow-ups (#4828-#4831): constructed once ca_store_, audit_store_ AND
+    // auth_key_provider_ all exist (right after the ca_store_->is_open() check below — audit_store_
+    // and auth_key_provider_ are both already constructed by that point, or startup_failed_ would
+    // have short-circuited this whole block). Owns the CRL builder/retry/self-heal logic formerly
+    // inlined in publish_crl()/the freshness tick — see crl_publisher.hpp's header banner. The
+    // former crl_freshness_retry_after_ backoff member moved inside it (CrlPublisher::retry_after_)
+    // since it paces freshness_tick(), which moved there too.
+    //
+    // Its Deps struct borrows ca_store_/audit_store_/auth_key_provider_.get() by raw pointer, so
+    // it is reset() in stop() BEFORE any of those three — same ordering discipline as
+    // RuntimeConfigStore/*SecretCodec above (see that comment for the external-review precedent
+    // this rule exists because of). Member-destruction order alone is NOT the safety net here;
+    // stop()'s explicit reset() is.
+    std::unique_ptr<CrlPublisher> crl_publisher_;
     DefaultCertSet default_cert_set_;
     bool default_certs_failed_{false};
-    // PR4: backoff for the reaper's CRL freshness re-publish — on a persistent
-    // publish failure (e.g. unreadable CA key) skip retries until this point so
-    // the ~15s reaper doesn't spam logs/metrics. steady_clock (NTP-jump-safe,
-    // gov L5). ACCESSED ONLY by the single reaper thread (health_recompute_thread_)
-    // — not atomic by design; do NOT read/write it from another thread without
-    // converting to std::atomic first (gov L1).
-    std::chrono::steady_clock::time_point crl_freshness_retry_after_{};
     // atomic so a future background-thread read can never be UB; today it is
     // written/read only on the main thread (ctor → run() → main()), so the
     // default seq_cst on the implicit load/store is free on this cold path
@@ -18779,11 +21629,6 @@ private:
     std::string agent_ca_cert_pem_;
     std::mutex csr_issue_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> csr_issue_last_;
-    // Serialises publish_crl() so next_crl_number()+record_crl() are atomic across
-    // concurrent publishers (startup pre-publish vs a revoke, or two revokes) —
-    // otherwise both could read the same number and last-writer-wins overwrites,
-    // breaking RFC 5280 monotonic crlNumber (gov architect SHOULD).
-    std::mutex crl_publish_mu_;
     // Cache of is_yuzu_issued (immutable per cert) — avoids a per-heartbeat
     // verify_chain fleet-wide (gov UP-7). Keyed by full leaf PEM.
     std::mutex yuzu_issued_cache_mu_;
@@ -18833,8 +21678,14 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<DeviceLensRoutes> device_lens_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
+    std::unique_ptr<HardwareRoutes> hardware_routes_;
+    std::unique_ptr<home::DashboardSummaryRoutes> dashboard_summary_routes_;
+    std::unique_ptr<DeviceContainmentRoutes> device_containment_routes_;
+    std::unique_ptr<DeviceEstateRoutes> device_estate_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;
+    std::unique_ptr<AppUsageRoutes> app_usage_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
@@ -18992,6 +21843,10 @@ private:
     std::unique_ptr<FileKeyProvider> auth_key_provider_;
     std::unique_ptr<pg::SecretCodec> auth_secret_codec_;
     std::unique_ptr<AuthDB> auth_db_;
+    // WS-6 6.2: outcome of the one-time legacy enrollment .cfg import (see the
+    // boot block after set_auth_db). Held until audit_store_ is constructed, then
+    // emitted as `enrollment.import` rows.
+    std::vector<enrollment_import::KindReport> enrollment_import_reports_;
     // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
     // ADR-2002 §4). Borrows pg_pool_ by reference, so (like every member here)
     // it destructs before pg_pool_. auth_mgr_ holds a raw pointer to it via
@@ -19095,6 +21950,9 @@ private:
     // SLE detected-licence store (ADR-0024 Decision 4). Declared after pg_pool_
     // so it destructs before the pool.
     std::unique_ptr<SoftwareLicensingStore> software_licensing_store_;
+    // Per-agent last-used app-usage store (Wave 7 PR7.2, ADR-0016 §5). Declared
+    // after pg_pool_ so it destructs before the pool.
+    std::unique_ptr<AppUsageStore> app_usage_store_;
     // SLE canonical product registry (ADR-0024 Decision 4). Declared after pg_pool_
     // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
     // module's evaluator writes it, out-of-server).
@@ -19162,6 +22020,13 @@ private:
     // leader_elector_->is_leader() via leader_gate.hpp — slice 3.2.
     std::unique_ptr<LeaderElector> leader_elector_;
     std::thread leader_thread_;
+
+    // HA WS-8 (ADR-2002 §12): the runtime Postgres-reachability probe behind
+    // /readyz's `pg_reachable` row. Dedicated connection (NOT pg_pool_), own loop
+    // thread. stop() joins the THREAD; the OBJECT lives until ~ServerImpl because
+    // /readyz handlers may still be running after web_server_->stop() (they read
+    // its snapshot under the probe's own leaf mutex) — never reset() it inside stop().
+    std::unique_ptr<PgReachabilityProbe> pg_reachability_probe_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

@@ -43,8 +43,10 @@ std::string build_yaml_source(const std::string& plugin_name, const std::string&
 std::vector<InstructionDefinition>
 generate_legacy_definitions(const std::vector<PluginCapability>& capabilities) {
 
-    const nlohmann::json parameter_schema = {{"type", "object"},
-                                             {"additionalProperties", {{"type", "string"}}}};
+    // The literal "{}" ("none stored") keeps these definitions accepting arbitrary string
+    // params: the store refuses an `additionalProperties` schema at write time, and the
+    // execute route does not validate a definition that stores none.
+    constexpr const char* kNoStoredParameterSchema = "{}";
 
     const nlohmann::json result_schema =
         nlohmann::json::array({{{"name", "output"}, {"type", "string"}}});
@@ -62,7 +64,7 @@ generate_legacy_definitions(const std::vector<PluginCapability>& capabilities) {
             def.action = action;
             def.description =
                 std::format("Auto-generated from {} plugin descriptor", cap.plugin_name);
-            def.parameter_schema = parameter_schema.dump();
+            def.parameter_schema = kNoStoredParameterSchema;
             def.result_schema = result_schema.dump();
             def.concurrency_mode = "per-device";
             def.approval_mode = "auto";

@@ -177,6 +177,18 @@ public:
     /// cannot report a false "erased".
     [[nodiscard]] bool delete_agent(const std::string& agent_id);
 
+    /// Delete every row for one plugin (source), across ALL agents. Mirrors
+    /// `delete_agent`'s lease/txn idiom exactly, keyed on `plugin` instead of
+    /// `agent_id`. Defence-in-depth (ADR-0016 §5) for the boot-time typed-
+    /// source purge (server.cpp): a typed source's rows never belong in this
+    /// generic store — `is_typed_inventory_source` is the primary control,
+    /// this is hygiene for a newer-agent/older-server window where a typed
+    /// blob landed here before the exclusion took effect. Returns false on a
+    /// closed store, a lease/lock timeout, or a SQL failure (never throws) —
+    /// callers must not treat a false return as fatal (never set
+    /// `startup_failed_` on it).
+    [[nodiscard]] bool delete_source(std::string_view plugin_name);
+
     /// Count total inventory records. AUTHORITATIVE read: `std::nullopt` on a
     /// store/pool/query degrade, NEVER a silent zero.
     [[nodiscard]] std::optional<int64_t> count() const;

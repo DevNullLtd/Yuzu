@@ -30,8 +30,18 @@
 #endif
 #include <windows.h>
 
+#include <algorithm>
 #include <string>
 #include <string_view>
+
+#include "installed_apps_parsers.hpp" // parsers::reg_string_type_accepted, kRegSz/kRegExpandSz
+
+// The host-independent registry-type predicate (parsers::reg_string_type_accepted)
+// carries winnt.h's REG_SZ/REG_EXPAND_SZ as literals so it is testable everywhere;
+// pin them to the real constants here (the plugin and its unit test both include
+// this header).
+static_assert(yuzu::installed_apps::parsers::kRegSz == REG_SZ &&
+              yuzu::installed_apps::parsers::kRegExpandSz == REG_EXPAND_SZ);
 
 // NOTE (#1681): this is the ONE conversion site deliberately NOT migrated to the shared
 // `agents/shared/win_str.hpp`. `reg_sz_to_utf8` below strips ALL trailing NULs, whereas the
@@ -65,12 +75,64 @@ inline std::string from_wide(const wchar_t* ws, int len = -1) {
 // Convert a REG_SZ payload (size is in BYTES, may include trailing NUL(s)) to
 // UTF-8. Length-aware: the trailing NUL(s) are stripped on the WCHAR side first,
 // so the conversion never depends on the value being NUL-terminated (a valid
-// REG_SZ may be stored without one).
+// REG_SZ may be stored without one). The result is cut at kMaxListFieldBytes on a
+// UTF-8 boundary (the same cut `list` applies per field), so every registry string
+// the plugin carries -- query/list_per_user rows, `inv|` rows, the AppInfo vectors --
+// is bounded at its source, not only in `list`.
 inline std::string reg_sz_to_utf8(const wchar_t* buf, DWORD size_bytes) {
     size_t nch = size_bytes / sizeof(wchar_t);
     while (nch > 0 && buf[nch - 1] == L'\0')
         --nch;
-    return from_wide(buf, static_cast<int>(nch));
+    const std::string utf8 = from_wide(buf, static_cast<int>(nch));
+    return std::string{yuzu::installed_apps::parsers::detail::cut_utf8(
+        utf8, yuzu::installed_apps::parsers::kMaxListFieldBytes)};
+}
+
+// The plugin's ONE registry string read (every Uninstall value: DisplayName,
+// DisplayVersion, Publisher, InstallDate, SystemComponent, InstallLocation).
+// accept_expand_sz=false is the ADR-0016 hashed-field policy (REG_SZ only,
+// unchanged since #1662); only InstallLocation passes true, and the value is
+// returned RAW (an unexpanded "%ProgramFiles%\..." stays as written). A value
+// larger than the 512-WCHAR stack buffer (ERROR_MORE_DATA) is re-read ONCE into
+// a heap buffer sized from the reported byte count, capped at kMaxValueBytes
+// (64 KiB); above the cap, or of any other type, or absent, it reads as empty --
+// the same "-" the row renders for a missing value (README caveats). A value that
+// is read is then cut to kMaxListFieldBytes (4 KiB) by reg_sz_to_utf8: 64 KiB is
+// the READ bound (so a long DisplayName is read, not dropped, #4714), 4 KiB is what
+// any action carries per field.
+// Lives here, not in the plugin's lambda, so test_installed_apps_registry_utf8
+// exercises the same code the plugin runs, rather than a re-implementation that
+// could silently diverge.
+inline constexpr DWORD kMaxValueBytes = 64 * 1024;
+
+inline std::string read_reg_string(HKEY key, const char* value_name, bool accept_expand_sz) {
+    const std::wstring wname = to_wide(value_name);
+    wchar_t buf[512]{};
+    DWORD size = sizeof(buf); // BYTES; buf is written as bytes and read back through
+    DWORD type = 0;           // its declared wchar_t lvalue (LPBYTE is align-1)
+    // The byte-type aliasing casts (docs/cpp-conventions.md asks for this
+    // proof): each buffer is a local that outlives its call and `size` bounds the write.
+    LSTATUS rc = RegQueryValueExW(key, wname.c_str(), nullptr, &type,
+                                  reinterpret_cast<LPBYTE>(buf), &size);
+    if (rc == ERROR_SUCCESS) {
+        if (yuzu::installed_apps::parsers::reg_string_type_accepted(type, accept_expand_sz) &&
+            size >= sizeof(wchar_t))
+            return reg_sz_to_utf8(buf, size);
+        return {};
+    }
+    if (rc != ERROR_MORE_DATA || size > kMaxValueBytes)
+        return {};
+    std::wstring big(size / sizeof(wchar_t) + 1, L'\0');
+    // Advertise at most the cap: a value that grew between the two reads gets
+    // ERROR_MORE_DATA (-> empty), never a buffer larger than the documented bound.
+    DWORD big_size = (std::min)(static_cast<DWORD>(big.size() * sizeof(wchar_t)), kMaxValueBytes);
+    if (RegQueryValueExW(key, wname.c_str(), nullptr, &type, reinterpret_cast<LPBYTE>(big.data()),
+                         &big_size) == ERROR_SUCCESS &&
+        yuzu::installed_apps::parsers::reg_string_type_accepted(type, accept_expand_sz) &&
+        big_size >= sizeof(wchar_t)) {
+        return reg_sz_to_utf8(big.data(), big_size);
+    }
+    return {};
 }
 
 } // namespace yuzu::installed_apps::reg_utf8

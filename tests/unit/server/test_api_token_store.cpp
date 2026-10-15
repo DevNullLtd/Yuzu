@@ -2694,6 +2694,83 @@ TEST_CASE("ApiTokenStore: rotate_token refuses on a scope_service mismatch even 
     CHECK(active[0].token_id == token_id);
 }
 
+TEST_CASE("ApiTokenStore: rotate_token succeeds when the caller holds NO standing tier/scope "
+          "authority at all, even against a TIERED/SCOPED predecessor — the #2963 "
+          "full-authority exception, and the successor inherits the TOKEN's own tier/scope, "
+          "never the caller's",
+          "[pg][token][rotation][human]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    // Predecessor is operator-tier + service-scoped — exactly the case an
+    // interactive dashboard/cookie session (empty tier/scope) could not
+    // reach before #2963, backwards precisely when the reason to rotate is
+    // that the secret may be compromised.
+    auto raw = store.create_token("alices-operator-pat", "alice", now + k90Days, "svc-a",
+                                  "operator");
+    REQUIRE(raw.has_value());
+    const std::string token_id = store.list_active_for_principal("alice")[0].token_id;
+
+    // Caller presents NO standing authority ("", "") — a plain cookie
+    // session — not the predecessor's own "operator"/"svc-a".
+    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", "", "",
+                                      std::nullopt);
+    REQUIRE(rotated.has_value());
+
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal("alice"))
+        if (t.token_id != token_id)
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+    auto successor = store.get_token(successor_id);
+    REQUIRE(successor.has_value());
+    REQUIRE(successor->has_value());
+    // Inherits the PREDECESSOR's tier/scope verbatim — the caller's own
+    // (empty) authority never leaks into the successor. Nothing is
+    // escalated: the minted credential is exactly as narrow as the one it
+    // replaces.
+    CHECK((*successor)->mcp_tier == "operator");
+    CHECK((*successor)->scope_service == "svc-a");
+}
+
+TEST_CASE("ApiTokenStore: confirm_token_rotation succeeds with the SAME full-authority caller "
+          "that initiated the rotation via the #2963 exception — rotate and confirm must "
+          "agree on the identical caller/token pair",
+          "[pg][token][rotation][human][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    auto raw = store.create_token("bobs-supervised-pat", "bob", now + k90Days, "svc-z",
+                                  "supervised");
+    REQUIRE(raw.has_value());
+    const std::string predecessor_id = store.list_active_for_principal("bob")[0].token_id;
+
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "bob", "", "",
+                                      std::nullopt);
+    REQUIRE(rotated.has_value());
+    const std::string raw_secret = *rotated;
+
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal("bob"))
+        if (t.supersedes_token_id == predecessor_id)
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    auto confirmed = store.confirm_token_rotation(successor_id, raw_secret, "bob", "", "");
+    REQUIRE(confirmed.has_value());
+    auto active = store.list_active_for_principal("bob");
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == successor_id);
+    CHECK(active[0].mcp_tier == "supervised");
+    CHECK(active[0].scope_service == "svc-z");
+}
+
 TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a non-owner even with the correct "
           "pinned successor token_id — self-service only",
           "[pg][token][rotation]") {

@@ -61,3 +61,28 @@ paths-ignore:
 query-filters:
   - exclude:
       id: cpp/poorly-documented-function
+  # actions/cache-poisoning/poisonable-step (CWE-349, #4471): fires on every
+  # step that executes the checked-out revision in ci.yml, because
+  # trusted-fork-ci.yml (workflow_dispatch) calls it as a reusable workflow and
+  # the query assumes a dispatch runs in the default-branch cache scope. It
+  # cannot see that trusted_inputs refuses any dispatch outside a throwaway
+  # trusted-fork/pr-<N> branch (tests/shell/test_trusted_inputs_validate.sh
+  # pins that on every PR; scripts/ci/test_runner_health_check.py pins that no
+  # other workflow checks out a PR-derived ref), and no CodeQL control-check
+  # covers workflow_dispatch, so each new preflight step re-raised a HIGH
+  # alert (#5177) -- alerts #5158 and #5175 hit the identical pattern and were
+  # each individually dismissed with the same rationale (governance.d
+  # mcp-retry-hardening.gilNSc.jsonl), which is the established precedent for
+  # this query and the recurring cost #4471 exists to stop paying. A global
+  # exclusion is chosen here, not another individual dismissal, because this
+  # change (adversarial-reviewed) also closes the underlying gap program-wide:
+  # trusted_inputs AND fork-dynamic-review.yml both refuse any ref outside the
+  # trusted-fork/pr-<N> quarantine, and the sweep in
+  # scripts/ci/test_runner_health_check.py covers .yml and .yaml. Alert
+  # #5177 itself stays dismissed (won't-fix, pointing at #4471) as the
+  # historical record of why this exclusion exists; this entry is what
+  # stops the pattern from generating a fresh alert on every future PR.
+  # Siblings stay on: actions/cache-poisoning/direct-cache,
+  # actions/untrusted-checkout/*, zizmor's cache-poisoning audit.
+  - exclude:
+      id: actions/cache-poisoning/poisonable-step

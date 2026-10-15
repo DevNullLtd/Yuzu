@@ -1,1 +1,0 @@
-- **`ManagementGroupStore`'s mandatory legacy backfill now reads all three tables (groups/members/roles) in one snapshot transaction** (#3210), closing a torn-read race with a concurrent legacy-file writer during migration. Previously this could cause a nondeterministic fail-closed backfill refusal (boot blocked, retry required); it now succeeds deterministically.

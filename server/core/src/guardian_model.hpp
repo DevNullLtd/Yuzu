@@ -25,30 +25,27 @@
 /// read (ADR-0038 catastrophic-read set) — the caller MUST 503 (REST) or
 /// otherwise refuse to render, never render an empty/zero result that would
 /// misreport the fleet as compliant or a rule as having no reporting agents.
+///
+/// The six result structs these functions return (`GuardianStatusRollup`
+/// through `GuardianDeviceComplianceRollup`, plus its nested
+/// `GuardianDeviceComplianceGuardRow`) live in the pure
+/// `guardian_types.hpp` (included below), NOT here — this header
+/// forward-declares `GuaranteedStateStore`/`BaselineStore` and its functions
+/// take them by reference, so it cannot itself sit behind the ADR-0031 WS-A4
+/// abstract `guardian_api.hpp` seam (whose closure must name no store type at
+/// all, not even by forward declaration — see that header's comment). The
+/// seam wraps these SAME functions one-for-one; `guardian_api.cpp`'s
+/// `LocalGuardianApi` is the one place that still includes this header.
 
-#include <cstdint>
+#include "guardian_types.hpp"
+
 #include <optional>
-#include <string>
 #include <vector>
 
 namespace yuzu::server {
 
 class GuaranteedStateStore;
 class BaselineStore;
-
-/// Fleet Guardian status rollup — shared by `GET /api/v1/guaranteed-state/status`
-/// and MCP `get_guardian_status`. Re-derives EXACTLY the fields the REST route
-/// already built inline before this PR (rest_api_v1.cpp's own "ADR-1005
-/// MCP-twin note" flagged the drift risk of a future rung completing one of
-/// these placeholder fields on the REST side only). `compliant_rules`/
-/// `drifted_rules` stay 0 until full status ingest lands (unchanged from
-/// today) — this function does not widen the capability, only shares it.
-struct GuardianStatusRollup {
-    std::int64_t total_rules{0};
-    std::int64_t compliant_rules{0};
-    std::int64_t drifted_rules{0};
-    std::int64_t errored_rules{0};
-};
 
 /// `agent_scope`: nullopt = whole fleet; engaged (including empty, ADR-0017
 /// INV-2) = confine `errored_rules` to exactly these agents, applied in SQL
@@ -69,13 +66,7 @@ guardian_status_rollup(GuaranteedStateStore& store,
 /// `rule_names_for`), never the global catalogue size the fleet rollup uses.
 /// `compliant_rules`/`drifted_rules` stay 0 for the same reason as the fleet
 /// rollup — full status ingest lands in a later rung.
-struct GuardianAgentStatusRollup {
-    std::int64_t total_rules{0};
-    std::int64_t compliant_rules{0};
-    std::int64_t drifted_rules{0};
-    std::int64_t errored_rules{0};
-};
-
+///
 /// Returns `nullopt` on a degraded `agent_rule_statuses_for_agent()`/
 /// `rule_names_for()` read (ADR-0038 catastrophic-read set) — caller MUST
 /// refuse to render (503 on REST), never render a silent 0 that would
@@ -100,12 +91,7 @@ guardian_agent_status_rollup(GuaranteedStateStore& store, const std::string& age
 /// (rest_api_v1.cpp) for the identical class of data. A caller wanting
 /// online/offline or hostname context correlates `agent_id` against
 /// `list_agents`/`GET /api/v1/agents` separately.
-struct GuardianRuleAgentStatusRow {
-    std::string agent_id;
-    std::string state;      // "compliant" | "drifted" | "errored"
-    std::string updated_at; // ISO-8601 of the event that set it
-};
-
+///
 /// Returns `nullopt` on a degraded `agent_rule_statuses()` read — caller MUST
 /// refuse to render (503 on REST), never render an empty list as "no device
 /// reports this guard". Does NOT distinguish "rule not found" from "rule
@@ -135,14 +121,7 @@ guardian_rule_agent_status_rows(GuaranteedStateStore& store, const std::string& 
 /// query), not the fragment's own `agent_rule_statuses()` unfiltered fleet
 /// scan post-filtered in C++ — same modernisation `device-compliance`
 /// already made for this identical class of read.
-struct GuardianDeviceGuardRow {
-    std::string rule_id;
-    std::string name;       // resolved rule name; falls back to rule_id if the
-                             // rule has since been deleted from the catalogue
-    std::string state;      // "compliant" | "drifted" | "errored"
-    std::string updated_at; // ISO-8601 of the event that set it
-};
-
+///
 /// Returns `nullopt` on a degraded `agent_rule_statuses_for_agent()`/
 /// `rule_names_for()` read — caller MUST refuse to render (503 on REST),
 /// never render an empty list as "this device has no guards".
@@ -159,29 +138,7 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
 /// row had already called "success". Aggregating all four reads here, behind
 /// one nullopt/`store_degraded` contract, means a caller can only audit once
 /// every read has actually completed.
-struct GuardianDeviceComplianceGuardRow {
-    std::string rule_id;
-    std::string name;       // resolved rule name; falls back to rule_id if the
-                             // rule has since been deleted from the catalogue
-    std::string status;     // "compliant" | "drifted" | "errored" | "pending"
-    std::string updated_at; // ISO-8601 of the last reported verdict; empty if none
-};
-
-struct GuardianDeviceComplianceRollup {
-    std::string baseline_id;
-    std::string baseline_name;
-    std::string baseline_lifecycle;
-    bool deployed{false};
-    std::int64_t snapshot_total{0}; // deployed_member_rule_ids().size()
-    std::int64_t total_guards{0};   // snapshot members this device has reported ANY verdict for
-    std::int64_t compliant{0};
-    std::int64_t drifted{0};
-    std::int64_t errored{0};
-    std::int64_t pending{0};
-    std::string last_updated; // max reported updated_at across guards; empty if none
-    std::vector<GuardianDeviceComplianceGuardRow> guards;
-};
-
+///
 /// `store_degraded` is a REQUIRED out-param, same contract as
 /// `BaselineStore::get_baseline_by_name`'s own `store_ok`: set true the
 /// moment ANY of the four underlying reads degrades, at which point the

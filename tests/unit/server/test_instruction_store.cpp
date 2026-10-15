@@ -15,7 +15,9 @@
  * are maintained as their own section.
  */
 
+#include "instruction_schema_test_util.hpp"
 #include "instruction_store.hpp"
+#include "instruction_param_schema.hpp"
 #include "store_errors.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -26,7 +28,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
+#include <cstring>
 #include <string>
 
 using namespace yuzu::server;
@@ -609,6 +614,99 @@ TEST_CASE("InstructionStore: update nonexistent fails", "[instruction_store][pg]
     CHECK(!result.has_value());
 }
 
+TEST_CASE("InstructionStore: update_definition with an expected updated_at only applies to the "
+          "version that was loaded",
+          "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto id = store.create_definition(make_question("Optimistic"));
+    REQUIRE(id.has_value());
+    auto loaded = store.get_definition(*id);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->has_value());
+    auto def = **loaded;
+    def.description = "mine";
+
+    // A stale expectation is a conflict, tagged for the route's 409, and writes nothing.
+    auto stale = store.update_definition(def, def.updated_at - 1);
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(is_conflict_error(stale.error()));
+    CHECK((**store.get_definition(*id)).description != "mine");
+
+    // The loaded version applies.
+    REQUIRE(store.update_definition(def, def.updated_at).has_value());
+    CHECK((**store.get_definition(*id)).description == "mine");
+
+    // A missing row stays not_found, not a conflict.
+    auto ghost = def;
+    ghost.id = "no-such-definition";
+    auto missing = store.update_definition(ghost, def.updated_at);
+    REQUIRE_FALSE(missing.has_value());
+    CHECK_FALSE(is_conflict_error(missing.error()));
+    CHECK(missing.error().rfind("not_found: ", 0) == 0);
+}
+
+TEST_CASE("InstructionStore: the name filter matches LIKE metacharacters literally",
+          "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_definition(make_question("50% off check")).has_value());
+    REQUIRE(store.create_definition(make_question("50 percent check")).has_value());
+    REQUIRE(store.create_definition(make_question("a_b probe")).has_value());
+    REQUIRE(store.create_definition(make_question("axb probe")).has_value());
+
+    InstructionQuery q;
+    q.name_filter = "50%";
+    auto pct = store.query_definitions(q);
+    REQUIRE(pct.has_value());
+    REQUIRE(pct->size() == 1); // '%' is not "anything"
+    CHECK((*pct)[0].name == "50% off check");
+
+    q.name_filter = "a_b";
+    auto under = store.query_definitions(q);
+    REQUIRE(under.has_value());
+    REQUIRE(under->size() == 1); // '_' is not "any one character"
+    CHECK((*under)[0].name == "a_b probe");
+
+    q.name_filter = "PROBE"; // still case-insensitive
+    auto ci = store.query_definitions(q);
+    REQUIRE(ci.has_value());
+    CHECK(ci->size() == 2);
+}
+
+TEST_CASE("InstructionStore: count_definitions_per_set is exact and only lists sets with members",
+          "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    InstructionSet a, b;
+    a.name = "Set A";
+    b.name = "Empty Set";
+    auto set_a = store.create_set(a);
+    auto set_b = store.create_set(b);
+    REQUIRE(set_a.has_value());
+    REQUIRE(set_b.has_value());
+    for (int i = 0; i < 3; ++i) {
+        auto d = make_question("In A " + std::to_string(i));
+        d.instruction_set_id = *set_a;
+        REQUIRE(store.create_definition(d).has_value());
+    }
+    REQUIRE(store.create_definition(make_question("No set")).has_value());
+
+    auto counts = store.count_definitions_per_set();
+    REQUIRE(counts.has_value());
+    REQUIRE(counts->count(*set_a) == 1);
+    CHECK((*counts)[*set_a] == 3);
+    CHECK(counts->count(*set_b) == 0);
+    CHECK(counts->size() == 1);
+}
+
 // ── Delete Definition ──────────────────────────────────────────────────────
 
 TEST_CASE("InstructionStore: delete definition", "[instruction_store][pg]") {
@@ -685,6 +783,161 @@ TEST_CASE("InstructionStore: import invalid JSON fails", "[instruction_store][js
 
     auto result = store.import_definition_json("not valid json {{{");
     CHECK(!result.has_value());
+}
+
+// json-dump-depth-guard fix (#2437-class): import_definition_json_impl copies
+// visualization_spec / response_templates_spec sub-trees verbatim into
+// normalize_to_array_helper / normalise_templates_array, both of which
+// eventually dump() the result, and stores parameter_schema verbatim for a
+// later dump() on the discover-catalog read side (discover_routes.cpp). Four
+// guards close this: a whole-body check before any parse, a string-form
+// check on visualization_spec's own re-parsed text, one on
+// response_templates_spec's own re-parsed text, and a write-side check on
+// parameter_schema's raw text.
+//
+// Every poisoned body below is a raw string built with a 35-deep bracket
+// chain (std::string(35,'[') + std::string(35,']')), never materialised as a
+// live nlohmann::json object at that depth - kMcpMaxJsonDepth is 32, so 35 is
+// comfortably past it and still trivially safe to construct in this test
+// process, orders of magnitude short of the ~100,000-level depth that
+// actually SIGSEGVs the real dump() call these guards exist to prevent.
+TEST_CASE("InstructionStore: import rejects a request body nested past the depth guard "
+          "(visualization_spec sub-tree), no definition created",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    // The deep chain is a direct sub-tree here (no surrounding quotes) - the
+    // whole-body guard runs before any parse and closes this and the
+    // response_templates_spec sub-tree sink in one check.
+    const std::string body =
+        R"({"name":"Deep Body","type":"question","plugin":"system_info","action":"query",)"
+        R"("visualization_spec":)" +
+        std::string(35, '[') + std::string(35, ']') + "}";
+    auto result = store.import_definition_json(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nests too deeply") != std::string::npos);
+
+    InstructionQuery q;
+    auto all = store.query_definitions(q);
+    REQUIRE(all.has_value());
+    CHECK(std::none_of(all->begin(), all->end(),
+                       [](const auto& d) { return d.name == "Deep Body"; }));
+}
+
+TEST_CASE("InstructionStore: import rejects visualization_spec supplied as a deeply-nested "
+          "JSON-encoded STRING, no definition created",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    // #1073: opt out of signature enforcement - the whole-body guard fires
+    // before the signature gate and needs no bypass, but this field's own
+    // re-parse site sits AFTER that gate, so an unsigned body would
+    // otherwise be rejected there first and never reach it.
+    store.set_require_signed_definitions(false);
+
+    // The deep chain is INSIDE a JSON string literal here - structurally
+    // different from the sub-tree test above. The whole-body text scan
+    // correctly does not count brackets inside a string value as structure,
+    // so this body reads as shallow to that scan; only the string's own
+    // decoded content, re-parsed at normalize_to_array's own site, is deep.
+    // This proves the dedicated string-form guard, not the whole-body one.
+    const std::string deep = std::string(35, '[') + std::string(35, ']');
+    const std::string body =
+        R"({"name":"Deep String Viz","type":"question","plugin":"system_info","action":"query",)"
+        R"("visualization_spec":")" +
+        deep + R"("})";
+    auto result = store.import_definition_json(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nests too deeply") != std::string::npos);
+
+    InstructionQuery q;
+    auto all = store.query_definitions(q);
+    REQUIRE(all.has_value());
+    CHECK(std::none_of(all->begin(), all->end(),
+                       [](const auto& d) { return d.name == "Deep String Viz"; }));
+}
+
+TEST_CASE("InstructionStore: import rejects response_templates_spec supplied as a "
+          "deeply-nested JSON-encoded STRING, no definition created",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_definitions(false);
+
+    // Well under the pre-existing 256 KiB string-size cap, so that cap alone
+    // does not close this - only the depth check does.
+    const std::string deep = std::string(35, '[') + std::string(35, ']');
+    const std::string body =
+        R"({"name":"Deep String Templates","type":"question","plugin":"system_info",)"
+        R"("action":"query","response_templates_spec":")" +
+        deep + R"("})";
+    auto result = store.import_definition_json(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nests too deeply") != std::string::npos);
+
+    InstructionQuery q;
+    auto all = store.query_definitions(q);
+    REQUIRE(all.has_value());
+    CHECK(std::none_of(all->begin(), all->end(),
+                       [](const auto& d) { return d.name == "Deep String Templates"; }));
+}
+
+TEST_CASE("InstructionStore: import rejects a deeply-nested parameter_schema string "
+          "at write time, no definition created",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_definitions(false);
+
+    const std::string deep = std::string(35, '[') + std::string(35, ']');
+    const std::string body =
+        R"({"name":"Deep Param Schema","type":"question","plugin":"system_info",)"
+        R"("action":"query","parameter_schema":")" +
+        deep + R"("})";
+    auto result = store.import_definition_json(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nests too deeply") != std::string::npos);
+
+    InstructionQuery q;
+    auto all = store.query_definitions(q);
+    REQUIRE(all.has_value());
+    CHECK(std::none_of(all->begin(), all->end(),
+                       [](const auto& d) { return d.name == "Deep Param Schema"; }));
+}
+
+TEST_CASE("InstructionStore: import with valid, shallow visualization_spec / "
+          "response_templates_spec / parameter_schema succeeds (happy path unaffected "
+          "by the #2437-class depth guards)",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_definitions(false);
+
+    const std::string body =
+        R"({"name":"Healthy Import","type":"question","plugin":"system_info","action":"query",)"
+        R"("parameter_schema":"{\"type\":\"object\"}",)"
+        R"("visualization_spec":[{"type":"bar"}],)"
+        R"("response_templates_spec":[{"id":"tmpl1","template":"ok"}]})";
+    auto result = store.import_definition_json(body);
+    REQUIRE(result.has_value());
+
+    auto def = store.get_definition(*result);
+    REQUIRE(def.has_value());
+    REQUIRE(def->has_value());
+    CHECK((*def)->parameter_schema == R"({"type":"object"})");
+    CHECK((*def)->visualization_spec.find("bar") != std::string::npos);
+    CHECK((*def)->response_templates_spec.find("tmpl1") != std::string::npos);
 }
 
 TEST_CASE("InstructionStore: export nonexistent returns empty", "[instruction_store][json][pg]") {
@@ -1339,3 +1592,102 @@ TEST_CASE("InstructionStore: read and write degrade counters increment on a stor
               .value() == 1.0);
 }
 
+// -- Stored parameter_schema: write-time gate and preserve-on-empty ---------
+
+TEST_CASE("InstructionStore: parameter_schema write gate rejects an oversize or invalid schema "
+          "on create and import",
+          "[instruction_store][pg][param-schema]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_definitions(false);
+
+    auto def = make_question("schema gate");
+    // Oversize: refused on its length, with the fixed message.
+    def.parameter_schema = std::string(instr::kMaxParameterSchemaBytes + 1, ' ');
+    auto over = store.create_definition(def);
+    REQUIRE_FALSE(over.has_value());
+    CHECK(over.error() == "parameter_schema is larger than the 262144-byte limit");
+
+    // Invalid: the first errors, and an "and N more" tail past three. No schema value is named.
+    def.parameter_schema = R"({"type":"object","properties":{"p":{"type":"number","SECRET":1}}})";
+    auto bad = store.create_definition(def);
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().rfind("parameter_schema is not a valid parameter schema: ", 0) == 0);
+    CHECK(bad.error().find("SECRET") == std::string::npos);
+    nlohmann::json many = {{"type", "object"}, {"properties", nlohmann::json::object()}};
+    for (int i = 0; i < 5; ++i)
+        many["properties"]["p" + std::to_string(i)] = {{"type", "number"}};
+    def.parameter_schema = many.dump();
+    auto more = store.create_definition(def);
+    REQUIRE_FALSE(more.has_value());
+    CHECK(more.error().find("; and 2 more") != std::string::npos);
+
+    // The import path is gated by the same check.
+    nlohmann::json imp = {{"name", "imp"}, {"type", "question"}, {"plugin", "p"}, {"action", "a"},
+                          {"version", "1.0"}, {"parameter_schema", "not json"}};
+    auto imported = store.import_definition_json(imp.dump());
+    REQUIRE_FALSE(imported.has_value());
+    CHECK(imported.error().find("not a valid parameter schema") != std::string::npos);
+
+    // Empty, `{}` and a valid schema are accepted.
+    for (const char* ok : {"", "{}", R"({"type":"object","properties":{"p":{"type":"string"}}})"}) {
+        def.name = std::string("schema ok ") + std::to_string(std::strlen(ok));
+        def.parameter_schema = ok;
+        CHECK(store.create_definition(def).has_value());
+    }
+}
+
+TEST_CASE("InstructionStore: update keeps the stored parameter_schema when the submitted one is "
+          "empty, and only checks a schema that differs from the stored one",
+          "[instruction_store][pg][param-schema]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string schema = R"({"type":"object","properties":{"p":{"type":"string"}}})";
+    auto def = make_question("schema keep");
+    def.parameter_schema = schema;
+    auto id = store.create_definition(def);
+    REQUIRE(id.has_value());
+    def.id = *id;
+    auto stored = [&] { return (*store.get_definition(*id))->parameter_schema; };
+
+    // Empty keeps the column while the other fields change.
+    def.parameter_schema.clear();
+    def.description = "edited";
+    REQUIRE(store.update_definition(def).has_value());
+    CHECK(stored() == schema);
+    CHECK((*store.get_definition(*id))->description == "edited");
+
+    // A supplied schema replaces it, and `{}` deliberately clears it.
+    def.parameter_schema = R"({"type":"object","properties":{"q":{"type":"integer"}}})";
+    REQUIRE(store.update_definition(def).has_value());
+    CHECK(stored() == def.parameter_schema);
+    def.parameter_schema = "{}";
+    REQUIRE(store.update_definition(def).has_value());
+    CHECK(stored() == "{}");
+
+    // A new invalid or oversize schema is refused and the column is untouched.
+    def.parameter_schema = "not json";
+    CHECK_FALSE(store.update_definition(def).has_value());
+    def.parameter_schema = std::string(instr::kMaxParameterSchemaBytes + 1, ' ');
+    CHECK(store.update_definition(def).error() ==
+          "parameter_schema is larger than the 262144-byte limit");
+    CHECK(stored() == "{}");
+
+    // A legacy row (written past the gate) stays editable when the schema is unchanged, and is
+    // not allowed to be re-saved with a different invalid schema.
+    const std::string legacy = std::string(instr::kMaxParameterSchemaBytes + 1, ' ');
+    yuzu::server::test::force_parameter_schema(pool, *id, legacy);
+    def.parameter_schema = legacy;
+    def.description = "edited again";
+    CHECK(store.update_definition(def).has_value());
+    def.parameter_schema = "not json";
+    CHECK_FALSE(store.update_definition(def).has_value());
+    def.parameter_schema.clear();
+    CHECK(store.update_definition(def).has_value());
+    CHECK(stored() == legacy);
+}

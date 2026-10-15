@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -179,19 +180,47 @@ TEST_CASE("PgPool: throwing acquire-wait observer does not leak the lease", "[pg
 // complete — never deadlock when the destroyer does NOT itself hold a lease.
 TEST_CASE("CH-9: pool dtor waits for an outstanding lease, no deadlock", "[pg][chaos]") {
     YUZU_REQUIRE_PG_DB(db);
+    // Every Catch2 assertion macro in this test runs on the MAIN thread only.
+    // Catch2's reporter/output-redirect state (Catch::OutputRedirect) is not
+    // thread-safe across concurrent invocation — a std::async worker thread
+    // calling REQUIRE/CHECK races the main thread's own Catch2 bookkeeping
+    // (TSan: catch_output_redirect.hpp, OutputRedirect::isActive() vs.
+    // deactivate(), #1611 governance round). The async lambda below and its
+    // inner `holder` thread only SIGNAL outcomes through these atomics, which
+    // must therefore live in THIS scope, not inside the lambda — every
+    // REQUIRE/CHECK below runs strictly after destroy.get() returns.
+    // std::future::get() synchronizes-with the async task's completion, so
+    // reading these atomics afterward is safe without a further fence.
+    std::atomic<bool> pool_valid{false};
+    std::atomic<bool> holding{false};
+    std::atomic<bool> released{false};
+    // Plain (non-atomic) string: written once by the holder thread only on
+    // the acquire-failure path, before `holding`/`released` are touched, and
+    // read only after destroy.get() — covered by the same synchronizes-with
+    // edge as the atomics above, so no separate synchronization is needed.
+    std::string acquire_failure_info;
     auto destroy = std::async(std::launch::async, [&] {
         auto pool = std::make_unique<PgPool>(PgPool::Options{.conninfo = db.dsn(), .size = 2});
-        REQUIRE(pool->valid());
-        std::atomic<bool> released{false};
-        std::atomic<bool> holding{false};
+        pool_valid.store(pool->valid());
         std::thread holder([&] {
-            // Assertions stay on the MAIN thread — Catch2 macros are not
-            // thread-safe; the holder only SIGNALS state through atomics.
+            // Assertions AND info macros stay on the MAIN thread — Catch2
+            // macros (REQUIRE/CHECK/UNSCOPED_INFO alike) are not thread-safe;
+            // the holder only SIGNALS state through these atomics/string.
+            // acquire_or_explain's own UNSCOPED_INFO call (on this thread, on
+            // failure) is therefore silently discarded by Catch2 before the
+            // main thread's REQUIRE(holding.load()) ever runs — capture the
+            // same diagnostic here instead, in plain data, and surface it
+            // from the main thread below.
             auto lease = acquire_or_explain(*pool);
             if (lease) {
                 holding.store(true);                // lease is now HELD...
                 std::this_thread::sleep_for(200ms); // ...across the reset()...
                 released.store(true);               // ...then returns at scope exit
+            } else {
+                std::ostringstream oss;
+                oss << "PgPool::acquire failed — last_error: " << pool->last_error()
+                    << " (connect_breaker_open=" << pool->connect_breaker_open() << ")";
+                acquire_failure_info = oss.str();
             }
         });
         // Barrier, NOT a bare sleep: destroy the pool only once the holder
@@ -212,13 +241,18 @@ TEST_CASE("CH-9: pool dtor waits for an outstanding lease, no deadlock", "[pg][c
         if (holding.load())
             pool.reset();          // lease held → the dtor MUST block until it returns
         holder.join();             // always join before scope exit — never a dangling thread
-        REQUIRE(holding.load());   // (main-thread assert) the holder did hold a lease
-        CHECK(released.load());
     });
     // Watchdog: a correct pool completes well under the deadline; a deadlock
     // would hang here, which the bounded wait converts into a test failure.
     REQUIRE(destroy.wait_for(15s) == std::future_status::ready);
     destroy.get();
+    // All assertions run here, on the main thread, strictly after the async
+    // task (and its inner holder thread) have fully completed.
+    REQUIRE(pool_valid.load());
+    if (!holding.load() && !acquire_failure_info.empty())
+        UNSCOPED_INFO(acquire_failure_info);
+    REQUIRE(holding.load());   // the holder did hold a lease
+    CHECK(released.load());
 }
 
 // CH-10: a wedged advisory lock must time out via lock_timeout so boot fails

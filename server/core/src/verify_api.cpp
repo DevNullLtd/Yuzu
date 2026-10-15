@@ -26,12 +26,15 @@ static_assert(kMaxWindowDays == AppPerfDailyStore::kRetentionDays,
 /// it is independently testable (ADR-0031 WS-A4 #4250). Behaviour preserved
 /// exactly: two bounded single-store leases (members, then B1 rows) composed
 /// never held across each other (ADR-0012 §1), the AUTHORITATIVE-degrade
-/// `nullopt` on either a missing reader or a failed row read, an
-/// empty/unknown group resolving to `member_count == 0` with an empty (not
-/// degraded) comparison, and the SAME two-canonicalize sequence the callers
-/// this replaces used — raw versions passed into `get_cohort_rows`
-/// (canonicalized internally there to match the stored key), canonicalized
-/// again here for `build_comparison`.
+/// `nullopt` on a missing reader, a DEGRADED member-resolution read (via
+/// `ManagementGroupStore::get_members_checked`, not the fail-soft
+/// `get_members()` — #1762, fixed: a store-not-open/pool-timeout/query-error
+/// member read no longer renders as `member_count == 0`), or a failed row
+/// read, an empty/unknown group resolving to `member_count == 0` with an
+/// empty (not degraded) comparison, and the SAME two-canonicalize sequence
+/// the callers this replaces used — raw versions passed into
+/// `get_cohort_rows` (canonicalized internally there to match the stored
+/// key), canonicalized again here for `build_comparison`.
 class LocalVerifyApi final : public VerifyApi {
 public:
     LocalVerifyApi(ManagementGroupStore& groups, AppPerfCohortReader* cohort_reader)
@@ -48,11 +51,15 @@ public:
         // Resolve members (one bounded read, lease released), THEN read their
         // raw B1 rows (a second bounded read) — never a lease held across the
         // other (ADR-0012 §1). The /auto VERIFY compare engine pairs these
-        // per machine.
-        const auto members = groups_.get_members(q.group_id);
+        // per machine. get_members_checked (not the fail-soft get_members())
+        // so a member-read degrade fails closed to nullopt rather than
+        // rendering as member_count 0 (#1762, fixed).
+        auto members = groups_.get_members_checked(q.group_id);
+        if (!members)
+            return std::nullopt; // AUTHORITATIVE degrade — the member read failed
         std::vector<std::string> agent_ids;
-        agent_ids.reserve(members.size());
-        for (const auto& m : members)
+        agent_ids.reserve(members->size());
+        for (const auto& m : *members)
             agent_ids.push_back(m.agent_id);
 
         VerifyCompareResult out;

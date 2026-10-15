@@ -77,7 +77,29 @@
         %% {spki_sha256, "hex"} (openssl x509 -in cert.pem -pubkey -noout |
         %% openssl pkey -pubin -outform DER | openssl dgst -sha256). List two
         %% pins to overlap a rotation. Empty/unresolvable pins fail CLOSED.
-        {mgmt_peer_pins, [{cert_file, "/etc/yuzu/certs/default-server.pem"}]}
+        {mgmt_peer_pins, [{cert_file, "/etc/yuzu/certs/default-server.pem"}]},
+
+        %% HA WS-4 #4555 — gateway multi-node cluster FORMATION (ADR-2002 §7b),
+        %% distinct from `cluster_id` above: this is what to RESOLVE to find
+        %% peer addresses, not the logical cluster identifier. Default
+        %% `"gateway"` matches the reference Compose service name. Override:
+        %% YUZU_GW_SEED_DNS_NAME.
+        {cluster_seed_dns_name, <<"gateway">>},
+
+        %% An explicit comma-separated peer address list. When set (non-empty),
+        %% REPLACES DNS resolution outright — never merged with it. Override:
+        %% YUZU_GW_SEED_NODES (e.g. "10.0.0.1,10.0.0.2").
+        {cluster_seed_nodes, []},
+
+        %% Always-on redial loop interval (ms) — fixed, no backoff. `connect_all`
+        %% is `false` below, so this loop is what forms AND maintains the mesh.
+        %% Override: YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS.
+        {cluster_redial_interval_ms, 5000},
+
+        %% Lifetime cap on DISTINCT peer addresses ever atomized — see
+        %% config/sys.config's identical setting for the full rationale
+        %% (PR #4604 review round 2, atom-table exhaustion).
+        {cluster_max_lifetime_addrs, 1024}
     ]},
 
     {grpcbox, [
@@ -172,6 +194,11 @@
     {kernel, [
         {connect_all, false},
         {net_ticktime, 30},
+        %% HA WS-4 #4555: pin a small distribution port range so it can
+        %% actually be firewalled — see config/sys.config's identical block
+        %% for the full rationale.
+        {inet_dist_listen_min, 9100},
+        {inet_dist_listen_max, 9105},
         {logger_level, info},
         {logger, [
             {handler, default, logger_std_h, #{

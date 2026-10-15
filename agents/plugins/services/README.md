@@ -100,6 +100,7 @@ Rows are pipe-delimited, prefixed `svc|`, one row per service. The row **shape**
 | `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:signaled` | Linux/macOS `list`/`running`, the `systemctl`/`launchctl` child was killed by a signal rather than exiting cleanly |
 | `OK` / `PARTIAL` | partial | `subprocess_runner:line_limit` | Linux/macOS `list`/`running`, the runner capped `systemctl`/`launchctl` output at its line limit and killed the still-producing child — a deliberate bounded stop, not a failure |
 | `CONSTRAINED` | PARTIAL | `services:output_truncated` | Linux/macOS `list`/`running` when the captured subprocess output was cut short by the runner's byte cap but the tool itself exited cleanly (`services_plugin.cpp:124-128`) |
+| `CONSTRAINED` | PARTIAL | `services:malformed_launchctl_capture` | macOS `list`/`running` when `launchctl list` exited cleanly but its output is not a well-formed listing: no lines at all, or a first line other than the `PID\tStatus\tLabel` header. No service rows are emitted: the malformed check fires before any row is decoded (`services_parsers.hpp:210-211`), so the caller receives zero `svc\|` rows together with this status, and can tell a failed read from a host with nothing running — before this, a truncated capture read as a genuine "0 services" success. Reported only when no subprocess-runner failure has already set a status (`services_plugin.cpp:758-762`) |
 
 ### Where the data goes
 
@@ -234,5 +235,4 @@ error|missing required parameter: name
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/agent/test_services_macos.cpp` · `tests/unit/test_services_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md`
 <!-- END GENERATED -->

@@ -9,9 +9,11 @@
  *   - agent-reported values are HTML-escaped (no stored XSS)
  *   - route gating: authed renders / unauth → 302 / perm-denied → 403 before audit
  */
+#include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "test_dex_perf_api_double.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -26,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -222,6 +225,10 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[pg][dex][rout
     // shared DEX sub-nav (Overview + Catalogue live; Health/Trends muted)
     CHECK(html.find("/fragments/dex/overview") != std::string::npos);
     CHECK(html.find("gp-subnav") != std::string::npos);
+    // The Alerts tab is static chrome: present for every viewer, no capability probe
+    // behind it (the Alerts fragment itself shows the role note).
+    CHECK(html.find("hx-get=\"/fragments/dex/alerts?window=7d\"") != std::string::npos);
+    CHECK(html.find(">Alerts</a>") != std::string::npos);
     CHECK(html.find("actively monitored") != std::string::npos);
     CHECK(html.find("of 114 signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)
@@ -744,7 +751,7 @@ TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
     DexFleet fleet;
     fleet.windows_online = 10;
     const auto html = render_dex_health_fragment(&store, "", 7, fleet, "default");
-    CHECK(html.find("Experience health") != std::string::npos);
+    CHECK(html.find("DEX health") != std::string::npos);
     CHECK(html.find("100 &minus; weighted deductions") != std::string::npos); // the formula is shown
     CHECK(html.find("derived &middot; secondary") != std::string::npos);
     CHECK(html.find("Why this score") != std::string::npos);
@@ -809,7 +816,7 @@ TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
     const auto html = render_dex_overview_fragment(&store, "", 7, fleet);
     CHECK(html.find("Explore") != std::string::npos);
     CHECK(html.find("Signal catalogue") != std::string::npos);
-    CHECK(html.find("Experience health") != std::string::npos);
+    CHECK(html.find("DEX health") != std::string::npos);
     CHECK(html.find("Cross-OS &amp; trends") != std::string::npos);
     // each card drills into its deep page
     CHECK(html.find("/fragments/dex/catalogue?window=") != std::string::npos);
@@ -837,7 +844,9 @@ TEST_CASE("DEX overview: renders real multi-signal aggregations", "[pg][dex][rou
     seed_boot(store, "e6", "WS-2", 91000.0, kDayB + "T08:05:00Z");
 
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{10, 12});
-    CHECK(html.find("Digital Employee Experience") != std::string::npos);
+    // Heading matches the nav label; the long form is the subtitle only.
+    CHECK(html.find("<h1>DEX</h1>") != std::string::npos);
+    CHECK(html.find("gp-sub\">Digital Employee Experience:") != std::string::npos);
     // Hub slim: the All-signals / boot / faulting-modules panels moved to the
     // deep pages (Catalogue + App reliability) — the hub summarises and links.
     CHECK(html.find("All signals") == std::string::npos);
@@ -909,11 +918,51 @@ TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; cr
     // 2 connected Windows agents: WS-1 crashed (<100), WS-2 clean (100).
     DexFleet fleet{2, 2, {"windows"}, {{"WS-1", "windows"}, {"WS-2", "windows"}}};
     auto html = render_dex_overview_fragment(&store, "", 7, fleet);
-    CHECK(html.find("Experience") != std::string::npos);         // new headline section
+    CHECK(html.find("<div class=\"gp-sech\">DEX score</div>") != std::string::npos); // headline section
     CHECK(html.find("Overall experience") != std::string::npos); // per-device median tile
     CHECK(html.find("great") != std::string::npos);              // the distribution bar
-    CHECK(html.find("Experience by segment") != std::string::npos); // the segment breakdown
+    CHECK(html.find("DEX score by segment") != std::string::npos); // the segment breakdown
     CHECK(html.find("Crash-free devices") != std::string::npos); // crashes demoted, not removed
+}
+
+// #4855: a degraded per-device signal-summary read must surface a COUNT of
+// devices that could not be scored, never silently thin the great/fair/poor
+// population (which would read as a healthier fleet than is actually known).
+// DROP TABLE forces every connected device's per-device read to degrade
+// while the store itself stays open.
+TEST_CASE("DEX overview: a degraded per-device read counts + surfaces unscored devices, never "
+          "silently thinning the scored population",
+          "[pg][dex][routes][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+
+    DexFleet fleet{2, 2, {"windows"}, {{"WS-1", "windows"}, {"WS-2", "windows"}}};
+    auto html = render_dex_overview_fragment(&store, "", 7, fleet);
+    CHECK(html.find("2 device(s) could not be scored") != std::string::npos);
+    // UP-3: scored==0 && unscored>0 must NOT claim "no devices reporting" —
+    // 2 devices ARE reporting/connected, they just couldn't be scored (the
+    // note above already says so). The Overall tile says so instead.
+    CHECK(html.find("scores unavailable") != std::string::npos);
+    CHECK(html.find("no devices reporting") == std::string::npos);
+
+    // The pure model (build_dex_overview_model) must count the same thing.
+    const auto model = build_dex_overview_model(&store, fleet, "7d", 7, "", nullptr);
+    CHECK(model.unscored == 2);
+    CHECK(model.overall_experience == -1);
+    CHECK(model.great == 0);
+    CHECK(model.fair == 0);
+    CHECK(model.poor == 0);
+    CHECK(dex_overview_json(model).find("\"unscored\":2") != std::string::npos);
 }
 
 TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest no-data",
@@ -1218,6 +1267,28 @@ TEST_CASE("DEX apps list: empty store → no-data placeholder", "[pg][dex][route
     CHECK(html.find("No data") != std::string::npos);
 }
 
+// Kills: a wrong active_key literal on /dex — apply_shell lights nothing and says nothing for an
+// unknown key, so only a test that fetches the page can see it. The page handler touches only
+// auth_fn_ and apply_shell, so no store is wired and this runs without Postgres.
+TEST_CASE("DEX routes: /dex lights DEX in the sidebar and ends the breadcrumb on it",
+          "[dex][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, /*perm_fn=*/{}, /*store=*/nullptr, /*fleet_fn=*/{},
+                           /*audit_fn=*/{});
+
+    auto page = sink.Get("/dex");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    CHECK(page->body.find("/fragments/dex/overview") != std::string::npos);
+    CHECK(page->body.find("<a class=\"shell-nav on\" href=\"/dex\" aria-current=\"page\">") !=
+          std::string::npos);
+    CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>DEX</b>") != std::string::npos);
+}
+
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1390,7 +1461,7 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") 
         };
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, scopedPerm);
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, scopedPerm);
         auto other = sink.Get("/fragments/dex/observation?agent_id=WS-OTHER&event_id=e9");
         REQUIRE(other);
         CHECK(other->status == 403);
@@ -1521,7 +1592,7 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") 
         };
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, scopedPerm,
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, scopedPerm,
                                visibleSet);
 
         // (1) The per-device drill is scoped: out-of-scope → 403, in-scope still opens.
@@ -1605,7 +1676,7 @@ TEST_CASE("DEX routes: service-scoped token denied on every fleet-wide device-li
         audit_log.push_back(a + "|" + r);
         return true;
     };
-    yuzu::server::DexRoutes::PerfFn perf_fn = [](const std::string&) {
+    yuzu::server::DexPerfFn perf_fn = [](const std::string&) {
         yuzu::server::DexPerfSnapshot snap;
         yuzu::server::DexPerfDevice d;
         d.agent_id = "WS-1";
@@ -1616,8 +1687,10 @@ TEST_CASE("DEX routes: service-scoped token denied on every fleet-wide device-li
 
     DexRoutes routes;
     yuzu::server::test::TestRouteSink sink;
+    auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+        perf_fn, yuzu::server::test::FnDexPerfApi::Providers{});
     routes.register_routes(sink, serviceScopedAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
-                           /*responses_fn=*/{}, perf_fn);
+                           /*responses_fn=*/{}, {}, {}, dex_perf_api);
 
     auto ov = sink.Get("/fragments/dex/overview?window=7d");
     REQUIRE(ov);
@@ -1665,7 +1738,7 @@ TEST_CASE("DEX routes: ordinary session reaches /fragments/dex/perf/devices, "
         audit_log.push_back(a + "|" + r);
         return true;
     };
-    yuzu::server::DexRoutes::PerfFn perf_fn = [](const std::string&) {
+    yuzu::server::DexPerfFn perf_fn = [](const std::string&) {
         yuzu::server::DexPerfSnapshot snap;
         yuzu::server::DexPerfDevice d;
         d.agent_id = "WS-1";
@@ -1676,8 +1749,10 @@ TEST_CASE("DEX routes: ordinary session reaches /fragments/dex/perf/devices, "
 
     DexRoutes routes;
     yuzu::server::test::TestRouteSink sink;
+    auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+        perf_fn, yuzu::server::test::FnDexPerfApi::Providers{});
     routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
-                           /*responses_fn=*/{}, perf_fn);
+                           /*responses_fn=*/{}, {}, {}, dex_perf_api);
 
     auto perf = sink.Get("/fragments/dex/perf/devices");
     REQUIRE(perf);
@@ -1688,6 +1763,194 @@ TEST_CASE("DEX routes: ordinary session reaches /fragments/dex/perf/devices, "
         if (a == "dex.perf.device.view|success")
             saw_success = true;
     CHECK(saw_success);
+}
+
+// ADR-0031 WS-A4 DexPerfApi seam (#4626) characterization: /fragments/dex/perf
+// and /fragments/dex/perf/cohort-diff had NO route-level coverage before this
+// seam's dashboard rewire. Pinned here BEFORE the rewire (perf_fn_ still the
+// live provider) so the rewire onto DexPerfApi::fleet_snapshot cannot silently
+// change the rendered HTML for these two fragments.
+TEST_CASE("DEX perf fragment (F2a fleet-now): unwired placeholder vs wired snapshot",
+          "[pg][dex][perf][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    SECTION("perf_fn unwired -> honest unavailable placeholder") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        auto r = sink.Get("/fragments/dex/perf");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no perf snapshot provider wired") != std::string::npos);
+    }
+
+    SECTION("perf_fn wired -> fleet-now cards render the reporting device") {
+        yuzu::server::DexPerfFn perf_fn = [](const std::string&) {
+            yuzu::server::DexPerfSnapshot snap;
+            yuzu::server::DexPerfDevice d;
+            d.agent_id = "WS-1";
+            d.os = "windows";
+            d.cpu_pct = 50.0;
+            snap.devices.push_back(d);
+            return snap;
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf_fn, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                               /*responses_fn=*/{}, {}, {}, dex_perf_api);
+        auto r = sink.Get("/fragments/dex/perf");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Fleet now (last rollup cycle)") != std::string::npos);
+        CHECK(r->body.find("CPU utilization") != std::string::npos);
+        CHECK(r->body.find("50.0%") != std::string::npos);
+    }
+}
+
+TEST_CASE("DEX perf cohort-diff fragment: unwired placeholder vs wired empty-cohort note",
+          "[pg][dex][perf][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    SECTION("perf_fn unwired -> honest unavailable placeholder") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        auto r = sink.Get("/fragments/dex/perf/cohort-diff?a=x&b=y");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no perf snapshot provider wired") != std::string::npos);
+    }
+
+    SECTION("perf_fn wired, no devices tagged -> both cohorts render absent") {
+        yuzu::server::DexPerfFn perf_fn = [](const std::string&) {
+            return yuzu::server::DexPerfSnapshot{}; // no devices, no keys
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            perf_fn, yuzu::server::test::FnDexPerfApi::Providers{});
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
+                               /*responses_fn=*/{}, {}, {}, dex_perf_api);
+        auto r = sink.Get("/fragments/dex/perf/cohort-diff?a=imageA&b=imageB");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no reporting devices") != std::string::npos);
+        CHECK(r->body.find("absent") != std::string::npos);
+        CHECK(r->body.find(">imageA</b>") != std::string::npos);
+        CHECK(r->body.find(">imageB</b>") != std::string::npos);
+    }
+}
+
+// kDexCohortFloor suppression at the route level (fleet + group + tag/model
+// paths) — pinned before the DexPerfApi rewire so the floor can never
+// silently drop out when the handler switches from AppPerfProviders.fleet/
+// .group/.tag_cohort to DexPerfApi::app_fleet_trend/group_trend/tag_trend
+// (all three apply the SAME app_perf_fleet_trend/app_perf_group_trend pure
+// reduction + kDexCohortFloor — tag_trend shares group_trend's reduction).
+TEST_CASE("DEX perf/app fragment: kDexCohortFloor suppresses a sub-floor point "
+          "(fleet, group, and tag/model paths)",
+          "[dex][app_perf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    auto sub_floor_row = []() {
+        AppPerfFleetRow row;
+        row.app_name = "chrome.exe";
+        row.version = "125.0.0.0";
+        row.day = 1'700'000'000;
+        row.device_count = 3; // < kDexCohortFloor (10)
+        row.cpu_sum = 30.0;
+        row.cpu_max = 40.0;
+        row.hist_version = kAppPerfHistVersion;
+        return row;
+    };
+
+    SECTION("fleet path (no group/model) floors too") {
+        yuzu::server::test::FnDexPerfApi::Providers providers;
+        providers.fleet = [&](std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{sub_floor_row()};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=chrome.exe");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("n too small (fewer than 10 devices") != std::string::npos);
+        // The exact CPU mean (30.0/3=10.0%) must be withheld once suppressed.
+        CHECK(r->body.find("10.0%") == std::string::npos);
+    }
+
+    SECTION("group path floors identically") {
+        yuzu::server::test::FnDexPerfApi::Providers providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{sub_floor_row()};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=chrome.exe&group=G1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("n too small (fewer than 10 devices") != std::string::npos);
+        CHECK(r->body.find("10.0%") == std::string::npos);
+    }
+
+    SECTION("tag/model path floors identically") {
+        yuzu::server::test::FnDexPerfApi::Providers providers;
+        providers.tag_cohort =
+            [&](std::string_view, std::string_view, std::string_view,
+               std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{sub_floor_row()};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=chrome.exe&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("n too small (fewer than 10 devices") != std::string::npos);
+        CHECK(r->body.find("10.0%") == std::string::npos);
+    }
 }
 
 // ── A4: device perf sparklines (federated TAR query) ────────────────────────
@@ -2139,7 +2402,7 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
 
     // B1 device provider: success rows, or a nullopt degrade when `degrade` is set.
     bool degrade = false;
-    AppPerfProviders providers;
+    yuzu::server::test::FnDexPerfApi::Providers providers;
     providers.device =
         [&](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
         CHECK(agent_id == "WS-1"); // the route must thread the agent_id, not a constant
@@ -2161,8 +2424,10 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
     SECTION("rows -> rendered table + dex.device.app_perf.view audit") {
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {}, {},
-                               providers, {});
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
         auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
         REQUIRE(r);
         CHECK(r->status == 200);
@@ -2172,37 +2437,73 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
     }
 
+    SECTION("empty rows -> \"No application performance history\" placeholder, not the "
+            "unavailable note") {
+        // A wired, healthy provider that simply has nothing retained yet for this
+        // device (present-empty, distinct from the nullopt degrade below) must
+        // render the honest-empty state, never the "unavailable" wording reserved
+        // for an unwired/degraded read.
+        providers.device =
+            [](std::string_view agent_id) -> std::optional<std::vector<AppPerfDailyRow>> {
+            CHECK(agent_id == "WS-1");
+            return std::vector<AppPerfDailyRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("No application performance history") != std::string::npos);
+        CHECK(r->body.find("App performance data unavailable") == std::string::npos);
+        CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
+    }
+
     SECTION("store degrade (nullopt) -> 200 honest note (htmx drops 4xx/5xx), audit still fired") {
         degrade = true;
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {}, {},
-                               providers, {});
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
         auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
         REQUIRE(r);
         // 200, NOT 503: the dashboard htmx config (swap:false for [45]..) would drop a
         // 503 body, rendering nothing — the exact "fake empty" the note avoids.
         CHECK(r->status == 200);
-        CHECK(r->body.find("could not be read") != std::string::npos);
+        // SAME unified F2b wording as the trend/app-list fragments (C-1).
+        CHECK(r->body.find("App performance data unavailable (not configured or "
+                           "degraded) — retry shortly.") != std::string::npos);
         // The access audit fires BEFORE the read, so a degrade still carries the row.
         CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
     }
 
-    SECTION("no provider wired -> graceful note, audit suppressed (no read served)") {
+    SECTION("no provider wired -> graceful note, audit STILL fires (#4626 Concern A: over-audits)") {
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit); // app_perf_providers={}
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit); // dex_perf_api={}
         auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
         REQUIRE(r);
-        CHECK(r->body.find("no app-perf store wired") != std::string::npos);
-        CHECK(audited.empty()); // provider-null checked before the audit — no PII-access row
+        CHECK(r->body.find("App performance data unavailable (not configured or "
+                           "degraded) — retry shortly.") != std::string::npos);
+        // #4626: dex_perf_api_ is constructed UNCONDITIONALLY in production, so
+        // there is no longer a distinct "provider unwired" signal to check
+        // BEFORE the audit — the audit now fires even on this null-dex_perf_api_
+        // path (over-audits, never under-audits).
+        CHECK(audited == "dex.device.app_perf.view|success|Agent|WS-1");
     }
 
     SECTION("missing agent_id -> note at 200, no audit (guarded before the PII audit)") {
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {}, {},
-                               providers, {});
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
         auto r = sink.Get("/fragments/dex/device/app-perf"); // no agent_id query param
         REQUIRE(r);
         CHECK(r->status == 200);
@@ -2219,8 +2520,10 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         };
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, {}, scoped, {},
-                               providers, {});
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, {}, {}, scoped, {},
+                               dex_perf_api, {});
         auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
         REQUIRE(r);
         CHECK(r->status == 200);
@@ -2230,12 +2533,207 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
     SECTION("perm-denied -> gate runs BEFORE audit + read (no audit row, no PII)") {
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, noPerm, &store, fleet, audit, {}, {}, {}, {}, {},
-                               providers, {});
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, noPerm, &store, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
         auto r = sink.Get("/fragments/dex/device/app-perf?agent_id=WS-1");
         REQUIRE(r);
         CHECK(audited.empty()); // denied before the behavioural-PII audit fires
         CHECK(r->body.find("chrome.exe") == std::string::npos);
+    }
+}
+
+TEST_CASE("DEX version-devices drill fragment: gate, param validation, audit, "
+          "visible-set threading",
+          "[dex][app_perf][routes][rbac]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    std::string audited;
+    std::string audited_result;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string& ttype, const std::string& tid, const std::string& d) -> bool {
+        audited = a + "|" + r + "|" + ttype + "|" + tid + "|" + d;
+        audited_result = r;
+        return true;
+    };
+
+    std::optional<std::vector<std::string>> seen_visible_ids;
+    bool seen_visible_ids_set = false;
+    bool degrade = false;
+    yuzu::server::test::FnDexPerfApi::Providers providers;
+    providers.version_devices =
+        [&](std::string_view app, std::string_view version,
+            const std::optional<std::vector<std::string>>& visible_ids,
+            bool& truncated) -> std::optional<std::vector<AppPerfVersionDeviceRow>> {
+        CHECK(app == "chrome.exe");
+        seen_visible_ids = visible_ids;
+        seen_visible_ids_set = true;
+        truncated = false;
+        if (degrade)
+            return std::nullopt;
+        (void)version;
+        AppPerfVersionDeviceRow r;
+        r.agent_id = "WS-1";
+        r.last_day = 1'700'000'000;
+        r.samples = 5;
+        r.cpu_avg = 42.0;
+        r.ws_avg_bytes = 100;
+        return std::vector<AppPerfVersionDeviceRow>{r};
+    };
+
+    auto admit_unfiltered = [](const httplib::Request&, httplib::Response&, const std::string&,
+                               const std::string&) {
+        return authz::FleetReadGate{.admitted = true, .scope = std::nullopt};
+    };
+    auto admit_scoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                           const std::string&) {
+        return authz::FleetReadGate{
+            .admitted = true,
+            .scope = authz::VisibleSet{std::unordered_set<std::string>{"WS-1"}}};
+    };
+    auto deny = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                   const std::string&) {
+        res.status = 403;
+        return authz::FleetReadGate{.admitted = false};
+    };
+
+    SECTION("gate unwired -> 200 note, no read, no audit (fails closed, never falls back)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {}); // fleet_read_fn = {} (unwired)
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("authorization gate not configured") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set); // provider never called
+        CHECK(audited.empty());
+    }
+
+    SECTION("gate denies -> the gate's own status stands, no read, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {}, deny);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK_FALSE(seen_visible_ids_set);
+        CHECK(audited.empty());
+    }
+
+    SECTION("missing app -> 200 note, gate never called, no read, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing or invalid") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set);
+    }
+
+    SECTION("missing version (absent, not empty) -> 200 note -- omission is NOT "
+            "'all versions' on this route") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing or invalid") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set);
+    }
+
+    SECTION("EMPTY version (present, explicit) IS accepted -- the unknown-version bucket") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_visible_ids_set); // reached the provider — "" was accepted
+        CHECK(r->body.find("WS-1") != std::string::npos);
+    }
+
+    SECTION("nullopt gate scope (unfiltered) threads through as nullopt, not an empty vector") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        REQUIRE(seen_visible_ids_set);
+        CHECK_FALSE(seen_visible_ids.has_value()); // unfiltered, not deny-all
+        CHECK(r->body.find("WS-1") != std::string::npos);
+        CHECK(r->body.find("42.0%") != std::string::npos);
+        // Audit fires AFTER the read with the real device count.
+        CHECK(audited.find("dex.app_perf.devices.view|success|GuaranteedState|") == 0);
+        CHECK(audited.find("devices=1") != std::string::npos);
+    }
+
+    SECTION("engaged gate scope threads through the EXACT set (ADR-0017 push-into-query)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {}, admit_scoped);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        REQUIRE(seen_visible_ids_set);
+        REQUIRE(seen_visible_ids.has_value());
+        REQUIRE(seen_visible_ids->size() == 1);
+        CHECK((*seen_visible_ids)[0] == "WS-1");
+    }
+
+    SECTION("store degrade -> 200 honest note, audit fires with result=failure") {
+        degrade = true;
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("could not be read") != std::string::npos);
+        CHECK(audited_result == "failure");
+    }
+
+    SECTION("no provider wired -> graceful note, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               {}, {}, admit_unfiltered); // dex_perf_api = {} (unwired)
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no app-perf device provider wired") != std::string::npos);
+        CHECK(audited.empty());
     }
 }
 
@@ -2266,7 +2764,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
 
     SECTION("short-form version canonicalizes before reaching the fleet provider AND the banner") {
         std::string seen_app, seen_version;
-        AppPerfProviders providers;
+        yuzu::server::test::FnDexPerfApi::Providers providers;
         providers.fleet = [&](std::string_view app,
                               std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
             seen_app = std::string(app);
@@ -2275,8 +2773,10 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         };
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
-                               providers, {});
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
         auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=1.2");
         REQUIRE(r);
         CHECK(r->status == 200);
@@ -2292,7 +2792,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
 
     SECTION("non-canonicalizable version folds to unfiltered -- never rendered as \"filtered\"") {
         std::string seen_version = "not-yet-called";
-        AppPerfProviders providers;
+        yuzu::server::test::FnDexPerfApi::Providers providers;
         providers.fleet = [&](std::string_view,
                               std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
             seen_version = std::string(version);
@@ -2300,8 +2800,10 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         };
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
-                               providers, {});
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
         auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=latest");
         REQUIRE(r);
         CHECK(r->status == 200);
@@ -2317,7 +2819,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
     // this (route) level doesn't exercise the other.
     SECTION("all-zero version (\"0.0.0.0\") also folds to unfiltered") {
         std::string seen_version = "not-yet-called";
-        AppPerfProviders providers;
+        yuzu::server::test::FnDexPerfApi::Providers providers;
         providers.fleet = [&](std::string_view,
                               std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
             seen_version = std::string(version);
@@ -2325,8 +2827,10 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         };
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
-                               providers, {});
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
         auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=0.0.0.0");
         REQUIRE(r);
         CHECK(r->status == 200);
@@ -2336,7 +2840,7 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
 
     SECTION("group path threads the SAME canonical version as the fleet path") {
         std::string seen_group, seen_app, seen_version;
-        AppPerfProviders providers;
+        yuzu::server::test::FnDexPerfApi::Providers providers;
         providers.group = [&](std::string_view group, std::string_view app,
                               std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
             seen_group = std::string(group);
@@ -2346,8 +2850,10 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         };
         test::TestRouteSink sink;
         DexRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
-                               providers, {});
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
         auto r = sink.Get("/fragments/dex/perf/app?app=Foo&group=G1&version=01.2.0.0");
         REQUIRE(r);
         CHECK(r->status == 200);
@@ -2355,5 +2861,243 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         CHECK(seen_app == "Foo");
         CHECK(seen_version == "1.2.0.0"); // leading-zero form canonicalized, matching the fleet path
         CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+    }
+
+    SECTION("model path fires tag_cohort with the SAME canonical version as the fleet path") {
+        std::string seen_key, seen_value, seen_app, seen_version;
+        bool group_called = false;
+        yuzu::server::test::FnDexPerfApi::Providers providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            group_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_cohort = [&](std::string_view key, std::string_view value,
+                                   std::string_view app,
+                                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_key = std::string(key);
+            seen_value = std::string(value);
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420&version=01.2.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(group_called); // model= alone must dispatch tag_cohort, not group
+        CHECK(seen_key == "model"); // default key
+        CHECK(seen_value == "Latitude 5420");
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // canonicalized, matching every other scope path
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+    }
+
+    SECTION("group wins when both group= and model= are present") {
+        bool group_called = false, tag_called = false;
+        yuzu::server::test::FnDexPerfApi::Providers providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            group_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_cohort = [&](std::string_view, std::string_view, std::string_view,
+                                   std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            tag_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&group=G1&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(group_called);
+        CHECK_FALSE(tag_called);
+    }
+
+    SECTION("model path: unwired tag_cohort reader -> honest placeholder, never a crash") {
+        yuzu::server::test::FnDexPerfApi::Providers providers; // .tag_cohort left null
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200); // dashboard htmx drops 4xx/5xx bodies -- always 200 + a note
+        // #4626 Concern A: DexPerfApi::tag_trend collapses "unwired" and
+        // "degraded" to the SAME nullopt — ONE honest wording, not the old
+        // "no device-model cohort reader wired" placeholder.
+        CHECK(r->body.find("App performance data unavailable (not configured or "
+                           "degraded) — retry shortly.") != std::string::npos);
+    }
+
+    SECTION("model path: store degrade (tag_cohort returns nullopt) -> honest placeholder") {
+        yuzu::server::test::FnDexPerfApi::Providers providers;
+        providers.tag_cohort = [](std::string_view, std::string_view, std::string_view,
+                                  std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::nullopt; // AUTHORITATIVE degrade (tag lookup OR the aggregate read failed)
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+            yuzu::server::DexPerfFn{}, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        // #4626 Concern A: ONE honest wording (see the sibling "unwired" test above).
+        CHECK(r->body.find("App performance data unavailable (not configured or "
+                           "degraded) — retry shortly.") != std::string::npos);
+    }
+
+    SECTION("model selector values come from DexPerfApi::fleet_snapshot cohorts "
+            "(#4857 D1) — the SAME dex_perf_cohorts() derivation "
+            "GET /api/v1/dex/perf/cohorts uses, not a standalone TagStore read; "
+            "populates regardless of active scope branch") {
+        yuzu::server::test::FnDexPerfApi::Providers providers;
+        providers.fleet = [](std::string_view,
+                             std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{};
+        };
+        yuzu::server::DexPerfFn dex_perf_fn =
+            [](const std::string& cohort_key) -> yuzu::server::DexPerfSnapshot {
+            CHECK(cohort_key == "model"); // kDexDefaultCohortKey
+            yuzu::server::DexPerfSnapshot snap;
+            snap.cohort_key = cohort_key;
+            yuzu::server::DexPerfDevice d1;
+            d1.agent_id = "a1";
+            d1.cpu_pct = 10.0;
+            d1.cohort = "Latitude 5420";
+            yuzu::server::DexPerfDevice d2;
+            d2.agent_id = "a2";
+            d2.cpu_pct = 20.0;
+            d2.cohort = "OptiPlex 7090";
+            snap.devices = {d1, d2};
+            return snap;
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api =
+            std::make_shared<yuzu::server::test::FnDexPerfApi>(dex_perf_fn, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo"); // fleet-wide, no scope selected
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Latitude 5420") != std::string::npos);
+        CHECK(r->body.find("OptiPlex 7090") != std::string::npos);
+        CHECK(r->body.find("no device-model values in the current fleet snapshot") == std::string::npos);
+    }
+
+    SECTION("model selector: zero reporting devices this cycle -> lists nothing + an "
+            "honest note, never a claimed \"degraded\" state (#4857 D1: "
+            "fleet_snapshot has no degrade channel)") {
+        yuzu::server::test::FnDexPerfApi::Providers providers;
+        providers.fleet = [](std::string_view,
+                             std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{}; // trend itself succeeds (empty)
+        };
+        yuzu::server::DexPerfFn dex_perf_fn =
+            [](const std::string&) -> yuzu::server::DexPerfSnapshot {
+            return yuzu::server::DexPerfSnapshot{}; // zero devices this cycle
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        auto dex_perf_api =
+            std::make_shared<yuzu::server::test::FnDexPerfApi>(dex_perf_fn, providers);
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               dex_perf_api, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("name=\"model\"") == std::string::npos); // no selector
+        CHECK(r->body.find("no device-model values in the current fleet snapshot") != std::string::npos);
+        CHECK(r->body.find("degraded") == std::string::npos);
+    }
+
+    SECTION("model selector: dex_perf_api_ entirely unwired -> the base trend itself "
+            "already fails closed with its own honest placeholder before the model "
+            "note is ever reached (never a crash, never a different \"degraded\" "
+            "wording)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {},
+                               {}, {}); // dex_perf_api = {} (fully unwired)
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("App performance data unavailable (not configured or "
+                           "degraded) — retry shortly.") != std::string::npos);
+        CHECK(r->body.find("no device-model values in the current fleet snapshot") == std::string::npos);
+        CHECK(r->body.find("name=\"model\"") == std::string::npos);
+    }
+}
+
+TEST_CASE("DEX perf/apps picker route: q/platform/sort params reach the render "
+          "function raw (normalization/filtering happens there)",
+          "[dex][app_perf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+
+    yuzu::server::test::FnDexPerfApi::Providers providers;
+    providers.apps = [](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
+        truncated = false;
+        return std::vector<AppPerfAppSummary>{
+            {.app_name = "chrome.exe", .versions = 3, .last_day = 200},
+            {.app_name = "sshd", .versions = 1, .last_day = 100},
+        };
+    };
+    test::TestRouteSink sink;
+    DexRoutes routes;
+    auto dex_perf_api = std::make_shared<yuzu::server::test::FnDexPerfApi>(
+        yuzu::server::DexPerfFn{}, providers);
+    routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {}, dex_perf_api,
+                           {});
+
+    SECTION("no params: both apps render, unfiltered") {
+        auto r = sink.Get("/fragments/dex/perf/apps");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find("sshd") != std::string::npos);
+    }
+
+    SECTION("q= substring-filters by name") {
+        auto r = sink.Get("/fragments/dex/perf/apps?q=chrome");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find(">sshd<") == std::string::npos);
+    }
+
+    SECTION("platform=windows keeps only the .exe-suffixed row") {
+        auto r = sink.Get("/fragments/dex/perf/apps?platform=windows");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find(">sshd<") == std::string::npos);
+    }
+
+    SECTION("sort=name orders alphabetically") {
+        auto r = sink.Get("/fragments/dex/perf/apps?sort=name");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") < r->body.find("sshd")); // c before s
     }
 }

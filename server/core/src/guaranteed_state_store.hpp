@@ -70,6 +70,27 @@
 ///    empty is at least visible on `/metrics` even though the return type
 ///    does not yet distinguish it. None of these reads feeds an
 ///    enforce/target decision (playbook's deny-or-benign class).
+///    **Named exception (#4855):** `dex_device_signal_summary` now ALSO has a
+///    type-distinguishable `dex_device_signal_summary_checked` twin
+///    (`std::optional`, `dex_read_checked<>`) — the per-device DEX
+///    experience-score surfaces (dashboard lens, REST
+///    `GET /api/v1/dex/devices/{id}`, MCP `get_dex_device_score`, and the pure
+///    per-device `dex_device_score()` helper they all route through) fail
+///    closed on a degrade instead of rendering it as a healthy, signal-free
+///    100. The plain `dex_device_signal_summary` above stays on the store as
+///    a documented, still-empty-on-degrade form (unchanged signature/
+///    behaviour, kept for any caller that only wants the #2659 posture) —
+///    this widens ONE read for ONE consumer class, not the #2659 fleet-wide
+///    set; every other `dex_*` read above is still deferred.
+///    **Second named exception (WS-A4 PR-1 fix round, sec-5):**
+///    `dex_signal_summary` — the FLEET-wide twin of the read above — now ALSO
+///    has a type-distinguishable `dex_signal_summary_checked` twin, for the
+///    same reason: `build_dex_catalogue_model` (the `GET /api/v1/dex/catalogue`
+///    + MCP `get_dex_catalogue` resource) must not render a degraded read as
+///    a healthy, zero-event fleet catalogue (previously an empty vector on
+///    degrade collapsed to exactly that — health 100, `total events: 0`).
+///    The plain `dex_signal_summary` stays a thin `.value_or({})` wrapper for
+///    every other, still-deferred (#2659) caller.
 
 #include <atomic>
 #include <cstdint>
@@ -79,6 +100,11 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "dex_types.hpp" // ADR-0031 WS-A4: DEX leaf value types relocated here (pure, store-free)
+#include "guardian_types.hpp" // ADR-0031 WS-A4 (ninth family): GuaranteedStateRuleRow/EventRow/
+                              // EventQuery/ReadError relocated here (pure, store-free) — see that
+                              // header's own comment for the ODR-safe relocation shape
 
 namespace yuzu {
 class MetricsRegistry;
@@ -99,64 +125,11 @@ namespace yuzu::server {
 // shared wire convention.
 inline constexpr const char* kObservationRuleId = "__observation__";
 
-struct GuaranteedStateRuleRow {
-    std::string rule_id;           // UUID
-    std::string name;              // unique, human-authored
-    std::string yaml_source;       // human-readable rendering (generated; see spec_json)
-    // Canonical structured JSON of the Guard (spark/assertion/remediation) —
-    // the AUTHORITATIVE form the agent enforces from and that the push proto is
-    // built from. yaml_source is rendered one-way from this.
-    std::string spec_json;
-    // RESERVED (stored, not yet evaluated): the Guard's Prerequisites — a Scope
-    // expression over device facts that must hold for the Guard to apply on a
-    // device, finer than a Baseline's management-group assignment.
-    std::string prerequisites;
-    int64_t version{1};
-    bool enabled{true};
-    std::string enforcement_mode;  // "enforce" | "audit" (validated at the REST boundary; `enabled` controls disable)
-    std::string severity;          // "critical" | "high" | "medium" | "low"
-    std::string os_target;         // "windows" | "linux" | "macos" | ""=all
-    std::string scope_expr;        // server-side scope expression
-    std::vector<uint8_t> signature;// HMAC-SHA256 over yaml_source
-    std::string created_at;        // ISO-8601
-    std::string updated_at;        // ISO-8601
-    // Principal who authored the rule (created_by) and who last modified it
-    // (updated_by). Required for SOC 2 audit-chain reconstruction alongside
-    // audit_events — the REST handler populates both from the session
-    // principal; the store is a plain passthrough.
-    std::string created_by;
-    std::string updated_by;
-};
-
-struct GuaranteedStateEventRow {
-    std::string event_id;          // UUID
-    std::string rule_id;
-    std::string agent_id;
-    std::string event_type;        // "drift.detected" | "drift.remediated" | ...
-    std::string severity;
-    std::string guard_type;        // "registry" | "etw" | ...
-    std::string guard_category;    // "event" | "condition"
-    std::string detected_value;
-    std::string expected_value;
-    // Structured, machine-readable detail (JSON, keyed by event_type). Companion
-    // to the human `detected_value`, not a replacement. For DEX observations
-    // (process.crashed) it carries the projectable crash facts; "" for plain
-    // drift. The DEX read model projects this into indexed columns.
-    std::string detail_json;
-    std::string remediation_action;
-    bool remediation_success{false};
-    int64_t detection_latency_us{0};
-    int64_t remediation_latency_us{0};
-    std::string timestamp;         // ISO-8601
-};
-
-struct GuaranteedStateEventQuery {
-    std::string rule_id;           // filter by rule, optional
-    std::string agent_id;          // filter by agent, optional
-    std::string severity;          // "critical" ... optional
-    int limit{100};                // clamped to [1, kMaxEventsLimit] by the store
-    int offset{0};
-};
+// GuaranteedStateRuleRow / GuaranteedStateEventRow / GuaranteedStateEventQuery
+// / GuaranteedStateReadError were relocated VERBATIM to the pure
+// "guardian_types.hpp" (included above) for the ADR-0031 WS-A4 GuardianApi
+// seam (ninth family); they remain in namespace yuzu::server and every
+// includer keeps seeing them transitively.
 
 // ── Overview aggregation result types (Slice A dashboard overview) ───────────
 struct GuardianRuleActivity {
@@ -182,101 +155,10 @@ struct GuardianAgentRuleStatus {
     std::string updated_at;  // ISO-8601 of the event that set it
 };
 
-struct GuardianObservationRow {
-    std::string event_id;          // shares the event journal dedup key
-    std::string agent_id;
-    std::string observed_at;       // ISO-8601 (= event timestamp)
-    std::string obs_type;          // = event_type, e.g. "process.crashed", "os.boot"
-    std::string subject;           // e.g. "notepad.exe", "Spooler", "HP LaserJet"
-    std::string reason;            // e.g. "0xC0000005", "0x80070643", "timeout"
-    std::string symbolic;          // e.g. "ACCESS_VIOLATION", "WIFI_DISCONNECT"
-    std::string component;         // e.g. "ntdll.dll" (faulting module)
-    std::string version;           // crashed/hung app's file version "a.b.c.d", "" if unknown
-    double metric{0.0};            // numeric payload (boot duration ms); 0 = none
-    std::string platform;          // "windows" | "linux" | "macos"
-};
-
-// ── DEX read-model aggregations over guardian_observations ───────────────────
-struct DexCrashSummary {
-    int64_t total_crashes{0};
-    int64_t distinct_devices{0};   // devices impacted (crash-free numerator)
-    int64_t distinct_apps{0};
-};
-struct DexAppCrashCount {          // top unreliable apps + blast radius
-    std::string subject;           // process name
-    std::string version;           // app file version, "" = unknown/all (version-blind query)
-    int64_t crashes{0};
-    int64_t hangs{0};
-    int64_t distinct_devices{0};   // blast radius = distinct devices, not event count
-    std::string last_seen;
-};
-struct DexModuleCrashCount {       // top faulting modules (crash-scoped)
-    std::string component;         // module name
-    int64_t crashes{0};
-    int64_t distinct_apps{0};
-};
-struct DexDeviceCrashCount {       // most-affected devices (crash-scoped)
-    std::string agent_id;
-    int64_t crashes{0};
-    std::string last_seen;
-};
-struct DexOsCrashCount {           // per-OS split (coverage-normalised at the route)
-    std::string platform;
-    int64_t crashes{0};
-    int64_t distinct_devices{0};
-};
-struct DexDayCrashCount {          // crashes-per-day trend
-    std::string day;               // YYYY-MM-DD
-    int64_t crashes{0};
-};
-struct DexExceptionCount {         // top failure reasons (per-app drill-down)
-    std::string reason;            // e.g. "0xC0000005"
-    std::string symbolic;          // e.g. "ACCESS_VIOLATION"
-    int64_t crashes{0};
-};
-struct DexEntitySummary {          // per-app / per-device drill-down summary
-    int64_t crashes{0};
-    int64_t hangs{0};
-    int64_t signals{0};            // ALL observation rows for the entity (any type)
-    int64_t distinct_devices{0};
-    int64_t distinct_apps{0};
-    std::string first_seen;
-    std::string last_seen;
-};
-struct DexSignalCount {            // the whole-catalogue rollup (overview panel)
-    std::string obs_type;
-    int64_t count{0};
-    int64_t distinct_devices{0};
-    std::string last_seen;
-};
-struct DexSubjectCount {           // top subjects for ONE obs_type (signal drill-down)
-    std::string subject;
-    int64_t count{0};
-    int64_t distinct_devices{0};
-    std::string last_seen;
-};
-struct DexOsScope {                // per-OS coverage: how many types each OS collects
-    std::string platform;
-    int64_t distinct_types{0};
-    int64_t total_events{0};
-};
-struct DexDaySignal {              // one (day, obs_type) cell of the trends matrix
-    std::string day;               // YYYY-MM-DD
-    std::string obs_type;
-    int64_t count{0};
-};
-struct DexBootStats {              // boot-performance rollup (os.boot metric, ms)
-    int64_t boots{0};
-    double avg_ms{0.0};
-    double max_ms{0.0};
-    int64_t distinct_devices{0};
-};
-struct DexDeviceBoot {             // slowest-booting devices
-    std::string agent_id;
-    double avg_ms{0.0};
-    double max_ms{0.0};
-    int64_t boots{0};
-};
+// The DEX read-model value types (GuardianObservationRow + the Dex* observation
+// aggregations) were relocated verbatim to the pure "dex_types.hpp" (included
+// above) for the ADR-0031 WS-A4 DexApi seam; they remain in namespace
+// yuzu::server and every includer keeps seeing them transitively.
 
 // Hard upper bound on `GuaranteedStateEventQuery::limit` and every DEX
 // `limit` parameter. Defence-in-depth: materialising millions of rows into a
@@ -298,15 +180,18 @@ enum class EventInsertOutcome { Inserted, Redelivered, Conflict, Error };
 struct EventInsertResult {
     EventInsertOutcome outcome{EventInsertOutcome::Error};
     std::string error; // set for Conflict (mismatch detail) + Error (db message); empty otherwise
+    std::int64_t committed_wall_ns{0}; ///< Application-observed wall-clock instant (ns since the
+                                        ///< Unix epoch) captured immediately after a successful
+                                        ///< COMMIT, for `Inserted` only — 0 for every other
+                                        ///< outcome. This is NOT a durable column and NOT the
+                                        ///< database's internal commit instant: it is a
+                                        ///< benchmark-diagnostic field on this in-memory result
+                                        ///< only (#4606 criterion-10 T_server). Never persisted.
 };
 
-// Error surface for the type-distinguishable single-object read (`get_rule`).
-// The success type is `std::optional<GuaranteedStateRuleRow>`: a value ==
-// found, `std::nullopt` == genuinely no row for this rule_id.
-// `std::unexpected(kDegraded)` == store/pool/query failure — the caller shows
-// a degrade banner/503, never treats it as absent (mirrors
-// `DeviceInventoryStore::CiReadError` / `InventoryReadError` exactly).
-enum class GuaranteedStateReadError { kDegraded };
+// GuaranteedStateReadError (the type-distinguishable single-object read
+// error surface for `get_rule`) was relocated to "guardian_types.hpp" too —
+// see that header's comment.
 
 class GuaranteedStateStore {
 public:
@@ -401,6 +286,18 @@ public:
     std::vector<DexDayCrashCount> dex_crashes_by_day(const std::string& since = "") const;
     std::vector<DexSignalCount> dex_signal_summary(const std::string& since = "",
                                                     const std::string& platform = "") const;
+    /// Type-distinguishable twin of the above (Fix 2, WS-A4 PR-1 fix round):
+    /// `std::nullopt` on a degraded read (store-not-open / pool-timeout /
+    /// query-error), never collapsed into an empty vector — the fleet
+    /// catalogue builder (`build_dex_catalogue_model`) needs this to avoid
+    /// rendering a degraded read as a healthy fleet with zero events (the
+    /// same #4855 shape `dex_device_signal_summary_checked` closes for the
+    /// per-device read below). Still bumps
+    /// `yuzu_server_guardian_read_degrade_total{reason}` on a degrade, same
+    /// as the plain form (which is now a thin `.value_or({})` over this).
+    std::optional<std::vector<DexSignalCount>>
+    dex_signal_summary_checked(const std::string& since = "",
+                               const std::string& platform = "") const;
     DexBootStats dex_boot_stats(const std::string& since = "") const;
     std::vector<DexDeviceBoot> dex_slowest_boots(const std::string& since = "",
                                                  int limit = 10) const;
@@ -440,6 +337,15 @@ public:
     std::optional<GuardianObservationRow> dex_observation(const std::string& event_id) const;
     std::vector<DexSignalCount> dex_device_signal_summary(const std::string& agent_id,
                                                           const std::string& since = "") const;
+    /// Type-distinguishable twin of the above (#4855): `std::nullopt` on a
+    /// degraded read (store-not-open / pool-timeout / query-error), never
+    /// collapsed into an empty vector — the device-score builders need this to
+    /// avoid rendering a degraded read as a healthy, signal-free device. Still
+    /// bumps `yuzu_server_guardian_read_degrade_total{reason}` on a degrade,
+    /// same as the plain form (which is now a thin `.value_or({})` over this).
+    std::optional<std::vector<DexSignalCount>>
+    dex_device_signal_summary_checked(const std::string& agent_id,
+                                      const std::string& since = "") const;
 
     std::vector<GuardianRuleActivity> rule_activity(const std::string& since = "") const;
     std::vector<GuardianDayCount> daily_remediations(const std::string& since = "") const;

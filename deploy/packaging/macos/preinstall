@@ -180,13 +180,16 @@ recover_interrupted_promotion() {
     remove_managed_plugins "$YUZU_LIB/.package-files.incoming"
     rm -f "$PLIST" "$YUZU_LIB/package-mode" "$YUZU_LIB/package-files.list"
     rm -rf "$APP_ROOT/YuzuAgent.app"
-    rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib
+    rm -f /usr/local/bin/yuzu-agent /usr/local/bin/libyuzu_agent_core.dylib /usr/local/lib/libyuzu_agent_core.dylib
     [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \
         ditto "$recovery/LaunchDaemons/com.yuzu.agent.plist" "$PLIST"
     [[ ! -d "$recovery/YuzuAgent.app" ]] || ditto "$recovery/YuzuAgent.app" "$APP_ROOT/YuzuAgent.app"
     [[ ! -e "$recovery/loose/yuzu-agent" ]] || ditto "$recovery/loose/yuzu-agent" /usr/local/bin/yuzu-agent
     [[ ! -e "$recovery/loose/libyuzu_agent_core.dylib" ]] || \
-        ditto "$recovery/loose/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib
+        ditto "$recovery/loose/libyuzu_agent_core.dylib" /usr/local/bin/libyuzu_agent_core.dylib
+    # A package from before #5144 kept the core dylib in /usr/local/lib.
+    [[ ! -e "$recovery/loose/legacy-lib/libyuzu_agent_core.dylib" ]] || \
+        ditto "$recovery/loose/legacy-lib/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib
     [[ ! -e "$recovery/package-mode" ]] || ditto "$recovery/package-mode" "$YUZU_LIB/package-mode"
     [[ ! -e "$recovery/package-files.list" ]] || \
         ditto "$recovery/package-files.list" "$YUZU_LIB/package-files.list"
@@ -240,7 +243,8 @@ if legacy_app_is_managed; then
     copy_if_present "$LEGACY_APP" "$RECOVERY/legacy/YuzuAgent.app"
 fi
 copy_if_present "/usr/local/bin/yuzu-agent" "$RECOVERY/loose/yuzu-agent"
-copy_if_present "/usr/local/lib/libyuzu_agent_core.dylib" "$RECOVERY/loose/libyuzu_agent_core.dylib"
+copy_if_present "/usr/local/bin/libyuzu_agent_core.dylib" "$RECOVERY/loose/libyuzu_agent_core.dylib"
+copy_if_present "/usr/local/lib/libyuzu_agent_core.dylib" "$RECOVERY/loose/legacy-lib/libyuzu_agent_core.dylib"
 copy_if_present "/usr/local/lib/yuzu/package-mode" "$RECOVERY/package-mode"
 copy_if_present "/usr/local/lib/yuzu/package-files.list" "$RECOVERY/package-files.list"
 if [[ -f "/usr/local/lib/yuzu/package-files.list" ]]; then
@@ -257,6 +261,7 @@ rm -rf "$APP_ROOT/.YuzuAgent.incoming.app" \
        "/usr/local/lib/yuzu/.plugins.incoming"
 rm -f "/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist" \
       "/usr/local/bin/.yuzu-agent.incoming" \
+      "/usr/local/bin/.libyuzu_agent_core.incoming.dylib" \
       "/usr/local/lib/.libyuzu_agent_core.incoming.dylib" \
       "/usr/local/lib/yuzu/.bundle-contents.incoming.zip" \
       "/usr/local/lib/yuzu/.package-mode.incoming" \

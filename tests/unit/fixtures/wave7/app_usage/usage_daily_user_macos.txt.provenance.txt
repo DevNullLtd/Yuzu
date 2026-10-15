@@ -1,0 +1,29 @@
+REAL CAPTURE
+
+File: usage_daily_user_macos.txt
+Host: alex's Mac (Darwin 25.6.0), 2026-09-14
+DB path: /private/tmp/yuzu-uat/agent-data/tar.db (mode 644, owner alex, WAL)
+Writing agent: pid 50138, `yuzu-agent --data-dir /tmp/yuzu-uat/agent-data`, built from
+  branch feat/wave7-pr72a-forensics-tar-usage (the usage fold dev carries as #4269,
+  merge 4ab9b9c83); live tar_config schema_version = 7 at capture time.
+Command:
+  sqlite3 -readonly "$DB" ".mode list" ".separator |" \
+    "SELECT day_ts, exe_key, user FROM usage_daily_user ORDER BY day_ts, exe_key, user" \
+    > usage_daily_user_macos.txt
+
+Row count: 583.
+
+This file DOES carry real local account names from this host (alex, root,
+_locationd, _spotlight, nobody, ...) — precedent:
+tests/unit/fixtures/wave7/autoruns/macos/listing_user_LaunchAgents.txt
+already commits this host's username as a REAL CAPTURE. app_usage's own
+queries only ever read COUNT(DISTINCT user) from this table (kDistinctUsersSql)
+— no query selects the `user` column's value — so the negative test
+("negative: REAL CAPTURE fixture summary/last_used output carries no pid or
+user-name field") plus an explicit "alex does not appear in any formatted
+output row" assertion is what makes committing these real names safe: the
+plugin's formatted output is proven never to reproduce them.
+
+contactsd (used in test_app_usage_parsers.cpp's distinct-users assertion)
+has COUNT(DISTINCT user) = 20 over the whole table (see
+usage_daily_macos.txt.provenance.txt's derivation queries).

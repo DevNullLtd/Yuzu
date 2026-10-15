@@ -84,6 +84,41 @@ using SparkEmitFn = std::function<void(const std::string& key, SparkData data)>;
 using SparkFaultFn =
     std::function<void(const std::string& key, bool faulted, std::string_view reason)>;
 
+/// The engine's establishment-signal callback (rung 9c PR-6 item 1) — a positive
+/// answer to "does live OS-level notification coverage exist for this watch right
+/// now," distinct from both `SparkEmitFn` (a real detection fire) and `SparkFaultFn`
+/// (post-arm health, which explicitly no-ops on a same-state call and so cannot
+/// carry a first-establishment edge — see spark.hpp's `SubscriptionEstablishment`
+/// doc comment). A mechanism calls it — from its OWN thread, lock released, NEVER
+/// from inside watch()/unwatch() (the same reentrancy prohibition as emit()/fault()
+/// above) — reporting EVERY coverage transition for `key`, not only the first: a
+/// mechanism that later loses coverage (a fault, a backend error) calls this again
+/// with `SparkCoverage::None`. Registry and File deliberately report nothing for
+/// unwatch() (the engine has already erased armed_[key], so the report would be
+/// dropped by the identity check by construction) or for an orderly stop() (neither
+/// marks a coverage transition; the engine's cache is left as it was). The engine's
+/// cache is therefore the LAST DELIVERED value, not an authoritative live state: a
+/// report dropped by a throwing sink, or a Registry sweeper or File worker that keeps
+/// failing before it flips `inert`, leaves it stale. `incarnation` identifies WHICH
+/// watch this report is about (the engine drops a report whose incarnation no longer
+/// matches the key's current one — a stale report against a superseded or torn-down
+/// watch); `at` is the mechanism's own timestamp taken at the point it committed the
+/// transition (source, never delivery — a queued/polled mechanism's dispatch latency
+/// must not leak into the recorded value). Exception: an adoption/join re-report
+/// (Registry, File) is stamped now(), not at the original commit. Optional: default
+/// `ISparkMechanism::set_established_sink` installs no sink, so a mechanism that never
+/// calls this is unaffected — Registry, File and both Service classes override it;
+/// only a bare test fake leaves it default. Called with the engine lock released,
+/// like emit()/fault() — MAY THROW under the same #2012/#3840 allocation posture as
+/// those two; a mechanism that owns one calls it from a context that can tolerate the
+/// throw. Registry and File wrap each call in their own try/catch and count the dropped
+/// report (`established_failed`); Service has no per-call catch, so a throw there reaches
+/// its run() catch, which invalidates every tracked key's coverage to `None` and stops the
+/// mechanism accepting new watches (spark_service.cpp).
+using SparkEstablishedFn = std::function<void(const std::string& key, SparkIncarnation incarnation,
+                                              std::chrono::steady_clock::time_point at,
+                                              SparkCoverage coverage)>;
+
 /// Point-in-time mechanism-internal counters (#1979), folded into
 /// SparkEngineStats' mech_* fields by SparkEngine::stats() and surfaced the
 /// same way (agent heartbeat status_tags — no /metrics endpoint). Every field
@@ -125,22 +160,52 @@ struct SparkMechanismStats {
     /// sweeper, the OS call itself runs off-lock). An early warning for a
     /// stalled or refused watcher, not a hard fault.
     std::uint64_t slow_op_total{0};
-    /// TRUE when the mechanism started but could NOT bind its OS facility, so every
-    /// watch() will be refused: no systemd system bus (a container — Dockerfile.agent
-    /// ships libsystemd0, but a container has no bus), OpenSCManager denied, or the
-    /// IOCP/threadpool could not be created; Registry also raises it while its
-    /// sweeper (the sole producer of late commits and health edges) has failed
-    /// several consecutive passes, and clears it on the next successful pass
-    /// (#2012 PR-B1). The mechanism stays REGISTERED (so arm()
-    /// gets an honest rejection rather than "unknown type"), which is exactly why this
-    /// bit is needed: without it, `registered` and `functional` are indistinguishable
-    /// on the wire, and an inert mechanism reports byte-identically to a healthy idle
-    /// one — "looks healthy, can detect nothing".
-    ///
-    /// Known at start(), NOT at arm() — which is why it lands at rung 1 rather than
-    /// waiting on #2084's armed-but-deaf liveness (governance Gate-3 cross-platform +
-    /// Gate-6 sre, reached independently).
+    /// TRUE when the mechanism is registered but is not currently a capability. Two
+    /// cases, and only the first refuses watch():
+    ///  - BOOT-TIME: start() could NOT bind its OS facility (no systemd system bus, e.g. in
+    ///    a container: Dockerfile.agent ships libsystemd0, but a container has no bus;
+    ///    OpenSCManager denied; the IOCP/threadpool could not be created), so every
+    ///    watch() is refused. Known at start(), NOT at arm(), which is why it lands at rung 1
+    ///    rather than waiting on #2084's armed-but-deaf liveness (governance Gate-3
+    ///    cross-platform + Gate-6 sre, reached independently). Mirrored by `boot_inert`
+    ///    below (#4685).
+    ///  - RUNTIME: Registry (its sweeper, the sole producer of late commits and health
+    ///    edges; #2012 PR-B1) and File (its IOCP worker; #4658) raise it after three
+    ///    consecutive failed passes and clear it on the next successful pass, both while
+    ///    running. watch() is still accepted (the obligation is served when a pass next
+    ///    succeeds), so `inert` then means "not a capability right now", not "refusing
+    ///    arms".
+    /// The mechanism stays REGISTERED in both cases (so a boot-time refusal is an honest
+    /// rejection rather than "unknown type"), which is exactly why this bit is needed:
+    /// without it, `registered` and `functional` are indistinguishable on the wire, and an
+    /// inert mechanism reports byte-identically to a healthy idle one: "looks healthy, can
+    /// detect nothing". Not every worker failure is reported through this flag: Service
+    /// worker death deliberately is NOT reported through `inert`. It refuses new watches
+    /// (the Linux mechanism clears `started_`, the Windows one clears `scm_ok_`) and
+    /// invalidates every tracked coverage, so `stats().inert` stays false and `service` stays
+    /// in the heartbeat CSV; spark_service.cpp keeps it out of this bit so a dead poll thread
+    /// is not misread as a bind failure at start(). `inert` stays the UNION of both cases —
+    /// what the heartbeat CSV (spark_heartbeat.hpp) and the subscription_establishment()
+    /// coverage overlay (spark_engine.cpp) both read, since either kind of gap means "not
+    /// currently serviceable" for their purposes.
     bool inert{false};
+    /// TRUE for the BOOT-TIME case above ONLY (#4685) — start() could not bind this
+    /// mechanism's OS facility, so every watch() is refused; a mechanism mid a RUNTIME
+    /// episode still accepts watch() and serves it once a pass next succeeds, so it is
+    /// NOT boot-inert. Declared AFTER `inert` deliberately: every stats() implementation
+    /// (spark_file.cpp, spark_registry.cpp, spark_service.cpp) uses a designated
+    /// initializer, and C++20 requires designated-initializer order to match declaration
+    /// order. The sole consumer today is Guardian's capability filter
+    /// (guardian_engine.cpp's reconcile_rule_locked): arming against `!boot_inert` rather
+    /// than `!inert` keeps a rule ARMED through a transient runtime-degraded episode
+    /// instead of misclassifying it Unsupported and stranding it there with no
+    /// re-reconcile on recovery (the bug this field exists to close). Invariant
+    /// `boot_inert => inert` holds per mechanism but is never asserted across the two
+    /// independently-read atomics that back these fields (matches the skew-tolerance
+    /// contract above) — each mechanism's stats() instead derives both fields from the
+    /// SAME two local atomic reads, so the implication holds within one returned
+    /// snapshot without needing a lock or a cross-field assert.
+    bool boot_inert{false};
 };
 
 /// One watch mechanism for one event-driven SparkType. Lifecycle mirrors the
@@ -158,10 +223,12 @@ struct SparkMechanismStats {
 ///      on the control path, and commit or hand the result off later. Registry
 ///      does this since PR-B1 (spark_registry.cpp, "Ownership / dispatch
 ///      protocol"); File does this since PR-B2 (spark_file.cpp, watch()'s own
-///      caller-wait-budget + off-lock discovery probe). Service's
-///      watch()/unwatch() are already O(1) queue pushes but its SCM
-///      open/notify still run head-of-line on its worker (PR-B3, not yet
-///      landed).
+///      caller-wait-budget + off-lock discovery probe). Service does this
+///      since PR-B3 (spark_service.cpp, Windows half only — the Linux sd-bus
+///      mechanism has no head-of-line OS call to isolate in the first place):
+///      watch()/unwatch() were already O(1) queue pushes, and the SCM
+///      establishment call (OpenServiceW) now runs on a bounded, F3-counted
+///      probe lane rather than head-of-line on the mechanism's one thread.
 ///   2. A mechanism must NEVER call emit()/fault() synchronously from inside
 ///      watch()/unwatch() - not even on an immediate-success path. The engine's
 ///      per-type lock is on that call stack, and an Inline consumer reacting by
@@ -215,6 +282,34 @@ public:
     /// stats() therefore closes an ABBA cycle and can deadlock the agent. All three
     /// shipped mechanisms read only `std::atomic`s here. Keep it that way.
     [[nodiscard]] virtual SparkMechanismStats stats() const { return {}; }
+
+    /// Additive establishment-signal seam (rung 9c PR-6 item 1). Default forwards to
+    /// watch() so a mechanism with no need to override it (a bare test fake) compiles
+    /// and behaves unchanged — Registry, File and both Service classes override this
+    /// instead, to correlate their establishment reports (see SparkEstablishedFn)
+    /// against a stable identity. The engine ALWAYS calls THIS overload, never the
+    /// plain watch() above.
+    /// A DISTINCT NAME, deliberately not an overload of watch(): an overload would be
+    /// a change to the frozen watch()/unwatch() seam this class's own header comment
+    /// documents as reviewed and settled; a new name is purely additive.
+    [[nodiscard]] virtual std::expected<void, std::string>
+    watch_incarnation(const std::string& key, const SparkParams& params,
+                      SparkIncarnation incarnation) {
+        return watch(key, params);
+    }
+
+    /// Install the establishment-signal sink (rung 9c PR-6 item 1). Default: no sink
+    /// exists to install, returns false — a mechanism that never overrides this has
+    /// nothing to report and every watch_incarnation() call above simply forwards to
+    /// watch(), so there is nothing for a caller to be surprised is missing. A
+    /// mechanism that DOES implement this must seal it at its own start(): once
+    /// started, a later call returns false rather than silently swapping the sink out
+    /// from under an in-flight report (the engine calls this exactly once, before
+    /// start(), so the seal is a defensive one-way latch, not a live requirement).
+    /// [[nodiscard]]: a `false` return means the sink installation was REFUSED
+    /// (already sealed) — the caller must not silently ignore it, since that
+    /// mechanism's establishment reporting is then unavailable for good.
+    [[nodiscard]] virtual bool set_established_sink(SparkEstablishedFn /*sink*/) { return false; }
 };
 
 /// Platform factory: a real IOCP + ReadDirectoryChangesW file-change mechanism
@@ -470,6 +565,20 @@ struct FileMechanismTestControls {
     /// Idle-at-rest with the just-consumed discovery result silently
     /// dropped and no owner for establishment. Null clears it.
     std::function<void(std::wstring_view dir)> commit_attach_fail_hook;
+    /// Runs on run()'s own worker thread at the top of EVERY pass (a real
+    /// completion's pass and a control-wake/timeout sweep pass alike), under
+    /// mu_, after the pass has reserved its FilePassWork containers and before
+    /// process_completion_locked()/sweep_probes_locked() (#4658). In a real
+    /// completion's pass the dequeue bookkeeping precedes it; that is what
+    /// unwind_pass_locked() recovers. Throwing here models an allocation
+    /// failure at that point: the pass is unwound, counted (`pass_failed`), and
+    /// retried on a doubling backoff from `sweep_cadence` capped at 30 s; after
+    /// kFileWorkerInertAfterFailures (3) consecutive failures the mechanism
+    /// reports `inert` until a pass succeeds. The hook runs under mu_, so it must
+    /// not call any member that takes mu_ (watch(), watch_incarnation(), unwatch(),
+    /// stop(), apply_test_controls(), debug_counters(): self-deadlock). Mirrors
+    /// RegistryMechanismTestControls::sweep_hook. Null clears it.
+    std::function<void()> pass_fail_hook;
     std::size_t probe_lane_cap{0};
     std::size_t retiring_cap{0};
     std::chrono::milliseconds caller_wait_budget{0};
@@ -495,6 +604,10 @@ struct FileMechanismDebugCounters {
     std::uint64_t emit_failed{0};    ///< emit() threw on submit
     std::uint64_t fault_failed{0};   ///< fault() threw on submit
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged on a later pass
+    std::uint64_t established_failed{0}; ///< established() threw when invoked
+    std::uint64_t pass_failed{0};               ///< worker passes that threw, all-time (#4658)
+    std::uint64_t pass_failures_consecutive{0}; ///< current failure episode length; 0 = last ok
+    std::int64_t pass_backoff_ms{0};            ///< delay computed for the last failed pass
     std::size_t probe_workers_active{0};
     std::size_t live_dirs{0};
     std::size_t live_ancestors{0};
@@ -568,6 +681,7 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t health_edges{0};
     std::uint64_t emit_failed{0};    ///< emit() threw on submit (fire callback or sweeper)
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged by the sweeper
+    std::uint64_t established_failed{0}; ///< established() threw when invoked
     std::size_t probe_workers_active{0};
     std::size_t drain_workers_active{0};
     std::size_t live_watches{0};

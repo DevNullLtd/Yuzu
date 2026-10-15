@@ -30,7 +30,7 @@ Use repo-local Codex skills first. Start with the narrowest matching skill and c
 - Treat `proto/yuzu/**` as the canonical wire contract.
 - Treat `gateway/priv/proto/**` as a gateway mirror that must stay synced with canonical proto sources.
 - Treat `sdk/include/yuzu/plugin.h` as the stable C ABI boundary.
-- On Windows, use MSYS2 bash plus `source ./setup_msvc_env.sh`. If the build touches the gateway custom target, also `source scripts/ensure-erlang.sh`.
+- On Windows, use MSYS2 bash plus `source ./setup_msvc_env.sh`. Meson resolves the gateway's Erlang/OTP itself; `source scripts/ensure-erlang.sh` only before running `rebar3` or `erl` by hand.
 - Never use `vcvars64.bat`.
 - Never switch Windows protobuf/grpc back to Meson's cmake dependency path without reviewing the Windows-specific rules in root `meson.build` and `docs/windows-build.md`.
 
@@ -44,7 +44,7 @@ Use repo-local Codex skills first. Start with the narrowest matching skill and c
 
 - This repo uses a single-context layout: `CONTEXT.md` at the root and ADRs in `docs/adr/`.
 - `docs/agents/issue-standard.md` is the binding standard for every `gh issue` operation (ADR-3001): dedupe before filing, four body sections, three-axis labels, and never-close rules for `security`/`do-not-close` issues.
-- `docs/agents/issue-tracker.md` records GitHub Issues at `github.com/Tr3kkR/Yuzu` (command crib).
+- `docs/agents/issue-tracker.md` records GitHub Issues at `github.com/DevNullLtd/Yuzu` (command crib).
 - `docs/agents/triage-labels.md` records the full label taxonomy, including the canonical triage mapping.
 - `docs/agents/domain.md` records how engineering skills consume context and ADRs.
 

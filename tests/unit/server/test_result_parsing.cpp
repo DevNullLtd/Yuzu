@@ -15,6 +15,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <string>
+#include <vector>
+
 using namespace yuzu::server;
 
 TEST_CASE("interaction is registered as a key/value plugin", "[result_parsing]") {
@@ -75,4 +78,18 @@ TEST_CASE("cell_hint_for is safe against a field_index past the end of a short "
           "[result_parsing]") {
     const std::vector<std::string> fields = {"autorun"};
     CHECK(cell_hint_for("autoruns", fields, 7).empty());
+}
+
+TEST_CASE("installed_apps rows split as key|remainder (pre-existing server decode; a "
+          "definition-aware splitter is a tracked follow-up)",
+          "[result_parsing]") {
+    // Mutation: removing installed_apps from kKeyValuePlugins makes this a
+    // seven-cell split and fails both checks.
+    CHECK(split_fields("installed_apps",
+                       "app|7-Zip 26.02 (x64)|26.02|Igor Pavlov|-|C:/Program Files/7-Zip/|-") ==
+          std::vector<std::string>{"app",
+                                   "7-Zip 26.02 (x64)|26.02|Igor Pavlov|-|C:/Program Files/7-Zip/|-"});
+    // An escaped pipe inside a column decodes inside the remainder, never as a cell.
+    CHECK(split_fields("installed_apps", "app|X|-|-|-|a\\|b|-") ==
+          std::vector<std::string>{"app", "X|-|-|-|a|b|-"});
 }

@@ -117,7 +117,7 @@ Use the `configure` action to adjust TAR behavior.
 | `power_lookback_seconds` | `0` or up to 7776000 (90 days) | 604800 | How far back the first macOS read replays OS-retained power history (Windows/Linux ignore this key — they are live subscriptions with no history API). **`0` = forward-only** — the control to use where retrospective collection is not lawful; a value that cannot be read is treated as `0`, never as the default. |
 | `removable_enabled` | `true` / `false` | **`true`** | Toggle the removable-media capture source (`removable` → `$Removable_Live`): USB/removable attach and detach with device identity, plus executed-from-removable evidence. **On by default** — see `power_enabled` above for what "first" does and does not mean here. Records vendor/product/serial and executed-binary paths, which is identity/usage-class data under the works-council posture. |
 | `removable_lookback_seconds` | `0` or up to 7776000 (90 days) | 604800 | How far back the first Windows read backfills OS-retained removable history (Linux/macOS ignore this key — they are live-only, no history API). **`0` = forward-only** — a value that cannot be read is treated as `0`, never as the default. |
-| `usage_enabled` | `true` / `false` | **`true`** | Toggle the derived app-usage fold (`usage` source → `$Usage_Live`/`$Usage_Daily`): pairs `process_live` started/stopped events into per-executable runs (`run_usage_fold`, no collector of its own — see `tar-implementer.md` §8). **On by default** — joining `power`/`removable` as a works-council-class source that ships enabled (see the note above for what "first" does and does not mean here). What a device runs and when is a presence/working-hours proxy even though `usage` carries no user column of its own (open runs record a `user` field, folded into a `distinct_users` count on write). Coverage begins once the source reaches its `Active` lifecycle state after enablement or upgrade — strictly forward-only, never a retrospective fold over history that accrued before that point. Set to `false` to opt out; disabling freezes retention rather than accelerating it (like every other TAR source, #539), and existing `usage_daily`/`usage_daily_user`/`usage_live` rows stay queryable until they age out on their own schedules (31-day `usage_daily`/`usage_daily_user`; the fold's own 20000-run open-run cap on `usage_live`). **Access limitation (tracked, not yet fixed): `usage_live` is reachable today via the generic `tar.sql` action at `Infrastructure:Read`** (`usage_daily_user` is not in `tar.sql`'s queryable-table allowlist), not through the `Forensics` securable this release also ships — the dedicated Forensics-gated reader for this data is a tracked companion capability, not yet built (issue #4260). |
+| `usage_enabled` | `true` / `false` | **`true`** | Toggle the derived app-usage fold (`usage` source → `$Usage_Live`/`$Usage_Daily`): pairs `process_live` started/stopped events into per-executable runs (`run_usage_fold`, no collector of its own — see `tar-implementer.md` §8). **On by default** — joining `power`/`removable` as a works-council-class source that ships enabled (see the note above for what "first" does and does not mean here). What a device runs and when is a presence/working-hours proxy even though `usage` carries no user column of its own (open runs record a `user` field, folded into a `distinct_users` count on write). Coverage begins once the source reaches its `Active` lifecycle state after enablement or upgrade — strictly forward-only, never a retrospective fold over history that accrued before that point. Set to `false` to opt out; disabling freezes retention rather than accelerating it (like every other TAR source, #539), and existing `usage_daily`/`usage_daily_user`/`usage_live` rows stay queryable until they age out on their own schedules (31-day `usage_daily`/`usage_daily_user`; the fold's own 20000-run open-run cap on `usage_live`). **Access posture (enforced): `usage_live`/`usage_daily`/`usage_daily_user` are queryable ONLY through the Forensics-gated `app_usage` reads**, never through the generic `tar.sql` action — `tar.sql` (`Infrastructure:Read`) denies all three tables (direct name, `$Usage_*` placeholder, alias, or JOIN/subquery), matching the posture this section already documents for `tar_events`. `usage_enabled` and the `tar.status` usage counters are unaffected by this — they report on the fold regardless of how (or whether) the data is subsequently read (issue #4260). |
 | `dns_enabled` | `true` / `false` | **`false`** | Toggle the DNS resolver-cache capture source (`dns` source → `$DNS_Live`/`$DNS_Hourly`) on this host (ADR-0015). **Off by default** — the DNS cache reveals which domains a host resolved (**usage-class telemetry under the works-council posture; enabling is audited**). **Device-level state only — no per-process attribution** (the cache carries no PID). **Windows only today** (`DnsGetCacheDataTable`, cache-only — never issues a wire query); Linux/macOS planned. Set to `true` to opt in; collected at `fast_interval`. |
 | `mapdrive_enabled` | `true` / `false` | **`false`** | Toggle the mapped-drive capture source (`mapdrive` source → `$MapDrive_Live`/`$MapDrive_Hourly`) on this host (capability-map §3.8). **Off by default** — rows expose usernames and remote share paths (**identity/usage-class telemetry under the works-council posture; enabling is audited**). Records network-share mappings in **both** directions (`direction` column): **outbound** (drives this host maps to remote shares) and **inbound** (remote hosts mapping this host's shares — the lateral-movement signal). Windows + Linux fully; macOS is constrained — outbound live only via `getfsstat` (the username column is always blank, but a credentialed SMB mount source is stored verbatim in `remote_path`; no inbound, no history: honestly out of reach for an unprivileged agent). Inbound needs local-admin/Server-Operator on Windows and Samba on Linux, degrading to empty otherwise. Collected at `slow_interval`. **A one-time historical backfill** seeds *previously* mapped drives (from the registry / fstab / event logs) as `origin='historical'` rows — it runs at agent init, so it materializes on the **first agent restart after you enable this**. Set to `true` to opt in. |
 | `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples (device **and** per-app, when each is enabled — they share the tick). `0` disables registration of the perf trigger entirely. **Read at agent startup (trigger registration), not via `tar.configure`** — change it through the agent's KV config / install profile; a running agent picks it up on restart. (To stop perf collection at runtime without a restart, use `perf_enabled=false`.) |
@@ -158,7 +158,8 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 An opt-in development package can wrap the existing TAR process collector in a
 signed `YuzuAgent.app`. It is not a release/notarization lane. Packaging requires
 an explicit current macOS App ID profile with the ES entitlement set to Boolean
-`true`, a matching signer and provisioned Mac, plus the full Xcode SDK. The root
+`true`, a matching signer and provisioned Mac, plus an SDK that ships the Endpoint Security
+header and library stub (both the Command Line Tools and full Xcode SDKs do). The root
 LaunchDaemon always disables bare-executable OTA updates. External plugins remain
 subject to Apple library validation and Yuzu final-byte CMS policy. These artifact
 checks do not establish live ES: verify `tar.status` reports
@@ -167,7 +168,7 @@ and check both drop counters. Polling is an honest fallback, never ES proof.
 
 | Source | Windows | Linux | macOS |
 |--------|---------|-------|-------|
-| **process** | supported (`etw`) — `Microsoft-Windows-Kernel-Process` real-time session: **gap-free** start/stop (catches short-lived processes the poll misses), exact timestamps + exit code. **Names only — no command line** (the start event carries none; aligns with the privacy posture). Owning user resolved from the SID at start (empty for processes that exit faster than ETW's ~1s buffer flush — the same limit the poll has). Falls back to the `toolhelp32` poll if the ETW session cannot start. **Boot gap:** processes that start *and* exit before the agent's live session opens are backfilled from a boot **AutoLogger** (a circular, FlushTimer-enabled Kernel-Process `.etl` configured by the InnoSetup installer and `install-agent-user.ps1`, started by the kernel early each boot); the agent reads it directly at startup for events before the live session began (no session stop / no elevation — read access only), de-duplicated per boot. Takes effect from the next boot after install. Boot-window events are **names-only with no user** (the start event carries no user SID — precise attribution would need the Security-Auditing 4688 provider); if the AutoLogger isn't configured, that narrow window is simply not captured. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`endpoint_security`) — Endpoint Security `NOTIFY_EXEC`/`NOTIFY_EXIT` stream: **gap-free** start/stop, full image path, accurate ppid, owning user from the audit token. **Names only — no command line** (parity with the Windows ETW posture). Requires a build against the **full Xcode SDK** (the Command Line Tools SDK omits the EndpointSecurity header and linker stub), the `com.apple.developer.endpoint-security.client` entitlement, and root. Falls back to the `KERN_PROC_ALL` sysctl poll when the stream is unavailable (CLT-SDK build, missing entitlement, or non-root) — **the poll is also names-only** (it blanks the `proc_pidpath` image it would otherwise place in `cmdline`), so macOS process rows carry no command line on either path. **Boot gap** (as on Windows): processes alive before the agent's session opens get no `started` row — macOS has no AutoLogger-equivalent backfill. **Not active in current shipped builds** — the Apple entitlement + notarized release pipeline are pending (#1455), so macOS agents poll until then; check `process_capture_method` in `tar.status` to see the live path. |
+| **process** | supported (`etw`) — `Microsoft-Windows-Kernel-Process` real-time session: **gap-free** start/stop (catches short-lived processes the poll misses), exact timestamps + exit code. **Names only — no command line** (the start event carries none; aligns with the privacy posture). Owning user resolved from the SID at start (empty for processes that exit faster than ETW's ~1s buffer flush — the same limit the poll has). Falls back to the `toolhelp32` poll if the ETW session cannot start. **Boot gap:** processes that start *and* exit before the agent's live session opens are backfilled from a boot **AutoLogger** (a circular, FlushTimer-enabled Kernel-Process `.etl` configured by the InnoSetup installer and `install-agent-user.ps1`, started by the kernel early each boot); the agent reads it directly at startup for events before the live session began (no session stop / no elevation — read access only), de-duplicated per boot. Takes effect from the next boot after install. Boot-window events are **names-only with no user** (the start event carries no user SID — precise attribution would need the Security-Auditing 4688 provider); if the AutoLogger isn't configured, that narrow window is simply not captured. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`endpoint_security`) — Endpoint Security `NOTIFY_EXEC`/`NOTIFY_EXIT` stream: **gap-free** start/stop, full image path, accurate ppid, owning user from the audit token. **Names only — no command line** (parity with the Windows ETW posture). Requires a build with the ES SDK present (shipped in both the Command Line Tools and full Xcode SDKs — "needs full Xcode" is a myth), the `com.apple.developer.endpoint-security.client` entitlement, and root. Falls back to the `KERN_PROC_ALL` sysctl poll when the stream is unavailable (ES SDK not detected at build time, missing entitlement, or non-root) — **the poll is also names-only** (it blanks the `proc_pidpath` image it would otherwise place in `cmdline`), so macOS process rows carry no command line on either path. **Boot gap** (as on Windows): processes alive before the agent's session opens get no `started` row — macOS has no AutoLogger-equivalent backfill. **Not active in current shipped builds** — the Apple entitlement + notarized release pipeline are pending (#1455), so macOS agents poll until then; check `process_capture_method` in `tar.status` to see the live path. |
 | **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`proc_pidfdinfo` + `nstat`) — `proc_listallpids` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc` remains the fallback/seed poll (same TOCTOU caveat: short-lived sockets that close before the per-fd query may produce empty rows). Connection **lifecycle is event-driven** via the same `nstat` kernel-control client that serves netqual: `SRC_ADDED`/`SRC_REMOVED` messages fire on open/close. **Not Endpoint Security** — ES has no TCP/socket event notifications, only process exec/exit. |
 | **service** | supported (`scm`) — `EnumServicesStatusEx` / `QueryServiceConfig`; full status + startup_type. | constrained (`systemctl`) — `systemctl list-units`; `startup_type` reported as `unknown`. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported. | constrained (`launchctl`) — `launchctl list`; no startup_type, status binary running/stopped only. |
 | **user** | supported (`wts`) — `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
@@ -235,6 +236,7 @@ The `status` action returns database health information:
 
 ```
 storage_state|ok
+db_health|ok|0
 record_count|15234
 oldest_timestamp|1710950000
 newest_timestamp|1711050423
@@ -278,7 +280,52 @@ config|network_capture_method|polling
 config|network_capture_method_effective|polling
 config|software_interval_seconds|3600
 config|software_last_run_ts|1711050000
+config|perf_capture_method|procfs
+config|procperf_procs_seen|412
+config|process_last_status|events_recorded
+config|process_consecutive_failures|0
+config|process_last_status_at|1711050400
+config|tcp_last_status|events_recorded
+config|tcp_consecutive_failures|0
+config|tcp_last_status_at|1711050400
 ```
+
+(The sample is abbreviated: `<source>_last_status`, `<source>_consecutive_failures`
+and `<source>_last_status_at` appear once per capture source, in registry order.)
+
+**Database health (`db_health`).** `db_health|ok|<epoch>` reports the epoch of
+the last tar.db quarantine ever recorded on the device (`0` = never);
+`db_health|quarantined|<epoch>` is reported only by the agent process whose
+startup quarantined a corrupt database (see "Corrupt-database quarantine" below).
+The fact is persisted in `tar_config` (`db_health_last_quarantine_epoch` /
+`db_health_last_quarantine_file`, basename only), so it survives restarts.
+
+**Per-source health.** `<source>_last_status` is the terminal outcome token of
+the source's most recent collection (`never_ran` until it has run in this agent
+process), `<source>_consecutive_failures` counts back-to-back failures, and
+`<source>_last_status_at` is the epoch of that outcome (`0` if never). The failure
+tokens are `capture_incomplete`, `counters_unavailable`, `cursor_lost`,
+`state_unreadable`, `insert_failed` and `state_save_failed`; every other token
+(including `source_disabled`, `unsupported_platform` and baseline resets) resets
+the streak. The ledger is **process memory only**: an agent restart resets every
+source to `never_ran` / `0`, which is not a recovery. When one source hits a fatal
+early return in a tick, the sources after it do not run that tick, so read
+`<source>_last_status_at` to spot a source that is frozen by an upstream failure
+rather than healthy. `perf_capture_method` is the registry capture method for the
+running OS (`procfs` on Linux, `ntcounters` on Windows, `none` where there is no
+perf collector), and `procperf_procs_seen` is the process count in the last valid
+per-process counter snapshot.
+
+**Write failures.** Snapshot-diff sources (`process`, `tcp`, `service`, `user`,
+`software`, `arp`, `dns`, `mapdrive`) commit a tick's events and their baseline in
+one transaction, so a failed save can never leave events durable against a stale
+baseline. When a tick that had events fails, the collector emits
+`error|<source> insert failed`; when only a baseline-only save fails (no events
+in the diff, the process fallback seed) it emits
+`error|<source> state_save_failed`; the software cold-start seed reports on the
+software collector's own line, `tar|collect_software|0|state_save_failed`. Either way nothing was persisted and the
+next tick re-derives the same delta. `arp`, `dns` and `mapdrive` are non-fatal:
+they emit no `error|` line and record the token in the ledger instead.
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module`, `software` (both shown
@@ -347,19 +394,58 @@ table -- see "The retention clock guard" below. The per-table counters are in-me
 (the clock reading they compare against is persisted, so restarting does not
 blind the guard). Scrape this across the fleet to find endpoints whose clocks
 need attention -- the agent has no `/metrics` endpoint, so this action is the
-fleet-readable signal. **Not yet fleet-aggregated**: there is no shipped
+fleet-readable signal. The retention-guard counters are **not yet fleet-aggregated**: there is no shipped
 instruction or heartbeat tag that rolls these up server-side; surfacing them via
-the agent heartbeat is a tracked follow-up.
+the agent heartbeat is a tracked follow-up. (tar.db corruption, by contrast, is fleet-visible: see "Corrupt-database quarantine" below.)
 
 The four `<source>_*` blocks are emitted per capture source. `<source>_enabled` is one of three values: `true` (collector active), `false` (disabled via `configure`), or `errored`. `errored` means the stored value is not a recognised boolean — `configure` only ever writes `true`/`false`, so an `errored` value indicates the agent's `tar.db` was tampered with or was corrupt and re-initialised (see "Corrupt-database quarantine" below). While an `errored` value persists the agent applies a **fail-closed policy**: the affected source stops collecting (it is treated as `false`, not enabled) and retention skips pruning that source's rows, so any forensic data already captured is preserved. The source stays paused until you re-issue an explicit `configure` for it on that device to clear the value. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0` — and this includes recovery from `errored`: issuing `configure <source>_enabled=true` on a source whose stored value is `errored` clears `paused_at` to `0` in the same transition, so a recovered source never reports `enabled=true` alongside a stale paused timestamp. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
 ### Corrupt-database quarantine
 
-When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. This is an **agent-local log line** (`spdlog`, error level), **not** a Yuzu server audit event — do not look for it under `GET /api/v1/audit`; surface it via the agent's log file or remote log shipping. Consequences an operator should know:
+When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. `tar.db.corruption_detected` is an agent-local log line (`spdlog`, error level); the quarantine itself reaches the server as a `tar.db.corruption_quarantined` audit row via the heartbeat — see "Fleet visibility" below. Consequences an operator should know:
 
 - **All TAR history on that device is reset** — the new database is empty; prior events live only in the `.corrupt-<epoch>` sidecar.
 - **Per-source enable/disable state is reset to defaults** — a source previously paused for forensic preservation is collecting again. After the agent recovers, re-issue any required `configure` toggles, and `status` may briefly show `errored` for a source whose value could not be read.
 - **The quarantined file is not auto-deleted.** Recover data from `tar.db.corrupt-<epoch>` before the new database's retention overwrites the device's storage budget — e.g. `sqlite3 tar.db.corrupt-<epoch> ".recover" | sqlite3 recovered.db`, or open it read-only with any SQLite tool — then remove the sidecar manually once recovered. Repeated corruption produces multiple timestamped quarantine files; none are pruned automatically, so an agent with a recurring storage fault can accumulate them — watch the data dir's footprint.
+
+**Fleet visibility.** A quarantine is reported off-device: the tar plugin
+publishes `heartbeat.db_corruption_total` (cumulative per agent, monotonic in the
+common case) and `heartbeat.db_quarantine_last` (`<epoch>:<file>`) in its plugin
+storage, which the
+agent forwards on every heartbeat as `yuzu.plugin.tar.db_corruption_total` /
+`yuzu.plugin.tar.db_quarantine_last`. The server exposes
+`yuzu_fleet_tar_db_corruption_agents` (see the metrics reference) and writes a
+`tar.db.corruption_quarantined` audit row per (agent, quarantine identity),
+deduplicated against the audit store and bounded to one row per agent per 10
+minutes per server process (intermediate quarantines inside that window collapse
+to the newest identity; another HA node can add a second row for the same
+identity) — see the audit-log reference. A plugin that failed to
+initialise (including TAR when the corrupt file cannot be moved aside) is reported
+in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
+which distinguishes "failed to load" from "not installed". The plugin keeps its
+count in a private storage record; if that record is present but unreadable the
+plugin logs `TAR: db_health.ledger unreadable; not overwriting` and stops updating
+the two heartbeat keys rather than resetting the count — `status` still reports
+`db_health`, and the agent log carries the warning on every collect_slow tick. If
+instead the record write itself fails persistently (as opposed to a read of it),
+there is currently no fleet-visible signal beyond that same local warning — a
+device stuck this way is silently excluded from `yuzu_fleet_tar_db_corruption_agents`
+until the fault clears; tracked as a follow-up. The count is not monotonic in one
+further edge case: a *transient* fault on the read that decides whether a prior
+record exists (rather than the read above) is indistinguishable in-plugin from
+"no prior record," so a faulted read followed by a successful write on a later
+tick restarts the count at 1 for that device rather than resuming it — the fleet
+gauge counts affected agents, not events, so this narrows to a small undercount
+rather than a lost signal; tracked as #5037.
+
+Two things worth knowing about the timing of this signal. **A mass event** (many
+devices quarantining near-simultaneously, e.g. a bad storage-driver rollout) still
+updates the fleet gauge in real time, but individual audit rows serialize behind
+one another server-wide, so the audit trail can lag well behind the gauge during a
+burst — don't read row latency as gauge inaccuracy. **A device already quarantined
+before this fleet-visibility mechanism shipped** has no durable epoch/basename
+recorded yet, so it produces no fleet signal until its *next* corruption event —
+there is no backfill of pre-existing quarantines.
 
 If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Other agent plugins continue running; only TAR is unavailable on that device until the underlying fault is cleared and the agent restarted.
 
@@ -367,13 +453,15 @@ If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked fi
 
 ## TAR dashboard page
 
-The Yuzu dashboard includes a dedicated TAR page at `/tar`, reachable from the **TAR** entry in the main navigation bar (visible after authentication). The page is the central operator surface for TAR across the fleet. Phase 15.A delivers the retention-paused source list as the first frame; the scope-walking-aware SQL frame and the process tree viewer drop into placeholder slots in subsequent phases.
+The Yuzu dashboard includes a dedicated TAR page at `/tar`, reachable from the **TAR** entry in the sidebar's **Posture** group (visible after authentication). The page is the central operator surface for TAR across the fleet. Phase 15.A delivers the retention-paused source list as the first frame; the process tree viewer and the capture sources frame sit below it. Ad-hoc TAR SQL is not on this page: it starts from **Result sets** (`/result-sets`), where **From TAR query** runs a SELECT on a scope and keeps the devices that answer, behind a confirm that shows the SQL.
 
 ### Retention-paused source list
 
 The first frame surfaces every device × source pair where the collector has been disabled (`<source>_enabled=false`). Rows are sorted paused-longest-first so devices accumulating non-aging data the longest float to the top of the list.
 
 **Columns:** device hostname, source pill, paused since (UTC), paused for (coarse age), live rows count, oldest data age.
+
+**Partial result banner (#4644).** The scan's response read is capped at 10,000 rows and 50 MiB of response payload. When either cap cuts it, the page shows a "Partial result" banner above the table, the header counts ("responded", "have all sources collecting normally") are marked as describing only the responses that were read, and, if no paused rows are in the part that was read, the empty state says the page cannot tell and that Refresh will not change it (the cut repeats), instead of "still in progress" or "running normally". Dropped responses read as agents that never answered, so the banner is NOT confirmation that every collector is running normally: narrow the scan to a smaller management group and scan again. A cut scan does not update the `yuzu_tar_retention_paused_devices` gauge (its partial row set would under-count), so the gauge keeps the last value from an uncut scan and can be stale. The same condition is `result_truncated_by_cap: true` in `GET /api/v1/tar/retention-paused` and the `list_tar_retention_paused` tool, which also set `store_degraded: true` for a cut scan so an older client sees an incomplete result.
 
 **Row states.** Beyond a normal paused row (with a timestamp), the table surfaces two conditions and floats both to the top of the list so they aren't missed:
 
@@ -435,7 +523,7 @@ POST /api/v1/instructions/execute
 }
 ```
 
-**Partial captures never fabricate events.** If a subprocess-backed leg (`systemctl`/`launchctl`/`smbstatus`/`journalctl`/`wevtutil`) or a procfs/`getfsstat` read fails or is truncated mid-capture, that tick's diff is skipped and the prior baseline is retained — no appeared/removed events are fabricated from a partial read. A rate-limited warning is logged; `tar.status` shows no dedicated counter for this today.
+**Partial captures never fabricate events.** If a subprocess-backed leg (`systemctl`/`launchctl`/`smbstatus`/`journalctl`/`wevtutil`) or a procfs/`getfsstat` read fails or is truncated mid-capture, that tick's diff is skipped and the prior baseline is retained — no appeared/removed events are fabricated from a partial read. A rate-limited warning is logged and the source's `<source>_last_status` reads `capture_incomplete` with `<source>_consecutive_failures` counting the streak in `tar.status`.
 
 ## Performance impact
 
@@ -759,6 +847,8 @@ The `$Software_*` tables are populated on **Windows** when the source is enabled
 **User tables:** `ts`, `user`, `domain`, `logon_type`, `action` (login/logout). Daily tier adds `login_count`.
 
 **Perf tables:** `ts`, `cpu_pct`, `mem_used_pct`, `commit_pct`, `disk_read_bps`, `disk_write_bps`, `disk_read_lat_us`, `disk_write_lat_us`, `net_rx_bps`, `net_tx_bps` (all numeric; rates are bytes/sec, latencies are µs per I/O). `$Perf_Hourly` carries per-hour `samples`, `cpu_avg`/`cpu_max`, `mem_avg`/`mem_max`, `commit_avg`, and avg/max throughput and latency columns. Collection is trigger-driven (`tar.collect_perf`, every `perf_interval_seconds`), so the audit trail for perf is the `configure` action that enables/paces it, not a per-sample dispatch record.
+
+**`collect_perf` status tokens.** `sample_recorded`, `baseline` (first tick after start), `source_disabled`, `unsupported_platform` (no perf collector for this OS: macOS today) and `counters_unavailable` (the OS has a perf collector but the counter read failed; the same token is used for `procperf`).
 
 **ProcPerf tables:** `ts`, `name` (image name only — **never a command line**), `instances`, `cpu_pct`, `ws_bytes`. Each tick records the **top 10 applications by CPU plus the top 10 by working set** (union, ≤ 20 rows), aggregated across same-name processes (`instances` = how many). `cpu_pct` is the app's share of *total machine capacity* — one saturated core on an 8-core box reads 12.5, matching `$Perf_Live` and Task Manager. `$ProcPerf_Hourly` aggregates per `(hour, name)`: `samples`, `instances_max`, `cpu_avg`/`cpu_max`, `ws_avg_bytes`/`ws_max_bytes`. Apps matching a redaction pattern are never recorded. Example — yesterday's CPU-hungriest apps on a device:
 

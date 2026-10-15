@@ -1,0 +1,165 @@
+## App Control Definitions
+## Reports the configured Windows application-control posture, read-only:
+## WDAC (Code Integrity) policy state and AppLocker rule-collection
+## enforcement. Windows-only concept: Linux/macOS report an honest
+## `unsupported` row.
+## Plugin: app_control | Actions: wdac_policy, applocker_policy
+##
+## Source: registry HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy + the
+## Active\*.cip policy-file listing (wdac_policy); wmi_bounded.hpp CIM query
+## of MSFT_ApplockerPolicy with a SrpV2 registry fallback (applocker_policy).
+## No PowerShell, no raw COM, no policy mutation. Refs #282 (PARTIAL): this
+## is the read-only posture only; add_rule / remove_rule / get_blocked_events
+## and a Linux fapolicyd leg are not implemented. See
+## agents/plugins/app_control/README.md.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.app_control.wdac_policy
+  displayName: WDAC Policy Posture
+  version: 1.0.0
+  description: >
+    Reads the configured Windows Defender Application Control (Code
+    Integrity) posture: every value under
+    HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy with its raw data and a
+    named state, plus one row per active .cip policy file. The value
+    `VerifiedAndReputablePolicyState` is the Smart App Control state, not
+    the state of the listed policies, and a `present` file does not say
+    whether its policy is enforced or audit-only; the legacy single-format
+    SiPolicy.p7b is reported by presence only. A value the
+    plugin does not model is reported `unmodelled`, never coerced; a key or
+    directory the OS reports as not present is `absent`; a failed read is
+    reported as a `constrained` row with a reason, never as absent.
+    An `enforced` mode is the configured mode, not proof that rules apply (the
+    Application Identity service is not read). Windows-only: application control has no Linux/macOS equivalent here.
+  tags: [windows, wdac, code-integrity, application-control, security, inventory]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: app_control
+    action: wdac_policy
+    concurrency: per-device
+
+  result:
+    # wdac|<name>|<raw>|<state>
+    # (also: wdac_cip|<policy_stem>|<present|absent>, and constrained|<reason>)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row family: `wdac` (a Control\CI\Policy value), `wdac_cip` (an active .cip policy file: the stem lands in `name`, `present` or `absent` in `raw`, and `state` is empty) or `constrained` (a failed step: the reason lands in `name`, the rest are empty).'
+        values: [wdac, wdac_cip, constrained]
+        example: wdac
+        platforms: [windows]
+      - name: name
+        type: string
+        description: 'Registry value name under Control\CI\Policy (or the policy file stem on a wdac_cip row, the failure reason on a constrained row).'
+        example: VerifiedAndReputablePolicyState
+        platforms: [windows]
+      - name: raw
+        type: string
+        description: 'Raw value: a decimal for a DWORD, the text for a string value, opaque_<n>B for any other type; a dash on the key-absent row; `present` or `absent` on a wdac_cip row.'
+        example: "1"
+        platforms: [windows]
+      - name: state
+        type: string
+        description: 'Named state of the value (`VerifiedAndReputablePolicyState` is the Smart App Control state, not the state of the listed `.cip` policies); empty on a wdac_cip or constrained row.'
+        values: [disabled, audit, enforced, unmodelled, absent]
+        example: enforced
+        platforms: [windows]
+
+  readablePayload: "Report Windows WDAC application-control policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_control]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.app_control.applocker_policy
+  displayName: AppLocker Policy Posture
+  version: 1.0.0
+  description: >
+    Reports the AppLocker enforcement mode and rule count for each rule
+    collection (Appx, Dll, Exe, Msi, Script). Reads the MSFT_ApplockerPolicy
+    CIM class through a bounded query; when the class is absent or returns
+    no rows, walks HKLM\SOFTWARE\Policies\Microsoft\Windows\SrpV2 instead.
+    A mode the plugin does not model is `unmodelled`; with no SrpV2 key the
+    answer is a single `none` row, and a collection that is not configured
+    under an existing key reads `absent`; a failed read is a `constrained`
+    row with a reason. `none` means neither the SrpV2 key nor the CIM class
+    shows a policy: one delivered another way (for example by MDM) is not
+    read. Rows from the CIM class report their mode `unmodelled`.
+    An `enforced` mode is the configured mode, not proof that rules apply (the
+    Application Identity service is not read). Windows-only: application control has no Linux/macOS
+    equivalent here.
+  tags: [windows, applocker, application-control, security, inventory]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: app_control
+    action: applocker_policy
+    concurrency: per-device
+
+  result:
+    # applocker|<collection>|<mode>|<rules>
+    # (also: constrained|<reason>)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row family: `applocker` (one per rule collection, or the single `none` placeholder) or `constrained` (a failed step: the reason lands in `collection`, the rest are empty).'
+        values: [applocker, constrained]
+        example: applocker
+        platforms: [windows]
+      - name: collection
+        type: string
+        description: 'AppLocker rule collection; `none` when neither the SrpV2 registry key nor the CIM class shows a policy (one delivered another way, for example by MDM, is not read); on a constrained row, the failure reason.'
+        values: [Appx, Dll, Exe, Msi, Script, none]
+        example: Exe
+        platforms: [windows]
+      - name: mode
+        type: string
+        description: 'Enforcement mode of the collection; `absent` when the collection is not configured (no rule-collection subkey) or has no EnforcementMode value. Rows from the CIM class report `unmodelled`: the registry numbering is not assumed for that unverified class.'
+        values: [audit, enforced, unmodelled, absent]
+        example: enforced
+        platforms: [windows]
+      - name: rules
+        type: int32
+        description: 'Number of rules in the collection (rule subkeys under the SrpV2 walk); 0 when none is configured.'
+        example: "12"
+        platforms: [windows]
+
+  readablePayload: "Report Windows AppLocker policy posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_control]
+
+status:
+  phase: active

@@ -708,9 +708,256 @@ TEST_CASE("InventoryEval: malformed JSON skipped", "[inventory_eval][edge]") {
     InventoryEvalRequest req;
     req.conditions = {{"hw", "os", "==", "Linux"}};
 
-    auto results = evaluate_inventory(req, records);
+    // #4496: a genuine parse error is a DIFFERENT failure mode from the
+    // depth-guard exclusion below - excluded_by_depth must stay 0 here, or a
+    // caller surfacing the poison-exclusion signal would fire it on ordinary
+    // malformed input too.
+    //
+    // #4496 follow-up: the malformed record IS counted, via the separate
+    // excluded_by_parse_error out-param - the two counters must move
+    // independently, never conflated into one signal.
+    std::size_t excluded_by_depth = 999;
+    std::size_t excluded_by_parse_error = 999;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth, &excluded_by_parse_error);
     REQUIRE(results.size() == 1);
     CHECK(results[0].agent_id == "agent-2");
+    CHECK(excluded_by_depth == 0);
+    CHECK(excluded_by_parse_error == 1);
+}
+
+// #2437-class guard: data_json nesting past kMcpMaxJsonDepth must be skipped
+// BEFORE the parse, exactly like a genuine parse error above. Deliberately
+// uses "exists" (matches on presence alone, not value) with the deep nesting
+// INSIDE the "os" field's own value rather than at the top level - this is
+// what makes the test discriminate: json_path would fail to resolve "os" on
+// a top-level array (wrong container kind) regardless of the guard, so that
+// shape can't prove anything. With "os" holding the deep structure, an
+// "exists" check that reaches eval_condition unguarded calls
+// json_value_to_string's dump() fallback on the parsed tree - the exact
+// unboundedly-recursive call that would SIGSEGV the whole process at the
+// real ~100,000-level attack depth - and would spuriously COUNT this record
+// as a match. The guard must exclude it before that call is ever made.
+// Reachability-proxy depth (36 > kMcpMaxJsonDepth's 32), never the real
+// attack depth. This one function backs all three evaluate_inventory()
+// callers (REST /api/v1/inventory/evaluate, REST from-inventory-query, and
+// the MCP create_result_set_from_inventory_query tool), so this single test
+// covers all three.
+//
+// #4496: also asserts the exclusion is COUNTED via the out-param, since
+// every production caller now depends on that count to surface a
+// truncation/exclusion signal rather than silently returning fewer matches
+// than actually exist.
+TEST_CASE("InventoryEval: over-deep data_json skipped before it can spuriously match or "
+          "reach the dump() fallback, a healthy matching record is still returned",
+          "[inventory_eval][edge][security]") {
+    const std::string poisoned = R"({"os":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    Records records = {
+        {"agent-1|hw", poisoned},
+        {"agent-2|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_depth = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-2");
+    CHECK(excluded_by_depth == 1);
+}
+
+// #4496: the sibling of the test above - no poisoned record present, so the
+// out-param must read back 0, not merely "truthy/absent". A caller building a
+// truncation flag off a garbage/uninitialized count would otherwise report a
+// false positive on perfectly healthy input.
+TEST_CASE("InventoryEval: excluded_by_depth stays zero when no record is poisoned",
+          "[inventory_eval][edge][security]") {
+    Records records = {
+        {"agent-1|hw", R"({"os": "Linux"})"},
+        {"agent-2|hw", R"({"os": "Windows"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_depth = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth);
+    REQUIRE(results.size() == 2);
+    CHECK(excluded_by_depth == 0);
+}
+
+// #4496 (Gate 7 fix, quality-engineer SHOULD): the out-param must ACCUMULATE
+// across records, not saturate at 1 - two independently-poisoned records
+// plus a healthy matching record must leave excluded_by_depth at 2, with the
+// healthy record's match still returned.
+TEST_CASE("InventoryEval: excluded_by_depth accumulates across multiple poisoned records",
+          "[inventory_eval][edge][security]") {
+    const std::string poisoned = R"({"os":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    Records records = {
+        {"agent-1|hw", poisoned},
+        {"agent-2|hw", poisoned},
+        {"agent-3|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_depth = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-3");
+    CHECK(excluded_by_depth == 2);
+}
+
+// #4496 (Gate 7 fix, cpp-expert + cpp-safety NICE, independently converged):
+// the out-param is zeroed up front so a caller never reads a garbage/stale
+// count - but that zeroing must also hold on the kMaxInventoryConditions
+// early-return path, not just the normal loop-exit path. Seed a stale
+// nonzero value and confirm this specific backstop path clears it too.
+TEST_CASE("InventoryEval: excluded_by_depth is zeroed on the kMaxInventoryConditions "
+          "early return, not just the loop-exit path",
+          "[inventory_eval][edge]") {
+    Records records = {
+        {"agent-1|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions.assign(kMaxInventoryConditions + 1, InventoryCondition{"hw", "os", "exists", ""});
+
+    std::size_t excluded_by_depth = 999;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth);
+    CHECK(results.empty());
+    CHECK(excluded_by_depth == 0);
+}
+
+// #4496 follow-up: the sibling of the four excluded_by_depth tests above, for
+// the excluded_by_parse_error out-param - mirrors their structure exactly,
+// substituting a malformed-JSON record for an over-nested one.
+
+// #4496 follow-up: the sibling of "no poisoned record" above - a caller
+// building a truncation flag off a garbage/uninitialized count would
+// otherwise report a false positive on perfectly healthy input.
+TEST_CASE("InventoryEval: excluded_by_parse_error stays zero when no record is malformed",
+          "[inventory_eval][edge][security]") {
+    Records records = {
+        {"agent-1|hw", R"({"os": "Linux"})"},
+        {"agent-2|hw", R"({"os": "Windows"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_parse_error = 0;
+    auto results = evaluate_inventory(req, records, nullptr, &excluded_by_parse_error);
+    REQUIRE(results.size() == 2);
+    CHECK(excluded_by_parse_error == 0);
+}
+
+// #4496 follow-up (Gate 7 shape from the depth-guard sibling): the out-param
+// must ACCUMULATE across records, not saturate at 1 - two independently
+// malformed records plus a healthy matching record must leave
+// excluded_by_parse_error at 2, with the healthy record's match still
+// returned.
+TEST_CASE("InventoryEval: excluded_by_parse_error accumulates across multiple malformed "
+          "records",
+          "[inventory_eval][edge][security]") {
+    Records records = {
+        {"agent-1|hw", "not valid json {{{"},
+        {"agent-2|hw", "also not valid ]]]"},
+        {"agent-3|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_parse_error = 0;
+    auto results = evaluate_inventory(req, records, nullptr, &excluded_by_parse_error);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-3");
+    CHECK(excluded_by_parse_error == 2);
+}
+
+// #4496 follow-up (Gate 7 shape from the depth-guard sibling): the out-param
+// is zeroed up front so a caller never reads a garbage/stale count - that
+// zeroing must also hold on the kMaxInventoryConditions early-return path,
+// not just the normal loop-exit path.
+TEST_CASE("InventoryEval: excluded_by_parse_error is zeroed on the kMaxInventoryConditions "
+          "early return, not just the loop-exit path",
+          "[inventory_eval][edge]") {
+    Records records = {
+        {"agent-1|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions.assign(kMaxInventoryConditions + 1, InventoryCondition{"hw", "os", "exists", ""});
+
+    std::size_t excluded_by_parse_error = 999;
+    auto results = evaluate_inventory(req, records, nullptr, &excluded_by_parse_error);
+    CHECK(results.empty());
+    CHECK(excluded_by_parse_error == 0);
+}
+
+// #4496 follow-up (Gate 8 targeted re-review, quality-engineer): the two
+// exclusion out-params are documented (inventory_eval.hpp) as "counted
+// separately so an operator can tell WHICH guard excluded a record" - a
+// claim only actually exercised when BOTH causes are present in the SAME
+// call. Every other test in this file (and the REST/MCP route-level tests)
+// exercises one cause at a time; this pins that both counters accumulate
+// independently within a single evaluate_inventory() call, and that the
+// healthy record still matches regardless of which other records were
+// excluded and for which reason.
+TEST_CASE("InventoryEval: excluded_by_depth and excluded_by_parse_error accumulate "
+          "independently when both causes are present in the same call",
+          "[inventory_eval][edge][security]") {
+    const std::string poisoned = R"({"os":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    Records records = {
+        {"agent-1|hw", poisoned},
+        {"agent-2|hw", "not valid json {{{"},
+        {"agent-3|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_depth = 0;
+    std::size_t excluded_by_parse_error = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth, &excluded_by_parse_error);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-3");
+    CHECK(excluded_by_depth == 1);
+    CHECK(excluded_by_parse_error == 1);
+}
+
+// #4541 review (Important finding 1): the fix capped PER-RECORD LOG DETAIL
+// at kMaxLoggedExclusionsPerCause (10) but must never cap the COUNT itself -
+// the out-param is the caller-facing signal ("N records were excluded"),
+// only the log-line volume is a pure implementation detail. Seeds MORE than
+// the cap for each cause (12) and asserts both out-params still report the
+// real total (12), not the capped log-line count (10) - proves the two are
+// genuinely independent, not the same counter reused for both purposes.
+TEST_CASE("InventoryEval: excluded_by_depth and excluded_by_parse_error report the real "
+          "total even when it exceeds the per-cause log-volume cap",
+          "[inventory_eval][edge][security]") {
+    const std::string poisoned = R"({"os":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    Records records;
+    for (int i = 0; i < 12; ++i) {
+        records.emplace_back("poisoned-" + std::to_string(i) + "|hw", poisoned);
+    }
+    for (int i = 0; i < 12; ++i) {
+        records.emplace_back("malformed-" + std::to_string(i) + "|hw", "not valid json {{{");
+    }
+    records.emplace_back("agent-healthy|hw", R"({"os": "Linux"})");
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_depth = 0;
+    std::size_t excluded_by_parse_error = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth, &excluded_by_parse_error);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-healthy");
+    CHECK(excluded_by_depth == 12);
+    CHECK(excluded_by_parse_error == 12);
 }
 
 TEST_CASE("InventoryEval: record key without separator skipped", "[inventory_eval][edge]") {

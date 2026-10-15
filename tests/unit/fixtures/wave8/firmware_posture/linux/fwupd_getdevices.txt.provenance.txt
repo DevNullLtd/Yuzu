@@ -1,0 +1,12 @@
+host: braga (Mac, Docker Desktop) running fedora:40 --platform linux/amd64 (x86_64 emulated)
+packages: fwupd-1.9.28-1.fc40, dbus-daemon-1.14.10-3.fc40, systemd-255.18-1.fc40 (busctl)
+identity: root (euid 0) inside the container
+setup: dbus-daemon --system --fork; /usr/libexec/fwupd/fwupd started by hand (no systemd PID 1)
+command: busctl --system call org.freedesktop.fwupd / org.freedesktop.fwupd GetDevices  (exit 0)
+date: 2026-09-21
+status: REAL CAPTURE (container, not hardware: the single device is the emulated CPU)
+notes: reply signature aa{sv}; Flags t 129 = INTERNAL|REGISTERED; this device carries NO
+  "Version" key, so a missing Version is a legitimate shape. "Created" is the container clock.
+  Follow-up GetUpgrades errors on the same daemon (dbus-send --print-reply):
+    updatable-less device -> org.freedesktop.fwupd.NothingToDo "Device is not updatable"
+    unknown id           -> org.freedesktop.fwupd.NotFound "device ID deadbeef was not found"

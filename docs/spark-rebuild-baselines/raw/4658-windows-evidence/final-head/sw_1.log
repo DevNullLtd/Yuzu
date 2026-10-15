@@ -1,0 +1,1329 @@
+[DIAG] DLL static-init starting (before proto registration)
+Filters: [spark] [windows]
+Randomness seeded to: 586978655
+[2026-09-21 21:41:15.693] [error] spark_file: worker pass failed (consecutive #1) - retrying in 20 ms
+[2026-09-21 21:41:15.724] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:15.745] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:15.745] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_adopt_10839832384165945109_1\watched.txt'
+[2026-09-21 21:41:15.746] [info] SparkEngine: disarmed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_adopt_10839832384165945109_1\watched.txt' (last subscription gone)
+[2026-09-21 21:41:15.756] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_adopt_10839832384165945109_1\watched.txt'
+[2026-09-21 21:41:15.772] [info] SparkEngine: disarmed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_adopt_10839832384165945109_1\watched.txt' (last subscription gone)
+[2026-09-21 21:41:15.773] [info] SparkEngine stopped
+[2026-09-21 21:41:15.778] [error] spark_file: worker pass failed (consecutive #1) - retrying in 500 ms
+[2026-09-21 21:41:16.283] [error] spark_file: worker pass failed (consecutive #2) - retrying in 1000 ms
+[2026-09-21 21:41:17.290] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:41:19.290] [info] spark_file: worker pass recovered after 3 failure(s)
+[2026-09-21 21:41:20.048] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:20.048] [info] SparkEngine: armed 'file|107:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_shared_anc_root_10839832384165945109_5\dep1\f1.txt'
+[2026-09-21 21:41:20.049] [info] SparkEngine: armed 'file|107:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_shared_anc_root_10839832384165945109_5\dep2\f2.txt'
+[2026-09-21 21:41:20.050] [info] SparkEngine: disarmed 'file|107:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_shared_anc_root_10839832384165945109_5\dep1\f1.txt' (last subscription gone)
+[2026-09-21 21:41:20.266] [info] SparkEngine: disarmed 'file|107:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_shared_anc_root_10839832384165945109_5\dep2\f2.txt' (last subscription gone)
+[2026-09-21 21:41:20.267] [info] SparkEngine stopped
+[2026-09-21 21:41:20.272] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:20.272] [info] SparkEngine: armed 'file|109:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_park_10839832384165945109_6\watched.txt'
+[2026-09-21 21:41:20.330] [warning] SparkEngine: watch 'file|109:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_park_10839832384165945109_6\watched.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:20.330] [info] SparkEngine: armed 'file|108:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_park_10839832384165945109_6\second.txt'
+[2026-09-21 21:41:20.330] [warning] SparkEngine: watch 'file|108:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_park_10839832384165945109_6\second.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:20.585] [info] SparkEngine: watch 'file|108:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_park_10839832384165945109_6\second.txt' recovered
+[2026-09-21 21:41:20.585] [info] SparkEngine: watch 'file|109:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_park_10839832384165945109_6\watched.txt' recovered
+[2026-09-21 21:41:20.601] [info] SparkEngine: disarmed 'file|109:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_park_10839832384165945109_6\watched.txt' (last subscription gone)
+[2026-09-21 21:41:20.601] [info] SparkEngine: disarmed 'file|108:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_park_10839832384165945109_6\second.txt' (last subscription gone)
+[2026-09-21 21:41:20.602] [info] SparkEngine stopped
+[2026-09-21 21:41:20.605] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:20.606] [info] SparkEngine: armed 'registry|4:HKCU|50:Software\Yuzu\SparkB1_est_target_28516_165945109_0'
+[2026-09-21 21:41:20.617] [info] SparkEngine: disarmed 'registry|4:HKCU|50:Software\Yuzu\SparkB1_est_target_28516_165945109_0' (last subscription gone)
+[2026-09-21 21:41:20.619] [info] SparkEngine stopped
+[2026-09-21 21:41:20.620] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:20.620] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_est_rearm_28516_165945109_1'
+[2026-09-21 21:41:20.794] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_est_rearm_28516_165945109_1' (last subscription gone)
+[2026-09-21 21:41:20.796] [info] SparkEngine stopped
+[2026-09-21 21:41:20.797] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:20.798] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:20.826] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:20.827] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:20.858] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:20.859] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:20.891] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:20.891] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:20.923] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:20.924] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:20.955] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:20.956] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:20.988] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:20.988] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.020] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.020] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.052] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.052] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.084] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.085] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.116] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.117] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.148] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.149] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.180] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.181] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.213] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.213] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.245] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.245] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.277] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.277] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.309] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.309] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.340] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.341] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.372] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.373] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.405] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.405] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.437] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.437] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.469] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.469] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.501] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.501] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.533] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.533] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.565] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.566] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.597] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.598] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.629] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.630] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.661] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.662] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.693] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.694] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.726] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.726] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.758] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.759] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.790] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.790] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.822] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.822] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.854] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.854] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.886] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.886] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.918] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.918] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.949] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.950] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:21.981] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:21.982] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.013] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.014] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.045] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.045] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.077] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.077] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.109] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.110] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.141] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.142] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.173] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.174] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.206] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.206] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.237] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.238] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.270] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.270] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.302] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.302] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.334] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.334] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.366] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.367] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.398] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.399] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.430] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.431] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.463] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.463] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.495] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.495] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.526] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.527] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.558] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.559] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.590] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.591] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.622] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.623] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.654] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.655] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.686] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.687] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.719] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.719] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.751] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.751] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.783] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.784] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.815] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.816] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.847] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.848] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.880] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.880] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.911] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.911] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.943] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.943] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:22.975] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:22.975] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.007] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.008] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.039] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.039] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.071] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.072] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.103] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.104] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.135] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.136] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.167] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.168] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.200] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.200] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.232] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.232] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.264] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.264] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.296] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.296] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.328] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.329] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.360] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.361] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.393] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.393] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.424] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.425] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.457] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.457] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.489] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.489] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.521] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.521] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.553] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.553] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.585] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.586] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.617] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.617] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.649] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.650] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.681] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.682] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.714] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.714] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.746] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.746] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.778] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.778] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.810] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2' (last subscription gone)
+[2026-09-21 21:41:23.811] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_up1_churn_28516_165945109_2'
+[2026-09-21 21:41:23.843] [info] SparkEngine stopped
+[2026-09-21 21:41:24.226] [warning] spark_file: synthetic fire for 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_dispatch_fail_root_10839832384165945109_7\shared' threw on submit (attempt 1) - retrying
+[2026-09-21 21:41:24.257] [warning] spark_file: synthetic fire for 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_dispatch_fail_root_10839832384165945109_7\shared' threw on submit (attempt 1) - retrying
+[2026-09-21 21:41:24.310] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:24.310] [info] SparkEngine: armed 'file|104:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_late_discard_10839832384165945109_8\watched.txt'
+[2026-09-21 21:41:24.368] [info] SparkEngine: disarmed 'file|104:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_late_discard_10839832384165945109_8\watched.txt' (last subscription gone)
+[2026-09-21 21:41:24.593] [info] SparkEngine stopped
+[2026-09-21 21:41:24.599] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:24.599] [info] SparkEngine: armed 'file|107:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_dead_anc_root_10839832384165945109_9\anc\d1\f1.txt'
+[2026-09-21 21:41:24.600] [info] SparkEngine: armed 'file|107:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_dead_anc_root_10839832384165945109_9\anc\d2\f2.txt'
+[2026-09-21 21:41:24.602] [info] SparkEngine: armed 'file|107:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_dead_anc_root_10839832384165945109_9\anc\d3\f3.txt'
+[2026-09-21 21:41:24.656] [warning] SparkEngine: watch 'file|107:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_dead_anc_root_10839832384165945109_9\anc\d3\f3.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:24.721] [info] SparkEngine: watch 'file|107:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_dead_anc_root_10839832384165945109_9\anc\d3\f3.txt' recovered
+[2026-09-21 21:41:24.738] [info] SparkEngine stopped
+[2026-09-21 21:41:25.083] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:25.083] [info] SparkEngine: armed 'file|98:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_iso_a_10839832384165945109_10\watched.txt'
+[2026-09-21 21:41:25.138] [warning] SparkEngine: watch 'file|98:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_iso_a_10839832384165945109_10\watched.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:25.138] [info] SparkEngine: armed 'file|98:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_iso_b_10839832384165945109_11\watched.txt'
+[2026-09-21 21:41:25.411] [info] SparkEngine: watch 'file|98:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_iso_a_10839832384165945109_10\watched.txt' recovered
+[2026-09-21 21:41:25.444] [info] SparkEngine stopped
+[2026-09-21 21:41:25.560] [info] SparkEngine: armed 'registry|4:HKCU|28:Software\Yuzu\SparkLat_28516'
+[2026-09-21 21:41:25.562] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:26.406] [info] SparkEngine stopped
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+yuzu_agent_tests.exe is a Catch2 v3.13.0 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+Registry spark (real mechanism): inline dispatch is microsecond-scale
+-------------------------------------------------------------------------------
+../tests/unit/test_spark_mechanism.cpp(10269)
+...............................................................................
+
+../tests/unit/test_spark_mechanism.cpp(10321): warning:
+  [registry TP_WAIT] inline DISPATCH us over 21 fires: min=7 median=15 p90=20
+  max=51 | inline HANDLER-exec us: max=61 over 21 calls, over_100us=0
+  over_10ms=0  (OS-notify latency NOT included — that is ms-scale, separate)
+
+[2026-09-21 21:41:26.411] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_commit_attach_fail_root_10839832384165945109_13\never_appears' failed (commit allocation failed, err=0) - watch is deaf until the retry
+[2026-09-21 21:41:26.486] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:26.486] [info] SparkEngine: armed 'file|98:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_late1_10839832384165945109_14\watched.txt'
+[2026-09-21 21:41:26.547] [warning] SparkEngine: watch 'file|98:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_late1_10839832384165945109_14\watched.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:26.611] [info] SparkEngine: watch 'file|98:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_late1_10839832384165945109_14\watched.txt' recovered
+[2026-09-21 21:41:26.628] [info] SparkEngine stopped
+[2026-09-21 21:41:26.632] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:26.633] [info] SparkEngine: armed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_late_10839832384165945109_15\watched.txt'
+[2026-09-21 21:41:26.691] [warning] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_late_10839832384165945109_15\watched.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:26.945] [info] SparkEngine: watch 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_late_10839832384165945109_15\watched.txt' recovered
+[2026-09-21 21:41:26.961] [info] SparkEngine: disarmed 'file|101:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_late_10839832384165945109_15\watched.txt' (last subscription gone)
+[2026-09-21 21:41:26.962] [info] SparkEngine stopped
+[2026-09-21 21:41:26.967] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:26.967] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep0\f.txt'
+[2026-09-21 21:41:26.969] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep1\f.txt'
+[2026-09-21 21:41:26.970] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep2\f.txt'
+[2026-09-21 21:41:26.971] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep3\f.txt'
+[2026-09-21 21:41:26.972] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep4\f.txt'
+[2026-09-21 21:41:26.973] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep5\f.txt'
+[2026-09-21 21:41:26.975] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep6\f.txt'
+[2026-09-21 21:41:26.976] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep7\f.txt'
+[2026-09-21 21:41:26.977] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt'
+[2026-09-21 21:41:26.978] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt'
+[2026-09-21 21:41:26.979] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt'
+[2026-09-21 21:41:26.981] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep11\f.txt'
+[2026-09-21 21:41:26.982] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep12\f.txt'
+[2026-09-21 21:41:26.983] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep13\f.txt'
+[2026-09-21 21:41:26.984] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep14\f.txt'
+[2026-09-21 21:41:26.985] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt'
+[2026-09-21 21:41:26.986] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt'
+[2026-09-21 21:41:26.986] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt'
+[2026-09-21 21:41:26.987] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt'
+[2026-09-21 21:41:26.988] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt'
+[2026-09-21 21:41:26.988] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep20\f.txt'
+[2026-09-21 21:41:26.989] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt'
+[2026-09-21 21:41:26.989] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep22\f.txt'
+[2026-09-21 21:41:26.990] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt'
+[2026-09-21 21:41:26.990] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep24\f.txt'
+[2026-09-21 21:41:26.991] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt'
+[2026-09-21 21:41:26.991] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt'
+[2026-09-21 21:41:26.992] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep27\f.txt'
+[2026-09-21 21:41:26.992] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep28\f.txt'
+[2026-09-21 21:41:26.993] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep29\f.txt'
+[2026-09-21 21:41:27.045] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.045] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.047] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.047] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.047] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.047] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep20\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.047] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.047] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.047] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.047] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.047] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.106] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep14\f.txt' recovered
+[2026-09-21 21:41:27.106] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' recovered
+[2026-09-21 21:41:27.106] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' recovered
+[2026-09-21 21:41:27.106] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' recovered
+[2026-09-21 21:41:27.106] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' recovered
+[2026-09-21 21:41:27.106] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep20\f.txt' recovered
+[2026-09-21 21:41:27.106] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' recovered
+[2026-09-21 21:41:27.106] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep24\f.txt' recovered
+[2026-09-21 21:41:27.188] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.220] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.220] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.232] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' recovered
+[2026-09-21 21:41:27.232] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' recovered
+[2026-09-21 21:41:27.232] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep27\f.txt' recovered
+[2026-09-21 21:41:27.253] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.254] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' recovered
+[2026-09-21 21:41:27.283] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' recovered
+[2026-09-21 21:41:27.283] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' recovered
+[2026-09-21 21:41:27.286] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.286] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.286] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.348] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' recovered
+[2026-09-21 21:41:27.348] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' recovered
+[2026-09-21 21:41:27.348] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' recovered
+[2026-09-21 21:41:27.366] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep0\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.366] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep1\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.366] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.366] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep2\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.366] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep29\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.367] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep3\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.367] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep4\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.367] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.367] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.367] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep20\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.367] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.368] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep0\f.txt' recovered
+[2026-09-21 21:41:27.372] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' recovered
+[2026-09-21 21:41:27.429] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep4\f.txt' recovered
+[2026-09-21 21:41:27.493] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep4\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.493] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep12\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.493] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep13\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.493] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.493] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.493] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.493] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.493] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.555] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep1\f.txt' recovered
+[2026-09-21 21:41:27.555] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep28\f.txt' recovered
+[2026-09-21 21:41:27.555] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep2\f.txt' recovered
+[2026-09-21 21:41:27.555] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep29\f.txt' recovered
+[2026-09-21 21:41:27.555] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep4\f.txt' recovered
+[2026-09-21 21:41:27.555] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' recovered
+[2026-09-21 21:41:27.556] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep3\f.txt' recovered
+[2026-09-21 21:41:27.556] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' recovered
+[2026-09-21 21:41:27.556] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.557] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.557] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.619] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' recovered
+[2026-09-21 21:41:27.619] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' recovered
+[2026-09-21 21:41:27.619] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' recovered
+[2026-09-21 21:41:27.685] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep12\f.txt' recovered
+[2026-09-21 21:41:27.685] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep13\f.txt' recovered
+[2026-09-21 21:41:27.685] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' recovered
+[2026-09-21 21:41:27.685] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' recovered
+[2026-09-21 21:41:27.685] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' recovered
+[2026-09-21 21:41:27.685] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' recovered
+[2026-09-21 21:41:27.686] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' recovered
+[2026-09-21 21:41:27.688] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.688] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.688] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.716] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep29\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.716] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep3\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.716] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep4\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.717] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep5\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.717] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep6\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.717] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.717] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.721] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep29\f.txt' recovered
+[2026-09-21 21:41:27.721] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep4\f.txt' recovered
+[2026-09-21 21:41:27.721] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep5\f.txt' recovered
+[2026-09-21 21:41:27.721] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep6\f.txt' recovered
+[2026-09-21 21:41:27.721] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' recovered
+[2026-09-21 21:41:27.722] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep3\f.txt' recovered
+[2026-09-21 21:41:27.765] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep1\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.765] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.765] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep2\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.765] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep7\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.765] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep22\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.765] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.766] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.766] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.766] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep11\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.766] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.782] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' recovered
+[2026-09-21 21:41:27.828] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep1\f.txt' recovered
+[2026-09-21 21:41:27.828] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' recovered
+[2026-09-21 21:41:27.829] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep28\f.txt' recovered
+[2026-09-21 21:41:27.829] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep2\f.txt' recovered
+[2026-09-21 21:41:27.829] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep7\f.txt' recovered
+[2026-09-21 21:41:27.830] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep22\f.txt' recovered
+[2026-09-21 21:41:27.830] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' recovered
+[2026-09-21 21:41:27.830] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' recovered
+[2026-09-21 21:41:27.861] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep13\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.861] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.875] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' recovered
+[2026-09-21 21:41:27.875] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep24\f.txt' recovered
+[2026-09-21 21:41:27.876] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' recovered
+[2026-09-21 21:41:27.893] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep6\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.893] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep7\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.893] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.893] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.893] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep12\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.909] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.909] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.909] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.909] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.922] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep13\f.txt' recovered
+[2026-09-21 21:41:27.922] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' recovered
+[2026-09-21 21:41:27.925] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:27.955] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep6\f.txt' recovered
+[2026-09-21 21:41:27.955] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep7\f.txt' recovered
+[2026-09-21 21:41:27.955] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' recovered
+[2026-09-21 21:41:27.955] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' recovered
+[2026-09-21 21:41:27.956] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep11\f.txt' recovered
+[2026-09-21 21:41:27.956] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep12\f.txt' recovered
+[2026-09-21 21:41:27.956] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep14\f.txt' recovered
+[2026-09-21 21:41:27.970] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' recovered
+[2026-09-21 21:41:27.970] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' recovered
+[2026-09-21 21:41:27.971] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' recovered
+[2026-09-21 21:41:27.971] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' recovered
+[2026-09-21 21:41:27.985] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' recovered
+[2026-09-21 21:41:27.988] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.003] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep22\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.003] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep13\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.004] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.035] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep24\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.035] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.049] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' recovered
+[2026-09-21 21:41:28.066] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep22\f.txt' recovered
+[2026-09-21 21:41:28.068] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.068] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.068] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.068] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.097] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep24\f.txt' recovered
+[2026-09-21 21:41:28.097] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' recovered
+[2026-09-21 21:41:28.115] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep7\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.115] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.115] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep11\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.115] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.115] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.115] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.115] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.129] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' recovered
+[2026-09-21 21:41:28.131] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' recovered
+[2026-09-21 21:41:28.131] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' recovered
+[2026-09-21 21:41:28.132] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' recovered
+[2026-09-21 21:41:28.181] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep7\f.txt' recovered
+[2026-09-21 21:41:28.182] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' recovered
+[2026-09-21 21:41:28.182] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep11\f.txt' recovered
+[2026-09-21 21:41:28.182] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' recovered
+[2026-09-21 21:41:28.182] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' recovered
+[2026-09-21 21:41:28.188] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' recovered
+[2026-09-21 21:41:28.211] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.211] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.215] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' recovered
+[2026-09-21 21:41:28.215] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' recovered
+[2026-09-21 21:41:28.244] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.244] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.244] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.277] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep27\f.txt' recovered
+[2026-09-21 21:41:28.279] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep20\f.txt' recovered
+[2026-09-21 21:41:28.291] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep0\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.291] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep1\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.291] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.292] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep2\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.292] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.292] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.292] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.292] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep11\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.293] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep28\f.txt' recovered
+[2026-09-21 21:41:28.293] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep2\f.txt' recovered
+[2026-09-21 21:41:28.293] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' recovered
+[2026-09-21 21:41:28.293] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' recovered
+[2026-09-21 21:41:28.304] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' recovered
+[2026-09-21 21:41:28.304] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' recovered
+[2026-09-21 21:41:28.306] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' recovered
+[2026-09-21 21:41:28.307] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' recovered
+[2026-09-21 21:41:28.307] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' recovered
+[2026-09-21 21:41:28.356] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep0\f.txt' recovered
+[2026-09-21 21:41:28.356] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep10\f.txt' recovered
+[2026-09-21 21:41:28.356] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep11\f.txt' recovered
+[2026-09-21 21:41:28.357] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep1\f.txt' recovered
+[2026-09-21 21:41:28.357] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.357] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.404] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep2\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.404] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep29\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.404] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep14\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.406] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.406] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep20\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.420] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep18\f.txt' recovered
+[2026-09-21 21:41:28.420] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep19\f.txt' recovered
+[2026-09-21 21:41:28.434] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep13\f.txt' recovered
+[2026-09-21 21:41:28.437] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep28\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.437] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep22\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.437] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.437] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.437] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.438] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.438] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.438] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep25\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.438] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep26\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.438] [warning] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep27\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:28.466] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep2\f.txt' recovered
+[2026-09-21 21:41:28.467] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep29\f.txt' recovered
+[2026-09-21 21:41:28.468] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep14\f.txt' recovered
+[2026-09-21 21:41:28.468] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep16\f.txt' recovered
+[2026-09-21 21:41:28.468] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep20\f.txt' recovered
+[2026-09-21 21:41:28.469] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep9\f.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+-------------------------------------------------------------------------------
+File spark (real mechanism): a shared-ancestor storm keeps concurrent discovery
+probes bounded by the lane cap and converges once the storm stops (#2012 PR-B2,
+criterion #15, bounded-growth half)
+-------------------------------------------------------------------------------
+../tests/unit/test_spark_mechanism.cpp(8022)
+...............................................................................
+
+../tests/unit/test_spark_mechanism.cpp(8065): FAILED:
+  CHECK( max_active <= kTestLaneCap )
+with expansion:
+  9 <= 8
+with message:
+  max observed probe_workers_active=9 (test cap=8)
+
+[2026-09-21 21:41:28.498] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep28\f.txt' recovered
+[2026-09-21 21:41:28.499] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep22\f.txt' recovered
+[2026-09-21 21:41:28.499] [info] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep8\f.txt' recovered
+[2026-09-21 21:41:28.499] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep23\f.txt' recovered
+[2026-09-21 21:41:28.499] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep15\f.txt' recovered
+[2026-09-21 21:41:28.499] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep17\f.txt' recovered
+[2026-09-21 21:41:28.499] [info] SparkEngine: watch 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_storm_root_10839832384165945109_16\dep21\f.txt' recovered
+[2026-09-21 21:41:28.516] [info] SparkEngine stopped
+[2026-09-21 21:41:28.675] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_handleloss_reissue_10839832384165945109_17' failed (coverage-loss probe staging failed, err=0) - watch is deaf until the retry
+[2026-09-21 21:41:28.692] [info] SparkEngine: armed 'registry|4:HKCU|30:Software\Yuzu\SparkSmoke_28516'
+[2026-09-21 21:41:28.694] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:28.867] [info] SparkEngine stopped
+[2026-09-21 21:41:29.015] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_attach_fail_10839832384165945109_18' failed (IOCP associate failed (test), err=0) - watch is deaf until the retry
+[2026-09-21 21:41:29.834] [error] spark_file: worker pass failed (consecutive #1) - retrying in 5000 ms
+[2026-09-21 21:41:29.845] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:29.880] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:29.880] [info] SparkEngine: armed 'registry|4:HKCU|45:Software\Yuzu\SparkB1_iso_a_28516_165945109_5'
+[2026-09-21 21:41:29.941] [warning] SparkEngine: watch 'registry|4:HKCU|45:Software\Yuzu\SparkB1_iso_a_28516_165945109_5' FAULTED — armed but not watching (registry watch establishment pending past grace)
+[2026-09-21 21:41:29.941] [info] SparkEngine: armed 'registry|4:HKCU|45:Software\Yuzu\SparkB1_iso_b_28516_165945109_6'
+[2026-09-21 21:41:30.117] [info] SparkEngine: watch 'registry|4:HKCU|45:Software\Yuzu\SparkB1_iso_a_28516_165945109_5' recovered
+[2026-09-21 21:41:30.149] [info] SparkEngine stopped
+[2026-09-21 21:41:30.184] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:41:30.244] [error] spark_file: worker pass failed (consecutive #2) - retrying in 100 ms
+[2026-09-21 21:41:30.356] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:41:30.373] [error] spark_file: worker pass failed (consecutive #4) - retrying in 400 ms
+[2026-09-21 21:41:33.189] [info] spark_file: worker pass recovered after 6 failure(s)
+[2026-09-21 21:41:33.527] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:33.527] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:41:33.604] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:41:33.605] [info] SparkEngine stopped
+[2026-09-21 21:41:34.301] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:34.301] [info] SparkEngine: armed 'registry|4:HKCU|47:Software\Yuzu\SparkB1_up2_acl_28516_165945109_7'
+[2026-09-21 21:41:34.302] [info] SparkEngine: armed 'registry|4:HKCU|47:Software\Yuzu\SparkB1_up2_acl_28516_165945109_7'
+[2026-09-21 21:41:34.469] [info] SparkEngine stopped
+[2026-09-21 21:41:34.630] [warning] spark_registry: emit for 'registry|4:HKCU|50:Software\Yuzu\SparkB1_emit_throw_28516_165945109_8' threw from the fire callback - the re-arm's synthetic fire covers it
+[2026-09-21 21:41:34.693] [warning] spark_registry: synthetic fire for 'registry|4:HKCU|50:Software\Yuzu\SparkB1_emit_throw_28516_165945109_8' threw on submit (attempt 1) - retrying in 50 ms
+[2026-09-21 21:41:34.757] [warning] spark_registry: synthetic fire for 'registry|4:HKCU|50:Software\Yuzu\SparkB1_emit_throw_28516_165945109_8' threw on submit (attempt 2) - retrying in 100 ms
+[2026-09-21 21:41:36.629] [info] SparkEngine: armed 'file|53:C:\Users\<user>\AppData\Local\Temp\spark_lat_28516.txt'
+[2026-09-21 21:41:36.630] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:37.471] [info] SparkEngine stopped
+-------------------------------------------------------------------------------
+File spark (real mechanism): inline dispatch is microsecond-scale
+-------------------------------------------------------------------------------
+../tests/unit/test_spark_mechanism.cpp(10328)
+...............................................................................
+
+../tests/unit/test_spark_mechanism.cpp(10377): warning:
+  [file IOCP] inline DISPATCH us over 40 fires: min=11 median=15 p90=17 max=19
+  | inline HANDLER-exec us: max=22 over 40 calls, over_100us=0 over_10ms=0
+  (OS-notify latency NOT included — that is ms-scale, separate)
+
+[2026-09-21 21:41:37.474] [info] SparkEngine: armed 'registry|4:HKCU|50:Software\Yuzu\SparkB1_est_delete_28516_165945109_9'
+[2026-09-21 21:41:37.475] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:37.631] [info] SparkEngine: disarmed 'registry|4:HKCU|50:Software\Yuzu\SparkB1_est_delete_28516_165945109_9' (last subscription gone)
+[2026-09-21 21:41:37.633] [info] SparkEngine stopped
+[2026-09-21 21:41:37.951] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:41:38.014] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:38.390] [info] SparkEngine: armed 'file|66:C:\Users\<user>\AppData\Local\Temp\spark_res_28516\watched\file.txt'
+[2026-09-21 21:41:38.392] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:39.073] [info] SparkEngine stopped
+[2026-09-21 21:41:39.540] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:39.540] [info] SparkEngine: armed 'file|98:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_late2_10839832384165945109_28\watched.txt'
+[2026-09-21 21:41:39.970] [info] SparkEngine stopped
+[2026-09-21 21:41:39.972] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:39.972] [info] SparkEngine: armed 'registry|4:HKCU|53:Software\Yuzu\SparkB1_late_discard_28516_165945109_11'
+[2026-09-21 21:41:40.033] [warning] SparkEngine: watch 'registry|4:HKCU|53:Software\Yuzu\SparkB1_late_discard_28516_165945109_11' FAULTED — armed but not watching (registry watch establishment pending past grace)
+[2026-09-21 21:41:40.033] [info] SparkEngine: disarmed 'registry|4:HKCU|53:Software\Yuzu\SparkB1_late_discard_28516_165945109_11' (last subscription gone)
+[2026-09-21 21:41:40.322] [info] SparkEngine stopped
+[2026-09-21 21:41:40.323] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:40.324] [info] SparkEngine: armed 'registry|4:HKCU|52:Software\Yuzu\SparkB1_rearm_retry_28516_165945109_12'
+[2026-09-21 21:41:40.546] [warning] spark_registry: establishing 'registry|4:HKCU|52:Software\Yuzu\SparkB1_rearm_retry_28516_165945109_12' failed (registry probe threw) - watch is deaf until the retry
+[2026-09-21 21:41:40.546] [warning] SparkEngine: watch 'registry|4:HKCU|52:Software\Yuzu\SparkB1_rearm_retry_28516_165945109_12' FAULTED — armed but not watching (registry probe threw)
+[2026-09-21 21:41:40.771] [warning] spark_registry: establishing 'registry|4:HKCU|52:Software\Yuzu\SparkB1_rearm_retry_28516_165945109_12' failed (registry probe threw) - watch is deaf until the retry
+[2026-09-21 21:41:41.139] [info] SparkEngine: watch 'registry|4:HKCU|52:Software\Yuzu\SparkB1_rearm_retry_28516_165945109_12' recovered
+[2026-09-21 21:41:41.171] [info] SparkEngine stopped
+[2026-09-21 21:41:41.507] [error] spark_registry: sweeper pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:41:41.571] [info] spark_registry: sweeper pass recovered after 1 failure(s)
+[2026-09-21 21:41:42.039] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_pf_later_deadline_10839832384165945109_30' failed (IOCP associate failed (test), err=0) - watch is deaf until the retry
+[2026-09-21 21:41:42.515] [error] spark_file: worker pass failed (consecutive #1) - retrying in 100 ms
+[2026-09-21 21:41:42.626] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:42.632] [error] spark_file: worker pass failed (consecutive #1) - retrying in 5000 ms
+[2026-09-21 21:41:42.646] [info] SparkEngine: armed 'file|105:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_est4340_absent_10839832384165945109_32\watched\file.txt'
+[2026-09-21 21:41:42.647] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:42.979] [info] SparkEngine: disarmed 'file|105:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_est4340_absent_10839832384165945109_32\watched\file.txt' (last subscription gone)
+[2026-09-21 21:41:42.981] [info] SparkEngine stopped
+[2026-09-21 21:41:43.815] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:43.816] [info] SparkEngine: armed 'file|124:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_confirm_migrate_root_10839832384165945109_34\appears_later\deep.txt'
+[2026-09-21 21:41:44.068] [info] SparkEngine stopped
+[2026-09-21 21:41:44.073] [info] SparkEngine: armed 'file|104:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_est4340_rearm_10839832384165945109_35\watched\file.txt'
+[2026-09-21 21:41:44.074] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:44.211] [info] SparkEngine: disarmed 'file|104:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_est4340_rearm_10839832384165945109_35\watched\file.txt' (last subscription gone)
+[2026-09-21 21:41:44.212] [info] SparkEngine stopped
+[2026-09-21 21:41:44.307] [warning] spark_file: establishing 'Z:\nonexistent\dir' failed (ancestor walk reached a fixed point with nothing openable, err=3) - watch is deaf until the retry
+[2026-09-21 21:41:44.307] [error] spark_file: worker pass failed (consecutive #1) - retrying in 20 ms
+[2026-09-21 21:41:44.339] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:44.376] [pf_stall] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_pf_stale_deadline_10839832384165945109_36' failed (IOCP associate failed (test), err=0) - watch is deaf until the retry
+[2026-09-21 21:41:44.852] [pf_stall] [error] spark_file: worker pass failed (consecutive #1) - retrying in 100 ms
+[2026-09-21 21:41:45.156] [pf_stall] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:45.684] [pf_stall] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:41:45.748] [pf_stall] [error] spark_file: worker pass failed (consecutive #2) - retrying in 100 ms
+[2026-09-21 21:41:45.860] [pf_stall] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:41:46.262] [pf_stall] [info] spark_file: worker pass recovered after 3 failure(s)
+[2026-09-21 21:41:46.342] [warning] spark_service: establishment probe for a watched service did not complete cleanly (threw)
+[2026-09-21 21:41:48.782] [error] spark_file: worker pass failed (consecutive #1) - retrying in 10 ms
+[2026-09-21 21:41:48.797] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:48.816] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:48.816] [info] SparkEngine: armed 'registry|4:HKCU|66:Software\Yuzu\SparkB1_est_absent_parent_28516_165945109_24\Missing'
+[2026-09-21 21:41:49.199] [info] SparkEngine: disarmed 'registry|4:HKCU|66:Software\Yuzu\SparkB1_est_absent_parent_28516_165945109_24\Missing' (last subscription gone)
+[2026-09-21 21:41:49.201] [info] SparkEngine stopped
+[2026-09-21 21:41:49.203] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.205] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:49.358] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.359] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.360] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.360] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.361] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.361] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.361] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.362] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.362] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.362] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.363] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.363] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.363] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.363] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.364] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.364] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.365] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.365] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.366] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.366] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.367] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.367] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.368] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.368] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.369] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.369] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.370] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.370] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.371] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.371] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.372] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.372] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.372] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.372] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.373] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.373] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.373] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.373] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.373] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.373] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.374] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.374] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.375] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.375] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.376] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.376] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.377] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.377] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.377] [info] SparkEngine: disarmed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt' (last subscription gone)
+[2026-09-21 21:41:49.377] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_rearm_28516.txt'
+[2026-09-21 21:41:49.550] [info] SparkEngine stopped
+[2026-09-21 21:41:49.843] [error] spark_file: worker pass failed (consecutive #1) - retrying in 30000 ms
+[2026-09-21 21:41:49.857] [warning] spark_registry: an establishment report for 'registry|4:HKCU|50:Software\Yuzu\SparkB1_est_thr_2_28516_165945109_27' was dropped (sink threw); further drops are not logged
+[2026-09-21 21:41:50.563] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:50.563] [info] SparkEngine: armed 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_f3_orphan_10839832384165945109_41\watched.txt'
+[2026-09-21 21:41:50.622] [warning] SparkEngine: watch 'file|102:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_f3_orphan_10839832384165945109_41\watched.txt' FAULTED — armed but not watching (file watch establishment pending past grace)
+[2026-09-21 21:41:50.623] [info] SparkEngine stopped
+[2026-09-21 21:41:50.640] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:50.641] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:41:50.719] [info] SparkEngine: armed 'service|19:YuzuNoSuchSvc_28516'
+[2026-09-21 21:41:50.798] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:41:50.799] [info] SparkEngine: disarmed 'service|19:YuzuNoSuchSvc_28516' (last subscription gone)
+[2026-09-21 21:41:50.800] [info] SparkEngine stopped
+[2026-09-21 21:41:51.136] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:41:51.200] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:51.542] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:51.542] [info] SparkEngine: armed 'file|108:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_notify_fail_10839832384165945109_46\watched.txt'
+[2026-09-21 21:41:51.632] [info] SparkEngine: disarmed 'file|108:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_notify_fail_10839832384165945109_46\watched.txt' (last subscription gone)
+[2026-09-21 21:41:51.633] [info] SparkEngine stopped
+[2026-09-21 21:41:52.601] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:52.601] [info] SparkEngine: armed 'registry|4:HKCU|50:Software\Yuzu\SparkB1_est_adopt_28516_165945109_29'
+[2026-09-21 21:41:52.602] [info] SparkEngine: disarmed 'registry|4:HKCU|50:Software\Yuzu\SparkB1_est_adopt_28516_165945109_29' (last subscription gone)
+[2026-09-21 21:41:52.603] [info] SparkEngine: armed 'registry|4:HKCU|50:Software\Yuzu\SparkB1_est_adopt_28516_165945109_29'
+[2026-09-21 21:41:52.609] [info] SparkEngine: disarmed 'registry|4:HKCU|50:Software\Yuzu\SparkB1_est_adopt_28516_165945109_29' (last subscription gone)
+[2026-09-21 21:41:52.609] [info] SparkEngine stopped
+[2026-09-21 21:41:52.610] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:52.610] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:41:52.689] [info] SparkEngine: armed 'service|7:WINMGMT'
+[2026-09-21 21:41:52.704] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:41:52.705] [info] SparkEngine: disarmed 'service|7:WINMGMT' (last subscription gone)
+[2026-09-21 21:41:52.706] [info] SparkEngine stopped
+[2026-09-21 21:41:53.698] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_strand_probe_10839832384165945109_55' failed (file discovery probe threw, err=0) - watch is deaf until the retry
+[2026-09-21 21:41:53.747] [error] spark_file: worker pass failed (consecutive #1) - retrying in 20 ms
+[2026-09-21 21:41:53.778] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:54.022] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:54.023] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:41:54.099] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:41:54.099] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:41:54.115] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:41:54.116] [info] SparkEngine stopped
+[2026-09-21 21:41:54.200] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:41:54.260] [error] spark_file: worker pass failed (consecutive #2) - retrying in 100 ms
+[2026-09-21 21:41:54.371] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:41:54.579] [error] spark_file: worker pass failed (consecutive #4) - retrying in 400 ms
+[2026-09-21 21:41:55.717] [info] SparkEngine: armed 'file|60:C:\Users\<user>\AppData\Local\Temp\spark_file_smoke_28516.txt'
+[2026-09-21 21:41:55.719] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:55.891] [info] SparkEngine stopped
+[2026-09-21 21:41:56.052] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_handleloss_realdir_10839832384165945109_57' failed (coverage-loss probe staging failed, err=0) - watch is deaf until the retry
+[2026-09-21 21:41:56.131] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:41:56.196] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:56.489] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_reserve_fail_10839832384165945109_60' failed (file discovery probe threw, err=0) - watch is deaf until the retry
+[2026-09-21 21:41:56.532] [error] spark_file: worker pass failed (consecutive #1) - retrying in 20 ms
+[2026-09-21 21:41:56.564] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:56.583] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:41:56.583] [info] SparkEngine: armed 'file|27:Z:\nonexistent\dir\file.txt'
+[2026-09-21 21:41:56.584] [warning] spark_file: establishing 'Z:\nonexistent\dir' failed (ancestor walk reached a fixed point with nothing openable, err=3) - watch is deaf until the retry
+[2026-09-21 21:41:56.584] [warning] spark_file: probe for 'Z:\nonexistent\dir' failed at ancestor walk reached a fixed point with nothing openable (err=3)
+[2026-09-21 21:41:56.585] [info] SparkEngine stopped
+[2026-09-21 21:41:57.122] [warning] spark_registry: establishing 'registry|4:HKCU|53:Software\Yuzu\SparkB1_strand_probe_28516_165945109_30' failed (registry probe threw) - watch is deaf until the retry
+[2026-09-21 21:41:57.170] [error] spark_registry: sweeper pass failed (consecutive #1) - retrying in 20 ms
+[2026-09-21 21:41:57.233] [info] spark_registry: sweeper pass recovered after 1 failure(s)
+[2026-09-21 21:41:57.447] [error] spark_file: worker pass failed (consecutive #1) - retrying in 5000 ms
+[2026-09-21 21:41:58.515] [error] spark_file: worker pass failed (consecutive #1) - retrying in 20 ms
+[2026-09-21 21:41:58.541] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:58.563] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_pf_after_dispatch_timer_10839832384165945109_66' failed (IOCP associate failed (test), err=0) - watch is deaf until the retry
+[2026-09-21 21:41:58.670] [error] spark_file: worker pass failed (consecutive #1) - retrying in 10 ms
+[2026-09-21 21:41:58.686] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:41:59.186] [info] SparkEngine: armed 'registry|4:HKCU|62:Software\Yuzu\SparkB1_appear_parent_28516_165945109_31\Missing'
+[2026-09-21 21:41:59.186] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:41:59.473] [info] SparkEngine stopped
+[2026-09-21 21:42:00.261] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:00.261] [info] SparkEngine: armed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_target_10839832384165945109_67\watched.txt'
+[2026-09-21 21:42:00.272] [info] SparkEngine: disarmed 'file|103:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_target_10839832384165945109_67\watched.txt' (last subscription gone)
+[2026-09-21 21:42:00.273] [info] SparkEngine stopped
+[2026-09-21 21:42:00.276] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:00.276] [info] SparkEngine: armed 'registry|4:HKCU|50:Software\Yuzu\SparkB1_f3_orphan_28516_165945109_32'
+[2026-09-21 21:42:00.337] [warning] SparkEngine: watch 'registry|4:HKCU|50:Software\Yuzu\SparkB1_f3_orphan_28516_165945109_32' FAULTED — armed but not watching (registry watch establishment pending past grace)
+[2026-09-21 21:42:00.337] [info] SparkEngine stopped
+[2026-09-21 21:42:00.358] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:00.359] [info] SparkEngine: armed 'file|105:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_10839832384165945109_68\watched.txt'
+[2026-09-21 21:42:00.369] [info] SparkEngine: armed 'file|104:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_10839832384165945109_68\second.txt'
+[2026-09-21 21:42:00.385] [info] SparkEngine: disarmed 'file|105:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_10839832384165945109_68\watched.txt' (last subscription gone)
+[2026-09-21 21:42:00.385] [info] SparkEngine: disarmed 'file|104:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_coalesce_10839832384165945109_68\second.txt' (last subscription gone)
+[2026-09-21 21:42:00.386] [info] SparkEngine stopped
+[2026-09-21 21:42:00.734] [warning] spark_file: retiring_ crossed 128 of 256 pending IOCP teardowns
+[2026-09-21 21:42:00.928] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_f1anc_10839832384165945109_69\gone' failed (ancestor bookkeeping allocation failed, err=0) - watch is deaf until the retry
+[2026-09-21 21:42:01.218] [warning] spark_file: establishing 'C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_admission_c_10839832384165945109_71' failed (file discovery probe threw, err=0) - watch is deaf until the retry
+[2026-09-21 21:42:01.225] [error] spark_file: worker pass failed (consecutive #1) - retrying in 100 ms
+[2026-09-21 21:42:01.329] [error] spark_file: worker pass failed (consecutive #2) - retrying in 200 ms
+[2026-09-21 21:42:01.537] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:42:01.938] [error] spark_file: worker pass failed (consecutive #4) - retrying in 800 ms
+[2026-09-21 21:42:04.828] [info] SparkEngine: armed 'registry|4:HKCU|28:Software\Yuzu\SparkRes_28516'
+[2026-09-21 21:42:04.829] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:42:05.652] [info] SparkEngine stopped
+[2026-09-21 21:42:05.653] [info] SparkEngine: armed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_a_28516_165945109_33'
+[2026-09-21 21:42:05.655] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:42:05.827] [info] SparkEngine: disarmed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_a_28516_165945109_33' (last subscription gone)
+[2026-09-21 21:42:05.827] [info] SparkEngine: armed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_1_28516_165945109_34'
+[2026-09-21 21:42:05.828] [info] SparkEngine: disarmed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_1_28516_165945109_34' (last subscription gone)
+[2026-09-21 21:42:05.828] [warning] spark_registry: drain worker for 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_1_28516_165945109_34' refused by the lane cap (1 retirement(s) backlogged, refusal #1) - relaunching on a backoff
+[2026-09-21 21:42:05.828] [info] SparkEngine: armed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_2_28516_165945109_35'
+[2026-09-21 21:42:05.829] [info] SparkEngine: disarmed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_2_28516_165945109_35' (last subscription gone)
+[2026-09-21 21:42:05.829] [warning] spark_registry: drain worker for 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_2_28516_165945109_35' refused by the lane cap (2 retirement(s) backlogged, refusal #2) - relaunching on a backoff
+[2026-09-21 21:42:05.829] [info] SparkEngine: armed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_3_28516_165945109_36'
+[2026-09-21 21:42:05.830] [info] SparkEngine: disarmed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_3_28516_165945109_36' (last subscription gone)
+[2026-09-21 21:42:05.830] [info] SparkEngine: armed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_4_28516_165945109_37'
+[2026-09-21 21:42:06.226] [info] SparkEngine: armed 'registry|4:HKCU|46:Software\Yuzu\SparkB1_cap_4_28516_165945109_37'
+[2026-09-21 21:42:06.227] [info] SparkEngine stopped
+[2026-09-21 21:42:06.230] [error] spark_registry: sweeper pass failed (consecutive #1) - retrying in 5 ms
+[2026-09-21 21:42:06.241] [error] spark_registry: sweeper pass failed (consecutive #2) - retrying in 10 ms
+[2026-09-21 21:42:06.257] [error] spark_registry: sweeper failing persistently - registry sparks reported inert until a pass succeeds
+[2026-09-21 21:42:06.289] [info] spark_registry: sweeper pass recovered after 3 failure(s)
+[2026-09-21 21:42:06.322] [info] SparkEngine: armed 'registry|4:HKCU|51:Software\Yuzu\SparkB1_stop_drain_28516_165945109_39'
+[2026-09-21 21:42:06.323] [info] SparkEngine started (1 spark(s) armed)
+[2026-09-21 21:42:06.496] [info] SparkEngine: disarmed 'registry|4:HKCU|51:Software\Yuzu\SparkB1_stop_drain_28516_165945109_39' (last subscription gone)
+[2026-09-21 21:42:07.215] [info] SparkEngine stopped
+[2026-09-21 21:42:07.232] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:07.233] [info] SparkEngine: armed 'registry|4:HKCU|57:Software\Yuzu\SparkB1_est_backend_fail_28516_165945109_40'
+[2026-09-21 21:42:07.294] [warning] spark_registry: establishing 'registry|4:HKCU|57:Software\Yuzu\SparkB1_est_backend_fail_28516_165945109_40' failed (registry probe threw) - watch is deaf until the retry
+[2026-09-21 21:42:07.294] [warning] SparkEngine: watch 'registry|4:HKCU|57:Software\Yuzu\SparkB1_est_backend_fail_28516_165945109_40' FAULTED — armed but not watching (registry probe threw)
+[2026-09-21 21:42:07.519] [info] SparkEngine: watch 'registry|4:HKCU|57:Software\Yuzu\SparkB1_est_backend_fail_28516_165945109_40' recovered
+[2026-09-21 21:42:07.535] [info] SparkEngine: disarmed 'registry|4:HKCU|57:Software\Yuzu\SparkB1_est_backend_fail_28516_165945109_40' (last subscription gone)
+[2026-09-21 21:42:07.536] [info] SparkEngine stopped
+[2026-09-21 21:42:07.701] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:07.701] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.701] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.702] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.702] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.702] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.702] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.702] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.702] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.703] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.703] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.703] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.703] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.703] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.703] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.703] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.703] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.704] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.704] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.704] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.704] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.704] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.704] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.705] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.705] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.705] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.705] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.705] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.705] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.705] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.705] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.705] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.706] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.706] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.706] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.706] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.706] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.706] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.706] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.707] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.707] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.707] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.707] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.707] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.707] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.707] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.707] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.708] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.708] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.708] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.708] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.708] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.708] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.708] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.708] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.709] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.709] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.709] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.709] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.709] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.709] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.710] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.710] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.710] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.710] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.710] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.710] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.710] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.710] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.711] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.711] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.711] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.711] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.711] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.711] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.711] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.711] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.711] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.712] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.712] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.712] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.712] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.712] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.712] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.713] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.713] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.713] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.713] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.713] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.713] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.713] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.713] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.713] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.713] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.713] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.713] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.713] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.713] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.714] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.714] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.714] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.714] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.714] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.714] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.714] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.715] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.715] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.715] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.715] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.715] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.715] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.715] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.715] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.715] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.716] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.716] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.717] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.717] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.718] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.718] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.719] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.719] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.719] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.719] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.719] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.719] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.719] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.719] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.719] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.719] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.719] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.719] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.720] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.720] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.720] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.720] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.720] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.720] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.720] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.721] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.721] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.721] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.721] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.721] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.721] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.721] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.721] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.721] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.721] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.721] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.721] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.721] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.721] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.722] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.722] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.722] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.722] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.722] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.722] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.722] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.723] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.723] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.723] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.723] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.723] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.723] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.723] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.723] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.724] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.724] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.724] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.724] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.724] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.724] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.724] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.725] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.725] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.725] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.725] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.725] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.725] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.725] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.725] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.725] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.726] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.726] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.726] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.726] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.726] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.726] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.726] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.726] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.726] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.727] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.727] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.727] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.727] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.727] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.727] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.727] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.727] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.727] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.728] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.728] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.729] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.729] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.730] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.730] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.730] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.730] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.730] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.730] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.730] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.730] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.730] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.730] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.731] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.731] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.732] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.732] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.733] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.733] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.733] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.733] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.733] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.733] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.733] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.733] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.733] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:07.733] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:07.735] [info] SparkEngine stopped
+[2026-09-21 21:42:07.736] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:07.736] [info] SparkEngine: armed 'file|123:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_confirm_stable_root_10839832384165945109_75\never_appears\deep.txt'
+[2026-09-21 21:42:08.464] [info] SparkEngine stopped
+[2026-09-21 21:42:08.467] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:08.467] [info] SparkEngine: armed 'service|7:Winmgmt'
+[2026-09-21 21:42:08.584] [info] SparkEngine: armed 'service|8:EventLog'
+[2026-09-21 21:42:08.655] [info] SparkEngine: armed 'service|8:Schedule'
+[2026-09-21 21:42:08.735] [info] SparkEngine: armed 'service|17:LanmanWorkstation'
+[2026-09-21 21:42:08.815] [info] SparkEngine: armed 'service|8:Dnscache'
+[2026-09-21 21:42:08.895] [info] SparkEngine: armed 'service|19:YuzuFdProof_0_28516'
+[2026-09-21 21:42:08.975] [info] SparkEngine: armed 'service|19:YuzuFdProof_1_28516'
+[2026-09-21 21:42:09.055] [info] SparkEngine: armed 'service|19:YuzuFdProof_2_28516'
+[2026-09-21 21:42:09.136] [info] SparkEngine: armed 'service|19:YuzuFdProof_3_28516'
+[2026-09-21 21:42:09.216] [info] SparkEngine: armed 'service|19:YuzuFdProof_4_28516'
+[2026-09-21 21:42:09.296] [info] SparkEngine: armed 'service|19:YuzuFdProof_5_28516'
+[2026-09-21 21:42:09.376] [info] SparkEngine: armed 'service|19:YuzuFdProof_6_28516'
+[2026-09-21 21:42:09.456] [info] SparkEngine: armed 'service|19:YuzuFdProof_7_28516'
+[2026-09-21 21:42:09.536] [info] SparkEngine: armed 'service|19:YuzuFdProof_8_28516'
+[2026-09-21 21:42:09.616] [info] SparkEngine: armed 'service|19:YuzuFdProof_9_28516'
+[2026-09-21 21:42:09.696] [info] SparkEngine: armed 'service|20:YuzuFdProof_10_28516'
+[2026-09-21 21:42:09.776] [info] SparkEngine: armed 'service|20:YuzuFdProof_11_28516'
+[2026-09-21 21:42:09.857] [info] SparkEngine: armed 'service|20:YuzuFdProof_12_28516'
+[2026-09-21 21:42:09.937] [info] SparkEngine: armed 'service|20:YuzuFdProof_13_28516'
+[2026-09-21 21:42:10.017] [info] SparkEngine: armed 'service|20:YuzuFdProof_14_28516'
+[2026-09-21 21:42:10.167] [info] SparkEngine: disarmed 'service|8:EventLog' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|8:Schedule' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|17:LanmanWorkstation' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|8:Dnscache' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_0_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_1_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_2_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_3_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_4_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_5_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_6_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_7_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_8_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|19:YuzuFdProof_9_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|20:YuzuFdProof_10_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|20:YuzuFdProof_11_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|20:YuzuFdProof_12_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|20:YuzuFdProof_13_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|20:YuzuFdProof_14_28516' (last subscription gone)
+[2026-09-21 21:42:10.168] [info] SparkEngine: disarmed 'service|7:Winmgmt' (last subscription gone)
+[2026-09-21 21:42:10.169] [info] SparkEngine stopped
+[2026-09-21 21:42:10.172] [error] spark_file: worker pass failed (consecutive #1) - retrying in 50 ms
+[2026-09-21 21:42:10.225] [error] spark_file: worker pass failed (consecutive #2) - retrying in 100 ms
+[2026-09-21 21:42:10.337] [error] spark_file: worker failing persistently - file sparks reported inert until a pass succeeds
+[2026-09-21 21:42:10.360] [error] spark_file: worker pass failed (consecutive #1) - retrying in 5000 ms
+[2026-09-21 21:42:10.379] [warning] spark_file: an establishment report for 'file|100:C:\Users\<user>\AppData\Local\Temp\yuzu_test_spark_fileb2_est_thr_10839832384165945109_80\watched.txt' was dropped (sink threw); further drops are not logged
+[2026-09-21 21:42:11.167] [error] spark_file: worker pass failed (consecutive #1) - retrying in 10 ms
+[2026-09-21 21:42:11.182] [info] spark_file: worker pass recovered after 1 failure(s)
+[2026-09-21 21:42:12.338] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:12.338] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_est_late_28516_165945109_41'
+[2026-09-21 21:42:12.398] [warning] SparkEngine: watch 'registry|4:HKCU|49:Software\Yuzu\SparkB1_est_late_28516_165945109_41' FAULTED — armed but not watching (registry watch establishment pending past grace)
+[2026-09-21 21:42:12.655] [info] SparkEngine: watch 'registry|4:HKCU|49:Software\Yuzu\SparkB1_est_late_28516_165945109_41' recovered
+[2026-09-21 21:42:12.670] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_est_late_28516_165945109_41' (last subscription gone)
+[2026-09-21 21:42:12.671] [info] SparkEngine stopped
+[2026-09-21 21:42:13.876] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:13.876] [info] SparkEngine: armed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_42'
+[2026-09-21 21:42:13.877] [info] SparkEngine: armed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_43'
+[2026-09-21 21:42:13.877] [info] SparkEngine: armed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_44'
+[2026-09-21 21:42:13.878] [info] SparkEngine: armed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_45'
+[2026-09-21 21:42:13.878] [info] SparkEngine: armed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_46'
+[2026-09-21 21:42:13.878] [info] SparkEngine: armed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_47'
+[2026-09-21 21:42:13.879] [info] SparkEngine: armed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_48'
+[2026-09-21 21:42:13.879] [info] SparkEngine: armed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_49'
+[2026-09-21 21:42:14.032] [info] SparkEngine: disarmed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_42' (last subscription gone)
+[2026-09-21 21:42:14.033] [info] SparkEngine: disarmed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_43' (last subscription gone)
+[2026-09-21 21:42:14.033] [info] SparkEngine: disarmed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_44' (last subscription gone)
+[2026-09-21 21:42:14.033] [info] SparkEngine: disarmed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_45' (last subscription gone)
+[2026-09-21 21:42:14.034] [info] SparkEngine: disarmed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_46' (last subscription gone)
+[2026-09-21 21:42:14.034] [info] SparkEngine: disarmed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_47' (last subscription gone)
+[2026-09-21 21:42:14.035] [info] SparkEngine: disarmed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_48' (last subscription gone)
+[2026-09-21 21:42:14.035] [info] SparkEngine: disarmed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_unwatch_bound_28516_165945109_49' (last subscription gone)
+[2026-09-21 21:42:14.036] [info] SparkEngine stopped
+[2026-09-21 21:42:14.038] [info] SparkEngine started (0 spark(s) armed)
+[2026-09-21 21:42:14.038] [info] SparkEngine: armed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_est_fast_warm_28516_165945109_50'
+[2026-09-21 21:42:14.354] [info] SparkEngine: armed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_est_fast_28516_165945109_51'
+[2026-09-21 21:42:14.370] [info] SparkEngine: disarmed 'registry|4:HKCU|49:Software\Yuzu\SparkB1_est_fast_28516_165945109_51' (last subscription gone)
+[2026-09-21 21:42:14.370] [info] SparkEngine: disarmed 'registry|4:HKCU|54:Software\Yuzu\SparkB1_est_fast_warm_28516_165945109_50' (last subscription gone)
+[2026-09-21 21:42:14.371] [info] SparkEngine stopped
+[2026-09-21 21:42:14.387] [warning] spark_registry: an establishment report for 'registry|4:HKCU|54:Software\Yuzu\SparkB1_est_thr_resid_28516_165945109_52' was dropped (sink threw); further drops are not logged
+===============================================================================
+test cases:  145 |  144 passed | 1 failed
+assertions: 1830 | 1829 passed | 1 failed
+
+[DIAG] Catch2 Session::run() returned 42 (main about to return)

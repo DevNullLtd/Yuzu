@@ -46,7 +46,14 @@ struct RecordingSink {
                 unfiltered_broadcast_used = true;
                 return static_cast<int>(fleet.size());
             },
-            [this] { return fleet; }};
+            [this] { return fleet; },
+            /*prepare_route_fallback=*/nullptr,
+            // HA WS-5 (governance hardening, 2026-09-22): see
+            // test_dispatch_confined_arms.cpp's RecordingSink — this mock
+            // has no presence concept, so every candidate is always locally
+            // known (never widens) for the fast-path eligibility check to
+            // hold.
+            [](const std::vector<std::string>&) { return false; }};
     }
 
     bool reached_exactly(std::vector<std::string> expected) {
@@ -319,7 +326,7 @@ TEST_CASE("ids_missing_plugin: an agent whose inventory does not include the plu
     p->set_name("os_info");
     registry.register_agent(info);
 
-    const auto missing = registry.ids_missing_plugin("tar");
+    const auto missing = registry.ids_missing_plugin("tar", "sql");
     CHECK(missing.contains("dev-A"));
 }
 
@@ -334,7 +341,7 @@ TEST_CASE("ids_missing_plugin: an agent whose inventory DOES include the plugin 
     p->set_name("tar");
     registry.register_agent(info);
 
-    const auto missing = registry.ids_missing_plugin("tar");
+    const auto missing = registry.ids_missing_plugin("tar", "sql");
     CHECK_FALSE(missing.contains("dev-A"));
 }
 
@@ -350,7 +357,7 @@ TEST_CASE("ids_missing_plugin: an agent with an EMPTY reported inventory is neve
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_presence_test_info("dev-A")); // no add_plugins() call at all
 
-    const auto missing = registry.ids_missing_plugin("tar");
+    const auto missing = registry.ids_missing_plugin("tar", "sql");
     CHECK_FALSE(missing.contains("dev-A"));
 }
 
@@ -371,7 +378,7 @@ TEST_CASE("ids_missing_plugin: a mixed fleet reports exactly the agents genuinel
 
     registry.register_agent(make_presence_test_info("dev-no-inventory"));
 
-    const auto missing = registry.ids_missing_plugin("tar");
+    const auto missing = registry.ids_missing_plugin("tar", "sql");
     CHECK(missing.size() == 1);
     CHECK(missing.contains("dev-lacks-it"));
     CHECK_FALSE(missing.contains("dev-has-it"));
@@ -411,8 +418,10 @@ TEST_CASE("BR-009: ids_missing_plugin against the canonical wire plugin name "
         .risk_tier = yuzu::server::authz::RiskTier::Medium,
         .system_reserved = false,
     };
-    std::function<bool(std::string_view, std::string_view)> switch_on =
-        [](std::string_view, std::string_view) { return true; };
+    yuzu::server::detail::KillSwitchFn switch_on =
+        [](std::string_view, std::string_view) {
+            return std::optional<std::unordered_set<std::string>>{std::unordered_set<std::string>{}};
+        };
 
     // A real caller dispatching with different-cased spelling — classify() is
     // case-insensitive, so this is authorized against kTarPurgeCap exactly
@@ -430,14 +439,14 @@ TEST_CASE("BR-009: ids_missing_plugin against the canonical wire plugin name "
     registry.register_agent(info);
 
     // The fix: query with the canonical wire plugin — the agent has it.
-    const auto missing_canonical = registry.ids_missing_plugin(classified->wire().plugin());
+    const auto missing_canonical = registry.ids_missing_plugin(classified->wire().plugin(), "sql");
     CHECK_FALSE(missing_canonical.contains("dev-A"));
 
     // The bug BR-009 fixed: querying with the raw caller casing instead would
     // have wrongly reported dev-A as missing the plugin it genuinely has —
     // pinned here so a future call-site regression back to the raw string is
     // caught by this same test, not just by the composition it demonstrates.
-    const auto missing_raw_caller_casing = registry.ids_missing_plugin("TAR");
+    const auto missing_raw_caller_casing = registry.ids_missing_plugin("TAR", "sql");
     CHECK(missing_raw_caller_casing.contains("dev-A"));
 }
 
@@ -489,9 +498,9 @@ TEST_CASE("wire_and_dispatch_confined: a plugin-absent id's per-device concurren
         registry.register_agent(info_b);
     }
     for (const auto& id : {"dev-A", "dev-B"})
-        registry.set_gateway_route(
-            id, "test-gateway",
-            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        REQUIRE(registry.set_gateway_route(
+            id, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("wiring-plugin-presence-cmd");

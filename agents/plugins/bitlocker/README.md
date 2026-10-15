@@ -130,5 +130,4 @@ volume|none|no_encrypted_volumes
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/agent/test_bitlocker_macos.cpp` · `tests/unit/test_bitlocker_linux_parsers.cpp` · `tests/unit/test_bitlocker_local_dispatcher.cpp` · `tests/unit/test_bitlocker_windows_wmi.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260818-wave3-bitlocker-native-acquisition.changed.md`
 <!-- END GENERATED -->

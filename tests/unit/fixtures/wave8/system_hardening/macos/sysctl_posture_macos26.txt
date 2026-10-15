@@ -1,0 +1,5 @@
+kern.securelevel	ok	0
+kern.coredump	ok	1
+kern.sugid_coredump	ok	0
+kern.bootargs	ok	
+kern.nx	err	sysctl: unknown oid 'kern.nx'

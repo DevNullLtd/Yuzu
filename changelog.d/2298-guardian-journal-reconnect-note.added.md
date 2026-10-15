@@ -1,1 +1,0 @@
-- Documented the durable Guardian lifecycle journal's reconnect-replay network traffic (`docs/user-manual/guaranteed-state.md`): trigger, rate/burst/per-pass/retention bounds, and the current per-agent-only observability path (no fleet rollup yet, tracked under #2298). `prefer_spark`-gated and inert in production today.

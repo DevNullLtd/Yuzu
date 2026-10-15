@@ -1,0 +1,3 @@
+host: the-rig (Windows 11 Pro 10.0.26200, x64, bare metal, UEFI); identity NT AUTHORITY\SYSTEM (scheduled task, RunLevel Highest); date 2026-09-21
+status: REAL CAPTURE. `reg export "HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State" <file> /y`, byte-for-byte (UTF-16LE with a BOM, CRLF). Secure Boot is ON on this host (Confirm-SecureBootUEFI = True): UEFISecureBootEnabled = 1, plus PolicyPublisher and PolicyVersion, which the plugin does not read.
+not captured: the OFF state (the firmware toggle cannot be flipped remotely). The OFF and unmodelled states are built in the test by rewriting the dword text of this file.

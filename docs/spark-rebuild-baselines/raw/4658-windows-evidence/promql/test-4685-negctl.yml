@@ -1,0 +1,64 @@
+rule_files: [rules-4685.yml]
+evaluation_interval: 1m
+tests:
+- name: "1 file: 3 rules unsupported, every reporting agent has file again -> fires"
+  interval: 1m
+  input_series:
+  - {series: 'yuzu_fleet_spark_reporting{os="windows",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_mechanisms{os="windows",mechanism="file",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_unsupported{os="windows",mechanism="file",instance="s1:8080"}', values: '3+0x5'}
+  alert_rule_test:
+  - {eval_time: 3m, alertname: StuckUnsupportedFile, exp_alerts: [{exp_labels: {os: windows, mechanism: file, instance: 's1:8080'}}]}
+  - {eval_time: 3m, alertname: StuckUnsupportedRegistry, exp_alerts: []}
+- name: "2 file: unsupported > 0 but file=8 of 10 (episode still open somewhere) -> silent"
+  interval: 1m
+  input_series:
+  - {series: 'yuzu_fleet_spark_reporting{os="windows",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_mechanisms{os="windows",mechanism="file",instance="s1:8080"}', values: '8+0x5'}
+  - {series: 'yuzu_fleet_spark_unsupported{os="windows",mechanism="file",instance="s1:8080"}', values: '3+0x5'}
+  alert_rule_test:
+  - {eval_time: 3m, alertname: StuckUnsupportedFile, exp_alerts: [{exp_labels: {os: windows, mechanism: file, instance: "s1:8080"}}]}
+- name: "3 file: unsupported = 0, file=10 of 10 -> silent"
+  interval: 1m
+  input_series:
+  - {series: 'yuzu_fleet_spark_reporting{os="windows",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_mechanisms{os="windows",mechanism="file",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_unsupported{os="windows",mechanism="file",instance="s1:8080"}', values: '0+0x5'}
+  alert_rule_test:
+  - {eval_time: 3m, alertname: StuckUnsupportedFile, exp_alerts: [{exp_labels: {os: windows, mechanism: file, instance: "s1:8080"}}]}
+- name: "4 file series absent on every agent (all inert) with unsupported > 0 -> silent, no error"
+  interval: 1m
+  input_series:
+  - {series: 'yuzu_fleet_spark_reporting{os="windows",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_unsupported{os="windows",mechanism="file",instance="s1:8080"}', values: '3+0x5'}
+  alert_rule_test:
+  - {eval_time: 3m, alertname: StuckUnsupportedFile, exp_alerts: [{exp_labels: {os: windows, mechanism: file, instance: "s1:8080"}}]}
+- name: "5 registry form: fires for registry only, file selector unaffected"
+  interval: 1m
+  input_series:
+  - {series: 'yuzu_fleet_spark_reporting{os="windows",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_mechanisms{os="windows",mechanism="file",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_mechanisms{os="windows",mechanism="registry",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_unsupported{os="windows",mechanism="file",instance="s1:8080"}', values: '0+0x5'}
+  - {series: 'yuzu_fleet_spark_unsupported{os="windows",mechanism="registry",instance="s1:8080"}', values: '2+0x5'}
+  alert_rule_test:
+  - {eval_time: 3m, alertname: StuckUnsupportedFile, exp_alerts: [{exp_labels: {os: windows, mechanism: file, instance: "s1:8080"}}]}
+  - {eval_time: 3m, alertname: StuckUnsupportedRegistry, exp_alerts: [{exp_labels: {os: windows, mechanism: registry, instance: 's1:8080'}}]}
+- name: "6 two scraped server replicas: replica 1 recovered fires, replica 2 still short -> only replica 1"
+  interval: 1m
+  input_series:
+  - {series: 'yuzu_fleet_spark_reporting{os="windows",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_mechanisms{os="windows",mechanism="file",instance="s1:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_unsupported{os="windows",mechanism="file",instance="s1:8080"}', values: '3+0x5'}
+  - {series: 'yuzu_fleet_spark_reporting{os="windows",instance="s2:8080"}', values: '10+0x5'}
+  - {series: 'yuzu_fleet_spark_mechanisms{os="windows",mechanism="file",instance="s2:8080"}', values: '9+0x5'}
+  - {series: 'yuzu_fleet_spark_unsupported{os="windows",mechanism="file",instance="s2:8080"}', values: '3+0x5'}
+  alert_rule_test:
+  - {eval_time: 3m, alertname: StuckUnsupportedFile, exp_alerts: [{exp_labels: {os: windows, mechanism: file, instance: 's1:8080'}}]}
+- name: "7 macOS-style routine unsupported (no windows series at all) -> silent"
+  interval: 1m
+  input_series:
+  - {series: 'yuzu_fleet_spark_reporting{os="macos",instance="s1:8080"}', values: '5+0x5'}
+  - {series: 'yuzu_fleet_spark_unsupported{os="macos",mechanism="file",instance="s1:8080"}', values: '5+0x5'}
+  alert_rule_test:
+  - {eval_time: 3m, alertname: StuckUnsupportedFile, exp_alerts: [{exp_labels: {os: windows, mechanism: file, instance: "s1:8080"}}]}

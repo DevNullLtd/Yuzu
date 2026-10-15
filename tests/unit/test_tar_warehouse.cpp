@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::tar;
@@ -110,12 +111,22 @@ TEST_CASE("TAR warehouse: unknown dollar name returns nullopt",
 TEST_CASE("TAR warehouse: is_queryable_table allows registry + base tables, denies others",
           "[tar][warehouse][security]") {
     // Every real warehouse table the registry knows about is queryable — this is
-    // the allowlist the read-only SQL sandbox's authorizer enforces (#760).
+    // the allowlist the read-only SQL sandbox's authorizer enforces (#760) —
+    // EXCEPT the three app-usage tables, a deliberate post-loop removal
+    // (#4260): they're read only through the Forensics-gated app_usage plugin,
+    // never generic tar.sql. Asserted as denials below instead of skipped
+    // silently, so a future registry change can't silently re-admit them here.
+    static const std::unordered_set<std::string> kDeniedDespiteRegistered{
+        "usage_live", "usage_daily", "usage_daily_user"};
     for (const auto& dn : all_dollar_names()) {
         auto real = translate_dollar_name(dn);
         REQUIRE(real.has_value());
         INFO("table: " << *real);
-        CHECK(is_queryable_table(*real));
+        if (kDeniedDespiteRegistered.contains(*real)) {
+            CHECK_FALSE(is_queryable_table(*real));
+        } else {
+            CHECK(is_queryable_table(*real));
+        }
     }
     CHECK(is_queryable_table("tar_state"));
     CHECK(is_queryable_table("tar_config"));
@@ -125,6 +136,9 @@ TEST_CASE("TAR warehouse: is_queryable_table allows registry + base tables, deni
     CHECK_FALSE(is_queryable_table("sqlite_master"));
     CHECK_FALSE(is_queryable_table("users"));
     CHECK_FALSE(is_queryable_table("made_up_table"));
+    // #4260: the app-usage tables remain registered (so schema/DDL machinery
+    // still sees them) but must never become queryable via this authorizer.
+    for (const auto& t : kDeniedDespiteRegistered) CHECK_FALSE(is_queryable_table(t));
 }
 
 // ── Rollup SQL coverage ────────────────────────────────────────────────────
