@@ -15,6 +15,9 @@
 #include <string>
 #include <vector>
 
+// The shared full-page shell /software is served from (guardian_page_ui.cpp, global scope).
+extern const char* const kGuardianDetailPageHtml;
+
 using namespace yuzu::server;
 namespace swc = yuzu::server::software_catalogue;
 
@@ -197,12 +200,14 @@ TEST_CASE("software page: freshness line, stale prefix, building and the later t
     REQUIRE_FALSE(has(h, "<table"));
 }
 
-TEST_CASE("software page: head, sub-nav and the ADR-0017 caveat", "[inventory][ui]") {
+TEST_CASE("software page: head, and no standing ADR-0017 scope banner", "[inventory][ui]") {
     const std::string h = full({}, page());
     REQUIRE(has(h, "<h1 class=\"inv-h1\">Software</h1>"));
     REQUIRE(has(h, "<a href=\"/hardware\">Hardware</a>"));
-    REQUIRE(has(h, "<div class=\"inv-subnav\" role=\"tablist\"><a class=\"on\" role=\"tab\""));
-    REQUIRE(has(h, "Scope (ADR-0017)"));
+    REQUIRE_FALSE(has(h, "inv-subnav")); // the lone Software tab is gone
+    // The scope note was a permanent banner above the table; confined callers still get their own
+    // notice (the kpis region), and the gate itself is unchanged.
+    REQUIRE_FALSE(has(h, "Scope (ADR-0017)"));
     REQUIRE_FALSE(has(h, "Devices tab"));
     REQUIRE_FALSE(has(h, "Find is also"));
 }
@@ -236,8 +241,8 @@ TEST_CASE("software page: kind control, ecosystem and found-by chips", "[invento
     f.ecosystem = "brew";
     f.source = "pkg_inventory.packages";
     const std::string h = full(f, page());
-    REQUIRE(has(h, "<button type=\"button\" class=\"gp-chip\" data-g=\"kind\" data-v=\"\""));
-    REQUIRE(has(h, "class=\"gp-chip on\" data-g=\"kind\" data-v=\"pkg\" aria-pressed=\"true\" "
+    REQUIRE(has(h, "<button type=\"button\" class=\"inv-chip\" data-g=\"kind\" data-v=\"\""));
+    REQUIRE(has(h, "class=\"inv-chip\" data-g=\"kind\" data-v=\"pkg\" aria-pressed=\"true\" "
                    "title=\"macOS pkgutil and Homebrew packages\""));
     REQUIRE(has(h, "data-g=\"kind\" data-v=\"\" aria-pressed=\"false\""));
     REQUIRE(has(h, "title=\"OS packages (rpm, deb, apk, pacman)\""));
@@ -438,6 +443,24 @@ TEST_CASE("software page: modes return the right regions", "[inventory][ui]") {
     const std::string f = full({}, d);
     REQUIRE(has(f, "id=\"sw-kpis\""));
     REQUIRE(has(f, "id=\"sw-results\" data-hash=\"\""));
+}
+
+TEST_CASE("software page: panel wrappers stay balanced in every region", "[inventory][ui]") {
+    // The inv-panel wrappers are concatenated by hand across both results_region return paths.
+    auto balanced = [](const std::string& h) {
+        INFO(h);
+        REQUIRE(count_of(h, "<div ") + count_of(h, "<div>") == count_of(h, "</div>"));
+    };
+    auto d = page();
+    balanced(full({}, d));
+    balanced(render_software_page({}, d, SoftwarePageMode::Results));
+    d = page({});
+    d.totals = SoftwareCatalogTotals{0, 0};
+    balanced(full({}, d));
+    balanced(render_software_page({}, d, SoftwarePageMode::Results));
+    d = page();
+    d.rows.reset();
+    balanced(render_software_page({}, d, SoftwarePageMode::Results));
 }
 
 TEST_CASE("software page: degrade, empty, filtered-empty and caveat states", "[inventory][ui]") {
@@ -743,4 +766,68 @@ TEST_CASE("software page: shell script is CSP-safe and wires the page's behaviou
     for (const char* never : {"hx-on", "new Function", "eval("})
         REQUIRE_FALSE(has(s, never));
     REQUIRE(s.rfind("<script>", 0) == 0);
+}
+
+// "Sync now" (device / scope or group / whole fleet). The button heads the Full page only; the
+// dialog is the shared one (the page shell loads it), built from the page script. Kills: dropping
+// the button, pointing the script at the per-device route, and an innerHTML sink for server text.
+TEST_CASE("software page: Sync now button and dialog script drive the fan-out route", "[inventory][ui]") {
+    const std::string h = full({}, page());
+    REQUIRE(has(h, "<div class=\"inv-titlerow\"><h1 class=\"inv-h1\">Software</h1><button type=\"button\" "
+                   "class=\"gp-btn accent\" data-act=\"sync\" onclick=\"swSync()\""));
+    REQUIRE(count_of(h, "data-act=\"sync\"") == 1);
+    REQUIRE_FALSE(has(render_software_page({}, page(), SoftwarePageMode::Results), "data-act=\"sync\""));
+
+    const std::string s = software_page_script();
+    for (const char* need : {"function swSync()", "function swSyncDone(", "window.YuzuDialog",
+                             "'/api/v1/hardware/sync'", "'/api/v1/scope/preview'", "installed_software",
+                             "body.scope = '__all__'", "body.scope_expression", "'This device ('",
+                             "Whole fleet", "Devices matching a scope expression or group", "'sw-agent'",
+                             "d.agents_reached", "not connected to this server"})
+        REQUIRE(has(s, need));
+    // The 202 count is agents_reached (as on /api/command and the per-device route).
+    REQUIRE_FALSE(has(s, "d.reached"));
+    // One definition of "skipped" in the dialog and its confirm step: not connected to THIS server
+    // (a device attached to another server included) or an agent older than 0.13.1.
+    REQUIRE(has(s, "Devices not connected to this server (including one attached to another server) and "
+                   "agents older than 0.13.1 are skipped."));
+    REQUIRE(has(s, "This server asks the devices connected to it."));
+    REQUIRE_FALSE(has(s, "Only connected devices"));
+    REQUIRE_FALSE(has(s, "Offline devices and agents"));
+    REQUIRE_FALSE(has(s, "Every connected device"));
+    // The scope preview needs Infrastructure:Read, so a PERMISSION refusal (403, or 401) means "no
+    // count" and the dialog goes on to the confirm step; any other failure (400 invalid expression,
+    // 404, 503) is still returned to the dialog so it is caught before the operator confirms.
+    REQUIRE(has(s, "if (!r.ok && r.status !== 403 && r.status !== 401)"));
+    REQUIRE(has(s, "return r.message || ('Scope preview failed (' + r.status + ')');"));
+    REQUIRE(has(s, "count = r.ok && r.data && r.data.data"));
+    REQUIRE(has(s, "count === null ? 'The devices matching this scope'"));
+    // Not the per-device route (that one is /api/v1/hardware/{id}/sync), and server text is
+    // only ever written with textContent.
+    REQUIRE_FALSE(has(s, "'/api/v1/hardware/' +"));
+    const auto from = s.find("function swSyncDone(");
+    const auto to = s.find("document.body.addEventListener('htmx:configRequest'");
+    REQUIRE(from != std::string::npos);
+    REQUIRE(to != std::string::npos);
+    REQUIRE(from < to);
+    const std::string sync_js = s.substr(from, to - from);
+    REQUIRE_FALSE(has(sync_js, "innerHTML"));
+    // The result is a toast only: no persistent note is written into the freshness line.
+    REQUIRE_FALSE(has(sync_js, "sw-sync-note"));
+    REQUIRE_FALSE(has(sync_js, ".inv-fresh"));
+    // The shared dialog module is loaded by the shell this script rides.
+    REQUIRE(has(kGuardianDetailPageHtml, "/static/yuzu-dialog.js"));
+}
+
+// The Inventory sources panel loads once with the full page and only there: the Results and
+// Rows swaps must not re-request it. Kills: moving the host into results_region.
+TEST_CASE("software page: Inventory sources host loads with the full page only",
+          "[inventory][ui]") {
+    const auto d = page();
+    const std::string html = full({}, d);
+    REQUIRE(has(html, "hx-get=\"/fragments/inventory/sources\" hx-trigger=\"load\""));
+    REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Results),
+                      "/fragments/inventory/sources"));
+    REQUIRE_FALSE(has(render_software_page({}, d, SoftwarePageMode::Rows),
+                      "/fragments/inventory/sources"));
 }

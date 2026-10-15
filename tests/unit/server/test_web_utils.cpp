@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -769,7 +770,7 @@ TEST_CASE("render_status_sparkbar: zero-count buckets emit no <rect>",
     // fallback tail; assert on the token name only.
     REQUIRE(svg.find("--mds-color-bg-success-emphasis") != std::string::npos);
     REQUIRE(svg.find("--mds-color-theme-indicator-error") == std::string::npos);
-    REQUIRE(svg.find("--mds-color-theme-indicator-stable") == std::string::npos);
+    REQUIRE(svg.find("--mds-color-theme-indicator-info") == std::string::npos);
     REQUIRE(svg.find("--mds-color-theme-text-tertiary") == std::string::npos);
 }
 
@@ -860,7 +861,7 @@ TEST_CASE("render_status_sparkbar: every fill has a two-arg var() fallback (UP-1
             != std::string::npos);
     REQUIRE(svg.find("var(--mds-color-theme-indicator-error,var(--red))")
             != std::string::npos);
-    REQUIRE(svg.find("var(--mds-color-theme-indicator-stable,var(--accent))")
+    REQUIRE(svg.find("var(--mds-color-theme-indicator-info,var(--info))")
             != std::string::npos);
     REQUIRE(svg.find("var(--mds-color-theme-text-tertiary,var(--muted))")
             != std::string::npos);
@@ -1159,6 +1160,10 @@ TEST_CASE("is_login_exempt_path: unrelated API paths are NOT exempt",
 
 TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",
           "[web_utils][login_exempt][regression]") {
+    // The landing and sign-in page renders for a visitor with no session.
+    CHECK(is_login_exempt_path("/home"));
+    CHECK_FALSE(is_login_exempt_path("/home/"));
+    CHECK_FALSE(is_login_exempt_path("/homes"));
     CHECK(is_login_exempt_path("/login"));
     CHECK(is_login_exempt_path("/login/mfa"));
     CHECK(is_login_exempt_path("/login/mfa/enroll"));
@@ -1215,4 +1220,118 @@ TEST_CASE("agent_error_display bounds the FIRST record, not a byte window",
     // Genuinely empty input stays empty without reading out of bounds.
     CHECK(yuzu::server::agent_error_display("error|").empty());
     CHECK(yuzu::server::agent_error_display("").empty());
+}
+
+// ── url_path_segment / url_query_value / is_dot_segment / path_segment_ok ───
+
+namespace {
+// Hostile ids a page link must never carry through verbatim.
+const std::vector<std::string> kHostileIds = {
+    "./bulk-approve?",
+    "../auto-approve/mode?",
+    "../users/x",
+    "a/b",
+    "%2e%2e",
+    "%2E%2E/x",
+    "..",
+    ".",
+    "a#b",
+    "a?b",
+    "caf\xC3\xA9",
+    std::string("a\0b", 3),
+    "a b",
+    "a&b=c;d",
+    "a\"b<c>'d",
+    std::string(5000, '/'),
+};
+
+bool only_encoded_chars(const std::string& s) {
+    for (const char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' ||
+                        c == '%';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+} // namespace
+
+TEST_CASE("url_path_segment: unreserved bytes pass, everything else is %XX",
+          "[web_utils][url_path_segment]") {
+    CHECK(url_path_segment("Az09-._~") == "Az09-._~");
+    CHECK(url_path_segment("") == "");
+    CHECK(url_path_segment("a/b") == "a%2Fb");
+    CHECK(url_path_segment("a?b#c") == "a%3Fb%23c");
+    CHECK(url_path_segment("100%") == "100%25");
+    CHECK(url_path_segment("a b&c") == "a%20b%26c");
+    CHECK(url_path_segment("caf\xC3\xA9") == "caf%C3%A9");
+    CHECK(url_path_segment(std::string("a\0b", 3)) == "a%00b");
+    // Dots stay (RFC 3986 unreserved) - the dot-only refusal is is_dot_segment's job.
+    CHECK(url_path_segment("..") == "..");
+}
+
+TEST_CASE("url_path_segment: no hostile id leaves '/', '?', '#' or a raw delimiter in the output",
+          "[web_utils][url_path_segment]") {
+    for (const auto& id : kHostileIds) {
+        const auto out = url_path_segment(id);
+        INFO("id size " << id.size());
+        CHECK(only_encoded_chars(out));
+        CHECK(out.find('/') == std::string::npos);
+        CHECK(out.find('?') == std::string::npos);
+        CHECK(out.find('#') == std::string::npos);
+        CHECK(out.find('"') == std::string::npos);
+    }
+    CHECK(url_path_segment(std::string(5000, '/')).size() == 15000);
+}
+
+TEST_CASE("url_path_segment: output is not double-escaped by a later html_escape",
+          "[web_utils][url_path_segment]") {
+    // Percent-encoded output has no HTML metacharacter, so html_escape is a no-op:
+    // a caller that escapes the assembled URL once does not change it.
+    for (const auto& id : kHostileIds) {
+        const auto out = url_path_segment(id);
+        CHECK(html_escape(out) == out);
+    }
+}
+
+TEST_CASE("url_query_value matches url_path_segment byte for byte",
+          "[web_utils][url_path_segment]") {
+    for (const auto& id : kHostileIds)
+        CHECK(url_query_value(id) == url_path_segment(id));
+    CHECK(url_query_value("a&b=c#d") == "a%26b%3Dc%23d");
+}
+
+TEST_CASE("is_dot_segment: '.', '..' and their %2e spellings", "[web_utils][url_path_segment]") {
+    CHECK(is_dot_segment("."));
+    CHECK(is_dot_segment(".."));
+    CHECK(is_dot_segment("%2e"));
+    CHECK(is_dot_segment("%2E"));
+    CHECK(is_dot_segment(".%2e"));
+    CHECK(is_dot_segment("%2e."));
+    CHECK(is_dot_segment("%2e%2e"));
+    CHECK(is_dot_segment("%2E%2E"));
+    // Not dot segments: a real name, a longer dot run, or a trailing delimiter.
+    CHECK_FALSE(is_dot_segment(""));
+    CHECK_FALSE(is_dot_segment("..."));
+    CHECK_FALSE(is_dot_segment("a.b"));
+    CHECK_FALSE(is_dot_segment(".hidden"));
+    CHECK_FALSE(is_dot_segment("..x"));
+    CHECK_FALSE(is_dot_segment("%2e%2e%2e"));
+    CHECK_FALSE(is_dot_segment("%2e%2"));  // truncated escape is not a dot
+    CHECK_FALSE(is_dot_segment("%2e%zz")); // malformed escape is not a dot
+    CHECK_FALSE(is_dot_segment("../x"));   // gets encoded, not a bare dot segment
+}
+
+TEST_CASE("path_segment_ok: empty and dot-only ids are refused, everything else may be encoded",
+          "[web_utils][url_path_segment]") {
+    CHECK_FALSE(path_segment_ok(""));
+    CHECK_FALSE(path_segment_ok("."));
+    CHECK_FALSE(path_segment_ok(".."));
+    CHECK_FALSE(path_segment_ok("%2e%2E"));
+    CHECK(path_segment_ok("a/b"));
+    CHECK(path_segment_ok("./bulk-approve?"));
+    CHECK(path_segment_ok("550e8400-e29b-41d4-a716-446655440000"));
+    CHECK(path_segment_ok(std::string(5000, 'x')));
 }

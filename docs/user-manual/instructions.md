@@ -79,10 +79,13 @@ spec:
 
 ### Saving YAML via API
 
+Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
+
 ```bash
 # Save a definition from a YAML file (form-encoded; the yaml_source field
 # carries the document verbatim)
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/yaml \
   --data-urlencode "yaml_source@definitions/process-list.yaml"
 
@@ -100,6 +103,54 @@ The Instruction Management page provides two authoring modes:
 - **Code mode** -- a CodeMirror editor with YAML syntax highlighting, live validation, and auto-complete for known plugin/action pairs.
 
 Both modes are served as HTMX fragments.
+
+**Saving keeps what the YAML does not carry.** The editor's Save writes only the
+fields the YAML expresses (name, plugin, action, description, and the optional
+`type`, `version`, `concurrency` and `approval`). Everything else stored on the
+definition -- its instruction set, enabled flag, TTLs, result schema,
+visualization, response templates, platforms, minimum agent version, required
+plugins and readable payload -- is kept. When the YAML omits `type`, `version`,
+`concurrency` or `approval`, the stored value is kept as well; a value that
+differs from the stored one is an intentional edit and is written, and a change
+of `approval` is recorded in the audit detail as `approval_mode: <old> -> <new>`.
+
+**Library list.** The Definitions tab lists up to 100 definitions by default.
+`GET /fragments/instructions` takes `name`, `plugin`, `type` and `limit` (maximum
+500); a cut list says "Showing the first N. Narrow the filter." The "Needs
+approval" column and the instruction sets panel appear for callers who hold
+`InstructionDefinition:Read` and `InstructionSet:Read` respectively.
+
+**Page controls follow permissions.** New, Edit, Import, Delete and the set
+controls appear for callers who hold `InstructionDefinition:Write`,
+`InstructionDefinition:Delete`, `InstructionSet:Write` and `InstructionSet:Delete`
+respectively, not for a role. Each capability is probed once per page render, and
+a denied probe is audited as a denial, so loading the page as a caller who lacks
+a capability writes one denial row for it.
+
+**Sets.** The sets panel lists each set with the number of definitions in it.
+New set asks for a name and description. Delete set states that its definitions
+stay and become unassigned. Each library row has a set select that assigns the
+definition to a set or clears it.
+
+**Response templates.** Templates on a library row opens a panel directly under the
+library filters, scrolled into view, with that definition's templates: the built-in
+default (never editable) first, then the authored ones. Close empties the panel.
+New, Edit and Delete open dialogs that call
+`/api/v1/definitions/{id}/response-templates`. Filters are written one per line as
+`column | op | value`.
+
+**Import and export.** Import definition takes the JSON document that Export
+produces (Ed25519-signed or not); unsigned documents can be refused by policy and
+a duplicate id is refused. When the audit record could not be written the page
+says so. Export saves the definition as `<id>.json`.
+
+**Dispatch.** Selecting a definition on the Executions tab reads its parameters
+from `GET /api/v1/instructions/{id}`; `grant_secret` and `grant_id` are write-only
+password inputs. The Target select offers a scope expression with Validate
+(syntax only) and Preview (needs `Infrastructure:Read`). Dispatch always
+confirms, naming the instruction, `plugin:action`, type and target; a definition
+whose approval mode is not `auto` says it will be submitted for approval and not
+run, and an expression that was not previewed needs `DISPATCH` typed to send.
 
 ---
 
@@ -304,6 +355,7 @@ metadata:
 ```bash
 # Create an instruction set
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instruction-sets \
   -H "Content-Type: application/json" \
   -d '{
@@ -313,6 +365,7 @@ curl -s -b cookies.txt \
 
 # Delete a set (cascades to contained definitions)
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instruction-sets/abc123
 ```
 
@@ -434,7 +487,7 @@ corrected `parameter_schema`:
 2. Edit its `parameter_schema` (a string holding the schema JSON). Unless the server runs with
    `--allow-unsigned-definitions`, the edited document must also be signed before import, or the import
    answers `400` as unsigned: add a hex `signature` and `publicKey` (an Ed25519 signature over the exact
-   bytes of `yaml_source`, 128 and 64 hex characters). A definition whose `yaml_source` is empty cannot be
+   bytes of `yaml_source`, 128 and 64 hex characters). The signature covers `yaml_source` only, so `plugin`, `action`, `type`, `approval_mode` and `concurrency_mode` are read from it and must agree with the envelope. A definition whose `yaml_source` is empty cannot be
    signed (import answers an error about a signature without `yaml_source`), so only the unsigned flag
    works for it.
 3. Rehearse the import, because step 5 cannot be rehearsed (an existing id answers `409`) and a refused
@@ -544,7 +597,7 @@ When a user (or MCP tool) executes an instruction that requires approval:
 
 1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. The execution is queued, not dropped.
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
-3. **Approvals tab.** The pending request is visible in the **Approvals** tab of the dashboard. The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded.
+3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded. On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
 The submitter cannot approve their own request. A different user with the appropriate role must review it.
 
@@ -974,6 +1027,7 @@ POST /api/instructions
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions \
   -H "Content-Type: application/json" \
   -d '{
@@ -1000,6 +1054,7 @@ PUT /api/instructions/{id}
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X PUT http://localhost:8080/api/instructions/crossplatform.service.inspect \
   -H "Content-Type: application/json" \
   -d '{
@@ -1017,6 +1072,7 @@ DELETE /api/instructions/{id}
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instructions/crossplatform.service.inspect
 ```
 
@@ -1030,6 +1086,7 @@ Accepts `Content-Type: application/x-yaml`. Parses the YAML, extracts metadata a
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/yaml \
   -H "Content-Type: application/x-yaml" \
   --data-binary @my-definition.yaml
@@ -1058,6 +1115,7 @@ POST /api/instructions/import
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/import \
   -H "Content-Type: application/json" \
   -d @exported-definition.json
@@ -1115,6 +1173,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/filesystem.exists/execute \
   -H "Content-Type: application/json" \
   -d '{"params":{"path":"C:\\Windows"}}'
@@ -1154,6 +1213,7 @@ POST /api/instruction-sets
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instruction-sets \
   -H "Content-Type: application/json" \
   -d '{
@@ -1172,6 +1232,7 @@ Cascade-deletes all definitions in the set.
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instruction-sets/SET-001
 ```
 
@@ -1268,7 +1329,8 @@ POST /api/approvals/{id}/approve
 
 The reviewer must be a different operator than the submitter — self-approval
 is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
-and the denied attempt is recorded in the audit log.
+and the denied attempt is recorded in the audit log. The `comment` is capped at
+4,000 bytes (HTTP 400 beyond that).
 
 ```bash
 curl -s -b cookies.txt \
@@ -1381,6 +1443,8 @@ curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
 
+Cancelling an execution that already finished (`succeeded`, `completed` or `cancelled`) answers `409` and changes nothing; the Executions page offers Cancel only for executions that are still running. Per-device results and the live view are on the page's detail pane.
+
 ---
 
 ## 13. Dashboard UI
@@ -1392,9 +1456,21 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | Tab | Description |
 |---|---|
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
-| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. Pass `?definition_id=<id>` in the page URL to pre-filter the list to one definition. |
+| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. The Executions page (`/executions`) takes `?definition_id=<id>` and `?status=<s>` to pre-filter the list and `?id=<execution>` to open one. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
-| **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
+| **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
+
+**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
+
+**Workflows page.** `/workflows` is a page in the sidebar under Instructions (its workflow actions are described below): the workflow definitions (name, description, step count; selecting one lists its steps with each step's failure policy) and the recurring schedules. Schedules run a single instruction on the cadence the scheduler really applies (once, every N minutes, daily, weekly or monthly; time of day, weekday and day of month are stored but not used) and are not linked to workflows. A schedule you did not create shows only whether it targets all devices or a subset.
+
+The definitions table also shows each workflow's Last run and Result (the newest run you may see: "Not run" when there is none, "None visible" when runs exist only on devices outside your scope, "Unknown" when the list of newest runs was cut off before it reached that workflow). Selecting a workflow loads its latest run in the **Latest run** panel (status, start, duration, device count and one row per step) and the **Recent runs** disclosure lists its ten newest runs; selecting one loads it. A step shown as *Dispatched* means the command was sent: it says nothing about the result on a device, and for a caller confined to a device scope it reads *Dispatched (run-wide)* because the send covered the run's whole target list. A skipped step says why only for the three reasons the engine writes (condition not met, previous step failed, workflow aborted); a failed step shows its error text when the engine stored one, otherwise "No detail.". A run is visible to you only if at least one of its target devices is in your scope; a run you may not see and a run that does not exist look the same.
+
+**Workflow actions.** **New workflow** (shown when you hold `Workflow:Write`) opens a dialog for the workflow's YAML; the server's message is shown if the YAML is refused, and nothing runs until you run it. Each row's **Run now** (needs `Workflow:Execute`) opens a device checklist built from the connected devices you may see (filter box, the first 200 matches shown, at most 500 selected); without permission to list devices it falls back to a box of device ids, one per line. Each step is sent to every selected device in order; a step whose instruction needs approval is refused, and device results are not collected on this page. The server runs the whole workflow before it answers, so the page waits 8 seconds, then says the run may keep running on the server, disables that workflow's Run now and checks its newest run every 5 seconds for up to 10 minutes. Check Recent runs before running it again. **Delete** in the Steps panel (needs `Workflow:Delete`) retires the workflow after a confirmation; run history is kept and there is no undelete in the console. A control you may not use is shown disabled with the permission it needs. Instruction names appear on step rows only if you also hold `InstructionDefinition:Read`; otherwise the step's label or instruction id is shown. **Schedule actions.** Each schedule row has **Enable**/**Disable** and **Delete**, enabled only on schedules you created (a schedule with no recorded creator is nobody's, so both stay disabled). **Enable** needs `Schedule:Write` and `Execution:Execute` and asks for confirmation because the schedule then runs without anyone present; **Disable** needs `Schedule:Write` and is one click; **Delete** needs `Schedule:Delete` and confirms first. After a change the list is re-read and the stored state shown. **New schedule** (needs `Schedule:Write` and `Execution:Execute`; the instruction list needs `InstructionDefinition:Read`) takes a name, an enabled instruction, a cadence (once runs at the next scheduler tick, about now; the scheduler ignores time of day), targets, whether each run needs approval and parameters as JSON. Leaving targets empty needs an explicit acknowledgement that it reaches every device. A final summary shows the instruction's approval mode before the schedule is created enabled; a run can still be refused when it fires. Not verified by running a workflow against a live fleet: that the server keeps running a workflow after the page stops waiting.
+
+Who sees what: Administrator, Operator, PlatformEngineer, Viewer and ITServiceOwner hold `Workflow:Read` and see all definitions; runs follow the fleet-read scope of the account. A caller scoped only to management groups is refused the definitions and schedules panels (the existing global-grant rule) but sees runs that include a device in scope. ITServiceOwner can create, enable and delete its own schedules elsewhere but has no Run, New workflow or Delete workflow control, and a service-scoped token is refused the schedules panel outright.
+
+Operational notes: listing definitions reads each workflow's steps with one query per row (up to 101 per page load, newest first), so the page asks for 101 and never renders the YAML. Opening the page or refreshing a denied panel writes a denial audit row for each refused panel, so a denied panel is not polled; reading a run's detail writes `workflow_execution.detail.fetch`. Not verified by running it: that a run keeps going on the server when the browser disconnects, and the content of the `perm_fn` denial audit rows for the refused panels.
 
 ### YAML Editor
 

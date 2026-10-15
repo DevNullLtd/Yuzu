@@ -8,11 +8,13 @@
 
 #include "hardware_routes.hpp"
 
+#include "app_shell.hpp"
 #include "authz_model.hpp"          // authz::in_scope
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
 
+#include <yuzu/protective_actions.hpp> // protective::is_quarantine_control_plugin
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 
 #include <nlohmann/json.hpp>
@@ -24,6 +26,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <unordered_set>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp).
 extern const char* const kGuardianDetailPageHtml;
@@ -44,15 +48,16 @@ std::string page_shell(const std::string& title, const std::string& fragment_url
     };
     sub("{{TITLE}}", title);
     sub("{{FRAGMENT}}", fragment_url);
-    sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
-        "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-    // The nav-sweep (10 shells) hasn't landed yet at this point in the branch history
-    // in a fresh checkout of this file alone — once it has, this activates the real
-    // Hardware nav link. Until then this is a silent no-op (the `sub` idiom's own
-    // known failure mode), which is exactly why test_nav_shells.cpp pins it.
-    sub("<a href=\"/hardware\" class=\"nav-link\">Hardware</a>",
-        "<a href=\"/hardware\" class=\"nav-link active\">Hardware</a>");
-    return html;
+    // The shared dialog module, the estate controller (quarantine, stored-data removal) and the
+    // tags/properties controls load after the template's own scripts, in that order. The shell is
+    // shared with pages that load none of them, so only this route family adds them.
+    // Same-origin static files: the dashboard CSP needs no change.
+    if (const auto end = html.rfind("</body>"); end != std::string::npos)
+        html.insert(end, "<script src=\"/static/yuzu-dialog.js\" defer></script>"
+                         "<script src=\"/static/yuzu-estate.js\" defer></script>"
+                         "<script src=\"/static/yuzu-device-data.js\" defer></script>\n");
+    // test_nav_shells.cpp pins that the shared shell carries the marker apply_shell fills.
+    return shell::apply_shell(std::move(html), {.active_key = "hardware"});
 }
 
 std::string url_encode_id(const std::string& s) {
@@ -85,6 +90,17 @@ bool bad_hw_ident(std::string_view v) {
         return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
                  c == '_' || c == '.' || c == '-');
     });
+}
+
+std::string hw_lens_or_overview(const std::string& raw, bool containment_ui) {
+    static constexpr std::string_view kLenses[] = {"overview", "software", "tags",  "dex",
+                                                   "guardian", "live",     "actions"};
+    for (const auto l : kLenses)
+        if (raw == l)
+            return raw;
+    if (containment_ui && raw == "containment")
+        return raw;
+    return "overview";
 }
 
 std::int64_t now_secs() {
@@ -158,6 +174,7 @@ HwCiAffordances HardwareRoutes::affordances_for(const httplib::Request& req, con
     aff.can_write_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Write", id);
     aff.can_read_guaranteed_state =
         deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "GuaranteedState", "Read", id);
+    aff.containment_ui = deps_.containment_ui;
     return aff;
 }
 
@@ -182,8 +199,13 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!session) { res.set_redirect("/login"); return; }
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        send_html(res, page_shell("Yuzu \xE2\x80\x94 Hardware",
-                                  "/fragments/hardware/ci?id=" + url_encode_id(id)));
+        // `lens` is forwarded so a link can open a specific lens (the row's Quarantine
+        // link). It is only a hint here: the fragment applies the allowlist, and the value
+        // is URL-encoded so it can never break out of the fragment URL.
+        std::string fragment = "/fragments/hardware/ci?id=" + url_encode_id(id);
+        if (req.has_param("lens"))
+            fragment += "&lens=" + url_encode_id(req.get_param_value("lens"));
+        send_html(res, page_shell("Yuzu \xE2\x80\x94 Hardware", fragment));
     });
 
     // -- Fragment: CI list --
@@ -223,16 +245,50 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                 "Inventory", "fleet", "hardware roster read failed");
             HardwareListPage degraded;
             degraded.query = *normalised;
+            degraded.containment_ui = deps_.containment_ui;
             send_html(res, render_hardware_list_fragment(degraded, false, /*roster_unavailable=*/true, results_only));
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        page.containment_ui = deps_.containment_ui;
         // DEX is scored ONLY on the page's rendered rows (device_routes.cpp's own
         // "score only rendered rows" rule) — a GROUP-BY per device is too costly to
         // run over the whole roster on every filter/sort/page click.
         if (deps_.dex_score_fn)
             for (auto& row : page.rows)
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
+
+        // Quarantined pill. Phase 1 reads which of THIS PAGE's devices have an active record
+        // (the read is restricted to the page's ids, so its cost is bounded by the page size
+        // and nothing is shown yet). Only if there is a candidate does phase 2 make ONE
+        // Security:Read list-gate decision (ADR-0017) and keep the candidates inside its
+        // scope — so a caller without Security:Read, or a page with no quarantines, costs no
+        // gate call and no denied audit row. The gate answers into a throwaway Response (the
+        // list itself is the response): a 403 means "this caller may not see pills" and draws
+        // none; an unavailable or unwired gate, or a degraded store, sets the banner flag and
+        // no pill (absence is then not evidence).
+        if (deps_.containment_ui && deps_.quarantine_list_fn && !page.rows.empty()) {
+            std::vector<std::string> page_ids;
+            page_ids.reserve(page.rows.size());
+            for (const auto& row : page.rows)
+                page_ids.push_back(row.agent_id);
+            const auto candidates = deps_.quarantine_list_fn(&page_ids, 0);
+            if (!candidates) {
+                page.quarantine_degraded = true;
+            } else if (!candidates->empty()) {
+                httplib::Response gate_res;
+                const authz::FleetReadGate qgate =
+                    deps_.fleet_read_fn ? deps_.fleet_read_fn(req, gate_res, "Security", "Read")
+                                        : authz::FleetReadGate{};
+                if (qgate.admitted) {
+                    for (const auto& r : *candidates)
+                        if (authz::in_scope(qgate.scope, r.agent_id))
+                            page.quarantined_ids.insert(r.agent_id);
+                } else if (!deps_.fleet_read_fn || gate_res.status != 403) {
+                    page.quarantine_degraded = true; // gate unwired/401/503: not a scope refusal
+                }
+            }
+        }
 
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
@@ -258,7 +314,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
-        const std::string lens = req.has_param("lens") ? req.get_param_value("lens") : "overview";
+        // Allowlisted: the value reaches the audit detail and echoed markup, so an unknown
+        // or oversized `lens` falls back to the overview rather than being carried through.
+        const std::string lens = hw_lens_or_overview(
+            req.has_param("lens") ? req.get_param_value("lens") : std::string{}, deps_.containment_ui);
         const bool lens_only = req.has_param("lens_only") && req.get_param_value("lens_only") == "1";
         if (!deps_.ci_detail_fn) {
             res.status = 503;
@@ -288,7 +347,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         const HardwareCiDetail detail = deps_.ci_detail_fn(id);
-        const HwCiAffordances aff = affordances_for(req, id, detail);
+        HwCiAffordances aff = affordances_for(req, id, detail);
+        if (lens == "tags")
+            aff.can_delete_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Delete", id);
 
         std::string verb = "inventory.device.ci";
         std::string state = !detail.ci.has_value() ? "store degraded"
@@ -343,7 +404,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // bar re-swapped (the active tab hasn't changed), so it's skipped there.
             std::string body = render_hardware_lens_body(id, detail, lens, now_secs(), aff);
             if (!await_since)
-                body = render_hardware_lens_bar(id, lens, /*oob=*/true) + body;
+                body = render_hardware_lens_bar(id, lens, /*oob=*/true, aff.containment_ui) + body;
             send_html(res, body);
         } else {
             send_html(res, render_hardware_ci_fragment(id, detail, lens, now_secs(), aff));
@@ -365,6 +426,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) return;
+        if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.device_sync")) return;
 
         std::string source = "all";
         if (!req.body.empty()) {
@@ -474,6 +536,90 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         };
         res.status = 202;
         res.set_content(out.dump(), "application/json");
+    });
+
+    // -- REST v1: POST /api/v1/hardware/sync — "Sync now" for a scope (the Software page) --
+    // One click, many devices. `scope` is __all__ / group:<id> / an agent id; `scope_expression`
+    // is a scope DSL expression (software_sync_decision.hpp owns the request grammar and every
+    // bound below).
+    // GATE: the type-level Execution:Execute check (sync_perm_fn = require_permission), which reads
+    // GLOBAL grants only, so an operator whose Execute is limited to management groups gets 403
+    // for every scope kind; then the same-site write gate (a cookie-session write must name this
+    // site; token callers are exempt). WHO IS REACHED is decided by `dispatch_confined_arms`
+    // (the system-reserved fan-out arm): the id list is intersected with the caller's own
+    // Execution:Execute visible set at SEND time, so a hidden device is never sent to. The
+    // resolver's narrowing (software_sync::resolve_targets) and the fleet-wide refusal for a
+    // filtered caller keep the counts, the 413 cap and the audit row from describing devices the
+    // caller may not see; with a global grant none of them changes the outcome today.
+    // The sequence (cooldown, in-flight lease, partition + cap, audit, dispatch, stamp) is
+    // software_sync::Runner, shared with the MCP tool sync_hardware_software.
+    // REACH: this server process only. Sessions and sends are per process, so an agent attached to
+    // another replica has no session here and is not sent to. skipped_offline = candidates this
+    // process did not reach that are not too old: no live session here (disconnected, or attached
+    // to another server) or a send the live stream refused. A group or a named device lists its
+    // disconnected members too; __all__ and a scope expression list only this process's sessions
+    // plus the shared presence record, so a device offline everywhere is never counted. The counts
+    // describe what THIS server could reach, not the fleet.
+    // Audit BEFORE dispatch, fail closed. 202 means REQUESTED: `agents_reached` is sessions that
+    // accepted the frame, not devices that have synced.
+    static_assert(software_sync::kMaxIdLen == auth::kMaxAgentIdLength);
+    sink.Post("/api/v1/hardware/sync", [this](const httplib::Request& req, httplib::Response& res) {
+        namespace ss = software_sync;
+        constexpr const char* kAction = "inventory.sync.request";
+        detail::ensure_correlation_id(res);
+        if (!deps_.sync_perm_fn || !deps_.auth_fn || !deps_.sync_runner) {
+            // The derivation of "which devices may this caller sync" is this route's only
+            // per-device authorization, so a missing dependency is a server misconfiguration
+            // (500), not a transient outage, and it is audited. Nothing here may use the
+            // dependencies that are missing; the audit sink is optional (audit-off is legal).
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "failure", "Scope", "",
+                                            "sync fan-out unwired");
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "sync fan-out is not configured on this server"),
+                            "application/json");
+            return;
+        }
+        if (!deps_.sync_perm_fn(req, res, "Execution", "Execute")) return;
+        const auto session = deps_.auth_fn(req, res);
+        if (!session) return;
+        // After the permission gate (an unauthorised caller keeps its 403) and before anything
+        // is parsed, resolved, slotted, audited or sent.
+        if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.sync")) return;
+
+        const auto parsed = ss::parse_request(nlohmann::json::parse(req.body, nullptr, false));
+        if (!parsed) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, "denied", "Scope", "",
+                                            "bad request: " + parsed.error());
+            res.status = 400;
+            res.set_content(detail::a4_error(res, parsed.error()), "application/json");
+            return;
+        }
+
+        // The audit sink for this request: refusals are best-effort rows, the pre-dispatch row
+        // is fail closed (`emit_behavioral_audit` also marks the response Sec-Audit-Failed).
+        ss::Audit audit;
+        audit.note = [&](std::string_view result, std::string_view type, const std::string& id,
+                         const std::string& detail_text) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, kAction, std::string(result),
+                                            std::string(type), id, detail_text);
+        };
+        audit.persist = [&](std::string_view result, std::string_view type, const std::string& id,
+                            const std::string& detail_text) {
+            return detail::emit_behavioral_audit(deps_.audit_fn, req, res, kAction, std::string(result),
+                                                 std::string(type), id, detail_text);
+        };
+        const auto out = deps_.sync_runner->run(*session, *parsed, audit);
+        if (out.status != ss::Status::Accepted) {
+            if (out.status == ss::Status::Cooldown)
+                res.set_header("Retry-After", std::to_string(*out.retry_after_ms / 1000));
+            res.status = out.http;
+            res.set_content(detail::a4_error(res, out.message, {.retry_after_ms = out.retry_after_ms}),
+                            "application/json");
+            return;
+        }
+        nlohmann::json body = {{"data", out.summary}, {"meta", {{"api_version", "v1"}}}};
+        res.status = 202;
+        res.set_content(body.dump(), "application/json");
     });
 
     // -- REST v1: GET /api/v1/hardware --
@@ -670,6 +816,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::optional<std::string> manifest =
                 deps_.manifest_fn ? deps_.manifest_fn(plugin.name) : std::nullopt;
             for (const auto& action : plugin.actions) {
+                // Hidden with the rest of the containment UI: a Run button on the quarantine
+                // plugin's own actions is a quarantine control. REST, MCP and the Instructions
+                // page are unchanged.
+                if (!deps_.containment_ui &&
+                    yuzu::protective::is_quarantine_control_plugin(plugin.name, action))
+                    continue;
                 HwActionRow row;
                 row.plugin = plugin.name;
                 row.action = action;

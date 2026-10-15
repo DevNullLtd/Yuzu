@@ -276,6 +276,10 @@ struct RestGsHarness {
     // calling /perf/app to drive the suppression-serialization path (the wired fleet
     // lambda reads it lazily at request time).
     std::vector<yuzu::server::AppPerfFleetRow> fleet_rows_;
+    // Per-version crash and hang rows the wired failure provider returns, and a
+    // switch that makes it report the owner's typed degrade (nullopt) instead.
+    std::vector<yuzu::server::AppPerfVersionFailureRow> failure_rows_;
+    bool failures_degraded_{false};
     // Rows the wired tag-cohort provider returns (default empty), same lazy-read
     // pattern as fleet_rows_ above — lets a test drive GET /dex/perf/tag's
     // suppression-serialization path (sub-floor cohort) without a harness rebuild.
@@ -549,6 +553,14 @@ struct RestGsHarness {
         // without seeding rows). Left empty when wire_app_perf is false so a test
         // can hit the provider-absent → 503 branch.
         if (wire_app_perf) {
+            app_perf_providers_.failures =
+                [this](std::string_view, const std::vector<std::string>&, std::int64_t,
+                       std::int64_t, std::string_view)
+                -> std::optional<std::vector<yuzu::server::AppPerfVersionFailureRow>> {
+                if (failures_degraded_)
+                    return std::nullopt;
+                return failure_rows_;
+            };
             app_perf_providers_.fleet =
                 [this](std::string_view, std::string_view)
                 -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
@@ -2442,7 +2454,17 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
     // A2 discovery: the per-device DEX endpoint is enumerable from the live server.
     REQUIRE(res->body.find(R"("/dex/devices/{id}":)") != std::string::npos);
     // And the embedded spec remains valid JSON after the insertion.
-    REQUIRE_NOTHROW(nlohmann::json::parse(res->body));
+    nlohmann::json spec;
+    REQUIRE_NOTHROW(spec = nlohmann::json::parse(res->body));
+    // The Apps list is enumerable with its success shape and its degrade response.
+    REQUIRE(spec["paths"].contains("/dex/apps"));
+    const auto& apps_rsp = spec["paths"]["/dex/apps"]["get"]["responses"];
+    REQUIRE(apps_rsp.contains("200"));
+    REQUIRE(apps_rsp.contains("400"));
+    REQUIRE(apps_rsp.contains("503"));
+    const auto desc = apps_rsp["200"]["description"].get<std::string>();
+    CHECK(desc.find("versions_truncated") != std::string::npos);
+    CHECK(desc.find("population_basis") != std::string::npos);
 }
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ═══
@@ -2592,6 +2614,59 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
             saw_chrome = true;
     CHECK(saw_chrome);
     CHECK(h.audit_log.empty()); // fleet aggregate — no per-agent identity
+
+    // Additive per-application and per-version figures.
+    CHECK(j["data"]["population"].is_number_integer());
+    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"]["apps_total"] == 2);
+    CHECK(j["data"]["apps_truncated"] == false);
+    CHECK_FALSE(j["data"].contains("stat_failures"));
+    const auto& first = j["data"]["apps"][0];
+    for (const char* k : {"share_affected", "rate_per_1000", "score", "version_count", "versions_truncated"})
+        CHECK(first.contains(k));
+    CHECK(first["versions"].is_array());
+    CHECK(res->body.find("below_floor") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not a 503",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["apps"].is_array());
+    CHECK(j["data"]["apps"].empty());
+    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(res->body.find("retry_after_ms") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: a degraded store read -> 503 with retry_after_ms, never an empty list",
+          "[pg][rest][dex][apps][degraded]") {
+    RestGsHarness h;
+    h.seed_obs("b1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"] == 503);
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: an off-enum window is a 400, never a silent default",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/apps?window=bogus");
+    REQUIRE(res);
+    CHECK(res->status == 400);
 }
 
 TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",
@@ -2670,6 +2745,9 @@ TEST_CASE("REST dex/catalogue: invalid os / window -> 400, missing dex_api -> 50
         auto res = h.sink.Get("/api/v1/dex/catalogue");
         REQUIRE(res);
         CHECK(res->status == 503);
+        auto apps = h.sink.Get("/api/v1/dex/apps");
+        REQUIRE(apps);
+        CHECK(apps->status == 503);
     }
 }
 
@@ -3345,17 +3423,121 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         auto j = nlohmann::json::parse(res->body);
         CHECK(j["data"]["app"].get<std::string>() == "chrome.exe");
         CHECK(j["data"]["points"].is_array());
+        // The additive per-version join: present and empty with no points, the
+        // window and exposure basis echoed, nothing counted as a failure.
+        CHECK(j["data"]["versions"].is_array());
+        CHECK(j["data"]["versions"].empty());
+        CHECK(j["data"]["versions_truncated"] == false);
+        CHECK(j["data"]["failure_window_days"] == 30);
+        CHECK(j["data"]["exposure_basis"].get<std::string>() == "resource_significant");
+        CHECK(j["data"]["stat_failures"] == 0);
     }
-    SECTION("sub-floor fleet point serializes suppressed, stats omitted") {
-        // The fleet path floors too now — a sub-floor (version,day) point must carry
-        // suppressed=true with device_count only, never zeroed stats that read as
-        // "3 devices @ 0% CPU" (security re-review of the suppressed-flag fix).
+    SECTION("two versions: points unchanged, versions[] joined with the failure rows") {
+        // The exact pre-change bytes of app, version and points[] for the fixture below.
+        const std::string kGoldenPrefix =
+            R"("app":"chrome.exe","version":"","points":[)"
+            R"({"version":"124.0.0.0","day":1700000000,"device_count":12,"suppressed":false,)"
+            R"("cpu_mean":5.00,"cpu_max":9.00,"cpu_p50":null,"cpu_p95":null,"ws_mean":100,)"
+            R"("ws_max":200,"ws_p50":null,"ws_p95":null,"hist_stale":false},)"
+            R"({"version":"125.0.0.0","day":1700000000,"device_count":15,"suppressed":false,)"
+            R"("cpu_mean":5.00,"cpu_max":9.00,"cpu_p50":null,"cpu_p95":null,"ws_mean":100,)"
+            R"("ws_max":200,"ws_p50":null,"ws_p95":null,"hist_stale":false}])";
+        RestGsHarness h;
+        auto mk = [](const char* v, std::int64_t devices) {
+            yuzu::server::AppPerfFleetRow r;
+            r.app_name = "chrome.exe";
+            r.version = v;
+            r.day = 1'700'000'000;
+            r.device_count = devices;
+            r.cpu_sum = 5.0 * static_cast<double>(devices);
+            r.cpu_max = 9.0;
+            r.ws_sum = 100 * devices;
+            r.ws_max = 200;
+            r.hist_version = yuzu::server::kAppPerfHistVersion;
+            r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+            r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+            return r;
+        };
+        h.fleet_rows_ = {mk("124.0.0.0", 12), mk("125.0.0.0", 15)};
+        yuzu::server::AppPerfVersionFailureRow f124;
+        f124.version = "124.0.0.0";
+        f124.exposure_devices = 9; // under the old device floor: published all the same
+        f124.crashes = 7;
+        f124.hangs = 1;
+        f124.affected_devices = 5;
+        f124.exposed_crashes = 4;
+        f124.exposed_hangs = 1;
+        yuzu::server::AppPerfVersionFailureRow f125;
+        f125.version = "125.0.0.0";
+        f125.exposure_devices = 15;
+        f125.crashes = 10;
+        f125.hangs = 2;
+        f125.affected_devices = 14;
+        f125.exposed_crashes = 10;
+        f125.exposed_hangs = 2;
+        h.failure_rows_ = {f124, f125};
+        auto res = h.sink.Get("/api/v1/dex/perf/app?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        // points[] keeps its existing shape and its two-decimal means.
+        // The bytes ahead of versions[] are the unchanged fleet-trend body: app, version
+        // and the points, with two-decimal means.
+        {
+            const auto from = res->body.find("\"app\":");
+            const auto to = res->body.find(",\"versions\":");
+            REQUIRE(from != std::string::npos);
+            REQUIRE(to != std::string::npos);
+            CHECK(res->body.substr(from, to - from) == kGoldenPrefix);
+        }
+        REQUIRE(j["data"]["points"].size() == 2);
+        CHECK(j["data"]["points"][0]["version"].get<std::string>() == "124.0.0.0");
+        CHECK(j["data"]["points"][0]["device_count"] == 12);
+        CHECK(j["data"]["points"][0]["cpu_mean"].get<double>() == 5.0);
+        REQUIRE(j["data"]["versions"].size() == 2);
+        const auto& v125 = j["data"]["versions"][0];
+        CHECK(v125["version"].get<std::string>() == "125.0.0.0");
+        CHECK(v125["previous_version"].get<std::string>() == "124.0.0.0");
+        CHECK_FALSE(v125.contains("below_floor"));
+        CHECK_FALSE(v125.contains("exposure_below_floor"));
+        CHECK(v125["crashes"] == 10);
+        CHECK(v125["exposure_devices"] == 15);
+        CHECK(v125["failure_rate"]["estimate"].get<double>() == Catch::Approx(0.8));
+        // (12/15) / (5/9): the 9-device arm is published, not withheld.
+        CHECK(v125["failure_rate_ratio"]["estimate"].get<double>() == Catch::Approx(1.44));
+        CHECK(v125["failure_rate_ratio"]["unbounded"] == false);
+        const auto& v124 = j["data"]["versions"][1];
+        CHECK_FALSE(v124.contains("below_floor"));
+        CHECK(v124["affected_devices"] == 5);
+        CHECK(v124["crashes"] == 7);
+        CHECK(v124["hangs"] == 1); // one hanging device, still published
+        CHECK(v124["exposure_devices"] == 9);
+        CHECK(v124["exposed_crashes"] == 4);
+        CHECK(v124["exposed_hangs"] == 1);
+        CHECK(v124["failure_rate"]["estimate"].get<double>() == Catch::Approx(5.0 / 9.0));
+        CHECK(v124["previous_version"].is_null());
+        CHECK(v124["failure_rate_ratio"].is_null());
+    }
+    SECTION("failure read degraded → 503 with the A4 envelope, never a 200 without versions") {
+        RestGsHarness h;
+        h.failures_degraded_ = true;
+        auto res = h.sink.Get("/api/v1/dex/perf/app?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["code"].get<int>() == 503);
+    }
+    SECTION("three-device fleet point serializes published at the one-device floor") {
+        // The fleet path floors through the ONE constant, which is one device
+        // (maintainer ruling 2026-10-14): a three-device point carries its exact
+        // stats with suppressed=false (it was suppressed at the old floor of 10).
         RestGsHarness h;
         yuzu::server::AppPerfFleetRow r;
         r.app_name = "niche.exe";
         r.version = "1.0";
         r.day = 1'700'000'000;
-        r.device_count = 3; // < kDexCohortFloor (10)
+        r.device_count = 3; // >= kDexCohortFloor (1)
         r.cpu_sum = 30.0;
         r.cpu_max = 10.0;
         r.ws_sum = 300;
@@ -3370,9 +3552,10 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         auto j = nlohmann::json::parse(res->body);
         REQUIRE(j["data"]["points"].size() == 1);
         const auto& pt = j["data"]["points"][0];
-        CHECK(pt["suppressed"] == true);
+        CHECK(pt["suppressed"] == false);
         CHECK(pt["device_count"] == 3);
-        CHECK_FALSE(pt.contains("cpu_mean")); // stats omitted when suppressed
+        REQUIRE(pt.contains("cpu_mean"));
+        CHECK(pt["cpu_mean"].get<double>() == Catch::Approx(10.0)); // 30.0 / 3
     }
 }
 
@@ -3473,7 +3656,9 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         REQUIRE(res);
         CHECK(res->status == 200);
         auto j = nlohmann::json::parse(res->body);
-        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+        // The one-device floor as a literal: deliberately not kDexCohortFloor, so a
+        // constant change breaks this wire pin.
+        CHECK(j["data"]["floor"].get<int64_t>() == 1);
         CHECK(j["data"]["key"].get<std::string>() == "model");
         CHECK(j["data"]["value"].get<std::string>() == "Latitude 5420");
     }
@@ -3489,7 +3674,7 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         r.app_name = "niche.exe";
         r.version = "1.0";
         r.day = 1'700'000'000;
-        r.device_count = 3; // < kDexCohortFloor (10)
+        r.device_count = 3; // >= kDexCohortFloor (1); was sub-floor at 10
         r.cpu_sum = 30.0;
         r.cpu_max = 10.0;
         r.ws_sum = 300;
@@ -3505,9 +3690,10 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         auto j = nlohmann::json::parse(res->body);
         REQUIRE(j["data"]["points"].size() == 1);
         const auto& pt = j["data"]["points"][0];
-        CHECK(pt["suppressed"] == true);
+        CHECK(pt["suppressed"] == false);
         CHECK(pt["device_count"] == 3);
-        CHECK_FALSE(pt.contains("cpu_mean"));
+        REQUIRE(pt.contains("cpu_mean"));
+        CHECK(pt["cpu_mean"].get<double>() == Catch::Approx(10.0));
     }
 }
 
@@ -3560,8 +3746,16 @@ TEST_CASE("REST dex/perf/group: missing params → 400; provider absent → 503;
         REQUIRE(res);
         CHECK(res->status == 200);
         auto j = nlohmann::json::parse(res->body);
-        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+        CHECK(j["data"]["floor"].get<int64_t>() == 1); // the one-device floor, as a literal
     }
+}
+
+TEST_CASE("REST dex/perf/cohort-diff: the one-device floor is echoed", "[pg][rest][dex][app_perf]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/perf/cohort-diff?a=x&b=y");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(nlohmann::json::parse(res->body)["data"]["floor"].get<int64_t>() == 1);
 }
 
 TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
@@ -3611,7 +3805,7 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
         auto j = nlohmann::json::parse(res->body);
         CHECK(j["data"]["paired"].get<int64_t>() == 2);
         CHECK(j["data"]["cohort_size"].get<int64_t>() == 2);
-        CHECK(j["data"]["small_cohort"].get<bool>() == true); // 2 < kDexCohortFloor
+        CHECK(j["data"]["small_cohort"].get<bool>() == false); // 2 >= kDexCohortFloor (1)
         CHECK(j["data"]["insufficient"].get<bool>() == false);
         CHECK(j["data"]["cpu"]["before_mean"].get<double>() == Catch::Approx(2.5));
         CHECK(j["data"]["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));

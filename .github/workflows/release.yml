@@ -146,8 +146,9 @@ jobs:
           persist-credentials: false
 
       # Activate Erlang/OTP + rebar3 so the meson `.gateway_built` custom_target
-      # (auto-enabled whenever rebar3 is on PATH — meson.build gates the gateway
-      # purely on `find_program('rebar3')`) can run `escript` at compile time.
+      # (enabled when rebar3 is on PATH AND an OTP passing the pin in
+      # scripts/erlang_toolchain.py - 28.4 or any later 28.x - is found at
+      # configure) can run `escript` at compile time.
       # The github-runner user has rebar3 in ~/.local/bin but no OTP runtime on
       # PATH, so without this the Build step fails at `.gateway_built` with
       # "escript: No such file or directory". Pin matches ci.yml + the

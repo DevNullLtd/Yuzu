@@ -1,49 +1,30 @@
 // Help page — Phase 2 stub.
 // Full HTMX help page will be implemented as part of the instruction system.
 
+#include "app_shell.hpp"
+
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kHelpHtml = R"HTM(<!DOCTYPE html>
+const char* const kHelpPageTemplate = R"HTM(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu — Help</title>
 <link rel="stylesheet" href="/static/yuzu.css">
+<script src="/static/htmx.js"></script>
 <style>
-.help-content{max-width:800px;margin:1.5rem auto;padding:0 1.5rem}
-h1{border-bottom:1px solid var(--border);padding-bottom:.5rem}
+.help-content{padding:22px 28px 36px}
+.help-content a{color:var(--primary);text-decoration:none}
+.help-content a:hover{text-decoration:underline}
+.help-content a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 </style>
 </head><body>
 
-<nav class="nav-bar">
-  <a href="/" class="nav-brand">
-    <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
-  </a>
-  <a href="/" class="nav-link">Dashboard</a>
-  <a href="/instructions" class="nav-link">Instructions</a>
-  <a href="/compliance" class="nav-link">Compliance</a>
-  <a href="/guardian" class="nav-link">Guardian</a>
-  <a href="/dex" class="nav-link">DEX</a>
-  <a href="/tar" class="nav-link">TAR</a>
-  <a href="/hardware" class="nav-link">Hardware</a>
-  <a href="/software" class="nav-link">Software</a>
-  <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-    <a href="/result-sets" class="nav-link">Result Sets</a>
-  <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
-  <span class="nav-spacer"></span>
-  <span class="nav-user" id="nav-user"></span>
-  <button class="nav-logout" hx-post="/logout">Logout</button>
-</nav>
-<div class="context-bar" id="context-bar">
-  <span class="context-role-badge" id="role-badge"></span>
-  <span class="context-user" id="context-user"></span>
-  <span class="context-spacer"></span>
-  <button class="context-bell" title="Notifications">
-    <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
-  </button>
-</div>
+  <!--yuzu:shell--><!--/yuzu:shell-->
 
 <div class="help-content">
+<header class="page-header"><div>
 <h1>Help</h1>
-<p>Help page is under construction. See the <a href="/">dashboard</a>.</p>
+<p class="subtitle">Help page is under construction. See the <a href="/">Console</a>.</p>
+</div></header>
 </div>
 
 <div id="toast-container" class="toast-container"></div>
@@ -73,26 +54,10 @@ document.body.addEventListener('showToast', function(e) {
   showToast(d.message || 'Done', d.level || 'success');
 });
 </script>
-<script>
-fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-  document.getElementById('nav-user').textContent = (d.display_name || d.username);
-  var role = d.rbac_role || d.role;
-  document.getElementById('role-badge').textContent = role;
-  document.getElementById('context-user').textContent = (d.display_name || d.username);
-  document.body.setAttribute('data-role', role);
-  if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
-    var sl = document.getElementById('nav-settings-link');
-    if(sl) sl.style.display = 'none';
-  }
-});
-/* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-document.addEventListener('keydown', function(e) {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-    e.preventDefault();
-    window.location.href = '/?palette=1';
-  }
-});
-</script>
 </body></html>
 )HTM";
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kHelpHtml =
+    yuzu::server::shell::bake(kHelpPageTemplate, {.title = "Help"});
 // NOLINTEND(cert-err58-cpp)

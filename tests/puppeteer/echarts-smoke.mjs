@@ -35,6 +35,8 @@ async function main() {
   await page.type('input[name="password"]', 'YuzuUatAdmin1!');
   await page.click('button[type="submit"]');
   await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+  // Sign-in now ends on the landing page (/home); the console is the Dashboard at /.
+  await page.goto('http://localhost:8080/', { waitUntil: 'networkidle2', timeout: 15000 });
 
   // QA-S4: wait for the adapter to finish booting deterministically
   // rather than wall-clock-sleeping. ECharts and YuzuCharts globals

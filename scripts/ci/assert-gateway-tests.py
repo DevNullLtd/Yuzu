@@ -2,10 +2,11 @@
 """Fail a CI leg whose Meson configure did not register the gateway tests.
 
 meson.build builds the Erlang gateway and registers `gateway eunit` /
-`gateway ct` only when `find_program('rebar3', required: false)` succeeds.
-Otherwise it skips them silently and the leg stays green with no gateway
-built or tested: the macOS leg ran that way from the start (#4841), and a
-runner that loses Erlang would do the same.
+`gateway ct` only when rebar3 is found AND an Erlang/OTP passing the pin
+(scripts/erlang_toolchain.py, 28.4 or any later 28.x) is resolved. Otherwise
+it skips them and the leg stays green with no gateway built or tested: the
+macOS leg ran that way from the start (#4841), and a runner that loses Erlang
+- or moves to an OTP outside the pin - would do the same.
 
 This check runs right after `meson setup` and reads the test list Meson just
 wrote (`<builddir>/meson-info/intro-tests.json`). It deliberately does NOT
@@ -45,9 +46,11 @@ def main(argv):
     missing = missing_tests(tests)
     if missing:
         print("::error::Meson did not register " + ", ".join(repr(n) for n in missing)
-              + " -- rebar3 (Erlang/OTP 28) was not found at configure time, so the "
-              "gateway would be silently skipped on this leg (#4841). Provision "
-              "Erlang on this runner (CI: erlef/setup-beam).")
+              + " -- at configure time either rebar3 was not found or no Erlang/OTP "
+              "passed the pin (28.4 or any later 28.x), so the gateway would be skipped "
+              "on this leg (#4841). The configure log's 'Erlang gateway: SKIPPED' "
+              "warning lists every install inspected. Provision a matching Erlang on "
+              "this runner (CI: see this leg's Erlang install step in ci.yml).")
         return 1
     print(f"assert-gateway-tests: {', '.join(REQUIRED)} registered.")
     return 0

@@ -215,6 +215,39 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/workflows",
+    "capability_id": "get.fragments-workflows",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflows"
+    },
+    "mcp_twin": "list_workflows",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/workflow-runs",
+    "capability_id": "get.fragments-workflow-runs",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflow-executions"
+    },
+    "mcp_twin": "list_workflow_executions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/workflow-runs/{param}",
+    "capability_id": "get.fragments-workflow-runs-param",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflow-executions/{param}"
+    },
+    "mcp_twin": "get_workflow_execution",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/schedules",
     "capability_id": "get.fragments-schedules",
     "rest_v1_twin": {

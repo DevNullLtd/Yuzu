@@ -605,7 +605,7 @@ TEST_CASE("software routes: any degraded read is the retry banner with an audite
     REQUIRE(contains(res->body, "hx-get=\"/fragments/inventory/software\" hx-target"));
     REQUIRE_FALSE(contains(res->body, "(503)"));
     auto filtered = h.sink.Get(std::string(kSoftware) + "?kind=app");
-    REQUIRE(contains(filtered->body, "data-act=\"retry\" style=\"margin-left:.6rem\" "
+    REQUIRE(contains(filtered->body, "data-act=\"retry\" "
                                      "hx-get=\"/fragments/inventory/software?kind=app\""));
 
     // ONE provider failing (the rows read; every other read answers) is the same degrade.
@@ -956,6 +956,9 @@ TEST_CASE("software routes: the shell carries the page script and /inventory red
     REQUIRE(contains(shell->body, "function swHost"));
     REQUIRE(contains(shell->body, "hx-get=\"/fragments/inventory/software\""));
     REQUIRE(contains(shell->body.substr(shell->body.rfind("function swHost")), "</body>"));
+    // The route's active_key lights the Software sidebar item and ends the breadcrumb on it.
+    REQUIRE(contains(shell->body, "<a class=\"shell-nav on\" href=\"/software\" aria-current=\"page\">"));
+    REQUIRE(contains(shell->body, "<span class=\"shell-sep\">/</span><b>Software</b>"));
     auto redirect = h.sink.Get("/inventory");
     REQUIRE(redirect);
     REQUIRE(redirect->status == 302);

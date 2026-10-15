@@ -763,7 +763,9 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/20261014-quarantine-routes-audit-before-change.changed.md"
+    ],
     "definitions": [
       "content/definitions/quarantine.yaml"
     ],

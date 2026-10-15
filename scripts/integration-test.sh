@@ -29,15 +29,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Ensure `erl` / `escript` / `rebar3` are on PATH before the gateway build
-# step runs. The helper is a no-op if Erlang is already available; otherwise
-# it probes kerl / asdf / Homebrew / MSYS2 and activates the first match.
-# The "28" arg pins the major version tracked by release.yml — keep in
-# sync with erlef/setup-beam otp-version in .github/workflows/release.yml.
+# step runs. The helper is a no-op if a passing Erlang is already first on
+# PATH; otherwise it asks scripts/erlang_toolchain.py find-otp and activates
+# what it picks. The "" arg selects the pinned default (DEFAULT_OTP_VERSION:
+# 28.4 or any later 28.x) and keeps this script's own $1 from being read as a
+# version.
 # shellcheck source=ensure-erlang.sh
-source "$SCRIPT_DIR/ensure-erlang.sh" 28
+source "$SCRIPT_DIR/ensure-erlang.sh" ""
 if ! command -v erl > /dev/null 2>&1; then
     echo "FAIL: erl not on PATH after ensure-erlang.sh (needed for rebar3/escript)" >&2
-    echo "      Install via kerl (kerl install 28.4.2), asdf, Homebrew, or the" >&2
+    echo "      Install via kerl (kerl build-install 28.4.2 28.4.2 ~/.kerl/28.4.2), asdf, Homebrew, or the" >&2
     echo "      MSYS2 Erlang installer, then rerun." >&2
     exit 1
 fi
@@ -739,8 +740,8 @@ log ""
 
 # ── Test 1: Server web UI is reachable ────────────────────────────────
 log "Test: Server web UI"
-HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/login" || echo "000")
-assert_eq "Server /login returns 200" "200" "$HTTP_CODE"
+HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/home" || echo "000")
+assert_eq "Server /home (sign-in landing page) returns 200" "200" "$HTTP_CODE"
 
 # ── Test 2: Server shows connected agents ─────────────────────────────
 log "Test: Agent registration through gateway"

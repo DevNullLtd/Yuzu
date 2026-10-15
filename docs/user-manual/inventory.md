@@ -468,7 +468,7 @@ The old three-tab **Inventory** dashboard is gone. `/inventory` itself still exi
 route, but it now just **302-redirects to `/hardware`** (auth still gates first, so an
 unauthenticated visitor lands on `/login`, never in a redirect loop through an
 authed-only destination) — old bookmarks and links keep working, nothing to change on
-your end beyond expecting a redirect. The top nav carries two separate links in its
+your end beyond expecting a redirect. The sidebar's **Estate** group carries two separate links in its
 place, **Hardware** and **Software**, each its own page:
 
 - **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
@@ -485,7 +485,12 @@ place, **Hardware** and **Software**, each its own page:
   device in one action — under the hood it loops the existing single-device tag routes,
   so each device still runs its own `Tag:Write` gate and its own `tag.set`/`tag.delete`
   audit row; nothing is bulk-authorized. The KPI strip (Total CIs / Online / Offline /
-  Stale / CI coverage) is computed over the same rows the table shows. **The list is
+  Stale / CI coverage) is computed over the same rows the table shows. Two readouts sit
+  beside it: **Median memory** (over the devices that have synced a positive RAM figure,
+  with that device count in the label) and a **By manufacturer** line (case-folded, the
+  top eight and an "Other" tail). Both are computed from the devices you can see before
+  any search or filter narrows the table, and both are hidden when no device has synced
+  the figure or the CI columns are degraded. **The list is
   gated on the global `Inventory:Read`, but — unlike the old Devices tab, whose
   management-group confinement this doc used to flag as "designed for, not yet verified
   effective" — it is wired as a live caller of the real ADR-0017 admit-then-filter
@@ -515,8 +520,30 @@ place, **Hardware** and **Software**, each its own page:
     `inventory.device.software`), now with its own filter box and, for the first time,
     rendered **Signature** and **Ecosystem** columns. Carries the same **Sync now**
     affordance, scoped to the `installed_software` source.
-  - **Tags** — inline add/remove via the existing tag routes, shown only when a
-    `Tag:Write` probe passes for the device.
+  - **Tags and properties** — inline add/remove via the existing tag routes. Add is
+    shown when a `Tag:Write` probe passes for the device; Remove needs its own
+    `Tag:Delete` probe (a different permission), taken only when this lens is open. The
+    lens also hosts **Custom properties** (the device's `props.<key>` values, read from
+    `GET /api/agents/{id}/properties`, gated on scoped `Infrastructure:Read`; edit
+    controls need `Infrastructure:Write`) and **Property schemas** (fleet-wide, read from
+    `GET /api/property-schemas`, so a management-group-confined operator sees a note
+    naming the missing fleet-wide `Infrastructure:Read` grant instead). Both load in one
+    fragment, `GET /fragments/hardware/ci/properties?id=`; a degraded store reads
+    "could not be read", never "No properties set." Property values are written to the
+    audit log (`custom_property.set`) and take part in scope expressions.
+    Add tag, Remove tag, Add or edit property, Delete property and Save schema open a
+    dialog (`static/yuzu-device-data.js` on the shared dialog module); removing or setting
+    the `service` tag says that it decides which service-scoped API tokens can reach the
+    device. The **environment** tag accepts only `Dev`, `UAT` or `Production`, exact case.
+  - **Installed software** also shows "N applications, last synced <time>" (a device that
+    never synced and a degraded read are worded differently), and two **click-to-load**
+    panels: **Application usage** (hours and runs over the last 30 days, first and last
+    seen, the first 200 executables by hours; scoped `Forensics:Read`, audit verb
+    `app_usage.agent.view`) and **Detected licences** (scoped `SoftwareLicensing:Read`,
+    audit verb `sle.agent.view`; no per-user column). Both write the audit row before
+    reading and, when it cannot persist, show "withheld" with `Sec-Audit-Failed: true`
+    and no data. They are the HTML twins of `GET /api/v1/forensics/agents/{id}/app-usage`
+    and `GET /api/v1/sle/agents/{id}`.
   - **DEX**, **Guardian**, **Live** — not reimplemented: these mount the *same*
     `/fragments/device/*` fragments the (now-redirected) device page used, each gated on
     scoped `GuaranteedState:Read` as before. **Live** additionally carries the ten
@@ -554,6 +581,11 @@ place, **Hardware** and **Software**, each its own page:
     Yuzu does not hold yet (end-of-support, unused, unauthorised, new titles,
     normalisation). The strip is the fleet-wide hourly rollup and does not change with
     the filters.
+  - **Inventory sources.** A panel under the results lists each collector that has
+    written inventory (Source, Devices, Last collected). It is the HTML twin of
+    `GET /api/v1/inventory/tables` and needs the fleet-wide `Inventory:Read` grant; a
+    caller without it sees a note, a degraded store says so, and an empty store says no
+    inventory has been collected yet.
   - **Search and filters.** One search box matches title, publisher, ecosystem or the
     source that found the software; chips narrow by kind, ecosystem and found-by; a host
     type-ahead shows a single device's software. The type-ahead lists the first 1,000
@@ -578,6 +610,48 @@ place, **Hardware** and **Software**, each its own page:
   - **Exports** are plain download links to the REST routes: the matching install rows as
     JSON or CSV (up to 10,000; the file says if it was cut off) and the titles as CSV.
     The sprawl filter is not applied to install exports.
+  - **Sync now.** The button at the top of the page asks devices to re-send their
+    installed-software inventory now instead of waiting for the ~24 h cadence. A dialog
+    offers three choices: **This device** (offered while the Host box names a listed host),
+    **Devices matching a scope expression or group** (a scope expression, or `group:<id>`),
+    and **Whole fleet**. For a scope expression the Review step previews the match count
+    through `POST /api/v1/scope/preview`; that route needs `Infrastructure:Read`, so if it is
+    refused for lack of permission the dialog goes on to the confirm step without a count; any
+    other preview error (an invalid expression, for example) is shown in the dialog before you
+    can confirm. After you confirm, a
+    notice says how many devices were asked to sync and how many were skipped. It calls
+    `POST /api/v1/hardware/sync`.
+    - **Who may.** The route needs `Execution:Execute`, checked as a **global** grant (or
+      RBAC off). An operator whose `Execution:Execute` is limited to management groups is
+      refused with `403` for every choice, including a single device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The route also
+      confines its targets to the caller's own `Execution:Execute` visible set and refuses
+      **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
+      changes the outcome today, and both stay in place as defence in depth for when the
+      gate becomes scope-aware.
+    - **Which devices.** A run reaches agents attached to **this server process** only.
+      `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability).
+      Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing.
+      `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents older than 0.13.1 are skipped
+      and counted separately (`skipped_version`). One request reaches at most 500 devices (`413` above that, counted after the skips:
+      narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
+      up to 256 bytes.
+    - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
+      (`429` with `Retry-After`; an attempt refused for exceeding 500 devices, or with no live target, counts as a run, a send every device refused does not) and one at a time per server process (`409`); a single device
+      is exempt from both. A `409` can follow a slow agent connection: the server sends to its
+      targets one after another, and a connected agent that has stopped reading holds the run
+      for at most 120 seconds, after which the next request takes the run over (`retry_after_ms` on the `409` is the time until that lease lapses; the stalled send itself is not cancelled). At most three runs are alive at once: while three stalled sends are still alive, no further takeover is allowed, the `409` keeps answering, and a WARN line is logged, until one of those sends unwinds (the agent reads, or its connection is cut) or the server restarts. A server clock that steps backwards
+      cannot lock an operator out: a last-run time in the future is ignored. Both limits are
+      held in each server process, not across a cluster: with several active servers every
+      one allows its own run and keeps its own per-operator cooldown, and each run is still
+      bounded by the 500-device cap. One run can make up to 500 agents upload their
+      inventory at nearly the same moment; see the connection-pool note in
+      [Server administration](server-admin.md).
+    - **Audit and result.** The request is audited as `inventory.sync.request` before
+      anything is sent, and is refused if the audit row cannot be written. `202` means the
+      request was sent, not that the devices have synced: the page's figures change when each
+      device reports back. In the `202` body `agents_reached` is the number of agents that
+      accepted the request; the audit row's `reached` is the number the run planned to send
+      to.
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
@@ -635,9 +709,17 @@ conflated.
 
 The Hardware list and its KPI strip serve at most the 100,000 most recently seen
 endpoints within the 30-day window; a fleet above that sees a capped list without a
-warning (a truncation signal is tracked in #5712). The per-device record's offline
+warning (a truncation signal is tracked in #5712). The cap counts distinct enrolled
+`agent_id`s seen in the window: a device that disconnects cleanly stays listed as
+Offline for the full 30 days (#5678), and a device re-enrolled under a new `agent_id`
+appears as two rows until the old one ages out. The per-device record's offline
 identity fallback reads the same capped set, so an offline device outside it shows no
 identity and, with nothing else synced, reads as not found.
+
+A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
+deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates
+it. A device that is never decommissioned stays listed as Offline for the 30-day window,
+and its stored record is deleted 37 days after its last contact.
 
 ## Access control
 

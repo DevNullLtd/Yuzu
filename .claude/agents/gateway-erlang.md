@@ -26,32 +26,34 @@ You own all Erlang source code in `gateway/`. You ensure the OTP supervision tre
 
 ## Toolchain Activation
 
-Before *any* Erlang work in this repo — `rebar3`, `erlc`, standalone `erl` shells, even `meson compile` runs that touch the gateway — the Erlang/OTP toolchain must be on `PATH`. Never assume it is; **always verify and activate first.**
+Before any by-hand Erlang work in this repo — `rebar3`, `erlc`, standalone `erl` shells — the pinned Erlang/OTP must be on `PATH` (a Meson build resolves it itself). Never assume it is; **always verify and activate first.**
 
 ### The helper
 
-`scripts/ensure-erlang.sh` is the canonical toolchain activator. Source it at the start of any session that touches Erlang, and verify:
+A Meson build needs no activation: `meson setup` resolves the pinned OTP (28.4 or any later 28.x) itself via `scripts/erlang_toolchain.py find-otp` and hands it to the gateway targets. For running rebar3 / erl / dialyzer by hand, `scripts/ensure-erlang.sh` activates the same pinned OTP in your shell. It returns 0 even when nothing passes the pin, so verify the VERSION, not just that `erl` exists:
 
 ```bash
-source scripts/ensure-erlang.sh           # default: latest 28.x
-source scripts/ensure-erlang.sh 28.4.2    # exact pin
-command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
+source scripts/ensure-erlang.sh           # default: the pin (28.4 or any later 28.x)
+source scripts/ensure-erlang.sh 28.4.2    # 28.4.2 or any later 28.x
+python3 scripts/erlang_toolchain.py find-otp >/dev/null   # exit 0 = the erl it reports passes the pin
 ```
 
-The helper detects the toolchain in this order: **kerl** (Linux/macOS dev boxes, matches by version or major prefix) → **asdf** (classic and 0.16+ rewrite) → **Homebrew** (macOS) → **MSYS2 Program Files probe** (MSYS2 bash on Windows). It **always returns 0**, so callers must verify `command -v erl` themselves — a sourced helper that returned non-zero would trip the parent shell's `set -e`.
+The helper asks the shared resolver (`scripts/erlang_toolchain.py find-otp`: PATH, kerl, asdf, mise, Homebrew, distro prefixes, the Windows installer under Program Files — never `C:\Erlang`) and activates what it picks; without a usable Python it falls back to its own narrower search (kerl → asdf → Homebrew → MSYS2 Program Files). It **always returns 0**, even under `set -euo pipefail`, and leaves PATH unchanged when nothing passes the pin — so verify with `find-otp` (exit 0), not `command -v erl`, which can pass with the wrong release.
 
 ### `erl -version` is misleading
 
-`erl -version` prints the **emulator** version (the BEAM VM version, currently 16.x on OTP 28), not the OTP release version. To get the OTP release, use `erl +V` or read `$ERL_TOP/releases/*/OTP_VERSION`. Confusing these two has wasted debugging time more than once — if the user asks "what OTP version", don't quote the emulator number.
+`erl -version` prints the **emulator** version (the BEAM VM version, currently 16.x on OTP 28), not the OTP release version. To get the OTP release, read the live release's OTP_VERSION (see `releases/start_erl.data`), e.g. via `python3 scripts/erlang_toolchain.py find-otp`, or read `$ERL_TOP/releases/*/OTP_VERSION`. Confusing these two has wasted debugging time more than once — if the user asks "what OTP version", don't quote the emulator number.
 
 ### Common activation failures
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `rebar3: command not found` after sourcing helper | Toolchain dir not installed where helper probes | `kerl install 28.4.2` (or asdf/brew equivalent), rerun |
+| `rebar3: command not found` after sourcing helper | rebar3 is not installed | Install rebar3 (e.g. the 3.24 escript into `~/.local/bin`) |
+| Helper says `no Erlang/OTP 28.4 or later 28.x found` | No install passes the pin | `kerl build-install 28.4.2 28.4.2 ~/.kerl/28.4.2` (or asdf / `brew install erlang@28`), rerun |
 | `Plugin gpb does not export init/1` | Benign — gpb is used via `grpc` config, not as a rebar3 plugin | Ignore |
 | `erl` is on PATH but `erl -version` hangs | Broken symlink or wrong-arch binary — helper probes with `erl -version` to catch this, but if you sourced manually it may still be stale | Delete the stale install and reinstall |
-| Meson custom_target `.gateway_built` fails while C++ targets succeed | Forgot to source `ensure-erlang.sh` before `meson compile` | Source it, rerun |
+| Configure prints `WARNING: Erlang gateway: SKIPPED.` | rebar3 is installed but no Erlang/OTP 28.4+ (same major) was found; the warning lists every install inspected | Install a matching OTP (or point `YUZU_OTP_BIN` at its `bin/`), then `meson setup --reconfigure` |
+| `.gateway_built` fails with "the configured Erlang/OTP ... is now ..." | The OTP Meson resolved was removed or replaced after configure | `meson setup --reconfigure <builddir>` |
 
 ## Build & Test Commands
 
@@ -59,7 +61,7 @@ All commands run from the **repo root**. Source the Erlang toolchain helper firs
 
 ```bash
 source scripts/ensure-erlang.sh >/dev/null
-command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
+python3 scripts/erlang_toolchain.py find-otp >/dev/null || { echo "no Erlang/OTP passing the pin"; exit 1; }
 
 cd gateway
 rebar3 compile                                                           # compile only
@@ -271,8 +273,8 @@ factorial(0) -> 1.
 
 | Area | Issue | Solution |
 |------|-------|----------|
-| Erlang toolchain not on PATH | `meson compile` fails on the gateway custom_target even though C++ targets succeed | `source scripts/ensure-erlang.sh` then verify `command -v erl` before any build or test command |
-| `erl -version` | Prints **emulator** version (16.x on OTP 28), not OTP release version | Use `erl +V` for OTP release |
+| No Erlang/OTP passing the pin | `meson setup` prints `WARNING: Erlang gateway: SKIPPED.` (or, under `-Drequire_gateway=true`, a configure error); by-hand rebar3 uses whatever erl is on PATH | A Meson build resolves OTP itself (see Toolchain Activation); for by-hand rebar3, `source scripts/ensure-erlang.sh` then verify with `python3 scripts/erlang_toolchain.py find-otp` before any build or test command |
+| `erl -version` / `erl +V` | Both print the **emulator** (ERTS) version (16.x on OTP 28), not the OTP release | Read `releases/<rel>/OTP_VERSION` (the live `<rel>` is in `releases/start_erl.data`), or run `python3 scripts/erlang_toolchain.py find-otp` |
 | `rebar3 eunit` (bare) | Rejects orphan test modules with `Module X not found in project` | Always pass `--dir apps/yuzu_gw/test` (#337) |
 | `rebar3 eunit --module X` | Does NOT isolate — runs full suite first in the same BEAM, then the filter | Delete `_build/test` or use `erl -pa ...` directly for real isolation |
 | Mock processes leaked across test modules | `spawn(fun() -> mock_loop() end) + register(yuzu_gw_registry, Pid)` in one test leaks a silent-discard gen_server stand-in; next module's `gen_server:call` hangs for 5s and cancels | Cleanup must look up the *current* `whereis(Name)`, not a cached pid. Consumers should verify `proc_lib:initial_call(Pid) =:= {gen_server, init_it, _}` before trusting a registered name. (#336) |

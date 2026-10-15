@@ -7,6 +7,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "audited_write.hpp"
 #include "http_route_sink.hpp"
 #include "offload_target_store.hpp"
 
@@ -26,7 +27,9 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
-    using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
+    /// Returns whether the row was persisted: create and delete write an `attempted` row FIRST
+    /// and refuse (503, `Sec-Audit-Failed`) when this reports false (ADR-0033 section 9).
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
 
@@ -37,13 +40,13 @@ public:
     ///   DELETE /api/v1/offload-targets/:id
     ///   GET    /api/v1/offload-targets/:id/deliveries
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                         OffloadTargetStore* offload_store);
+                         OffloadTargetStore* offload_store, WriteGate write_gate = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink without httplib::Server's TSan-hostile
     /// acceptor (#438).
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                         OffloadTargetStore* offload_store);
+                         OffloadTargetStore* offload_store, WriteGate write_gate = {});
 };
 
 } // namespace yuzu::server

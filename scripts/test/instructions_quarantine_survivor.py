@@ -199,7 +199,9 @@ class YuzuClient:
         body = json.dumps({"params": {k: str(v) for k, v in params.items()}}).encode()
         req = urllib.request.Request(
             f"{self.base}/api/instructions/{urllib.parse.quote(def_id)}/execute",
-            data=body, headers={"Content-Type": "application/json"})
+            data=body, headers={"Content-Type": "application/json",
+                                # Same-site Origin, as the dashboard sends (cookie write).
+                                "Origin": self.base})
         try:
             with self.opener.open(req, timeout=self.timeout) as resp:
                 return resp.status, json.loads(resp.read() or b"{}")

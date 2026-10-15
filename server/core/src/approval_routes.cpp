@@ -137,7 +137,7 @@ void register_approval_routes(HttpRouteSink& sink, Deps deps) {
                   deps.emit_event_fn("approval.approved", req, {{"reviewer", reviewer}},
                                      {{"approval_id", id}});
                   res.set_header("HX-Trigger",
-                                 R"({"showToast":{"message":"Approved","level":"success"}})");
+                                 R"({"showToast":{"message":"Approved","level":"success"},"refreshApprovals":true})");
                   res.set_content(R"({"status":"approved"})", "application/json");
               });
 
@@ -197,7 +197,7 @@ void register_approval_routes(HttpRouteSink& sink, Deps deps) {
                                      {{"reviewer", reviewer}, {"comment", comment}},
                                      {{"approval_id", id}});
                   res.set_header("HX-Trigger",
-                                 R"({"showToast":{"message":"Rejected","level":"warning"}})");
+                                 R"({"showToast":{"message":"Rejected","level":"warning"},"refreshApprovals":true})");
                   res.set_content(R"({"status":"rejected"})", "application/json");
               });
 }

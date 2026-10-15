@@ -13,9 +13,9 @@ or app problem — something a network-only tool cannot do.
 
 ## Access
 
-Network is a **sub-view of DEX**, not a standalone top-level nav item: open
-**DEX** in the top navigation bar and choose the **Network** tab, or go to
-`/network` directly. Permission required: **`GuaranteedState:Read`** (the same
+Network is a sub-item of **Fleet** in the sidebar (**Fleet > Network**), not a
+top-level item. It is also the **Network** tab of the DEX page's sub-navigation,
+or go to `/network` directly. Permission required: **`GuaranteedState:Read`** (the same
 permission that gates the Guardian and DEX read surfaces).
 
 ## Overview tab
@@ -80,6 +80,31 @@ read a missing gauge as "0 degraded = healthy".
 Lists devices worst-by-metric (RTT, retransmit, or throughput), or filtered to a
 co-occurrence band or to not-reporting devices, with the co-occurring
 device/app facts flagged inline. Each row links to the device drill-down.
+
+## Discovered hosts
+
+Hosts found by network discovery scans (including hosts with no agent) are
+readable through `GET /api/v1/network/discovered-devices`, the MCP tool
+`list_discovered_devices` and the `/fragments/network/discovered` fragment.
+Permission required: **`Infrastructure:Read`**. Each read is audited as
+`network.discovered.view`, and a service-scoped API token is refused.
+
+- When RBAC is enforced, an operator confined to a management group is refused
+  (`403`): this read is gated by a flat `Infrastructure:Read` check, as the
+  device list is (that one needs `GuaranteedState:Read`), and does not yet narrow
+  rows to the confined operator's devices (tracked by `#5855`, revisit by
+  2026-11-14). A holder of the global grant sees every discovered host.
+- The dashboard fragment answers a failed read (an invalid filter, or an
+  unavailable store) with a failure box and HTTP 200, so the page shows it; the
+  REST and MCP reads return the real `400`/`503`.
+- Results are newest last-seen first, at most 500 rows, filterable by exact
+  subnet. The summary counts (hosts and distinct subnets) cover every matching
+  row; `truncated` says when the list was cut.
+- Hostnames and MAC addresses are reported by agents and shown as received
+  (escaped); a failed reverse lookup reads `unknown`.
+- There is no "managed" column: discovery does not yet match found hosts to
+  enrolled agents, so a managed flag would be wrong for enrolled hosts.
+- A store fault is reported as unavailable, never as an empty list.
 
 ## Platform coverage (v1)
 

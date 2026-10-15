@@ -15,11 +15,13 @@
 #include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
 #include "runtime_config_store.hpp"
+#include "settings_model.hpp" // RetentionEnforced
 #include "tag_store.hpp"
 #include "update_registry.hpp"
 
 #include <httplib.h>
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -35,6 +37,14 @@ class RbacStore;
 class AccessReviewStore;
 class DirectorySync;
 class ScimStore;
+
+/// True when an enrollment token's expiry has passed at `now`. Pure: `now` is injected so
+/// the expired branch can be tested without waiting out a TTL. `expires_at` is
+/// `time_point::max()` for a token that never expires (what `list_tokens` maps a NULL expiry
+/// to). Same comparison the consume path enforces in SQL (`expires_at > now()` must hold to
+/// enrol), so a token the server refuses as expired is never listed Active.
+[[nodiscard]] bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
+                                            std::chrono::system_clock::time_point now) noexcept;
 
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {
@@ -63,9 +73,10 @@ public:
     /// see `rest_audit.hpp`'s "null/empty audit_fn is not a persistence
     /// failure" contract. Not all 8 sub-areas are wired to it: only the four
     /// judged high/mixed-high sensitivity in #4028's Evidence section
-    /// (tls, https, plugin-signing, analytics) call it; the other four
+    /// (tls, https, plugin-signing, analytics) call it; of the other four
     /// (gateway, server-config, mcp, data-retention — "nothing secret" per
-    /// the same Evidence section) issue no audit call at all, matching the
+    /// the same Evidence section) the READ routes issue no audit call at all (`POST
+    /// /api/settings/mcp` writes its audit-first `attempted` row through it), matching the
     /// unaudited posture the existing `/fragments/settings/*` HTML renderers
     /// for those four already have today.
     using AuditReadFn =
@@ -85,6 +96,18 @@ public:
     /// (so no request can race the set). May stay empty (tests) — the
     /// handlers then persist without the live apply.
     void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
+
+    /// Test seam: directory the cert-upload / cert-paste routes write into.
+    /// Empty (production) = auth::default_cert_dir().
+    void set_cert_dir_for_test(std::filesystem::path dir) { cert_dir_override_ = std::move(dir); }
+
+    /// Reads the retention windows the stores actually enforce (the stores copy
+    /// their window at construction, so Config can differ). Wired by server.cpp
+    /// before the listener starts; the closure must report `nullopt` for a store
+    /// that is absent or not open. Left empty (tests), every window renders as
+    /// "Unknown" rather than a number nothing verified.
+    using RetentionEnforcedFn = std::function<settings_model::RetentionEnforced()>;
+    void set_retention_enforced_fn(RetentionEnforcedFn fn) { retention_enforced_fn_ = std::move(fn); }
 
     /// Inject the engine-principal store (nullable — a null pointer means
     /// the feature is not yet wired; server.cpp wiring is a separate task
@@ -278,6 +301,9 @@ private:
     AuditFn audit_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
+    std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()
+    RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
+    nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
     Config* cfg_{};
     auth::AuthManager* auth_mgr_{};
     auth::AutoApproveEngine* auto_approve_{};
