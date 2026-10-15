@@ -102,7 +102,7 @@ echarts_embed = custom_target(
   input: 'vendor/echarts.min.js',
   output: 'echarts_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -122,7 +122,7 @@ three_embed = custom_target(
   input: 'vendor/three.module.min.js',
   output: 'three_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -135,7 +135,7 @@ three_orbit_embed = custom_target(
   input: 'vendor/three-orbit-controls.js',
   output: 'three_orbit_controls_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -153,7 +153,7 @@ yuzu_viz_js_embed = custom_target(
   input: 'static/yuzu-viz.js',
   output: 'yuzu_viz_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -173,7 +173,7 @@ yuzu_viz_host_js_embed = custom_target(
   input: 'static/yuzu-viz-host.js',
   output: 'yuzu_viz_host_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -188,7 +188,7 @@ yuzu_dialog_js_embed = custom_target(
   input: 'static/yuzu-dialog.js',
   output: 'yuzu_dialog_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -203,7 +203,7 @@ yuzu_operate_js_embed = custom_target(
   input: 'static/yuzu-operate.js',
   output: 'yuzu_operate_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -218,7 +218,7 @@ yuzu_operate_extras_js_embed = custom_target(
   input: 'static/yuzu-operate-extras.js',
   output: 'yuzu_operate_extras_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -232,7 +232,7 @@ yuzu_estate_js_embed = custom_target(
   input: 'static/yuzu-estate.js',
   output: 'yuzu_estate_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -246,7 +246,7 @@ yuzu_device_data_js_embed = custom_target(
   input: 'static/yuzu-device-data.js',
   output: 'yuzu_device_data_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -259,7 +259,7 @@ cytoscape_js_embed = custom_target(
   input: 'static/cytoscape.min.js',
   output: 'cytoscape_js_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -277,7 +277,7 @@ yuzu_css_embed = custom_target(
   input: 'static/yuzu.css',
   output: 'yuzu_css_bundle.cpp',
   command: [
-    find_program('python3', 'python'),
+    yuzu_python,
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
@@ -303,7 +303,7 @@ foreach symbol, file : plex_fonts
     input: 'vendor/ibm-plex/' + file,
     output: symbol.to_lower() + '_bundle.cpp',
     command: [
-      find_program('python3', 'python'),
+      yuzu_python,
       files('scripts/embed_binary.py'),
       '@INPUT@',
       '@OUTPUT@',
@@ -323,7 +323,7 @@ endforeach
 # filesystem fallback at runtime), so a missing PyYAML used to silently
 # produce a binary with an empty Instructions tab. Probe at configure
 # time so the failure surfaces here rather than mid-compile.
-embed_python = find_program('python3', 'python')
+embed_python = yuzu_python
 _yaml_probe = run_command(embed_python, '-c', 'import yaml', check: false)
 if _yaml_probe.returncode() != 0
   error(

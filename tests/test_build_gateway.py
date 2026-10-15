@@ -228,6 +228,33 @@ class TestRunBuild(_TempDirCase):
         with open(os.path.join(self.log_dir, build_gateway.LOG_NAME), "rb") as f:
             self.assertIn(b"hello from rebar3", f.read())
 
+    def test_log_is_written_by_default_on_every_platform(self):
+        # relay_output defaults on everywhere now (it was Windows-only), so a
+        # macOS/Linux build keeps its rebar3 output in meson-logs/ too.
+        rc = build_gateway.run_build(_child('print("default relay", flush=True)'),
+                                     self.tmp, None, 60, self.log_dir)
+        self.assertEqual(rc, 0)
+        with open(os.path.join(self.log_dir, build_gateway.LOG_NAME), "rb") as f:
+            self.assertIn(b"default relay", f.read())
+
+    def test_log_header_names_the_command_and_the_otp(self):
+        # A log read later must answer "which OTP built this?" on its own.
+        root = os.path.join(self.tmp, "otp")
+        os.makedirs(os.path.join(root, "bin"))
+        os.makedirs(os.path.join(root, "releases", "81"))
+        with open(os.path.join(root, "releases", "81", "OTP_VERSION"), "w") as f:
+            f.write("81.4.2\n")
+        erl = os.path.join(root, "bin", "erl.exe" if sys.platform == "win32" else "erl")
+        open(erl, "w").close()
+        env = dict(os.environ, YUZU_OTP_BIN=os.path.join(root, "bin"))
+        cmd = _child('print("compiled", flush=True)')
+        self.assertEqual(build_gateway.run_build(cmd, self.tmp, env, 60, self.log_dir), 0)
+        with open(os.path.join(self.log_dir, build_gateway.LOG_NAME), encoding="utf-8") as f:
+            head = [next(f) for _ in range(3)]
+        self.assertTrue(head[0].startswith("build_gateway: 20"))
+        self.assertEqual(head[1], f"build_gateway: command {cmd!r} in {self.tmp}\n")
+        self.assertEqual(head[2], f"build_gateway: OTP 81.4.2 from {os.path.join(root, 'bin')}\n")
+
     def test_timeout_kills_tree(self):
         self.assertEqual(self.run_build(self.sleeper(), timeout_s=1),
                          build_gateway.EXIT_TIMEOUT)
