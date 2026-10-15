@@ -97,7 +97,7 @@ constexpr char kBody[] = R"HTM(<body>
 <main class="pg">
   <div class="page-header"><div>
     <h1>General and appearance</h1>
-    <p class="subtitle">Agent timeout and logging, event collection, and table density in this browser.</p>
+    <p class="subtitle">Agent timeout and logging, event collection, and colour scheme and table density in this browser.</p>
   </div></div>
 
   <section class="panel" id="appearance-section" aria-labelledby="h-appearance">
@@ -105,12 +105,34 @@ constexpr char kBody[] = R"HTM(<body>
     <div class="form">
       <div class="fld">
         <span class="lb" id="lb-scheme">Colour scheme</span>
-        <div class="pals"><div class="pal" role="group" aria-labelledby="lb-scheme">
-          <span class="sw-row" aria-hidden="true"><span class="swatch s-bg"></span><span class="swatch s-surface"></span><span class="swatch s-raise"></span><span class="swatch s-primary"></span><span class="swatch s-hl"></span><span class="swatch s-ok"></span></span>
-          <b>Slate <span class="pill idle">Current</span></b>
-          <small>Dark theme. Cool blue-grey with a blue accent.</small>
-        </div></div>
-        <span class="hint">Slate is the only colour scheme.</span>
+        <div class="pals" role="radiogroup" aria-labelledby="lb-scheme">
+          <label class="pal"><input type="radio" name="theme" value="slate" checked>
+            <span class="sw-row" aria-hidden="true" style="--bg:#14171c;--surface:#1b1f26;--raise:#2b313c;--primary:#4c9aff;--hl:#f5c542;--ok:#3dd68c"><span class="swatch s-bg"></span><span class="swatch s-surface"></span><span class="swatch s-raise"></span><span class="swatch s-primary"></span><span class="swatch s-hl"></span><span class="swatch s-ok"></span></span>
+            <b>Slate</b>
+            <small>Dark. Cool blue-grey with a blue accent.</small></label>
+          <label class="pal"><input type="radio" name="theme" value="navy">
+            <span class="sw-row" aria-hidden="true" style="--bg:#0b1526;--surface:#101e36;--raise:#1c2f50;--primary:#22d3ee;--hl:#f5c542;--ok:#34d399"><span class="swatch s-bg"></span><span class="swatch s-surface"></span><span class="swatch s-raise"></span><span class="swatch s-primary"></span><span class="swatch s-hl"></span><span class="swatch s-ok"></span></span>
+            <b>Navy</b>
+            <small>Dark. Deep blue with a cyan accent.</small></label>
+          <label class="pal"><input type="radio" name="theme" value="jade">
+            <span class="sw-row" aria-hidden="true" style="--bg:#0a1714;--surface:#0f211d;--raise:#1a332d;--primary:#2fd6a0;--hl:#e8c76a;--ok:#4ade80"><span class="swatch s-bg"></span><span class="swatch s-surface"></span><span class="swatch s-raise"></span><span class="swatch s-primary"></span><span class="swatch s-hl"></span><span class="swatch s-ok"></span></span>
+            <b>Jade</b>
+            <small>Dark. Green-black with a jade accent.</small></label>
+          <label class="pal"><input type="radio" name="theme" value="light">
+            <span class="sw-row" aria-hidden="true" style="--bg:#f5f6f8;--surface:#ffffff;--raise:#ffffff;--primary:#1a5fd0;--hl:#b87900;--ok:#146a35"><span class="swatch s-bg"></span><span class="swatch s-surface"></span><span class="swatch s-raise"></span><span class="swatch s-primary"></span><span class="swatch s-hl"></span><span class="swatch s-ok"></span></span>
+            <b>Light</b>
+            <small>Light. Cool white and grey with a blue accent.</small></label>
+          <label class="pal"><input type="radio" name="theme" value="light-baby">
+            <span class="sw-row" aria-hidden="true" style="--bg:#fff4f7;--surface:#ffffff;--raise:#ffffff;--primary:#c2255c;--hl:#d6336c;--ok:#146f36"><span class="swatch s-bg"></span><span class="swatch s-surface"></span><span class="swatch s-raise"></span><span class="swatch s-primary"></span><span class="swatch s-hl"></span><span class="swatch s-ok"></span></span>
+            <b>Light Baby Pink</b>
+            <small>Light. Pale pink with a rose accent.</small></label>
+          <label class="pal"><input type="radio" name="theme" value="light-hot">
+            <span class="sw-row" aria-hidden="true" style="--bg:#ffffff;--surface:#fff6fa;--raise:#ffffff;--primary:#cf006b;--hl:#cf006b;--ok:#146f36"><span class="swatch s-bg"></span><span class="swatch s-surface"></span><span class="swatch s-raise"></span><span class="swatch s-primary"></span><span class="swatch s-hl"></span><span class="swatch s-ok"></span></span>
+            <b>Light Hot Pink</b>
+            <small>Light. White and pink with a hot-pink accent.</small></label>
+        </div>
+        <span class="hint">Applies to every page in this browser.</span>
+        <span class="hint" id="theme-blocked" role="status" hidden>This browser blocked saving the setting, so it applies until you leave this page.</span>
       </div>
       <div class="fld">
         <span class="lb" id="lb-density">Density</span>
@@ -218,6 +240,31 @@ constexpr char kScript[] = R"HTM(<script>
     try { window.localStorage.setItem(DENSITY_KEY, v); } catch (err) { saved = false; }
     paintDensity(v);
     var note = $('density-blocked');
+    if (note) note.hidden = saved;
+  });
+
+  /* Colour scheme: the same browser-local pattern. The key and the whitelist are the ones the
+     boot script in every page head reads, so a saved choice paints before first paint on the
+     next page. Slate is the :root and the fallback for anything not on the list. */
+  var THEME_KEY = 'yuzu-theme', THEMES = /^(slate|navy|jade|light|light-baby|light-hot)$/;
+  function readTheme() {
+    try { var v = window.localStorage.getItem(THEME_KEY); return THEMES.test(v) ? v : 'slate'; }
+    catch (err) { return 'slate'; }
+  }
+  function paintTheme(v) {
+    document.documentElement.setAttribute('data-theme', v);
+    var r = document.querySelector('input[name=theme][value=' + v + ']');
+    if (r) r.checked = true;
+  }
+  paintTheme(readTheme());
+  document.addEventListener('change', function (e) {
+    var t = e.target;
+    if (!t || t.name !== 'theme') return;
+    var v = THEMES.test(t.value) ? t.value : 'slate';
+    var saved = true;
+    try { window.localStorage.setItem(THEME_KEY, v); } catch (err) { saved = false; }
+    paintTheme(v);
+    var note = $('theme-blocked');
     if (note) note.hidden = saved;
   });
 

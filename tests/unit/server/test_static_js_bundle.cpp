@@ -68,6 +68,7 @@ extern const std::string kYuzuChartsJs;
 // yuzu::server like the JS bundles).
 extern const char* const kVizFleetPageHtml;
 extern const char* const kVizHostPageHtml;
+extern const char* const kSettingsGeneralHtml;
 
 using Catch::Matchers::ContainsSubstring;
 
@@ -1120,6 +1121,72 @@ TEST_CASE("static_js_bundle: kYuzuCss carries the design-system token layer",
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("@font-face"));
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Sans'"));
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Mono'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuCss ships the five alternate colour schemes",
+          "[static-js][yuzu-css][theme]") {
+    // Each scheme is a self-contained html[data-theme] block (same element as :root, so the
+    // short-name aliases re-resolve) that redefines the minimal token set. The picker
+    // (settings_general_ui.cpp) and the boot script name the same six.
+    const std::string_view css = yuzu::server::kYuzuCss;
+    auto block = [&](const std::string& t) {
+        const std::string selector = "html[data-theme=\"" + t + "\"] {";
+        const auto at = css.find(selector);
+        REQUIRE(at != std::string_view::npos);
+        const auto end = css.find('}', at);
+        REQUIRE(end != std::string_view::npos);
+        return std::string(css.substr(at, end - at));
+    };
+    for (const char* t : {"navy", "jade", "light", "light-baby", "light-hot"}) {
+        const auto b = block(t);
+        for (const char* tok :
+             {"color-scheme:", "--mds-color-theme-background-canvas:",
+              "--mds-color-theme-background-solid-primary:", "--mds-color-theme-text-primary:",
+              "--mds-color-theme-text-tertiary:", "--mds-color-theme-accent-primary-normal:",
+              "--mds-color-text-on-accent:", "--raise:", "--faint:", "--hl:", "--focus:",
+              "--mds-color-theme-indicator-error:", "--mds-color-indicator-error-bright:",
+              "--mds-elevation-2:", "--mds-elevation-3:"})
+            CHECK_THAT(b, ContainsSubstring(tok));
+    }
+    // The light family flips the UA colour scheme and puts white on the action colour; the dark
+    // ones keep dark. Slate is the :root and has no block.
+    for (const char* t : {"light", "light-baby", "light-hot"}) {
+        CHECK_THAT(block(t), ContainsSubstring("color-scheme: light;"));
+        CHECK_THAT(block(t), ContainsSubstring("--mds-color-text-on-accent: #ffffff;"));
+    }
+    for (const char* t : {"navy", "jade"})
+        CHECK_THAT(block(t), ContainsSubstring("color-scheme: dark;"));
+    CHECK_THAT(std::string(css), !ContainsSubstring("html[data-theme=\"slate\"]"));
+    // Chart cards lift through one token; slate's value is the :root default.
+    CHECK_THAT(std::string(css), ContainsSubstring("--mds-elevation-2: 0 6px 18px rgba(0,0,0,.35);"));
+}
+
+TEST_CASE("static_js_bundle: the Appearance swatches show each scheme's real colours",
+          "[static-js][yuzu-css][theme]") {
+    // The picker draws six palettes at once, so its swatches carry inline hex (the live tokens
+    // can only show the current one). They are checked against the CSS so they cannot drift.
+    const std::string_view css = yuzu::server::kYuzuCss;
+    const std::string page = kSettingsGeneralHtml;
+    auto decl = [](const std::string& hay, const std::string& name) {
+        const auto at = hay.find(name + ":");
+        REQUIRE(at != std::string::npos);
+        const auto from = hay.find('#', at);
+        return hay.substr(from, 7);
+    };
+    for (const char* t : {"navy", "jade", "light", "light-baby", "light-hot"}) {
+        const auto cs = css.find(std::string("html[data-theme=\"") + t + "\"] {");
+        REQUIRE(cs != std::string_view::npos);
+        const std::string blk(css.substr(cs, css.find('}', cs) - cs));
+        const auto card = page.find(std::string("name=\"theme\" value=\"") + t + "\"");
+        REQUIRE(card != std::string::npos);
+        const std::string row = page.substr(card, page.find("</span></span>", card) - card);
+        CHECK(decl(row, "--bg") == decl(blk, "--mds-color-theme-background-canvas"));
+        CHECK(decl(row, "--surface") == decl(blk, "--mds-color-theme-background-solid-primary"));
+        CHECK(decl(row, "--raise") == decl(blk, "--raise"));
+        CHECK(decl(row, "--primary") == decl(blk, "--mds-color-theme-accent-primary-normal"));
+        CHECK(decl(row, "--hl") == decl(blk, "--hl"));
+        CHECK(decl(row, "--ok") == decl(blk, "--mds-color-theme-indicator-success"));
+    }
 }
 
 TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and keep a page recolour",

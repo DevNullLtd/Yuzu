@@ -283,8 +283,10 @@ separately.
 **Settings → General** (`/settings/general`, admin only; every panel it shows also stays on the
 `/settings` page).
 
-- **Appearance** holds the table-density preference (Comfortable or Compact). It is saved in this
-  browser only and applies to the Dashboard results table.
+- **Appearance** holds the colour scheme and the table-density preference. The scheme is one of
+  six: Slate (the default), Navy and Jade are dark; Light, Light Baby Pink and Light Hot Pink are
+  light. It applies to every page and repaints as soon as you pick it. Density (Comfortable or
+  Compact) applies to the Dashboard results table. Both are saved in this browser only.
 - **Server** holds the two runtime settings that change on a running server, written through
   `PUT /api/config/{key}`: the **agent heartbeat timeout** (`heartbeat_timeout`; seconds of silence
   after which this server drops an agent connected directly to it) and the **log level**
