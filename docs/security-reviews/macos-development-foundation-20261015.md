@@ -6,7 +6,7 @@ follow-up issues. This record supersedes the scope, verification and plugin-owne
 statements of [macos-development-foundation-20260917.md](macos-development-foundation-20260917.md);
 that record still describes `6eb78e12e` and is not rewritten.
 
-Ledger: `governance.d/4482-macos-installer-rework.aGwZqa.jsonl` (this run, 154 rows), plus three
+Ledger: `governance.d/4482-macos-installer-rework.aGwZqa.jsonl` (this run, 162 rows: 154 from the gates, 8 from the external review rounds below), plus three
 supersession rows appended to `governance.d/macos-foundation-20260917.cdfcd1.jsonl` (CP1, RD1, SEC-3).
 
 ## Scope
@@ -78,6 +78,20 @@ governance gate or the VM. The review's minor items (promoted-plist hardening, t
 ACL right, the updater's lstat-then-rename, stale macOS rows in `docs/agent-privilege-model.md`)
 are not addressed here.
 
+**Second external round (FortitudeEtc, 2026-10-15, on `3ca104a3b`).** It verified fr-2, fr-3 and
+fr-4 and found that fr-1's fix was incomplete:
+
+| Id | Finding | Fix |
+|---|---|---|
+| fr-5 | Only the directories were checked. The prescribed `chown -hR` migration re-owned a symlink `_yuzu` had planted (`agent.db`, the log), so it passed and the root daemon followed it. | Every entry in the data and log directories must be a root-owned regular file or directory, not group/world writable, with no write-granting ACL and not hard-linked; symlinks and special files are refused and listed. The remedy is per-entry inspection; recursive `chown`/`chmod` is advised against. |
+| fr-6 | Recovery restarted the root agent before an install's data and log checks ran. | Recovery's start gate runs the same directory and entry checks; on failure it restores but does not start. |
+| fr-7 | No test failed when the ACL half of `root_file_trusted` was deleted. | Native ACL test added. |
+| fr-8 | This record's row count and the RD1 row were stale. | Corrected. |
+
+Not changed: a `/var/db` with an inheritable ACL makes a fresh install refuse (safe direction,
+with a printed remedy), and a restored definition that recovery does not start still loads at
+the next boot, as documented. Neither round ran in the VM.
+
 ## Evidence at the final head (`8691d6bf6`)
 
 - **Packaging tests** (`tests/test_macos_app_packaging.py`):
@@ -124,7 +138,7 @@ are not addressed here.
 | Finding | 2026-09-17 state | Now |
 |---|---|---|
 | CP1 | fixed (pass 3) | Regressed as bci-1/xp-1 when the September review fixes added unguarded macOS-userland tests. Re-fixed by per-test guards (`53fd57eaa`). |
-| RD1 | fixed: create the data directory, preserve the existing one | Replaced by **D2**: an existing directory must be owned by root or `_yuzu` and not group/world writable, or the install refuses (`806eca71b`, `7dd3b4886`). |
+| RD1 | fixed: create the data directory, preserve the existing one | Replaced by **D2**: an existing directory must be owned by root or `_yuzu` and not group/world writable, or the install refuses (`806eca71b`, `7dd3b4886`). D2 was later withdrawn (fr-1, fr-5): root only, contents included. |
 | SEC-3 | fixed: receipt-based legacy ownership | Superseded by **byte ownership**: a plugin is package-owned only while its bytes match a recorded package hash (`5897fb52a`). Removal keeps operator-modified plugins and accepts any package record (`806eca71b`, `59599eeac`). The receipt remains the source for pre-manifest packages and for re-derivation after a rollback (`806eca71b`, `59599eeac`). |
 
 Statements in the 2026-09-17 record and the original PR body that no longer hold:
