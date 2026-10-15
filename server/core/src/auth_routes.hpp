@@ -188,10 +188,6 @@ enum class SsoOnlyLocalGate : std::uint8_t {
                       ///< state could not be read — fail CLOSED): never evaluate PBKDF2
 };
 
-/// Quiet::Yes asks `require_permission` / `require_tier_policy` for the verdict only: no denial
-/// audit row and no denial counter. Default is No (loud) everywhere.
-enum class Quiet : std::uint8_t { No, Yes };
-
 /// Whether a probe may withhold this caller's denial rows. Only an interactive cookie session
 /// qualifies (local, OIDC or SAML sign-in); an API/MCP/engine token or an engine principal that
 /// reaches a panel URL is anomalous and keeps the auditing behaviour, so a revoked or
@@ -265,8 +261,7 @@ public:
 
     /// RBAC-aware permission check. Falls back to legacy admin/user check if RBAC is disabled.
     bool require_permission(const httplib::Request& req, httplib::Response& res,
-                            const std::string& securable_type, const std::string& operation,
-                            Quiet quiet = Quiet::No);
+                            const std::string& securable_type, const std::string& operation);
 
     /// Whether the caller holds `securable_type:operation`, for deciding what to DRAW. It runs
     /// `require_permission`'s own decision path (elevation, engine principals, MCP tier,
@@ -345,8 +340,7 @@ public:
     /// admit them), must state its intent.
     bool require_tier_policy(const httplib::Request& req, httplib::Response& res,
                              const auth::Session& session, const std::string& securable_type,
-                             const std::string& operation, bool actionable_permission,
-                             Quiet quiet = Quiet::No);
+                             const std::string& operation, bool actionable_permission);
 
     /// The SOLE production factory for a gate-less-route `TierPolicyFn` (#5047
     /// governance fix round). Returns a callable that invokes
@@ -985,12 +979,11 @@ private:
     /// the permission) and answers 503 with `retry_after_ms` 5000 and no `.permission`.
     /// Called by `require_fleet_read` and `require_scoped_permission`, and by
     /// `require_permission` only as the dormant guard where its allow-list would admit
-    /// (extend, never fork); each caller still refuses the request itself. `Quiet::Yes` writes
-    /// the same 503 response but no counter and no audit row.
+    /// (extend, never fork); each caller still refuses the request itself.
     void respond_ceiling_degraded(const httplib::Request& req, httplib::Response& res,
                                   const std::string& audit_action,
                                   const std::string& audit_detail,
-                                  const authz::CeilingResult& ceiling, Quiet quiet = Quiet::No);
+                                  const authz::CeilingResult& ceiling);
 
     std::optional<std::vector<authz::PermPair>> service_scope_global_safe_override_for_test_;
 

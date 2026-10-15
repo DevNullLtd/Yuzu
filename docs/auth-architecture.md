@@ -3005,26 +3005,26 @@ only when a change cannot be expressed as an idempotent additive re-seed
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
 
-## Quiet permission probe (render-time capability hints)
+## Render-time permission probes (capability hints)
 
-`AuthRoutes::require_permission` and `require_tier_policy` take a trailing `Quiet` argument
-(`Quiet::No` by default). `Quiet::Yes` returns the identical verdict, status and body but
-suppresses the denial side effects: the `auth.permission_required` / `auth.approval_required`
-audit rows and the `yuzu_auth_topology_floor_denied_total` and
-`yuzu_auth_service_scope_default_denied_total` counters. The ceiling-degraded 503 path still
-answers the same 503 body but skips its degrade counter and audit row.
+Three `AuthRoutes` methods answer a permission question without writing a denial row, for pages
+that decide what to DRAW: `has_permission` (the verdict only), `probe_permission` (the verdict
+with the gate's own response kept, so "denied" and "store unavailable" stay distinguishable) and
+`probe_fleet_read` (`require_fleet_read`'s decision and scope). Each runs the gate's own code
+under the thread-local `AuditProbeScope`, which makes `audit_log` a no-op, and withholds the
+denial row **only for an interactive cookie sign-in** (`denial_row_may_be_withheld`: `local`,
+`oidc` or `saml` and not an engine principal). A token or engine caller that reaches such a route
+keeps its row.
 
-Not suppressed: the one-off `role.elevation.expired` lifecycle row minted when the request
-reaps an expired elevation, and `RbacStore`'s own store-read telemetry (latency histogram,
-circuit breaker).
+What is withheld is the audit row. The denial counters (`yuzu_auth_topology_floor_denied_total`,
+`yuzu_auth_service_scope_default_denied_total`, `yuzu_server_rbac_read_degrade_total`) still tick,
+and the store's own read telemetry is untouched.
 
-Only `require_permission` (with its tier belt) has a quiet form; `require_fleet_read` and
-`require_scoped_permission` can still narrow a verdict a probe allowed.
-
-A probe is a rendering hint, never a gate: use it to hide or disable a control, and let the
-action route re-check through the loud gate. `ServerImpl::probe_permission` is the binding
-for a `std::function<bool(const httplib::Request&, const std::string& securable,
-const std::string& operation)>` consumer; it passes a scratch `httplib::Response`.
+A probe is a rendering hint unless a route deliberately binds it as its gate: the Dashboard panel
+fragments do (a refused sign-in is shown a note and leaves no row), while an action route must
+re-check through `require_permission` or `require_scoped_permission`. An earlier design that
+threaded a `Quiet` argument through `require_permission` was dropped because nothing called it and
+it did not cover `require_fleet_read`.
 
 ## Settings read-twins (#4028, api-parity programme #2146)
 
