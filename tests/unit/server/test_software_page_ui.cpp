@@ -787,12 +787,13 @@ TEST_CASE("software page: Sync now button and dialog script drive the fan-out ro
         REQUIRE(has(s, need));
     // The 202 count is agents_reached (as on /api/command and the per-device route).
     REQUIRE_FALSE(has(s, "d.reached"));
-    // The scope preview needs Infrastructure:Read, so a refused preview (403 or any non-2xx) means
-    // "no count" and the dialog goes on to the confirm step; it must not become a dead end.
+    // The scope preview needs Infrastructure:Read, so a PERMISSION refusal (403, or 401) means "no
+    // count" and the dialog goes on to the confirm step; any other failure (400 invalid expression,
+    // 404, 503) is still returned to the dialog so it is caught before the operator confirms.
+    REQUIRE(has(s, "if (!r.ok && r.status !== 403 && r.status !== 401)"));
+    REQUIRE(has(s, "return r.message || ('Scope preview failed (' + r.status + ')');"));
     REQUIRE(has(s, "count = r.ok && r.data && r.data.data"));
     REQUIRE(has(s, "count === null ? 'The devices matching this scope'"));
-    REQUIRE_FALSE(has(s, "Scope preview failed"));
-    REQUIRE_FALSE(has(s, "return r.message"));
     // Not the per-device route (that one is /api/v1/hardware/{id}/sync), and server text is
     // only ever written with textContent.
     REQUIRE_FALSE(has(s, "'/api/v1/hardware/' +"));

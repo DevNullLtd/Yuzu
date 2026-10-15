@@ -616,7 +616,9 @@ place, **Hardware** and **Software**, each its own page:
     **Devices matching a scope expression or group** (a scope expression, or `group:<id>`),
     and **Whole fleet**. For a scope expression the Review step previews the match count
     through `POST /api/v1/scope/preview`; that route needs `Infrastructure:Read`, so if it is
-    refused the dialog goes on to the confirm step without a count. After you confirm, a
+    refused for lack of permission the dialog goes on to the confirm step without a count; any
+    other preview error (an invalid expression, for example) is shown in the dialog before you
+    can confirm. After you confirm, a
     notice says how many devices were asked to sync and how many were skipped. It calls
     `POST /api/v1/hardware/sync`.
     - **Who may.** The route needs `Execution:Execute`, checked as a **global** grant (or
