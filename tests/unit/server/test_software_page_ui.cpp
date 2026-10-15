@@ -793,8 +793,10 @@ TEST_CASE("software page: Sync now button and dialog script drive the fan-out ro
     REQUIRE(to != std::string::npos);
     REQUIRE(from < to);
     const std::string sync_js = s.substr(from, to - from);
-    REQUIRE(has(sync_js, "textContent"));
     REQUIRE_FALSE(has(sync_js, "innerHTML"));
+    // The result is a toast only: no persistent note is written into the freshness line.
+    REQUIRE_FALSE(has(sync_js, "sw-sync-note"));
+    REQUIRE_FALSE(has(sync_js, ".inv-fresh"));
     // The shared dialog module is loaded by the shell this script rides.
     REQUIRE(has(kGuardianDetailPageHtml, "/static/yuzu-dialog.js"));
 }

@@ -940,7 +940,7 @@ function swClose(x) {
 /* Sync now: pick the devices (this device / a scope expression or group / the whole fleet), confirm
    the count, POST /api/v1/hardware/sync. Two shared-dialog steps; the server enforces every bound. */
 function swSyncDone(r) {
-  var d = r.data && r.data.data, note, msg, skip = [];
+  var d = r.data && r.data.data, msg, skip = [];
   if (!r.ok || !d) {
     if (typeof showToast === 'function') showToast(r.message || ('Sync request failed (' + r.status + ')'), 'error');
     return;
@@ -950,12 +950,6 @@ function swSyncDone(r) {
   if (d.skipped_version) skip.push(d.skipped_version + ' on an agent older than 0.13.1');
   if (skip.length) msg += ' (skipped: ' + skip.join(', ') + ')';
   if (typeof showToast === 'function') showToast(msg, d.reached ? 'success' : 'warning');
-  var f = document.querySelector('.inv-fresh');
-  if (f) {
-    note = document.getElementById('sw-sync-note');
-    if (!note) { note = document.createElement('span'); note.id = 'sw-sync-note'; f.appendChild(note); }
-    note.textContent = ' \u00b7 ' + msg + ' at ' + new Date().toLocaleTimeString();
-  }
 }
 function swSync() {
   var D = window.YuzuDialog;
